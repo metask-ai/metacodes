@@ -29,6 +29,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
@@ -43,10 +44,27 @@ from .memory_procedural_adapter import (
     validate_validator_bundle,
 )
 from .memory_replay import (
+    PRODUCTION_EXECUTION_MODE,
+    PRODUCTION_MODEL_ID,
+    PRODUCTION_MODEL_PROVIDER,
+    PRODUCTION_PRICING_PROVENANCE,
+    PRODUCTION_PROVIDER_ID,
+    PRODUCTION_DISALLOWED_PROVIDER_TOOLS,
+    PRODUCTION_AUTO_COMPACT_POLICY,
+    PRODUCTION_CHILD_PATH,
+    PRODUCTION_FORCE_COMPACT_AT,
+    PRODUCTION_FILESYSTEM_ISOLATION,
+    PRODUCTION_RUNNER_SOURCE_MODULES,
+    PRODUCTION_TOOL_NETWORK_ISOLATION,
     REPLAY_SCHEMA_VERSION,
     RUNNER_SOURCE_MODULES,
     _artifact_tree_digest,
     _cassette_memory_activity,
+    _cassette_memory_exposure,
+    _cassette_treatment_activation,
+    _native_pricing_provenance,
+    _path_is_within,
+    _production_harness_fingerprint,
     load_manifest,
     replay_observations,
 )
@@ -61,9 +79,21 @@ from .model import ValidationError, stable_json
 
 
 RUNTIME_RECEIPT_SCHEMA_VERSION = 3
+PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 4
 RUNTIME_METADATA_SCHEMA_VERSION = NATIVE_EVENT_SCHEMA_VERSION
 SCRIPTED_PROVIDER_ID = "metacodes-memory-scripted-lifecycle-v3"
 SCRIPTED_LIFECYCLE_MODE = "native-agent-loop-scripted-lifecycle-smoke"
+PRODUCTION_MODEL_FINGERPRINT = hashlib.sha256(
+    stable_json(
+        {
+            "endpoint": "https://napi.metask-ai.com/v1/messages",
+            "model": PRODUCTION_MODEL_ID,
+            "protocol": "anthropic-messages-sse",
+            "provider": PRODUCTION_MODEL_PROVIDER,
+        }
+    ).encode("utf-8")
+).hexdigest()
+PRODUCTION_CREDENTIAL_MAX_BYTES = 4096
 ARM_TO_RUNTIME = {
     "no_memory": "codex_style",
     "codex_style": "codex_style",
@@ -74,6 +104,78 @@ ARM_TO_RUNTIME = {
 }
 SAFE_STOP_REASONS = frozenset({"end_turn", "max_turns", "tool_loop", "budget"})
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True)
+class ProductionRuntimeConfig:
+    """Host-only authority and fixed caps for one paid production schedule.
+
+    The API key is deliberately excluded from repr/equality-facing receipts.
+    Receipts bind only the public provider/model identity and the budget caps.
+    """
+
+    api_key: str = field(repr=False, compare=False)
+    allow_paid_rollouts: bool = False
+    max_total_cost_usd: float = 0.0
+    max_total_metered_tokens: int = 0
+    max_rollout_cost_usd: float = 0.0
+    max_rollout_metered_tokens: int = 0
+    max_output_tokens: int = 4096
+
+    def validate(self, rollout_count: int) -> None:
+        if not self.allow_paid_rollouts:
+            _fail("production memory runtime", "requires explicit paid-rollout authority")
+        if not isinstance(self.api_key, str) or not self.api_key.strip():
+            _fail("production memory runtime", "API credential is unavailable")
+        if len(self.api_key.encode("utf-8")) > PRODUCTION_CREDENTIAL_MAX_BYTES:
+            _fail("production memory runtime", "API credential exceeds inherited FD limit")
+        if not isinstance(rollout_count, int) or isinstance(rollout_count, bool) or rollout_count <= 0:
+            _fail("production memory runtime", "rollout count must be positive")
+        for name, value in (
+            ("max_total_cost_usd", self.max_total_cost_usd),
+            ("max_rollout_cost_usd", self.max_rollout_cost_usd),
+        ):
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                or float(value) <= 0
+            ):
+                _fail(f"production memory runtime.{name}", "expected a finite number > 0")
+        for name, value in (
+            ("max_total_metered_tokens", self.max_total_metered_tokens),
+            ("max_rollout_metered_tokens", self.max_rollout_metered_tokens),
+            ("max_output_tokens", self.max_output_tokens),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                _fail(f"production memory runtime.{name}", "expected an integer > 0")
+        if self.max_total_cost_usd > 1000.0:
+            _fail("production memory runtime.max_total_cost_usd", "must not exceed $1000")
+        if self.max_rollout_cost_usd > self.max_total_cost_usd:
+            _fail("production memory runtime", "rollout cost cap exceeds total cost cap")
+        if self.max_rollout_metered_tokens > self.max_total_metered_tokens:
+            _fail("production memory runtime", "rollout token cap exceeds total token cap")
+        # Strict inequality preserves one fail-closed unit of headroom: reaching
+        # either hard cap is a terminal budget event, not a successful schedule.
+        if self.max_rollout_cost_usd * rollout_count >= self.max_total_cost_usd:
+            _fail(
+                "production memory runtime",
+                "total cost cap does not strictly cover every fixed rollout cap",
+            )
+        if self.max_rollout_metered_tokens * rollout_count >= self.max_total_metered_tokens:
+            _fail(
+                "production memory runtime",
+                "total token cap does not strictly cover every fixed rollout cap",
+            )
+
+    def public_budget(self) -> Mapping[str, Any]:
+        return {
+            "max_total_cost_usd": float(self.max_total_cost_usd),
+            "max_total_metered_tokens": self.max_total_metered_tokens,
+            "max_rollout_cost_usd": float(self.max_rollout_cost_usd),
+            "max_rollout_metered_tokens": self.max_rollout_metered_tokens,
+            "max_output_tokens": self.max_output_tokens,
+        }
 
 
 def _fail(where: str, message: str) -> None:
@@ -93,8 +195,11 @@ def _hash_text(value: str) -> str:
 
 
 def _safe_component(value: str) -> str:
-    prefix = re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")[:40] or "run"
-    return f"{prefix}-{_hash_text(value)[:12]}"
+    # Artifact paths are visible to the model through cwd, memory instructions,
+    # and METACODES_KG_STORE. Never leak arm labels such as "tinykg" or
+    # "no_memory" into those paths; treatment identity belongs only in the
+    # host-owned schedule/receipt.
+    return f"run-{_hash_text(value)[:20]}"
 
 
 def _inside(child: Path, parent: Path, where: str) -> Path:
@@ -158,7 +263,61 @@ def _read_regular_file(path: Path, where: str) -> bytes:
         os.close(fd)
 
 
-def _load_json(path: Path, label: str) -> Mapping[str, Any]:
+def _secret_encodings(secret: str) -> Tuple[bytes, ...]:
+    """Representations that may appear in raw or JSON-encoded artifacts."""
+
+    raw = secret.encode("utf-8")
+    escaped = json.dumps(secret, ensure_ascii=False)[1:-1].encode("utf-8")
+    return tuple(dict.fromkeys((raw, escaped)))
+
+
+def _assert_production_secret_absent(
+    artifact_root: Path,
+    secret: str,
+    *,
+    pending_payloads: Sequence[Tuple[str, bytes]] = (),
+) -> None:
+    """Fail closed if a production credential reached any durable artifact.
+
+    The scan runs before observations/receipt publication and covers the whole
+    owned run tree, not only the artifacts currently named by the receipt. This
+    catches stdout/stderr, cassette, transcript, workspace, Markdown memory,
+    TinyKG bytes, and unexpected files created by a model tool call.
+    """
+
+    if not isinstance(secret, str) or not secret:
+        _fail("production secret scan", "credential is unavailable")
+    needles = _secret_encodings(secret)
+
+    def check(label: str, payload: bytes) -> None:
+        if any(needle and needle in payload for needle in needles):
+            _fail("production secret scan", f"credential leaked into {label}")
+
+    try:
+        root_info = artifact_root.lstat()
+        if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+            _fail("production secret scan", "artifact root must be a real directory")
+        for path in sorted(artifact_root.rglob("*")):
+            relative = path.relative_to(artifact_root).as_posix()
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                _fail("production secret scan", f"symlink is forbidden: {relative!r}")
+            if stat.S_ISDIR(info.st_mode):
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                _fail("production secret scan", f"non-regular artifact: {relative!r}")
+            if info.st_nlink != 1:
+                _fail("production secret scan", f"hard-linked artifact: {relative!r}")
+            check(relative, _read_regular_file(path, f"production secret scan {relative!r}"))
+    except ValidationError:
+        raise
+    except OSError as exc:
+        raise ValidationError(f"production secret scan: cannot re-observe artifacts: {exc}") from exc
+    for label, payload in pending_payloads:
+        check(label, payload)
+
+
+def _load_json_payload(payload: bytes, label: str) -> Mapping[str, Any]:
     def reject_duplicates(pairs: Sequence[Tuple[str, Any]]) -> Dict[str, Any]:
         result: Dict[str, Any] = {}
         for key, value in pairs:
@@ -168,14 +327,18 @@ def _load_json(path: Path, label: str) -> Mapping[str, Any]:
         return result
 
     try:
-        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicates)
+        value = json.loads(payload.decode("utf-8"), object_pairs_hook=reject_duplicates)
     except ValidationError:
         raise
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ValidationError(f"cannot read {label} {path}: {exc}") from exc
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValidationError(f"cannot parse {label}: {exc}") from exc
     if not isinstance(value, dict):
         _fail(label, "expected an object")
     return value
+
+
+def _load_json(path: Path, label: str) -> Mapping[str, Any]:
+    return _load_json_payload(_read_regular_file(path, label), label)
 
 
 def _xxhash64(data: bytes, seed: int = 0) -> int:
@@ -790,6 +953,8 @@ def _cassette_tool_data(
     cassette: Path,
     logical_ids: Mapping[int, str],
     fallback_query: str,
+    *,
+    memory_dir: Path | None = None,
 ) -> Mapping[str, Any]:
     query_variants: List[Mapping[str, str]] = []
     retrieved: List[str] = []
@@ -812,6 +977,12 @@ def _cassette_tool_data(
             for item in content:
                 if not isinstance(item, dict):
                     continue
+                if item.get("type") == "text" and isinstance(item.get("text"), str):
+                    raw_text = item["text"]
+                    for match in re.finditer(r"\bnode_id=([0-9]+)\b", raw_text):
+                        logical = logical_ids.get(int(match.group(1)))
+                        if logical is not None and logical not in retrieved:
+                            retrieved.append(logical)
                 if item.get("type") == "tool_use":
                     tool_id, name, tool_input = item.get("id"), item.get("name"), item.get("input")
                     if isinstance(tool_id, str) and isinstance(name, str) and isinstance(tool_input, dict):
@@ -866,9 +1037,20 @@ def _cassette_tool_data(
                         remembered_node_ids.append(node_id)
                 except json.JSONDecodeError:
                     pass
-            elif name == "Read" and tool_id.startswith("markdown-read-"):
+            elif name in {"Read", "Grep"} and (
+                _path_is_within(tool_input.get("file_path"), memory_dir)
+                or _path_is_within(tool_input.get("path"), memory_dir)
+            ):
                 if not query_variants:
-                    query_variants.append({"kind": "exact", "text": fallback_query})
+                    observed_query = tool_input.get("pattern") if name == "Grep" else fallback_query
+                    query_variants.append(
+                        {
+                            "kind": "exact",
+                            "text": observed_query if isinstance(observed_query, str) else fallback_query,
+                        }
+                    )
+    if retrieved and not query_variants:
+        query_variants.append({"kind": "automatic", "text": fallback_query})
     return {
         "query_variants": query_variants,
         "retrieved": retrieved,
@@ -889,8 +1071,12 @@ def _runtime_metadata(
     model_provider: str,
     harness_fingerprint: str,
     environment_fingerprint: str,
+    max_metered_tokens: int | None = None,
+    max_cost_usd: float | None = None,
 ) -> Mapping[str, Any]:
-    return {
+    if (max_metered_tokens is None) != (max_cost_usd is None):
+        _fail("memory runtime metadata", "token and cost caps must be supplied together")
+    metadata: Dict[str, Any] = {
         "schema_version": RUNTIME_METADATA_SCHEMA_VERSION,
         "events_path": str(events_path),
         "run_id": run_id,
@@ -908,6 +1094,10 @@ def _runtime_metadata(
         "environment_fingerprint": environment_fingerprint,
         "grader_fingerprint": case["grader"]["fingerprint"],
     }
+    if max_metered_tokens is not None:
+        metadata["max_metered_tokens"] = max_metered_tokens
+        metadata["max_cost_usd"] = float(max_cost_usd)
+    return metadata
 
 
 def _sanitized_environment(base: Mapping[str, str]) -> Dict[str, str]:
@@ -925,12 +1115,86 @@ def _sanitized_environment(base: Mapping[str, str]) -> Dict[str, str]:
         "METACODES_EVAL_FD",
         "METACODES_LOG",
         "METACODES_LOG_FILE",
+        "METACODES_AUTH_FILE",
+        "METACODES_API_KEY_FD",
+        "METACODES_PROVIDER",
+        "METACODES_AUTH_PRECEDENCE",
+        "METACODES_NO_AUTO_RECALL",
+        "METACODES_RECALL_FLOOR",
+        "METASK_API_KEY",
     }
     return {
         key: value
         for key, value in base.items()
         if not key.startswith("TINYKG_") and key not in forbidden_exact
     }
+
+
+def _production_environment(_base: Mapping[str, str]) -> Dict[str, str]:
+    """Build the minimal inherited environment for a paid model-controlled run.
+
+    A credential-name blacklist is insufficient here: Bash could inspect an
+    unrelated AWS/GitHub/SSH secret inherited from the operator. Production
+    receives only a deterministic system search path; HOME, temp, locale,
+    evaluation FDs, and treatment settings are added explicitly by the caller.
+    """
+
+    return {"PATH": PRODUCTION_CHILD_PATH}
+
+
+def _assert_executable_identity(path: Path, expected_sha256: str, where: str) -> None:
+    if not path.is_file() or not os.access(path, os.X_OK):
+        _fail(where, "is no longer executable")
+    if file_sha256(path) != expected_sha256:
+        _fail(where, "changed during the frozen schedule")
+
+
+def _validate_production_manifest(
+    manifest: Mapping[str, Any],
+    production: ProductionRuntimeConfig,
+) -> None:
+    execution = manifest.get("execution")
+    if not isinstance(execution, dict):
+        _fail("production memory manifest", "missing execution contract")
+    if execution.get("model_id") != PRODUCTION_MODEL_ID:
+        _fail(
+            "production memory manifest.model_id",
+            f"must be exactly {PRODUCTION_MODEL_ID!r}",
+        )
+    if execution.get("model_fingerprint") != PRODUCTION_MODEL_FINGERPRINT:
+        _fail(
+            "production memory manifest.model_fingerprint",
+            "does not bind the production provider/model endpoint",
+        )
+    production.validate(len(manifest.get("schedule", ())))
+
+
+def _require_production_budget(
+    production: ProductionRuntimeConfig,
+    rollout_receipts: Sequence[Mapping[str, Any]],
+    remaining_rollouts: int,
+) -> None:
+    observed_cost = sum(
+        float(item["estimated_cost_usd"]) for item in rollout_receipts
+    )
+    observed_tokens = sum(
+        int(item["metered_tokens"]) for item in rollout_receipts
+    )
+    remaining_cost = float(production.max_total_cost_usd) - observed_cost
+    remaining_tokens = production.max_total_metered_tokens - observed_tokens
+    required_cost = float(production.max_rollout_cost_usd) * remaining_rollouts
+    required_tokens = production.max_rollout_metered_tokens * remaining_rollouts
+    if (
+        not math.isfinite(observed_cost)
+        or observed_cost < 0
+        or observed_tokens < 0
+        or remaining_cost <= required_cost
+        or remaining_tokens <= required_tokens
+    ):
+        _fail(
+            "production memory runtime budget",
+            "remaining schedule is not budget-feasible before provider request",
+        )
 
 
 def run_memory_agent_schedule(
@@ -946,8 +1210,14 @@ def run_memory_agent_schedule(
     runtime_receipt_path: Path,
     validator_bundle_path: Path | None = None,
     timeout_seconds: int = 45,
+    production: ProductionRuntimeConfig | None = None,
 ) -> Tuple[List[Mapping[str, Any]], Mapping[str, Any]]:
-    """Run one complete frozen schedule with the zero-cost scripted provider."""
+    """Run one complete frozen schedule through scripted or production provider.
+
+    The default remains the v3 zero-cost lifecycle smoke. Passing ``production``
+    selects the stricter v4 contract and requires explicit paid authority plus
+    schedule-wide and per-rollout caps before any provider request.
+    """
 
     metacodes = metacodes_binary.expanduser().resolve()
     tinykg = tinykg_binary.expanduser().resolve()
@@ -963,14 +1233,26 @@ def run_memory_agent_schedule(
         _fail("TinyKG runtime binary", "SHA-256 mismatch")
 
     manifest = load_manifest(manifest_path)
-    source = _load_json(source_path, "memory adapter source")
-    source_sha = file_sha256(source_path)
+    # Parse and hash the same opened bytes. Separate path reads leave a TOCTOU
+    # gap where the executed public source and the receipt identity can refer
+    # to different file versions.
+    source_payload = _read_regular_file(source_path, "memory adapter source")
+    source = _load_json_payload(source_payload, "memory adapter source")
+    source_sha = _hash_bytes(source_payload)
     if source_sha != manifest["dataset"]["source_sha256"]:
         _fail("memory adapter source", "SHA-256 does not match manifest")
     if source.get("adapter_id") != manifest["dataset"]["adapter_id"]:
         _fail("memory adapter source", "adapter id does not match manifest")
     if source.get("adapter_revision") != manifest["dataset"]["adapter_revision"]:
         _fail("memory adapter source", "adapter revision does not match manifest")
+    production_mode = production is not None
+    if production is not None:
+        if os.name == "nt":
+            _fail(
+                "production memory runtime",
+                "inherited credential FD transport is not implemented on Windows",
+            )
+        _validate_production_manifest(manifest, production)
 
     procedural_cases = _public_procedural_cases(source)
     public_cases = {
@@ -999,7 +1281,10 @@ def run_memory_agent_schedule(
     resolved_run.mkdir(parents=True)
     runtime_source_root = Path(__file__).resolve().parent
     runner_sources: List[Mapping[str, str]] = []
-    for module in RUNNER_SOURCE_MODULES:
+    runner_source_modules = (
+        PRODUCTION_RUNNER_SOURCE_MODULES if production_mode else RUNNER_SOURCE_MODULES
+    )
+    for module in runner_source_modules:
         runtime_source = runtime_source_root / f"{module}.py"
         target = resolved_run / "runner-sources" / f"{module}.py"
         _write_new(target, _read_regular_file(runtime_source, f"runtime source {module}"))
@@ -1032,6 +1317,17 @@ def run_memory_agent_schedule(
     procedural_stores: MutableMapping[Tuple[str, int, str], Mapping[str, Any]] = {}
 
     for expected_sequence, schedule in enumerate(manifest["schedule"]):
+        if production_mode:
+            _assert_executable_identity(
+                metacodes,
+                expected_metacodes_sha256,
+                "production metacodes binary",
+            )
+            _assert_executable_identity(
+                tinykg,
+                expected_tinykg_sha256,
+                "production TinyKG binary",
+            )
         if schedule["sequence"] != expected_sequence:
             _fail("memory schedule", "sequence is not contiguous")
         case = cases[schedule["case_id"]]
@@ -1074,7 +1370,7 @@ def run_memory_agent_schedule(
         memory_backend = {
             "codex_style": "none",
             "claude_style": "markdown",
-            "tinykg": "tinykg",
+            "tinykg": "tinykg_integrated" if production_mode else "tinykg",
         }[runtime_arm]
         memory_dir: Path | None = None
         memory_file: Path | None = None
@@ -1083,6 +1379,10 @@ def run_memory_agent_schedule(
         markdown_state: Path | None = None
         memory_state_before = "none"
         memory_state_after = "none"
+        markdown_revision_before: str | None = None
+        markdown_revision_after: str | None = None
+        markdown_files_before = 0
+        markdown_files_after = 0
         if case["benchmark"] == "procedural_transfer":
             procedure_id = public_case.get("_procedure_evidence_id")
             if not isinstance(procedure_id, str) or not procedure_id:
@@ -1091,26 +1391,39 @@ def run_memory_agent_schedule(
                 f"procedure-memory:{procedure_id}: preserve the intent-family pattern across "
                 "registry, protocol manifest, documentation, and contract surfaces"
             )
-        if runtime_arm == "claude_style":
+        if runtime_arm == "claude_style" or (runtime_arm == "tinykg" and production_mode):
             memory_dir = _memory_dir(sealed_home, project_root)
             memory_dir.mkdir(parents=True)
             memory_index = memory_dir / "MEMORY.md"
             if case["benchmark"] == "procedural_transfer":
-                markdown_state = project_root / "durable-markdown-state"
+                markdown_state = project_root / (
+                    "durable-integrated-markdown-state"
+                    if runtime_arm == "tinykg"
+                    else "durable-markdown-state"
+                )
                 if markdown_state.exists():
                     _copy_memory_tree(markdown_state, memory_dir)
                 elif split != "online":
-                    _fail("procedural Markdown runtime", "offline phase has no online memory state")
-                memory_file = memory_dir / "benchmark-procedural-pattern.md"
-            else:
+                    _fail("procedural memory runtime", "offline phase has no online Markdown state")
+                if runtime_arm == "claude_style":
+                    memory_file = memory_dir / "benchmark-procedural-pattern.md"
+            elif runtime_arm == "claude_style":
                 memory_file, memory_marker = _seed_public_markdown_memory(
                     memory_dir,
                     public_case,
                 )
-            memory_state_before = _artifact_tree_digest(
+            markdown_revision_before = _artifact_tree_digest(
                 memory_dir,
                 "markdown memory before rollout",
             )
+            markdown_files_before = sum(1 for path in memory_dir.rglob("*") if path.is_file())
+            if production_mode:
+                if runtime_arm == "claude_style":
+                    memory_state_before = _canonical_sha256(
+                        {"markdown": markdown_revision_before, "tinykg": None}
+                    )
+            else:
+                memory_state_before = markdown_revision_before
 
         store: Path | None = None
         logical_ids: Dict[int, str] = {}
@@ -1119,6 +1432,7 @@ def run_memory_agent_schedule(
         raw_store_digest_before = "none"
         raw_store_digest_after = "none"
         store_nodes = 0
+        store_nodes_before = 0
         store_edges = 0
         store_text_stale = False
         abstraction_nodes = 0
@@ -1166,44 +1480,78 @@ def run_memory_agent_schedule(
             raw_store_digest_before = _tree_digest(store)
             info = _store_info(local.command("store-info", store, ()))
             store_nodes, store_edges = int(info["nodes"]), int(info["edges"])
+            store_nodes_before = store_nodes
             if info.get("text_stale") not in {"0", "1"}:
                 _fail(f"native memory rollout {case['id']}", "invalid TinyKG text_stale state")
             store_text_stale = info["text_stale"] == "1"
-            memory_state_before = graph_revision_before
+            if production_mode:
+                assert markdown_revision_before is not None
+                memory_state_before = _canonical_sha256(
+                    {"markdown": markdown_revision_before, "tinykg": graph_revision_before}
+                )
+            else:
+                memory_state_before = graph_revision_before
+
+        memory_index_before = (
+            _read_regular_file(memory_index, "pre-rollout MEMORY.md")
+            if memory_index is not None and memory_index.exists()
+            else b""
+        )
 
         events = artifact_dir / "native-events.jsonl"
         metadata_path = artifact_dir / "runtime-metadata.json"
         stdout_path = artifact_dir / "stdout.ndjson"
         stderr_path = artifact_dir / "stderr.log"
         run_id = f"{manifest['manifest_id']}:{expected_sequence}:{case['id']}:{schedule['trial']}:{arm_id}"
-        harness_fingerprint = _canonical_sha256(
-            {
-                "metacodes_binary_sha256": metacodes_sha,
-                "harness_revision": manifest["execution"]["harness_revision"],
-                "arm": arms[arm_id],
-                "runtime_arm": runtime_arm,
-                "provider": SCRIPTED_PROVIDER_ID,
-                "runner_sources_sha256": runner_sources_sha,
-            }
+        harness_fingerprint = (
+            _production_harness_fingerprint(
+                metacodes_binary_sha256=metacodes_sha,
+                tinykg_binary_sha256=tinykg_sha if tinykg_enabled else None,
+                harness_revision=manifest["execution"]["harness_revision"],
+                arm=arms[arm_id],
+                runtime_arm=runtime_arm,
+                runtime_budget=production.public_budget(),
+                runner_sources=runner_sources,
+            )
+            if production is not None
+            else _canonical_sha256(
+                {
+                    "metacodes_binary_sha256": metacodes_sha,
+                    "harness_revision": manifest["execution"]["harness_revision"],
+                    "arm": arms[arm_id],
+                    "runtime_arm": runtime_arm,
+                    "provider": SCRIPTED_PROVIDER_ID,
+                    "runtime_budget": None,
+                    "disallowed_provider_tools": None,
+                    "runner_sources_sha256": runner_sources_sha,
+                }
+            )
         )
-        environment_fingerprint = _canonical_sha256(
-            {
-                "platform": platform.platform(),
-                "python": platform.python_version(),
-                "source_sha256": source_sha,
-                "tinykg_binary_sha256": tinykg_sha if tinykg_enabled else None,
-                "project_domain": _project_domain(project_root),
-            }
-        )
+        environment_claim = {
+            "platform": platform.platform(),
+            "python": platform.python_version(),
+            "source_sha256": source_sha,
+            "tinykg_binary_sha256": tinykg_sha if tinykg_enabled else None,
+            "project_domain": _project_domain(project_root),
+            "child_path": PRODUCTION_CHILD_PATH,
+            "auto_compact_policy": PRODUCTION_AUTO_COMPACT_POLICY,
+        }
+        environment_fingerprint = _canonical_sha256(environment_claim)
         metadata = _runtime_metadata(
             manifest=manifest,
             case=case,
             schedule=schedule,
             events_path=events,
             run_id=run_id,
-            model_provider="scripted-local",
+            model_provider=(PRODUCTION_MODEL_PROVIDER if production_mode else "scripted-local"),
             harness_fingerprint=harness_fingerprint,
             environment_fingerprint=environment_fingerprint,
+            max_metered_tokens=(
+                production.max_rollout_metered_tokens if production is not None else None
+            ),
+            max_cost_usd=(
+                production.max_rollout_cost_usd if production is not None else None
+            ),
         )
         _write_new(
             metadata_path,
@@ -1214,69 +1562,136 @@ def run_memory_agent_schedule(
         events_file = tempfile.TemporaryFile()
         started = time.monotonic_ns()
         provider_memory_verified = False
+        treatment_activation: Mapping[str, Any] | None = None
+        env = (
+            _production_environment(os.environ)
+            if production_mode
+            else _sanitized_environment(os.environ)
+        )
+        env.update(
+            {
+                "HOME": str(sealed_home),
+                "TMPDIR": str(child_tmp),
+                "TMP": str(child_tmp),
+                "TEMP": str(child_tmp),
+                "LC_ALL": "C",
+                "LANG": "C",
+                "METACODES_NO_PROBE": "1",
+                "METACODES_PROVIDER": "anthropic",
+                "METACODES_LONG_HORIZON_ARM": runtime_arm,
+                "METACODES_RECORD_DIR": str(cassette),
+                "METACODES_EVAL_METADATA_FD": str(metadata_fd),
+                "METACODES_EVAL_FD": str(events_file.fileno()),
+            }
+        )
+        if tinykg_enabled and store is not None:
+            env["METACODES_KG_BIN"] = str(tinykg)
+            env["METACODES_KG_STORE"] = str(store)
+        if production_mode:
+            env["METACODES_FORCE_COMPACT_AT"] = PRODUCTION_FORCE_COMPACT_AT
+        common_args = [
+            str(metacodes),
+            "--model",
+            manifest["execution"]["model_id"],
+            "--permission",
+            "bypassPermissions",
+            "--no-theme",
+            "--record",
+            str(cassette),
+            "-p",
+            case["prompt"],
+            "--json",
+        ]
         try:
-            with ScriptedMemoryProvider(
-                case["prompt"],
-                runtime_arm,
-                case["benchmark"],
-                split,
-                memory_file=memory_file,
-                memory_index=memory_index,
-                memory_marker=memory_marker,
-            ) as provider:
-                env = _sanitized_environment(os.environ)
-                env.update(
-                    {
-                        "HOME": str(sealed_home),
-                        "TMPDIR": str(child_tmp),
-                        "TMP": str(child_tmp),
-                        "TEMP": str(child_tmp),
-                        "LC_ALL": "C",
-                        "LANG": "C",
-                        "METACODES_NO_PROBE": "1",
-                        "METACODES_LONG_HORIZON_ARM": runtime_arm,
-                        "METACODES_RECORD_DIR": str(cassette),
-                        "METACODES_EVAL_METADATA_FD": str(metadata_fd),
-                        "METACODES_EVAL_FD": str(events_file.fileno()),
-                    }
+            if production is not None:
+                _require_production_budget(
+                    production,
+                    rollout_receipts,
+                    len(manifest["schedule"]) - expected_sequence,
                 )
-                if tinykg_enabled and store is not None:
-                    env["METACODES_KG_BIN"] = str(tinykg)
-                    env["METACODES_KG_STORE"] = str(store)
-                completed = subprocess.run(
-                    [
-                        str(metacodes),
-                        "--api-key",
-                        "scripted-local-no-secret",
-                        "--base-url",
-                        provider.url,
-                        "--model",
-                        manifest["execution"]["model_id"],
-                        "--permission",
-                        "bypassPermissions",
-                        "--no-theme",
-                        "--record",
-                        str(cassette),
-                        "-p",
-                        case["prompt"],
-                        "--json",
-                    ],
-                    cwd=workspace,
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=timeout_seconds,
-                    check=False,
-                    pass_fds=(metadata_fd, events_file.fileno()),
+                credential_read_fd, credential_write_fd = os.pipe()
+                try:
+                    credential = production.api_key.encode("utf-8")
+                    pipe_buf = os.fpathconf(credential_write_fd, "PC_PIPE_BUF")
+                    if len(credential) > min(PRODUCTION_CREDENTIAL_MAX_BYTES, pipe_buf):
+                        _fail("production credential", "exceeds inherited FD limit")
+                    written = os.write(credential_write_fd, credential)
+                    if written != len(credential):
+                        _fail("production credential", "short write to inherited FD")
+                    os.close(credential_write_fd)
+                    credential_write_fd = -1
+                    env["METACODES_API_KEY_FD"] = str(credential_read_fd)
+                    completed = subprocess.run(
+                        [
+                            *common_args[:3],
+                            "--max-tokens",
+                            str(production.max_output_tokens),
+                            "--disallowedTools",
+                            ",".join(PRODUCTION_DISALLOWED_PROVIDER_TOOLS),
+                            *common_args[3:],
+                        ],
+                        cwd=workspace,
+                        env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=timeout_seconds,
+                        check=False,
+                        pass_fds=(
+                            metadata_fd,
+                            events_file.fileno(),
+                            credential_read_fd,
+                        ),
+                    )
+                finally:
+                    if credential_write_fd >= 0:
+                        os.close(credential_write_fd)
+                    os.close(credential_read_fd)
+                provider_request_count = len(list(cassette.glob("req-*.json")))
+                treatment_activation = _cassette_treatment_activation(
+                    cassette,
+                    runtime_arm,
+                    PRODUCTION_MODEL_ID,
                 )
-                provider_request_count = len(provider.requests)
-                provider_memory_verified = provider.planner.memory_verified
+            else:
+                with ScriptedMemoryProvider(
+                    case["prompt"],
+                    runtime_arm,
+                    case["benchmark"],
+                    split,
+                    memory_file=memory_file,
+                    memory_index=memory_index,
+                    memory_marker=memory_marker,
+                ) as provider:
+                    completed = subprocess.run(
+                        [
+                            str(metacodes),
+                            "--api-key",
+                            "scripted-local-no-secret",
+                            "--base-url",
+                            provider.url,
+                            *common_args[1:],
+                        ],
+                        cwd=workspace,
+                        env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=timeout_seconds,
+                        check=False,
+                        pass_fds=(metadata_fd, events_file.fileno()),
+                    )
+                    provider_request_count = len(provider.requests)
+                    provider_memory_verified = provider.planner.memory_verified
         except (OSError, subprocess.TimeoutExpired) as exc:
             events_file.close()
+            if production is not None:
+                _assert_production_secret_absent(resolved_run, production.api_key)
             raise ValidationError(f"native memory rollout {run_id} failed to execute: {exc}") from exc
         except BaseException:
             events_file.close()
+            if production is not None:
+                _assert_production_secret_absent(resolved_run, production.api_key)
             raise
         finally:
             os.close(metadata_fd)
@@ -1285,8 +1700,28 @@ def run_memory_agent_schedule(
             finalize_evaluation_fd(events_file.fileno(), events)
         finally:
             events_file.close()
+            # Event finalization itself can fail. The child has already
+            # terminated, so scan every durable artifact before propagating
+            # that failure instead of leaving an unchecked partial run.
+            if production is not None:
+                _assert_production_secret_absent(resolved_run, production.api_key)
         _write_new(stdout_path, completed.stdout.encode("utf-8"))
         _write_new(stderr_path, completed.stderr.encode("utf-8"))
+        if production is not None:
+            _assert_executable_identity(
+                metacodes,
+                expected_metacodes_sha256,
+                "production metacodes binary",
+            )
+            _assert_executable_identity(
+                tinykg,
+                expected_tinykg_sha256,
+                "production TinyKG binary",
+            )
+            # Stop the schedule at the first contaminated rollout rather than
+            # spending the remaining budget and discovering the leak only when
+            # publishing the final receipt.
+            _assert_production_secret_absent(resolved_run, production.api_key)
         result = _parse_result(completed.stdout)
         native, native_error = _native_trace_metrics(events)
         if native_error is not None or native is None:
@@ -1314,10 +1749,25 @@ def run_memory_agent_schedule(
                 _fail(f"native memory rollout {run_id}", f"metadata drift in {key}")
         if native_metadata.get("runtime_model_id") != manifest["execution"]["model_id"]:
             _fail(f"native memory rollout {run_id}", "runtime model id drift")
+        if native_metadata.get("runtime_model_provider") != "anthropic":
+            _fail(f"native memory rollout {run_id}", "runtime model provider drift")
         if native_metadata.get("runtime_permission_mode") != "bypass_permissions":
             _fail(f"native memory rollout {run_id}", "runtime permission drift")
+        if production is not None and (
+            native_metadata.get("model_provider") != PRODUCTION_MODEL_PROVIDER
+            or native_metadata.get("max_metered_tokens")
+            != production.max_rollout_metered_tokens
+            or native_metadata.get("max_cost_usd") != production.max_rollout_cost_usd
+        ):
+            _fail(f"native memory rollout {run_id}", "production identity or budget drift")
         if metrics["model_request_count"] != provider_request_count or provider_request_count < 1:
             _fail(f"native memory rollout {run_id}", "provider/native request count mismatch")
+        compact_event_count = int(metrics["compact_request_count"])
+        if production is not None and compact_event_count != 0:
+            _fail(
+                f"native memory rollout {run_id}",
+                "production pilot requires an uncompacted trace",
+            )
         metric_cost = float(metrics["cost_usd"])
         result_cost = float(result["cost_usd"])
         if (
@@ -1328,14 +1778,48 @@ def run_memory_agent_schedule(
             or abs(metric_cost - result_cost) > 1e-12
         ):
             _fail(f"native memory rollout {run_id}", "runtime emitted an invalid estimated cost")
+        metered_tokens = sum(
+            int(metrics[key])
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+            )
+        )
+        pricing_provenance = _native_pricing_provenance(
+            events,
+            f"native memory rollout {run_id} pricing",
+        )
+        if production is not None:
+            if metered_tokens <= 0:
+                _fail(f"native memory rollout {run_id}", "production usage is empty")
+            if (
+                metered_tokens > production.max_rollout_metered_tokens
+                or metric_cost > production.max_rollout_cost_usd
+            ):
+                _fail(f"native memory rollout {run_id}", "production budget exceeded")
+            if pricing_provenance != PRODUCTION_PRICING_PROVENANCE:
+                _fail(f"native memory rollout {run_id}", "production pricing provenance drift")
 
-        tool_data = _cassette_tool_data(cassette, logical_ids, case["prompt"])
+        tool_data = _cassette_tool_data(
+            cassette,
+            logical_ids,
+            case["prompt"],
+            memory_dir=memory_dir,
+        )
         cassette_activity = _cassette_memory_activity(
             cassette,
             f"native memory rollout {run_id} cassette",
+            memory_root=memory_dir,
         )
         if cassette_activity["provider_requests"] != provider_request_count:
             _fail(f"native memory rollout {run_id}", "raw provider request count drift")
+        if production is not None and cassette_activity["forbidden_provider_tool_attempts"] != 0:
+            _fail(
+                f"native memory rollout {run_id}",
+                "production model attempted a forbidden nested-provider tool",
+            )
         if (
             tinykg_enabled
             and case["benchmark"] == "procedural_transfer"
@@ -1350,12 +1834,32 @@ def run_memory_agent_schedule(
                 "logical_ids": logical_ids,
                 "abstraction_nodes": abstraction_nodes,
             }
-            tool_data = _cassette_tool_data(cassette, logical_ids, case["prompt"])
+            tool_data = _cassette_tool_data(
+                cassette,
+                logical_ids,
+                case["prompt"],
+                memory_dir=memory_dir,
+            )
         query_variants = tool_data["query_variants"]
         retrieved = tool_data["retrieved"]
         verified = tool_data["verified"]
         graph_truncated = bool(tool_data["graph_truncated"])
-        exposed_bytes = int(tool_data["exposed_bytes"])
+        exposure = (
+            _cassette_memory_exposure(
+                cassette,
+                f"native memory rollout {run_id} exposure",
+                memory_root=memory_dir,
+                expected_memory_index=memory_index_before,
+                count_graph_context=tinykg_enabled,
+            )
+            if production_mode
+            else {
+                "auto_injected_bytes": 0,
+                "tool_result_bytes": int(tool_data["exposed_bytes"]),
+                "total_bytes": int(tool_data["exposed_bytes"]),
+            }
+        )
+        exposed_bytes = int(exposure["total_bytes"])
         remembered_node_ids = [int(node_id) for node_id in tool_data["remembered_node_ids"]]
         if memory_backend == "tinykg":
             memory_reads = int(cassette_activity["tinykg_reads"])
@@ -1369,6 +1873,14 @@ def run_memory_agent_schedule(
             foreign_memory_events = int(
                 cassette_activity["tinykg_reads"] + cassette_activity["tinykg_writes"]
             )
+        elif memory_backend == "tinykg_integrated":
+            memory_reads = int(
+                cassette_activity["tinykg_reads"] + cassette_activity["markdown_reads"]
+            )
+            memory_writes = int(
+                cassette_activity["tinykg_writes"] + cassette_activity["markdown_writes"]
+            )
+            foreign_memory_events = 0
         else:
             memory_reads = 0
             memory_writes = 0
@@ -1383,13 +1895,23 @@ def run_memory_agent_schedule(
             )
         if foreign_memory_events != 0:
             _fail(f"native memory rollout {run_id}", "cross-backend memory activity")
-        if int(metrics["tool_calls"]) != memory_reads + memory_writes:
-            _fail(f"native memory rollout {run_id}", "scripted lifecycle reached an undeclared tool")
-        if int(metrics["model_tool_errors"] + metrics["harness_tool_errors"]) != 0:
-            _fail(f"native memory rollout {run_id}", "scripted lifecycle contains a tool failure")
+        if production_mode:
+            if int(metrics["tool_calls"]) < memory_reads + memory_writes:
+                _fail(f"native memory rollout {run_id}", "memory activity exceeds native tools")
+        else:
+            if int(metrics["tool_calls"]) != memory_reads + memory_writes:
+                _fail(f"native memory rollout {run_id}", "scripted lifecycle reached an undeclared tool")
+            if int(metrics["model_tool_errors"] + metrics["harness_tool_errors"]) != 0:
+                _fail(f"native memory rollout {run_id}", "scripted lifecycle contains a tool failure")
         if len([item for item in query_variants if item["kind"] == "semantic"]) > 4:
             _fail(f"native memory rollout {run_id}", "semantic query cap exceeded")
         online_memory = case["benchmark"] == "procedural_transfer" and split == "online"
+        if memory_dir is not None:
+            markdown_revision_after = _artifact_tree_digest(
+                memory_dir,
+                "markdown memory after rollout",
+            )
+            markdown_files_after = sum(1 for path in memory_dir.rglob("*") if path.is_file())
         if tinykg_enabled:
             assert store is not None
             graph_revision_after = _tree_digest(store, normalize_store_manifest=True)
@@ -1399,31 +1921,52 @@ def run_memory_agent_schedule(
             if info_after.get("text_stale") not in {"0", "1"}:
                 _fail(f"native memory rollout {case['id']}", "invalid TinyKG text_stale state")
             store_text_stale = info_after["text_stale"] == "1"
-            memory_state_after = graph_revision_after
-            if online_memory:
-                if memory_writes < 1 or graph_revision_after == graph_revision_before:
-                    _fail(f"native memory rollout {run_id}", "online TinyKG phase did not commit memory")
-                if raw_store_digest_after == raw_store_digest_before:
-                    _fail(f"native memory rollout {run_id}", "online TinyKG bytes did not change")
-                if len(set(remembered_node_ids)) != 1:
-                    _fail(f"native memory rollout {run_id}", "online TinyKG insert was not observable")
-            elif graph_revision_after != graph_revision_before:
-                _fail(f"native memory rollout {run_id}", "read-only memory rollout changed TinyKG store")
-            elif raw_store_digest_after != raw_store_digest_before:
-                _fail(
-                    f"native memory rollout {run_id}",
-                    "read-only memory rollout changed raw TinyKG store bytes",
+            if production_mode:
+                assert markdown_revision_after is not None
+                memory_state_after = _canonical_sha256(
+                    {"markdown": markdown_revision_after, "tinykg": graph_revision_after}
                 )
-            if memory_reads < 1 or not query_variants or not provider_memory_verified:
-                _fail(f"native memory rollout {run_id}", "TinyKG arm did not call KgRecall")
+            else:
+                memory_state_after = graph_revision_after
+            if online_memory:
+                if production_mode:
+                    assert markdown_state is not None
+                    if markdown_state.exists():
+                        _fail("procedural integrated runtime", "online state already exists")
+                    assert memory_dir is not None
+                    _copy_memory_tree(memory_dir, markdown_state)
+                else:
+                    if memory_writes < 1 or graph_revision_after == graph_revision_before:
+                        _fail(f"native memory rollout {run_id}", "online TinyKG phase did not commit memory")
+                    if raw_store_digest_after == raw_store_digest_before:
+                        _fail(f"native memory rollout {run_id}", "online TinyKG bytes did not change")
+                    if len(set(remembered_node_ids)) != 1:
+                        _fail(f"native memory rollout {run_id}", "online TinyKG insert was not observable")
+            else:
+                if graph_revision_after != graph_revision_before:
+                    _fail(f"native memory rollout {run_id}", "read-only memory rollout changed TinyKG store")
+                if raw_store_digest_after != raw_store_digest_before:
+                    _fail(
+                        f"native memory rollout {run_id}",
+                        "read-only memory rollout changed raw TinyKG store bytes",
+                    )
+                if production_mode:
+                    if memory_writes != 0 or markdown_revision_after != markdown_revision_before:
+                        _fail(f"native memory rollout {run_id}", "read-only integrated memory changed")
+                elif memory_reads < 1 or not query_variants or not provider_memory_verified:
+                    _fail(f"native memory rollout {run_id}", "TinyKG arm did not call KgRecall")
         elif runtime_arm == "claude_style":
             assert memory_dir is not None
-            memory_state_after = _artifact_tree_digest(
-                memory_dir,
-                "markdown memory after rollout",
+            assert markdown_revision_after is not None
+            memory_state_after = (
+                _canonical_sha256({"markdown": markdown_revision_after, "tinykg": None})
+                if production_mode
+                else markdown_revision_after
             )
             if online_memory:
-                if memory_writes < 1 or memory_state_after == memory_state_before:
+                if not production_mode and (
+                    memory_writes < 1 or memory_state_after == memory_state_before
+                ):
                     _fail(f"native memory rollout {run_id}", "online Markdown phase did not persist memory")
                 assert markdown_state is not None
                 if markdown_state.exists():
@@ -1432,18 +1975,29 @@ def run_memory_agent_schedule(
             else:
                 if memory_writes != 0 or memory_state_after != memory_state_before:
                     _fail(f"native memory rollout {run_id}", "read-only Markdown phase changed memory")
-                if memory_reads < 1 or not query_variants or not provider_memory_verified:
+                if (
+                    not production_mode
+                    and (memory_reads < 1 or not query_variants or not provider_memory_verified)
+                ):
                     _fail(f"native memory rollout {run_id}", "Markdown arm did not read durable memory")
         elif query_variants or memory_reads != 0 or memory_writes != 0:
             _fail(f"native memory rollout {run_id}", "no-memory control reached memory tools")
 
         inserted_nodes = 0
         if online_memory and memory_backend == "markdown":
-            inserted_nodes = 1
-        elif online_memory and memory_backend == "tinykg":
-            inserted_nodes = len(set(remembered_node_ids))
+            inserted_nodes = (
+                max(0, markdown_files_after - markdown_files_before)
+                if production_mode
+                else 1
+            )
+        elif online_memory and memory_backend in {"tinykg", "tinykg_integrated"}:
+            inserted_nodes = (
+                max(0, store_nodes - store_nodes_before)
+                if production_mode
+                else len(set(remembered_node_ids))
+            )
 
-        retrieval_enabled = memory_reads > 0
+        retrieval_enabled = bool(query_variants) if production_mode else memory_reads > 0
         if memory_backend == "none":
             active_memory = 0
             provenance_links = 0
@@ -1485,7 +2039,7 @@ def run_memory_agent_schedule(
             "retrieval": {
                 "enabled": retrieval_enabled,
                 "k": (8 if tinykg_enabled else 1) if retrieval_enabled else 0,
-                "hop_count": 1 if provider_memory_verified else 0,
+                "hop_count": 1 if (provider_memory_verified or verified) else 0,
                 "query_variants": query_variants,
                 "retrieved_evidence_ids": retrieved,
                 "verified_evidence_ids": verified,
@@ -1507,7 +2061,7 @@ def run_memory_agent_schedule(
                 "candidate_fanout": float(len(retrieved) if tinykg_enabled else memory_reads),
             },
             "graph": {
-                "revision": memory_state_after,
+                "revision": graph_revision_after if tinykg_enabled else memory_state_after,
                 "text_stale": store_text_stale,
                 "retrieval_excluded_nodes": 0,
                 "contradiction_edges": 0,
@@ -1522,10 +2076,7 @@ def run_memory_agent_schedule(
                 "offline_write_events": memory_writes if split == "offline" else 0,
             },
             "cost": {
-                # The provider is an in-process test fixture; token-priced
-                # runtime telemetry is preserved in the native event artifact
-                # and receipt, while actual paid spend is exactly zero.
-                "cost_usd": 0.0,
+                "cost_usd": metric_cost if production_mode else 0.0,
                 "wall_time_ms": float(metrics["wall_time_ms"]),
             },
             "trajectory": {
@@ -1536,8 +2087,7 @@ def run_memory_agent_schedule(
             },
         }
         observations.append(observation)
-        rollout_receipts.append(
-            {
+        rollout_receipt: Dict[str, Any] = {
                 "sequence": expected_sequence,
                 "case_id": case["id"],
                 "trial": schedule["trial"],
@@ -1577,18 +2127,49 @@ def run_memory_agent_schedule(
                 "memory_read_events": memory_reads,
                 "memory_write_events": memory_writes,
                 "stop_reason": result["stop_reason"],
-                "provider_mode": "scripted-local",
                 "provider_requests": provider_request_count,
-                "external_network_calls": 0,
-                "paid_cost_usd": 0.0,
                 "estimated_cost_usd": float(metrics["cost_usd"]),
                 "observation_sha256": _canonical_sha256(observation),
                 "host_elapsed_ms": elapsed_ms,
-            }
-        )
+        }
+        if production_mode:
+            assert treatment_activation is not None
+            rollout_receipt.update(
+                {
+                    "harness_fingerprint": harness_fingerprint,
+                    "environment": environment_claim,
+                    "environment_fingerprint": environment_fingerprint,
+                    "memory_components_before": {
+                        "markdown": markdown_revision_before,
+                        "tinykg": graph_revision_before if tinykg_enabled else None,
+                    },
+                    "memory_components_after": {
+                        "markdown": markdown_revision_after,
+                        "tinykg": graph_revision_after if tinykg_enabled else None,
+                    },
+                    "provider_mode": "production-network",
+                    "tool_network_isolation": PRODUCTION_TOOL_NETWORK_ISOLATION,
+                    "filesystem_isolation": PRODUCTION_FILESYSTEM_ISOLATION,
+                    "provider_billed_cost_usd": None,
+                    "metered_tokens": metered_tokens,
+                    "pricing_provenance": pricing_provenance,
+                    "compact_event_count": compact_event_count,
+                    "memory_auto_injected_bytes": int(exposure["auto_injected_bytes"]),
+                    "memory_tool_result_bytes": int(exposure["tool_result_bytes"]),
+                    "treatment_activation": treatment_activation,
+                }
+            )
+        else:
+            rollout_receipt.update(
+                {
+                    "provider_mode": "scripted-local",
+                    "external_network_calls": 0,
+                    "paid_cost_usd": 0.0,
+                }
+            )
+        rollout_receipts.append(rollout_receipt)
 
-    receipt: Mapping[str, Any] = {
-        "schema_version": RUNTIME_RECEIPT_SCHEMA_VERSION,
+    receipt_common: Dict[str, Any] = {
         "protocol_id": PROTOCOL_ID,
         "manifest_sha256": _canonical_sha256(manifest),
         "observations_sha256": _canonical_sha256(observations),
@@ -1604,17 +2185,46 @@ def run_memory_agent_schedule(
             {"case_id": case["id"], "fingerprint": case["grader"]["fingerprint"]}
             for case in manifest["cases"]
         ],
-        "execution_mode": SCRIPTED_LIFECYCLE_MODE,
         "quality_evidence": False,
         "metacodes_binary_sha256": metacodes_sha,
         "tinykg_binary_sha256": tinykg_sha,
-        "external_network_calls": 0,
-        "paid_cost_usd": 0.0,
         "estimated_cost_usd": sum(
             float(rollout["estimated_cost_usd"]) for rollout in rollout_receipts
         ),
         "rollouts": rollout_receipts,
     }
+    if production is not None:
+        receipt_common.update(
+            {
+                "schema_version": PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                "execution_mode": PRODUCTION_EXECUTION_MODE,
+                "provider_id": PRODUCTION_PROVIDER_ID,
+                "model_provider": PRODUCTION_MODEL_PROVIDER,
+                "disallowed_provider_tools": list(PRODUCTION_DISALLOWED_PROVIDER_TOOLS),
+                "budget": production.public_budget(),
+                "provider_requests": sum(
+                    int(rollout["provider_requests"]) for rollout in rollout_receipts
+                ),
+                "tool_network_isolation": PRODUCTION_TOOL_NETWORK_ISOLATION,
+                "filesystem_isolation": PRODUCTION_FILESYSTEM_ISOLATION,
+                "auto_compact_policy": PRODUCTION_AUTO_COMPACT_POLICY,
+                "provider_billed_cost_usd": None,
+                "metered_tokens": sum(
+                    int(rollout["metered_tokens"]) for rollout in rollout_receipts
+                ),
+                "pricing_provenance": PRODUCTION_PRICING_PROVENANCE,
+            }
+        )
+    else:
+        receipt_common.update(
+            {
+                "schema_version": RUNTIME_RECEIPT_SCHEMA_VERSION,
+                "execution_mode": SCRIPTED_LIFECYCLE_MODE,
+                "external_network_calls": 0,
+                "paid_cost_usd": 0.0,
+            }
+        )
+    receipt: Mapping[str, Any] = receipt_common
     # Join before publication: a malformed observation must not leave a receipt
     # that looks complete.  The v3 receipt additionally binds each row to its
     # durable memory pre/post state and raw native artifacts.
@@ -1625,12 +2235,25 @@ def run_memory_agent_schedule(
         runtime_receipt=receipt,
         runtime_artifact_root=resolved_run,
     )
+    observations_payload = b"".join(
+        (stable_json(row) + "\n").encode("utf-8") for row in observations
+    )
+    receipt_payload = (stable_json(receipt) + "\n").encode("utf-8")
+    if production is not None:
+        _assert_production_secret_absent(
+            resolved_run,
+            production.api_key,
+            pending_payloads=(
+                ("pending observations", observations_payload),
+                ("pending runtime receipt", receipt_payload),
+            ),
+        )
     _write_new(
         observations_output,
-        b"".join((stable_json(row) + "\n").encode("utf-8") for row in observations),
+        observations_payload,
     )
     _write_new(
         receipt_output,
-        (stable_json(receipt) + "\n").encode("utf-8"),
+        receipt_payload,
     )
     return observations, receipt

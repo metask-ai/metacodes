@@ -16,6 +16,7 @@ const time = @import("../util/time.zig");
 const types = @import("../types.zig");
 
 pub const METASK_API_KEY_ENV = "METASK_API_KEY";
+pub const RUNTIME_API_KEY_FD_ENV = "METACODES_API_KEY_FD";
 pub const AUTH_FILE_ENV = "METACODES_AUTH_FILE";
 pub const OAUTH_TOKEN_URL_ENV = "METACODE_OAUTH_TOKEN_URL";
 pub const OAUTH_AUTHORIZE_URL_ENV = "METACODE_OAUTH_AUTHORIZE_URL";
@@ -38,6 +39,7 @@ pub fn parsePrecedence(s: []const u8) ?AuthPrecedence {
 
 pub const CredentialSource = enum {
     cli_api_key,
+    fd_api_key,
     env_api_key,
     stored_api_key,
     stored_oauth,
@@ -122,6 +124,91 @@ pub fn resolveCredential(
 
     if (stored.api_key) |k| return credentialFromApiKey(allocator, k, .stored_api_key);
     return error.MissingCredentials;
+}
+
+/// Runtime-only credential boundary.
+///
+/// The one-shot FD authority is consumed before App/tool threads exist. When
+/// that authority is present, any ambient METASK_API_KEY is also scrubbed so it
+/// cannot become an accidental second credential channel. Ordinary env-based
+/// sessions preserve their historical inheritance semantics because detached
+/// teammate processes still authenticate through the inherited environment.
+/// Production evaluation never uses that path: its parent supplies only the FD
+/// inside a minimal child environment.
+pub fn resolveRuntimeCredential(
+    allocator: std.mem.Allocator,
+    cli_api_key: ?[]const u8,
+    precedence: AuthPrecedence,
+) !ResolvedCredential {
+    const fd_api_key = try takeRuntimeFdApiKey(allocator);
+    defer if (fd_api_key) |key| secureFree(allocator, key);
+    if (cli_api_key != null and fd_api_key != null) return error.AmbiguousRuntimeCredentials;
+
+    // An inherited FD is an explicit runtime authority, not another candidate
+    // in the stored OAuth/API-key preference chain. In particular,
+    // `oauth_first` must not silently discard the one-shot pilot credential.
+    var credential = if (fd_api_key) |key|
+        try credentialFromApiKey(allocator, key, .fd_api_key)
+    else
+        try resolveCredential(allocator, cli_api_key, precedence);
+    errdefer credential.deinit(allocator);
+    if (fd_api_key != null) {
+        if (!@import("platform").paths.unsetEnvChecked(METASK_API_KEY_ENV)) {
+            return error.CredentialEnvironmentScrubFailed;
+        }
+    }
+    return credential;
+}
+
+const MAX_RUNTIME_API_KEY_BYTES: usize = 16 * 1024;
+
+/// Consume a credential from an inherited descriptor without ever placing the
+/// secret in argv or the process's initial environment. The descriptor number
+/// itself arrives through RUNTIME_API_KEY_FD_ENV, is removed immediately, and
+/// the descriptor is closed before App/tool threads can start.
+fn takeRuntimeFdApiKey(allocator: std.mem.Allocator) !?[]u8 {
+    const raw = std.c.getenv(RUNTIME_API_KEY_FD_ENV) orelse return null;
+    const raw_fd = std.mem.span(raw);
+    // Parse before unset: getenv's slice points into environment-owned storage
+    // and becomes invalid as soon as unsetenv/_putenv_s mutates that storage.
+    const fd = std.fmt.parseInt(pfs.Fd, raw_fd, 10) catch {
+        if (!@import("platform").paths.unsetEnvChecked(RUNTIME_API_KEY_FD_ENV)) {
+            return error.CredentialEnvironmentScrubFailed;
+        }
+        return error.InvalidCredentialFd;
+    };
+    if (fd < 3) {
+        if (!@import("platform").paths.unsetEnvChecked(RUNTIME_API_KEY_FD_ENV)) {
+            return error.CredentialEnvironmentScrubFailed;
+        }
+        return error.InvalidCredentialFd;
+    }
+    // Once the descriptor number is known and safe to close, every subsequent
+    // failure path owns and closes it, including an environment-scrub failure.
+    defer pfs.close(fd);
+    if (!@import("platform").paths.unsetEnvChecked(RUNTIME_API_KEY_FD_ENV)) {
+        return error.CredentialEnvironmentScrubFailed;
+    }
+
+    var bytes = std.ArrayList(u8).empty;
+    errdefer {
+        // Failure paths (oversize, read failure, OOM) may already hold a
+        // credential prefix. Do not return that prefix to the allocator
+        // without first erasing it.
+        @memset(bytes.items, 0);
+        bytes.deinit(allocator);
+    }
+    var chunk: [1024]u8 = undefined;
+    while (true) {
+        const count = pfs.readZ(fd, &chunk) catch return error.CredentialFdReadFailed;
+        if (count == 0) break;
+        if (bytes.items.len > MAX_RUNTIME_API_KEY_BYTES -| count) {
+            return error.CredentialFdTooLarge;
+        }
+        try bytes.appendSlice(allocator, chunk[0..count]);
+    }
+    if (bytes.items.len == 0) return error.MissingCredentials;
+    return try bytes.toOwnedSlice(allocator);
 }
 
 fn credentialFromApiKey(allocator: std.mem.Allocator, key_raw: []const u8, source: CredentialSource) !ResolvedCredential {

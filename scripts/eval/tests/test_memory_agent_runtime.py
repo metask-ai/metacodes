@@ -1,19 +1,40 @@
 import copy
+import contextlib
 import hashlib
+import io
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.eval.memory_agent_runtime import (
+    PRODUCTION_MODEL_FINGERPRINT,
+    ProductionRuntimeConfig,
+    _assert_executable_identity,
+    _assert_production_secret_absent,
     _copy_memory_tree,
     _project_domain,
+    _production_environment,
+    _safe_component,
+    _sanitized_environment,
     _xxhash64,
 )
 from scripts.eval.memory_replay import (
+    PRODUCTION_PRICING_PROVENANCE,
+    PRODUCTION_AUTO_COMPACT_POLICY,
+    PRODUCTION_CHILD_PATH,
+    PRODUCTION_DISALLOWED_PROVIDER_TOOLS,
+    PRODUCTION_FILESYSTEM_ISOLATION,
+    PRODUCTION_RUNNER_SOURCE_MODULES,
+    PRODUCTION_TOOL_NETWORK_ISOLATION,
     RUNNER_SOURCE_MODULES,
     _artifact_tree_digest,
+    _cassette_memory_activity,
+    _cassette_memory_exposure,
+    _cassette_treatment_activation,
+    _production_harness_fingerprint,
     load_manifest,
     load_observations,
     load_runtime_receipt,
@@ -21,6 +42,11 @@ from scripts.eval.memory_replay import (
     validate_runtime_artifacts,
     validate_runtime_receipt,
 )
+from scripts.eval.memory_agent_runtime_pilot import (
+    _load_api_key,
+    main as production_pilot_main,
+)
+from scripts.eval.e2e_adapter import NATIVE_EVENT_SCHEMA_VERSION
 from scripts.eval.model import ValidationError, stable_json
 
 
@@ -33,6 +59,425 @@ def digest(label: str) -> str:
 
 
 class MemoryAgentRuntimeContractTest(unittest.TestCase):
+    def _materialize_valid_production_events(self, root, rollout, grader_fingerprint):
+        cassette = root / rollout["artifact_paths"]["cassette"]
+        uses = {}
+        results = set()
+        for request_path in sorted(cassette.glob("req-*.json")):
+            body = json.loads(request_path.read_text(encoding="utf-8"))
+            for message in body.get("messages", []):
+                for item in message.get("content", []):
+                    if item.get("type") == "tool_use":
+                        uses[item["id"]] = item["name"]
+                    elif item.get("type") == "tool_result":
+                        results.add(item["tool_use_id"])
+        completed_tools = [(tool_id, name) for tool_id, name in uses.items() if tool_id in results]
+        metadata = {
+            "run_id": rollout["run_id"],
+            "invocation": 0,
+            "trial": rollout["trial"],
+            "suite_id": "memory-production-test",
+            "task_id": rollout["case_id"],
+            "task_fingerprint": rollout["task_fingerprint"],
+            "task_fingerprint_provenance": "recorded_at_execution",
+            "model_provider": "anthropic",
+            "model_id": "glm-5.2",
+            "model_fingerprint": PRODUCTION_MODEL_FINGERPRINT,
+            "runtime_model_provider": "anthropic",
+            "runtime_model_id": "glm-5.2",
+            "harness_config_id": "candidate",
+            "harness_revision": "production-memory-pilot-v1",
+            "harness_fingerprint": rollout["harness_fingerprint"],
+            "permission_mode": "bypass_permissions",
+            "runtime_permission_mode": "bypass_permissions",
+            "environment_fingerprint": rollout["environment_fingerprint"],
+            "grader_fingerprint": grader_fingerprint,
+            "max_metered_tokens": 300_000,
+            "max_cost_usd": 0.9,
+        }
+        trace = "production-test-trace"
+        events = [{"run_started": {"trace_id": trace, "metadata": metadata}}]
+        request_count = rollout["provider_requests"]
+        for request_index in range(1, request_count + 1):
+            events.append(
+                {"turn_started": {"trace_id": trace, "depth": 0, "turn": request_index}}
+            )
+            events.append(
+                {
+                    "model_request_finished": {
+                        "trace_id": trace,
+                        "depth": 0,
+                        "turn": request_index,
+                        "attempt": 0,
+                        "elapsed_ms": 1,
+                        "outcome": "success",
+                    }
+                }
+            )
+            turn_tools = completed_tools if request_index == 1 else []
+            for tool_id, name in turn_tools:
+                events.extend(
+                    [
+                        {
+                            "policy_decision": {
+                                "trace_id": trace,
+                                "depth": 0,
+                                "id": tool_id,
+                                "tool": name,
+                                "decision": "allow",
+                                "source": "permission_chain",
+                                "allowed": True,
+                            }
+                        },
+                        {
+                            "tool_started": {
+                                "trace_id": trace,
+                                "id": tool_id,
+                                "name": name,
+                                "input_bytes": 2,
+                                "input_sha256": digest(f"input:{tool_id}"),
+                            }
+                        },
+                        {
+                            "tool_finished": {
+                                "trace_id": trace,
+                                "id": tool_id,
+                                "name": name,
+                                "is_error": False,
+                                "error_code": None,
+                                "error_category": None,
+                                "recoverable": None,
+                                "elapsed_ms": 1,
+                                "result_bytes": 2,
+                                "result_sha256": digest(f"result:{tool_id}"),
+                            }
+                        },
+                    ]
+                )
+            if turn_tools:
+                events.append(
+                    {
+                        "tool_stage_finished": {
+                            "trace_id": trace,
+                            "depth": 0,
+                            "turn": request_index,
+                            "tool_calls": len(turn_tools),
+                            "elapsed_ms": len(turn_tools),
+                        }
+                    }
+                )
+            events.append(
+                {
+                    "turn_finished": {
+                        "trace_id": trace,
+                        "depth": 0,
+                        "turn": request_index,
+                        "tool_calls": len(turn_tools),
+                    }
+                }
+            )
+        events.append(
+            {
+                "usage": {
+                    "trace_id": trace,
+                    "input_tokens": rollout["metered_tokens"],
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "estimated_cost_usd": rollout["estimated_cost_usd"],
+                    "pricing_provenance": PRODUCTION_PRICING_PROVENANCE,
+                }
+            }
+        )
+        events.append(
+            {
+                "run_finished": {
+                    "trace_id": trace,
+                    "depth": 0,
+                    "turns": request_count,
+                    "tool_calls": len(completed_tools),
+                    "stop_reason": "end_turn",
+                    "wall_time_ms": request_count + len(completed_tools) + 10,
+                    "dropped_events": 0,
+                }
+            }
+        )
+        event_path = root / rollout["artifact_paths"]["native_events"]
+        event_path.write_text(
+            "".join(
+                stable_json(
+                    {
+                        "schema_version": NATIVE_EVENT_SCHEMA_VERSION,
+                        "sequence": index,
+                        "monotonic_elapsed_ns": index,
+                        "session_id": "single",
+                        "event": event,
+                    }
+                )
+                + "\n"
+                for index, event in enumerate(events)
+            ),
+            encoding="utf-8",
+        )
+        rollout["native_events_sha256"] = hashlib.sha256(event_path.read_bytes()).hexdigest()
+
+    def test_production_budget_authority_is_fail_closed_and_secret_free(self):
+        valid = ProductionRuntimeConfig(
+            api_key="super-secret-key",
+            allow_paid_rollouts=True,
+            max_total_cost_usd=10.0,
+            max_total_metered_tokens=3_100_000,
+            max_rollout_cost_usd=0.9,
+            max_rollout_metered_tokens=300_000,
+            max_output_tokens=4096,
+        )
+        valid.validate(9)
+        self.assertNotIn("super-secret-key", repr(valid))
+
+        unauthorized = copy.copy(valid)
+        object.__setattr__(unauthorized, "allow_paid_rollouts", False)
+        with self.assertRaisesRegex(ValidationError, "explicit paid-rollout authority"):
+            unauthorized.validate(9)
+
+        over_limit = copy.copy(valid)
+        object.__setattr__(over_limit, "max_total_cost_usd", 1000.01)
+        with self.assertRaisesRegex(ValidationError, "must not exceed \\$1000"):
+            over_limit.validate(9)
+
+        no_headroom = copy.copy(valid)
+        object.__setattr__(no_headroom, "max_total_cost_usd", 8.1)
+        with self.assertRaisesRegex(ValidationError, "strictly cover"):
+            no_headroom.validate(9)
+
+    def test_runtime_paths_do_not_reveal_treatment_labels(self):
+        component = _safe_component("task:0:tinykg_lexical:no_memory:markdown_memory")
+        self.assertRegex(component, r"^run-[0-9a-f]{20}$")
+        for leaked in ("tinykg", "no-memory", "markdown"):
+            self.assertNotIn(leaked, component)
+
+    def test_production_pilot_dry_run_loads_no_credential_and_makes_no_network_call(self):
+        manifest = copy.deepcopy(load_manifest(FIXTURES / "smoke-manifest.json"))
+        manifest["execution"]["model_id"] = "glm-5.2"
+        manifest["execution"]["model_fingerprint"] = PRODUCTION_MODEL_FINGERPRINT
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(stable_json(manifest) + "\n", encoding="utf-8")
+            missing_auth = root / "must-not-be-read.json"
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = production_pilot_main(
+                    [
+                        "--binary",
+                        "/bin/echo",
+                        "--tinykg-binary",
+                        "/bin/echo",
+                        "--source",
+                        str(FIXTURES / "smoke-source.json"),
+                        "--manifest",
+                        str(manifest_path),
+                        "--auth-file",
+                        str(missing_auth),
+                        "--dry-run",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            plan = json.loads(output.getvalue())
+            self.assertTrue(plan["dry_run"])
+            self.assertEqual(plan["network_requests"], 0)
+            self.assertFalse(plan["credential_loaded"])
+            self.assertFalse(missing_auth.exists())
+
+    def test_production_secret_scan_rejects_artifact_and_pending_receipt(self):
+        secret = 'super-secret-"escaped"-key'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "stdout.ndjson").write_text("safe\n", encoding="utf-8")
+            _assert_production_secret_absent(
+                root,
+                secret,
+                pending_payloads=(("pending receipt", b'{"safe":true}'),),
+            )
+
+            (root / "cassette.json").write_text(
+                json.dumps({"tool_result": secret}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValidationError, "credential leaked into cassette.json"):
+                _assert_production_secret_absent(root, secret)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(ValidationError, "pending runtime receipt"):
+                _assert_production_secret_absent(
+                    root,
+                    secret,
+                    pending_payloads=(
+                        ("pending runtime receipt", json.dumps(secret).encode("utf-8")),
+                    ),
+                )
+
+    def test_production_executable_identity_is_rechecked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "runtime"
+            binary.write_bytes(b"frozen-runtime")
+            binary.chmod(0o700)
+            expected = hashlib.sha256(binary.read_bytes()).hexdigest()
+            _assert_executable_identity(binary, expected, "test runtime")
+            binary.write_bytes(b"changed-runtime")
+            with self.assertRaisesRegex(ValidationError, "changed during the frozen schedule"):
+                _assert_executable_identity(binary, expected, "test runtime")
+
+    def test_production_child_environment_excludes_all_credential_channels(self):
+        clean = _production_environment(
+            {
+                "PATH": "/operator/bin",
+                "METASK_API_KEY": "must-not-pass",
+                "METACODES_API_KEY_FD": "99",
+                "METACODES_AUTH_FILE": "/host/auth.json",
+                "TINYKG_API_KEY": "remote-must-not-pass",
+                "GITHUB_TOKEN": "unrelated-must-not-pass",
+                "AWS_SECRET_ACCESS_KEY": "unrelated-must-not-pass",
+                "SSH_AUTH_SOCK": "/operator/agent.sock",
+            }
+        )
+        self.assertEqual(clean, {"PATH": PRODUCTION_CHILD_PATH})
+
+    def test_production_auth_rejects_parent_environment_and_reads_private_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            auth = Path(directory) / "auth.json"
+            auth.write_text('{"api_key":"private-file-key"}\n', encoding="utf-8")
+            auth.chmod(0o600)
+            with mock.patch.dict(os.environ, {"METASK_API_KEY": "parent-env-key"}):
+                with self.assertRaisesRegex(ValidationError, "parent's initial environment"):
+                    _load_api_key(auth)
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("METASK_API_KEY", None)
+                self.assertEqual(_load_api_key(auth), "private-file-key")
+
+    def test_memory_exposure_uses_only_injected_and_successful_memory_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cassette = root / "cassette"
+            memory = root / "memory"
+            cassette.mkdir()
+            memory.mkdir()
+            index = b"- [Procedure](procedure.md) -- durable pattern\n"
+            graph_line = "- [node_id=7 decision] graph fact\n"
+            graph_context = "# Knowledge Graph\n" + graph_line
+            body = {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": index.decode("utf-8")
+                                + "\n"
+                                + graph_context
+                                + "# currentDate\nToday's date is 2026/08/07.\n",
+                            }
+                        ],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "memory-read",
+                                "name": "Read",
+                                "input": {"file_path": str(memory / "MEMORY.md")},
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "memory-error",
+                                "name": "Grep",
+                                "input": {"path": str(memory), "pattern": "x"},
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "markdown-read-spoof",
+                                "name": "Read",
+                                "input": {"file_path": str(root / "source.zig")},
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "kg-read",
+                                "name": "KgRecall",
+                                "input": {"query": "durable pattern"},
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "nested-provider",
+                                "name": "WebSearch",
+                                "input": {"query": "must not execute"},
+                            },
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "memory-read",
+                                "content": "memory-result",
+                            },
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "memory-error",
+                                "content": "denied",
+                                "is_error": True,
+                            },
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "markdown-read-spoof",
+                                "content": "workspace-result-must-not-count",
+                            },
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "kg-read",
+                                "content": "kg-result",
+                            },
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "nested-provider",
+                                "content": "denied",
+                                "is_error": True,
+                            },
+                        ],
+                    },
+                ]
+            }
+            (cassette / "req-001.json").write_text(
+                stable_json(body) + "\n", encoding="utf-8"
+            )
+            exposure = _cassette_memory_exposure(
+                cassette,
+                "test exposure",
+                memory_root=memory,
+                expected_memory_index=index,
+                count_graph_context=True,
+            )
+            self.assertEqual(
+                exposure,
+                {
+                    "auto_injected_bytes": len(index) + len(graph_context.encode("utf-8")),
+                    "tool_result_bytes": len(b"memory-result") + len(b"kg-result"),
+                    "total_bytes": len(index)
+                    + len(graph_context.encode("utf-8"))
+                    + len(b"memory-result")
+                    + len(b"kg-result"),
+                },
+            )
+            activity = _cassette_memory_activity(
+                cassette,
+                "test activity",
+                memory_root=memory,
+            )
+            self.assertEqual(activity["markdown_reads"], 2)
+            self.assertEqual(activity["tinykg_reads"], 1)
+            self.assertEqual(activity["forbidden_provider_tool_attempts"], 1)
+
     def test_dependency_free_xxhash_matches_zig_vectors(self):
         vectors = {
             b"": "ef46db3751d8e999",
@@ -244,20 +689,38 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             backend = rollout["memory_backend"]
             online = case["benchmark"] == "procedural_transfer" and case["split"] == "online"
             if backend == "markdown":
+                memory_root = root / paths["memory_state"]
                 tools = (
                     [
-                        ("markdown-memory-1", "Write"),
-                        ("markdown-index-1", "Write"),
+                        (
+                            "markdown-memory-1",
+                            "Write",
+                            {"file_path": str(memory_root / "memory.md")},
+                        ),
+                        (
+                            "markdown-index-1",
+                            "Write",
+                            {"file_path": str(memory_root / "MEMORY.md")},
+                        ),
                     ]
                     if online
-                    else [("markdown-read-1", "Read")]
+                    else [
+                        (
+                            "markdown-read-1",
+                            "Read",
+                            {"file_path": str(memory_root / "memory.md")},
+                        )
+                    ]
                 )
             elif backend == "tinykg":
                 tools = (
-                    [("kg-remember-1", "KgRemember")]
+                    [("kg-remember-1", "KgRemember", {"text": "memory"})]
                     if online
                     else []
-                ) + [("kg-recall-1", "KgRecall"), ("kg-context-1", "KgContext")]
+                ) + [
+                    ("kg-recall-1", "KgRecall", {"query": "memory"}),
+                    ("kg-context-1", "KgContext", {"node_id": 1}),
+                ]
             for request_id in range(1, rollout["provider_requests"] + 1):
                 messages = []
                 if request_id == rollout["provider_requests"] and tools:
@@ -265,15 +728,15 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                         {
                             "role": "assistant",
                             "content": [
-                                {"type": "tool_use", "id": tool_id, "name": name, "input": {}}
-                                for tool_id, name in tools
+                                {"type": "tool_use", "id": tool_id, "name": name, "input": tool_input}
+                                for tool_id, name, tool_input in tools
                             ],
                         },
                         {
                             "role": "user",
                             "content": [
                                 {"type": "tool_result", "tool_use_id": tool_id, "content": "{}"}
-                                for tool_id, _name in tools
+                                for tool_id, _name, _tool_input in tools
                             ],
                         },
                     ]
@@ -453,6 +916,205 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         receipt["observations_sha256"] = hashlib.sha256(
             stable_json(observations).encode("utf-8")
         ).hexdigest()
+        return manifest, observations, receipt
+
+    def _v4(self, root):
+        manifest, observations, receipt = self._v3()
+        manifest["execution"]["model_id"] = "glm-5.2"
+        manifest["execution"]["model_fingerprint"] = PRODUCTION_MODEL_FINGERPRINT
+        manifest["execution"]["harness_revision"] = "production-memory-pilot-v1"
+        self._materialize_v3_artifacts(root, manifest, observations, receipt)
+
+        receipt["schema_version"] = 4
+        receipt["model_id"] = "glm-5.2"
+        receipt["model_fingerprint"] = PRODUCTION_MODEL_FINGERPRINT
+        receipt["harness_revision"] = manifest["execution"]["harness_revision"]
+        receipt["execution_mode"] = "native-agent-loop-production-memory-pilot"
+        receipt["provider_id"] = "metask-anthropic-compatible-v1"
+        receipt["model_provider"] = "anthropic"
+        receipt["disallowed_provider_tools"] = list(PRODUCTION_DISALLOWED_PROVIDER_TOOLS)
+        receipt["provider_billed_cost_usd"] = None
+        receipt["pricing_provenance"] = PRODUCTION_PRICING_PROVENANCE
+        receipt["tool_network_isolation"] = PRODUCTION_TOOL_NETWORK_ISOLATION
+        receipt["filesystem_isolation"] = PRODUCTION_FILESYSTEM_ISOLATION
+        receipt["auto_compact_policy"] = PRODUCTION_AUTO_COMPACT_POLICY
+        receipt["budget"] = {
+            "max_total_cost_usd": 10.0,
+            "max_total_metered_tokens": 3_100_000,
+            "max_rollout_cost_usd": 0.9,
+            "max_rollout_metered_tokens": 300_000,
+            "max_output_tokens": 4096,
+        }
+        receipt.pop("paid_cost_usd")
+        receipt.pop("external_network_calls")
+        receipt["runner_sources"] = [
+            {
+                "module": module,
+                "path": f"runner-sources/{module}.py",
+                "sha256": digest(f"production-runner:{module}"),
+            }
+            for module in PRODUCTION_RUNNER_SOURCE_MODULES
+        ]
+        receipt["arms"] = copy.deepcopy(manifest["execution"]["arms"])
+        for source in receipt["runner_sources"]:
+            runner = root / source["path"]
+            runner.write_text(
+                f"production-runner-source:{source['module']}\n",
+                encoding="utf-8",
+            )
+            source["sha256"] = hashlib.sha256(runner.read_bytes()).hexdigest()
+
+        for rollout in receipt["rollouts"]:
+            sequence = rollout["sequence"]
+            case = next(case for case in manifest["cases"] if case["id"] == rollout["case_id"])
+            runtime_arm = (
+                "codex_style"
+                if rollout["arm"] in {"no_memory", "codex_style"}
+                else "claude_style"
+                if rollout["arm"] in {"markdown_memory", "claude_style"}
+                else "tinykg"
+            )
+            system = "" if runtime_arm == "codex_style" else "# Memory\n"
+            tool_names = ["Read", "Write", "Edit"]
+            if runtime_arm == "tinykg":
+                system += "# Knowledge Graph\n"
+                tool_names += ["KgRemember", "KgRecall", "KgContext"]
+                rollout["memory_backend"] = "tinykg_integrated"
+                memory_path = f"rollouts/{sequence}/sealed-home/integrated-memory"
+                rollout["artifact_paths"]["memory_state"] = memory_path
+                memory_root = root / memory_path
+                memory_root.mkdir(parents=True)
+                (memory_root / "MEMORY.md").write_text("# Integrated memory\n", encoding="utf-8")
+            elif runtime_arm == "claude_style":
+                memory_root = root / rollout["artifact_paths"]["memory_state"]
+            else:
+                memory_root = None
+            markdown_after = _artifact_tree_digest(memory_root) if memory_root else None
+            online = case["benchmark"] == "procedural_transfer" and case["split"] == "online"
+            markdown_before = (
+                digest(f"markdown-before-v4:{sequence}")
+                if online and memory_root is not None
+                else markdown_after
+            )
+            tinykg_before = rollout["store_revision_before"] if runtime_arm == "tinykg" else None
+            tinykg_after = rollout["store_revision_after"] if runtime_arm == "tinykg" else None
+            before_components = {"markdown": markdown_before, "tinykg": tinykg_before}
+            after_components = {"markdown": markdown_after, "tinykg": tinykg_after}
+            rollout["memory_components_before"] = before_components
+            rollout["memory_components_after"] = after_components
+            if runtime_arm == "codex_style":
+                rollout["memory_state_before"] = "none"
+                rollout["memory_state_after"] = "none"
+            else:
+                rollout["memory_state_before"] = hashlib.sha256(
+                    stable_json(before_components).encode("utf-8")
+                ).hexdigest()
+                rollout["memory_state_after"] = hashlib.sha256(
+                    stable_json(after_components).encode("utf-8")
+                ).hexdigest()
+            rollout["provider_mode"] = "production-network"
+            rollout["harness_fingerprint"] = _production_harness_fingerprint(
+                metacodes_binary_sha256=receipt["metacodes_binary_sha256"],
+                tinykg_binary_sha256=(
+                    receipt["tinykg_binary_sha256"] if runtime_arm == "tinykg" else None
+                ),
+                harness_revision=receipt["harness_revision"],
+                arm=next(arm for arm in receipt["arms"] if arm["id"] == rollout["arm"]),
+                runtime_arm=runtime_arm,
+                runtime_budget=receipt["budget"],
+                runner_sources=receipt["runner_sources"],
+            )
+            rollout["environment"] = {
+                "platform": "test-platform",
+                "python": "3.test",
+                "source_sha256": receipt["dataset_sha256"],
+                "tinykg_binary_sha256": (
+                    receipt["tinykg_binary_sha256"] if runtime_arm == "tinykg" else None
+                ),
+                "project_domain": f"test-project-{sequence}",
+                "child_path": PRODUCTION_CHILD_PATH,
+                "auto_compact_policy": PRODUCTION_AUTO_COMPACT_POLICY,
+            }
+            rollout["environment_fingerprint"] = hashlib.sha256(
+                stable_json(rollout["environment"]).encode("utf-8")
+            ).hexdigest()
+            rollout.pop("external_network_calls")
+            rollout["tool_network_isolation"] = PRODUCTION_TOOL_NETWORK_ISOLATION
+            rollout["filesystem_isolation"] = PRODUCTION_FILESYSTEM_ISOLATION
+            rollout["provider_billed_cost_usd"] = None
+            rollout["metered_tokens"] = 10 + sequence
+            rollout["pricing_provenance"] = PRODUCTION_PRICING_PROVENANCE
+            rollout.pop("paid_cost_usd")
+
+            cassette = root / rollout["artifact_paths"]["cassette"]
+            first_request = cassette / "req-001.json"
+            body = json.loads(first_request.read_text(encoding="utf-8"))
+            body.update(
+                {
+                    "model": "glm-5.2",
+                    "system": system,
+                    "tools": [{"name": name} for name in tool_names],
+                }
+            )
+            expected_index = b""
+            if memory_root is not None and case["split"] != "online":
+                index_path = memory_root / "MEMORY.md"
+                if index_path.is_file():
+                    expected_index = index_path.read_bytes()
+                    if not body.get("messages"):
+                        body["messages"] = [{"role": "user", "content": []}]
+                    body["messages"][0].setdefault("content", []).append(
+                        {"type": "text", "text": expected_index.decode("utf-8")}
+                    )
+            first_request.write_text(stable_json(body) + "\n", encoding="utf-8")
+            exposure = _cassette_memory_exposure(
+                cassette,
+                "test production exposure",
+                memory_root=memory_root,
+                expected_memory_index=expected_index,
+                count_graph_context=runtime_arm == "tinykg",
+            )
+            rollout["compact_event_count"] = 0
+            rollout["memory_auto_injected_bytes"] = exposure["auto_injected_bytes"]
+            rollout["memory_tool_result_bytes"] = exposure["tool_result_bytes"]
+            rollout["treatment_activation"] = _cassette_treatment_activation(
+                cassette,
+                runtime_arm,
+                "glm-5.2",
+            )
+            rollout["cassette_sha256"] = _artifact_tree_digest(cassette)
+            observations[sequence]["cost"]["cost_usd"] = rollout["estimated_cost_usd"]
+            observations[sequence]["graph"]["revision"] = (
+                rollout["store_revision_after"]
+                if runtime_arm == "tinykg"
+                else rollout["memory_state_after"]
+            )
+            observations[sequence]["memory"]["exposed_tokens"] = (
+                exposure["total_bytes"] + 3
+            ) // 4
+            rollout["observation_sha256"] = hashlib.sha256(
+                stable_json(observations[sequence]).encode("utf-8")
+            ).hexdigest()
+
+        receipt["manifest_sha256"] = hashlib.sha256(
+            stable_json(manifest).encode("utf-8")
+        ).hexdigest()
+        receipt["observations_sha256"] = hashlib.sha256(
+            stable_json(observations).encode("utf-8")
+        ).hexdigest()
+        receipt["provider_requests"] = sum(
+            rollout["provider_requests"] for rollout in receipt["rollouts"]
+        )
+        receipt["metered_tokens"] = sum(
+            rollout["metered_tokens"] for rollout in receipt["rollouts"]
+        )
+        receipt["estimated_cost_usd"] = sum(
+            rollout["estimated_cost_usd"] for rollout in receipt["rollouts"]
+        )
+        for rollout in receipt["rollouts"]:
+            paths = rollout["artifact_paths"]
+            rollout["transcript_sha256"] = _artifact_tree_digest(root / paths["transcript"])
+            rollout["workspace_sha256"] = _artifact_tree_digest(root / paths["workspace"])
         return manifest, observations, receipt
 
     def test_v2_receipt_binds_native_rows_and_rejects_replay_laundering(self):
@@ -676,7 +1338,11 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                     "type": "tool_use",
                     "id": "markdown-laundered-1",
                     "name": "Write",
-                    "input": {},
+                    "input": {
+                        "file_path": str(
+                            root / offline["artifact_paths"]["memory_state"] / "laundered.md"
+                        )
+                    },
                 }
             )
             body["messages"][1]["content"].append(
@@ -689,6 +1355,208 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             request.write_text(stable_json(body) + "\n", encoding="utf-8")
             offline["cassette_sha256"] = _artifact_tree_digest(cassette)
             with self.assertRaisesRegex(ValidationError, "memory_write_events"):
+                validate_runtime_artifacts(receipt, root)
+
+    def test_v4_receipt_binds_production_budget_treatment_and_unknown_bill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest, observations, receipt = self._v4(Path(directory))
+            validate_runtime_receipt(
+                receipt,
+                manifest,
+                observations,
+                manifest["dataset"]["source_sha256"],
+            )
+
+            secret = stable_json(receipt)
+            self.assertNotIn("api_key", secret)
+            self.assertNotIn("super-secret", secret)
+            self.assertIsNone(receipt["provider_billed_cost_usd"])
+
+            mutations = []
+            over_budget = copy.deepcopy(receipt)
+            over_budget["rollouts"][0]["metered_tokens"] = 300_001
+            over_budget["metered_tokens"] = sum(
+                item["metered_tokens"] for item in over_budget["rollouts"]
+            )
+            mutations.append((over_budget, "fixed production budget"))
+
+            forged_bill = copy.deepcopy(receipt)
+            forged_bill["provider_billed_cost_usd"] = forged_bill["estimated_cost_usd"]
+            mutations.append((forged_bill, "must remain null"))
+
+            wrong_treatment = copy.deepcopy(receipt)
+            wrong_treatment["rollouts"][0]["treatment_activation"][
+                "knowledge_graph_prompt_active"
+            ] = True
+            mutations.append((wrong_treatment, "treatment flags drift"))
+
+            compact = copy.deepcopy(receipt)
+            compact["rollouts"][0]["compact_event_count"] = 1
+            mutations.append((compact, "requires an uncompacted trace"))
+
+            false_network_claim = copy.deepcopy(receipt)
+            false_network_claim["tool_network_isolation"] = "enforced"
+            mutations.append((false_network_claim, "tool_network_isolation"))
+
+            false_filesystem_claim = copy.deepcopy(receipt)
+            false_filesystem_claim["filesystem_isolation"] = "enforced"
+            mutations.append((false_filesystem_claim, "filesystem_isolation"))
+
+            false_rollout_filesystem_claim = copy.deepcopy(receipt)
+            false_rollout_filesystem_claim["rollouts"][0]["filesystem_isolation"] = "enforced"
+            mutations.append((false_rollout_filesystem_claim, "filesystem_isolation"))
+
+            nonminimal_environment = copy.deepcopy(receipt)
+            changed_environment = nonminimal_environment["rollouts"][0]["environment"]
+            changed_environment["child_path"] = "/operator/bin:/bin:/usr/bin"
+            nonminimal_environment["rollouts"][0]["environment_fingerprint"] = hashlib.sha256(
+                stable_json(changed_environment).encode("utf-8")
+            ).hexdigest()
+            mutations.append((nonminimal_environment, "production environment is not minimal"))
+
+            exposure = copy.deepcopy(receipt)
+            exposure_observations = copy.deepcopy(observations)
+            exposure_index = next(
+                index
+                for index, item in enumerate(exposure["rollouts"])
+                if item["memory_backend"] != "none"
+            )
+            exposure["rollouts"][exposure_index]["memory_auto_injected_bytes"] += 4
+            exposure["rollouts"][exposure_index]["observation_sha256"] = hashlib.sha256(
+                stable_json(exposure_observations[exposure_index]).encode("utf-8")
+            ).hexdigest()
+            mutations.append((exposure, "exposed_tokens"))
+
+            for mutated, expected in mutations:
+                with self.subTest(expected=expected):
+                    with self.assertRaisesRegex(ValidationError, expected):
+                        validate_runtime_receipt(
+                            mutated,
+                            manifest,
+                            observations,
+                            manifest["dataset"]["source_sha256"],
+                        )
+
+            offline = next(
+                index
+                for index, item in enumerate(receipt["rollouts"])
+                if item["memory_phase"] == "offline"
+            )
+            offline_write = copy.deepcopy(receipt)
+            offline_observations = copy.deepcopy(observations)
+            rollout = offline_write["rollouts"][offline]
+            rollout["memory_write_events"] = 1
+            rollout["memory_components_after"]["markdown"] = digest("offline-write")
+            rollout["memory_state_after"] = hashlib.sha256(
+                stable_json(rollout["memory_components_after"]).encode("utf-8")
+            ).hexdigest()
+            offline_observations[offline]["trajectory"]["tool_calls"] += 1
+            offline_observations[offline]["governance"]["offline_write_events"] = 1
+            if rollout["memory_backend"] == "markdown":
+                offline_observations[offline]["graph"]["revision"] = rollout[
+                    "memory_state_after"
+                ]
+            rollout["observation_sha256"] = hashlib.sha256(
+                stable_json(offline_observations[offline]).encode("utf-8")
+            ).hexdigest()
+            offline_write["observations_sha256"] = hashlib.sha256(
+                stable_json(offline_observations).encode("utf-8")
+            ).hexdigest()
+            with self.assertRaisesRegex(ValidationError, "read-only phase changed"):
+                validate_runtime_receipt(
+                    offline_write,
+                    manifest,
+                    offline_observations,
+                    manifest["dataset"]["source_sha256"],
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, observations, receipt = self._v4(root)
+            for rollout in receipt["rollouts"]:
+                grader_fingerprint = next(
+                    item["fingerprint"]
+                    for item in receipt["graders"]
+                    if item["case_id"] == rollout["case_id"]
+                )
+                self._materialize_valid_production_events(
+                    root,
+                    rollout,
+                    grader_fingerprint,
+                )
+
+            validate_runtime_receipt(
+                receipt,
+                manifest,
+                observations,
+                manifest["dataset"]["source_sha256"],
+            )
+            validate_runtime_artifacts(receipt, root)
+
+            identity_attack = copy.deepcopy(receipt)
+            event_path = root / identity_attack["rollouts"][0]["artifact_paths"][
+                "native_events"
+            ]
+            original_events = event_path.read_bytes()
+            event_rows = [json.loads(line) for line in original_events.splitlines()]
+            event_rows[0]["event"]["run_started"]["metadata"][
+                "runtime_model_id"
+            ] = "forged-model"
+            event_path.write_text(
+                "".join(stable_json(row) + "\n" for row in event_rows),
+                encoding="utf-8",
+            )
+            identity_attack["rollouts"][0]["native_events_sha256"] = hashlib.sha256(
+                event_path.read_bytes()
+            ).hexdigest()
+            with self.assertRaisesRegex(
+                ValidationError,
+                "native_events.metadata.runtime_model_id",
+            ):
+                validate_runtime_artifacts(identity_attack, root)
+            event_path.write_bytes(original_events)
+
+            attacked = copy.deepcopy(receipt)
+            cassette = root / attacked["rollouts"][0]["artifact_paths"]["cassette"]
+            request = cassette / "req-001.json"
+            body = json.loads(request.read_text(encoding="utf-8"))
+            body["messages"].extend(
+                [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "nested-provider-attempt",
+                                "name": "WebSearch",
+                                "input": {"query": "must fail closed"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "nested-provider-attempt",
+                                "content": "denied",
+                                "is_error": True,
+                            }
+                        ],
+                    },
+                ]
+            )
+            request.write_text(stable_json(body) + "\n", encoding="utf-8")
+            attacked["rollouts"][0]["cassette_sha256"] = _artifact_tree_digest(cassette)
+            with self.assertRaisesRegex(
+                ValidationError,
+                "forbidden nested-provider tool",
+            ):
+                validate_runtime_artifacts(attacked, root)
+
+            runner = root / receipt["runner_sources"][0]["path"]
+            runner.write_text("tampered production runner\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValidationError, "runtime source mismatch"):
                 validate_runtime_artifacts(receipt, root)
 
 

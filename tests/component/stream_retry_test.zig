@@ -94,6 +94,38 @@ test "L2: 建连断一次 → 重试包装第2次成功(短退避)" {
     try std.testing.expect(resp.done);
 }
 
+test "L2 evaluation gate makes one physical provider attempt and never retries outside receipt" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startFlaky(OK_SSE, 1);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = mkClient(a, io_runtime.io(), url);
+    defer client.deinit();
+
+    const empty: []const cc.types_mod.ApiMessage = &.{};
+    const result = client.sendMessageStreamFullRetry(
+        empty,
+        null,
+        null,
+        null,
+        null,
+        null,
+        cc.agent_loop.providerAttemptLimit(true),
+        1,
+        null,
+    );
+    try std.testing.expectError(error.TransientNetwork, result);
+    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+    try std.testing.expectEqual(
+        cc.client_mod.defaultMaxRetries(),
+        cc.agent_loop.providerAttemptLimit(false),
+    );
+}
+
 // ③ 退避公式:min(base*2^(n-1),32000)+jitter(0~25%)。
 test "L2: retryDelayMs 指数退避 + cap + jitter 范围" {
     const base: u64 = 500;

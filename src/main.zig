@@ -295,7 +295,9 @@ pub fn main(init: std.process.Init) !void {
     // --- record/replay cassette 录制目录(Stage 7)---
     if (config.record_dir) |dir| recorder.setDir(dir);
 
-    var resolved_credential = auth.resolveCredential(allocator, config.api_key, config.auth_precedence) catch |err| {
+    // Runtime resolution consumes one-shot FD authority before App/job/tool
+    // subprocesses exist. Ordinary env auth retains legacy teammate inheritance.
+    var resolved_credential = auth.resolveRuntimeCredential(allocator, config.api_key, config.auth_precedence) catch |err| {
         @import("util/log.zig").err("auth", "credential resolution failed: {s}", .{@errorName(err)});
         std.debug.print(
             \\Authentication required.
@@ -793,7 +795,7 @@ fn applyStoredLoginSelection(allocator: std.mem.Allocator, config: *types.Config
 
 fn isUsableConfiguredSession(config: types.Config, source: auth.CredentialSource) bool {
     return switch (source) {
-        .cli_api_key, .env_api_key => true,
+        .cli_api_key, .fd_api_key, .env_api_key => true,
         .stored_api_key => config.model_explicit and config.reasoning_effort != null,
         .stored_oauth => false,
     };

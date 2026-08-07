@@ -30,8 +30,13 @@ from .model import ValidationError, stable_json
 REPLAY_SCHEMA_VERSION = 1
 LEGACY_RUNTIME_RECEIPT_SCHEMA_VERSION = 2
 RUNTIME_RECEIPT_SCHEMA_VERSION = 3
+PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 4
 NATIVE_RUNTIME_RECEIPT_VERSIONS = frozenset(
-    {LEGACY_RUNTIME_RECEIPT_SCHEMA_VERSION, RUNTIME_RECEIPT_SCHEMA_VERSION}
+    {
+        LEGACY_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+    }
 )
 RUNNER_SOURCE_MODULES = (
     "e2e_adapter",
@@ -45,6 +50,27 @@ RUNNER_SOURCE_MODULES = (
     "memory_tinykg_local",
     "model",
 )
+PRODUCTION_RUNNER_SOURCE_MODULES = (*RUNNER_SOURCE_MODULES, "memory_agent_runtime_pilot")
+PRODUCTION_PROVIDER_ID = "metask-anthropic-compatible-v1"
+PRODUCTION_MODEL_PROVIDER = "anthropic"
+PRODUCTION_MODEL_ID = "glm-5.2"
+PRODUCTION_EXECUTION_MODE = "native-agent-loop-production-memory-pilot"
+PRODUCTION_PRICING_PROVENANCE = (
+    "metacodes_glm-5.2_conservative_sonnet4_usd_guardrail_2026-08-07_not_provider_bill"
+)
+PRODUCTION_DISALLOWED_PROVIDER_TOOLS = (
+    "Agent",
+    "Task",
+    "TaskBatch",
+    "TeamCreate",
+    "WebFetch",
+    "WebSearch",
+)
+PRODUCTION_TOOL_NETWORK_ISOLATION = "not_proven_bash_network_unsandboxed"
+PRODUCTION_FILESYSTEM_ISOLATION = "not_proven_bypass_permissions_same_uid"
+PRODUCTION_CHILD_PATH = "/bin:/usr/bin"
+PRODUCTION_AUTO_COMPACT_POLICY = "disabled_threshold_reject_any_compact_event"
+PRODUCTION_FORCE_COMPACT_AT = "9223372036854775807"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
 TREATMENT_LEAK_TERMS = (
@@ -122,6 +148,35 @@ def _string_list(value: Any, where: str, *, allow_empty: bool) -> List[str]:
 
 def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()
+
+
+def _production_harness_fingerprint(
+    *,
+    metacodes_binary_sha256: str,
+    tinykg_binary_sha256: str | None,
+    harness_revision: str,
+    arm: Mapping[str, Any],
+    runtime_arm: str,
+    runtime_budget: Mapping[str, Any],
+    runner_sources: Sequence[Mapping[str, Any]],
+) -> str:
+    """Compute the production harness identity used at run and replay time."""
+
+    return _canonical_sha256(
+        {
+            "metacodes_binary_sha256": metacodes_binary_sha256,
+            "tinykg_binary_sha256": tinykg_binary_sha256,
+            "harness_revision": harness_revision,
+            "arm": arm,
+            "runtime_arm": runtime_arm,
+            "provider": PRODUCTION_PROVIDER_ID,
+            "runtime_budget": runtime_budget,
+            "disallowed_provider_tools": list(PRODUCTION_DISALLOWED_PROVIDER_TOOLS),
+            "filesystem_isolation": PRODUCTION_FILESYSTEM_ISOLATION,
+            "auto_compact_policy": PRODUCTION_AUTO_COMPACT_POLICY,
+            "runner_sources_sha256": _canonical_sha256(list(runner_sources)),
+        }
+    )
 
 
 def _finite_number(value: Any, where: str, *, minimum: float = 0.0) -> float:
@@ -213,7 +268,22 @@ def _artifact_tree_digest(
     return hashlib.sha256(stable_json(records).encode("utf-8")).hexdigest()
 
 
-def _cassette_memory_activity(root: Path, where: str) -> Mapping[str, int]:
+def _path_is_within(raw_path: Any, root: Path | None) -> bool:
+    if root is None or not isinstance(raw_path, str) or not raw_path:
+        return False
+    try:
+        Path(raw_path).expanduser().resolve(strict=False).relative_to(root.resolve(strict=True))
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _cassette_memory_activity(
+    root: Path,
+    where: str,
+    *,
+    memory_root: Path | None = None,
+) -> Mapping[str, int]:
     """Recompute executed memory operations from the raw provider requests.
 
     Requests contain the complete conversation-so-far, so tool ids are
@@ -273,12 +343,23 @@ def _cassette_memory_activity(root: Path, where: str) -> Mapping[str, int]:
         "tinykg_writes": 0,
         "markdown_reads": 0,
         "markdown_writes": 0,
+        "forbidden_provider_tool_attempts": 0,
     }
-    for tool_id, (name, _raw_input) in tool_defs.items():
+    for tool_id, (name, raw_input) in tool_defs.items():
+        tool_input = json.loads(raw_input)
+        if name in PRODUCTION_DISALLOWED_PROVIDER_TOOLS:
+            counts["forbidden_provider_tool_attempts"] += 1
+        markdown_read = name in {"Read", "Grep"} and (
+            _path_is_within(tool_input.get("file_path"), memory_root)
+            or _path_is_within(tool_input.get("path"), memory_root)
+        )
+        markdown_write = name in {"Write", "Edit"} and _path_is_within(
+            tool_input.get("file_path"), memory_root
+        )
         memory_operation = (
             name in {"KgRecall", "KgContext", "KgRemember"}
-            or (name == "Read" and tool_id.startswith("markdown-read-"))
-            or (name in {"Write", "Edit"} and tool_id.startswith("markdown-"))
+            or markdown_read
+            or markdown_write
         )
         if memory_operation and tool_id not in tool_results:
             _fail(where, f"memory tool {tool_id!r} has no observable result")
@@ -288,11 +369,202 @@ def _cassette_memory_activity(root: Path, where: str) -> Mapping[str, int]:
             counts["tinykg_reads"] += 1
         elif name == "KgRemember":
             counts["tinykg_writes"] += 1
-        elif name == "Read" and tool_id.startswith("markdown-read-"):
+        if markdown_read:
             counts["markdown_reads"] += 1
-        elif name in {"Write", "Edit"} and tool_id.startswith("markdown-"):
+        elif markdown_write:
             counts["markdown_writes"] += 1
     return counts
+
+
+def _cassette_memory_exposure(
+    root: Path,
+    where: str,
+    *,
+    memory_root: Path | None,
+    expected_memory_index: bytes,
+    count_graph_context: bool,
+) -> Mapping[str, int]:
+    """Recompute memory bytes actually exposed to the production model.
+
+    Provider requests repeat the complete conversation, so both tool results
+    and injected context must be deduplicated. Only successful memory-read
+    results count; unrelated Read/Bash/test output and memory-write receipts do
+    not. ``expected_memory_index`` is the pre-rollout MEMORY.md payload, which
+    must occur exactly once in the first request when non-empty.
+    """
+
+    request_paths = sorted(root.glob("req-*.json"))
+    if not request_paths:
+        _fail(where, "provider cassette has no request artifacts")
+    first = _load_unique_json(request_paths[0], f"{where}.{request_paths[0].name}")
+    first_messages = first.get("messages")
+    if not isinstance(first_messages, list):
+        _fail(f"{where}.{request_paths[0].name}.messages", "expected an array")
+
+    first_text_blocks: List[str] = []
+    for message in first_messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "text"
+                and isinstance(item.get("text"), str)
+            ):
+                first_text_blocks.append(item["text"])
+
+    auto_injected_bytes = 0
+    if expected_memory_index:
+        try:
+            index_text = expected_memory_index.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValidationError(f"{where}: MEMORY.md is not UTF-8: {exc}") from exc
+        occurrences = sum(block.count(index_text) for block in first_text_blocks)
+        if occurrences != 1:
+            _fail(where, f"expected one injected MEMORY.md index, observed {occurrences}")
+        auto_injected_bytes += len(expected_memory_index)
+
+    if count_graph_context:
+        seen_sections: set[str] = set()
+        for block in first_text_blocks:
+            date_start = block.rfind("# currentDate\n")
+            if date_start < 0:
+                continue
+            graph_start = block.rfind("# Knowledge Graph\n", 0, date_start)
+            if graph_start < 0:
+                continue
+            section = block[graph_start:date_start]
+            if section and section not in seen_sections:
+                seen_sections.add(section)
+                auto_injected_bytes += len(section.encode("utf-8"))
+
+    tool_defs: Dict[str, Tuple[str, str]] = {}
+    tool_results: Dict[str, Tuple[str, bool]] = {}
+    for request_path in request_paths:
+        body = _load_unique_json(request_path, f"{where}.{request_path.name}")
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            _fail(f"{where}.{request_path.name}.messages", "expected an array")
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "tool_use":
+                    tool_id = item.get("id")
+                    name = item.get("name")
+                    tool_input = item.get("input")
+                    if not isinstance(tool_id, str) or not tool_id:
+                        _fail(where, "tool_use has no stable id")
+                    if not isinstance(name, str) or not isinstance(tool_input, dict):
+                        _fail(where, f"tool_use {tool_id!r} is malformed")
+                    signature = (name, stable_json(tool_input))
+                    prior = tool_defs.get(tool_id)
+                    if prior is not None and prior != signature:
+                        _fail(where, f"tool id {tool_id!r} changed semantics across requests")
+                    tool_defs[tool_id] = signature
+                elif item.get("type") == "tool_result":
+                    tool_id = item.get("tool_use_id")
+                    content_value = item.get("content")
+                    if isinstance(tool_id, str) and isinstance(content_value, str):
+                        observed = (content_value, item.get("is_error") is True)
+                        prior = tool_results.get(tool_id)
+                        if prior is not None and prior != observed:
+                            _fail(where, f"tool result {tool_id!r} changed across requests")
+                        tool_results[tool_id] = observed
+
+    tool_result_bytes = 0
+    for tool_id, (name, raw_input) in tool_defs.items():
+        result = tool_results.get(tool_id)
+        if result is None or result[1]:
+            continue
+        tool_input = json.loads(raw_input)
+        markdown_read = name in {"Read", "Grep"} and (
+            _path_is_within(tool_input.get("file_path"), memory_root)
+            or _path_is_within(tool_input.get("path"), memory_root)
+        )
+        if name in {"KgRecall", "KgContext"} or markdown_read:
+            tool_result_bytes += len(result[0].encode("utf-8"))
+
+    return {
+        "auto_injected_bytes": auto_injected_bytes,
+        "tool_result_bytes": tool_result_bytes,
+        "total_bytes": auto_injected_bytes + tool_result_bytes,
+    }
+
+
+def _cassette_treatment_activation(
+    root: Path,
+    runtime_arm: str,
+    model_id: str,
+    where: str = "production treatment activation",
+) -> Mapping[str, Any]:
+    requests = sorted(root.glob("req-*.json"))
+    if not requests:
+        _fail(where, "provider cassette is empty")
+    body = _load_unique_json(requests[0], f"{where}.request")
+    if body.get("model") != model_id:
+        _fail(f"{where}.model", "request model drift")
+    system = body.get("system")
+    if not isinstance(system, str):
+        _fail(f"{where}.system", "request system prompt is unavailable")
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        _fail(f"{where}.tools", "request tool schema is unavailable")
+    names = {
+        item.get("name")
+        for item in tools
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    kg_tools = {"KgRemember", "KgRecall", "KgContext"}
+    has_memory = "# Memory" in system
+    has_graph = "# Knowledge Graph" in system
+    if runtime_arm == "codex_style":
+        valid = not has_memory and not has_graph and not (names & kg_tools)
+    elif runtime_arm == "claude_style":
+        valid = has_memory and not has_graph and not (names & kg_tools)
+    elif runtime_arm == "tinykg":
+        valid = has_memory and has_graph and kg_tools <= names
+    else:
+        valid = False
+    if not valid:
+        _fail(where, f"request does not match runtime arm {runtime_arm!r}")
+    evidence = {
+        "runtime_arm": runtime_arm,
+        "system_prompt_sha256": hashlib.sha256(system.encode("utf-8")).hexdigest(),
+        "tool_names_sha256": _canonical_sha256(sorted(names)),
+        "memory_prompt_active": has_memory,
+        "knowledge_graph_prompt_active": has_graph,
+        "tinykg_tools_active": sorted(names & kg_tools),
+    }
+    return {**evidence, "fingerprint": _canonical_sha256(evidence)}
+
+
+def _native_pricing_provenance(path: Path, where: str) -> str:
+    observed: set[str] = set()
+    try:
+        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            event = value.get("event") if isinstance(value, dict) else None
+            usage = event.get("usage") if isinstance(event, dict) else None
+            if not isinstance(usage, dict):
+                continue
+            provenance = usage.get("pricing_provenance")
+            if not isinstance(provenance, str) or not provenance:
+                _fail(f"{where}:{line_no}", "usage has no pricing provenance")
+            observed.add(provenance)
+    except ValidationError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValidationError(f"{where}: cannot inspect native pricing events: {exc}") from exc
+    if len(observed) != 1:
+        _fail(where, "expected one non-empty pricing provenance")
+    return next(iter(observed))
 
 
 def _load_unique_json(path: Path, label: str) -> Mapping[str, Any]:
@@ -359,6 +631,560 @@ def load_runtime_receipt(path: Path) -> Mapping[str, Any]:
     return _load_unique_json(path, f"memory runtime receipt {path}")
 
 
+def _production_runtime_arm(arm_id: str) -> str:
+    if arm_id in {"no_memory", "codex_style"}:
+        return "codex_style"
+    if arm_id in {"markdown_memory", "claude_style"}:
+        return "claude_style"
+    if arm_id in {"tinykg_lexical", "tinykg"}:
+        return "tinykg"
+    _fail("production runtime arm", f"unsupported arm {arm_id!r}")
+    raise AssertionError("unreachable")
+
+
+def _validate_production_runtime_receipt(
+    receipt: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    observations: Sequence[Mapping[str, Any]],
+    dataset_sha256: str,
+    where: str,
+) -> None:
+    value = _object(
+        receipt,
+        where,
+        (
+            "schema_version",
+            "protocol_id",
+            "manifest_sha256",
+            "observations_sha256",
+            "dataset_sha256",
+            "adapter_id",
+            "adapter_revision",
+            "model_id",
+            "model_fingerprint",
+            "harness_revision",
+            "runner_sources",
+            "arms",
+            "graders",
+            "execution_mode",
+            "quality_evidence",
+            "provider_id",
+            "model_provider",
+            "disallowed_provider_tools",
+            "metacodes_binary_sha256",
+            "tinykg_binary_sha256",
+            "budget",
+            "provider_requests",
+            "tool_network_isolation",
+            "filesystem_isolation",
+            "auto_compact_policy",
+            "provider_billed_cost_usd",
+            "estimated_cost_usd",
+            "metered_tokens",
+            "pricing_provenance",
+            "rollouts",
+        ),
+    )
+    if value["schema_version"] != PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+        _fail(f"{where}.schema_version", "expected production runtime receipt v4")
+    if value["protocol_id"] != PROTOCOL_ID:
+        _fail(f"{where}.protocol_id", f"expected {PROTOCOL_ID!r}")
+    expected_scalars = {
+        "manifest_sha256": _canonical_sha256(manifest),
+        "observations_sha256": _canonical_sha256(list(observations)),
+        "dataset_sha256": dataset_sha256,
+        "adapter_id": manifest["dataset"]["adapter_id"],
+        "adapter_revision": manifest["dataset"]["adapter_revision"],
+        "model_id": manifest["execution"]["model_id"],
+        "model_fingerprint": manifest["execution"]["model_fingerprint"],
+        "harness_revision": manifest["execution"]["harness_revision"],
+    }
+    for key, expected in expected_scalars.items():
+        observed = _string(value[key], f"{where}.{key}")
+        if key.endswith("sha256") or key.endswith("fingerprint"):
+            _hash(observed, f"{where}.{key}")
+        if observed != expected:
+            _fail(f"{where}.{key}", "does not match the frozen manifest")
+    if value["model_id"] != PRODUCTION_MODEL_ID:
+        _fail(f"{where}.model_id", f"expected {PRODUCTION_MODEL_ID!r}")
+    if value["execution_mode"] != PRODUCTION_EXECUTION_MODE:
+        _fail(f"{where}.execution_mode", "unsupported production execution mode")
+    if value["quality_evidence"] is not False:
+        _fail(f"{where}.quality_evidence", "a small production pilot is not quality evidence")
+    if value["provider_id"] != PRODUCTION_PROVIDER_ID:
+        _fail(f"{where}.provider_id", "provider identity drift")
+    if value["model_provider"] != PRODUCTION_MODEL_PROVIDER:
+        _fail(f"{where}.model_provider", "model provider drift")
+    if value["disallowed_provider_tools"] != list(PRODUCTION_DISALLOWED_PROVIDER_TOOLS):
+        _fail(
+            f"{where}.disallowed_provider_tools",
+            "nested provider side-effect policy drift",
+        )
+    if value["tool_network_isolation"] != PRODUCTION_TOOL_NETWORK_ISOLATION:
+        _fail(
+            f"{where}.tool_network_isolation",
+            "must not claim unobserved Bash/subprocess network isolation",
+        )
+    if value["filesystem_isolation"] != PRODUCTION_FILESYSTEM_ISOLATION:
+        _fail(
+            f"{where}.filesystem_isolation",
+            "must not claim unobserved host or cross-arm filesystem isolation",
+        )
+    if value["auto_compact_policy"] != PRODUCTION_AUTO_COMPACT_POLICY:
+        _fail(f"{where}.auto_compact_policy", "production trace may compact")
+    if value["provider_billed_cost_usd"] is not None:
+        _fail(
+            f"{where}.provider_billed_cost_usd",
+            "must remain null when no provider bill is available",
+        )
+    if value["pricing_provenance"] != PRODUCTION_PRICING_PROVENANCE:
+        _fail(f"{where}.pricing_provenance", "unknown pricing provenance")
+
+    raw_sources = value["runner_sources"]
+    if not isinstance(raw_sources, list):
+        _fail(f"{where}.runner_sources", "expected an array")
+    source_modules: List[str] = []
+    source_paths: set[str] = set()
+    for index, raw_source in enumerate(raw_sources):
+        source_where = f"{where}.runner_sources[{index}]"
+        source = _object(raw_source, source_where, ("module", "path", "sha256"))
+        module = _identifier(source["module"], f"{source_where}.module")
+        path = _artifact_relative_path(source["path"], f"{source_where}.path").as_posix()
+        _hash(source["sha256"], f"{source_where}.sha256")
+        if path != f"runner-sources/{module}.py":
+            _fail(f"{source_where}.path", "does not match its runner module")
+        if module in source_modules or path in source_paths:
+            _fail(source_where, "duplicate runner source")
+        source_modules.append(module)
+        source_paths.add(path)
+    if source_modules != list(PRODUCTION_RUNNER_SOURCE_MODULES):
+        _fail(f"{where}.runner_sources", "does not bind the production host source set")
+
+    if value["arms"] != manifest["execution"]["arms"]:
+        _fail(f"{where}.arms", "runtime arm identities do not match the manifest")
+    expected_graders = [
+        {"case_id": case["id"], "fingerprint": case["grader"]["fingerprint"]}
+        for case in manifest["cases"]
+    ]
+    if value["graders"] != expected_graders:
+        _fail(f"{where}.graders", "runtime grader identities do not match the manifest")
+
+    budget = _object(
+        value["budget"],
+        f"{where}.budget",
+        (
+            "max_total_cost_usd",
+            "max_total_metered_tokens",
+            "max_rollout_cost_usd",
+            "max_rollout_metered_tokens",
+            "max_output_tokens",
+        ),
+    )
+    max_total_cost = _finite_number(
+        budget["max_total_cost_usd"], f"{where}.budget.max_total_cost_usd"
+    )
+    max_rollout_cost = _finite_number(
+        budget["max_rollout_cost_usd"], f"{where}.budget.max_rollout_cost_usd"
+    )
+    max_total_tokens = _integer(
+        budget["max_total_metered_tokens"],
+        f"{where}.budget.max_total_metered_tokens",
+        minimum=1,
+    )
+    max_rollout_tokens = _integer(
+        budget["max_rollout_metered_tokens"],
+        f"{where}.budget.max_rollout_metered_tokens",
+        minimum=1,
+    )
+    _integer(budget["max_output_tokens"], f"{where}.budget.max_output_tokens", minimum=1)
+    if max_total_cost <= 0 or max_rollout_cost <= 0 or max_total_cost > 1000:
+        _fail(f"{where}.budget", "invalid paid cost authority")
+
+    rollouts = value["rollouts"]
+    if not isinstance(rollouts, list) or len(rollouts) != len(observations):
+        _fail(f"{where}.rollouts", f"expected exactly {len(observations)} entries")
+    if max_rollout_cost * len(rollouts) >= max_total_cost:
+        _fail(f"{where}.budget", "total cost cap lacks strict schedule headroom")
+    if max_rollout_tokens * len(rollouts) >= max_total_tokens:
+        _fail(f"{where}.budget", "total token cap lacks strict schedule headroom")
+
+    metacodes_sha = _hash(value["metacodes_binary_sha256"], f"{where}.metacodes_binary_sha256")
+    tinykg_sha = _hash(value["tinykg_binary_sha256"], f"{where}.tinykg_binary_sha256")
+    schedule = {entry["sequence"]: entry for entry in manifest["schedule"]}
+    cases = {case["id"]: case for case in manifest["cases"]}
+    arms_by_id = {arm["id"]: arm for arm in value["arms"]}
+    seen_run_ids: set[str] = set()
+    for index, raw_rollout in enumerate(rollouts):
+        rollout_where = f"{where}.rollouts[{index}]"
+        rollout = _object(
+            raw_rollout,
+            rollout_where,
+            (
+                "sequence",
+                "case_id",
+                "trial",
+                "arm",
+                "run_id",
+                "task_fingerprint",
+                "harness_fingerprint",
+                "environment",
+                "environment_fingerprint",
+                "metacodes_binary_sha256",
+                "tinykg_binary_sha256",
+                "native_events_sha256",
+                "result_sha256",
+                "stderr_sha256",
+                "cassette_sha256",
+                "transcript_sha256",
+                "workspace_sha256",
+                "artifact_paths",
+                "store_revision_before",
+                "store_revision_after",
+                "raw_store_digest_before",
+                "raw_store_digest_after",
+                "memory_backend",
+                "memory_phase",
+                "memory_state_before",
+                "memory_state_after",
+                "memory_components_before",
+                "memory_components_after",
+                "memory_read_events",
+                "memory_write_events",
+                "stop_reason",
+                "provider_mode",
+                "provider_requests",
+                "tool_network_isolation",
+                "filesystem_isolation",
+                "provider_billed_cost_usd",
+                "estimated_cost_usd",
+                "metered_tokens",
+                "pricing_provenance",
+                "compact_event_count",
+                "memory_auto_injected_bytes",
+                "memory_tool_result_bytes",
+                "treatment_activation",
+                "observation_sha256",
+                "host_elapsed_ms",
+            ),
+        )
+        sequence = _integer(rollout["sequence"], f"{rollout_where}.sequence")
+        if sequence != index or sequence not in schedule:
+            _fail(f"{rollout_where}.sequence", "must be contiguous and scheduled")
+        scheduled = schedule[sequence]
+        for key in ("case_id", "trial", "arm"):
+            if rollout[key] != scheduled[key]:
+                _fail(f"{rollout_where}.{key}", "does not match frozen schedule")
+        case = cases[rollout["case_id"]]
+        run_id = _string(rollout["run_id"], f"{rollout_where}.run_id")
+        if run_id in seen_run_ids:
+            _fail(f"{rollout_where}.run_id", "must be unique")
+        seen_run_ids.add(run_id)
+        if _hash(rollout["task_fingerprint"], f"{rollout_where}.task_fingerprint") != _canonical_sha256(case):
+            _fail(f"{rollout_where}.task_fingerprint", "does not bind the frozen case")
+        if _hash(rollout["metacodes_binary_sha256"], f"{rollout_where}.metacodes_binary_sha256") != metacodes_sha:
+            _fail(f"{rollout_where}.metacodes_binary_sha256", "binary identity drift")
+
+        runtime_arm = _production_runtime_arm(str(rollout["arm"]))
+        tinykg_enabled = runtime_arm == "tinykg"
+        expected_backend = {
+            "codex_style": "none",
+            "claude_style": "markdown",
+            "tinykg": "tinykg_integrated",
+        }[runtime_arm]
+        if rollout["memory_backend"] != expected_backend:
+            _fail(f"{rollout_where}.memory_backend", "does not match frozen arm")
+        expected_harness_fingerprint = _production_harness_fingerprint(
+            metacodes_binary_sha256=metacodes_sha,
+            tinykg_binary_sha256=tinykg_sha if tinykg_enabled else None,
+            harness_revision=value["harness_revision"],
+            arm=arms_by_id[rollout["arm"]],
+            runtime_arm=runtime_arm,
+            runtime_budget=budget,
+            runner_sources=raw_sources,
+        )
+        if _hash(
+            rollout["harness_fingerprint"],
+            f"{rollout_where}.harness_fingerprint",
+        ) != expected_harness_fingerprint:
+            _fail(f"{rollout_where}.harness_fingerprint", "does not bind runtime inputs")
+        environment = _object(
+            rollout["environment"],
+            f"{rollout_where}.environment",
+            (
+                "platform",
+                "python",
+                "source_sha256",
+                "tinykg_binary_sha256",
+                "project_domain",
+                "child_path",
+                "auto_compact_policy",
+            ),
+        )
+        environment_fingerprint = _hash(
+            rollout["environment_fingerprint"],
+            f"{rollout_where}.environment_fingerprint",
+        )
+        if environment_fingerprint != _canonical_sha256(environment):
+            _fail(f"{rollout_where}.environment_fingerprint", "does not bind environment claims")
+        _string(environment["platform"], f"{rollout_where}.environment.platform")
+        _string(environment["python"], f"{rollout_where}.environment.python")
+        if _hash(environment["source_sha256"], f"{rollout_where}.environment.source_sha256") != dataset_sha256:
+            _fail(f"{rollout_where}.environment.source_sha256", "dataset identity drift")
+        _string(environment["project_domain"], f"{rollout_where}.environment.project_domain")
+        if environment["child_path"] != PRODUCTION_CHILD_PATH:
+            _fail(f"{rollout_where}.environment.child_path", "production environment is not minimal")
+        if environment["auto_compact_policy"] != PRODUCTION_AUTO_COMPACT_POLICY:
+            _fail(f"{rollout_where}.environment.auto_compact_policy", "production trace may compact")
+        if tinykg_enabled:
+            if _hash(rollout["tinykg_binary_sha256"], f"{rollout_where}.tinykg_binary_sha256") != tinykg_sha:
+                _fail(f"{rollout_where}.tinykg_binary_sha256", "binary identity drift")
+            if environment["tinykg_binary_sha256"] != tinykg_sha:
+                _fail(f"{rollout_where}.environment.tinykg_binary_sha256", "binary identity drift")
+        elif rollout["tinykg_binary_sha256"] is not None:
+            _fail(f"{rollout_where}.tinykg_binary_sha256", "control arm must use null")
+        elif environment["tinykg_binary_sha256"] is not None:
+            _fail(f"{rollout_where}.environment.tinykg_binary_sha256", "control arm must use null")
+        for key in (
+            "native_events_sha256",
+            "result_sha256",
+            "stderr_sha256",
+            "cassette_sha256",
+            "transcript_sha256",
+            "workspace_sha256",
+        ):
+            _hash(rollout[key], f"{rollout_where}.{key}")
+        paths = _object(
+            rollout["artifact_paths"],
+            f"{rollout_where}.artifact_paths",
+            (
+                "native_events",
+                "result",
+                "stderr",
+                "cassette",
+                "transcript",
+                "workspace",
+                "store",
+                "memory_state",
+            ),
+        )
+        for key in ("native_events", "result", "stderr", "cassette", "transcript", "workspace"):
+            _artifact_relative_path(paths[key], f"{rollout_where}.artifact_paths.{key}")
+        if tinykg_enabled:
+            _artifact_relative_path(paths["store"], f"{rollout_where}.artifact_paths.store")
+        elif paths["store"] is not None:
+            _fail(f"{rollout_where}.artifact_paths.store", "control arm must use null")
+        if expected_backend == "none":
+            if paths["memory_state"] is not None:
+                _fail(f"{rollout_where}.artifact_paths.memory_state", "no-memory arm must use null")
+        else:
+            _artifact_relative_path(paths["memory_state"], f"{rollout_where}.artifact_paths.memory_state")
+
+        if rollout["stop_reason"] not in {"end_turn", "max_turns", "tool_loop", "budget"}:
+            _fail(f"{rollout_where}.stop_reason", "unsupported native stop reason")
+        if rollout["provider_mode"] != "production-network":
+            _fail(f"{rollout_where}.provider_mode", "must be production-network")
+        provider_requests = _integer(
+            rollout["provider_requests"], f"{rollout_where}.provider_requests", minimum=1
+        )
+        if rollout["tool_network_isolation"] != PRODUCTION_TOOL_NETWORK_ISOLATION:
+            _fail(
+                f"{rollout_where}.tool_network_isolation",
+                "must not claim unobserved Bash/subprocess network isolation",
+            )
+        if rollout["filesystem_isolation"] != PRODUCTION_FILESYSTEM_ISOLATION:
+            _fail(
+                f"{rollout_where}.filesystem_isolation",
+                "must not claim unobserved host or cross-arm filesystem isolation",
+            )
+        if rollout["provider_billed_cost_usd"] is not None:
+            _fail(f"{rollout_where}.provider_billed_cost_usd", "must remain null")
+        estimated_cost = _finite_number(
+            rollout["estimated_cost_usd"], f"{rollout_where}.estimated_cost_usd"
+        )
+        metered_tokens = _integer(
+            rollout["metered_tokens"], f"{rollout_where}.metered_tokens", minimum=1
+        )
+        if estimated_cost > max_rollout_cost or metered_tokens > max_rollout_tokens:
+            _fail(rollout_where, "rollout exceeded its fixed production budget")
+        if rollout["pricing_provenance"] != PRODUCTION_PRICING_PROVENANCE:
+            _fail(f"{rollout_where}.pricing_provenance", "unknown pricing provenance")
+        compact_events = _integer(
+            rollout["compact_event_count"],
+            f"{rollout_where}.compact_event_count",
+        )
+        if compact_events != 0:
+            _fail(
+                f"{rollout_where}.compact_event_count",
+                "production pilot requires an uncompacted trace",
+            )
+        auto_injected_bytes = _integer(
+            rollout["memory_auto_injected_bytes"],
+            f"{rollout_where}.memory_auto_injected_bytes",
+        )
+        tool_result_bytes = _integer(
+            rollout["memory_tool_result_bytes"],
+            f"{rollout_where}.memory_tool_result_bytes",
+        )
+        _finite_number(rollout["host_elapsed_ms"], f"{rollout_where}.host_elapsed_ms")
+
+        activation = _object(
+            rollout["treatment_activation"],
+            f"{rollout_where}.treatment_activation",
+            (
+                "runtime_arm",
+                "system_prompt_sha256",
+                "tool_names_sha256",
+                "memory_prompt_active",
+                "knowledge_graph_prompt_active",
+                "tinykg_tools_active",
+                "fingerprint",
+            ),
+        )
+        if activation["runtime_arm"] != runtime_arm:
+            _fail(f"{rollout_where}.treatment_activation.runtime_arm", "arm drift")
+        _hash(activation["system_prompt_sha256"], f"{rollout_where}.treatment_activation.system_prompt_sha256")
+        _hash(activation["tool_names_sha256"], f"{rollout_where}.treatment_activation.tool_names_sha256")
+        expected_flags = {
+            "codex_style": (False, False, []),
+            "claude_style": (True, False, []),
+            "tinykg": (True, True, ["KgContext", "KgRecall", "KgRemember"]),
+        }[runtime_arm]
+        observed_flags = (
+            activation["memory_prompt_active"],
+            activation["knowledge_graph_prompt_active"],
+            activation["tinykg_tools_active"],
+        )
+        if observed_flags != expected_flags:
+            _fail(f"{rollout_where}.treatment_activation", "treatment flags drift")
+        activation_payload = {key: activation[key] for key in activation if key != "fingerprint"}
+        if _hash(activation["fingerprint"], f"{rollout_where}.treatment_activation.fingerprint") != _canonical_sha256(activation_payload):
+            _fail(f"{rollout_where}.treatment_activation.fingerprint", "does not bind activation")
+
+        observation = observations[sequence]
+        if _hash(rollout["observation_sha256"], f"{rollout_where}.observation_sha256") != _canonical_sha256(observation):
+            _fail(f"{rollout_where}.observation_sha256", "does not bind observation")
+        trajectory = observation.get("trajectory")
+        retrieval = observation.get("retrieval")
+        cost = observation.get("cost")
+        memory = observation.get("memory")
+        graph = observation.get("graph")
+        governance = observation.get("governance")
+        if not all(isinstance(item, dict) for item in (trajectory, retrieval, cost, memory, graph, governance)):
+            _fail(f"{rollout_where}.observation", "missing production lifecycle fields")
+        if _integer(trajectory.get("model_requests"), f"{rollout_where}.trajectory.model_requests", minimum=1) != provider_requests:
+            _fail(f"{rollout_where}.provider_requests", "does not match native trajectory")
+        memory_reads = _integer(rollout["memory_read_events"], f"{rollout_where}.memory_read_events")
+        memory_writes = _integer(rollout["memory_write_events"], f"{rollout_where}.memory_write_events")
+        if _integer(trajectory.get("tool_calls"), f"{rollout_where}.trajectory.tool_calls") < memory_reads + memory_writes:
+            _fail(f"{rollout_where}.trajectory.tool_calls", "cannot be below memory activity")
+        expected_exposed_tokens = (auto_injected_bytes + tool_result_bytes + 3) // 4
+        if memory.get("exposed_tokens") != expected_exposed_tokens:
+            _fail(
+                f"{rollout_where}.observation.memory.exposed_tokens",
+                "does not match raw memory exposure bytes",
+            )
+        if cost.get("cost_usd") != estimated_cost:
+            _fail(f"{rollout_where}.estimated_cost_usd", "does not match observation cost")
+
+        phase = _string(rollout["memory_phase"], f"{rollout_where}.memory_phase")
+        if phase != case["split"]:
+            _fail(f"{rollout_where}.memory_phase", "does not match frozen case")
+        state_before = _string(rollout["memory_state_before"], f"{rollout_where}.memory_state_before")
+        state_after = _string(rollout["memory_state_after"], f"{rollout_where}.memory_state_after")
+        before_components = _object(
+            rollout["memory_components_before"],
+            f"{rollout_where}.memory_components_before",
+            ("markdown", "tinykg"),
+        )
+        after_components = _object(
+            rollout["memory_components_after"],
+            f"{rollout_where}.memory_components_after",
+            ("markdown", "tinykg"),
+        )
+        if expected_backend == "none":
+            if (
+                state_before != "none"
+                or state_after != "none"
+                or before_components != {"markdown": None, "tinykg": None}
+                or after_components != {"markdown": None, "tinykg": None}
+                or memory_reads != 0
+                or memory_writes != 0
+                or auto_injected_bytes != 0
+                or tool_result_bytes != 0
+            ):
+                _fail(rollout_where, "no-memory arm has durable-memory activity")
+        else:
+            if expected_backend == "markdown":
+                for components_where, components in (
+                    ("memory_components_before", before_components),
+                    ("memory_components_after", after_components),
+                ):
+                    _hash(components["markdown"], f"{rollout_where}.{components_where}.markdown")
+                    if components["tinykg"] is not None:
+                        _fail(f"{rollout_where}.{components_where}.tinykg", "Markdown arm must use null")
+            else:
+                for components_where, components in (
+                    ("memory_components_before", before_components),
+                    ("memory_components_after", after_components),
+                ):
+                    _hash(components["markdown"], f"{rollout_where}.{components_where}.markdown")
+                    _hash(components["tinykg"], f"{rollout_where}.{components_where}.tinykg")
+            if state_before != _canonical_sha256(before_components) or state_after != _canonical_sha256(after_components):
+                _fail(rollout_where, "memory state does not bind its components")
+        online = case["benchmark"] == "procedural_transfer" and phase == "online"
+        expected_write_mode = "disabled" if expected_backend == "none" else "online" if online else "read_only"
+        if memory.get("write_mode") != expected_write_mode:
+            _fail(f"{rollout_where}.observation.memory.write_mode", "lifecycle mismatch")
+        if not online and (memory_writes != 0 or state_before != state_after):
+            _fail(rollout_where, "read-only phase changed durable memory state")
+        if phase == "offline" and governance.get("offline_write_events") != 0:
+            _fail(f"{rollout_where}.observation.governance", "offline write leakage")
+        if retrieval.get("enabled") is not bool(retrieval.get("query_variants")):
+            _fail(f"{rollout_where}.observation.retrieval", "activation is not grounded in observed queries")
+
+        store_before = _string(rollout["store_revision_before"], f"{rollout_where}.store_revision_before")
+        store_after = _string(rollout["store_revision_after"], f"{rollout_where}.store_revision_after")
+        raw_before = _string(rollout["raw_store_digest_before"], f"{rollout_where}.raw_store_digest_before")
+        raw_after = _string(rollout["raw_store_digest_after"], f"{rollout_where}.raw_store_digest_after")
+        if tinykg_enabled:
+            for key, item in (
+                ("store_revision_before", store_before),
+                ("store_revision_after", store_after),
+                ("raw_store_digest_before", raw_before),
+                ("raw_store_digest_after", raw_after),
+            ):
+                _hash(item, f"{rollout_where}.{key}")
+            if before_components["tinykg"] != store_before or after_components["tinykg"] != store_after:
+                _fail(rollout_where, "integrated memory does not bind TinyKG revision")
+            if not online and (store_before != store_after or raw_before != raw_after):
+                _fail(rollout_where, "read-only phase changed TinyKG store")
+            if graph.get("revision") != store_after:
+                _fail(f"{rollout_where}.observation.graph.revision", "does not bind TinyKG state")
+        elif (store_before, store_after, raw_before, raw_after) != ("none", "none", "none", "none"):
+            _fail(rollout_where, "control arm must use none store digests")
+        elif graph.get("revision") != state_after:
+            _fail(f"{rollout_where}.observation.graph.revision", "does not bind memory state")
+
+    estimated_total = sum(float(item["estimated_cost_usd"]) for item in rollouts)
+    metered_total = sum(int(item["metered_tokens"]) for item in rollouts)
+    observed_estimated_total = _finite_number(
+        value["estimated_cost_usd"], f"{where}.estimated_cost_usd"
+    )
+    observed_metered_total = _integer(
+        value["metered_tokens"], f"{where}.metered_tokens", minimum=1
+    )
+    observed_provider_total = _integer(
+        value["provider_requests"], f"{where}.provider_requests", minimum=1
+    )
+    if observed_estimated_total != estimated_total or estimated_total > max_total_cost:
+        _fail(f"{where}.estimated_cost_usd", "does not equal bounded rollout total")
+    if observed_metered_total != metered_total or metered_total > max_total_tokens:
+        _fail(f"{where}.metered_tokens", "does not equal bounded rollout total")
+    provider_total = sum(int(item["provider_requests"]) for item in rollouts)
+    if observed_provider_total != provider_total:
+        _fail(f"{where}.provider_requests", "does not equal rollout total")
+
+
 def validate_runtime_receipt(
     receipt: Mapping[str, Any],
     manifest: Mapping[str, Any],
@@ -370,8 +1196,17 @@ def validate_runtime_receipt(
     if schema_version not in {REPLAY_SCHEMA_VERSION, *NATIVE_RUNTIME_RECEIPT_VERSIONS}:
         _fail(
             f"{where}.schema_version",
-            "expected replay v1, native wiring v2, or native lifecycle v3",
+            "expected replay v1, native wiring v2, native lifecycle v3, or production v4",
         )
+    if schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+        _validate_production_runtime_receipt(
+            receipt,
+            manifest,
+            observations,
+            dataset_sha256,
+            where,
+        )
+        return
     v2_fields = (
         "execution_mode",
         "quality_evidence",
@@ -460,7 +1295,10 @@ def validate_runtime_receipt(
 
     if schema_version not in NATIVE_RUNTIME_RECEIPT_VERSIONS:
         return
-    if schema_version == RUNTIME_RECEIPT_SCHEMA_VERSION:
+    if schema_version in {
+        RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+    }:
         raw_sources = value["runner_sources"]
         if not isinstance(raw_sources, list):
             _fail(f"{where}.runner_sources", "expected an array")
@@ -858,7 +1696,10 @@ def validate_runtime_artifacts(
     if schema_version not in NATIVE_RUNTIME_RECEIPT_VERSIONS:
         return
     seen_paths: set[str] = set()
-    if schema_version == RUNTIME_RECEIPT_SCHEMA_VERSION:
+    if schema_version in {
+        RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+    }:
         raw_sources = receipt.get("runner_sources")
         if not isinstance(raw_sources, list):
             _fail(f"{where}.runner_sources", "expected an array")
@@ -906,6 +1747,18 @@ def validate_runtime_artifacts(
         paths = raw_rollout.get("artifact_paths")
         if not isinstance(paths, dict):
             _fail(f"{rollout_where}.artifact_paths", "expected an object")
+        memory_root: Path | None = None
+        if (
+            schema_version
+            in {RUNTIME_RECEIPT_SCHEMA_VERSION, PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION}
+            and paths.get("memory_state") is not None
+        ):
+            memory_root = _artifact_path(
+                artifact_root,
+                paths.get("memory_state"),
+                f"{rollout_where}.artifact_paths.memory_state",
+                directory=True,
+            )
         for path_key, digest_key in file_specs:
             raw_path = paths.get(path_key)
             relative = _artifact_relative_path(
@@ -928,6 +1781,85 @@ def validate_runtime_artifacts(
             expected = _hash(raw_rollout.get(digest_key), f"{rollout_where}.{digest_key}")
             if observed != expected:
                 _fail(f"{rollout_where}.{digest_key}", "raw artifact SHA-256 mismatch")
+            if (
+                path_key == "native_events"
+                and schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
+            ):
+                from .e2e_adapter import _native_trace_metrics
+
+                native, native_error = _native_trace_metrics(path)
+                if native_error is not None or native is None:
+                    _fail(f"{rollout_where}.native_events", native_error or "invalid events")
+                if (
+                    not native.get("complete")
+                    or native.get("starts") != 1
+                    or native.get("finishes") != 1
+                    or native.get("dropped_events_total") != 0
+                ):
+                    _fail(f"{rollout_where}.native_events", "production lifecycle is incomplete")
+                metadata = native.get("metadata")
+                if not isinstance(metadata, dict):
+                    _fail(f"{rollout_where}.native_events", "run metadata is unavailable")
+                grader_fingerprints = {
+                    item["case_id"]: item["fingerprint"] for item in receipt["graders"]
+                }
+                expected_metadata = {
+                    "run_id": raw_rollout.get("run_id"),
+                    "trial": raw_rollout.get("trial"),
+                    "task_id": raw_rollout.get("case_id"),
+                    "task_fingerprint": raw_rollout.get("task_fingerprint"),
+                    "task_fingerprint_provenance": "recorded_at_execution",
+                    "model_provider": PRODUCTION_MODEL_PROVIDER,
+                    "model_id": PRODUCTION_MODEL_ID,
+                    "model_fingerprint": receipt.get("model_fingerprint"),
+                    "runtime_model_provider": PRODUCTION_MODEL_PROVIDER,
+                    "runtime_model_id": PRODUCTION_MODEL_ID,
+                    "harness_revision": receipt.get("harness_revision"),
+                    "harness_fingerprint": raw_rollout.get("harness_fingerprint"),
+                    "environment_fingerprint": raw_rollout.get("environment_fingerprint"),
+                    "grader_fingerprint": grader_fingerprints.get(raw_rollout.get("case_id")),
+                    "permission_mode": "bypass_permissions",
+                    "runtime_permission_mode": "bypass_permissions",
+                    "max_metered_tokens": receipt["budget"]["max_rollout_metered_tokens"],
+                    "max_cost_usd": receipt["budget"]["max_rollout_cost_usd"],
+                }
+                for key, expected in expected_metadata.items():
+                    if metadata.get(key) != expected:
+                        _fail(
+                            f"{rollout_where}.native_events.metadata.{key}",
+                            "does not match the production receipt",
+                        )
+                metrics = native["metrics"]
+                metered_tokens = sum(
+                    int(metrics[key])
+                    for key in (
+                        "input_tokens",
+                        "output_tokens",
+                        "cache_read_tokens",
+                        "cache_write_tokens",
+                    )
+                )
+                if metered_tokens != raw_rollout.get("metered_tokens"):
+                    _fail(f"{rollout_where}.metered_tokens", "native event total mismatch")
+                if metrics.get("model_request_count") != raw_rollout.get("provider_requests"):
+                    _fail(f"{rollout_where}.provider_requests", "native event total mismatch")
+                if metrics.get("compact_request_count") != raw_rollout.get("compact_event_count"):
+                    _fail(
+                        f"{rollout_where}.compact_event_count",
+                        "native event total mismatch",
+                    )
+                observed_cost = float(metrics.get("cost_usd", -1.0))
+                expected_cost = raw_rollout.get("estimated_cost_usd")
+                if (
+                    not isinstance(expected_cost, (int, float))
+                    or isinstance(expected_cost, bool)
+                    or abs(observed_cost - float(expected_cost)) > 1e-12
+                ):
+                    _fail(f"{rollout_where}.estimated_cost_usd", "native event total mismatch")
+                if _native_pricing_provenance(path, f"{rollout_where}.native_events") != raw_rollout.get(
+                    "pricing_provenance"
+                ):
+                    _fail(f"{rollout_where}.pricing_provenance", "native event provenance mismatch")
         for path_key, digest_key in tree_specs:
             raw_path = paths.get(path_key)
             relative = _artifact_relative_path(
@@ -947,13 +1879,25 @@ def validate_runtime_artifacts(
             expected = _hash(raw_rollout.get(digest_key), f"{rollout_where}.{digest_key}")
             if observed != expected:
                 _fail(f"{rollout_where}.{digest_key}", "raw artifact tree mismatch")
-            if path_key == "cassette" and schema_version == RUNTIME_RECEIPT_SCHEMA_VERSION:
+            if path_key == "cassette" and schema_version in {
+                RUNTIME_RECEIPT_SCHEMA_VERSION,
+                PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+            }:
                 activity = _cassette_memory_activity(
                     path,
                     f"{rollout_where}.artifact_paths.cassette",
+                    memory_root=memory_root,
                 )
                 if activity["provider_requests"] != raw_rollout.get("provider_requests"):
                     _fail(f"{rollout_where}.provider_requests", "raw cassette count mismatch")
+                if (
+                    schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
+                    and activity["forbidden_provider_tool_attempts"] != 0
+                ):
+                    _fail(
+                        f"{rollout_where}.artifact_paths.cassette",
+                        "production model attempted a forbidden nested-provider tool",
+                    )
                 backend = raw_rollout.get("memory_backend")
                 if backend == "tinykg":
                     expected_reads = activity["tinykg_reads"]
@@ -963,6 +1907,10 @@ def validate_runtime_artifacts(
                     expected_reads = activity["markdown_reads"]
                     expected_writes = activity["markdown_writes"]
                     foreign_activity = activity["tinykg_reads"] + activity["tinykg_writes"]
+                elif backend == "tinykg_integrated":
+                    expected_reads = activity["tinykg_reads"] + activity["markdown_reads"]
+                    expected_writes = activity["tinykg_writes"] + activity["markdown_writes"]
+                    foreign_activity = 0
                 else:
                     expected_reads = 0
                     expected_writes = 0
@@ -981,6 +1929,51 @@ def validate_runtime_artifacts(
                     _fail(f"{rollout_where}.memory_read_events", "raw cassette count mismatch")
                 if expected_writes != raw_rollout.get("memory_write_events"):
                     _fail(f"{rollout_where}.memory_write_events", "raw cassette count mismatch")
+                if schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+                    runtime_arm = _production_runtime_arm(str(raw_rollout.get("arm")))
+                    activation = _cassette_treatment_activation(
+                        path,
+                        runtime_arm,
+                        PRODUCTION_MODEL_ID,
+                        f"{rollout_where}.treatment_activation",
+                    )
+                    if activation != raw_rollout.get("treatment_activation"):
+                        _fail(
+                            f"{rollout_where}.treatment_activation",
+                            "raw provider request does not match receipt",
+                        )
+                    expected_index = b""
+                    if memory_root is not None and raw_rollout.get("memory_phase") != "online":
+                        index_path = memory_root / "MEMORY.md"
+                        if index_path.is_file():
+                            try:
+                                expected_index = index_path.read_bytes()
+                            except OSError as exc:
+                                raise ValidationError(
+                                    f"{rollout_where}.artifact_paths.memory_state: "
+                                    f"cannot read MEMORY.md: {exc}"
+                                ) from exc
+                    exposure = _cassette_memory_exposure(
+                        path,
+                        f"{rollout_where}.memory_exposure",
+                        memory_root=memory_root,
+                        expected_memory_index=expected_index,
+                        count_graph_context=raw_rollout.get("memory_backend") == "tinykg_integrated",
+                    )
+                    if exposure["auto_injected_bytes"] != raw_rollout.get(
+                        "memory_auto_injected_bytes"
+                    ):
+                        _fail(
+                            f"{rollout_where}.memory_auto_injected_bytes",
+                            "raw cassette count mismatch",
+                        )
+                    if exposure["tool_result_bytes"] != raw_rollout.get(
+                        "memory_tool_result_bytes"
+                    ):
+                        _fail(
+                            f"{rollout_where}.memory_tool_result_bytes",
+                            "raw cassette count mismatch",
+                        )
         store_path = paths.get("store")
         tinykg_enabled = raw_rollout.get("tinykg_binary_sha256") is not None
         if tinykg_enabled:
@@ -1041,6 +2034,27 @@ def validate_runtime_artifacts(
                     f"{rollout_where}.artifact_paths.memory_state",
                     "only Markdown rollouts have a separate memory tree",
                 )
+        elif schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+            memory_path = paths.get("memory_state")
+            backend = raw_rollout.get("memory_backend")
+            if backend == "none":
+                if memory_path is not None:
+                    _fail(
+                        f"{rollout_where}.artifact_paths.memory_state",
+                        "no-memory rollout must use null",
+                    )
+            else:
+                assert memory_root is not None
+                observed_markdown = _artifact_tree_digest(
+                    memory_root,
+                    f"{rollout_where}.artifact_paths.memory_state",
+                )
+                components = raw_rollout.get("memory_components_after")
+                if not isinstance(components, dict) or observed_markdown != components.get("markdown"):
+                    _fail(
+                        f"{rollout_where}.memory_components_after.markdown",
+                        "current Markdown tree no longer matches the production receipt",
+                    )
 
 
 def validate_manifest(manifest: Mapping[str, Any], where: str = "memory manifest") -> None:

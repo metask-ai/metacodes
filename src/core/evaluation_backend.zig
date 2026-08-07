@@ -565,7 +565,7 @@ pub const EvaluationBackend = struct {
                     .cache_read_tokens = u.cache_read_input_tokens,
                     .cache_write_tokens = u.cache_creation_input_tokens,
                     .estimated_cost_usd = estimated_cost_usd,
-                    .pricing_provenance = "metacodes_builtin_2026-04_with_fallback",
+                    .pricing_provenance = pricing.provenanceFor(self.metadata.runtime_model_id),
                 } });
                 // Persist complete usage before the next request boundary can
                 // consult the gate and terminate the scored rollout.

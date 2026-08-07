@@ -210,6 +210,14 @@ const ToolErrSig = struct {
 pub const MIN_AUTO_COMPACT_THRESHOLD: usize = 32_000;
 pub const COMPACT_MIN_SAVED_PERCENT: usize = 5;
 
+/// Evaluation runs disable transparent provider retries. This keeps the
+/// request gate, native model-request event, cassette request, and external
+/// side effect in a one-to-one relation. A failed physical attempt invalidates
+/// the rollout instead of silently spending outside the measured boundary.
+pub fn providerAttemptLimit(evaluation_gated: bool) u32 {
+    return if (evaluation_gated) 1 else client_mod.defaultMaxRetries();
+}
+
 /// 强制 auto-compact 阈值(测试/power-user 旋钮)。设 `METACODES_FORCE_COMPACT_AT=<tokens>` 后,
 /// **直接**把 auto/micro 阈值钉到该值,绕过 formula(≈window-reserve)和 32K 下限——让真模型 e2e
 /// 能在短对话里触发真实压缩+投影(否则 glm 262K 窗口下要灌 ~200K token 才够)。
@@ -893,7 +901,7 @@ pub fn run(
                 opts.abort,
                 opts.model_override,
                 null,
-                client_mod.defaultMaxRetries(),
+                providerAttemptLimit(opts.request_gate != null),
                 0, // base_ms=0 → 用默认 RETRY_BASE_MS(500)
                 reporter,
                 latestUserText(conversation), // web_search 显示用:用户原话(P1:作请求参数传, 不再 post-set)
