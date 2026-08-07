@@ -87,6 +87,53 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         self.assertFalse(_estimated_costs_match(0.0, float("inf")))
         self.assertFalse(_estimated_costs_match(-0.000001, 0.0))
 
+    def test_checked_in_pilot_v2_binds_artifacts_schedule_and_carryover(self):
+        pilot = ROOT / "evals/memory/pilots/procedural-glm52-v2"
+        contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        manifest = load_manifest(pilot / "manifest.json")
+        execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
+
+        for name, identity in contract["artifacts"].items():
+            payload = (pilot / name).read_bytes()
+            self.assertEqual(len(payload), identity["bytes"])
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), identity["sha256"])
+
+        self.assertEqual(contract["harness"]["revision"], execution["harness_revision"])
+        self.assertEqual(manifest["execution"], execution)
+        rows = [
+            [item["sequence"], item["case_id"], item["trial"], item["arm"]]
+            for item in manifest["schedule"]
+        ]
+        self.assertEqual(rows, contract["schedule"]["ordered_rows"])
+        ordered_tsv = "".join("\t".join(str(value) for value in row) + "\n" for row in rows)
+        self.assertEqual(
+            hashlib.sha256(ordered_tsv.encode("utf-8")).hexdigest(),
+            contract["schedule"]["ordered_tsv_sha256"],
+        )
+        self.assertEqual(
+            {item["id"]: item["fingerprint"] for item in manifest["execution"]["arms"]},
+            {item["id"]: item["fingerprint"] for item in contract["protocol"]["arms"]},
+        )
+        budget = contract["budget_authority"]
+        self.assertAlmostEqual(
+            budget["carryover_max_cost_usd"] + budget["max_total_cost_usd"],
+            budget["program_max_cost_usd"],
+        )
+        self.assertEqual(
+            budget["carryover_max_metered_tokens"]
+            + budget["max_total_metered_tokens"],
+            budget["program_max_metered_tokens"],
+        )
+        ProductionRuntimeConfig(
+            api_key="test-only",
+            allow_paid_rollouts=True,
+            max_total_cost_usd=budget["max_total_cost_usd"],
+            max_total_metered_tokens=budget["max_total_metered_tokens"],
+            max_rollout_cost_usd=budget["max_rollout_cost_usd"],
+            max_rollout_metered_tokens=budget["max_rollout_metered_tokens"],
+            max_output_tokens=budget["max_output_tokens"],
+        ).validate(len(rows))
+
     def _materialize_valid_production_events(self, root, rollout, grader_fingerprint):
         cassette = root / rollout["artifact_paths"]["cassette"]
         uses = {}
