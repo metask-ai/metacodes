@@ -1653,6 +1653,247 @@
           ]
         }
       ]
+    },
+    {
+      "id": "recovery-protocol-transfer",
+      "procedure_evidence_id": "procedure:recovery-protocol-transfer:v1",
+      "intent_template": "Register sibling recovery operation `{name}`. {instruction}",
+      "cases": [
+        {
+          "id": "incident-export",
+          "split": "online",
+          "bindings": {
+            "instruction": "Establish this family's recovery protocol: use compatibility alias RECOVERY_<UPPER_SNAKE_NAME>, phase order snapshot > diagnose > attest, and documentation line - <name> => <alias> [snapshot > diagnose > attest]. Update the operation registry, compatibility alias map, phase map, docs, and JSON contract.",
+            "name": "incident_export"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/recovery-operations.md",
+                "content": "# Recovery operations\n\n- inspect => INSPECT_V1 [observe > report]\n"
+              },
+              {
+                "path": "src/recovery_operations.py",
+                "content": "OPERATIONS = [\"inspect\"]\nCOMPAT_ALIAS = {\"inspect\": \"INSPECT_V1\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"]}\n"
+              },
+              {
+                "path": "tests/recovery-operations.json",
+                "content": "{\"operations\":[{\"name\":\"inspect\",\"compat_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/recovery-operations.md",
+              "src/recovery_operations.py",
+              "tests/recovery-operations.json"
+            ],
+            "required_changed_paths": [
+              "docs/recovery-operations.md",
+              "src/recovery_operations.py",
+              "tests/recovery-operations.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/recovery_operations.py",
+                "value": "OPERATIONS = [\"inspect\", \"incident_export\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/recovery_operations.py",
+                "value": "\"incident_export\": \"RECOVERY_INCIDENT_EXPORT\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/recovery_operations.py",
+                "value": "\"incident_export\": [\"snapshot\", \"diagnose\", \"attest\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/recovery-operations.md",
+                "value": "- incident_export => RECOVERY_INCIDENT_EXPORT [snapshot > diagnose > attest]"
+              },
+              {
+                "kind": "equals",
+                "path": "tests/recovery-operations.json",
+                "value": "{\"operations\":[{\"name\":\"inspect\",\"compat_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]},{\"name\":\"incident_export\",\"compat_alias\":\"RECOVERY_INCIDENT_EXPORT\",\"phases\":[\"snapshot\",\"diagnose\",\"attest\"]}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/recovery-operations.md",
+              "content": "# Recovery operations\n\n- inspect => INSPECT_V1 [observe > report]\n- incident_export => RECOVERY_INCIDENT_EXPORT [snapshot > diagnose > attest]\n"
+            },
+            {
+              "path": "src/recovery_operations.py",
+              "content": "OPERATIONS = [\"inspect\", \"incident_export\"]\nCOMPAT_ALIAS = {\"inspect\": \"INSPECT_V1\", \"incident_export\": \"RECOVERY_INCIDENT_EXPORT\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"], \"incident_export\": [\"snapshot\", \"diagnose\", \"attest\"]}\n"
+            },
+            {
+              "path": "tests/recovery-operations.json",
+              "content": "{\"operations\":[{\"name\":\"inspect\",\"compat_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]},{\"name\":\"incident_export\",\"compat_alias\":\"RECOVERY_INCIDENT_EXPORT\",\"phases\":[\"snapshot\",\"diagnose\",\"attest\"]}]}\n"
+            }
+          ]
+        },
+        {
+          "id": "journal-repair",
+          "split": "offline",
+          "bindings": {
+            "instruction": "Reuse the previously established family recovery protocol for this sibling. Update the operation registry, compatibility alias map, phase map, docs, and JSON contract.",
+            "name": "journal_repair"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/recovery-operations.md",
+                "content": "# Recovery operations\n\n- inspect => INSPECT_V1 [observe > report]\n"
+              },
+              {
+                "path": "src/recovery_operations.py",
+                "content": "OPERATIONS = [\"inspect\"]\nCOMPAT_ALIAS = {\"inspect\": \"INSPECT_V1\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"]}\n"
+              },
+              {
+                "path": "tests/recovery-operations.json",
+                "content": "{\"operations\":[{\"name\":\"inspect\",\"compat_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/recovery-operations.md",
+              "src/recovery_operations.py",
+              "tests/recovery-operations.json"
+            ],
+            "required_changed_paths": [
+              "docs/recovery-operations.md",
+              "src/recovery_operations.py",
+              "tests/recovery-operations.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/recovery_operations.py",
+                "value": "OPERATIONS = [\"inspect\", \"journal_repair\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/recovery_operations.py",
+                "value": "\"journal_repair\": \"RECOVERY_JOURNAL_REPAIR\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/recovery_operations.py",
+                "value": "\"journal_repair\": [\"snapshot\", \"diagnose\", \"attest\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/recovery-operations.md",
+                "value": "- journal_repair => RECOVERY_JOURNAL_REPAIR [snapshot > diagnose > attest]"
+              },
+              {
+                "kind": "equals",
+                "path": "tests/recovery-operations.json",
+                "value": "{\"operations\":[{\"name\":\"inspect\",\"compat_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]},{\"name\":\"journal_repair\",\"compat_alias\":\"RECOVERY_JOURNAL_REPAIR\",\"phases\":[\"snapshot\",\"diagnose\",\"attest\"]}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/recovery-operations.md",
+              "content": "# Recovery operations\n\n- inspect => INSPECT_V1 [observe > report]\n- journal_repair => RECOVERY_JOURNAL_REPAIR [snapshot > diagnose > attest]\n"
+            },
+            {
+              "path": "src/recovery_operations.py",
+              "content": "OPERATIONS = [\"inspect\", \"journal_repair\"]\nCOMPAT_ALIAS = {\"inspect\": \"INSPECT_V1\", \"journal_repair\": \"RECOVERY_JOURNAL_REPAIR\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"], \"journal_repair\": [\"snapshot\", \"diagnose\", \"attest\"]}\n"
+            },
+            {
+              "path": "tests/recovery-operations.json",
+              "content": "{\"operations\":[{\"name\":\"inspect\",\"compat_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]},{\"name\":\"journal_repair\",\"compat_alias\":\"RECOVERY_JOURNAL_REPAIR\",\"phases\":[\"snapshot\",\"diagnose\",\"attest\"]}]}\n"
+            }
+          ]
+        },
+        {
+          "id": "lease-recover",
+          "split": "offline",
+          "bindings": {
+            "instruction": "Reuse the previously established family recovery protocol for this sibling. Update the operation registry, compatibility alias map, phase map, docs, and JSON contract.",
+            "name": "lease_recover"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/recovery-operations.md",
+                "content": "# Recovery operations\n\n- inspect => INSPECT_V1 [observe > report]\n"
+              },
+              {
+                "path": "src/recovery_operations.py",
+                "content": "OPERATIONS = [\"inspect\"]\nCOMPAT_ALIAS = {\"inspect\": \"INSPECT_V1\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"]}\n"
+              },
+              {
+                "path": "tests/recovery-operations.json",
+                "content": "{\"operations\":[{\"name\":\"inspect\",\"compat_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/recovery-operations.md",
+              "src/recovery_operations.py",
+              "tests/recovery-operations.json"
+            ],
+            "required_changed_paths": [
+              "docs/recovery-operations.md",
+              "src/recovery_operations.py",
+              "tests/recovery-operations.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/recovery_operations.py",
+                "value": "OPERATIONS = [\"inspect\", \"lease_recover\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/recovery_operations.py",
+                "value": "\"lease_recover\": \"RECOVERY_LEASE_RECOVER\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/recovery_operations.py",
+                "value": "\"lease_recover\": [\"snapshot\", \"diagnose\", \"attest\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/recovery-operations.md",
+                "value": "- lease_recover => RECOVERY_LEASE_RECOVER [snapshot > diagnose > attest]"
+              },
+              {
+                "kind": "equals",
+                "path": "tests/recovery-operations.json",
+                "value": "{\"operations\":[{\"name\":\"inspect\",\"compat_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]},{\"name\":\"lease_recover\",\"compat_alias\":\"RECOVERY_LEASE_RECOVER\",\"phases\":[\"snapshot\",\"diagnose\",\"attest\"]}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/recovery-operations.md",
+              "content": "# Recovery operations\n\n- inspect => INSPECT_V1 [observe > report]\n- lease_recover => RECOVERY_LEASE_RECOVER [snapshot > diagnose > attest]\n"
+            },
+            {
+              "path": "src/recovery_operations.py",
+              "content": "OPERATIONS = [\"inspect\", \"lease_recover\"]\nCOMPAT_ALIAS = {\"inspect\": \"INSPECT_V1\", \"lease_recover\": \"RECOVERY_LEASE_RECOVER\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"], \"lease_recover\": [\"snapshot\", \"diagnose\", \"attest\"]}\n"
+            },
+            {
+              "path": "tests/recovery-operations.json",
+              "content": "{\"operations\":[{\"name\":\"inspect\",\"compat_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]},{\"name\":\"lease_recover\",\"compat_alias\":\"RECOVERY_LEASE_RECOVER\",\"phases\":[\"snapshot\",\"diagnose\",\"attest\"]}]}\n"
+            }
+          ]
+        }
+      ]
     }
   ]
 }

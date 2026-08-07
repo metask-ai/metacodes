@@ -237,8 +237,8 @@ class ProceduralMemoryAdapterTest(unittest.TestCase):
                 limit_families=2,
                 split_seed=20260806,
             )
-        with self.assertRaisesRegex(ValidationError, "requested 8 families"):
-            select_families(load_fixture()["families"], limit_families=8, split_seed=1)
+        with self.assertRaisesRegex(ValidationError, "requested 9 families"):
+            select_families(load_fixture()["families"], limit_families=9, split_seed=1)
 
     def test_cli_writes_three_distinct_artifacts_and_rejects_overlap(self):
         fixture_sha = hashlib.sha256(FIXTURE.read_bytes()).hexdigest()
