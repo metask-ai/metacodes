@@ -127,6 +127,35 @@ the agent stops, and compare the graph revision around every offline run. Offlin
 zero inserts and zero write events. The checked fixture is an adapter/validator trace, not evidence that one
 memory arm improves coding success.
 
+### Local TinyKG isolation smoke
+
+Benchmark corpora must never be sent through the user-level TinyKG skill harness because that harness may be
+configured for the remote canonical memory store. `smoke-local-tinykg-memory` instead invokes a hash-pinned
+TinyKG executable directly. It requires a fresh run directory, creates every store below that directory, gives
+children a sealed `HOME`, removes `TINYKG_STORE` and every `TINYKG_REMOTE_*` variable, and passes the store path
+positionally on every command. The smoke supports all three adapters: Hotpot documents/sentences,
+LongMemEval sessions/turns, and procedural online-evidence/offline-query families.
+
+```bash
+tinykg_sha=$(shasum -a 256 zig-out/vendor/tinykg/tinykg | cut -d' ' -f1)
+python3 -m scripts.eval.cli smoke-local-tinykg-memory \
+  --binary zig-out/vendor/tinykg/tinykg \
+  --expected-binary-sha256 "$tinykg_sha" \
+  --source /tmp/procedural-memory-source.json \
+  --manifest /tmp/procedural-memory-manifest.json \
+  --run-dir /tmp/metacodes-procedural-local-run \
+  --output /tmp/metacodes-procedural-local-run/trace.json \
+  --case-limit 1
+```
+
+The loader emits a TinyKG `apply` batch containing only public corpus fields. It then records lexical hits and a
+bounded graph-neighbor probe. A full content digest of the store is taken after online/import writes and again
+after `store-info`, `search`, and `neighbors`; any content change during this read-only phase fails the run. The
+trace records `skill_harness_invocations=0`, `remote_api_calls=0`, and `remote_store_writes=0`, along with binary,
+source, manifest, batch, and graph-revision hashes. These are isolation and plumbing claims, not memory-quality
+scores. Actual outcome experiments still require scheduled agent executions, deterministic grading, runtime
+receipts, repeated trials, and confidence intervals.
+
 ## Result row contract
 
 Each v2 JSONL row is validated by `scripts.eval.memory_benchmark` and must bind:

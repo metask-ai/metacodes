@@ -76,6 +76,7 @@ if __package__ in {None, ""}:
         load_runtime_receipt as load_memory_runtime_receipt,
         replay_observations,
     )
+    from scripts.eval.memory_tinykg_local import run_local_tinykg_smoke  # type: ignore
     from scripts.eval.paired_runner import run_multi_arm, run_paired  # type: ignore
     from scripts.eval.promotion import (  # type: ignore
         build_promotion_receipt,
@@ -145,6 +146,7 @@ else:
         load_runtime_receipt as load_memory_runtime_receipt,
         replay_observations,
     )
+    from .memory_tinykg_local import run_local_tinykg_smoke
     from .paired_runner import run_multi_arm, run_paired
     from .promotion import (
         build_promotion_receipt,
@@ -403,6 +405,25 @@ def cmd_adapt_procedural_memory(args: argparse.Namespace) -> int:
         f"families={len(source_slice['families'])} "
         f"cases={len(manifest['cases'])} "
         f"source={manifest['dataset']['source_sha256'][:16]}"
+    )
+    return 0
+
+
+def cmd_smoke_local_tinykg_memory(args: argparse.Namespace) -> int:
+    trace = run_local_tinykg_smoke(
+        binary=Path(args.binary),
+        expected_binary_sha256=args.expected_binary_sha256,
+        source_path=Path(args.source),
+        manifest_path=Path(args.manifest),
+        run_dir=Path(args.run_dir),
+        output_path=Path(args.output),
+        case_limit=args.case_limit,
+    )
+    print(
+        "local TinyKG memory smoke complete: "
+        f"adapter={trace['identity']['adapter_id']} "
+        f"cases={len(trace['cases'])} "
+        "remote_calls=0 remote_writes=0"
     )
     return 0
 
@@ -1111,6 +1132,19 @@ def parser() -> argparse.ArgumentParser:
     procedural_adapter_parser.add_argument("--limit-families", type=int, default=2)
     procedural_adapter_parser.add_argument("--split-seed", type=int, default=20260806)
     procedural_adapter_parser.set_defaults(func=cmd_adapt_procedural_memory)
+
+    local_tinykg_parser = commands.add_parser(
+        "smoke-local-tinykg-memory",
+        help="materialize a memory source slice in fresh explicit local TinyKG stores",
+    )
+    local_tinykg_parser.add_argument("--binary", required=True)
+    local_tinykg_parser.add_argument("--expected-binary-sha256", required=True)
+    local_tinykg_parser.add_argument("--source", required=True)
+    local_tinykg_parser.add_argument("--manifest", required=True)
+    local_tinykg_parser.add_argument("--run-dir", required=True)
+    local_tinykg_parser.add_argument("--output", required=True)
+    local_tinykg_parser.add_argument("--case-limit", type=int, default=1)
+    local_tinykg_parser.set_defaults(func=cmd_smoke_local_tinykg_memory)
 
     memory_replay_parser = commands.add_parser(
         "replay-memory",
