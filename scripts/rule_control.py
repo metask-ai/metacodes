@@ -3107,7 +3107,7 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
             "preauthorization host failure aborts before provider": all(
                 marker in preauth_test
                 for marker in (
-                    '"scripts.eval.memory_agent_runtime.os.pipe"',
+                    '"scripts.eval.memory_agent_runtime.os.fpathconf"',
                     '"aborted_pre_request": 1', "self.assertEqual(provider.requests, 0)",
                 )
             ),

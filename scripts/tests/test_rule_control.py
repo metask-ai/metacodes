@@ -1389,6 +1389,25 @@ class PaidBudgetJournalSensorTests(unittest.TestCase):
             observation.missing_declarations,
         )
 
+    def test_missing_pre_authorization_failure_path_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        tests = root / "scripts/eval/tests/test_memory_budget_runtime.py"
+        tests.write_text(
+            tests.read_text(encoding="utf-8").replace(
+                '"scripts.eval.memory_agent_runtime.os.fpathconf"',
+                '"scripts.eval.memory_agent_runtime.unobserved_pre_authorization_step"',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "real_runner_provider_requires_durable_authorization",
+            observation.missing_declarations,
+        )
+
     def test_missing_post_provider_crash_window_is_observed(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
