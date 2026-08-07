@@ -26,8 +26,10 @@ from scripts.eval.memory_budget_journal import (
     usd_to_microusd,
 )
 from scripts.eval.memory_replay import (
+    PRODUCTION_ALLOWED_PROVIDER_TOOLS,
     PRODUCTION_PRICING_PROVENANCE,
     PRODUCTION_PROVIDER_ID,
+    _artifact_tree_digest,
     load_manifest,
     validate_runtime_artifacts,
     validate_runtime_receipt,
@@ -37,6 +39,8 @@ from scripts.eval.model import ValidationError, stable_json
 
 ROOT = Path(__file__).resolve().parents[3]
 FIXTURES = ROOT / "evals/memory/fixtures"
+TEST_RIPGREP = Path(sys.executable).resolve()
+TEST_RIPGREP_SHA256 = hashlib.sha256(TEST_RIPGREP.read_bytes()).hexdigest()
 
 
 class _AuthorizationObservingServer:
@@ -261,6 +265,8 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
             max_rollout_cost_usd=1.0,
             max_rollout_metered_tokens=100_000,
             max_output_tokens=128,
+            ripgrep_binary=TEST_RIPGREP,
+            ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
         )
 
     def _authority(self, manifest) -> BudgetAuthority:
@@ -325,6 +331,12 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                 self.assertFalse(provider.errors)
                 self.assertIn("request_authorized", provider.observed_states)
                 self.assertEqual(receipt["rollouts"][0]["budget_transaction"]["state"], "committed")
+                self.assertEqual(
+                    receipt["allowed_provider_tools"],
+                    list(PRODUCTION_ALLOWED_PROVIDER_TOOLS),
+                )
+                self.assertNotIn("Task", receipt["allowed_provider_tools"])
+                self.assertEqual(receipt["ripgrep_binary_sha256"], TEST_RIPGREP_SHA256)
                 validate_runtime_receipt(
                     receipt,
                     manifest,
@@ -332,6 +344,18 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                     manifest["dataset"]["source_sha256"],
                 )
                 validate_runtime_artifacts(receipt, root / "run-success")
+
+                cassette = root / "run-success" / receipt["rollouts"][0]["artifact_paths"]["cassette"]
+                request_path = cassette / "req-001.json"
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+                request["tools"].append(
+                    {"name": "Task", "description": "forged", "input_schema": {"type": "object"}}
+                )
+                request_path.write_text(stable_json(request) + "\n", encoding="utf-8")
+                forged = copy.deepcopy(receipt)
+                forged["rollouts"][0]["cassette_sha256"] = _artifact_tree_digest(cassette)
+                with self.assertRaisesRegex(ValidationError, "out-of-policy tool 'Task'"):
+                    validate_runtime_artifacts(forged, root / "run-success")
 
     def test_crash_windows_remain_authorized_and_cannot_retry(self):
         for crash_stage, expected_requests in (
@@ -414,6 +438,8 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                 str(fake),
                 "--tinykg-binary",
                 str(tinykg),
+                "--ripgrep-binary",
+                str(TEST_RIPGREP),
                 "--source",
                 str(source_path),
                 "--manifest",

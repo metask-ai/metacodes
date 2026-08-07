@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -71,6 +72,8 @@ from scripts.eval.model import ValidationError, stable_json
 
 ROOT = Path(__file__).resolve().parents[3]
 FIXTURES = ROOT / "evals/memory/fixtures"
+TEST_RIPGREP = Path(sys.executable).resolve()
+TEST_RIPGREP_SHA256 = hashlib.sha256(TEST_RIPGREP.read_bytes()).hexdigest()
 
 
 def digest(label: str) -> str:
@@ -132,6 +135,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             max_rollout_cost_usd=budget["max_rollout_cost_usd"],
             max_rollout_metered_tokens=budget["max_rollout_metered_tokens"],
             max_output_tokens=budget["max_output_tokens"],
+            ripgrep_binary=TEST_RIPGREP,
+            ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
         ).validate(len(rows))
 
     def _materialize_valid_production_events(self, root, rollout, grader_fingerprint):
@@ -305,6 +310,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             max_rollout_cost_usd=0.9,
             max_rollout_metered_tokens=300_000,
             max_output_tokens=4096,
+            ripgrep_binary=TEST_RIPGREP,
+            ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
         )
         valid.validate(9)
         self.assertNotIn("super-secret-key", repr(valid))
@@ -360,6 +367,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                         "/bin/echo",
                         "--tinykg-binary",
                         str(tinykg),
+                        "--ripgrep-binary",
+                        str(TEST_RIPGREP),
                         "--source",
                         str(FIXTURES / "smoke-source.json"),
                         "--manifest",
@@ -399,6 +408,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                         "/bin/echo",
                         "--tinykg-binary",
                         "/bin/echo",
+                        "--ripgrep-binary",
+                        str(TEST_RIPGREP),
                         "--source",
                         str(FIXTURES / "smoke-source.json"),
                         "--manifest",
@@ -502,6 +513,10 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             sibling.write_text("sibling-secret\n", encoding="utf-8")
             profile = artifact / "production-seatbelt.sb"
             evidence_path = artifact / "production-seatbelt-probe.json"
+            ripgrep = artifact / "sealed-home" / ".metacodes" / "toolchain" / "rg"
+            ripgrep.parent.mkdir(parents=True)
+            ripgrep.write_bytes(TEST_RIPGREP.read_bytes())
+            ripgrep.chmod(0o500)
 
             sandbox = _materialize_production_sandbox(
                 profile_path=profile,
@@ -511,6 +526,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 store=store,
                 metacodes=Path("/bin/echo"),
                 tinykg=Path("/bin/cat"),
+                ripgrep=ripgrep,
             )
             evidence = _run_production_sandbox_probe(
                 sandbox,
@@ -531,10 +547,12 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                         "/bin/sh",
                         "-c",
                         'if /bin/echo changed > "$1" 2>/dev/null; then exit 21; fi; '
-                        'if /bin/echo changed > "$2" 2>/dev/null; then exit 22; fi',
+                        'if /bin/echo changed > "$2" 2>/dev/null; then exit 22; fi; '
+                        'if /bin/echo changed > "$3" 2>/dev/null; then exit 23; fi',
                         "sealed-profile-probe",
                         str(profile),
                         str(evidence_path),
+                        str(ripgrep),
                     ]
                 ),
                 cwd=workspace,
@@ -546,6 +564,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(sealed_probe.returncode, 0, sealed_probe.stderr)
+            self.assertEqual(hashlib.sha256(ripgrep.read_bytes()).hexdigest(), TEST_RIPGREP_SHA256)
             _assert_production_sandbox_identity(sandbox, evidence_path)
 
     def test_memory_exposure_uses_only_injected_and_successful_memory_reads(self):

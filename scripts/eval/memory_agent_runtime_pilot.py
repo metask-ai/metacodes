@@ -39,6 +39,7 @@ if __package__ in {None, ""}:
     )
     from scripts.eval.memory_replay import (  # type: ignore
         PRODUCTION_AUTO_COMPACT_POLICY,
+        PRODUCTION_ALLOWED_PROVIDER_TOOLS,
         PRODUCTION_DISALLOWED_PROVIDER_TOOLS,
         PRODUCTION_FILESYSTEM_ISOLATION,
         PRODUCTION_TOOL_NETWORK_ISOLATION,
@@ -58,6 +59,7 @@ else:
     from .memory_budget_journal import BudgetAuthority, BudgetJournal, usd_to_microusd
     from .memory_replay import (
         PRODUCTION_AUTO_COMPACT_POLICY,
+        PRODUCTION_ALLOWED_PROVIDER_TOOLS,
         PRODUCTION_DISALLOWED_PROVIDER_TOOLS,
         PRODUCTION_FILESYSTEM_ISOLATION,
         PRODUCTION_TOOL_NETWORK_ISOLATION,
@@ -121,6 +123,8 @@ def _config(args: argparse.Namespace, api_key: str, *, authorized: bool) -> Prod
         max_rollout_cost_usd=args.max_rollout_cost_usd,
         max_rollout_metered_tokens=args.max_rollout_metered_tokens,
         max_output_tokens=args.max_output_tokens,
+        ripgrep_binary=args.ripgrep_binary.expanduser().resolve(),
+        ripgrep_binary_sha256=file_sha256(args.ripgrep_binary.expanduser().resolve()),
     )
 
 
@@ -212,6 +216,8 @@ def _public_plan(
         "rollouts": len(manifest["schedule"]),
         "budget": budget.public_budget(),
         "disallowed_provider_tools": list(PRODUCTION_DISALLOWED_PROVIDER_TOOLS),
+        "allowed_provider_tools": list(PRODUCTION_ALLOWED_PROVIDER_TOOLS),
+        "ripgrep_binary_sha256": file_sha256(args.ripgrep_binary.expanduser().resolve()),
         "tool_network_isolation": PRODUCTION_TOOL_NETWORK_ISOLATION,
         "filesystem_isolation": PRODUCTION_FILESYSTEM_ISOLATION,
         "auto_compact_policy": PRODUCTION_AUTO_COMPACT_POLICY,
@@ -227,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--tinykg-binary", type=Path, required=True)
+    parser.add_argument("--ripgrep-binary", type=Path, required=True)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--validators", type=Path)
@@ -245,18 +252,20 @@ def main(argv: list[str] | None = None) -> int:
 
     metacodes = args.binary.expanduser().resolve()
     tinykg = args.tinykg_binary.expanduser().resolve()
+    ripgrep = args.ripgrep_binary.expanduser().resolve()
     source = args.source.expanduser().resolve()
     manifest_path = args.manifest.expanduser().resolve()
     for path, label in (
         (metacodes, "metacodes binary"),
         (tinykg, "TinyKG binary"),
+        (ripgrep, "ripgrep binary"),
         (source, "adapter source"),
         (manifest_path, "manifest"),
     ):
         if not path.is_file():
             raise ValidationError(f"{label} is unavailable")
-    if not os.access(metacodes, os.X_OK) or not os.access(tinykg, os.X_OK):
-        raise ValidationError("production binaries must be executable")
+    if not all(os.access(path, os.X_OK) for path in (metacodes, tinykg, ripgrep)):
+        raise ValidationError("production binaries and toolchain must be executable")
     metacodes_sha = file_sha256(metacodes)
     tinykg_sha = file_sha256(tinykg)
     manifest = load_manifest(manifest_path)

@@ -59,6 +59,7 @@ from .memory_replay import (
     PRODUCTION_MODEL_PROVIDER,
     PRODUCTION_PRICING_PROVENANCE,
     PRODUCTION_PROVIDER_ID,
+    PRODUCTION_ALLOWED_PROVIDER_TOOLS,
     PRODUCTION_DISALLOWED_PROVIDER_TOOLS,
     PRODUCTION_AUTO_COMPACT_POLICY,
     PRODUCTION_CHILD_PATH,
@@ -74,6 +75,7 @@ from .memory_replay import (
     _cassette_memory_activity,
     _cassette_memory_exposure,
     _cassette_treatment_activation,
+    _validate_production_provider_tool_schema,
     _native_pricing_provenance,
     _path_is_within,
     _production_harness_fingerprint,
@@ -91,7 +93,7 @@ from .model import ValidationError, stable_json
 
 
 RUNTIME_RECEIPT_SCHEMA_VERSION = 3
-PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 5
+PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 6
 RUNTIME_METADATA_SCHEMA_VERSION = NATIVE_EVENT_SCHEMA_VERSION
 SCRIPTED_PROVIDER_ID = "metacodes-memory-scripted-lifecycle-v3"
 SCRIPTED_LIFECYCLE_MODE = "native-agent-loop-scripted-lifecycle-smoke"
@@ -154,6 +156,8 @@ class ProductionRuntimeConfig:
     max_rollout_cost_usd: float = 0.0
     max_rollout_metered_tokens: int = 0
     max_output_tokens: int = 4096
+    ripgrep_binary: Path | None = None
+    ripgrep_binary_sha256: str | None = None
 
     def validate(self, rollout_count: int) -> None:
         if not self.allow_paid_rollouts:
@@ -188,6 +192,15 @@ class ProductionRuntimeConfig:
             _fail("production memory runtime", "rollout cost cap exceeds total cost cap")
         if self.max_rollout_metered_tokens > self.max_total_metered_tokens:
             _fail("production memory runtime", "rollout token cap exceeds total token cap")
+        if self.ripgrep_binary is None or self.ripgrep_binary_sha256 is None:
+            _fail("production memory runtime", "requires a pinned ripgrep binary")
+        if not HEX64.fullmatch(self.ripgrep_binary_sha256):
+            _fail("production memory runtime.ripgrep_binary_sha256", "expected SHA-256")
+        _assert_executable_identity(
+            self.ripgrep_binary,
+            self.ripgrep_binary_sha256,
+            "production ripgrep binary",
+        )
         # Strict inequality preserves one fail-closed unit of headroom: reaching
         # either hard cap is a terminal budget event, not a successful schedule.
         if self.max_rollout_cost_usd * rollout_count >= self.max_total_cost_usd:
@@ -1156,6 +1169,7 @@ def _runtime_metadata(
     model_provider: str,
     harness_fingerprint: str,
     environment_fingerprint: str,
+    allowed_tools: Sequence[str] | None = None,
     max_metered_tokens: int | None = None,
     max_cost_usd: float | None = None,
 ) -> Mapping[str, Any]:
@@ -1182,6 +1196,8 @@ def _runtime_metadata(
     if max_metered_tokens is not None:
         metadata["max_metered_tokens"] = max_metered_tokens
         metadata["max_cost_usd"] = float(max_cost_usd)
+    if allowed_tools is not None:
+        metadata["allowed_tools"] = list(allowed_tools)
     return metadata
 
 
@@ -1361,14 +1377,15 @@ def _materialize_production_sandbox(
     store: Path | None,
     metacodes: Path,
     tinykg: Path | None,
+    ripgrep: Path,
 ) -> ProductionSandbox:
     roots = [artifact_dir, workspace]
     if store is not None:
         roots.append(store)
     profile = _production_sandbox_profile(
         read_write_roots=roots,
-        read_only_files=(metacodes,) if tinykg is None else (metacodes, tinykg),
-        sealed_files=(profile_path, evidence_path),
+        read_only_files=(metacodes, ripgrep) if tinykg is None else (metacodes, tinykg, ripgrep),
+        sealed_files=(profile_path, evidence_path, ripgrep),
     )
     _write_new(profile_path, profile.encode("utf-8"))
     return ProductionSandbox(
@@ -1474,6 +1491,20 @@ def _assert_executable_identity(path: Path, expected_sha256: str, where: str) ->
         _fail(where, "is no longer executable")
     if file_sha256(path) != expected_sha256:
         _fail(where, "changed during the frozen schedule")
+
+
+def _materialize_pinned_ripgrep(
+    source: Path,
+    expected_sha256: str,
+    sealed_home: Path,
+) -> Path:
+    _assert_executable_identity(source, expected_sha256, "production ripgrep binary")
+    target = sealed_home / ".metacodes" / "toolchain" / "rg"
+    _write_new(target, _read_regular_file(source, "production ripgrep binary"))
+    target.chmod(0o500)
+    _assert_executable_identity(target, expected_sha256, "sealed production ripgrep binary")
+    _assert_executable_identity(source, expected_sha256, "production ripgrep binary")
+    return target
 
 
 def _validate_production_manifest(
@@ -1673,6 +1704,14 @@ def run_memory_agent_schedule(
                 expected_tinykg_sha256,
                 "production TinyKG binary",
             )
+            assert production is not None
+            assert production.ripgrep_binary is not None
+            assert production.ripgrep_binary_sha256 is not None
+            _assert_executable_identity(
+                production.ripgrep_binary,
+                production.ripgrep_binary_sha256,
+                "production ripgrep binary",
+            )
         if schedule["sequence"] != expected_sequence:
             _fail("memory schedule", "sequence is not contiguous")
         case = cases[schedule["case_id"]]
@@ -1706,6 +1745,15 @@ def run_memory_agent_schedule(
         cassette = artifact_dir / "cassette"
         for directory in (sealed_home, child_tmp, cassette):
             directory.mkdir()
+        pinned_ripgrep: Path | None = None
+        if production is not None:
+            assert production.ripgrep_binary is not None
+            assert production.ripgrep_binary_sha256 is not None
+            pinned_ripgrep = _materialize_pinned_ripgrep(
+                production.ripgrep_binary,
+                production.ripgrep_binary_sha256,
+                sealed_home,
+            )
 
         baseline: Dict[str, str] = {}
         public_case = public_cases.get(case["id"])
@@ -1851,6 +1899,7 @@ def run_memory_agent_schedule(
         sandbox_profile_path: Path | None = None
         sandbox_evidence_path: Path | None = None
         if production_mode:
+            assert pinned_ripgrep is not None
             sandbox_profile_path = artifact_dir / "production-seatbelt.sb"
             sandbox_evidence_path = artifact_dir / "production-seatbelt-probe.json"
             sibling_sentinel = (
@@ -1868,6 +1917,7 @@ def run_memory_agent_schedule(
                 store=store,
                 metacodes=metacodes,
                 tinykg=tinykg if tinykg_enabled else None,
+                ripgrep=pinned_ripgrep,
             )
             sandbox_evidence = _run_production_sandbox_probe(
                 sandbox,
@@ -1891,6 +1941,8 @@ def run_memory_agent_schedule(
                 runtime_arm=runtime_arm,
                 runtime_budget=production.public_budget(),
                 runner_sources=runner_sources,
+                allowed_provider_tools=PRODUCTION_ALLOWED_PROVIDER_TOOLS,
+                ripgrep_binary_sha256=production.ripgrep_binary_sha256,
             )
             if production is not None
             else _canonical_sha256(
@@ -1917,10 +1969,13 @@ def run_memory_agent_schedule(
         }
         if production_mode:
             assert sandbox is not None
+            assert production is not None
+            assert production.ripgrep_binary_sha256 is not None
             environment_claim.update(
                 {
                     "sandbox_backend": PRODUCTION_SANDBOX_BACKEND,
                     "sandbox_profile_sha256": sandbox.profile_sha256,
+                    "ripgrep_binary_sha256": production.ripgrep_binary_sha256,
                 }
             )
         environment_fingerprint = _canonical_sha256(environment_claim)
@@ -1933,6 +1988,7 @@ def run_memory_agent_schedule(
             model_provider=(PRODUCTION_MODEL_PROVIDER if production_mode else "scripted-local"),
             harness_fingerprint=harness_fingerprint,
             environment_fingerprint=environment_fingerprint,
+            allowed_tools=(PRODUCTION_ALLOWED_PROVIDER_TOOLS if production_mode else None),
             max_metered_tokens=(
                 production.max_rollout_metered_tokens if production is not None else None
             ),
@@ -1982,6 +2038,8 @@ def run_memory_agent_schedule(
             env["METACODES_KG_STORE"] = str(store)
         if production_mode:
             env["METACODES_FORCE_COMPACT_AT"] = PRODUCTION_FORCE_COMPACT_AT
+            assert pinned_ripgrep is not None
+            env["RG_BIN"] = str(pinned_ripgrep)
         common_args = [
             str(metacodes),
             "--model",
@@ -2161,6 +2219,19 @@ def run_memory_agent_schedule(
                 expected_tinykg_sha256,
                 "production TinyKG binary",
             )
+            assert production.ripgrep_binary is not None
+            assert production.ripgrep_binary_sha256 is not None
+            assert pinned_ripgrep is not None
+            _assert_executable_identity(
+                production.ripgrep_binary,
+                production.ripgrep_binary_sha256,
+                "production ripgrep binary",
+            )
+            _assert_executable_identity(
+                pinned_ripgrep,
+                production.ripgrep_binary_sha256,
+                "sealed production ripgrep binary",
+            )
             assert sandbox is not None
             assert sandbox_evidence_path is not None
             _assert_production_sandbox_identity(sandbox, sandbox_evidence_path)
@@ -2260,6 +2331,12 @@ def run_memory_agent_schedule(
             f"native memory rollout {run_id} cassette",
             memory_root=memory_dir,
         )
+        if production is not None:
+            _validate_production_provider_tool_schema(
+                cassette,
+                f"native memory rollout {run_id} cassette",
+                PRODUCTION_ALLOWED_PROVIDER_TOOLS,
+            )
         if cassette_activity["provider_requests"] != provider_request_count:
             _fail(f"native memory rollout {run_id}", "raw provider request count drift")
         if production is not None and cassette_activity["forbidden_provider_tool_attempts"] != 0:
@@ -2716,6 +2793,8 @@ def run_memory_agent_schedule(
                 "provider_id": PRODUCTION_PROVIDER_ID,
                 "model_provider": PRODUCTION_MODEL_PROVIDER,
                 "disallowed_provider_tools": list(PRODUCTION_DISALLOWED_PROVIDER_TOOLS),
+                "allowed_provider_tools": list(PRODUCTION_ALLOWED_PROVIDER_TOOLS),
+                "ripgrep_binary_sha256": production.ripgrep_binary_sha256,
                 "budget": production.public_budget(),
                 "provider_requests": sum(
                     int(rollout["provider_requests"]) for rollout in rollout_receipts

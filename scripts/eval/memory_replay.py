@@ -40,18 +40,21 @@ REPLAY_SCHEMA_VERSION = 1
 LEGACY_RUNTIME_RECEIPT_SCHEMA_VERSION = 2
 RUNTIME_RECEIPT_SCHEMA_VERSION = 3
 LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 4
-PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 5
+BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 5
+PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 6
 NATIVE_RUNTIME_RECEIPT_VERSIONS = frozenset(
     {
         LEGACY_RUNTIME_RECEIPT_SCHEMA_VERSION,
         RUNTIME_RECEIPT_SCHEMA_VERSION,
         LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }
 )
 PRODUCTION_RUNTIME_RECEIPT_VERSIONS = frozenset(
     {
         LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }
 )
@@ -98,6 +101,22 @@ PRODUCTION_DISALLOWED_PROVIDER_TOOLS = (
     "TeamCreate",
     "WebFetch",
     "WebSearch",
+)
+PRODUCTION_ALLOWED_PROVIDER_TOOLS = (
+    "Read",
+    "Write",
+    "Edit",
+    "ApplyPatch",
+    "Glob",
+    "Grep",
+    "CodeMap",
+    "FindSymbol",
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "KgRemember",
+    "KgRecall",
+    "KgContext",
 )
 PRODUCTION_TOOL_NETWORK_ISOLATION = "not_proven_bash_network_unsandboxed"
 PRODUCTION_SANDBOX_BACKEND = "macos-seatbelt-sandbox-exec-v1"
@@ -219,7 +238,10 @@ def _query_plan_source_bound(receipt: Mapping[str, Any], where: str) -> bool:
     elif schema_version == LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
         if observed != LEGACY_PRODUCTION_RUNNER_SOURCE_MODULES:
             _fail(f"{where}.runner_sources", "unknown legacy production source set")
-    elif schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+    elif schema_version in {
+        BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+    }:
         if observed not in {
             PRE_QUERY_PLAN_PRODUCTION_RUNNER_SOURCE_MODULES,
             PRODUCTION_RUNNER_SOURCE_MODULES,
@@ -239,11 +261,12 @@ def _production_harness_fingerprint(
     runtime_arm: str,
     runtime_budget: Mapping[str, Any],
     runner_sources: Sequence[Mapping[str, Any]],
+    allowed_provider_tools: Sequence[str] | None = None,
+    ripgrep_binary_sha256: str | None = None,
 ) -> str:
     """Compute the production harness identity used at run and replay time."""
 
-    return _canonical_sha256(
-        {
+    identity = {
             "metacodes_binary_sha256": metacodes_binary_sha256,
             "tinykg_binary_sha256": tinykg_binary_sha256,
             "harness_revision": harness_revision,
@@ -255,8 +278,13 @@ def _production_harness_fingerprint(
             "filesystem_isolation": PRODUCTION_FILESYSTEM_ISOLATION,
             "auto_compact_policy": PRODUCTION_AUTO_COMPACT_POLICY,
             "runner_sources_sha256": _canonical_sha256(list(runner_sources)),
-        }
-    )
+    }
+    if allowed_provider_tools is not None or ripgrep_binary_sha256 is not None:
+        if allowed_provider_tools is None or ripgrep_binary_sha256 is None:
+            _fail("production harness fingerprint", "incomplete toolchain identity")
+        identity["allowed_provider_tools"] = list(allowed_provider_tools)
+        identity["ripgrep_binary_sha256"] = ripgrep_binary_sha256
+    return _canonical_sha256(identity)
 
 
 def _finite_number(value: Any, where: str, *, minimum: float = 0.0) -> float:
@@ -454,6 +482,40 @@ def _cassette_memory_activity(
         elif markdown_write:
             counts["markdown_writes"] += 1
     return counts
+
+
+def _validate_production_provider_tool_schema(
+    root: Path,
+    where: str,
+    allowed_tools: Sequence[str],
+) -> None:
+    """Re-open every provider request and enforce the sealed schema ceiling."""
+
+    allowed = set(allowed_tools)
+    if not allowed or len(allowed) != len(allowed_tools):
+        _fail(where, "production allowed-tool policy is empty or duplicated")
+    request_paths = sorted(root.glob("req-*.json"))
+    if not request_paths:
+        _fail(where, "provider cassette has no request artifacts")
+    for request_path in request_paths:
+        body = _load_unique_json(request_path, f"{where}.{request_path.name}")
+        tools = body.get("tools")
+        if not isinstance(tools, list):
+            _fail(f"{where}.{request_path.name}.tools", "expected an array")
+        seen: set[str] = set()
+        for index, raw_tool in enumerate(tools):
+            tool_where = f"{where}.{request_path.name}.tools[{index}]"
+            if not isinstance(raw_tool, dict):
+                _fail(tool_where, "expected an object")
+            name = _string(raw_tool.get("name"), f"{tool_where}.name")
+            if name in seen:
+                _fail(f"{tool_where}.name", "duplicate provider tool definition")
+            seen.add(name)
+            if name not in allowed:
+                _fail(
+                    f"{tool_where}.name",
+                    f"provider schema exposed out-of-policy tool {name!r}",
+                )
 
 
 def _cassette_memory_exposure(
@@ -939,12 +1001,13 @@ def _validate_production_runtime_receipt(
     where: str,
 ) -> None:
     schema_version = receipt.get("schema_version")
-    if schema_version not in {
-        LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+    if schema_version not in PRODUCTION_RUNTIME_RECEIPT_VERSIONS:
+        _fail(f"{where}.schema_version", "expected production runtime receipt v4, v5, or v6")
+    journal_bound = schema_version in {
+        BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
-    }:
-        _fail(f"{where}.schema_version", "expected production runtime receipt v4 or v5")
-    journal_bound = schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
+    }
+    toolchain_bound = schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
     value = _object(
         receipt,
         where,
@@ -967,6 +1030,7 @@ def _validate_production_runtime_receipt(
             "provider_id",
             "model_provider",
             "disallowed_provider_tools",
+            *(("allowed_provider_tools", "ripgrep_binary_sha256") if toolchain_bound else ()),
             "metacodes_binary_sha256",
             "tinykg_binary_sha256",
             "budget",
@@ -1015,6 +1079,13 @@ def _validate_production_runtime_receipt(
             f"{where}.disallowed_provider_tools",
             "nested provider side-effect policy drift",
         )
+    if toolchain_bound:
+        if value["allowed_provider_tools"] != list(PRODUCTION_ALLOWED_PROVIDER_TOOLS):
+            _fail(
+                f"{where}.allowed_provider_tools",
+                "provider-visible production tool policy drift",
+            )
+        _hash(value["ripgrep_binary_sha256"], f"{where}.ripgrep_binary_sha256")
     if value["tool_network_isolation"] != PRODUCTION_TOOL_NETWORK_ISOLATION:
         _fail(
             f"{where}.tool_network_isolation",
@@ -1216,6 +1287,12 @@ def _validate_production_runtime_receipt(
             runtime_arm=runtime_arm,
             runtime_budget=budget,
             runner_sources=raw_sources,
+            allowed_provider_tools=(
+                value["allowed_provider_tools"] if toolchain_bound else None
+            ),
+            ripgrep_binary_sha256=(
+                value["ripgrep_binary_sha256"] if toolchain_bound else None
+            ),
         )
         if _hash(
             rollout["harness_fingerprint"],
@@ -1233,6 +1310,7 @@ def _validate_production_runtime_receipt(
                 "project_domain",
                 "child_path",
                 "auto_compact_policy",
+                *(("ripgrep_binary_sha256",) if toolchain_bound else ()),
                 *(("sandbox_backend", "sandbox_profile_sha256") if journal_bound else ()),
             ),
         )
@@ -1251,6 +1329,11 @@ def _validate_production_runtime_receipt(
             _fail(f"{rollout_where}.environment.child_path", "production environment is not minimal")
         if environment["auto_compact_policy"] != PRODUCTION_AUTO_COMPACT_POLICY:
             _fail(f"{rollout_where}.environment.auto_compact_policy", "production trace may compact")
+        if toolchain_bound and environment["ripgrep_binary_sha256"] != value["ripgrep_binary_sha256"]:
+            _fail(
+                f"{rollout_where}.environment.ripgrep_binary_sha256",
+                "does not bind the production toolchain",
+            )
         if journal_bound:
             sandbox = _object(
                 rollout["sandbox"],
@@ -1707,6 +1790,7 @@ def validate_runtime_receipt(
     if schema_version in {
         RUNTIME_RECEIPT_SCHEMA_VERSION,
         LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }:
         raw_sources = value["runner_sources"]
@@ -2114,6 +2198,7 @@ def validate_runtime_artifacts(
     if schema_version in {
         RUNTIME_RECEIPT_SCHEMA_VERSION,
         LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }:
         raw_sources = receipt.get("runner_sources")
@@ -2143,7 +2228,10 @@ def validate_runtime_artifacts(
             expected_runner_sha = _hash(raw_source.get("sha256"), f"{source_where}.sha256")
             if observed_runner_sha != expected_runner_sha:
                 _fail(f"{source_where}.sha256", "runtime source mismatch")
-    if schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+    if schema_version in {
+        BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+    }:
         journal_receipt = receipt.get("budget_journal")
         if not isinstance(journal_receipt, dict):
             _fail(f"{where}.budget_journal", "expected an object")
@@ -2218,7 +2306,10 @@ def validate_runtime_artifacts(
         rollout_where = f"{where}.rollouts[{index}]"
         if not isinstance(raw_rollout, dict):
             _fail(rollout_where, "expected an object")
-        if schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+        if schema_version in {
+            BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+            PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        }:
             assert checkpoint_transactions is not None
             transaction_receipt = raw_rollout.get("budget_transaction")
             if not isinstance(transaction_receipt, dict):
@@ -2367,6 +2458,7 @@ def validate_runtime_artifacts(
             in {
                 RUNTIME_RECEIPT_SCHEMA_VERSION,
                 LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
             }
             and paths.get("memory_state") is not None
@@ -2497,9 +2589,31 @@ def validate_runtime_artifacts(
             expected = _hash(raw_rollout.get(digest_key), f"{rollout_where}.{digest_key}")
             if observed != expected:
                 _fail(f"{rollout_where}.{digest_key}", "raw artifact tree mismatch")
+            if (
+                path_key == "transcript"
+                and schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
+            ):
+                ripgrep = path / ".metacodes" / "toolchain" / "rg"
+                try:
+                    info = ripgrep.lstat()
+                except OSError as exc:
+                    raise ValidationError(
+                        f"{rollout_where}.ripgrep_binary_sha256: cannot stat artifact: {exc}"
+                    ) from exc
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not info.st_mode & 0o111:
+                    _fail(
+                        f"{rollout_where}.ripgrep_binary_sha256",
+                        "expected a private executable regular artifact",
+                    )
+                if file_sha256(ripgrep) != receipt["ripgrep_binary_sha256"]:
+                    _fail(
+                        f"{rollout_where}.ripgrep_binary_sha256",
+                        "sealed ripgrep artifact identity drift",
+                    )
             if path_key == "cassette" and schema_version in {
                 RUNTIME_RECEIPT_SCHEMA_VERSION,
                 LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
             }:
                 activity = _cassette_memory_activity(
@@ -2507,6 +2621,12 @@ def validate_runtime_artifacts(
                     f"{rollout_where}.artifact_paths.cassette",
                     memory_root=memory_root,
                 )
+                if schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+                    _validate_production_provider_tool_schema(
+                        path,
+                        f"{rollout_where}.artifact_paths.cassette",
+                        receipt["allowed_provider_tools"],
+                    )
                 if activity["provider_requests"] != raw_rollout.get("provider_requests"):
                     _fail(f"{rollout_where}.provider_requests", "raw cassette count mismatch")
                 if (
