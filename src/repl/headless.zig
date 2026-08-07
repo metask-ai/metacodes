@@ -14,6 +14,10 @@ const std = @import("std");
 const pfs = @import("platform").fs;
 const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
+const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
+const request_gate_mod = @import("../core/request_gate.zig");
+const tee_backend_mod = @import("../core/tee_backend.zig");
+const ui_backend_mod = @import("../core/protocol/ui_backend.zig");
 const writer_backend = @import("../core/writer_backend.zig");
 
 /// headless 用 WriterBackend null-sink:吞掉 agent_loop 的流式输出（ANSI + tool 注解），
@@ -33,8 +37,36 @@ pub fn run(
 
     try app.conversation.appendText(.user, trimmed);
 
+    // Headless is the benchmark/CI entry point, so evaluation cannot remain a
+    // REPL-only decorator.  Metadata and event fds are host-owned; malformed
+    // grounding fails before the provider or any tool can run.
+    var eval_runtime = try evaluation_backend_mod.RuntimeConfig.fromEnvironment(allocator);
+    defer if (eval_runtime) |*runtime| runtime.deinit();
+
     var wb = writer_backend.WriterBackend.initNullWithUsage(&app.usage);
-    const be = wb.backend();
+    var be = wb.backend();
+    var eval_be: ?evaluation_backend_mod.EvaluationBackend = if (eval_runtime) |*runtime| blk: {
+        const active_provider = app.provider();
+        runtime.configureBudgetReserve(
+            active_provider.maxInputTokens(),
+            active_provider.maxTokens(),
+            app.activeModel(),
+        );
+        break :blk try runtime.initEvaluation(allocator, runtime.nextMetadata(
+            @tagName(app.config.provider_kind),
+            app.activeModel(),
+            @tagName(app.permission_ctx.modeValue()),
+        ));
+    } else null;
+    const eval_request_gate = if (eval_runtime) |*runtime|
+        runtime.requestGate(&app.abort)
+    else
+        null;
+    defer if (eval_be) |*evaluation| evaluation.deinit();
+    var eval_ui: ui_backend_mod.UiBackend = if (eval_be) |*evaluation| evaluation.backend() else be;
+    var eval_tee = tee_backend_mod.TeeBackend{ .primary = &be, .secondary = &eval_ui };
+    const eval_tee_ui = eval_tee.backend();
+    const effective_be: *const ui_backend_mod.UiBackend = if (eval_be != null) &eval_tee_ui else &be;
     // scoped 自动召回(一等公民 P1):headless 单次 prompt 也按请求装配相关记忆(cache-safe 尾注入)。
     const scoped_recall = if (app.kg) |*k| (@import("../kg/scoped_recall.zig").build(allocator, k, &app.conversation, &app.abort) catch null) else null;
     defer if (scoped_recall) |s| allocator.free(s);
@@ -43,13 +75,20 @@ pub fn run(
         app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        buildOptions(app, scoped_recall),
-        &be,
+        buildOptions(app, scoped_recall, eval_request_gate, eval_be != null),
+        effective_be,
         allocator,
     ) catch |err| {
         std.debug.print("error: {s}\n", .{@errorName(err)});
         return 1;
     };
+
+    // Streaming writes every complete event as it is emitted; the final flush
+    // is still mandatory so a short write or transient sink error cannot leave
+    // a successful headless result backed by an incomplete artifact.
+    if (eval_be) |*evaluation| {
+        if (eval_runtime) |*runtime| try runtime.appendEvaluation(evaluation);
+    }
 
     app.persistTranscript();
 
@@ -95,7 +134,12 @@ fn pendingRequestFn(
 }
 var pending_requester_dummy: u8 = 0;
 
-fn buildOptions(app: *app_mod.App, scoped_recall: ?[]const u8) agent_loop.Options {
+fn buildOptions(
+    app: *app_mod.App,
+    scoped_recall: ?[]const u8,
+    request_gate: ?request_gate_mod.Gate,
+    emit_semantic_tool_events: bool,
+) agent_loop.Options {
     return .{
         // task#20:--suspendable 时装恒 .pending requester → headless 遇 UI 工具挂起而非 NotATty。
         .ui_requester = if (app.config.suspendable)
@@ -104,6 +148,11 @@ fn buildOptions(app: *app_mod.App, scoped_recall: ?[]const u8) agent_loop.Option
             null,
         .verbose = app.config.verbose,
         .abort = &app.abort,
+        .request_gate = request_gate,
+        // Tool lifecycle events are part of the evaluation protocol even
+        // though the null writer renders no cards.  Leaving this false made
+        // headless traces contain policy decisions without tool attempts.
+        .emit_tool_cards = emit_semantic_tool_events,
         .read_state = &app.read_state,
         .lsp = app.lsp_service, // Y2:headless 也接 LSP 诊断
         .jobs = if (app.jobs) |*j| j else null,
@@ -191,7 +240,7 @@ pub fn resumeSuspended(
         state.tool_use_id,
         response_json,
         crs,
-        buildOptions(app, null), // resume 不重新召回
+        buildOptions(app, null, null, false), // resume 不重新召回;fresh eval metadata 已在原进程消费
         &be,
         allocator,
     ) catch |err| {
