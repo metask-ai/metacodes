@@ -101,6 +101,7 @@ class SlowMockServer:
     def __init__(self, turns):
         self.turns = turns
         self.turn_idx = 0
+        self.requests = []
         self._srv = None
         self._thr = None
         self.port = None
@@ -114,7 +115,7 @@ class SlowMockServer:
 
             def do_POST(self):
                 ln = int(self.headers.get('content-length', 0))
-                self.rfile.read(ln)
+                outer.requests.append(self.rfile.read(ln))
                 self.send_response(200)
                 self.send_header('content-type', 'text/event-stream')
                 self.end_headers()

@@ -15,6 +15,7 @@ const pricing = @import("../util/pricing.zig");
 const log = @import("../util/log.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const request_gate = @import("request_gate.zig");
+const ToolExecutionPolicy = @import("../tools/context.zig").ToolExecutionPolicy;
 
 const CoreEvent = ui_backend.CoreEvent;
 const UiEvent = ui_backend.UiEvent;
@@ -70,6 +71,11 @@ pub const RuntimeMetadataFile = struct {
     permission_mode: []const u8,
     environment_fingerprint: []const u8,
     grader_fingerprint: []const u8,
+    /// Optional host-sealed provider-visible/executable tool ceiling. The
+    /// production memory runner uses this to remove interactive and nested
+    /// provider tools from the model schema, not merely deny them after the
+    /// model has already selected one.
+    allowed_tools: ?[]const []const u8 = null,
     max_metered_tokens: ?u64 = null,
     max_cost_usd: ?f64 = null,
 };
@@ -217,6 +223,18 @@ pub const RuntimeConfig = struct {
             if (!std.math.isFinite(value) or value <= 0)
                 return error.InvalidEvaluationBudget;
         }
+        if (parsed.value.allowed_tools) |allowed_tools| {
+            if (allowed_tools.len == 0 or allowed_tools.len > 128)
+                return error.InvalidEvaluationToolPolicy;
+            for (allowed_tools, 0..) |name, index| {
+                if (name.len == 0 or name.len > 128)
+                    return error.InvalidEvaluationToolPolicy;
+                for (allowed_tools[0..index]) |previous| {
+                    if (std.mem.eql(u8, name, previous))
+                        return error.InvalidEvaluationToolPolicy;
+                }
+            }
+        }
         return .{
             .allocator = allocator,
             .parsed = parsed,
@@ -225,6 +243,32 @@ pub const RuntimeConfig = struct {
                 .max_cost_usd = max_cost,
             },
         };
+    }
+
+    pub fn toolExecutionPolicy(self: *const RuntimeConfig) ?ToolExecutionPolicy {
+        if (self.parsed.value.allowed_tools == null) return null;
+        return .{
+            .ctx = @ptrCast(self),
+            .allowsToolFn = allowsEvaluationTool,
+            .allowsInvocationFn = allowsEvaluationInvocation,
+        };
+    }
+
+    fn allowsEvaluationTool(raw: *const anyopaque, name: []const u8) bool {
+        const self: *const RuntimeConfig = @ptrCast(@alignCast(raw));
+        const allowed_tools = self.parsed.value.allowed_tools orelse return true;
+        for (allowed_tools) |allowed| {
+            if (std.mem.eql(u8, name, allowed)) return true;
+        }
+        return false;
+    }
+
+    fn allowsEvaluationInvocation(
+        raw: *const anyopaque,
+        name: []const u8,
+        _: []const u8,
+    ) bool {
+        return allowsEvaluationTool(raw, name);
     }
 
     pub fn deinit(self: *RuntimeConfig) void {
@@ -851,7 +895,7 @@ test "RuntimeConfig loads frozen identities and records runtime identity" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "metadata.json",
         .data =
-        \\{"schema_version":3,"events_path":"events.jsonl","run_id":"rollout-1","trial":2,"suite_id":"suite","task_id":"task","task_fingerprint":"task-fp","model_provider":"test","model_id":"model-a","model_fingerprint":"model-fp","harness_config_id":"candidate","harness_revision":"abc","harness_fingerprint":"harness-fp","permission_mode":"default","environment_fingerprint":"env-fp","grader_fingerprint":"grader-fp"}
+        \\{"schema_version":3,"events_path":"events.jsonl","run_id":"rollout-1","trial":2,"suite_id":"suite","task_id":"task","task_fingerprint":"task-fp","model_provider":"test","model_id":"model-a","model_fingerprint":"model-fp","harness_config_id":"candidate","harness_revision":"abc","harness_fingerprint":"harness-fp","permission_mode":"default","environment_fingerprint":"env-fp","grader_fingerprint":"grader-fp","allowed_tools":["Read","Write"]}
         ,
     });
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -868,6 +912,11 @@ test "RuntimeConfig loads frozen identities and records runtime identity" {
     try std.testing.expectEqualStrings("test", metadata.runtime_model_provider);
     try std.testing.expectEqual(@as(u32, 0), metadata.invocation);
     try std.testing.expectEqual(@as(u32, 1), runtime.invocation);
+    const policy = runtime.toolExecutionPolicy().?;
+    try std.testing.expect(policy.allowsTool("Read"));
+    try std.testing.expect(policy.allowsInvocation("Write", "{}"));
+    try std.testing.expect(!policy.allowsTool("Task"));
+    try std.testing.expect(!policy.allowsInvocation("Task", "{}"));
 }
 
 test "EvaluationBackend appends complete NDJSON runs to a private artifact" {

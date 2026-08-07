@@ -62,6 +62,10 @@ pub fn run(
         runtime.requestGate(&app.abort)
     else
         null;
+    const eval_execution_policy = if (eval_runtime) |*runtime|
+        runtime.toolExecutionPolicy()
+    else
+        null;
     defer if (eval_be) |*evaluation| evaluation.deinit();
     var eval_ui: ui_backend_mod.UiBackend = if (eval_be) |*evaluation| evaluation.backend() else be;
     var eval_tee = tee_backend_mod.TeeBackend{ .primary = &be, .secondary = &eval_ui };
@@ -75,7 +79,13 @@ pub fn run(
         app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        buildOptions(app, scoped_recall, eval_request_gate, eval_be != null),
+        buildOptions(
+            app,
+            scoped_recall,
+            eval_request_gate,
+            eval_execution_policy,
+            eval_be != null,
+        ),
         effective_be,
         allocator,
     ) catch |err| {
@@ -138,6 +148,7 @@ fn buildOptions(
     app: *app_mod.App,
     scoped_recall: ?[]const u8,
     request_gate: ?request_gate_mod.Gate,
+    execution_policy: ?@import("../tools/context.zig").ToolExecutionPolicy,
     emit_semantic_tool_events: bool,
 ) agent_loop.Options {
     return .{
@@ -149,6 +160,7 @@ fn buildOptions(
         .verbose = app.config.verbose,
         .abort = &app.abort,
         .request_gate = request_gate,
+        .execution_policy = execution_policy,
         // Tool lifecycle events are part of the evaluation protocol even
         // though the null writer renders no cards.  Leaving this false made
         // headless traces contain policy decisions without tool attempts.
@@ -240,7 +252,7 @@ pub fn resumeSuspended(
         state.tool_use_id,
         response_json,
         crs,
-        buildOptions(app, null, null, false), // resume 不重新召回;fresh eval metadata 已在原进程消费
+        buildOptions(app, null, null, null, false), // resume 不重新召回;fresh eval metadata 已在原进程消费
         &be,
         allocator,
     ) catch |err| {

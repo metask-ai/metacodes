@@ -20,6 +20,111 @@ BIN = os.environ.get("METACODES_NATIVE_E2E_BIN")
 
 @unittest.skipUnless(BIN, "set METACODES_NATIVE_E2E_BIN to run the native runtime smoke test")
 class NativeRuntimeTest(unittest.TestCase):
+    def test_real_repl_evaluation_tool_policy_filters_provider_schema(self):
+        binary = Path(BIN).resolve()
+        suite = load_json(REPO_ROOT / "evals/suites/core-e2e.json")
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            home = workspace / ".home"
+            home.mkdir(parents=True)
+            events = workspace / "events.jsonl"
+            metadata_path = workspace / "eval-metadata.json"
+            prepare_runtime_metadata(
+                suite,
+                REPO_ROOT,
+                "00_smoke",
+                output=metadata_path,
+                events_path=str(events),
+                run_id="native-runtime:tool-policy:0",
+                trial=0,
+                model_provider="anthropic",
+                model_id="claude-sonnet-4-20250514",
+                harness_config_id="native-runtime-tool-policy-test",
+                harness_revision="test",
+                permission_mode="bypass_permissions",
+                binary_path=binary,
+            )
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["allowed_tools"] = ["Read"]
+            metadata_path.write_text(
+                json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            metadata_fd = os.open(metadata_path, os.O_RDONLY)
+            metadata_path.unlink()
+            events_file = tempfile.TemporaryFile()
+            forbidden_write = workspace / "must-not-exist.txt"
+            with SlowMockServer(
+                turns=[
+                    slow_text_then_tooluse(
+                        n_chunks=0,
+                        delay=0,
+                        tool="Write",
+                        tool_input=json.dumps(
+                            {
+                                "file_path": str(forbidden_write),
+                                "content": "policy bypass",
+                            }
+                        ),
+                    ),
+                    simple_text("done"),
+                ]
+            ) as server:
+                completed = subprocess.run(
+                    [
+                        str(binary),
+                        "--api-key",
+                        "test-key",
+                        "--base-url",
+                        server.url,
+                        "--model",
+                        "claude-sonnet-4-20250514",
+                        "--permission",
+                        "bypassPermissions",
+                        "--no-theme",
+                        "-p",
+                        "inspect only",
+                        "--json",
+                    ],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    cwd=workspace,
+                    env={
+                        **os.environ,
+                        "HOME": str(home),
+                        "METACODES_EVAL_METADATA_FD": str(metadata_fd),
+                        "METACODES_EVAL_FD": str(events_file.fileno()),
+                    },
+                    timeout=10,
+                    check=False,
+                    pass_fds=(metadata_fd, events_file.fileno()),
+                )
+            os.close(metadata_fd)
+            events_file.close()
+
+            self.assertEqual(completed.returncode, 0, completed.stdout)
+            self.assertEqual(len(server.requests), 2)
+            requests = [json.loads(raw) for raw in server.requests]
+            for request in requests:
+                self.assertEqual([tool["name"] for tool in request["tools"]], ["Read"])
+                self.assertNotIn("Task", {tool["name"] for tool in request["tools"]})
+                self.assertNotIn("Write", {tool["name"] for tool in request["tools"]})
+            self.assertFalse(forbidden_write.exists())
+            tool_results = [
+                item
+                for message in requests[1]["messages"]
+                if isinstance(message, dict)
+                for item in (
+                    message.get("content")
+                    if isinstance(message.get("content"), list)
+                    else []
+                )
+                if isinstance(item, dict) and item.get("type") == "tool_result"
+            ]
+            self.assertEqual(len(tool_results), 1)
+            self.assertTrue(tool_results[0].get("is_error"), tool_results[0])
+
     def test_real_repl_budget_spans_user_submissions_and_stops_second_request(self):
         binary = Path(BIN).resolve()
         suite = load_json(REPO_ROOT / "evals/suites/core-e2e.json")
