@@ -346,7 +346,7 @@ def build_case_batch(
     _fail("memory manifest.dataset.adapter_id", f"unsupported adapter {adapter_id!r}")
 
 
-def _tree_digest(root: Path) -> str:
+def _tree_digest(root: Path, *, normalize_store_manifest: bool = False) -> str:
     records: List[Mapping[str, Any]] = []
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root).as_posix()
@@ -358,6 +358,15 @@ def _tree_digest(root: Path) -> str:
         if not path.is_file() or path.name.endswith(".lock"):
             continue
         data = path.read_bytes()
+        if normalize_store_manifest and relative == ".tinykg/store-manifest.json":
+            try:
+                manifest = json.loads(data)
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise ValidationError(f"local TinyKG store manifest is invalid: {exc}") from exc
+            migration = manifest.get("migration") if isinstance(manifest, dict) else None
+            if isinstance(migration, dict) and "recorded_ns" in migration:
+                migration["recorded_ns"] = 0
+            data = stable_artifact_bytes(manifest)
         records.append(
             {
                 "path": relative,
@@ -596,7 +605,8 @@ def run_local_tinykg_smoke(
         batch_path.write_bytes(batch)
         local.command("init", store, ())
         apply_output = local.command("apply", store, (str(batch_path),))
-        before_reads = _tree_digest(store)
+        raw_before_reads = _tree_digest(store)
+        graph_revision_before = _tree_digest(store, normalize_store_manifest=True)
         info_before = _store_info(local.command("store-info", store, ()))
         prompt = _string(query_case["prompt"], f"manifest case {query_case_id}.prompt")
         search_output = local.command(
@@ -615,8 +625,9 @@ def run_local_tinykg_smoke(
         except json.JSONDecodeError as exc:
             raise ValidationError(f"local TinyKG neighbors returned invalid JSON: {exc}") from exc
         info_after = _store_info(local.command("store-info", store, ()))
-        after_reads = _tree_digest(store)
-        if before_reads != after_reads:
+        raw_after_reads = _tree_digest(store)
+        graph_revision_after = _tree_digest(store, normalize_store_manifest=True)
+        if raw_before_reads != raw_after_reads:
             _fail(
                 f"local TinyKG case {requested_case_id}",
                 "read-only search/traversal changed store contents",
@@ -642,8 +653,8 @@ def run_local_tinykg_smoke(
                     "edges": int(info_after["edges"]),
                     "storage_format_version": int(info_after["storage_format_version"]),
                 },
-                "graph_revision_before_reads": before_reads,
-                "graph_revision_after_reads": after_reads,
+                "graph_revision_before_reads": graph_revision_before,
+                "graph_revision_after_reads": graph_revision_after,
                 "read_only_preserved": True,
                 "retrieval": {
                     "query_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),

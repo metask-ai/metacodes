@@ -185,6 +185,17 @@ class LocalTinyKgNativeTest(unittest.TestCase):
                     output_path=run_dir / "trace.json",
                     case_limit=1,
                 )
+                repeat_run_dir = root / "isolated-run-repeat"
+                repeated_trace = run_local_tinykg_smoke(
+                    binary=NATIVE_TINYKG,
+                    expected_binary_sha256=binary_sha256,
+                    source_path=source_path,
+                    manifest_path=manifest_path,
+                    run_dir=repeat_run_dir,
+                    output_path=repeat_run_dir / "trace.json",
+                    case_limit=1,
+                )
+            self.assertEqual(trace, repeated_trace)
             self.assertEqual(marker.read_text(encoding="utf-8"), "remote-canonical-store")
             self.assertEqual(list(sentinel_store.iterdir()), [marker])
             self.assertEqual(

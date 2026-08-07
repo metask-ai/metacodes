@@ -156,6 +156,11 @@ source, manifest, batch, and graph-revision hashes. These are isolation and plum
 scores. Actual outcome experiments still require scheduled agent executions, deterministic grading, runtime
 receipts, repeated trials, and confidence intervals.
 
+The graph revision normalizes only TinyKG's volatile `migration.recorded_ns` creation timestamp; the stricter
+read-only guard still hashes the raw manifest and every store file/directory, so normalization cannot hide a
+write during retrieval. This makes equivalent fresh stores comparable while preserving fail-closed write-leak
+detection.
+
 ## Result row contract
 
 Each v2 JSONL row is validated by `scripts.eval.memory_benchmark` and must bind:
