@@ -743,6 +743,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
     def test_checked_in_pilot_v8_binds_unseen_transfer_and_text_catalog_publication(self):
         pilot = ROOT / "evals/memory/pilots/procedural-glm52-v8"
         contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        attempt = json.loads((pilot / "attempt-001-observation.json").read_text(encoding="utf-8"))
         source = json.loads((pilot / "source.json").read_text(encoding="utf-8"))
         manifest = load_manifest(pilot / "manifest.json")
         execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
@@ -809,6 +810,33 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         )
         self.assertTrue(contract["current_phase"]["paid_rollouts_authorized"])
         self.assertFalse(contract["current_phase"]["quality_evidence"])
+        self.assertEqual(attempt["outcome"]["status"], "halted")
+        self.assertFalse(attempt["outcome"]["quality_evidence"])
+        self.assertFalse(attempt["outcome"]["canonical_runtime_receipt_published"])
+        self.assertEqual(attempt["outcome"]["committed_rollout_transactions"], 6)
+        self.assertEqual(attempt["budget_journal"]["uncertain_authorized_transactions"], 1)
+        self.assertTrue(attempt["outcome"]["automatic_retry_forbidden"])
+        self.assertEqual(
+            sum(item["actual_metered_tokens"] for item in attempt["rollouts"]),
+            attempt["budget_journal"]["committed_metered_tokens"],
+        )
+        self.assertAlmostEqual(
+            sum(item["actual_cost_usd"] for item in attempt["rollouts"]),
+            attempt["budget_journal"]["committed_cost_usd"],
+        )
+        self.assertEqual(
+            attempt["failure"]["classification"],
+            "post-provider-toolchain-identity-drift",
+        )
+        self.assertTrue(
+            attempt["uncertain_rollout_diagnostic"][
+                "workspace_deterministic_success_recomputed_offline"
+            ]
+        )
+        self.assertLessEqual(
+            attempt["program_authority"]["conservative_cost_usd_after_attempt"],
+            attempt["program_authority"]["user_authorization_max_cost_usd"],
+        )
         ProductionRuntimeConfig(
             api_key="test-only",
             allow_paid_rollouts=True,
