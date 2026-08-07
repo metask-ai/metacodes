@@ -517,6 +517,18 @@ class BudgetJournal:
             flags |= os.O_CLOEXEC
         try:
             self._dir_fd = os.open(parent, flags)
+            opened_parent_info = os.fstat(self._dir_fd)
+            if not stat.S_ISDIR(opened_parent_info.st_mode):
+                _fail("budget journal parent", "opened object is not a directory")
+            if (
+                opened_parent_info.st_dev != parent_info.st_dev
+                or opened_parent_info.st_ino != parent_info.st_ino
+            ):
+                _fail("budget journal parent", "changed while opening")
+            if hasattr(os, "geteuid") and opened_parent_info.st_uid != os.geteuid():
+                _fail("budget journal parent", "opened directory is not owned by current user")
+            if stat.S_IMODE(opened_parent_info.st_mode) & 0o022:
+                _fail("budget journal parent", "opened directory is group/world writable")
             self._lock_fd = self._open_lock()
             try:
                 fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

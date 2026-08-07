@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.eval.memory_budget_journal import (
     BudgetAuthority,
@@ -282,6 +283,31 @@ with BudgetJournal(Path(%r), authority):
             with self.assertRaisesRegex(ValidationError, "manual inspection"):
                 with BudgetJournal(incomplete, authority):
                     pass
+
+    def test_parent_directory_replacement_between_stat_and_open_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trusted = root / "trusted"
+            replacement = root / "replacement"
+            trusted.mkdir(mode=0o700)
+            replacement.mkdir(mode=0o700)
+            trusted_resolved = trusted.resolve()
+            real_open = os.open
+
+            def swapped_open(path, flags, *args, **kwargs):
+                if Path(path) == trusted_resolved and kwargs.get("dir_fd") is None:
+                    return real_open(replacement, flags, *args, **kwargs)
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch(
+                "scripts.eval.memory_budget_journal.os.open",
+                side_effect=swapped_open,
+            ):
+                with self.assertRaisesRegex(ValidationError, "changed while opening"):
+                    with BudgetJournal(trusted / "pilot-budget.json", self.authority()):
+                        pass
+            self.assertFalse((trusted / "pilot-budget.json").exists())
+            self.assertFalse((replacement / "pilot-budget.json").exists())
 
     def test_fault_before_rename_leaves_manual_stop_after_rename_recovers_new_head(self):
         with tempfile.TemporaryDirectory() as directory:
