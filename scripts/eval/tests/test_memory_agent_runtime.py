@@ -484,6 +484,95 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
         ).validate(len(rows))
 
+    def test_checked_in_pilot_v6_binds_unseen_family_and_all_uncertain_requests(self):
+        pilot = ROOT / "evals/memory/pilots/procedural-glm52-v6"
+        contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        source = json.loads((pilot / "source.json").read_text(encoding="utf-8"))
+        manifest = load_manifest(pilot / "manifest.json")
+        execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
+
+        for name, identity in contract["artifacts"].items():
+            payload = (pilot / name).read_bytes()
+            self.assertEqual(len(payload), identity["bytes"])
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), identity["sha256"])
+        fixture = ROOT / contract["generation"]["source_path"]
+        self.assertEqual(
+            hashlib.sha256(fixture.read_bytes()).hexdigest(),
+            contract["generation"]["expected_upstream_sha256"],
+        )
+        self.assertEqual(
+            source["upstream"]["source_sha256"],
+            contract["generation"]["expected_upstream_sha256"],
+        )
+        self.assertEqual(
+            [family["id"] for family in source["families"]],
+            ["hook-contract-propagation"],
+        )
+        public_source = stable_json(source)
+        for exposed_family in (
+            "config-field-migration",
+            "error-contract-propagation",
+            "capability-contract-propagation",
+            "lifecycle-state-propagation",
+        ):
+            self.assertNotIn(exposed_family, public_source)
+        self.assertEqual(manifest["execution"], execution)
+        self.assertEqual(contract["harness"]["revision"], execution["harness_revision"])
+        rows = [
+            [item["sequence"], item["case_id"], item["trial"], item["arm"]]
+            for item in manifest["schedule"]
+        ]
+        self.assertEqual(rows, contract["schedule"]["ordered_rows"])
+        ordered_tsv = "".join("\t".join(str(value) for value in row) + "\n" for row in rows)
+        self.assertEqual(
+            hashlib.sha256(ordered_tsv.encode("utf-8")).hexdigest(),
+            contract["schedule"]["ordered_tsv_sha256"],
+        )
+        self.assertEqual(
+            {item["id"]: item["fingerprint"] for item in execution["arms"]},
+            {item["id"]: item["fingerprint"] for item in contract["protocol"]["arms"]},
+        )
+        predecessors = contract["predecessor_uncertain_requests"]
+        self.assertEqual(
+            {item["transaction_id"] for item in predecessors},
+            {
+                "27da31d17143929fba09e07328a178c5cfc09e35708c7d1c781a1f15dc438a0d",
+                "b5a9a0c309f62b92f97e4241cffcfa9f14b05917beb9ccc5d8c1f116c4035830",
+            },
+        )
+        self.assertTrue(all(item["state"] == "request_authorized" for item in predecessors))
+        self.assertTrue(all(item["automatic_retry_forbidden"] for item in predecessors))
+        budget = contract["budget_authority"]
+        self.assertGreaterEqual(
+            budget["prior_conservative_cost_usd"],
+            sum(item["maximum_cost_usd"] for item in predecessors),
+        )
+        self.assertGreaterEqual(
+            budget["prior_conservative_metered_tokens"],
+            sum(item["maximum_metered_tokens"] for item in predecessors),
+        )
+        self.assertLessEqual(
+            budget["prior_conservative_cost_usd"] + budget["max_total_cost_usd"],
+            budget["user_authorization_max_cost_usd"],
+        )
+        self.assertGreaterEqual(
+            budget["max_total_metered_tokens"],
+            len(rows) * budget["max_rollout_metered_tokens"],
+        )
+        self.assertTrue(contract["current_phase"]["paid_rollouts_authorized"])
+        self.assertFalse(contract["current_phase"]["quality_evidence"])
+        ProductionRuntimeConfig(
+            api_key="test-only",
+            allow_paid_rollouts=True,
+            max_total_cost_usd=budget["max_total_cost_usd"],
+            max_total_metered_tokens=budget["max_total_metered_tokens"],
+            max_rollout_cost_usd=budget["max_rollout_cost_usd"],
+            max_rollout_metered_tokens=budget["max_rollout_metered_tokens"],
+            max_output_tokens=budget["max_output_tokens"],
+            ripgrep_binary=TEST_RIPGREP,
+            ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
+        ).validate(len(rows))
+
     def _materialize_valid_production_events(self, root, rollout, grader_fingerprint):
         cassette = root / rollout["artifact_paths"]["cassette"]
         uses = {}

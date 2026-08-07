@@ -1,0 +1,25 @@
+{
+  "model_id": "glm-5.2",
+  "model_fingerprint": "e5cc883082b2a25721ee8b861c5e0cca37b6bdd93648d6883d6c8c54a34bf650",
+  "harness_revision": "metacodes-memory-production-pilot-v11-48ba3ae",
+  "arms": [
+    {
+      "id": "no_memory",
+      "fingerprint": "1d70eb700887237a6b751c4d80d777d04d2d59710b7cac76d882920583033c96"
+    },
+    {
+      "id": "markdown_memory",
+      "fingerprint": "5879e7949fd4690eda7ba2aa9445c1b8f4895bc832ce21da370496b4acedf585"
+    },
+    {
+      "id": "tinykg_lexical",
+      "fingerprint": "1b7c69db0fa9a1ca6dc0a4061428d6d11816c3d9e2145fda6aa5a950ffa80d5b"
+    }
+  ],
+  "trials": 1,
+  "retrieval_limits": {
+    "max_k": 10,
+    "max_hops": 3,
+    "max_semantic_variants": 4
+  }
+}
