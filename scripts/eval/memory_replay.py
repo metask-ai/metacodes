@@ -42,12 +42,15 @@ from .model import ValidationError, stable_json
 
 
 REPLAY_SCHEMA_VERSION = 1
+LEGACY_OBSERVATION_SCHEMA_VERSION = 1
+OBSERVATION_SCHEMA_VERSION = 2
 LEGACY_RUNTIME_RECEIPT_SCHEMA_VERSION = 2
 RUNTIME_RECEIPT_SCHEMA_VERSION = 3
 LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 4
 BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 5
 PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 6
-PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 7
+PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 7
+PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 8
 NATIVE_RUNTIME_RECEIPT_VERSIONS = frozenset(
     {
         LEGACY_RUNTIME_RECEIPT_SCHEMA_VERSION,
@@ -55,6 +58,7 @@ NATIVE_RUNTIME_RECEIPT_VERSIONS = frozenset(
         LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }
 )
@@ -63,6 +67,7 @@ PRODUCTION_RUNTIME_RECEIPT_VERSIONS = frozenset(
         LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }
 )
@@ -135,6 +140,7 @@ PRODUCTION_SANDBOX_BACKEND = "macos-seatbelt-sandbox-exec-v1"
 PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION = 1
 PRODUCTION_FILESYSTEM_ISOLATION = "not_proven_bypass_permissions_same_uid"
 PRODUCTION_CHILD_PATH = "/bin:/usr/bin"
+PRODUCTION_RIPGREP_SNAPSHOT_PATH = "production-toolchain/.metacodes/toolchain/rg"
 PRODUCTION_AUTO_COMPACT_POLICY = "disabled_threshold_reject_any_compact_event"
 PRODUCTION_FORCE_COMPACT_AT = "9223372036854775807"
 SCOPED_RECALL_PREFIX = "<system-reminder>\n# 相关持久记忆(按你的请求自动召回,可能不全)\n"
@@ -254,6 +260,7 @@ def _query_plan_source_bound(receipt: Mapping[str, Any], where: str) -> bool:
     elif schema_version in {
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }:
         expected_sources = {
@@ -261,6 +268,8 @@ def _query_plan_source_bound(receipt: Mapping[str, Any], where: str) -> bool:
                 PRE_QUERY_PLAN_PRODUCTION_RUNNER_SOURCE_MODULES,
             PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
                 PRE_CONSOLIDATION_PRODUCTION_RUNNER_SOURCE_MODULES,
+            PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+                PRODUCTION_RUNNER_SOURCE_MODULES,
             PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
                 PRODUCTION_RUNNER_SOURCE_MODULES,
         }[schema_version]
@@ -1056,17 +1065,26 @@ def _validate_production_runtime_receipt(
 ) -> None:
     schema_version = receipt.get("schema_version")
     if schema_version not in PRODUCTION_RUNTIME_RECEIPT_VERSIONS:
-        _fail(f"{where}.schema_version", "expected production runtime receipt v4, v5, v6, or v7")
+        _fail(
+            f"{where}.schema_version",
+            "expected production runtime receipt v4, v5, v6, v7, or v8",
+        )
     journal_bound = schema_version in {
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }
     toolchain_bound = schema_version in {
         PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }
-    scoped_recall_bound = schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
+    scoped_recall_bound = schema_version in {
+        PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+    }
+    workspace_outcome_bound = schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
     value = _object(
         receipt,
         where,
@@ -1090,6 +1108,7 @@ def _validate_production_runtime_receipt(
             "model_provider",
             "disallowed_provider_tools",
             *(("allowed_provider_tools", "ripgrep_binary_sha256") if toolchain_bound else ()),
+            *(("ripgrep_snapshot_path",) if workspace_outcome_bound else ()),
             "metacodes_binary_sha256",
             "tinykg_binary_sha256",
             "budget",
@@ -1145,6 +1164,16 @@ def _validate_production_runtime_receipt(
                 "provider-visible production tool policy drift",
             )
         _hash(value["ripgrep_binary_sha256"], f"{where}.ripgrep_binary_sha256")
+        if workspace_outcome_bound:
+            snapshot_path = _artifact_relative_path(
+                value["ripgrep_snapshot_path"],
+                f"{where}.ripgrep_snapshot_path",
+            ).as_posix()
+            if snapshot_path != PRODUCTION_RIPGREP_SNAPSHOT_PATH:
+                _fail(
+                    f"{where}.ripgrep_snapshot_path",
+                    "does not name the canonical host snapshot",
+                )
     if value["tool_network_isolation"] != PRODUCTION_TOOL_NETWORK_ISOLATION:
         _fail(
             f"{where}.tool_network_isolation",
@@ -1186,6 +1215,7 @@ def _validate_production_runtime_receipt(
         LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION: LEGACY_PRODUCTION_RUNNER_SOURCE_MODULES,
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION: PRE_QUERY_PLAN_PRODUCTION_RUNNER_SOURCE_MODULES,
         PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION: PRE_CONSOLIDATION_PRODUCTION_RUNNER_SOURCE_MODULES,
+        PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION: PRODUCTION_RUNNER_SOURCE_MODULES,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION: PRODUCTION_RUNNER_SOURCE_MODULES,
     }[schema_version]
     if tuple(source_modules) != expected_source_modules:
@@ -1637,6 +1667,16 @@ def _validate_production_runtime_receipt(
         consolidation = rollout.get("consolidation") if scoped_recall_bound else None
 
         observation = observations[sequence]
+        expected_observation_schema = (
+            OBSERVATION_SCHEMA_VERSION
+            if workspace_outcome_bound
+            else LEGACY_OBSERVATION_SCHEMA_VERSION
+        )
+        if observation.get("schema_version") != expected_observation_schema:
+            _fail(
+                f"{rollout_where}.observation.schema_version",
+                f"expected {expected_observation_schema}",
+            )
         if _hash(rollout["observation_sha256"], f"{rollout_where}.observation_sha256") != _canonical_sha256(observation):
             _fail(f"{rollout_where}.observation_sha256", "does not bind observation")
         trajectory = observation.get("trajectory")
@@ -1651,13 +1691,22 @@ def _validate_production_runtime_receipt(
             for item in (trajectory, retrieval, cost, memory, graph, governance, evaluator)
         ):
             _fail(f"{rollout_where}.observation", "missing production lifecycle fields")
+        if workspace_outcome_bound:
+            workspace = _object(
+                observation.get("workspace"),
+                f"{rollout_where}.observation.workspace",
+                ("deterministic_success",),
+            )
+            consolidation_success = workspace.get("deterministic_success")
+        else:
+            consolidation_success = evaluator.get("deterministic_success")
         if scoped_recall_bound:
             consolidation = _validate_consolidation_receipt(
                 consolidation,
                 required=online and expected_backend != "none",
                 tinykg_enabled=tinykg_enabled,
                 native_events_sha256=rollout["native_events_sha256"],
-                deterministic_success=evaluator.get("deterministic_success"),
+                deterministic_success=consolidation_success,
                 final_store_revision=rollout["store_revision_after"],
                 final_raw_store_digest=rollout["raw_store_digest_after"],
                 where=f"{rollout_where}.consolidation",
@@ -1866,7 +1915,7 @@ def validate_runtime_receipt(
     if schema_version not in {REPLAY_SCHEMA_VERSION, *NATIVE_RUNTIME_RECEIPT_VERSIONS}:
         _fail(
             f"{where}.schema_version",
-            "expected replay v1, native wiring v2, native lifecycle v3, or production v4/v5",
+            "expected replay v1, native wiring v2, native lifecycle v3, or production v4-v8",
         )
     if schema_version in PRODUCTION_RUNTIME_RECEIPT_VERSIONS:
         _validate_production_runtime_receipt(
@@ -1970,6 +2019,7 @@ def validate_runtime_receipt(
         LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }:
         raw_sources = value["runner_sources"]
@@ -2379,6 +2429,7 @@ def validate_runtime_artifacts(
         LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }:
         raw_sources = receipt.get("runner_sources")
@@ -2408,9 +2459,37 @@ def validate_runtime_artifacts(
             expected_runner_sha = _hash(raw_source.get("sha256"), f"{source_where}.sha256")
             if observed_runner_sha != expected_runner_sha:
                 _fail(f"{source_where}.sha256", "runtime source mismatch")
+    if schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+        snapshot_relative = _artifact_relative_path(
+            receipt.get("ripgrep_snapshot_path"),
+            f"{where}.ripgrep_snapshot_path",
+        ).as_posix()
+        if snapshot_relative != PRODUCTION_RIPGREP_SNAPSHOT_PATH:
+            _fail(
+                f"{where}.ripgrep_snapshot_path",
+                "does not name the canonical host snapshot",
+            )
+        if snapshot_relative in seen_paths:
+            _fail(f"{where}.ripgrep_snapshot_path", "reuses another runtime artifact")
+        seen_paths.add(snapshot_relative)
+        snapshot = _artifact_path(
+            artifact_root,
+            snapshot_relative,
+            f"{where}.ripgrep_snapshot_path",
+            directory=False,
+        )
+        snapshot_info = snapshot.lstat()
+        if stat.S_IMODE(snapshot_info.st_mode) != 0o500:
+            _fail(
+                f"{where}.ripgrep_snapshot_path",
+                "snapshot permissions must remain 0500",
+            )
+        if file_sha256(snapshot) != receipt.get("ripgrep_binary_sha256"):
+            _fail(f"{where}.ripgrep_snapshot_path", "snapshot identity drift")
     if schema_version in {
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }:
         journal_receipt = receipt.get("budget_journal")
@@ -2491,6 +2570,7 @@ def validate_runtime_artifacts(
         if schema_version in {
             BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
             PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+            PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
             PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         }:
             assert checkpoint_transactions is not None
@@ -2643,6 +2723,7 @@ def validate_runtime_artifacts(
                 LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
             }
             and paths.get("memory_state") is not None
@@ -2787,6 +2868,7 @@ def validate_runtime_artifacts(
                 and schema_version
                 in {
                     PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                    PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                     PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 }
             ):
@@ -2812,6 +2894,7 @@ def validate_runtime_artifacts(
                 LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
             }:
                 activity = _cassette_memory_activity(
@@ -2821,6 +2904,7 @@ def validate_runtime_artifacts(
                 )
                 if schema_version in {
                     PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                    PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                     PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 }:
                     _validate_production_provider_tool_schema(
@@ -2838,7 +2922,10 @@ def validate_runtime_artifacts(
                         f"{rollout_where}.artifact_paths.cassette",
                         "production model attempted a forbidden nested-provider tool",
                     )
-                if schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+                if schema_version in {
+                    PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                    PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                }:
                     if native_scoped_recalls is None:
                         _fail(
                             f"{rollout_where}.native_events",
@@ -3054,7 +3141,10 @@ def validate_runtime_artifacts(
                         f"{rollout_where}.memory_components_after.markdown",
                         "current Markdown tree no longer matches the production receipt",
                     )
-            if schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+            if schema_version in {
+                PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+            }:
                 consolidation_required = bool(
                     raw_rollout.get("memory_phase") == "online" and backend != "none"
                 )
@@ -3362,6 +3452,17 @@ def _schedule_map(manifest: Mapping[str, Any]) -> Dict[int, Mapping[str, Any]]:
 def _observation_shell(
     observation: Mapping[str, Any], where: str
 ) -> Mapping[str, Any]:
+    if not isinstance(observation, dict):
+        _fail(where, "expected an object")
+    schema_version = observation.get("schema_version")
+    if schema_version not in {
+        LEGACY_OBSERVATION_SCHEMA_VERSION,
+        OBSERVATION_SCHEMA_VERSION,
+    }:
+        _fail(
+            f"{where}.schema_version",
+            f"expected {LEGACY_OBSERVATION_SCHEMA_VERSION} or {OBSERVATION_SCHEMA_VERSION}",
+        )
     return _object(
         observation,
         where,
@@ -3372,6 +3473,7 @@ def _observation_shell(
             "trial",
             "arm",
             "execution",
+            *(("workspace",) if schema_version == OBSERVATION_SCHEMA_VERSION else ()),
             "evaluator",
             "prediction",
             "retrieval",
@@ -3434,8 +3536,7 @@ def replay_observations(
     for index, raw_observation in enumerate(observations):
         where = f"memory observations[{index}]"
         observation = _observation_shell(raw_observation, where)
-        if observation["schema_version"] != REPLAY_SCHEMA_VERSION:
-            _fail(f"{where}.schema_version", f"expected {REPLAY_SCHEMA_VERSION}")
+        observation_schema_version = observation["schema_version"]
         if observation["protocol_id"] != PROTOCOL_ID:
             _fail(f"{where}.protocol_id", f"expected {PROTOCOL_ID!r}")
         case_id = _identifier(observation["case_id"], f"{where}.case_id")
@@ -3479,6 +3580,15 @@ def replay_observations(
         if execution_status == "invalid":
             _string(execution["invalid_reason"], f"{where}.execution.invalid_reason")
 
+        workspace_success: bool | None = None
+        if observation_schema_version == OBSERVATION_SCHEMA_VERSION:
+            workspace = _object(
+                observation["workspace"],
+                f"{where}.workspace",
+                ("deterministic_success",),
+            )
+            workspace_success = workspace["deterministic_success"]
+
         evaluator = _object(
             observation["evaluator"],
             f"{where}.evaluator",
@@ -3495,6 +3605,24 @@ def replay_observations(
             _fail(f"{where}.evaluator.invalid_reason", "ready evaluator must use null")
 
         grader_kind = case["grader"]["kind"]
+        if observation_schema_version == OBSERVATION_SCHEMA_VERSION:
+            if grader_kind == "normalized_exact_match":
+                if workspace_success is not None:
+                    _fail(
+                        f"{where}.workspace.deterministic_success",
+                        "answer success is not a workspace fact",
+                    )
+            elif execution_status == "completed":
+                if not isinstance(workspace_success, bool):
+                    _fail(
+                        f"{where}.workspace.deterministic_success",
+                        "completed deterministic validation must preserve a boolean workspace fact",
+                    )
+            elif workspace_success is not None:
+                _fail(
+                    f"{where}.workspace.deterministic_success",
+                    "invalid execution has no workspace result",
+                )
         if evaluator_status == "ready" and grader_kind == "normalized_exact_match":
             if evaluator["deterministic_success"] is not None:
                 _fail(
@@ -3513,6 +3641,15 @@ def replay_observations(
                 _fail(
                     f"{where}.evaluator.deterministic_success",
                     "invalid execution has no procedural success result",
+                )
+            if (
+                observation_schema_version == OBSERVATION_SCHEMA_VERSION
+                and execution_status == "completed"
+                and evaluator["deterministic_success"] != workspace_success
+            ):
+                _fail(
+                    f"{where}.evaluator.deterministic_success",
+                    "ready evaluator must match the host workspace fact",
                 )
 
         retrieval = _object(

@@ -235,6 +235,14 @@ denominators. Missing evidence is not interpreted as a failed answer; it is repo
 An empty model prediction is different: it is retained as a scored failure so silence cannot disappear from the
 denominator.
 
+Observation schema v2 keeps the host workspace fact separate from scoreability. For deterministic coding cases,
+`workspace.deterministic_success` records the validator result even when a malformed query plan or inactive
+treatment makes `evaluator.status=invalid`; consolidation binds the workspace fact, while benchmark denominators
+bind evaluator validity. Production receipt v8 also materializes the pinned ripgrep executable once under the
+run-owned canonical toolchain path before any provider request. Every rollout receives a private copy from that
+snapshot, and replay rechecks its canonical path, 0500 mode, single-link regular-file identity, and SHA-256.
+Historical observation v1 and production receipt v7 artifacts remain replayable with their original semantics.
+
 ## Frozen replay boundary
 
 `replay-memory` joins three deliberately separate artifacts:

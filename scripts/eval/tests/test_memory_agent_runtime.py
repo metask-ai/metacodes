@@ -43,6 +43,7 @@ from scripts.eval.memory_budget_journal import (
 from scripts.eval.memory_query_plan import SIDECAR_NAME, build_query_plan_trace
 from scripts.eval.memory_replay import (
     LEGACY_RUNNER_SOURCE_MODULES,
+    OBSERVATION_SCHEMA_VERSION,
     PRODUCTION_ALLOWED_PROVIDER_TOOLS,
     CONSOLIDATION_SCHEMA_VERSION,
     PRODUCTION_PRICING_PROVENANCE,
@@ -55,6 +56,7 @@ from scripts.eval.memory_replay import (
     PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     PRE_CONSOLIDATION_PRODUCTION_RUNNER_SOURCE_MODULES,
     PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+    PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     PRODUCTION_SANDBOX_BACKEND,
     PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION,
     PRODUCTION_TOOL_NETWORK_ISOLATION,
@@ -1848,6 +1850,11 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         receipt["schema_version"] = PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
         receipt["allowed_provider_tools"] = list(PRODUCTION_ALLOWED_PROVIDER_TOOLS)
         receipt["ripgrep_binary_sha256"] = TEST_RIPGREP_SHA256
+        ripgrep_snapshot = root / "production-toolchain" / ".metacodes" / "toolchain" / "rg"
+        ripgrep_snapshot.parent.mkdir(parents=True, exist_ok=True)
+        ripgrep_snapshot.write_bytes(TEST_RIPGREP.read_bytes())
+        ripgrep_snapshot.chmod(0o500)
+        receipt["ripgrep_snapshot_path"] = ripgrep_snapshot.relative_to(root).as_posix()
 
         sources = {item["module"]: item for item in receipt["runner_sources"]}
         ordered_sources = []
@@ -1866,6 +1873,12 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         cases = {case["id"]: case for case in manifest["cases"]}
         arms = {arm["id"]: arm for arm in receipt["arms"]}
         for rollout, observation in zip(receipt["rollouts"], observations):
+            observation["schema_version"] = OBSERVATION_SCHEMA_VERSION
+            observation["workspace"] = {
+                "deterministic_success": observation["evaluator"][
+                    "deterministic_success"
+                ]
+            }
             sequence = rollout["sequence"]
             case = cases[rollout["case_id"]]
             online = case["benchmark"] == "procedural_transfer" and case["split"] == "online"
@@ -1975,7 +1988,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             consolidation = None
             if online and runtime_arm != "codex_style":
                 assert memory_root is not None
-                deterministic = observation["evaluator"]["deterministic_success"]
+                deterministic = observation["workspace"]["deterministic_success"]
                 outcome = (
                     "success"
                     if deterministic is True
@@ -2874,6 +2887,82 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             )
             validate_runtime_artifacts(receipt, root)
 
+            legacy_observations = copy.deepcopy(observations)
+            legacy_receipt = copy.deepcopy(receipt)
+            legacy_receipt["schema_version"] = (
+                PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
+            )
+            legacy_receipt.pop("ripgrep_snapshot_path")
+            for legacy_observation, legacy_rollout in zip(
+                legacy_observations,
+                legacy_receipt["rollouts"],
+            ):
+                legacy_observation["schema_version"] = 1
+                legacy_observation.pop("workspace")
+                legacy_rollout["observation_sha256"] = hashlib.sha256(
+                    stable_json(legacy_observation).encode("utf-8")
+                ).hexdigest()
+            legacy_receipt["observations_sha256"] = hashlib.sha256(
+                stable_json(legacy_observations).encode("utf-8")
+            ).hexdigest()
+            validate_runtime_receipt(
+                legacy_receipt,
+                manifest,
+                legacy_observations,
+                manifest["dataset"]["source_sha256"],
+            )
+            validate_runtime_artifacts(legacy_receipt, root)
+
+            online_tinykg = next(
+                rollout
+                for rollout in receipt["rollouts"]
+                if rollout["memory_phase"] == "online"
+                and rollout["memory_backend"] == "tinykg_integrated"
+            )
+            sequence = online_tinykg["sequence"]
+            treatment_invalid_observations = copy.deepcopy(observations)
+            treatment_invalid_receipt = copy.deepcopy(receipt)
+            treatment_invalid_observations[sequence]["evaluator"] = {
+                "status": "invalid",
+                "invalid_reason": "query-plan trace invalid",
+                "deterministic_success": None,
+            }
+            treatment_invalid_receipt["rollouts"][sequence][
+                "observation_sha256"
+            ] = hashlib.sha256(
+                stable_json(treatment_invalid_observations[sequence]).encode("utf-8")
+            ).hexdigest()
+            treatment_invalid_receipt["observations_sha256"] = hashlib.sha256(
+                stable_json(treatment_invalid_observations).encode("utf-8")
+            ).hexdigest()
+            validate_runtime_receipt(
+                treatment_invalid_receipt,
+                manifest,
+                treatment_invalid_observations,
+                manifest["dataset"]["source_sha256"],
+            )
+
+            forged_workspace = copy.deepcopy(treatment_invalid_observations)
+            forged_receipt = copy.deepcopy(treatment_invalid_receipt)
+            observed_success = forged_workspace[sequence]["workspace"][
+                "deterministic_success"
+            ]
+            self.assertIsInstance(observed_success, bool)
+            forged_workspace[sequence]["workspace"]["deterministic_success"] = not observed_success
+            forged_receipt["rollouts"][sequence]["observation_sha256"] = hashlib.sha256(
+                stable_json(forged_workspace[sequence]).encode("utf-8")
+            ).hexdigest()
+            forged_receipt["observations_sha256"] = hashlib.sha256(
+                stable_json(forged_workspace).encode("utf-8")
+            ).hexdigest()
+            with self.assertRaisesRegex(ValidationError, "bind validator outcome"):
+                validate_runtime_receipt(
+                    forged_receipt,
+                    manifest,
+                    forged_workspace,
+                    manifest["dataset"]["source_sha256"],
+                )
+
             missing = copy.deepcopy(receipt)
             online_memory = next(
                 rollout
@@ -2961,12 +3050,6 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                         manifest["dataset"]["source_sha256"],
                     )
 
-            online_tinykg = next(
-                rollout
-                for rollout in receipt["rollouts"]
-                if rollout["memory_phase"] == "online"
-                and rollout["memory_backend"] == "tinykg_integrated"
-            )
             episode = (
                 root
                 / online_tinykg["artifact_paths"]["memory_state"]

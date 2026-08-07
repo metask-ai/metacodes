@@ -70,7 +70,7 @@ from .memory_replay import (
     PRODUCTION_SANDBOX_BACKEND,
     PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION,
     PRODUCTION_TOOL_NETWORK_ISOLATION,
-    REPLAY_SCHEMA_VERSION,
+    OBSERVATION_SCHEMA_VERSION,
     RUNNER_SOURCE_MODULES,
     _artifact_tree_digest,
     _cassette_memory_activity,
@@ -95,7 +95,7 @@ from .model import ValidationError, stable_json
 
 
 RUNTIME_RECEIPT_SCHEMA_VERSION = 3
-PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 7
+PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 8
 RUNTIME_METADATA_SCHEMA_VERSION = NATIVE_EVENT_SCHEMA_VERSION
 SCRIPTED_PROVIDER_ID = "metacodes-memory-scripted-lifecycle-v3"
 SCRIPTED_LIFECYCLE_MODE = "native-agent-loop-scripted-lifecycle-smoke"
@@ -1744,7 +1744,7 @@ def run_memory_agent_schedule(
     """Run one complete frozen schedule through scripted or production provider.
 
     The default remains the v3 zero-cost lifecycle smoke. Passing ``production``
-    selects the stricter v7 contract and requires an exclusively locked,
+    selects the stricter v8 contract and requires an exclusively locked,
     persistent authorization journal before any provider-capable subprocess.
     """
 
@@ -1824,6 +1824,15 @@ def run_memory_agent_schedule(
     if observations_output == receipt_output:
         _fail("memory agent runtime", "observation and receipt outputs must be distinct")
     resolved_run.mkdir(parents=True)
+    production_ripgrep: Path | None = None
+    if production is not None:
+        assert production.ripgrep_binary is not None
+        assert production.ripgrep_binary_sha256 is not None
+        production_ripgrep = _materialize_pinned_ripgrep(
+            production.ripgrep_binary,
+            production.ripgrep_binary_sha256,
+            resolved_run / "production-toolchain",
+        )
     runtime_source_root = Path(__file__).resolve().parent
     runner_sources: List[Mapping[str, str]] = []
     runner_source_modules = (
@@ -1874,12 +1883,12 @@ def run_memory_agent_schedule(
                 "production TinyKG binary",
             )
             assert production is not None
-            assert production.ripgrep_binary is not None
             assert production.ripgrep_binary_sha256 is not None
+            assert production_ripgrep is not None
             _assert_executable_identity(
-                production.ripgrep_binary,
+                production_ripgrep,
                 production.ripgrep_binary_sha256,
-                "production ripgrep binary",
+                "frozen production ripgrep binary",
             )
         if schedule["sequence"] != expected_sequence:
             _fail("memory schedule", "sequence is not contiguous")
@@ -1916,10 +1925,10 @@ def run_memory_agent_schedule(
             directory.mkdir()
         pinned_ripgrep: Path | None = None
         if production is not None:
-            assert production.ripgrep_binary is not None
             assert production.ripgrep_binary_sha256 is not None
+            assert production_ripgrep is not None
             pinned_ripgrep = _materialize_pinned_ripgrep(
-                production.ripgrep_binary,
+                production_ripgrep,
                 production.ripgrep_binary_sha256,
                 sealed_home,
             )
@@ -2404,13 +2413,13 @@ def run_memory_agent_schedule(
                 expected_tinykg_sha256,
                 "production TinyKG binary",
             )
-            assert production.ripgrep_binary is not None
             assert production.ripgrep_binary_sha256 is not None
+            assert production_ripgrep is not None
             assert pinned_ripgrep is not None
             _assert_executable_identity(
-                production.ripgrep_binary,
+                production_ripgrep,
                 production.ripgrep_binary_sha256,
-                "production ripgrep binary",
+                "frozen production ripgrep binary",
             )
             _assert_executable_identity(
                 pinned_ripgrep,
@@ -2853,12 +2862,13 @@ def run_memory_agent_schedule(
                 )
 
         observation: Mapping[str, Any] = {
-            "schema_version": REPLAY_SCHEMA_VERSION,
+            "schema_version": OBSERVATION_SCHEMA_VERSION,
             "protocol_id": PROTOCOL_ID,
             "case_id": case["id"],
             "trial": schedule["trial"],
             "arm": arm_id,
             "execution": {"status": "completed", "invalid_reason": None},
+            "workspace": {"deterministic_success": deterministic_success},
             "evaluator": {
                 "status": "invalid" if evaluator_invalid else "ready",
                 "invalid_reason": evaluator_invalid,
@@ -3071,6 +3081,10 @@ def run_memory_agent_schedule(
                 "disallowed_provider_tools": list(PRODUCTION_DISALLOWED_PROVIDER_TOOLS),
                 "allowed_provider_tools": list(PRODUCTION_ALLOWED_PROVIDER_TOOLS),
                 "ripgrep_binary_sha256": production.ripgrep_binary_sha256,
+                "ripgrep_snapshot_path": artifact_relative(
+                    production_ripgrep,
+                    "frozen production ripgrep binary",
+                ),
                 "budget": production.public_budget(),
                 "provider_requests": sum(
                     int(rollout["provider_requests"]) for rollout in rollout_receipts

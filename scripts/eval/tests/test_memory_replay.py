@@ -10,6 +10,7 @@ from pathlib import Path
 from scripts.eval.cli import main
 from scripts.eval.memory_benchmark import summarize_memory, write_memory_rows
 from scripts.eval.memory_replay import (
+    OBSERVATION_SCHEMA_VERSION,
     load_manifest,
     load_observations,
     load_runtime_receipt,
@@ -220,6 +221,22 @@ class MemoryReplayTest(unittest.TestCase):
         }
         rows = self.replay(observed=observed)
         row = rows[1]
+        self.assertEqual(row["execution"]["status"], "completed")
+        self.assertEqual(row["evaluator"]["status"], "invalid")
+        self.assertEqual(row["outcome"]["status"], "unscored")
+        self.assertIsNone(row["outcome"]["success"])
+
+    def test_workspace_fact_survives_invalid_treatment_evaluator(self):
+        observed = observations()
+        observation = observed[7]
+        observation["schema_version"] = OBSERVATION_SCHEMA_VERSION
+        observation["workspace"] = {"deterministic_success": True}
+        observation["evaluator"] = {
+            "status": "invalid",
+            "invalid_reason": "query-plan trace invalid",
+            "deterministic_success": None,
+        }
+        row = self.replay(observed=observed)[7]
         self.assertEqual(row["execution"]["status"], "completed")
         self.assertEqual(row["evaluator"]["status"], "invalid")
         self.assertEqual(row["outcome"]["status"], "unscored")

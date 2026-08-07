@@ -30,6 +30,7 @@ from scripts.eval.memory_replay import (
     PRODUCTION_ALLOWED_PROVIDER_TOOLS,
     PRODUCTION_PRICING_PROVENANCE,
     PRODUCTION_PROVIDER_ID,
+    PRODUCTION_RIPGREP_SNAPSHOT_PATH,
     _artifact_tree_digest,
     load_manifest,
     validate_runtime_artifacts,
@@ -270,7 +271,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
         )
         path.chmod(0o700)
 
-    def _production(self) -> ProductionRuntimeConfig:
+    def _production(self, ripgrep_binary: Path = TEST_RIPGREP) -> ProductionRuntimeConfig:
         return ProductionRuntimeConfig(
             api_key="runtime-l2-private-key",
             allow_paid_rollouts=True,
@@ -279,12 +280,16 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
             max_rollout_cost_usd=1.0,
             max_rollout_metered_tokens=100_000,
             max_output_tokens=128,
-            ripgrep_binary=TEST_RIPGREP,
-            ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
+            ripgrep_binary=ripgrep_binary,
+            ripgrep_binary_sha256=hashlib.sha256(ripgrep_binary.read_bytes()).hexdigest(),
         )
 
-    def _authority(self, manifest) -> BudgetAuthority:
-        production = self._production()
+    def _authority(
+        self,
+        manifest,
+        production=None,
+    ) -> BudgetAuthority:
+        production = production or self._production()
         return BudgetAuthority(
             manifest_sha256=hashlib.sha256(
                 stable_json(manifest).encode("utf-8")
@@ -305,6 +310,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
         *,
         run_name: str,
         fault_hook=None,
+        production=None,
     ):
         run_dir = root / run_name
         return run_memory_agent_schedule(
@@ -318,7 +324,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
             observations_path=run_dir / "observations.jsonl",
             runtime_receipt_path=run_dir / "runtime-receipt.json",
             timeout_seconds=10,
-            production=self._production(),
+            production=production or self._production(),
             budget_journal=journal,
             budget_fault_hook=fault_hook,
         )
@@ -427,6 +433,73 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                                     run_name="run-retry",
                                 )
                         self.assertEqual(provider.requests, expected_requests)
+
+    def test_external_ripgrep_may_disappear_after_run_snapshot_without_spending_gap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path, manifest_path, manifest = self._materialize_contract(root)
+            journal_path = root / "budget-control" / "journal.json"
+            journal_path.parent.mkdir(mode=0o700)
+            external_ripgrep = root / "ephemeral-rg"
+            external_ripgrep.write_bytes(TEST_RIPGREP.read_bytes())
+            external_ripgrep.chmod(0o700)
+            production = self._production(external_ripgrep)
+            removed = False
+
+            def remove_external_after_provider(stage, _receipt):
+                nonlocal removed
+                if stage == "after_provider_return_before_commit" and not removed:
+                    external_ripgrep.unlink()
+                    removed = True
+
+            with _AuthorizationObservingServer(journal_path) as provider:
+                fake = root / "fake-metacodes"
+                self._write_fake_metacodes(fake, provider.url)
+                with BudgetJournal(
+                    journal_path,
+                    self._authority(manifest, production),
+                ) as journal:
+                    observations, receipt = self._run(
+                        root,
+                        journal,
+                        fake,
+                        source_path,
+                        manifest_path,
+                        run_name="run-snapshotted-toolchain",
+                        fault_hook=remove_external_after_provider,
+                        production=production,
+                    )
+            self.assertTrue(removed)
+            self.assertFalse(external_ripgrep.exists())
+            self.assertEqual(provider.requests, 2)
+            self.assertEqual(receipt["ripgrep_snapshot_path"], PRODUCTION_RIPGREP_SNAPSHOT_PATH)
+            snapshot = root / "run-snapshotted-toolchain" / receipt["ripgrep_snapshot_path"]
+            self.assertTrue(snapshot.is_file())
+            self.assertTrue(os.access(snapshot, os.X_OK))
+            self.assertEqual(hashlib.sha256(snapshot.read_bytes()).hexdigest(), TEST_RIPGREP_SHA256)
+            validate_runtime_receipt(
+                receipt,
+                manifest,
+                observations,
+                manifest["dataset"]["source_sha256"],
+            )
+            validate_runtime_artifacts(receipt, root / "run-snapshotted-toolchain")
+
+            forged = copy.deepcopy(receipt)
+            forged["ripgrep_snapshot_path"] = receipt["rollouts"][0]["artifact_paths"][
+                "transcript"
+            ] + "/.metacodes/toolchain/rg"
+            with self.assertRaisesRegex(ValidationError, "canonical host snapshot"):
+                validate_runtime_receipt(
+                    forged,
+                    manifest,
+                    observations,
+                    manifest["dataset"]["source_sha256"],
+                )
+
+            snapshot.chmod(0o400)
+            with self.assertRaisesRegex(ValidationError, "permissions must remain 0500"):
+                validate_runtime_artifacts(receipt, root / "run-snapshotted-toolchain")
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX signal return codes")
     def test_hard_child_signal_after_provider_persists_authorized_diagnostic(self):
