@@ -3,6 +3,7 @@ import hashlib
 import http.server
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -132,12 +133,24 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
         manifest = load_manifest(manifest_path)
         return source_path, manifest_path, manifest
 
-    def _write_fake_metacodes(self, path: Path, provider_url: str) -> None:
+    def _write_fake_metacodes(
+        self,
+        path: Path,
+        provider_url: str,
+        *,
+        crash_after_provider: bool = False,
+    ) -> None:
+        crash_line = (
+            "os.kill(os.getpid(), signal.SIGTERM)"
+            if crash_after_provider
+            else "pass"
+        )
         script = textwrap.dedent(
             f"""\
             #!/usr/bin/python3 -I
             import json
             import os
+            import signal
             import urllib.request
 
             def stable(value):
@@ -171,6 +184,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
             with urllib.request.urlopen(request, timeout=5) as response:
                 if response.status != 200:
                     raise SystemExit(42)
+            {crash_line}
 
             runtime_metadata = dict(metadata)
             runtime_metadata.update({{
@@ -413,6 +427,53 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                                     run_name="run-retry",
                                 )
                         self.assertEqual(provider.requests, expected_requests)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signal return codes")
+    def test_hard_child_signal_after_provider_persists_authorized_diagnostic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path, manifest_path, manifest = self._materialize_contract(root)
+            journal_path = root / "budget-control" / "journal.json"
+            journal_path.parent.mkdir(mode=0o700)
+            with _AuthorizationObservingServer(journal_path) as provider:
+                fake = root / "fake-metacodes"
+                self._write_fake_metacodes(
+                    fake,
+                    provider.url,
+                    crash_after_provider=True,
+                )
+                with BudgetJournal(journal_path, self._authority(manifest)) as journal:
+                    with self.assertRaisesRegex(ValidationError, "SIGTERM"):
+                        self._run(
+                            root,
+                            journal,
+                            fake,
+                            source_path,
+                            manifest_path,
+                            run_name="run-hard-exit",
+                        )
+                    self.assertEqual(
+                        journal.snapshot()["transaction_states"],
+                        {"request_authorized": 1},
+                    )
+            self.assertEqual(provider.requests, 1)
+            rollouts = list((root / "run-hard-exit" / "rollouts").iterdir())
+            self.assertEqual(len(rollouts), 1)
+            diagnostic = json.loads(
+                (rollouts[0] / "child-process-failure.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(diagnostic["returncode"], -signal.SIGTERM)
+            self.assertEqual(diagnostic["signal"], signal.SIGTERM)
+            self.assertEqual(diagnostic["signal_name"], "SIGTERM")
+            self.assertEqual(
+                diagnostic["budget_transaction"]["state"],
+                "request_authorized",
+            )
+            self.assertIsNone(diagnostic["budget_transaction"]["commit_revision"])
+            self.assertTrue((rollouts[0] / "stdout.ndjson").is_file())
+            self.assertTrue((rollouts[0] / "stderr.log").is_file())
 
     def test_second_pilot_runner_loses_lock_before_credential_or_network(self):
         with tempfile.TemporaryDirectory() as directory:

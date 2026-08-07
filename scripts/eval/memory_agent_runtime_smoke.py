@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import json
 import os
+import platform
 import subprocess
 import tempfile
 from pathlib import Path
@@ -17,7 +19,11 @@ if __package__ in {None, ""}:
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.eval.memory_agent_runtime import (  # type: ignore
+        PRODUCTION_CHILD_PATH,
         SCRIPTED_PROVIDER_ID,
+        ScriptedMemoryProvider,
+        _materialize_production_sandbox,
+        _run_production_sandbox_probe,
         run_memory_agent_schedule,
     )
     from scripts.eval.memory_hotpot_adapter import adapt_hotpot, artifact_bytes  # type: ignore
@@ -29,7 +35,14 @@ if __package__ in {None, ""}:
     from scripts.eval.memory_tinykg_local import _store_info  # type: ignore
     from scripts.eval.model import stable_json  # type: ignore
 else:
-    from .memory_agent_runtime import SCRIPTED_PROVIDER_ID, run_memory_agent_schedule
+    from .memory_agent_runtime import (
+        PRODUCTION_CHILD_PATH,
+        SCRIPTED_PROVIDER_ID,
+        ScriptedMemoryProvider,
+        _materialize_production_sandbox,
+        _run_production_sandbox_probe,
+        run_memory_agent_schedule,
+    )
     from .memory_hotpot_adapter import adapt_hotpot, artifact_bytes
     from .memory_longmem_adapter import adapt_longmem
     from .memory_procedural_adapter import adapt_procedural
@@ -105,6 +118,122 @@ def _longmem_record() -> Mapping[str, Any]:
         ],
         "answer_session_ids": ["answer-session"],
     }
+
+
+def _run_fd_auth_seatbelt_smoke(root: Path, metacodes: Path) -> None:
+    """Exercise the release binary's one-shot FD auth on the paid sandbox path."""
+
+    if platform.system() != "Darwin":
+        return
+    smoke_root = root / "fd-auth-seatbelt"
+    artifact = smoke_root / "rollout"
+    workspace = smoke_root / "workspace"
+    child_tmp = artifact / "tmp"
+    sealed_home = artifact / "sealed-home"
+    for path in (artifact, workspace, child_tmp, sealed_home):
+        path.mkdir(parents=True, exist_ok=True)
+    sibling = smoke_root / "sibling-sentinel.txt"
+    sibling.write_text("must remain unreadable\n", encoding="utf-8")
+    ripgrep = sealed_home / ".metacodes" / "toolchain" / "rg"
+    ripgrep.parent.mkdir(parents=True)
+    # This no-tool smoke only needs a sealed executable at the production
+    # profile's pinned-ripgrep slot. Reusing the already hash-pinned app keeps
+    # the check cross-worktree and avoids depending on a host rg installation.
+    ripgrep.write_bytes(metacodes.read_bytes())
+    ripgrep.chmod(0o500)
+    profile = artifact / "production-seatbelt.sb"
+    evidence = artifact / "production-seatbelt-probe.json"
+    sandbox = _materialize_production_sandbox(
+        profile_path=profile,
+        evidence_path=evidence,
+        artifact_dir=artifact,
+        workspace=workspace,
+        store=None,
+        metacodes=metacodes,
+        tinykg=None,
+        ripgrep=ripgrep,
+    )
+    _run_production_sandbox_probe(
+        sandbox,
+        host_read_path=REPO_ROOT / "build.zig",
+        sibling_read_path=sibling,
+        writable_root=child_tmp,
+        evidence_path=evidence,
+    )
+
+    credential_read_fd, credential_write_fd = os.pipe()
+    try:
+        secret = b"loopback-only-fd-auth-smoke"
+        if os.write(credential_write_fd, secret) != len(secret):
+            raise RuntimeError("FD auth smoke wrote a partial credential")
+        os.close(credential_write_fd)
+        credential_write_fd = -1
+        env = {
+            "PATH": PRODUCTION_CHILD_PATH,
+            "HOME": str(sealed_home),
+            "TMPDIR": str(child_tmp),
+            "TMP": str(child_tmp),
+            "TEMP": str(child_tmp),
+            "LC_ALL": "C",
+            "LANG": "C",
+            "METACODES_API_KEY_FD": str(credential_read_fd),
+            "METACODES_NO_PROBE": "1",
+            "METACODES_PROVIDER": "anthropic",
+            "RG_BIN": str(ripgrep),
+        }
+        with ScriptedMemoryProvider(
+            "Reply briefly.",
+            "codex_style",
+            "episodic_recall",
+            "test",
+            memory_file=None,
+            memory_index=None,
+            memory_marker=None,
+        ) as provider:
+            completed = subprocess.run(
+                sandbox.command(
+                    [
+                        str(metacodes),
+                        "--base-url",
+                        provider.url,
+                        "--model",
+                        "claude-sonnet-4-20250514",
+                        "--permission",
+                        "bypassPermissions",
+                        "--no-theme",
+                        "--max-tokens",
+                        "128",
+                        "-p",
+                        "Reply briefly.",
+                        "--json",
+                    ]
+                ),
+                cwd=workspace,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+                check=False,
+                pass_fds=(credential_read_fd,),
+            )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "FD auth Seatbelt smoke failed "
+                f"returncode={completed.returncode}: {completed.stderr[-1000:]}"
+            )
+        rows = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
+        results = [row for row in rows if row.get("type") == "result"]
+        if len(results) != 1 or results[0].get("stop_reason") != "end_turn":
+            raise RuntimeError("FD auth Seatbelt smoke produced no complete result")
+        if len(provider.requests) != 1:
+            raise RuntimeError("FD auth Seatbelt smoke did not make exactly one loopback request")
+        if secret.decode("ascii") in completed.stdout or secret.decode("ascii") in completed.stderr:
+            raise RuntimeError("FD auth Seatbelt smoke leaked its credential")
+    finally:
+        if credential_write_fd >= 0:
+            os.close(credential_write_fd)
+        os.close(credential_read_fd)
 
 
 def _run_adapter(
@@ -244,6 +373,7 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["TINYKG_REMOTE_CONFIG"] = str(remote_config)
         os.environ["TINYKG_STORE"] = str(remote_store)
         try:
+            _run_fd_auth_seatbelt_smoke(root, metacodes)
             raw_hotpot = root / "hotpot-upstream.json"
             raw_hotpot.write_text(stable_json([_hotpot_record()]) + "\n", encoding="utf-8")
             hotpot_slice, hotpot_manifest = adapt_hotpot(
@@ -339,7 +469,7 @@ def main(argv: list[str] | None = None) -> int:
             )
     suffix = f", artifacts={Path(args.output_dir).resolve()}" if args.output_dir else ""
     print(
-        "memory-agent-runtime-smoke: 3 adapters, 3 arms, durable lifecycle, native agent loop, "
+        "memory-agent-runtime-smoke: FD auth Seatbelt + 3 adapters, 3 arms, durable lifecycle, native agent loop, "
         f"paid=0, external_network=0{suffix}"
     )
     return 0

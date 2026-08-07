@@ -214,6 +214,10 @@ test "compact summary module tests are reachable from root" {
 }
 
 pub fn main(init: std.process.Init) !void {
+    // Must precede every setenv/unsetenv path.  In particular, consuming the
+    // production credential FD mutates libc's environment while Zig 0.16's
+    // default Io still holds the startup pointer array for a lazy scan.
+    auth.stabilizeRuntimeIoEnvironment(init.io);
     const allocator = init.arena.allocator();
 
     // SIGPIPE 全局忽略:向已关闭的 pipe/socket 写(hook 子进程 stdin、web SSE、子进程管道)默认会

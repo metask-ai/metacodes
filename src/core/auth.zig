@@ -29,6 +29,16 @@ const OAUTH_REFRESH_SKEW_SECONDS: i64 = 300;
 const DEFAULT_LOGIN_PORT: u16 = 1455;
 const FALLBACK_LOGIN_PORT: u16 = 1457;
 
+/// Zig 0.16's default `std.process.Init.io` keeps a borrowed view of the
+/// process environment and scans it lazily.  POSIX `unsetenv` may move that
+/// pointer array, so the one-shot FD credential scrub below must not run until
+/// the Io implementation has consumed its view.  The progress-parent lookup
+/// is the smallest public vtable operation that forces that scan; the returned
+/// descriptor, when present, remains owned by the process environment.
+pub fn stabilizeRuntimeIoEnvironment(io: std.Io) void {
+    _ = io.vtable.progressParentFile(io.userdata) catch {};
+}
+
 pub const AuthPrecedence = types.AuthPrecedence;
 
 pub fn parsePrecedence(s: []const u8) ?AuthPrecedence {

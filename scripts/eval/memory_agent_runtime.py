@@ -23,6 +23,7 @@ import math
 import os
 import platform
 import re
+import signal
 import socketserver
 import stat
 import subprocess
@@ -340,6 +341,50 @@ def _write_new(path: Path, payload: bytes) -> None:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
+
+
+def _child_failure_diagnostic(
+    *,
+    run_id: str,
+    returncode: int,
+    stdout: str,
+    stderr: str,
+    budget_transaction: Mapping[str, Any] | None,
+) -> Mapping[str, Any]:
+    signal_number = -returncode if returncode < 0 else None
+    signal_name = None
+    if signal_number is not None:
+        try:
+            signal_name = signal.Signals(signal_number).name
+        except ValueError:
+            signal_name = f"SIGNAL_{signal_number}"
+    stdout_bytes = stdout.encode("utf-8")
+    stderr_bytes = stderr.encode("utf-8")
+    return {
+        "schema_version": 1,
+        "run_id": run_id,
+        "returncode": returncode,
+        "exit_code": returncode if returncode >= 0 else None,
+        "signal": signal_number,
+        "signal_name": signal_name,
+        "stdout_bytes": len(stdout_bytes),
+        "stdout_sha256": _hash_bytes(stdout_bytes),
+        "stderr_bytes": len(stderr_bytes),
+        "stderr_sha256": _hash_bytes(stderr_bytes),
+        # This is evidence of authorization exposure, never a commit receipt.
+        "budget_transaction": budget_transaction,
+    }
+
+
+def _child_failure_message(returncode: int) -> str:
+    if returncode >= 0:
+        return f"process exited {returncode}"
+    signal_number = -returncode
+    try:
+        name = signal.Signals(signal_number).name
+    except ValueError:
+        name = f"signal {signal_number}"
+    return f"process terminated by {name} ({signal_number})"
 
 
 def _read_regular_file(path: Path, where: str) -> bytes:
@@ -2246,6 +2291,23 @@ def run_memory_agent_schedule(
         finally:
             os.close(metadata_fd)
         elapsed_ms = (time.monotonic_ns() - started) / 1_000_000.0
+        # Persist the direct child evidence before parsing NDJSON or finalizing
+        # native events.  A signal exit commonly leaves no result row; checking
+        # `_parse_result` first erased the only actionable diagnosis.
+        _write_new(stdout_path, completed.stdout.encode("utf-8"))
+        _write_new(stderr_path, completed.stderr.encode("utf-8"))
+        if completed.returncode != 0:
+            diagnostic = _child_failure_diagnostic(
+                run_id=run_id,
+                returncode=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                budget_transaction=budget_transaction_receipt,
+            )
+            _write_new(
+                artifact_dir / "child-process-failure.json",
+                (stable_json(diagnostic) + "\n").encode("utf-8"),
+            )
         try:
             finalize_evaluation_fd(events_file.fileno(), events)
         finally:
@@ -2255,8 +2317,6 @@ def run_memory_agent_schedule(
             # that failure instead of leaving an unchecked partial run.
             if production is not None:
                 _assert_production_secret_absent(resolved_run, production.api_key)
-        _write_new(stdout_path, completed.stdout.encode("utf-8"))
-        _write_new(stderr_path, completed.stderr.encode("utf-8"))
         if production is not None:
             _assert_executable_identity(
                 metacodes,
@@ -2288,6 +2348,11 @@ def run_memory_agent_schedule(
             # spending the remaining budget and discovering the leak only when
             # publishing the final receipt.
             _assert_production_secret_absent(resolved_run, production.api_key)
+        if completed.returncode != 0:
+            _fail(
+                f"native memory rollout {run_id}",
+                _child_failure_message(completed.returncode),
+            )
         result = _parse_result(completed.stdout)
         native, native_error = _native_trace_metrics(events)
         if native_error is not None or native is None:
@@ -2300,8 +2365,6 @@ def run_memory_agent_schedule(
             tinykg_enabled=tinykg_enabled,
             where=f"native memory rollout {run_id} scoped recall",
         )
-        if completed.returncode != 0:
-            _fail(f"native memory rollout {run_id}", f"process exited {completed.returncode}")
         if result["stop_reason"] not in SAFE_STOP_REASONS:
             _fail(f"native memory rollout {run_id}", f"unsafe stop {result['stop_reason']!r}")
         if not native["complete"] or native["starts"] != 1 or native["finishes"] != 1:
