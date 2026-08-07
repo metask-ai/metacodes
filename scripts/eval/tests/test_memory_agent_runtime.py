@@ -496,11 +496,9 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             payload = (pilot / name).read_bytes()
             self.assertEqual(len(payload), identity["bytes"])
             self.assertEqual(hashlib.sha256(payload).hexdigest(), identity["sha256"])
-        fixture = ROOT / contract["generation"]["source_path"]
-        self.assertEqual(
-            hashlib.sha256(fixture.read_bytes()).hexdigest(),
-            contract["generation"]["expected_upstream_sha256"],
-        )
+        # The host-owned source fixture grows when a new unseen family is
+        # staged.  Historical pilots bind the exact upstream snapshot through
+        # their frozen source slice and contract, not through today's fixture.
         self.assertEqual(
             source["upstream"]["source_sha256"],
             contract["generation"]["expected_upstream_sha256"],
@@ -578,6 +576,85 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             attempt["failure"]["classification"],
             "treatment-activation-evidence-failure",
         )
+        ProductionRuntimeConfig(
+            api_key="test-only",
+            allow_paid_rollouts=True,
+            max_total_cost_usd=budget["max_total_cost_usd"],
+            max_total_metered_tokens=budget["max_total_metered_tokens"],
+            max_rollout_cost_usd=budget["max_rollout_cost_usd"],
+            max_rollout_metered_tokens=budget["max_rollout_metered_tokens"],
+            max_output_tokens=budget["max_output_tokens"],
+            ripgrep_binary=TEST_RIPGREP,
+            ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
+        ).validate(len(rows))
+
+    def test_checked_in_pilot_v7_binds_durable_cwd_fix_and_larger_rollout_reserve(self):
+        pilot = ROOT / "evals/memory/pilots/procedural-glm52-v7"
+        contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        source = json.loads((pilot / "source.json").read_text(encoding="utf-8"))
+        manifest = load_manifest(pilot / "manifest.json")
+        execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
+
+        for name, identity in contract["artifacts"].items():
+            payload = (pilot / name).read_bytes()
+            self.assertEqual(len(payload), identity["bytes"])
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), identity["sha256"])
+        fixture = ROOT / contract["generation"]["source_path"]
+        self.assertEqual(
+            hashlib.sha256(fixture.read_bytes()).hexdigest(),
+            contract["generation"]["expected_upstream_sha256"],
+        )
+        self.assertEqual(
+            source["upstream"]["source_sha256"],
+            contract["generation"]["expected_upstream_sha256"],
+        )
+        self.assertEqual(
+            [family["id"] for family in source["families"]],
+            ["policy-action-propagation"],
+        )
+        self.assertEqual(manifest["execution"], execution)
+        self.assertEqual(contract["harness"]["revision"], execution["harness_revision"])
+        rows = [
+            [item["sequence"], item["case_id"], item["trial"], item["arm"]]
+            for item in manifest["schedule"]
+        ]
+        self.assertEqual(rows, contract["schedule"]["ordered_rows"])
+        ordered_tsv = "".join("\t".join(str(value) for value in row) + "\n" for row in rows)
+        self.assertEqual(
+            hashlib.sha256(ordered_tsv.encode("utf-8")).hexdigest(),
+            contract["schedule"]["ordered_tsv_sha256"],
+        )
+        self.assertEqual(
+            {item["id"]: item["fingerprint"] for item in execution["arms"]},
+            {item["id"]: item["fingerprint"] for item in contract["protocol"]["arms"]},
+        )
+        predecessor = contract["predecessor_halted_attempt"]
+        self.assertEqual(predecessor["pilot_id"], "procedural-glm52-v6")
+        self.assertEqual(predecessor["status"], "halted")
+        self.assertFalse(predecessor["quality_evidence"])
+        self.assertEqual(predecessor["completed_provider_requests"], 4)
+        self.assertEqual(predecessor["remaining_provider_requests_not_started"], 5)
+        self.assertEqual(predecessor["uncertain_authorized_transactions"], 0)
+        uncertain = contract["predecessor_uncertain_requests"]
+        self.assertEqual(len(uncertain), 2)
+        self.assertTrue(all(item["automatic_retry_forbidden"] for item in uncertain))
+        budget = contract["budget_authority"]
+        self.assertEqual(budget["max_rollout_cost_usd"], 1.5)
+        self.assertEqual(budget["max_rollout_metered_tokens"], 600000)
+        self.assertGreaterEqual(
+            budget["max_total_metered_tokens"],
+            len(rows) * budget["max_rollout_metered_tokens"],
+        )
+        self.assertGreaterEqual(
+            budget["max_total_cost_usd"],
+            len(rows) * budget["max_rollout_cost_usd"],
+        )
+        self.assertLessEqual(
+            budget["prior_conservative_cost_usd"] + budget["max_total_cost_usd"],
+            budget["user_authorization_max_cost_usd"],
+        )
+        self.assertTrue(contract["current_phase"]["paid_rollouts_authorized"])
+        self.assertFalse(contract["current_phase"]["quality_evidence"])
         ProductionRuntimeConfig(
             api_key="test-only",
             allow_paid_rollouts=True,
