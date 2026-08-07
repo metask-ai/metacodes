@@ -34,6 +34,7 @@ SUPPORTED_SENSOR_ADAPTERS = frozenset(
         "eval_budget_checkpoint",
         "treatment_activation",
         "memory_local_store_isolation",
+        "paid_budget_journal",
     )
 )
 RULE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,127}$")
@@ -2771,6 +2772,516 @@ def observe_memory_local_store_isolation(repo: Path) -> Observation:
     )
 
 
+def observe_paid_budget_journal(repo: Path) -> Observation:
+    """Bind Lean's paid-request model to production code and native feedback.
+
+    Lean owns lifecycle, exposure, identity, and request-admission semantics.
+    This adapter owns host facts Lean cannot prove: flock placement, durable
+    publication calls, real subprocess order, crash injection, and checkpoint
+    re-observation. Fixed paths prevent a helper-only test from self-attesting.
+    """
+
+    declarations = [
+        "legal_journal_state_machine_and_identity_binding",
+        "durable_atomic_authorization_persistence",
+        "exclusive_lock_precedes_credentials_and_provider",
+        "real_runner_provider_requires_durable_authorization",
+        "authorized_crash_recovery_consumes_maximum_without_retry",
+        "commit_idempotency_and_two_dimensional_authority",
+        "journal_integrity_and_path_faults_fail_closed",
+        "receipt_binds_final_journal_checkpoint",
+        "dry_run_and_paid_regression_gates_remain_zero_side_effect",
+    ]
+    relative_sources = {
+        "journal": "scripts/eval/memory_budget_journal.py",
+        "runner": "scripts/eval/memory_agent_runtime.py",
+        "pilot": "scripts/eval/memory_agent_runtime_pilot.py",
+        "replay": "scripts/eval/memory_replay.py",
+        "journal_tests": "scripts/eval/tests/test_memory_budget_journal.py",
+        "runtime_tests": "scripts/eval/tests/test_memory_budget_runtime.py",
+        "agent_tests": "scripts/eval/tests/test_memory_agent_runtime.py",
+        "retry_test": "tests/component/stream_retry_test.zig",
+    }
+    paths = {name: repo / relative for name, relative in relative_sources.items()}
+    missing_files = [relative_sources[name] for name, path in paths.items() if not path.is_file()]
+    if missing_files:
+        return Observation(
+            sensor="paid_budget_journal",
+            declared=len(declarations),
+            declarations=declarations,
+            missing_declarations=declarations,
+            deviation=len(declarations),
+            errors=[f"required paid-budget source is missing: {path}" for path in missing_files],
+            fingerprint_sha256=fingerprint(paths.values()),
+        )
+
+    try:
+        sources = {name: read_text(path) for name, path in paths.items()}
+        trees = {
+            name: ast.parse(source, filename=str(paths[name]))
+            for name, source in sources.items()
+            if name != "retry_test"
+        }
+    except (ControlError, SyntaxError) as exc:
+        return Observation(
+            sensor="paid_budget_journal",
+            declared=len(declarations),
+            declarations=declarations,
+            missing_declarations=declarations,
+            deviation=len(declarations),
+            errors=[f"paid-budget source cannot be observed: {exc}"],
+            fingerprint_sha256=fingerprint(paths.values()),
+        )
+
+    def top_function(tree_name: str, name: str) -> ast.FunctionDef | None:
+        return next(
+            (
+                node
+                for node in trees[tree_name].body
+                if isinstance(node, ast.FunctionDef) and node.name == name
+            ),
+            None,
+        )
+
+    def method(tree_name: str, class_name: str, name: str) -> ast.FunctionDef | None:
+        owner = next(
+            (
+                node
+                for node in trees[tree_name].body
+                if isinstance(node, ast.ClassDef) and node.name == class_name
+            ),
+            None,
+        )
+        if owner is None:
+            return None
+        return next(
+            (
+                node
+                for node in owner.body
+                if isinstance(node, ast.FunctionDef) and node.name == name
+            ),
+            None,
+        )
+
+    def node_source(tree_name: str, node: ast.AST | None) -> str:
+        return "" if node is None else ast.get_source_segment(sources[tree_name], node) or ""
+
+    def top_source(tree_name: str, name: str) -> str:
+        return node_source(tree_name, top_function(tree_name, name))
+
+    def method_source(tree_name: str, class_name: str, name: str) -> str:
+        return node_source(tree_name, method(tree_name, class_name, name))
+
+    def dotted_name(node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            prefix = dotted_name(node.value)
+            return f"{prefix}.{node.attr}" if prefix else node.attr
+        return ""
+
+    def call_lines(function: ast.FunctionDef | None, call_name: str) -> list[int]:
+        if function is None:
+            return []
+        return sorted(
+            node.lineno
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call) and dotted_name(node.func) == call_name
+        )
+
+    def call_names(function: ast.FunctionDef | None) -> set[str]:
+        if function is None:
+            return set()
+        return {
+            dotted_name(node.func)
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call) and dotted_name(node.func)
+        }
+
+    journal_replay = top_source("journal", "_replay_document")
+    identity_validate = top_source("journal", "_validate_identity_record")
+    journal_enter = method_source("journal", "BudgetJournal", "__enter__")
+    journal_open_lock = method_source("journal", "BudgetJournal", "_open_lock")
+    journal_regular = method_source("journal", "BudgetJournal", "_validate_regular_fd")
+    journal_persist = method_source("journal", "BudgetJournal", "_persist")
+    journal_append = method_source("journal", "BudgetJournal", "_append")
+    journal_reserve = method_source("journal", "BudgetJournal", "reserve")
+    journal_authorize = method_source("journal", "BudgetJournal", "authorize_request")
+    journal_commit = method_source("journal", "BudgetJournal", "commit")
+    journal_snapshot = method_source("journal", "BudgetJournal", "snapshot")
+    journal_reobserve = method_source("journal", "BudgetJournal", "_reobserve")
+    journal_temp = method_source("journal", "BudgetJournal", "_reject_temporary")
+    runner = top_function("runner", "run_memory_agent_schedule")
+    runner_source = node_source("runner", runner)
+    pilot = top_function("pilot", "main")
+    pilot_source = node_source("pilot", pilot)
+    receipt_validate = top_source("replay", "_validate_budget_transaction_receipt")
+    journal_receipt_validate = top_source("replay", "_validate_budget_journal_receipt")
+    artifact_validate = top_source("replay", "validate_runtime_artifacts")
+
+    reserve_lines = call_lines(runner, "budget_journal.reserve")
+    pipe_lines = call_lines(runner, "os.pipe")
+    authorize_lines = call_lines(runner, "budget_journal.authorize_request")
+    subprocess_lines = call_lines(runner, "subprocess.run")
+    commit_lines = call_lines(runner, "budget_journal.commit")
+    pilot_lock_lines = call_lines(pilot, "BudgetJournal")
+    credential_lines = call_lines(pilot, "_load_api_key")
+    schedule_lines = call_lines(pilot, "run_memory_agent_schedule")
+    runner_calls = call_names(runner)
+    alternate_launchers = {
+        name
+        for name in runner_calls
+        if name in {
+            "subprocess.Popen", "subprocess.call", "subprocess.check_call",
+            "subprocess.check_output", "os.system", "os.popen", "os.posix_spawn",
+            "os.posix_spawnp", "urllib.request.urlopen", "http.client.HTTPConnection",
+            "http.client.HTTPSConnection", "socket.create_connection",
+        }
+        or name.startswith("os.spawn")
+        or name.startswith("os.exec")
+    }
+
+    def test_source(tree_name: str, class_name: str, test_name: str) -> str:
+        return method_source(tree_name, class_name, test_name)
+
+    journal_state_test = test_source(
+        "journal_tests", "MemoryBudgetJournalTest",
+        "test_state_machine_crash_exposure_and_commit_idempotence",
+    )
+    exposure_test = test_source(
+        "journal_tests", "MemoryBudgetJournalTest",
+        "test_exposure_limit_is_checked_before_persist",
+    )
+    cas_test = test_source(
+        "journal_tests", "MemoryBudgetJournalTest",
+        "test_revision_cas_and_identity_drift_fail_closed",
+    )
+    lock_test = test_source(
+        "journal_tests", "MemoryBudgetJournalTest",
+        "test_lock_is_process_exclusive_and_loser_does_not_mutate",
+    )
+    integrity_test = test_source(
+        "journal_tests", "MemoryBudgetJournalTest",
+        "test_corrupt_truncated_symlink_hardlink_and_temp_fail_closed",
+    )
+    persist_fault_test = test_source(
+        "journal_tests", "MemoryBudgetJournalTest",
+        "test_fault_before_rename_leaves_manual_stop_after_rename_recovers_new_head",
+    )
+    drift_test = test_source(
+        "journal_tests", "MemoryBudgetJournalTest",
+        "test_on_disk_revision_drift_while_locked_is_detected",
+    )
+    provider_test = test_source(
+        "runtime_tests", "MemoryBudgetRuntimeL2Test",
+        "test_mock_provider_observes_durable_authorization_on_real_runner_path",
+    )
+    crash_test = test_source(
+        "runtime_tests", "MemoryBudgetRuntimeL2Test",
+        "test_crash_windows_remain_authorized_and_cannot_retry",
+    )
+    runner_lock_test = test_source(
+        "runtime_tests", "MemoryBudgetRuntimeL2Test",
+        "test_second_pilot_runner_loses_lock_before_credential_or_network",
+    )
+    preauth_test = test_source(
+        "runtime_tests", "MemoryBudgetRuntimeL2Test",
+        "test_pre_authorization_os_failure_aborts_without_provider_request",
+    )
+    dry_run_test = test_source(
+        "agent_tests", "MemoryAgentRuntimeContractTest",
+        "test_production_pilot_dry_run_loads_no_credential_and_makes_no_network_call",
+    )
+    authority_test = test_source(
+        "agent_tests", "MemoryAgentRuntimeContractTest",
+        "test_production_budget_authority_is_fail_closed_and_secret_free",
+    )
+    receipt_test = test_source(
+        "agent_tests", "MemoryAgentRuntimeContractTest",
+        "test_v5_receipt_binds_durable_budget_transactions_and_checkpoint",
+    )
+
+    obligations = {
+        declarations[0]: {
+            "replay accepts only four explicit actions": all(
+                marker in journal_replay
+                for marker in (
+                    '"reserved"', '"request_authorized"', '"committed"',
+                    '"aborted_pre_request"', "authorization requires reserved state",
+                    "commit requires request_authorized state",
+                    "pre-request abort requires reserved state",
+                    "run id already has a non-aborted transaction",
+                )
+            ),
+            "identity has exact run/model/harness/provider/cap fields": all(
+                marker in identity_validate
+                for marker in (
+                    '"run_id"', '"manifest_sha256"', '"model_fingerprint"',
+                    '"harness_fingerprint"', '"provider_identity"',
+                    '"max_cost_microusd"', '"max_metered_tokens"',
+                )
+            ),
+            "transaction id binds journal revision and full identity": all(
+                marker in journal_reserve
+                for marker in ('"journal_id"', '"reservation_revision"', '"identity"')
+            ) and "_canonical_sha256" in journal_reserve,
+        },
+        declarations[1]: {
+            "authorization appends through the durable writer": (
+                'action="request_authorized"' in journal_authorize
+                and "return self._append(" in journal_authorize
+                and "self._reobserve()" in journal_append
+                and "self._persist(updated)" in journal_append
+            ),
+            "writer fsyncs temp then atomically replaces then fsyncs parent": (
+                journal_persist.find("os.fsync(fd)") >= 0
+                and journal_persist.find("os.replace(") > journal_persist.find("os.fsync(fd)")
+                and journal_persist.rfind("os.fsync(self._dir_fd)") > journal_persist.find("os.replace(")
+                and "os.O_EXCL" in journal_persist
+                and "src_dir_fd=self._dir_fd" in journal_persist
+                and "dst_dir_fd=self._dir_fd" in journal_persist
+            ),
+            "fault injection covers both rename crash windows": all(
+                marker in persist_fault_test
+                for marker in (
+                    '"after_temporary_fsync"', '"manual inspection"',
+                    '"after_atomic_replace"', '"reserved": 1',
+                )
+            ),
+        },
+        declarations[2]: {
+            "pilot lock encloses credential load and entire schedule": (
+                len(pilot_lock_lines) == 1 and len(credential_lines) == 1
+                and len(schedule_lines) == 1
+                and pilot_lock_lines[0] < credential_lines[0] < schedule_lines[0]
+                and "with BudgetJournal(journal_path, authority) as budget_journal:" in pilot_source
+            ),
+            "lock is exclusive nonblocking and held until context exit": all(
+                marker in journal_open_lock
+                for marker in ("os.O_NOFOLLOW", "self._validate_regular_fd")
+            ) and all(
+                marker in journal_enter
+                for marker in (
+                    "fcntl.LOCK_EX", "fcntl.LOCK_NB",
+                    "another local runner holds it", "self._lock_fd",
+                )
+            ),
+            "real competing pilot proves zero credential/run-dir/child effects": all(
+                marker in runner_lock_test
+                for marker in (
+                    "must-not-be-read.json", "another local runner holds it",
+                    "self.assertFalse(missing_auth.exists())",
+                    "self.assertFalse(invoked.exists())",
+                    'self.assertFalse((root / "loser-run").exists())',
+                )
+            ) and "self.assertEqual(journal.snapshot(), before)" in lock_test,
+        },
+        declarations[3]: {
+            "production spawn has one authorization predecessor": (
+                len(reserve_lines) == 1 and len(authorize_lines) == 1
+                and len(subprocess_lines) == 2 and len(commit_lines) == 1
+                and reserve_lines[0] < authorize_lines[0] < subprocess_lines[0] < commit_lines[0]
+                and pipe_lines and pipe_lines[0] < authorize_lines[0]
+            ),
+            "no alternate provider-capable launcher bypasses the gate": not alternate_launchers,
+            "authorization receipt is marked before subprocess": (
+                runner_source.find("budget_request_authorized = True")
+                > runner_source.find("budget_journal.authorize_request(")
+                and runner_source.find("completed = subprocess.run(")
+                > runner_source.find("budget_request_authorized = True")
+            ),
+            "MockServer reopens journal at request arrival": all(
+                marker in sources["runtime_tests"]
+                for marker in (
+                    "validate_checkpoint_payload(owner.journal_path.read_bytes())",
+                    'if "request_authorized" not in states:',
+                    "provider request preceded durable authorization",
+                )
+            ) and all(
+                marker in provider_test
+                for marker in (
+                    "self._run(", "self.assertEqual(provider.requests, 2)",
+                    '"budget_transaction"', '"committed"',
+                )
+            ),
+            "preauthorization host failure aborts before provider": all(
+                marker in preauth_test
+                for marker in (
+                    '"scripts.eval.memory_agent_runtime.os.pipe"',
+                    '"aborted_pre_request": 1', "self.assertEqual(provider.requests, 0)",
+                )
+            ),
+        },
+        declarations[4]: {
+            "reserve refuses authorized identity replay": all(
+                marker in journal_reserve
+                for marker in (
+                    'item["identity"]["run_id"] == identity["run_id"]',
+                    "run id is already bound to a different transaction identity",
+                    'current["state"] == "request_authorized"',
+                    "automatic or implicit retry is forbidden",
+                )
+            ),
+            "snapshot charges reserved and authorized maximum": all(
+                marker in journal_snapshot
+                for marker in (
+                    'state in {"reserved", "request_authorized"}',
+                    'transaction["identity"]["max_cost_microusd"]',
+                    'transaction["identity"]["max_metered_tokens"]',
+                )
+            ),
+            "both real crash windows recover authorized and reject retry": all(
+                marker in crash_test
+                for marker in (
+                    '"after_request_authorized", 0',
+                    '"after_provider_return_before_commit", 1',
+                    '{"request_authorized": 1}', '"unsettled_max_cost_microusd"',
+                    '"retry is forbidden"',
+                )
+            ),
+        },
+        declarations[5]: {
+            "replay checks aggregate cost and token exposure after every event": all(
+                marker in journal_replay
+                for marker in (
+                    'exposure_cost > authority["total_cost_microusd"]',
+                    'exposure_tokens > authority["total_metered_tokens"]',
+                    'transaction["state"] == "committed"',
+                    'transaction["state"] in {"reserved", "request_authorized"}',
+                )
+            ),
+            "commit is exact-idempotent and bounded by both maxima": all(
+                marker in journal_commit
+                for marker in (
+                    'current["actual_cost_microusd"] == actual_cost',
+                    'current["actual_metered_tokens"] == actual_tokens',
+                    "committed usage may only be replayed identically", 'action="committed"',
+                )
+            ) and all(
+                marker in journal_replay
+                for marker in (
+                    'actual_cost > identity["max_cost_microusd"]',
+                    'actual_tokens > identity["max_metered_tokens"]',
+                )
+            ),
+            "L2 exercises capacity release and idempotent usage drift": all(
+                marker in exposure_test for marker in ("exceeds authority", "4_000_000")
+            ) and all(
+                marker in journal_state_test for marker in ("journal_revision", "identically", "750_001")
+            ),
+        },
+        declarations[6]: {
+            "files and parent reject untrusted object types and permissions": all(
+                marker in journal_enter
+                for marker in (
+                    "parent.resolve(strict=True)", "must be owned", "0o022",
+                    "os.fstat(self._dir_fd)", "opened_parent_info.st_dev",
+                    "opened_parent_info.st_ino", "changed while opening",
+                )
+            ) and all(
+                marker in journal_regular for marker in ("stat.S_ISREG", "st_nlink != 1", "0o077")
+            ) and "incomplete temporary file requires manual inspection" in journal_temp,
+            "reobservation binds journal id revision and head": all(
+                marker in journal_reobserve
+                for marker in ('["revision"]', '["head_sha256"]', '["journal_id"]', "drift while lock is held")
+            ),
+            "corruption links temp and CAS drift fail closed in L2": all(
+                marker in integrity_test
+                for marker in ("invalid JSON", "symlink_to", "os.link", "manual inspection")
+            ) and "CAS" in cas_test and "event count" in drift_test,
+        },
+        declarations[7]: {
+            "runtime exports checkpoint before final journal receipt": all(
+                marker in runner_source
+                for marker in (
+                    "budget_journal.checkpoint_payload()", '"budget-journal-checkpoint.json"',
+                    '"checkpoint_sha256"', "budget_journal.snapshot()",
+                )
+            ) and all(
+                marker in journal_snapshot
+                for marker in ('"journal_id"', '"revision"', '"head_sha256"', '"transaction_states"')
+            ),
+            "replay recomputes transaction and journal identities": all(
+                marker in receipt_validate for marker in ("identity_sha256", "transaction_id", "reservation_revision")
+            ) and all(
+                marker in journal_receipt_validate
+                for marker in ("journal_id", "revision", "head_sha256", "checkpoint_sha256")
+            ) and all(
+                marker in artifact_validate
+                for marker in (
+                    "validate_checkpoint_payload(checkpoint_payload)",
+                    "checkpoint bytes drifted", "does not match the hash-chained checkpoint",
+                )
+            ),
+            "v5 L2 rejects authorization usage and checkpoint tampering": all(
+                marker in receipt_test
+                for marker in (
+                    "authorization_revision", "actual_metered_tokens",
+                    "checkpoint bytes drifted", "validate_runtime_artifacts",
+                )
+            ),
+        },
+        declarations[8]: {
+            "dry run returns before lock credential journal or network": (
+                pilot_source.find("if args.dry_run:") >= 0
+                and pilot_source.find("return 0", pilot_source.find("if args.dry_run:"))
+                < pilot_source.find("with BudgetJournal(")
+                and pilot_source.find("with BudgetJournal(") < pilot_source.find("_load_api_key(")
+            ) and all(
+                marker in top_source("pilot", "_public_plan")
+                for marker in (
+                    '"network_requests": 0', '"paid_rollouts_authorized": False',
+                    '"credential_loaded": False',
+                )
+            ),
+            "dry-run and authority L2 preserve zero side effects and hard cap": all(
+                marker in dry_run_test
+                for marker in (
+                    'plan["network_requests"]', 'plan["credential_loaded"]',
+                    "self.assertFalse(missing_auth.exists())",
+                    "self.assertFalse(budget_journal.exists())",
+                )
+            ) and all(
+                marker in authority_test
+                for marker in ("1000.01", "must not exceed", "explicit paid-rollout authority")
+            ),
+            "quality flag and single physical provider attempt remain gated": (
+                '"quality_evidence": False' in runner_source
+                and 'value["quality_evidence"] is not False' in sources["replay"]
+                and 'test "L2 evaluation gate makes one physical provider attempt and never retries outside receipt"'
+                in sources["retry_test"]
+            ),
+        },
+    }
+
+    covered = [name for name, checks in obligations.items() if all(checks.values())]
+    missing = [name for name in declarations if name not in covered]
+    errors: list[str] = []
+    for obligation, checks in obligations.items():
+        absent = [name for name, present in checks.items() if not present]
+        if absent:
+            errors.append(f"{obligation}: missing {', '.join(absent)}")
+    return Observation(
+        sensor="paid_budget_journal",
+        sensor_ok=not errors and len(covered) == len(declarations),
+        declared=len(declarations),
+        covered=len(covered),
+        deviation=max(len(declarations) - len(covered), 0),
+        declarations=declarations,
+        covered_declarations=covered,
+        missing_declarations=missing,
+        feedback_bindings=[
+            {"unittest": "scripts.tests.test_rule_control.PaidBudgetJournalSensorTests"},
+            {"unittest": "scripts.eval.tests.test_memory_budget_journal"},
+            {"unittest": "scripts.eval.tests.test_memory_budget_runtime"},
+            {"unittest": "scripts.eval.tests.test_memory_agent_runtime"},
+            {"step": "test:new", "filter": "L2 evaluation gate makes one physical provider attempt"},
+        ],
+        errors=errors,
+        fingerprint_sha256=fingerprint(paths.values()),
+    )
+
+
 def observe_rule(repo: Path, rule: dict[str, Any]) -> Observation:
     sensor = rule.get("sensor")
     if not isinstance(sensor, dict):
@@ -2799,6 +3310,8 @@ def observe_rule(repo: Path, rule: dict[str, Any]) -> Observation:
         return observe_treatment_activation(repo)
     if adapter == "memory_local_store_isolation":
         return observe_memory_local_store_isolation(repo)
+    if adapter == "paid_budget_journal":
+        return observe_paid_budget_journal(repo)
     return Observation(sensor=str(adapter), errors=[f"unsupported sensor adapter: {adapter!r}"])
 
 
@@ -2956,6 +3469,9 @@ def link_topology(
         ),
         "eval.memory-local-store-isolation.l2": (
             "MetaCodesControl.ClosedLoop.memoryIsolationSignal"
+        ),
+        "eval.paid-budget-journal-authorization.l2": (
+            "MetaCodesControl.PaidBudgetJournal.paidBudgetSignal"
         ),
     }.get(rule.get("id"), "MetaCodesControl.ClosedLoop.signal")
     decision_ok = (

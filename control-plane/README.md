@@ -262,6 +262,29 @@ repository and actuator are re-observed before the final Lean decision. This
 rule proves the observed execution boundary and fail-closed tests—it does not
 turn a smoke trace into evidence of memory quality.
 
+`eval.paid-budget-journal-authorization.l2` governs the current production
+memory pilot's single-machine paid-request boundary. It intentionally does not
+model a future cross-machine swarm lease and does not introduce SQLite or a
+second memory store. Its nine fixed obligations cover the hash-chained journal
+state machine and complete identity, durable authorization publication, one
+exclusive runner lock around credential and schedule access, the real
+authorization-before-provider call chain, both authorized crash windows,
+two-dimensional exposure and exact commit replay, fail-closed file/CAS checks,
+checkpoint-bound receipts, and dry-run plus one-physical-attempt regressions.
+
+`PaidBudgetJournal.lean` proves the legal lifecycle, authorized maximum
+exposure, no authorized rollback/re-authorization, exact committed replay,
+provider denial without a matching persisted authorization receipt, complete
+identity/authority binding, and cost/token authority preservation for accepted
+transitions. The repository sensor and L2—not Lean—establish that the host uses
+POSIX `flock`, calls `fsync`/atomic rename/parent `fsync` in the observed order,
+and reaches the provider only after that code path. A loopback MockServer opens
+the on-disk journal when the request arrives; fault injection covers crashes
+both immediately after authorization and after provider return but before
+commit. Recovered authorized requests retain maximum exposure and cannot be
+implicitly retried. The rule is a release gate for the pilot mechanism, not
+proof of filesystem power-loss semantics or memory quality.
+
 ## Commands
 
 From `metacodes/`:

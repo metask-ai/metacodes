@@ -730,6 +730,126 @@
       "feedback_status": "passed",
       "expected_signal": "block_release",
       "expected_state": "blocked"
+    },
+    {
+      "id": "eval-paid-budget-journal-closed-loop-pass",
+      "rule_ids": [
+        "eval.paid-budget-journal-authorization.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 9,
+      "covered": 9,
+      "feedback_status": "passed",
+      "expected_signal": "admit_release",
+      "expected_state": "compliant"
+    },
+    {
+      "id": "eval-paid-budget-journal-missing-obligation-blocks",
+      "rule_ids": [
+        "eval.paid-budget-journal-authorization.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 9,
+      "covered": 8,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "eval-paid-budget-journal-formalization-orphan-blocks",
+      "rule_ids": [
+        "eval.paid-budget-journal-authorization.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": false,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 9,
+      "covered": 9,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "eval-paid-budget-journal-failed-feedback-blocks",
+      "rule_ids": [
+        "eval.paid-budget-journal-authorization.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 9,
+      "covered": 9,
+      "feedback_status": "failed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "eval-paid-budget-journal-sensor-failure-blocks",
+      "rule_ids": [
+        "eval.paid-budget-journal-authorization.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": false,
+      "declared": 9,
+      "covered": 9,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "eval-paid-budget-journal-wrong-cardinality-blocks",
+      "rule_ids": [
+        "eval.paid-budget-journal-authorization.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 8,
+      "covered": 8,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
     }
   ]
 }

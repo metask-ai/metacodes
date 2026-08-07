@@ -597,6 +597,91 @@
         "fixture": "control-plane/counterexamples.json",
         "required": true
       }
+    },
+    {
+      "id": "eval.paid-budget-journal-authorization.l2",
+      "title": "Paid memory pilots require durable local authorization before provider access",
+      "target": {
+        "metric": "paid_budget_journal_obligations_minus_observed",
+        "setpoint": 0,
+        "goal": "Every single-machine production-memory request is covered by the exclusive local journal, a complete transaction identity, two-dimensional budget authority, a durably persisted request_authorized transition before provider execution, conservative crash recovery, exact commit idempotency, and checkpoint-bound receipts; dry runs and preauthorization failures remain zero-network."
+      },
+      "sensor": {
+        "adapter": "paid_budget_journal",
+        "schema_version": 1
+      },
+      "decision": {
+        "engine": "lean",
+        "kernel": "MetaCodesControl.PaidBudgetJournal.paidBudgetSignal",
+        "theorems": [
+          "admitted_implies_closed_loop",
+          "admitted_implies_zero_deviation",
+          "admitted_implies_feedback_passed",
+          "admitted_identity_is_complete_and_authority_bound",
+          "authorized_recovery_exposes_maximum",
+          "authorized_cannot_return_to_unrequested",
+          "repeated_authorization_is_rejected",
+          "admitted_authorization_has_new_revision_and_head",
+          "committed_usage_is_idempotent",
+          "committed_usage_drift_is_rejected",
+          "provider_request_requires_persisted_authorization",
+          "provider_request_without_persisted_authorization_is_rejected",
+          "provider_request_without_permit_is_rejected",
+          "successful_transition_preserves_total_authority",
+          "paid_budget_admitted_implies_nine_obligations",
+          "paid_budget_missing_obligation_blocks",
+          "paid_budget_wrong_cardinality_blocks",
+          "orphan_cannot_be_compliant",
+          "failed_feedback_blocks",
+          "sensor_failure_blocks",
+          "unobserved_actuator_blocks"
+        ]
+      },
+      "actuator": {
+        "kind": "release_gate",
+        "on_violation": "block",
+        "remediation": "Restore the fixed local journal lifecycle and identity binding, exclusive runner lock, temp-fsync/atomic-rename/parent-fsync publication, real runner authorization-before-provider order, both crash-window counterexamples, maximum authorized exposure, exact committed replay, fail-closed path/CAS checks, checkpoint-bound receipt validation, dry-run zero side effects, and the one-physical-provider-attempt gate. Lean proves only the abstract lifecycle and budget predicates; flock, fsync, rename, subprocess order, and filesystem crash behavior require the native L2 feedback named by this rule.",
+        "observation": {
+          "schema_version": 1,
+          "build_file": "control-plane/build.zig",
+          "build_step": "rule-check",
+          "workflow_file": ".github/workflows/cross-platform.yml",
+          "workflow_job": "rule-control",
+          "workflow_workdir": "metacodes",
+          "telemetry_path": "metacodes/zig-out/reports/rule-control.json"
+        }
+      },
+      "feedback": {
+        "kind": "python_l2_then_reobserve",
+        "reobserve": true,
+        "timeout_seconds": 600,
+        "commands": [
+          [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.tests.test_rule_control.PaidBudgetJournalSensorTests",
+            "scripts.eval.tests.test_memory_budget_journal",
+            "scripts.eval.tests.test_memory_budget_runtime",
+            "scripts.eval.tests.test_memory_agent_runtime",
+            "-v"
+          ],
+          [
+            "zig",
+            "build",
+            "test:new",
+            "-Dtinykg=false",
+            "-Dtfilter=L2 evaluation gate makes one physical provider attempt",
+            "-j2",
+            "--summary",
+            "all"
+          ]
+        ]
+      },
+      "counterexample": {
+        "fixture": "control-plane/counterexamples.json",
+        "required": true
+      }
     }
   ]
 }

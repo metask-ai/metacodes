@@ -1285,6 +1285,167 @@ class MemoryLocalStoreIsolationSensorTests(unittest.TestCase):
         )
 
 
+class PaidBudgetJournalSensorTests(unittest.TestCase):
+    RELATIVE_SOURCES = (
+        "scripts/eval/memory_budget_journal.py",
+        "scripts/eval/memory_agent_runtime.py",
+        "scripts/eval/memory_agent_runtime_pilot.py",
+        "scripts/eval/memory_replay.py",
+        "scripts/eval/tests/test_memory_budget_journal.py",
+        "scripts/eval/tests/test_memory_budget_runtime.py",
+        "scripts/eval/tests/test_memory_agent_runtime.py",
+        "tests/component/stream_retry_test.zig",
+    )
+
+    def make_repo(self) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        for relative in self.RELATIVE_SOURCES:
+            source = PROJECT_ROOT / relative
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+        return temporary, root
+
+    def test_all_nine_paid_budget_obligations_are_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertTrue(observation.sensor_ok, observation.errors)
+        self.assertEqual(9, observation.declared)
+        self.assertEqual(9, observation.covered)
+        self.assertEqual(5, len(observation.feedback_bindings))
+
+    def test_spawn_without_real_authorization_predecessor_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        runner = root / "scripts/eval/memory_agent_runtime.py"
+        runner.write_text(
+            runner.read_text(encoding="utf-8").replace(
+                "budget_journal.authorize_request(", "trust_unpersisted_authorization(", 1
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "real_runner_provider_requires_durable_authorization",
+            observation.missing_declarations,
+        )
+
+    def test_alternate_child_launcher_cannot_bypass_authorized_run_path(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        runner = root / "scripts/eval/memory_agent_runtime.py"
+        runner.write_text(
+            runner.read_text(encoding="utf-8").replace(
+                "        try:\n            if production is not None:\n",
+                "        try:\n"
+                "            os.system('provider-bypass')\n"
+                "            if production is not None:\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "real_runner_provider_requires_durable_authorization",
+            observation.missing_declarations,
+        )
+
+    def test_fsync_without_atomic_parent_commit_is_not_durable_evidence(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        journal = root / "scripts/eval/memory_budget_journal.py"
+        journal.write_text(
+            journal.read_text(encoding="utf-8").replace(
+                "os.fsync(self._dir_fd)", "parent_commit_was_not_durable = True", 1
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "durable_atomic_authorization_persistence",
+            observation.missing_declarations,
+        )
+
+    def test_helper_only_provider_test_cannot_replace_real_runner_path(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        tests = root / "scripts/eval/tests/test_memory_budget_runtime.py"
+        tests.write_text(
+            tests.read_text(encoding="utf-8").replace(
+                "test_mock_provider_observes_durable_authorization_on_real_runner_path",
+                "test_authorization_parser_helper_only",
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "real_runner_provider_requires_durable_authorization",
+            observation.missing_declarations,
+        )
+
+    def test_missing_post_provider_crash_window_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        tests = root / "scripts/eval/tests/test_memory_budget_runtime.py"
+        tests.write_text(
+            tests.read_text(encoding="utf-8").replace(
+                '"after_provider_return_before_commit", 1',
+                '"unobserved_post_provider_window", 1',
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "authorized_crash_recovery_consumes_maximum_without_retry",
+            observation.missing_declarations,
+        )
+
+    def test_receipt_without_checkpoint_reobservation_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        replay = root / "scripts/eval/memory_replay.py"
+        replay.write_text(
+            replay.read_text(encoding="utf-8").replace(
+                "validate_checkpoint_payload(checkpoint_payload)",
+                "trust_cached_checkpoint_summary(checkpoint_payload)",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "receipt_binds_final_journal_checkpoint",
+            observation.missing_declarations,
+        )
+
+    def test_dry_run_claim_without_zero_side_effect_l2_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        tests = root / "scripts/eval/tests/test_memory_agent_runtime.py"
+        tests.write_text(
+            tests.read_text(encoding="utf-8").replace(
+                "self.assertFalse(budget_journal.exists())",
+                "self.assertTrue(plan['dry_run'])",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "dry_run_and_paid_regression_gates_remain_zero_side_effect",
+            observation.missing_declarations,
+        )
+
+
 class FeedbackExecutionTests(unittest.TestCase):
     def test_shard_key_value_summary_does_not_impersonate_skipped_feedback(self) -> None:
         passed, results = rule_control.run_feedback(
@@ -1676,6 +1837,65 @@ class TopologyTests(unittest.TestCase):
             actuator_observed=True,
         )
         self.assertFalse(missing_native_dependency["feedback"])
+
+    def test_paid_budget_rule_requires_nine_obligation_kernel_and_real_feedback(self) -> None:
+        rule = self.complete_rule()
+        rule["id"] = "eval.paid-budget-journal-authorization.l2"
+        rule["sensor"] = {
+            "adapter": "paid_budget_journal",
+            "schema_version": 1,
+        }
+        rule["decision"]["kernel"] = (
+            "MetaCodesControl.PaidBudgetJournal.paidBudgetSignal"
+        )
+        rule["feedback"] = {
+            "kind": "python_l2_then_reobserve",
+            "reobserve": True,
+            "commands": [
+                [
+                    "python",
+                    "-m",
+                    "unittest",
+                    "scripts.tests.test_rule_control.PaidBudgetJournalSensorTests",
+                    "scripts.eval.tests.test_memory_budget_journal",
+                    "scripts.eval.tests.test_memory_budget_runtime",
+                    "scripts.eval.tests.test_memory_agent_runtime",
+                ],
+                [
+                    "zig",
+                    "build",
+                    "test:new",
+                    "-Dtfilter=L2 evaluation gate makes one physical provider attempt",
+                ],
+            ],
+        }
+        topology, errors = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertTrue(topology["sensor"], errors)
+        self.assertTrue(topology["decision"], errors)
+        self.assertTrue(topology["feedback"], errors)
+
+        rule["decision"]["kernel"] = "MetaCodesControl.ClosedLoop.signal"
+        weakened, _ = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertFalse(weakened["decision"])
+
+        rule["decision"]["kernel"] = (
+            "MetaCodesControl.PaidBudgetJournal.paidBudgetSignal"
+        )
+        rule["feedback"]["commands"] = [rule["feedback"]["commands"][1]]
+        helper_only, _ = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertFalse(helper_only["feedback"])
 
     def test_release_gate_is_observed_from_build_ci_and_telemetry_wiring(self) -> None:
         temporary, workspace, repo, actuator = self.make_actuator_workspace()
