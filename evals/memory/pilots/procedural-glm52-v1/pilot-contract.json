@@ -2,11 +2,11 @@
   "artifacts": {
     "execution.json": {
       "bytes": 705,
-      "sha256": "6c273d01eed102ca477695c973d0c0b8938bc138ec0dec297d3f545c241f1209"
+      "sha256": "b8902cee3035df76aa2aa11e3fc07f81af57b3db87492fdcc61f2f2c0a1f57cc"
     },
     "manifest.json": {
       "bytes": 3667,
-      "sha256": "9b8e362661dcc6ee680a48b3186b4b3c32d443cedc5f849f242c70621556d595"
+      "sha256": "495bb13089d773ef0f3ad939b4eecd8cafc40959dccf4aaddd48b41d4315012f"
     },
     "source.json": {
       "bytes": 4391,
@@ -37,8 +37,8 @@
     "split_seed": 20260807
   },
   "harness": {
-    "git_commit": "c7be832",
-    "revision": "metacodes-memory-production-pilot-v5-c7be832"
+    "git_commit": "bda846f",
+    "revision": "metacodes-memory-production-pilot-v6-bda846f"
   },
   "model": {
     "fingerprint": "e5cc883082b2a25721ee8b861c5e0cca37b6bdd93648d6883d6c8c54a34bf650",
@@ -58,7 +58,8 @@
         "treatment": "online durable Markdown memory followed by read-only offline reuse"
       },
       {
-        "fingerprint": "6cd0325087d56afe2ef3ba83835cd8fdd54b61e0b9069968da1333e6cfab29d7",
+        "fingerprint": "de986c26898812e2c766573a0a11cc197f9c8e55efa355f9f782f148fa94b363",
+        "fingerprint_basis": "sha256:tinykg-lexical-integrated-v2-stable-project-domain",
         "id": "tinykg_lexical",
         "treatment": "exact lexical query, at most four separate LLM-selected semantic probes, bounded graph traversal, and provenance verification"
       }
@@ -92,5 +93,12 @@
     ],
     "ordered_tsv_sha256": "128b43eac8bf699524db6fd295469195af75c55943facf608e1657cd44451eba"
   },
-  "schema_version": 1
+  "schema_version": 1,
+  "tinykg_runtime": {
+    "binary_sha256": "6ce9495c79ff9cab306fb3f70239c36611160c0a871eb1d28b70bb33333dcbd1",
+    "preflight_commands": ["init", "apply", "store-info"],
+    "schema_version": 3,
+    "source_commit": "93d89bcd4d0208c994da3632fb6166efffcc86e7",
+    "storage_format_version": 2
+  }
 }
