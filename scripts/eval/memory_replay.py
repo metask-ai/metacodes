@@ -1048,6 +1048,318 @@ def _summarize_context_cache(
     }
 
 
+def _native_warm_cache_metrics(
+    path: Path,
+    context_cache: Mapping[str, Any],
+    where: str = "production warm context/cache",
+) -> Mapping[str, Any]:
+    """Measure cache reuse after the first normal provider request.
+
+    The receipt-v9 cache summary intentionally keeps its historical aggregate
+    metric.  That metric includes each rollout's cold first request and, when
+    present, the tool-less breaker finalization request.  This function reads
+    the immutable native event artifact and exposes a separate diagnostic
+    metric that excludes both.  It is deliberately fail-closed when the
+    native usage timeline cannot be reconciled with the receipt's request
+    classification; a partial timeline must never become a positive cache
+    claim.
+    """
+
+    from .e2e_adapter import (
+        MAX_NATIVE_EVENT_BYTES,
+        NATIVE_EVENT_SCHEMA_VERSION,
+        _native_trace_metrics,
+        _read_regular_text_capped,
+    )
+
+    native, native_error = _native_trace_metrics(path)
+    if native_error is not None or native is None:
+        _fail(f"{where}.native_events", native_error or "invalid native events")
+    text, artifact_error = _read_regular_text_capped(path, MAX_NATIVE_EVENT_BYTES)
+    if artifact_error is not None or text is None:
+        _fail(f"{where}.native_events", artifact_error or "cannot read native events")
+
+    usages: List[Mapping[str, Any]] = []
+    for line_no, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            envelope = json.loads(line)
+        except json.JSONDecodeError as exc:
+            _fail(f"{where}.native_events:{line_no}", f"invalid JSON: {exc}")
+        if envelope.get("schema_version") != NATIVE_EVENT_SCHEMA_VERSION:
+            _fail(f"{where}.native_events:{line_no}", "schema version drift")
+        tagged = envelope.get("event")
+        if not isinstance(tagged, dict) or len(tagged) != 1:
+            _fail(f"{where}.native_events:{line_no}", "malformed event union")
+        payload = tagged.get("usage")
+        if isinstance(payload, dict):
+            usages.append(payload)
+
+    normal_request_count = _integer(
+        context_cache.get("normal_request_count"),
+        f"{where}.normal_request_count",
+        minimum=1,
+    )
+    finalization_count = _integer(
+        context_cache.get("tool_less_finalization_request_count"),
+        f"{where}.tool_less_finalization_request_count",
+    )
+
+    def metered_tokens(usage: Mapping[str, Any]) -> int:
+        return sum(
+            _integer(usage.get(key), f"{where}.usage.{key}")
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+            )
+        )
+
+    # The runtime emits a zero-valued usage event before the provider reports
+    # its metering.  Use the first non-zero event as the cold normal request;
+    # finalization is a known suffix and is excluded from warm reuse.
+    real_usages = [
+        usage
+        for usage in usages
+        if metered_tokens(usage) > 0
+        or _finite_number(usage.get("estimated_cost_usd"), f"{where}.usage.cost") > 0
+    ]
+    expected_real = normal_request_count + finalization_count
+    if len(real_usages) != expected_real:
+        _fail(
+            f"{where}.native_events",
+            "usage timeline does not match normal/finalization request counts",
+        )
+    if finalization_count and finalization_count > len(real_usages):
+        _fail(f"{where}.tool_less_finalization_request_count", "exceeds usage timeline")
+    normal_usages = real_usages[:normal_request_count]
+    finalization_usages = real_usages[normal_request_count:]
+    if len(finalization_usages) != finalization_count:
+        _fail(f"{where}.native_events", "finalization usage suffix is incomplete")
+
+    def totals(values: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
+        return {
+            key: sum(_integer(item.get(key), f"{where}.usage.{key}") for item in values)
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+            )
+        }
+
+    cold = totals(normal_usages[:1])
+    warm = totals(normal_usages[1:])
+    finalization = totals(finalization_usages)
+    warm_denominator = (
+        warm["input_tokens"]
+        + warm["cache_read_tokens"]
+        + warm["cache_write_tokens"]
+    )
+    return {
+        "usage_event_count": len(usages),
+        "zero_usage_event_count": len(usages) - len(real_usages),
+        "real_usage_event_count": len(real_usages),
+        "normal_request_count": normal_request_count,
+        "tool_less_finalization_request_count": finalization_count,
+        "warm_request_count": len(normal_usages) - 1,
+        "cold_start": cold,
+        "warm": warm,
+        "finalization": finalization,
+        "warm_cache_reuse_denominator_tokens": warm_denominator,
+        "warm_cache_reuse_ratio": (
+            warm["cache_read_tokens"] / warm_denominator
+            if warm_denominator > 0
+            else None
+        ),
+        "warm_cache_hit": warm["cache_read_tokens"] > 0,
+        "timeline_verified": True,
+    }
+
+
+def summarize_warm_context_cache(
+    runtime_receipt: Mapping[str, Any],
+    artifact_root: Path,
+    *,
+    runtime_receipt_sha256: str | None = None,
+    where: str = "memory warm context/cache analysis",
+) -> Mapping[str, Any]:
+    """Create a local, receipt-bound warm-cache diagnostic sidecar.
+
+    This does not modify or upgrade receipt-v9.  Each native event file is
+    rehashed against the receipt before its usage timeline is used, so the
+    sidecar cannot be populated from an unrelated trace.  It is diagnostic
+    evidence only; the production claim gate remains the receipt-v9 gate.
+    """
+
+    schema_version = runtime_receipt.get("schema_version")
+    if schema_version != PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+        _fail(f"{where}.schema_version", "warm-cache analysis requires production receipt-v9")
+    rollouts = runtime_receipt.get("rollouts")
+    if not isinstance(rollouts, list) or not rollouts:
+        _fail(f"{where}.rollouts", "expected non-empty receipt rollouts")
+    if runtime_receipt_sha256 is not None:
+        _hash(runtime_receipt_sha256, f"{where}.runtime_receipt_sha256")
+
+    by_arm: Dict[str, List[Mapping[str, Any]]] = {}
+    rollout_metrics: List[Mapping[str, Any]] = []
+    for index, raw_rollout in enumerate(rollouts):
+        rollout_where = f"{where}.rollouts[{index}]"
+        if not isinstance(raw_rollout, dict):
+            _fail(rollout_where, "expected an object")
+        paths = raw_rollout.get("artifact_paths")
+        if not isinstance(paths, dict):
+            _fail(f"{rollout_where}.artifact_paths", "expected an object")
+        relative = _artifact_relative_path(
+            paths.get("native_events"),
+            f"{rollout_where}.artifact_paths.native_events",
+        ).as_posix()
+        path = _artifact_path(
+            artifact_root,
+            relative,
+            f"{rollout_where}.artifact_paths.native_events",
+            directory=False,
+        )
+        expected_digest = _hash(
+            raw_rollout.get("native_events_sha256"),
+            f"{rollout_where}.native_events_sha256",
+        )
+        try:
+            observed_digest = file_sha256(path)
+        except OSError as exc:
+            raise ValidationError(f"{rollout_where}.native_events: cannot hash artifact: {exc}") from exc
+        if observed_digest != expected_digest:
+            _fail(f"{rollout_where}.native_events_sha256", "native event artifact drift")
+        context_cache = raw_rollout.get("context_cache")
+        if not isinstance(context_cache, dict):
+            _fail(f"{rollout_where}.context_cache", "expected an object")
+        metric = {
+            "sequence": _integer(raw_rollout.get("sequence"), f"{rollout_where}.sequence"),
+            "arm": _identifier(raw_rollout.get("arm"), f"{rollout_where}.arm"),
+            "run_id": _string(raw_rollout.get("run_id"), f"{rollout_where}.run_id"),
+            "native_events_sha256": expected_digest,
+            **_native_warm_cache_metrics(path, context_cache, rollout_where),
+        }
+        rollout_metrics.append(metric)
+        by_arm.setdefault(metric["arm"], []).append(metric)
+
+    summaries: Dict[str, Mapping[str, Any]] = {}
+    for arm in sorted(by_arm):
+        rows = by_arm[arm]
+        warm = [row["warm"] for row in rows]
+        cold = [row["cold_start"] for row in rows]
+        finalization = [row["finalization"] for row in rows]
+        warm_denominator = sum(row["warm_cache_reuse_denominator_tokens"] for row in rows)
+        warm_reads = sum(item["cache_read_tokens"] for item in warm)
+        all_reads = warm_reads + sum(item["cache_read_tokens"] for item in cold) + sum(
+            item["cache_read_tokens"] for item in finalization
+        )
+        all_prompt = sum(
+            item["input_tokens"] + item["cache_read_tokens"] + item["cache_write_tokens"]
+            for item in (*warm, *cold, *finalization)
+        )
+        summaries[arm] = {
+            "rollouts": len(rows),
+            "normal_request_count": sum(row["normal_request_count"] for row in rows),
+            "warm_request_count": sum(row["warm_request_count"] for row in rows),
+            "tool_less_finalization_request_count": sum(
+                row["tool_less_finalization_request_count"] for row in rows
+            ),
+            "usage_event_count": sum(row["usage_event_count"] for row in rows),
+            "zero_usage_event_count": sum(row["zero_usage_event_count"] for row in rows),
+            "real_usage_event_count": sum(row["real_usage_event_count"] for row in rows),
+            "warm_input_tokens": sum(item["input_tokens"] for item in warm),
+            "warm_output_tokens": sum(item["output_tokens"] for item in warm),
+            "warm_cache_read_tokens": warm_reads,
+            "warm_cache_write_tokens": sum(item["cache_write_tokens"] for item in warm),
+            "warm_cache_reuse_denominator_tokens": warm_denominator,
+            "warm_cache_reuse_ratio": (
+                warm_reads / warm_denominator if warm_denominator > 0 else None
+            ),
+            "warm_cache_opportunity_rollouts": sum(
+                row["warm_request_count"] > 0 for row in rows
+            ),
+            "warm_cache_hit_rollouts": sum(row["warm_cache_hit"] for row in rows),
+            "aggregate_cache_read_tokens": all_reads,
+            "aggregate_prompt_tokens": all_prompt,
+            "aggregate_cache_reuse_ratio": all_reads / all_prompt if all_prompt > 0 else None,
+        }
+
+    baseline = summaries.get("no_memory")
+    comparison: Dict[str, Any] = {}
+    blockers: List[str] = []
+    if baseline is None or baseline["warm_cache_reuse_ratio"] is None:
+        blockers.append("missing_no_memory_warm_cache_baseline")
+    else:
+        for arm in ("markdown_memory", "tinykg_lexical"):
+            candidate = summaries.get(arm)
+            if candidate is None or candidate["warm_cache_reuse_ratio"] is None:
+                blockers.append(f"missing_{arm}_warm_cache_baseline")
+                continue
+            difference = float(candidate["warm_cache_reuse_ratio"]) - float(
+                baseline["warm_cache_reuse_ratio"]
+            )
+            comparison[arm] = {
+                "risk_difference": difference,
+                "not_below_no_memory": difference >= -1e-12,
+            }
+            if difference < -1e-12:
+                blockers.append(f"{arm}:warm_cache_below_no_memory")
+    receipt_summary = runtime_receipt.get("context_cache_summary")
+    if not isinstance(receipt_summary, dict):
+        blockers.append("missing_receipt_context_cache_summary")
+    elif receipt_summary.get("context_cache_claim_gate_passed") is not True:
+        blockers.append("receipt_context_cache_claim_gate_not_passed")
+    return {
+        "schema_version": 1,
+        "diagnostic_only": True,
+        "runtime_receipt_sha256": runtime_receipt_sha256,
+        "artifact_root_contract": "receipt-bound-native-events",
+        "warm_cache_reuse_denominator": "warm_input_plus_cache_read_plus_cache_write_tokens_after_first_normal_request",
+        "rollouts": rollout_metrics,
+        "by_arm": summaries,
+        "comparison_to_no_memory": comparison,
+        "warm_cache_diagnostic_gate_passed": not blockers,
+        "claim_blockers": blockers,
+    }
+
+
+def render_warm_context_cache_markdown(
+    summary: Mapping[str, Any], title: str = "metacodes warm-cache diagnostic"
+) -> str:
+    lines = [
+        f"# {title}",
+        "",
+        "> Diagnostic only. This sidecar does not upgrade receipt-v9 or establish a memory-quality claim.",
+        "",
+        f"- Denominator: `{summary['warm_cache_reuse_denominator']}`",
+        f"- Diagnostic gate: `{'PASS' if summary['warm_cache_diagnostic_gate_passed'] else 'FAIL'}`",
+        "",
+        "| Arm | Rollouts | Normal requests | Warm requests | Warm cache-read | Warm denominator | Warm reuse | Aggregate reuse |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for arm, value in sorted(summary["by_arm"].items()):
+        warm_ratio = value["warm_cache_reuse_ratio"]
+        aggregate_ratio = value["aggregate_cache_reuse_ratio"]
+        lines.append(
+            f"| {arm} | {value['rollouts']} | {value['normal_request_count']} | "
+            f"{value['warm_request_count']} | {value['warm_cache_read_tokens']} | "
+            f"{value['warm_cache_reuse_denominator_tokens']} | "
+            f"{'n/a' if warm_ratio is None else f'{warm_ratio:.5f}'} | "
+            f"{'n/a' if aggregate_ratio is None else f'{aggregate_ratio:.5f}'} |"
+        )
+    lines.extend(["", "## Blockers", ""])
+    blockers = summary["claim_blockers"]
+    if blockers:
+        lines.extend(f"- `{item}`" for item in blockers)
+    else:
+        lines.append("- none")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _native_pricing_provenance(path: Path, where: str) -> str:
     observed: set[str] = set()
     try:

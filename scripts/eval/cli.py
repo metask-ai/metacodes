@@ -76,6 +76,8 @@ if __package__ in {None, ""}:
         load_observations as load_memory_observations,
         load_runtime_receipt as load_memory_runtime_receipt,
         replay_observations,
+        render_warm_context_cache_markdown,
+        summarize_warm_context_cache,
         summarize_runtime_query_plans,
     )
     from scripts.eval.memory_tinykg_local import run_local_tinykg_smoke  # type: ignore
@@ -147,7 +149,9 @@ else:
         load_manifest as load_memory_manifest,
         load_observations as load_memory_observations,
         load_runtime_receipt as load_memory_runtime_receipt,
+        render_warm_context_cache_markdown,
         replay_observations,
+        summarize_warm_context_cache,
         summarize_runtime_query_plans,
     )
     from .memory_tinykg_local import run_local_tinykg_smoke
@@ -246,6 +250,31 @@ def cmd_report_memory_query_plans(args: argparse.Namespace) -> int:
         f"host_recall_satisfied={summary['status_counts']['host_recall_satisfied']} "
         f"invalid={summary['status_counts']['invalid']} "
         f"legacy_unavailable={summary['status_counts']['legacy_unavailable']}"
+    )
+    return 0
+
+
+def cmd_report_memory_cache(args: argparse.Namespace) -> int:
+    receipt_path = Path(args.runtime_receipt).resolve()
+    receipt = load_memory_runtime_receipt(receipt_path)
+    artifact_root = (
+        Path(args.artifact_root).resolve()
+        if args.artifact_root
+        else receipt_path.parent
+    )
+    receipt_sha256 = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+    summary = summarize_warm_context_cache(
+        receipt,
+        artifact_root,
+        runtime_receipt_sha256=receipt_sha256,
+    )
+    _write(args.markdown, render_warm_context_cache_markdown(summary, args.title))
+    if args.json:
+        _write_json(args.json, summary)
+    print(
+        "memory warm-cache: "
+        f"diagnostic_gate={'PASS' if summary['warm_cache_diagnostic_gate_passed'] else 'FAIL'} "
+        f"arms={len(summary['by_arm'])} rollouts={len(summary['rollouts'])}"
     )
     return 0
 
@@ -1124,6 +1153,23 @@ def parser() -> argparse.ArgumentParser:
     query_plan_report_parser.add_argument("--markdown")
     query_plan_report_parser.add_argument("--json")
     query_plan_report_parser.set_defaults(func=cmd_report_memory_query_plans)
+
+    cache_report_parser = commands.add_parser(
+        "report-memory-cache",
+        help="measure warm provider-cache reuse from receipt-bound native events",
+    )
+    cache_report_parser.add_argument("--runtime-receipt", required=True)
+    cache_report_parser.add_argument(
+        "--artifact-root",
+        help="runtime artifact root (defaults to the receipt parent directory)",
+    )
+    cache_report_parser.add_argument(
+        "--title",
+        default="metacodes warm-cache diagnostic",
+    )
+    cache_report_parser.add_argument("--markdown")
+    cache_report_parser.add_argument("--json")
+    cache_report_parser.set_defaults(func=cmd_report_memory_cache)
 
     hotpot_adapter_parser = commands.add_parser(
         "adapt-hotpot-memory",
