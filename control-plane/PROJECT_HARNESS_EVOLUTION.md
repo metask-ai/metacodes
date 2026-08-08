@@ -177,6 +177,10 @@ Implemented runtime properties:
   `file_mutation_v2` after a real post-action re-read;
 - pre block prevents the dispatcher call; post block/fault occurs after the
   real outcome is re-observed and poisons the Run instead of hiding the effect;
+- all active rules for one phase are sent to one fixed-kernel batch call (up to
+  1024 requests / 4 MiB), while every member keeps its own request, candidate,
+  binding and verdict identity; batching changes process topology, not rule
+  semantics;
 - the durable journal validates exact `pre -> dispatch -> post -> finish`
   ordering, rejects duplicate candidate/phase decisions and dispatch-id reuse,
   requires one post verdict per admitted active rule unless a terminal
@@ -276,7 +280,7 @@ The artifacts are the primary paper dataset, not console logs:
 | shadow cases, interval, divergence, side effects | `rule-shadow-trace-*` and `rule-shadow-result-*` |
 | lifecycle acceptance/rejection and actors | `rule-stage-receipt-*` chain |
 | promotion/kernel latency and artifact size | promoted receipt `checker_elapsed_ns/checker_bytes` |
-| runtime checker calls/latency, blocks/faults | journal `formal_decision` events |
+| runtime checker calls/latency, blocks/faults | journal `formal_decision_batch` (or legacy `formal_decision`) events; deduplicate physical latency by checker-call hash |
 | actual effect/re-observation outcome | paired journal dispatch events |
 | active revision and provenance | `active.json`, bundle, promotion request/verdict |
 
@@ -290,16 +294,123 @@ human-review count, wall-clock proposal-to-promotion duration and cost; those
 experiment labels are not authorization inputs and therefore do not belong in
 the fixed kernel request.
 
-Compare at least:
+### Causal evaluation protocol
 
-1. no project rules;
-2. static hand-written rules;
-3. governed project-evolved rules.
+The central empirical claim is narrower than “Lean improves agents”:
 
-Use matched tasks, models, tool/token/cost caps, and isolated local TinyKG data
-for memory benchmarks. Report rule growth and maintenance cost as well as task
-success; a safer Harness that destroys context/cache reuse or consumes more
-maintenance budget than it saves is not an improvement.
+> After a project exposes a correction or counterexample, governed rule
+> evolution reduces recurrence on later, unseen variants without an
+> unacceptable loss of trustworthy task completion, context/cache reuse, or
+> operating cost.
+
+The experiment must preserve temporal direction.  An incident at time `t` may
+create a candidate, but replay and evaluation cases at `t+1` must not be used to
+author that candidate.  Fresh project/TinyKG stores per rollout prevent one arm
+from learning the other arm's future.  Replaying the original incident is a
+lifecycle check, not evidence of generalization.
+
+Use four primary arms:
+
+1. `signal_only`: actual tool signals and journal, no project rules;
+2. `static_enforced`: a frozen, hand-written project rule set;
+3. `evolved_shadow`: correction/reflection-derived governed rules evaluated
+   but not allowed to change dispatch;
+4. `evolved_enforced`: the identical evolved bundle actively gates dispatch.
+
+`evolved_shadow` versus `evolved_enforced` isolates actuation.  `static_enforced`
+versus `evolved_enforced` asks whether project learning adds value beyond a
+generic rulebook.  `signal_only` measures the ungoverned task baseline.  Rules,
+model, task/trial pairs, provider, tool/token/cost caps, initial filesystem and
+provider-visible prompt/tool prefix are frozen before arm assignment.  Arm
+order is randomized and every rollout uses a fresh local store and run
+directory.
+
+The first corpus should mix two evidence classes instead of pretending that
+one benchmark answers everything:
+
+- deterministic incident families with an executable oracle: prohibited
+  dispatch, excessive input/depth, non-authoritative action, missing or
+  mismatched file re-observation, stale/tampered binding, checker failure and
+  crash/recovery faults;
+- long-horizon project tasks containing later paraphrased or structurally
+  shifted recurrences of earlier corrections, plus ordinary tasks on which a
+  rule should remain silent.
+
+The current bounded `RuleSpec` can only support claims about its narrow tool and
+file-mutation vocabulary.  New signal/effect types expand the evaluated corpus
+only after a real L2 proves that the actual dispatcher emits them and the host
+re-observes the claimed effect.
+
+Pre-register three co-primary outcomes rather than hiding trade-offs in one
+score:
+
+- corrected-hazard recurrence rate on unseen post-correction cases;
+- trustworthy task success (task success with valid execution evidence);
+- false-intervention rate on oracle-safe actions.
+
+Secondary outcomes expose the control-loop mechanism:
+
+| Control question | Measure |
+| --- | --- |
+| observability | relevant incidents carrying sufficient typed pre/post signal |
+| controllability | oracle-preventable incidents reaching a pre-side-effect gate |
+| settling | later episodes and wall time from correction to first stable prevention |
+| overshoot | repeated incidents after correction but before stable prevention |
+| stability | rule churn, contradiction/supersession count, re-opened incidents |
+| robustness | recurrence prevention on paraphrase, tool-order and project-state shifts |
+| semantic learning | proposed/built/promoted/rejected candidates, replay FP/FN and shadow divergence |
+| formal integration | illegal lifecycle/binding/protocol mutations rejected before dispatch |
+| operating cost | proposal/review/build/checker time, model tokens, dollars and artifact bytes |
+| runtime cost | physical checker calls, p50/p95 latency and peak resources by active-rule count |
+| context/cache | provider-visible prefix SHA, cache breaks, cache read/write tokens and warm reuse ratio |
+
+Lean's empirical contribution should not be inferred from task score alone.
+Mutation and fault-injection tests measure whether every illegal transition in
+the stated theorem boundary is rejected through the real Zig-to-sidecar path.
+Task trials measure whether the *chosen invariant* is useful.  Lean can make a
+bad invariant consistently enforceable; it cannot make that invariant
+semantically wise.
+
+Run evaluation in four cost stages:
+
+1. deterministic native L2 and mutation/fault injection, with zero provider
+   requests;
+2. side-effect-free shadow replay over frozen historical Runs;
+3. a small paired model pilot to estimate variance and false interventions;
+4. only after a written power analysis, a paid temporally ordered continual
+   evaluation within the authorized budget.
+
+Use paired task/trial analysis.  Report raw counts and confidence intervals;
+use an exact paired binary test for success/hazard outcomes and bootstrap
+paired deltas for latency, tokens and cost.  Freeze exclusions and stopping
+rules before the paid run, and retain rejected candidates, timeouts and
+fail-closed Runs.  A useful first production gate is: exact cache-prefix
+identity and zero cache breaks, p95 formal overhead below 100 ms at 64 active
+rules, a pre-registered non-inferiority margin for trustworthy task success,
+and a positive recurrence reduction whose interval is reported rather than
+replaced by a hand-tuned composite score.
+
+Memory quality and formal governance remain separate experiments.  Existing
+`no_memory` / `markdown_memory` / `tinykg_lexical` benchmarks answer whether
+memory helps recall and task performance.  The four arms above answer whether
+project-specific formal evolution prevents recurrence.  A later reduced
+factorial experiment may cross memory and governance, but doing so before each
+main effect is established wastes paid samples and obscures causality.
+
+Raw benchmark stores and rollouts stay in the isolated local experiment tree.
+Only preregistered manifests, code/artifact identities, aggregate tables and
+concise verified conclusions may enter the remote TinyKG control plane.
+
+The 2026-08-09 local macOS arm64 ReleaseFast batch baseline used ten warm-file-
+cache test processes over the real `executeOne -> pre checker -> dispatcher ->
+post checker -> durable artifact/journal` path.  Execute-time p50/p95 was
+17.659/17.943 ms at 1 rule, 18.161/18.506 ms at 4, 20.374/20.894 ms at 16 and
+30.011/30.830 ms at 64.  This is mechanism overhead, not model-task outcome
+evidence; the ignored raw report remains under `zig-out/reports`.
+
+Report rule growth and maintenance cost as well as task success; a safer
+Harness that destroys context/cache reuse or consumes more maintenance budget
+than it saves is not an improvement.
 
 This control plane never changes the provider-visible Conversation, system
 prompt, tool schema, or tool ordering. Its journal and sidecar artifacts live
