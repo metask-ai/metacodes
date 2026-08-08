@@ -374,9 +374,9 @@ one benchmark answers everything:
   rule should remain silent.
 
 The current bounded `RuleSpec v2` can only support claims about its narrow tool,
-existing-file scope, and file-mutation vocabulary. New signal/effect types expand the evaluated corpus
-only after a real L2 proves that the actual dispatcher emits them and the host
-re-observes the claimed effect.
+existing-file scope, and file-mutation vocabulary. New signal/effect types
+expand the evaluated corpus only after a real L2 proves that the actual
+dispatcher emits them and the host re-observes the claimed effect.
 
 Pre-register three co-primary outcomes rather than hiding trade-offs in one
 score:
@@ -429,12 +429,22 @@ False intervention is reported separately, not hidden inside a composite
 score. The preregistration fixes sample size, exclusions, timeout treatment,
 non-inferiority margin and stopping rule before the first confirmatory request.
 
+Cache equality is causal-prefix equality, not an impossible demand that all
+arms remain byte-identical after treatment. Provider-visible system text, tool
+schema/order, task prompt and Conversation must be byte-identical through the
+last common event before the first enforced intervention. A blocked tool result
+and the model's recovery after it are treatment outcomes and may legitimately
+fork the later Conversation. The cache regression gate therefore rejects only
+control-plane-induced prefix changes (hidden rule prompts, schema reordering or
+extra model-facing metadata) and reports post-actuation cache reuse separately.
+
 Use paired task/trial analysis.  Report raw counts and confidence intervals;
 use an exact paired binary test for success/hazard outcomes and bootstrap
 paired deltas for latency, tokens and cost.  Freeze exclusions and stopping
 rules before the paid run, and retain rejected candidates, timeouts and
 fail-closed Runs.  A useful first production gate is: exact cache-prefix
-identity and zero cache breaks, p95 formal overhead below 100 ms at 64 active
+identity through the pre-treatment boundary and zero control-plane-induced
+cache breaks, p95 formal overhead below 100 ms at 64 active
 rules, a pre-registered non-inferiority margin for trustworthy task success,
 and a positive recurrence reduction whose interval is reported rather than
 replaced by a hand-tuned composite score.
