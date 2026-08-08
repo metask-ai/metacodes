@@ -115,6 +115,9 @@ pub const ToolProgressReporter = struct {
     }
 };
 
+pub const ToolObservationSink = @import("observation.zig").Sink;
+pub const ToolObservationOrigin = @import("observation.zig").Origin;
+
 /// Admission-fixed Run identity, passed by value down the execution chain.
 /// Immutable for the duration of one Run; never looked up from mutable state.
 pub const RunIdentity = struct {
@@ -408,6 +411,14 @@ pub const ToolContext = struct {
     /// id = 该工具的 tool_use id(per-toolUse 多卡按它路由;tool_exec runJob 盖入)。flat 保留(per-job 数据非闭包)。
     progress_tool_id: []const u8 = "",
 
+    /// UI-independent evidence emitted at the actual dispatch boundary. The
+    /// sink is host supplied and may fail closed; it is not a permission or
+    /// rule-promotion capability. `effect_slot` is installed by executeOne for
+    /// one synchronous dispatch and must never escape that call.
+    tool_observer: ?ToolObservationSink = null,
+    tool_observation_origin: ToolObservationOrigin = .authoritative,
+    effect_slot: ?*@import("observation.zig").EffectSlot = null,
+
     /// **U6 A2:工具→父 backend 通知通路**。Task 生 subagent → emit agent_lifecycle;
     /// TaskUpdate 改 DAG → emit tasks_changed。agent_loop(depth==0)注入,转发到 backend.emitEvent
     /// (mirror progress_reporter/ProgressTramp)。null = 无(headless/子 agent/纯单测)→ 工具跳过 emit。
@@ -444,6 +455,21 @@ pub const ToolContext = struct {
     /// id 自动用 self.progress_tool_id(per-toolUse 多卡路由)。
     pub fn reportProgress(self: *const ToolContext, phase: ProgressPhase, text: []const u8, count: u32) void {
         if (self.progress_reporter) |r| r.report(self.progress_tool_id, phase, text, count);
+    }
+
+    /// Attach target-file evidence observed by this dispatch. `after` is the
+    /// byte sequence the tool finished writing, not a race-free post-dispatch
+    /// re-observation. With no executeOne-installed slot (direct unit calls /
+    /// legacy embedders), this is deliberately a no-op rather than a second
+    /// observation path.
+    pub fn reportFileMutation(
+        self: *const ToolContext,
+        path: []const u8,
+        before: @import("observation.zig").BeforeContent,
+        after: []const u8,
+    ) void {
+        const slot = self.effect_slot orelse return;
+        slot.record(@import("observation.zig").fileMutation(path, before, after));
     }
 
     pub fn isPrefetchSafe(self: *const ToolContext, name: []const u8) bool {

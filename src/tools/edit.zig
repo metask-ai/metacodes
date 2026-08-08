@@ -131,8 +131,14 @@ fn finalizeWrite(
     const write_fd = pfs.openZ(file_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return error.WriteError;
     defer _ = pfs.close(write_fd);
 
-    const written = pfs.write(write_fd, content);
-    if (written < 0) return error.WriteError;
+    var pos: usize = 0;
+    while (pos < content.len) {
+        const written = pfs.write(write_fd, content[pos..]);
+        if (written <= 0) return error.WriteError;
+        pos += @intCast(written);
+    }
+
+    ctx.reportFileMutation(file_path, .{ .known = old_content }, content);
 
     // 写完后刷新 ReadState 的 mtime + content_hash，避免紧接着再次 Edit 报 stale
     if (ctx.read_state) |rs| {

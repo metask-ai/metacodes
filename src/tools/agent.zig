@@ -458,6 +458,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .dyn_registry = ctx.dyn_registry,
             .tool_defs_override = if (filtered_owned != null) effective_tool_defs else null,
             .execution_policy = child_execution_policy,
+            .tool_observer = ctx.tool_observer,
             .permission_mode_override = perm_override,
             .model_override = model_override,
             .reasoning_effort_override = if (def_opt) |d| d.effort else null,

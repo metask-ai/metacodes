@@ -410,6 +410,9 @@ pub const Options = struct {
     /// Borrowed immutable upper bound for this execution context. The owner
     /// keeps it alive until this synchronous Run and all tool workers quiesce.
     execution_policy: ?tools_mod.ToolExecutionPolicy = null,
+    /// UI-independent actual-dispatch observation capability. Unlike
+    /// `emit_tool_cards`/EventProjection this remains active at every depth.
+    tool_observer: ?tools_mod.ToolObservationSink = null,
     /// 统一 UI 请求回调(替代旧 ask_question/exit_plan 三套;ctx 指 *TuiBackend)。
     /// 仅顶层 TUI 接(agent_depth==0)——子 agent 无 tty。见 UiRequester。
     ui_requester: ?@import("protocol/ui_request.zig").UiRequester = null,
@@ -860,6 +863,8 @@ pub fn run(
             .dyn_registry = opts.dyn_registry,
             .tool_dispatcher = opts.tool_dispatcher,
             .execution_policy = opts.execution_policy,
+            .tool_observer = opts.tool_observer,
+            .tool_observation_origin = .speculative_prefetch,
             .host_services = opts.host_services,
             .host_run = opts.host_run,
             .explicit_invocation = opts.explicit_invocation,
@@ -1403,6 +1408,8 @@ pub fn run(
             .dyn_registry = opts.dyn_registry,
             .tool_dispatcher = opts.tool_dispatcher,
             .execution_policy = opts.execution_policy,
+            .tool_observer = opts.tool_observer,
+            .tool_observation_origin = .authoritative,
             .host_services = opts.host_services,
             .host_run = opts.host_run,
             .explicit_invocation = opts.explicit_invocation,

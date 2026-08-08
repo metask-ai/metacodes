@@ -41,6 +41,9 @@ pub const HostRunIdentity = @import("tools/context.zig").HostRunIdentity;
 pub const HostServices = @import("tools/context.zig").HostServices;
 pub const PendingRequest = @import("tools/context.zig").PendingRequest;
 pub const ToolProgressReporter = @import("tools/context.zig").ToolProgressReporter;
+pub const ToolObservationSink = @import("tools/context.zig").ToolObservationSink;
+pub const ToolObservationOrigin = @import("tools/context.zig").ToolObservationOrigin;
+pub const tool_observation = @import("tools/observation.zig");
 pub const PromptContext = @import("tools/prompt_context.zig").PromptContext;
 pub const descriptions = @import("tools/descriptions.zig");
 

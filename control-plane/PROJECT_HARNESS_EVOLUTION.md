@@ -1,0 +1,173 @@
+# Project-specific Harness Evolution
+
+Status: design contract plus the first observation-plane pilot. This document
+does not claim that automatic Lean rule evolution is already implemented.
+
+## Direction
+
+The useful end state is not one universal, prewritten rulebook. A metacodes
+project gradually acquires a versioned, project-specific Harness as real work
+reveals its failure modes:
+
+```text
+actual tool signals
+  -> user correction / agent reflection / runtime counterexample
+  -> candidate Lean rule
+  -> isolated build + axiom audit + historical replay + shadow execution
+  -> independent promotion
+  -> hash-pinned project rule bundle
+  -> runtime verdict
+  -> actual tool signals and re-observation
+```
+
+“Dynamic Lean” means evolution across the lifetime of a project. It never
+means that an agent writes a theorem during an action and immediately uses that
+same theorem to authorize the action.
+
+Lean starts deliberately small. A rule is worth formalizing only after the
+project has produced a concrete correction, counterexample, or repeated
+operational failure that makes the invariant stable enough to state precisely.
+
+## Signal plane
+
+Every actual tool dispatch needs a generic, UI-independent envelope at the one
+real execution seam. The envelope identifies the tool use, requested and
+actually dispatched names, origin, agent depth, input/result commitments,
+outcome, error code, and elapsed time. A tool may add a versioned typed effect
+when the generic envelope is insufficient.
+
+Typed effects are added incrementally. The first pilot is `file_mutation_v1`,
+which reports commitments and byte counts for the file state observed by
+Write/Edit. It does not expose paths or contents, prove filesystem atomicity, or
+authorize another mutation. Its path hash is a commitment rather than an
+anonymity guarantee, and the pilot does not claim to enumerate auxiliary
+effects such as parent-directory creation. Tool cards, TUI projection, and
+model-facing tool schemas are separate consumers and cannot disable the signal
+plane.
+
+Speculative prefetch is marked separately from authoritative execution. A
+discarded prefetch remains a real dispatch and therefore remains observable,
+but it cannot be mistaken for the action selected by the completed model turn.
+
+## Candidate sources and authority
+
+The source is part of the candidate identity and cannot be rewritten during
+promotion.
+
+| Source | Meaning | Initial authority | May do |
+| --- | --- | --- | --- |
+| `user_correction` | An external correction or project constraint | high | prioritize a candidate and define acceptance examples |
+| `agent_reflection` | An agent hypothesis formed after inspecting its work and signals | low | propose a falsifiable candidate and replay cases |
+| `runtime_counterexample` | A concrete failed verdict, invariant breach, or execution mismatch | evidence | demonstrate that an existing contract is incomplete |
+
+An agent reflection must bind the run identity, the observation interval used,
+the proposed invariant, and at least one falsifier: a condition under which the
+reflection should be rejected. It is a hypothesis, not testimony. The agent
+that produced it cannot certify its truth, promote it, expand its own authority,
+or use it to approve side effects in the same incident.
+
+A user correction has greater semantic authority, but it still does not bypass
+type checking, the axiom policy, replay, shadow execution, or runtime evidence.
+For example, a correction can establish “never do X in this project”; it cannot
+make a malformed checker artifact safe.
+
+## Candidate lifecycle
+
+The intended persistent states are:
+
+```text
+proposed
+  -> built
+  -> axiom_audited
+  -> replay_passed
+  -> shadow_passed
+  -> promoted
+  -> superseded
+
+proposed/built/axiom_audited/replay_passed/shadow_passed -> rejected
+```
+
+Each transition appends evidence; it does not overwrite prior evidence. A
+promotion receipt must bind all of the following:
+
+- project identity and rule identifier;
+- source kind and immutable source evidence;
+- Lean source hash and compiled checker hash;
+- approved axiom policy and axiom-audit result;
+- replay corpus identity and results, including negative cases;
+- shadow interval, observed decisions, and divergences;
+- promoter identity, bundle revision, and previous bundle hash.
+
+There is no direct `proposed -> promoted` transition. The proposal-producing
+agent is never sufficient promotion authority. Runtime loads only promoted,
+compiled, version-compatible, hash-pinned bundles. Missing artifacts, identity
+drift, malformed receipts, or a checker protocol error fail closed.
+
+Promotion does not prove that a natural-language belief is true. It establishes
+that a particular executable decision rule passed the declared governance
+process and that its runtime artifact is the one that was reviewed.
+
+## Closed-loop responsibilities
+
+- Tools emit actual signals and typed effects. They do not declare themselves
+  compliant.
+- Zig owns permission, dispatch ordering, durable observation transport,
+  checker invocation, re-observation, and fail-closed actuation.
+- Lean owns the small set of promoted transition and governance invariants. It
+  does not prove `fsync`, locks, provider behavior, or semantic truth.
+- TinyKG is the eventual versioned task/memory/audit plane. Canonical mutation
+  waits for its dedicated snapshot/CAS/receipt/rollback primitive; ordinary
+  multi-command writes must not emulate that transaction.
+- The LLM proposes meanings, abstractions, repairs, and candidate rules. It
+  never self-promotes them.
+
+The loop is complete only when the verdict changes what the runtime may do and
+the resulting environment is observed again. A theorem that is built in CI but
+does not gate a real action is documentation, not a control loop.
+
+## Current implementation boundary
+
+Implemented in the first pilot:
+
+- `tool_exec.executeOne` emits start/finish observations around actual dispatch;
+- observations are independent of UI projection and work at nested depth;
+- observer rejection before dispatch prevents the dispatcher call;
+- observer rejection after an effect poisons the Run instead of reporting an
+  unobserved success;
+- Write/Edit can publish `file_mutation_v1` evidence;
+- synchronous subagents and TaskBatch inherit the observer;
+- an L2 test covers model tool use through the real Write dispatch.
+
+Not yet implemented:
+
+- a durable, receipt-producing observation journal;
+- observer ownership for detached background subagents whose lifetime exceeds
+  a synchronous Run;
+- authoritative adoption/discard disposition for a speculative prefetch after
+  the completed model turn is known;
+- a persistent RuleCandidate protocol and evidence store;
+- isolated candidate Lean compilation, replay, shadow, and promotion;
+- a project bundle loader or runtime verdict gate;
+- TinyKG atomic MemoryMigration commit/rollback integration.
+
+Consequently, the current milestone is an observation-plane foundation, not a
+self-evolving formal Harness.
+
+## Evaluation and paper data
+
+Retain event counts, dropped/rejected events, effect coverage by tool and depth,
+observer latency, candidate source, correction/reflection provenance, build and
+axiom-audit outcomes, replay false-positive/false-negative cases, shadow
+divergences, promotion/rejection reasons, bundle hashes, runtime blocks, and
+post-action re-observation results.
+
+Compare at least:
+
+1. no project rules;
+2. static hand-written rules;
+3. governed project-evolved rules.
+
+Use matched tasks, models, tool/token/cost caps, and isolated local TinyKG data
+for memory benchmarks. Report rule growth and maintenance cost as well as task
+success; a safer Harness that destroys context/cache reuse or consumes more
+maintenance budget than it saves is not an improvement.

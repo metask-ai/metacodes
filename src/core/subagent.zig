@@ -66,6 +66,7 @@ pub const SpawnOptions = struct {
     /// Optional Session-owned dispatch and immutable execution bound.
     tool_dispatcher: ?@import("../tools/context.zig").ToolDispatcher = null,
     execution_policy: ?@import("../tools/context.zig").ToolExecutionPolicy = null,
+    tool_observer: ?@import("../tools/context.zig").ToolObservationSink = null,
     host_run: ?@import("../tools/context.zig").HostRunIdentity = null,
     ui_requester: ?@import("protocol/ui_request.zig").UiRequester = null,
     read_state: ?*@import("read_state.zig").ReadState = null,
@@ -195,6 +196,7 @@ pub fn spawnAgentSink(
             .dyn_registry = opts.dyn_registry,
             .tool_dispatcher = opts.tool_dispatcher,
             .execution_policy = opts.execution_policy,
+            .tool_observer = opts.tool_observer,
             .host_services = opts.host_services,
             .host_run = opts.host_run,
             .ui_requester = opts.ui_requester,
@@ -272,5 +274,6 @@ test "SpawnOptions defaults" {
     try testing.expectEqualSlices(u8, SessionId.single.asSlice(), o.session.asSlice());
     try testing.expect(o.event_projection == .legacy);
     try testing.expect(o.execution_policy == null);
+    try testing.expect(o.tool_observer == null);
     try testing.expect(o.tool_dispatcher == null);
 }

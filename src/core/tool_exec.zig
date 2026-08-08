@@ -15,6 +15,7 @@ const std = @import("std");
 const platform = @import("platform");
 const tools_mod = @import("../tools.zig");
 const ToolContext = tools_mod.ToolContext;
+const tool_observation = @import("../tools/observation.zig");
 const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
 
@@ -133,6 +134,151 @@ pub const OneResult = union(enum) {
     host_fatal,
 };
 
+fn emitDispatchStarted(
+    ctx: *const ToolContext,
+    id: []const u8,
+    requested_name: []const u8,
+    dispatched_name: []const u8,
+    input: []const u8,
+) bool {
+    const sink = ctx.tool_observer orelse return true;
+    return sink.emit(.{ .dispatch_started = .{
+        .id = id,
+        .requested_name = requested_name,
+        .dispatched_name = dispatched_name,
+        .origin = ctx.tool_observation_origin,
+        .agent_depth = ctx.agent_depth,
+        .input_bytes = input.len,
+        .input_sha256 = tool_observation.sha256Hex(input),
+    } });
+}
+
+fn emitDispatchFinished(
+    ctx: *const ToolContext,
+    id: []const u8,
+    requested_name: []const u8,
+    dispatched_name: []const u8,
+    outcome: tool_observation.Outcome,
+    error_code: ?[]const u8,
+    elapsed_ms: u64,
+    result: ?[]const u8,
+    effect_slot: tool_observation.EffectSlot,
+) bool {
+    const sink = ctx.tool_observer orelse return true;
+    return sink.emit(.{ .dispatch_finished = .{
+        .id = id,
+        .requested_name = requested_name,
+        .dispatched_name = dispatched_name,
+        .origin = ctx.tool_observation_origin,
+        .agent_depth = ctx.agent_depth,
+        .outcome = outcome,
+        .error_code = error_code,
+        .elapsed_ms = elapsed_ms,
+        .result_present = result != null,
+        .result_bytes = if (result) |bytes| bytes.len else 0,
+        .result_sha256 = if (result) |bytes|
+            tool_observation.sha256Hex(bytes)
+        else
+            [_]u8{'0'} ** 64,
+        .effect = effect_slot.effect,
+        .effect_valid = effect_slot.valid,
+    } });
+}
+
+/// Keeps the actual-dispatch observation pair structurally closed. Explicit
+/// terminal outcomes still carry the useful code/result; the defer is a final
+/// defense against a future early-return branch silently losing its finish.
+const DispatchObservation = struct {
+    ctx: *const ToolContext,
+    id: []const u8,
+    requested_name: []const u8,
+    dispatched_name: []const u8,
+    started_at_ms: i64,
+    effect_slot: *const tool_observation.EffectSlot,
+    started: bool = false,
+    terminal_attempted: bool = false,
+
+    fn start(self: *DispatchObservation, input: []const u8) bool {
+        if (!emitDispatchStarted(self.ctx, self.id, self.requested_name, self.dispatched_name, input)) return false;
+        self.started = true;
+        return true;
+    }
+
+    fn finish(
+        self: *DispatchObservation,
+        outcome: tool_observation.Outcome,
+        error_code: ?[]const u8,
+        result: ?[]const u8,
+    ) bool {
+        // This protocol protects production evidence, so duplicate/unstarted
+        // terminal attempts must fail closed in Release builds too; a Debug
+        // assertion alone would compile the guard away.
+        if (!self.started or self.terminal_attempted) return false;
+        self.terminal_attempted = true;
+        const elapsed: u64 = @intCast(@max(util_time.nowMs() - self.started_at_ms, 0));
+        return emitDispatchFinished(
+            self.ctx,
+            self.id,
+            self.requested_name,
+            self.dispatched_name,
+            outcome,
+            error_code,
+            elapsed,
+            result,
+            self.effect_slot.*,
+        );
+    }
+
+    fn ensureTerminal(self: *DispatchObservation) void {
+        if (!self.started or self.terminal_attempted) return;
+        _ = self.finish(.host_fatal, "DispatchObservationUnwound", null);
+    }
+};
+
+const ObservationCapture = struct {
+    mutex: platform.sync.Mutex = .{},
+    starts: usize = 0,
+    finishes: usize = 0,
+    depth: u8 = 0,
+    origin: tool_observation.Origin = .authoritative,
+    outcome: tool_observation.Outcome = .tool_error,
+    effect: ?tool_observation.Effect = null,
+    effect_valid: bool = false,
+    accept_start: bool = true,
+    accept_finish: bool = true,
+    saw_name_repair: bool = false,
+    dispatched_as_write: bool = false,
+
+    fn sink(self: *ObservationCapture) tools_mod.ToolObservationSink {
+        return .{ .ctx = @ptrCast(self), .emitFn = emit };
+    }
+
+    fn emit(raw: *anyopaque, event: tool_observation.Event) bool {
+        const self: *ObservationCapture = @ptrCast(@alignCast(raw));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        switch (event) {
+            .dispatch_started => |started| {
+                self.starts += 1;
+                self.depth = started.agent_depth;
+                self.origin = started.origin;
+                self.saw_name_repair = !std.mem.eql(u8, started.requested_name, started.dispatched_name);
+                self.dispatched_as_write = std.mem.eql(u8, started.dispatched_name, "Write");
+                return self.accept_start;
+            },
+            .dispatch_finished => |finished| {
+                self.finishes += 1;
+                self.depth = finished.agent_depth;
+                self.origin = finished.origin;
+                self.outcome = finished.outcome;
+                self.effect = finished.effect;
+                self.effect_valid = finished.effect_valid;
+                return self.accept_finish;
+            },
+        }
+    }
+};
+
 /// **单一工具执行入口**——executeSlots(串行/并发批)与 stream_prefetch(边流边执行)共用,
 /// 保证两条路径的执行语义/错误处理**完全一致**(消除历史"行为分叉":富错误 detail、UnknownTool
 /// 引导、大结果落盘、UiPending 控制信号、计时)。每次自建 arena 规避 GPA 并发;结果 dupe 逃逸。
@@ -158,6 +304,23 @@ pub fn executeOne(
     // L3 挂起槽:工具发起 custom UI 拿到 .pending → 写 {kind,payload} 进这里 + 返 error.UiPending。
     var pending_req: ?tools_mod.PendingRequest = null;
     job_ctx.pending_request = &pending_req;
+    var effect_slot = tool_observation.EffectSlot{};
+    job_ctx.effect_slot = &effect_slot;
+    // Built-in/dynamic dispatch performs deterministic name normalization;
+    // host Session dispatch deliberately receives the exact advertised name.
+    // Preserve both so evidence never attributes a repaired call to the model.
+    const dispatched_name = if (job_ctx.tool_dispatcher != null)
+        name
+    else
+        tools_mod.resolveToolNameExact(&job_ctx, name) orelse name;
+    var dispatch_observation = DispatchObservation{
+        .ctx = &job_ctx,
+        .id = id,
+        .requested_name = name,
+        .dispatched_name = dispatched_name,
+        .started_at_ms = t_start,
+        .effect_slot = &effect_slot,
+    };
 
     log.infoId("agent", rid, "tool.exec start(par) name={s} id={s}", .{ name, id });
     if (job_ctx.execution_policy) |policy| {
@@ -182,11 +345,22 @@ pub fn executeOne(
             } };
         }
     }
+    if (!dispatch_observation.start(input)) {
+        log.warnId("agent", rid, "tool observation rejected dispatch start name={s} id={s}", .{ name, id });
+        return .host_fatal;
+    }
+    defer dispatch_observation.ensureTerminal();
     const r = tools_mod.dispatch(&job_ctx, name, input) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
         const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
+        if (err == error.OutOfMemory) {
+            if (!dispatch_observation.finish(.host_fatal, @errorName(err), null))
+                return .host_fatal;
+            return error.OutOfMemory;
+        }
         // L3:UiPending 是控制信号(非工具错误)——kind/payload dupe 到父 allocator 逃逸 arena。
         if (err == error.UiPending) {
+            if (!dispatch_observation.finish(.pending, @errorName(err), null))
+                return .host_fatal;
             log.infoId("agent", rid, "tool.exec PENDING(par) name={s} id={s} kind={s}", .{ name, id, if (pending_req) |pr| pr.kind else "" });
             const kind = if (pending_req) |pr| try parent_allocator.dupe(u8, pr.kind) else null;
             errdefer if (kind) |bytes| parent_allocator.free(bytes);
@@ -198,6 +372,8 @@ pub fn executeOne(
             } };
         }
         const code = if (err == error.UnknownTool) "UnknownTool" else @errorName(err);
+        if (!dispatch_observation.finish(.tool_error, code, null))
+            return .host_fatal;
         const tool_error = @import("tool_error.zig");
         // 错误 json 用父 allocator(逃逸 arena)。工具填了 detail 用之,否则通用文案。
         // P0.6:UnknownTool 附可用工具清单(hermes 式引导),弱模型据此自纠而非空转烧 turn。
@@ -219,12 +395,16 @@ pub fn executeOne(
     // outcome slice 挂 job_ctx.allocator(= 本函数 arena) → 随 arena 回收,无单独释放点。
     switch (r) {
         .host_fatal => {
+            _ = dispatch_observation.finish(.host_fatal, "HostToolFatal", null);
             log.warnId("agent", rid, "tool.exec HOST-FATAL name={s} id={s}", .{ name, id });
             return .host_fatal;
         },
         .host_failed, .host_rejected => |maybe_detail| {
             const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
             const code: []const u8 = if (r == .host_failed) "HostToolFailed" else "HostToolRejected";
+            const outcome: tool_observation.Outcome = if (r == .host_failed) .host_failed else .host_rejected;
+            if (!dispatch_observation.finish(outcome, code, maybe_detail))
+                return .host_fatal;
             const ej = try hostToolErrorJson(code, name, maybe_detail, parent_allocator);
             log.warnId("agent", rid, "tool.exec HOST-{s}(par) name={s} duration_ms={d}", .{ code, name, elapsed });
             return .{ .done = .{ .content = ej, .is_error = true, .elapsed_ms = elapsed } };
@@ -232,6 +412,10 @@ pub fn executeOne(
         .ok => {},
     }
     const ok_bytes = r.ok;
+    if (!dispatch_observation.finish(.succeeded, null, ok_bytes)) {
+        log.warnId("agent", rid, "tool observation rejected dispatch finish name={s} id={s}", .{ name, id });
+        return .host_fatal;
+    }
     // A successful persistent-task claim is the first decision point for that
     // task. Feed verified, execution-grounded history back through the same
     // tool result before the next model request. The adapter is deliberately
@@ -1027,4 +1211,156 @@ test "Slot.takeContent 转移即置空,与 deinit 无双释放" {
     try std.testing.expect(s.content == null);
     a.free(taken.?); // 调用方持有
     s.deinit(a); // 已置空 → no-op,无双释放(testing.allocator 会抓)
+}
+
+test "tool observation: actual Write dispatch emits UI-independent typed effect at nested depth" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/observed.txt",
+        .{root_buffer[0..root_len]},
+        0,
+    );
+    defer allocator.free(path);
+    const args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"grounded\"}}",
+        .{path},
+    );
+    defer allocator.free(args);
+
+    var capture = ObservationCapture{};
+    var ctx = tools_mod.ToolContext.simple(allocator);
+    ctx.agent_depth = 7;
+    ctx.tool_observer = capture.sink();
+    const result = try executeOne(
+        &ctx,
+        "write_tool",
+        args,
+        "nested-write",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(!done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), capture.starts);
+    try std.testing.expectEqual(@as(usize, 1), capture.finishes);
+    try std.testing.expectEqual(@as(u8, 7), capture.depth);
+    try std.testing.expect(capture.origin == .authoritative);
+    try std.testing.expect(capture.outcome == .succeeded);
+    try std.testing.expect(capture.saw_name_repair);
+    try std.testing.expect(capture.dispatched_as_write);
+    try std.testing.expect(capture.effect_valid);
+    const effect = capture.effect orelse return error.MissingToolEffect;
+    const mutation = switch (effect) {
+        .file_mutation_v1 => |value| value,
+    };
+    try std.testing.expect(mutation.before_state == .missing);
+    try std.testing.expect(mutation.change == .changed);
+    try std.testing.expectEqual(@as(usize, "grounded".len), mutation.after_bytes);
+    try std.testing.expectEqualSlices(
+        u8,
+        &tool_observation.sha256Hex(path),
+        &mutation.path_sha256,
+    );
+    try std.testing.expect(platform.fs.exists(path.ptr));
+}
+
+test "tool observation: finish rejection poisons dispatch after preserving actual file effect" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/finish-rejected.txt",
+        .{root_buffer[0..root_len]},
+        0,
+    );
+    defer allocator.free(path);
+    const args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"effect-happened\"}}",
+        .{path},
+    );
+    defer allocator.free(args);
+
+    var capture = ObservationCapture{ .accept_finish = false };
+    var ctx = tools_mod.ToolContext.simple(allocator);
+    ctx.tool_observer = capture.sink();
+    const result = try executeOne(
+        &ctx,
+        "Write",
+        args,
+        "finish-rejected",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+
+    try std.testing.expect(result == .host_fatal);
+    try std.testing.expectEqual(@as(usize, 1), capture.starts);
+    try std.testing.expectEqual(@as(usize, 1), capture.finishes);
+    try std.testing.expect(capture.outcome == .succeeded);
+    try std.testing.expect(capture.effect_valid);
+    try std.testing.expect(capture.effect != null);
+    try std.testing.expect(platform.fs.exists(path.ptr));
+}
+
+test "tool observation: sink rejection blocks before actual dispatcher invocation" {
+    const Probe = struct {
+        calls: usize = 0,
+
+        fn dispatch(raw: *const anyopaque, tool_ctx: *const tools_mod.ToolContext, _: []const u8, _: []const u8) anyerror!tools_mod.ToolDispatchOutcome {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            return .{ .ok = try tool_ctx.allocator.dupe(u8, "unexpected") };
+        }
+        fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+        fn nameAt(_: *const anyopaque, _: usize) ?[]const u8 {
+            return null;
+        }
+        fn hostSync(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+        fn dispatcher(self: *@This()) tools_mod.ToolDispatcher {
+            return .{
+                .ctx = @ptrCast(self),
+                .dispatchFn = dispatch,
+                .prefetchSafeFn = prefetchSafe,
+                .nameAtFn = nameAt,
+                .hostSyncFn = hostSync,
+            };
+        }
+    };
+
+    var probe = Probe{};
+    var capture = ObservationCapture{ .accept_start = false };
+    var ctx = tools_mod.ToolContext.simple(std.testing.allocator);
+    ctx.tool_dispatcher = probe.dispatcher();
+    ctx.tool_observer = capture.sink();
+    const result = try executeOne(
+        &ctx,
+        "Probe",
+        "{}",
+        "blocked",
+        std.testing.allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    try std.testing.expect(result == .host_fatal);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    try std.testing.expectEqual(@as(usize, 1), capture.starts);
+    try std.testing.expectEqual(@as(usize, 0), capture.finishes);
 }
