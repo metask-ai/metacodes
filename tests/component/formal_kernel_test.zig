@@ -229,6 +229,24 @@ test "L2 headless formal tool crosses registry, TinyKG sensor, compiled Lean, an
     const ReceiptProbe = struct {
         schema_version: []const u8,
         identity: ?struct { root_task_id: u64, snapshot_revision: []const u8 },
+        work_cell: struct {
+            schema_version: []const u8,
+            controller: []const u8,
+            formal_transition: []const u8,
+            effect_class: []const u8,
+            phase: []const u8,
+            formal_gate_admitted: bool,
+            pipeline_admitted: bool,
+            mutation_authorized: bool,
+            authorization_scope: []const u8,
+            snapshot_revision: ?[]const u8,
+            verdict_sha256: ?[]const u8,
+            andon: struct {
+                tripped: bool,
+                reason_code: ?[]const u8,
+                permitted_recovery: []const []const u8,
+            },
+        },
         checker: ?struct {
             expected_version: []const u8,
             actual_sha256: ?[]const u8,
@@ -256,6 +274,29 @@ test "L2 headless formal tool crosses registry, TinyKG sensor, compiled Lean, an
     try std.testing.expectEqualStrings("none", checker.runtime_failure_kind orelse return error.MissingFormalFailureKind);
     try std.testing.expect(verdict.checker_admitted);
     try std.testing.expectEqual(@as(usize, 0), verdict.reason_codes.len);
+    try std.testing.expectEqualStrings(
+        cc.formal_task_audit.WORK_CELL_RECEIPT_SCHEMA,
+        parsed.value.work_cell.schema_version,
+    );
+    try std.testing.expectEqualStrings("zig_operation_specific", parsed.value.work_cell.controller);
+    try std.testing.expectEqualStrings(
+        "task_audit_observed_to_verified_or_blocked",
+        parsed.value.work_cell.formal_transition,
+    );
+    try std.testing.expectEqualStrings("read_only", parsed.value.work_cell.effect_class);
+    try std.testing.expectEqualStrings("verified", parsed.value.work_cell.phase);
+    try std.testing.expect(parsed.value.work_cell.formal_gate_admitted);
+    try std.testing.expect(parsed.value.work_cell.pipeline_admitted);
+    try std.testing.expect(!parsed.value.work_cell.mutation_authorized);
+    try std.testing.expectEqualStrings("audit_result_only", parsed.value.work_cell.authorization_scope);
+    try std.testing.expectEqualStrings(
+        identity.snapshot_revision,
+        parsed.value.work_cell.snapshot_revision orelse return error.MissingWorkCellRevision,
+    );
+    try std.testing.expect(parsed.value.work_cell.verdict_sha256 != null);
+    try std.testing.expect(!parsed.value.work_cell.andon.tripped);
+    try std.testing.expect(parsed.value.work_cell.andon.reason_code == null);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.work_cell.andon.permitted_recovery.len);
     if (!parsed.value.pipeline.admitted) std.debug.print("headless formal receipt: {s}\n", .{receipt});
     try std.testing.expect(parsed.value.pipeline.admitted);
     try std.testing.expectEqualStrings("none", parsed.value.pipeline.failure_kind);
@@ -303,6 +344,18 @@ test "L2 headless formal tool crosses registry, TinyKG sensor, compiled Lean, an
     defer allocator.free(blocked_receipt);
     const BlockedProbe = struct {
         checker: ?struct { runtime_failure_kind: ?[]const u8 },
+        work_cell: struct {
+            phase: []const u8,
+            formal_gate_admitted: bool,
+            pipeline_admitted: bool,
+            mutation_authorized: bool,
+            authorization_scope: []const u8,
+            andon: struct {
+                tripped: bool,
+                reason_code: []const u8,
+                permitted_recovery: []const []const u8,
+            },
+        },
         pipeline: struct { admitted: bool, failure_kind: []const u8, telemetry_persisted: bool },
     };
     var blocked = try std.json.parseFromSlice(
@@ -318,6 +371,21 @@ test "L2 headless formal tool crosses registry, TinyKG sensor, compiled Lean, an
     try std.testing.expectEqualStrings(
         "checker_hash_mismatch",
         blocked_checker.runtime_failure_kind orelse return error.MissingFormalFailureKind,
+    );
+    try std.testing.expectEqualStrings("blocked", blocked.value.work_cell.phase);
+    try std.testing.expect(!blocked.value.work_cell.formal_gate_admitted);
+    try std.testing.expect(!blocked.value.work_cell.pipeline_admitted);
+    try std.testing.expect(!blocked.value.work_cell.mutation_authorized);
+    try std.testing.expectEqualStrings("audit_result_only", blocked.value.work_cell.authorization_scope);
+    try std.testing.expect(blocked.value.work_cell.andon.tripped);
+    try std.testing.expectEqualStrings(
+        "formal_runtime_unavailable",
+        blocked.value.work_cell.andon.reason_code,
+    );
+    try std.testing.expectEqual(@as(usize, 1), blocked.value.work_cell.andon.permitted_recovery.len);
+    try std.testing.expectEqualStrings(
+        "inspect_formal_runtime_and_provenance",
+        blocked.value.work_cell.andon.permitted_recovery[0],
     );
     try std.testing.expect(blocked.value.pipeline.telemetry_persisted);
     try std.testing.expectEqual(cc.kg_client.TaskStatus.open, try kg.taskStatus(root_task_id));

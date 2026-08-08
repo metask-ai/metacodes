@@ -18,6 +18,7 @@ const time = @import("../util/time.zig");
 pub const RECEIPT_SCHEMA = "metacodes-formal-audit-receipt-v1";
 pub const PROPOSAL_SCHEMA = "metacodes-formal-proposal-v1";
 pub const TELEMETRY_SCHEMA = artifact_store.INDEX_SCHEMA;
+pub const WORK_CELL_RECEIPT_SCHEMA = "metacodes-control-work-cell-receipt-v1";
 const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 
 const PipelineFailure = enum {
@@ -31,6 +32,48 @@ const PipelineFailure = enum {
     checker_provenance_invalid,
     checker_blocked,
     telemetry_not_persisted,
+};
+
+const WorkCellPhase = enum {
+    verified,
+    blocked,
+};
+
+const AndonReason = enum {
+    formal_configuration_unavailable,
+    observation_source_unavailable,
+    observation_contract_invalid,
+    formal_runtime_unavailable,
+    formal_counterexample,
+    evidence_not_persisted,
+};
+
+const RecoveryAction = enum {
+    configure_pinned_formal_kernel,
+    restore_tinykg_snapshot_source,
+    repair_snapshot_contract,
+    inspect_formal_runtime_and_provenance,
+    inspect_typed_counterexample,
+    restore_evidence_sink_and_rerun_read_only_audit,
+};
+
+/// Host-observed identity crossing the operation-specific work-cell boundary.
+/// Arrays are copied into the receipt state so rendering never borrows a
+/// mutable process buffer or model-authored text.
+const ObservationEnvelope = struct {
+    snapshot_revision: ?[64]u8,
+    verdict_sha256: ?[64]u8,
+};
+
+/// Composite work-cell state. Lean owns the formal facts transition; Zig owns
+/// the real checker/provenance/evidence gates around it. A formal admit is
+/// therefore necessary but deliberately insufficient for `verified`.
+const WorkCell = struct {
+    phase: WorkCellPhase,
+    formal_gate_admitted: bool,
+    pipeline_admitted: bool,
+    observation: ObservationEnvelope,
+    andon_reason: ?AndonReason,
 };
 
 pub const Facts = struct {
@@ -86,9 +129,57 @@ const Receipt = struct {
 
     fn pipelineAdmitted(self: Receipt) bool {
         return self.pipeline_failure == .none and self.telemetry_persisted and
-            self.invocation != null and self.invocation.?.checkerAdmitted();
+            self.identity != null and self.config != null and
+            self.provenance != null and self.invocation != null and
+            self.invocation.?.checkerAdmitted();
     }
 };
+
+fn deriveWorkCell(receipt: Receipt) WorkCell {
+    const formal_gate_admitted = if (receipt.invocation) |invocation|
+        invocation.checkerAdmitted()
+    else
+        false;
+    const pipeline_admitted = receipt.pipelineAdmitted();
+    return .{
+        .phase = if (pipeline_admitted) .verified else .blocked,
+        .formal_gate_admitted = formal_gate_admitted,
+        .pipeline_admitted = pipeline_admitted,
+        .observation = .{
+            .snapshot_revision = if (receipt.identity) |identity| identity.snapshot_revision else null,
+            .verdict_sha256 = if (receipt.invocation) |invocation| invocation.verdict_sha256 else null,
+        },
+        .andon_reason = if (pipeline_admitted) null else andonReason(receipt),
+    };
+}
+
+fn andonReason(receipt: Receipt) AndonReason {
+    return switch (receipt.pipeline_failure) {
+        .config_missing, .config_invalid => .formal_configuration_unavailable,
+        .tinykg_unavailable, .snapshot_fetch_failed => .observation_source_unavailable,
+        .snapshot_invalid => .observation_contract_invalid,
+        .runtime_failure, .checker_provenance_invalid => .formal_runtime_unavailable,
+        .checker_blocked => .formal_counterexample,
+        .telemetry_not_persisted => .evidence_not_persisted,
+        // A receipt with no named pipeline failure can still be blocked before
+        // persistence. Keep that impossible-to-misread and fail closed.
+        .none => if (!receipt.telemetry_persisted)
+            .evidence_not_persisted
+        else
+            .formal_runtime_unavailable,
+    };
+}
+
+fn recoveryAction(reason: AndonReason) RecoveryAction {
+    return switch (reason) {
+        .formal_configuration_unavailable => .configure_pinned_formal_kernel,
+        .observation_source_unavailable => .restore_tinykg_snapshot_source,
+        .observation_contract_invalid => .repair_snapshot_contract,
+        .formal_runtime_unavailable => .inspect_formal_runtime_and_provenance,
+        .formal_counterexample => .inspect_typed_counterexample,
+        .evidence_not_persisted => .restore_evidence_sink_and_rerun_read_only_audit,
+    };
+}
 
 const Args = struct {
     root_task_id: u64,
@@ -490,10 +581,42 @@ fn writeFacts(writer: *std.Io.Writer, facts: Facts) !void {
     );
 }
 
+fn writeWorkCell(writer: *std.Io.Writer, work_cell: WorkCell) !void {
+    try writer.print(
+        "{{\"schema_version\":\"{s}\",\"controller\":\"zig_operation_specific\",\"formal_transition\":\"task_audit_observed_to_verified_or_blocked\",\"effect_class\":\"read_only\",\"phase\":\"{s}\",\"formal_gate_admitted\":{s},\"pipeline_admitted\":{s},\"mutation_authorized\":false,\"authorization_scope\":\"audit_result_only\",\"snapshot_revision\":",
+        .{
+            WORK_CELL_RECEIPT_SCHEMA,
+            @tagName(work_cell.phase),
+            boolText(work_cell.formal_gate_admitted),
+            boolText(work_cell.pipeline_admitted),
+        },
+    );
+    if (work_cell.observation.snapshot_revision) |revision|
+        try writer.print("\"{s}\"", .{revision[0..]})
+    else
+        try writer.writeAll("null");
+    try writer.writeAll(",\"verdict_sha256\":");
+    if (work_cell.observation.verdict_sha256) |hash|
+        try writer.print("\"{s}\"", .{hash[0..]})
+    else
+        try writer.writeAll("null");
+    try writer.print(",\"andon\":{{\"tripped\":{s},\"reason_code\":", .{boolText(work_cell.andon_reason != null)});
+    if (work_cell.andon_reason) |reason| {
+        try writer.print(
+            "\"{s}\",\"permitted_recovery\":[\"{s}\"]}}",
+            .{ @tagName(reason), @tagName(recoveryAction(reason)) },
+        );
+    } else {
+        try writer.writeAll("null,\"permitted_recovery\":[]}");
+    }
+    try writer.writeAll("}");
+}
+
 fn renderReceipt(allocator: std.mem.Allocator, receipt: Receipt) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const writer = &out.writer;
+    const work_cell = deriveWorkCell(receipt);
     try writer.print(
         "{{\"schema_version\":\"{s}\",\"evidence_layer\":\"mechanism\",\"stage\":\"engineering_validation\",\"statistical_claim\":\"none\",\"operation\":\"task_audit\",\"artifact_bundle\":{{\"schema_version\":\"{s}\",\"event_id\":\"{s}\",\"authoritative_raw_evidence\":{s},\"persisted\":{s},\"index_schema\":\"{s}\",\"index_role\":\"best_effort_discovery_cache\"}},\"started_wall_ns\":{d},\"finished_wall_ns\":{d},\"monotonic_elapsed_ns\":{d},\"latency_boundary\":\"tool_entry_through_last_completed_gate_before_evidence_persistence\",\"phase_latency_ns\":{{\"snapshot_fetch\":{d},\"sensor\":{d}}},",
         .{
@@ -521,6 +644,8 @@ fn renderReceipt(allocator: std.mem.Allocator, receipt: Receipt) ![]u8 {
     } else {
         try writer.writeAll("null");
     }
+    try writer.writeAll(",\"work_cell\":");
+    try writeWorkCell(writer, work_cell);
     try writer.writeAll(",\"checker\":");
     if (receipt.config) |config| {
         try writer.print(
@@ -693,12 +818,41 @@ test "formal receipts do not claim authoritative evidence before persistence" {
             authoritative_raw_evidence: bool,
             persisted: bool,
         },
+        work_cell: struct {
+            schema_version: []const u8,
+            phase: []const u8,
+            formal_gate_admitted: bool,
+            pipeline_admitted: bool,
+            mutation_authorized: bool,
+            authorization_scope: []const u8,
+            andon: struct {
+                tripped: bool,
+                reason_code: []const u8,
+                permitted_recovery: []const []const u8,
+            },
+        },
         paid_experiment_cost_usd: []const u8,
     };
     var parsed = try std.json.parseFromSlice(Probe, std.testing.allocator, receipt, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     try std.testing.expect(!parsed.value.artifact_bundle.authoritative_raw_evidence);
     try std.testing.expect(!parsed.value.artifact_bundle.persisted);
+    try std.testing.expectEqualStrings(WORK_CELL_RECEIPT_SCHEMA, parsed.value.work_cell.schema_version);
+    try std.testing.expectEqualStrings("blocked", parsed.value.work_cell.phase);
+    try std.testing.expect(!parsed.value.work_cell.formal_gate_admitted);
+    try std.testing.expect(!parsed.value.work_cell.pipeline_admitted);
+    try std.testing.expect(!parsed.value.work_cell.mutation_authorized);
+    try std.testing.expectEqualStrings("audit_result_only", parsed.value.work_cell.authorization_scope);
+    try std.testing.expect(parsed.value.work_cell.andon.tripped);
+    try std.testing.expectEqualStrings(
+        "formal_configuration_unavailable",
+        parsed.value.work_cell.andon.reason_code,
+    );
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.work_cell.andon.permitted_recovery.len);
+    try std.testing.expectEqualStrings(
+        "configure_pinned_formal_kernel",
+        parsed.value.work_cell.andon.permitted_recovery[0],
+    );
     try std.testing.expectEqualStrings("not_attributed_by_tool", parsed.value.paid_experiment_cost_usd);
 }
 
@@ -771,6 +925,24 @@ test "native formal task audit binds sidecar verdict and persists mechanism rece
             snapshot_sha256: []const u8,
             snapshot_revision: []const u8,
         },
+        work_cell: struct {
+            schema_version: []const u8,
+            controller: []const u8,
+            formal_transition: []const u8,
+            effect_class: []const u8,
+            phase: []const u8,
+            formal_gate_admitted: bool,
+            pipeline_admitted: bool,
+            mutation_authorized: bool,
+            authorization_scope: []const u8,
+            snapshot_revision: ?[]const u8,
+            verdict_sha256: ?[]const u8,
+            andon: struct {
+                tripped: bool,
+                reason_code: ?[]const u8,
+                permitted_recovery: []const []const u8,
+            },
+        },
         checker: struct {
             verdict_sha256: []const u8,
             provenance: struct { manifest_sha256: []const u8 },
@@ -797,6 +969,29 @@ test "native formal task audit binds sidecar verdict and persists mechanism rece
     try std.testing.expectEqualStrings("best_effort_discovery_cache", parsed.value.artifact_bundle.index_role);
     try std.testing.expect(parsed.value.artifact_bundle.authoritative_raw_evidence);
     try std.testing.expect(parsed.value.artifact_bundle.persisted);
+    try std.testing.expectEqualStrings(WORK_CELL_RECEIPT_SCHEMA, parsed.value.work_cell.schema_version);
+    try std.testing.expectEqualStrings("zig_operation_specific", parsed.value.work_cell.controller);
+    try std.testing.expectEqualStrings(
+        "task_audit_observed_to_verified_or_blocked",
+        parsed.value.work_cell.formal_transition,
+    );
+    try std.testing.expectEqualStrings("read_only", parsed.value.work_cell.effect_class);
+    try std.testing.expectEqualStrings("verified", parsed.value.work_cell.phase);
+    try std.testing.expect(parsed.value.work_cell.formal_gate_admitted);
+    try std.testing.expect(parsed.value.work_cell.pipeline_admitted);
+    try std.testing.expect(!parsed.value.work_cell.mutation_authorized);
+    try std.testing.expectEqualStrings("audit_result_only", parsed.value.work_cell.authorization_scope);
+    try std.testing.expectEqualStrings(
+        parsed.value.identity.snapshot_revision,
+        parsed.value.work_cell.snapshot_revision orelse return error.MissingWorkCellRevision,
+    );
+    try std.testing.expectEqualStrings(
+        parsed.value.checker.verdict_sha256,
+        parsed.value.work_cell.verdict_sha256 orelse return error.MissingWorkCellVerdictHash,
+    );
+    try std.testing.expect(!parsed.value.work_cell.andon.tripped);
+    try std.testing.expect(parsed.value.work_cell.andon.reason_code == null);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.work_cell.andon.permitted_recovery.len);
     try std.testing.expect(parsed.value.pipeline.admitted);
     try std.testing.expectEqualStrings("none", parsed.value.pipeline.failure_kind);
     try std.testing.expect(parsed.value.pipeline.telemetry_persisted);
@@ -913,6 +1108,17 @@ test "native formal task audit binds sidecar verdict and persists mechanism rece
     defer std.testing.allocator.free(counterexample);
     const CounterexampleProbe = struct {
         verdict: struct { checker_admitted: bool, reason_codes: []const []const u8 },
+        work_cell: struct {
+            phase: []const u8,
+            formal_gate_admitted: bool,
+            pipeline_admitted: bool,
+            mutation_authorized: bool,
+            andon: struct {
+                tripped: bool,
+                reason_code: []const u8,
+                permitted_recovery: []const []const u8,
+            },
+        },
         pipeline: struct { admitted: bool, failure_kind: []const u8, telemetry_persisted: bool },
     };
     var counterexample_parsed = try std.json.parseFromSlice(
@@ -927,6 +1133,20 @@ test "native formal task audit binds sidecar verdict and persists mechanism rece
     try std.testing.expectEqualStrings(
         "terminal_evidence_missing",
         counterexample_parsed.value.verdict.reason_codes[0],
+    );
+    try std.testing.expectEqualStrings("blocked", counterexample_parsed.value.work_cell.phase);
+    try std.testing.expect(!counterexample_parsed.value.work_cell.formal_gate_admitted);
+    try std.testing.expect(!counterexample_parsed.value.work_cell.pipeline_admitted);
+    try std.testing.expect(!counterexample_parsed.value.work_cell.mutation_authorized);
+    try std.testing.expect(counterexample_parsed.value.work_cell.andon.tripped);
+    try std.testing.expectEqualStrings(
+        "formal_counterexample",
+        counterexample_parsed.value.work_cell.andon.reason_code,
+    );
+    try std.testing.expectEqual(@as(usize, 1), counterexample_parsed.value.work_cell.andon.permitted_recovery.len);
+    try std.testing.expectEqualStrings(
+        "inspect_typed_counterexample",
+        counterexample_parsed.value.work_cell.andon.permitted_recovery[0],
     );
     try std.testing.expect(!counterexample_parsed.value.pipeline.admitted);
     try std.testing.expectEqualStrings("checker_blocked", counterexample_parsed.value.pipeline.failure_kind);
@@ -983,6 +1203,13 @@ test "native formal task audit binds sidecar verdict and persists mechanism rece
     const ProvenanceBlockedProbe = struct {
         checker: struct { runtime_failure_kind: []const u8, provenance: ?std.json.Value },
         verdict: struct { checker_admitted: bool },
+        work_cell: struct {
+            phase: []const u8,
+            formal_gate_admitted: bool,
+            pipeline_admitted: bool,
+            mutation_authorized: bool,
+            andon: struct { reason_code: []const u8, permitted_recovery: []const []const u8 },
+        },
         pipeline: struct {
             admitted: bool,
             failure_kind: []const u8,
@@ -1003,6 +1230,18 @@ test "native formal task audit binds sidecar verdict and persists mechanism rece
     );
     try std.testing.expect(provenance_blocked_parsed.value.checker.provenance == null);
     try std.testing.expect(provenance_blocked_parsed.value.verdict.checker_admitted);
+    try std.testing.expectEqualStrings("blocked", provenance_blocked_parsed.value.work_cell.phase);
+    try std.testing.expect(provenance_blocked_parsed.value.work_cell.formal_gate_admitted);
+    try std.testing.expect(!provenance_blocked_parsed.value.work_cell.pipeline_admitted);
+    try std.testing.expect(!provenance_blocked_parsed.value.work_cell.mutation_authorized);
+    try std.testing.expectEqualStrings(
+        "formal_runtime_unavailable",
+        provenance_blocked_parsed.value.work_cell.andon.reason_code,
+    );
+    try std.testing.expectEqualStrings(
+        "inspect_formal_runtime_and_provenance",
+        provenance_blocked_parsed.value.work_cell.andon.permitted_recovery[0],
+    );
     try std.testing.expect(!provenance_blocked_parsed.value.pipeline.admitted);
     try std.testing.expectEqualStrings(
         "checker_provenance_invalid",
@@ -1029,6 +1268,13 @@ test "native formal task audit binds sidecar verdict and persists mechanism rece
     defer std.testing.allocator.free(blocked);
     const BlockedProbe = struct {
         checker: struct { runtime_failure_kind: []const u8 },
+        work_cell: struct {
+            phase: []const u8,
+            formal_gate_admitted: bool,
+            pipeline_admitted: bool,
+            mutation_authorized: bool,
+            andon: struct { reason_code: []const u8 },
+        },
         pipeline: struct { admitted: bool, failure_kind: []const u8, telemetry_persisted: bool },
     };
     var blocked_parsed = try std.json.parseFromSlice(BlockedProbe, std.testing.allocator, blocked, .{ .ignore_unknown_fields = true });
@@ -1036,7 +1282,78 @@ test "native formal task audit binds sidecar verdict and persists mechanism rece
     try std.testing.expect(!blocked_parsed.value.pipeline.admitted);
     try std.testing.expectEqualStrings("runtime_failure", blocked_parsed.value.pipeline.failure_kind);
     try std.testing.expectEqualStrings("checker_hash_mismatch", blocked_parsed.value.checker.runtime_failure_kind);
+    try std.testing.expectEqualStrings("blocked", blocked_parsed.value.work_cell.phase);
+    try std.testing.expect(!blocked_parsed.value.work_cell.formal_gate_admitted);
+    try std.testing.expect(!blocked_parsed.value.work_cell.pipeline_admitted);
+    try std.testing.expect(!blocked_parsed.value.work_cell.mutation_authorized);
+    try std.testing.expectEqualStrings(
+        "formal_runtime_unavailable",
+        blocked_parsed.value.work_cell.andon.reason_code,
+    );
     try std.testing.expect(blocked_parsed.value.pipeline.telemetry_persisted);
+
+    // Persistence is part of the work cell rather than post-hoc diagnostics.
+    // Even a valid Lean admit must become a typed stop-the-line result when the
+    // immutable evidence bundle cannot be durably published.
+    const telemetry_blocker = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/telemetry-blocker",
+        .{root_buffer[0..root_len]},
+    );
+    defer std.testing.allocator.free(telemetry_blocker);
+    try writeTestFile(telemetry_blocker, "not a directory\n");
+    const impossible_telemetry_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/events-v1.jsonl",
+        .{telemetry_blocker},
+    );
+    defer std.testing.allocator.free(impossible_telemetry_path);
+    const evidence_blocked = try auditSnapshot(
+        std.testing.allocator,
+        1,
+        audit_fixture,
+        .{ .checker_path = checker_path, .expected_sha256 = expected_sha256 },
+        impossible_telemetry_path,
+        null,
+        time.nowWallNs(),
+        time.nowNs(),
+    );
+    defer std.testing.allocator.free(evidence_blocked);
+    const EvidenceBlockedProbe = struct {
+        work_cell: struct {
+            phase: []const u8,
+            formal_gate_admitted: bool,
+            pipeline_admitted: bool,
+            mutation_authorized: bool,
+            andon: struct { reason_code: []const u8, permitted_recovery: []const []const u8 },
+        },
+        pipeline: struct { admitted: bool, failure_kind: []const u8, telemetry_persisted: bool },
+    };
+    var evidence_blocked_parsed = try std.json.parseFromSlice(
+        EvidenceBlockedProbe,
+        std.testing.allocator,
+        evidence_blocked,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer evidence_blocked_parsed.deinit();
+    try std.testing.expectEqualStrings("blocked", evidence_blocked_parsed.value.work_cell.phase);
+    try std.testing.expect(evidence_blocked_parsed.value.work_cell.formal_gate_admitted);
+    try std.testing.expect(!evidence_blocked_parsed.value.work_cell.pipeline_admitted);
+    try std.testing.expect(!evidence_blocked_parsed.value.work_cell.mutation_authorized);
+    try std.testing.expectEqualStrings(
+        "evidence_not_persisted",
+        evidence_blocked_parsed.value.work_cell.andon.reason_code,
+    );
+    try std.testing.expectEqualStrings(
+        "restore_evidence_sink_and_rerun_read_only_audit",
+        evidence_blocked_parsed.value.work_cell.andon.permitted_recovery[0],
+    );
+    try std.testing.expect(!evidence_blocked_parsed.value.pipeline.admitted);
+    try std.testing.expectEqualStrings(
+        "telemetry_not_persisted",
+        evidence_blocked_parsed.value.pipeline.failure_kind,
+    );
+    try std.testing.expect(!evidence_blocked_parsed.value.pipeline.telemetry_persisted);
 }
 
 fn readSmallFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {

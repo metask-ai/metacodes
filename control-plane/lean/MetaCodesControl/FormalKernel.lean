@@ -70,6 +70,39 @@ def SafeMigration (facts : SafetyFacts) : Bool :=
   facts.preserves_recovery && facts.preserves_schema && facts.contradiction_safe &&
   facts.reversible
 
+/--
+The read-only formal audit is one bounded control work cell.  `observed` means
+the Zig host has produced the versioned snapshot facts; the kernel, rather
+than the LLM or receipt renderer, owns the only transition to `verified`.
+Both terminal states are closed so replaying a verdict cannot manufacture a
+second transition.
+-/
+inductive WorkCellPhase where
+  | observed
+  | verified
+  | blocked
+  deriving Repr, BEq
+
+def advanceTaskAudit (phase : WorkCellPhase) (facts : SafetyFacts) : Option WorkCellPhase :=
+  match phase with
+  | .observed => some (if SafeMigration facts then .verified else .blocked)
+  | .verified | .blocked => none
+
+def WorkCellPhase.admitted : WorkCellPhase → Bool
+  | .verified => true
+  | .observed | .blocked => false
+
+/-- A verified work cell is exactly an admitted operation-specific rule. -/
+theorem taskAudit_verified_iff_safe (facts : SafetyFacts) :
+    advanceTaskAudit .observed facts = some .verified ↔ SafeMigration facts = true := by
+  simp [advanceTaskAudit]
+
+/-- A terminal receipt cannot be advanced or replayed as fresh work. -/
+theorem taskAudit_terminal_closed (facts : SafetyFacts) :
+    advanceTaskAudit WorkCellPhase.verified facts = none ∧
+    advanceTaskAudit WorkCellPhase.blocked facts = none := by
+  constructor <;> rfl
+
 /-- The runtime decision cannot admit while silently dropping an obligation. -/
 theorem safeMigration_sound (facts : SafetyFacts)
     (admitted : SafeMigration facts = true) :
@@ -293,7 +326,8 @@ def decodeCanonicalRequest (input : String) : Except String Request := do
   }
 
 def verdictJson (request : Request) : String :=
-  let admitted := SafeMigration request.facts
+  let phase := (advanceTaskAudit .observed request.facts).getD .blocked
+  let admitted := phase.admitted
   let obligations := request.facts.proposal_bound &&
     request.facts.preserves_tasks && request.facts.preserves_evidence &&
     request.facts.preserves_recovery && request.facts.preserves_schema &&

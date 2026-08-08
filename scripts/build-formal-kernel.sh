@@ -46,6 +46,8 @@ host_os=$(uname -s)
 axiom_audit=$(cd "$lean_dir" && "$lake" env lean FormalAxiomAudit.lean 2>&1)
 expected_axioms="'MetaCodesControl.FormalKernel.safeMigration_sound' depends on axioms: [propext, Quot.sound]"
 expected_axioms="$expected_axioms
+'MetaCodesControl.FormalKernel.taskAudit_verified_iff_safe' depends on axioms: [propext]
+'MetaCodesControl.FormalKernel.taskAudit_terminal_closed' does not depend on any axioms
 'MetaCodesControl.MemoryMigration.safeSupersede_sound' depends on axioms: [propext]
 'MetaCodesControl.MemoryMigration.applySupersede_preserves_nodes' does not depend on any axioms
 'MetaCodesControl.MemoryMigration.rollbackSupersede_apply' depends on axioms: [propext, Quot.sound]"
