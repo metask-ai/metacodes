@@ -1185,6 +1185,63 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
         ).validate(len(rows))
 
+    def test_checked_in_pilot_v13_uses_fresh_identity_after_invalid_key(self):
+        pilot = ROOT / "evals/memory/pilots/procedural-glm52-v13"
+        contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        manifest = load_manifest(pilot / "manifest.json")
+        execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
+
+        for name, identity in contract["artifacts"].items():
+            payload = (pilot / name).read_bytes()
+            self.assertEqual(len(payload), identity["bytes"])
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), identity["sha256"])
+        fixture = ROOT / contract["generation"]["source_path"]
+        self.assertEqual(
+            hashlib.sha256(fixture.read_bytes()).hexdigest(),
+            contract["generation"]["expected_upstream_sha256"],
+        )
+        self.assertEqual(manifest["execution"], execution)
+        self.assertEqual(manifest["manifest_id"], "coding-intent-families-2026080815-1")
+        self.assertEqual(contract["pilot_id"], "procedural-glm52-v13")
+        self.assertEqual(contract["generation"]["split_seed"], 2026080815)
+        self.assertEqual(contract["harness"]["revision"], execution["harness_revision"])
+        self.assertIn(
+            "distinct from the rejected v12 credential",
+            contract["paid_execution_requirements"]["credential_transport"],
+        )
+        predecessor = contract["predecessor_attempts"]
+        self.assertEqual(
+            [(item["pilot_id"], item["status"]) for item in predecessor],
+            [("procedural-glm52-v12", "halted")],
+        )
+        uncertain = contract["predecessor_uncertain_requests"]
+        self.assertEqual(len(uncertain), 5)
+        self.assertTrue(all(item["automatic_retry_forbidden"] for item in uncertain))
+        self.assertIn(
+            "2a53fc44a007fab397e642486802368e951730f7ecc4ff75aae85b7c817369e0",
+            {item["transaction_id"] for item in uncertain},
+        )
+        budget = contract["budget_authority"]
+        self.assertEqual(budget["prior_conservative_cost_usd"], 9.1764158)
+        self.assertEqual(budget["prior_conservative_metered_tokens"], 5329364)
+        self.assertLessEqual(
+            budget["prior_conservative_cost_usd"] + budget["max_total_cost_usd"],
+            budget["user_authorization_max_cost_usd"],
+        )
+        self.assertTrue(contract["current_phase"]["paid_rollouts_authorized"])
+        self.assertFalse(contract["current_phase"]["quality_evidence"])
+        ProductionRuntimeConfig(
+            api_key="test-only",
+            allow_paid_rollouts=True,
+            max_total_cost_usd=budget["max_total_cost_usd"],
+            max_total_metered_tokens=budget["max_total_metered_tokens"],
+            max_rollout_cost_usd=budget["max_rollout_cost_usd"],
+            max_rollout_metered_tokens=budget["max_rollout_metered_tokens"],
+            max_output_tokens=budget["max_output_tokens"],
+            ripgrep_binary=TEST_RIPGREP,
+            ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
+        ).validate(len(manifest["schedule"]))
+
     def _materialize_valid_production_events(self, root, rollout, grader_fingerprint):
         cassette = root / rollout["artifact_paths"]["cassette"]
         uses = {}
