@@ -217,6 +217,22 @@ new/repeated hits, unique-gain ratio, stopping calls, stage, and variant kind. O
 ablation metrics. The deterministic lifecycle smoke must itself produce a verified TinyKG trace; merely observing
 a `KgRecall` call is no longer sufficient.
 
+For production receipt-v9 artifacts, cache diagnostics should also separate cold-start effects from
+steady-state reuse:
+
+```bash
+python3 -m scripts.eval.cli report-memory-cache \
+  --runtime-receipt /path/to/native-run/runtime-receipt.json \
+  --json /tmp/warm-cache-report.json \
+  --markdown /tmp/warm-cache-report.md
+```
+
+This report rehashes every native event artifact against the receipt, excludes each rollout's first
+normal request and tool-less breaker finalization from the warm denominator, and fails closed when the
+usage timeline disagrees with the receipt's request classification. It does not alter receipt-v9 or
+turn a cache diagnostic into memory-quality evidence; the existing prefix-drift, cache-break,
+compaction, and context-projection gates remain authoritative.
+
 ## Result row contract
 
 Each v2 JSONL row is validated by `scripts.eval.memory_benchmark` and must bind:
