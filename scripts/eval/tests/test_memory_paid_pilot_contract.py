@@ -10,17 +10,24 @@ from scripts.eval.memory_replay import load_manifest
 
 
 ROOT = Path(__file__).resolve().parents[3]
-PILOT = ROOT / "evals/memory/pilots/procedural-glm52-v19"
+PILOT = ROOT / "evals/memory/pilots/procedural-glm52-v20"
 TEST_RIPGREP = Path(sys.executable).resolve()
 TEST_RIPGREP_SHA256 = hashlib.sha256(TEST_RIPGREP.read_bytes()).hexdigest()
 
 
 class PaidPilotContractTest(unittest.TestCase):
-    def test_v19_is_reproducible_balanced_and_resume_bound(self):
+    def test_v20_is_reproducible_balanced_and_resume_bound(self):
         contract = json.loads((PILOT / "pilot-contract.json").read_text(encoding="utf-8"))
         source = json.loads((PILOT / "source.json").read_text(encoding="utf-8"))
         manifest = load_manifest(PILOT / "manifest.json")
         execution = json.loads((PILOT / "execution.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(contract["pilot_id"], "procedural-glm52-v20")
+        self.assertEqual(contract["protocol"]["production_receipt_schema_version"], 9)
+        self.assertEqual(
+            contract["harness"]["binary_sha256"],
+            "e98d5aa08eeb725f36433c82c774829d963d65aa935485d481b6b39298f82241",
+        )
 
         for name, identity in contract["artifacts"].items():
             payload = (PILOT / name).read_bytes()
@@ -57,7 +64,7 @@ class PaidPilotContractTest(unittest.TestCase):
             hashlib.sha256(
                 (
                     ROOT
-                    / "evals/memory/pilots/procedural-glm52-v18/manifest.json"
+                    / "evals/memory/pilots/procedural-glm52-v19/manifest.json"
                 ).read_bytes()
             ).hexdigest(),
         )
@@ -88,6 +95,7 @@ class PaidPilotContractTest(unittest.TestCase):
         self.assertFalse(guard["v16_transaction_reuse"])
         self.assertFalse(guard["v17_transaction_reuse"])
         self.assertFalse(guard["v18_transaction_reuse"])
+        self.assertFalse(guard["v19_transaction_reuse"])
         self.assertEqual(
             [
                 (item["pilot_id"], item["status"], item["uncertain_authorized_transactions"])
@@ -97,6 +105,7 @@ class PaidPilotContractTest(unittest.TestCase):
                 ("procedural-glm52-v16", "halted-runner-misclassification", 0),
                 ("procedural-glm52-v17", "halted-evidence-validator-protocol-drift", 0),
                 ("procedural-glm52-v18", "halted-provider-authentication-rejected", 1),
+                ("procedural-glm52-v19", "superseded-before-paid-run-by-receipt-v9", 0),
             ],
         )
         self.assertIn("explicit --resume-paid-run", contract["resume_contract"]["activation"])
