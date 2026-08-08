@@ -1,0 +1,263 @@
+{
+  "schema_version": 1,
+  "dataset_id": "coding-intent-transfer-v3",
+  "dataset_revision": "checked-in-fixture-v3",
+  "families": [
+    {
+      "id": "recovery-receipt-transfer-v3",
+      "procedure_evidence_id": "procedure:recovery-receipt-transfer:v3",
+      "intent_template": "Register recovery receipt `{name}`. {instruction}",
+      "cases": [
+        {
+          "id": "artifact-snapshot",
+          "split": "online",
+          "bindings": {
+            "instruction": "Establish this family's v3 protocol: append the receipt name; derive stable alias REC3_<UPPER_SNAKE_NAME>; use phase order snapshot > cross_check > seal; and set retry policy manual_review. Update the Python registry, structured documentation, and structured contract.",
+            "name": "artifact_snapshot"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/recovery-receipts.json",
+                "content": "{\"receipts\":{\"inspect\":{\"alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"],\"retry_policy\":\"automatic\"}},\"schema_version\":1}\n"
+              },
+              {
+                "path": "src/recovery_receipts.py",
+                "content": "RECEIPTS = [\"inspect\"]\nSTABLE_ALIAS = {\"inspect\": \"INSPECT_V1\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"]}\nRETRY_POLICY = {\"inspect\": \"automatic\"}\n"
+              },
+              {
+                "path": "tests/recovery-receipts.json",
+                "content": "{\"required_receipts\":{\"inspect\":{\"alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"],\"retry_policy\":\"automatic\"}},\"schema_version\":1}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/recovery-receipts.json",
+              "src/recovery_receipts.py",
+              "tests/recovery-receipts.json"
+            ],
+            "required_changed_paths": [
+              "docs/recovery-receipts.json",
+              "src/recovery_receipts.py",
+              "tests/recovery-receipts.json"
+            ],
+            "checks": [
+              {
+                "kind": "python_assignment_equals",
+                "path": "src/recovery_receipts.py",
+                "value": "{\"name\":\"RECEIPTS\",\"value\":[\"inspect\",\"artifact_snapshot\"]}"
+              },
+              {
+                "kind": "python_assignment_equals",
+                "path": "src/recovery_receipts.py",
+                "value": "{\"name\":\"STABLE_ALIAS\",\"value\":{\"artifact_snapshot\":\"REC3_ARTIFACT_SNAPSHOT\",\"inspect\":\"INSPECT_V1\"}}"
+              },
+              {
+                "kind": "python_assignment_equals",
+                "path": "src/recovery_receipts.py",
+                "value": "{\"name\":\"PHASES\",\"value\":{\"artifact_snapshot\":[\"snapshot\",\"cross_check\",\"seal\"],\"inspect\":[\"observe\",\"report\"]}}"
+              },
+              {
+                "kind": "python_assignment_equals",
+                "path": "src/recovery_receipts.py",
+                "value": "{\"name\":\"RETRY_POLICY\",\"value\":{\"artifact_snapshot\":\"manual_review\",\"inspect\":\"automatic\"}}"
+              },
+              {
+                "kind": "json_equals",
+                "path": "docs/recovery-receipts.json",
+                "value": "{\"receipts\":{\"artifact_snapshot\":{\"alias\":\"REC3_ARTIFACT_SNAPSHOT\",\"phases\":[\"snapshot\",\"cross_check\",\"seal\"],\"retry_policy\":\"manual_review\"},\"inspect\":{\"alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"],\"retry_policy\":\"automatic\"}},\"schema_version\":1}"
+              },
+              {
+                "kind": "json_equals",
+                "path": "tests/recovery-receipts.json",
+                "value": "{\"required_receipts\":{\"artifact_snapshot\":{\"alias\":\"REC3_ARTIFACT_SNAPSHOT\",\"phases\":[\"snapshot\",\"cross_check\",\"seal\"],\"retry_policy\":\"manual_review\"},\"inspect\":{\"alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"],\"retry_policy\":\"automatic\"}},\"schema_version\":1}"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/recovery-receipts.json",
+              "content": "{\"schema_version\":1,\"receipts\":{\"inspect\":{\"retry_policy\":\"automatic\",\"phases\":[\"observe\",\"report\"],\"alias\":\"INSPECT_V1\"},\"artifact_snapshot\":{\"retry_policy\":\"manual_review\",\"phases\":[\"snapshot\",\"cross_check\",\"seal\"],\"alias\":\"REC3_ARTIFACT_SNAPSHOT\"}}}\n"
+            },
+            {
+              "path": "src/recovery_receipts.py",
+              "content": "RECEIPTS = [\"inspect\", \"artifact_snapshot\"]\nSTABLE_ALIAS = {\"inspect\": \"INSPECT_V1\", \"artifact_snapshot\": \"REC3_ARTIFACT_SNAPSHOT\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"], \"artifact_snapshot\": [\"snapshot\", \"cross_check\", \"seal\"]}\nRETRY_POLICY = {\"inspect\": \"automatic\", \"artifact_snapshot\": \"manual_review\"}\n"
+            },
+            {
+              "path": "tests/recovery-receipts.json",
+              "content": "{\"schema_version\":1,\"required_receipts\":{\"inspect\":{\"retry_policy\":\"automatic\",\"phases\":[\"observe\",\"report\"],\"alias\":\"INSPECT_V1\"},\"artifact_snapshot\":{\"retry_policy\":\"manual_review\",\"phases\":[\"snapshot\",\"cross_check\",\"seal\"],\"alias\":\"REC3_ARTIFACT_SNAPSHOT\"}}}\n"
+            }
+          ]
+        },
+        {
+          "id": "budget-reservation",
+          "split": "offline",
+          "bindings": {
+            "instruction": "Reuse the previously established family v3 protocol for this sibling. Update the Python registry, structured documentation, and structured contract.",
+            "name": "budget_reservation"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/recovery-receipts.json",
+                "content": "{\"receipts\":{\"inspect\":{\"alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"],\"retry_policy\":\"automatic\"}},\"schema_version\":1}\n"
+              },
+              {
+                "path": "src/recovery_receipts.py",
+                "content": "RECEIPTS = [\"inspect\"]\nSTABLE_ALIAS = {\"inspect\": \"INSPECT_V1\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"]}\nRETRY_POLICY = {\"inspect\": \"automatic\"}\n"
+              },
+              {
+                "path": "tests/recovery-receipts.json",
+                "content": "{\"required_receipts\":{\"inspect\":{\"alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"],\"retry_policy\":\"automatic\"}},\"schema_version\":1}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/recovery-receipts.json",
+              "src/recovery_receipts.py",
+              "tests/recovery-receipts.json"
+            ],
+            "required_changed_paths": [
+              "docs/recovery-receipts.json",
+              "src/recovery_receipts.py",
+              "tests/recovery-receipts.json"
+            ],
+            "checks": [
+              {
+                "kind": "python_assignment_equals",
+                "path": "src/recovery_receipts.py",
+                "value": "{\"name\":\"RECEIPTS\",\"value\":[\"inspect\",\"budget_reservation\"]}"
+              },
+              {
+                "kind": "python_assignment_equals",
+                "path": "src/recovery_receipts.py",
+                "value": "{\"name\":\"STABLE_ALIAS\",\"value\":{\"budget_reservation\":\"REC3_BUDGET_RESERVATION\",\"inspect\":\"INSPECT_V1\"}}"
+              },
+              {
+                "kind": "python_assignment_equals",
+                "path": "src/recovery_receipts.py",
+                "value": "{\"name\":\"PHASES\",\"value\":{\"budget_reservation\":[\"snapshot\",\"cross_check\",\"seal\"],\"inspect\":[\"observe\",\"report\"]}}"
+              },
+              {
+                "kind": "python_assignment_equals",
+                "path": "src/recovery_receipts.py",
+                "value": "{\"name\":\"RETRY_POLICY\",\"value\":{\"budget_reservation\":\"manual_review\",\"inspect\":\"automatic\"}}"
+              },
+              {
+                "kind": "json_equals",
+                "path": "docs/recovery-receipts.json",
+                "value": "{\"receipts\":{\"budget_reservation\":{\"alias\":\"REC3_BUDGET_RESERVATION\",\"phases\":[\"snapshot\",\"cross_check\",\"seal\"],\"retry_policy\":\"manual_review\"},\"inspect\":{\"alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"],\"retry_policy\":\"automatic\"}},\"schema_version\":1}"
+              },
+              {
+                "kind": "json_equals",
+                "path": "tests/recovery-receipts.json",
+                "value": "{\"required_receipts\":{\"budget_reservation\":{\"alias\":\"REC3_BUDGET_RESERVATION\",\"phases\":[\"snapshot\",\"cross_check\",\"seal\"],\"retry_policy\":\"manual_review\"},\"inspect\":{\"alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"],\"retry_policy\":\"automatic\"}},\"schema_version\":1}"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/recovery-receipts.json",
+              "content": "{\"receipts\":{\"budget_reservation\":{\"alias\":\"REC3_BUDGET_RESERVATION\",\"phases\":[\"snapshot\",\"cross_check\",\"seal\"],\"retry_policy\":\"manual_review\"},\"inspect\":{\"alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"],\"retry_policy\":\"automatic\"}},\"schema_version\":1}\n"
+            },
+            {
+              "path": "src/recovery_receipts.py",
+              "content": "RECEIPTS = [\"inspect\", \"budget_reservation\"]\nSTABLE_ALIAS = {\"inspect\": \"INSPECT_V1\", \"budget_reservation\": \"REC3_BUDGET_RESERVATION\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"], \"budget_reservation\": [\"snapshot\", \"cross_check\", \"seal\"]}\nRETRY_POLICY = {\"inspect\": \"automatic\", \"budget_reservation\": \"manual_review\"}\n"
+            },
+            {
+              "path": "tests/recovery-receipts.json",
+              "content": "{\"required_receipts\":{\"budget_reservation\":{\"alias\":\"REC3_BUDGET_RESERVATION\",\"phases\":[\"snapshot\",\"cross_check\",\"seal\"],\"retry_policy\":\"manual_review\"},\"inspect\":{\"alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"],\"retry_policy\":\"automatic\"}},\"schema_version\":1}\n"
+            }
+          ]
+        },
+        {
+          "id": "memory-migration",
+          "split": "offline",
+          "bindings": {
+            "instruction": "Reuse the previously established family v3 protocol for this sibling. Update the Python registry, structured documentation, and structured contract.",
+            "name": "memory_migration"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/recovery-receipts.json",
+                "content": "{\"receipts\":{\"inspect\":{\"alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"],\"retry_policy\":\"automatic\"}},\"schema_version\":1}\n"
+              },
+              {
+                "path": "src/recovery_receipts.py",
+                "content": "RECEIPTS = [\"inspect\"]\nSTABLE_ALIAS = {\"inspect\": \"INSPECT_V1\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"]}\nRETRY_POLICY = {\"inspect\": \"automatic\"}\n"
+              },
+              {
+                "path": "tests/recovery-receipts.json",
+                "content": "{\"required_receipts\":{\"inspect\":{\"alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"],\"retry_policy\":\"automatic\"}},\"schema_version\":1}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/recovery-receipts.json",
+              "src/recovery_receipts.py",
+              "tests/recovery-receipts.json"
+            ],
+            "required_changed_paths": [
+              "docs/recovery-receipts.json",
+              "src/recovery_receipts.py",
+              "tests/recovery-receipts.json"
+            ],
+            "checks": [
+              {
+                "kind": "python_assignment_equals",
+                "path": "src/recovery_receipts.py",
+                "value": "{\"name\":\"RECEIPTS\",\"value\":[\"inspect\",\"memory_migration\"]}"
+              },
+              {
+                "kind": "python_assignment_equals",
+                "path": "src/recovery_receipts.py",
+                "value": "{\"name\":\"STABLE_ALIAS\",\"value\":{\"inspect\":\"INSPECT_V1\",\"memory_migration\":\"REC3_MEMORY_MIGRATION\"}}"
+              },
+              {
+                "kind": "python_assignment_equals",
+                "path": "src/recovery_receipts.py",
+                "value": "{\"name\":\"PHASES\",\"value\":{\"inspect\":[\"observe\",\"report\"],\"memory_migration\":[\"snapshot\",\"cross_check\",\"seal\"]}}"
+              },
+              {
+                "kind": "python_assignment_equals",
+                "path": "src/recovery_receipts.py",
+                "value": "{\"name\":\"RETRY_POLICY\",\"value\":{\"inspect\":\"automatic\",\"memory_migration\":\"manual_review\"}}"
+              },
+              {
+                "kind": "json_equals",
+                "path": "docs/recovery-receipts.json",
+                "value": "{\"receipts\":{\"inspect\":{\"alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"],\"retry_policy\":\"automatic\"},\"memory_migration\":{\"alias\":\"REC3_MEMORY_MIGRATION\",\"phases\":[\"snapshot\",\"cross_check\",\"seal\"],\"retry_policy\":\"manual_review\"}},\"schema_version\":1}"
+              },
+              {
+                "kind": "json_equals",
+                "path": "tests/recovery-receipts.json",
+                "value": "{\"required_receipts\":{\"inspect\":{\"alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"],\"retry_policy\":\"automatic\"},\"memory_migration\":{\"alias\":\"REC3_MEMORY_MIGRATION\",\"phases\":[\"snapshot\",\"cross_check\",\"seal\"],\"retry_policy\":\"manual_review\"}},\"schema_version\":1}"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/recovery-receipts.json",
+              "content": "{\"schema_version\":1,\"receipts\":{\"memory_migration\":{\"retry_policy\":\"manual_review\",\"phases\":[\"snapshot\",\"cross_check\",\"seal\"],\"alias\":\"REC3_MEMORY_MIGRATION\"},\"inspect\":{\"retry_policy\":\"automatic\",\"phases\":[\"observe\",\"report\"],\"alias\":\"INSPECT_V1\"}}}\n"
+            },
+            {
+              "path": "src/recovery_receipts.py",
+              "content": "RECEIPTS = [\"inspect\", \"memory_migration\"]\nSTABLE_ALIAS = {\"memory_migration\": \"REC3_MEMORY_MIGRATION\", \"inspect\": \"INSPECT_V1\"}\nPHASES = {\"memory_migration\": [\"snapshot\", \"cross_check\", \"seal\"], \"inspect\": [\"observe\", \"report\"]}\nRETRY_POLICY = {\"memory_migration\": \"manual_review\", \"inspect\": \"automatic\"}\n"
+            },
+            {
+              "path": "tests/recovery-receipts.json",
+              "content": "{\"schema_version\":1,\"required_receipts\":{\"memory_migration\":{\"retry_policy\":\"manual_review\",\"phases\":[\"snapshot\",\"cross_check\",\"seal\"],\"alias\":\"REC3_MEMORY_MIGRATION\"},\"inspect\":{\"retry_policy\":\"automatic\",\"phases\":[\"observe\",\"report\"],\"alias\":\"INSPECT_V1\"}}}\n"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

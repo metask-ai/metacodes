@@ -25,6 +25,7 @@ from scripts.eval.model import ValidationError, stable_json
 
 ROOT = Path(__file__).resolve().parents[3]
 FIXTURE = ROOT / "evals/memory/fixtures/procedural-coding-source.json"
+STRUCTURED_FIXTURE = ROOT / "evals/memory/fixtures/procedural-coding-source-v3.json"
 EXECUTION = ROOT / "evals/memory/fixtures/procedural-adapter-smoke-execution.json"
 
 
@@ -126,6 +127,33 @@ class ProceduralMemoryAdapterTest(unittest.TestCase):
         validators = json.loads((pilot / "validators.json").read_text(encoding="utf-8"))
         validate_validator_bundle(validators, source_slice)
 
+    def test_v3_fixture_uses_hidden_structural_semantics_and_latent_protocol(self):
+        fixture_sha = hashlib.sha256(STRUCTURED_FIXTURE.read_bytes()).hexdigest()
+        source_slice, validators, manifest = adapt_procedural(
+            STRUCTURED_FIXTURE,
+            execution(),
+            expected_source_sha256=fixture_sha,
+            limit_families=1,
+            split_seed=2026080820,
+        )
+        self.assertEqual(source_slice["dataset_id"], "coding-intent-transfer-v3")
+        self.assertEqual(
+            [family["id"] for family in source_slice["families"]],
+            ["recovery-receipt-transfer-v3"],
+        )
+        public_json = stable_json(source_slice)
+        self.assertNotIn("python_assignment_equals", public_json)
+        self.assertNotIn("json_equals", public_json)
+        self.assertNotIn("REC3_BUDGET_RESERVATION", public_json)
+        self.assertNotIn("REC3_MEMORY_MIGRATION", public_json)
+        online = source_slice["families"][0]["cases"][0]
+        offline = source_slice["families"][0]["cases"][1:]
+        self.assertIn("REC3_<UPPER_SNAKE_NAME>", online["prompt"])
+        self.assertTrue(all("REC3_<UPPER_SNAKE_NAME>" not in case["prompt"] for case in offline))
+        self.assertTrue(all(case["prompt"].startswith(OFFLINE_READ_ONLY_POLICY) for case in offline))
+        validate_validator_bundle(validators, source_slice)
+        validate_manifest(manifest)
+
     def test_adapter_is_byte_deterministic_and_family_selection_is_input_order_independent(self):
         value = load_fixture()
         with tempfile.TemporaryDirectory() as directory:
@@ -210,6 +238,64 @@ class ProceduralMemoryAdapterTest(unittest.TestCase):
         passed, failures = evaluate_workspace(baseline, with_extra, validator)
         self.assertFalse(passed)
         self.assertTrue(any("file set changed" in failure for failure in failures))
+
+    def test_structured_validators_ignore_formatting_but_reject_semantic_drift(self):
+        baseline = {
+            "registry.py": "ITEMS = ['old']\n",
+            "contract.json": '{"items":["old"]}\n',
+        }
+        validator = {
+            "allowed_changed_paths": ["contract.json", "registry.py"],
+            "required_changed_paths": ["contract.json", "registry.py"],
+            "checks": [
+                {
+                    "kind": "python_assignment_equals",
+                    "path": "registry.py",
+                    "value": stable_json({"name": "ITEMS", "value": ["old", "new"]}),
+                },
+                {
+                    "kind": "json_equals",
+                    "path": "contract.json",
+                    "value": stable_json({"items": ["old", "new"], "revision": 2}),
+                },
+            ],
+        }
+        reformatted = {
+            "registry.py": 'ITEMS: list[str] = [\n    "old",\n    "new",\n]\n',
+            "contract.json": '{\n  "revision": 2,\n  "items": ["old", "new"]\n}\n',
+        }
+        passed, failures = evaluate_workspace(baseline, reformatted, validator)
+        self.assertTrue(passed, failures)
+
+        drifted = dict(reformatted)
+        drifted["registry.py"] = 'ITEMS = ["old", "wrong"]\n'
+        passed, failures = evaluate_workspace(baseline, drifted, validator)
+        self.assertFalse(passed)
+        self.assertTrue(any("semantic assignment" in failure for failure in failures))
+
+        drifted = dict(reformatted)
+        drifted["contract.json"] = '{"items":["old","new"],"revision":3}\n'
+        passed, failures = evaluate_workspace(baseline, drifted, validator)
+        self.assertFalse(passed)
+        self.assertTrue(any("structured JSON" in failure for failure in failures))
+
+    def test_structured_validator_does_not_execute_candidate_python(self):
+        baseline = {"registry.py": "ITEMS = []\n"}
+        validator = {
+            "allowed_changed_paths": ["registry.py"],
+            "required_changed_paths": ["registry.py"],
+            "checks": [
+                {
+                    "kind": "python_assignment_equals",
+                    "path": "registry.py",
+                    "value": stable_json({"name": "ITEMS", "value": ["new"]}),
+                }
+            ],
+        }
+        candidate = {"registry.py": 'ITEMS = dangerous_call("new")\n'}
+        passed, failures = evaluate_workspace(baseline, candidate, validator)
+        self.assertFalse(passed)
+        self.assertTrue(any("literal value" in failure for failure in failures))
 
     def test_validator_bundle_tampering_is_detected(self):
         fixture_sha = hashlib.sha256(FIXTURE.read_bytes()).hexdigest()

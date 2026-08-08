@@ -15,6 +15,7 @@ No model, shell, network, or TinyKG process is used by this adapter.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
@@ -45,7 +46,15 @@ SOURCE_SLICE_SCHEMA_VERSION = 1
 VALIDATOR_BUNDLE_SCHEMA_VERSION = 1
 SELECTION_ALGORITHM = "sha256-seed-null-family-id-v1"
 VALIDATOR_KIND = "workspace_assertions_v1"
-CHECK_KINDS = frozenset({"contains", "not_contains", "equals"})
+CHECK_KINDS = frozenset(
+    {
+        "contains",
+        "not_contains",
+        "equals",
+        "json_equals",
+        "python_assignment_equals",
+    }
+)
 IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
 
 
@@ -246,6 +255,30 @@ def _validator(value: Any, where: str, workspace_paths: set[str]) -> Mapping[str
         expected = _text(check["value"], f"{check_where}.value")
         if kind != "equals" and not expected:
             _fail(f"{check_where}.value", "substring checks require non-empty text")
+        if kind in {"json_equals", "python_assignment_equals"}:
+            try:
+                structured_expected = json.loads(expected)
+            except json.JSONDecodeError as exc:
+                raise ValidationError(
+                    f"{check_where}.value: invalid canonical JSON: {exc}"
+                ) from exc
+            if stable_json(structured_expected) != expected:
+                _fail(f"{check_where}.value", "structured expectation must be canonical JSON")
+            if kind == "python_assignment_equals":
+                specification = _object(
+                    structured_expected,
+                    f"{check_where}.value",
+                    ("name", "value"),
+                )
+                assignment_name = _string(
+                    specification["name"],
+                    f"{check_where}.value.name",
+                )
+                if not assignment_name.isidentifier():
+                    _fail(
+                        f"{check_where}.value.name",
+                        "expected a Python identifier",
+                    )
         key = (kind, path, expected)
         if key in seen_checks:
             _fail(check_where, "duplicate validator check")
@@ -286,6 +319,8 @@ def evaluate_workspace(
         failures.append(f"changed paths outside validator allowance: {unexpected}")
     if unchanged_required:
         failures.append(f"required paths were not changed: {unchanged_required}")
+    parsed_json: Dict[str, Any] = {}
+    parsed_python: Dict[str, ast.Module] = {}
     for index, check in enumerate(validator["checks"]):
         path = check["path"]
         if path not in candidate:
@@ -299,6 +334,53 @@ def evaluate_workspace(
             failures.append(f"check[{index}] expected {path!r} to omit pinned text")
         elif check["kind"] == "equals" and content != expected:
             failures.append(f"check[{index}] expected exact pinned contents for {path!r}")
+        elif check["kind"] == "json_equals":
+            try:
+                if path not in parsed_json:
+                    parsed_json[path] = json.loads(content)
+                expected_value = json.loads(expected)
+            except json.JSONDecodeError:
+                failures.append(f"check[{index}] expected {path!r} to contain valid JSON")
+                continue
+            if parsed_json[path] != expected_value:
+                failures.append(f"check[{index}] expected structured JSON equality for {path!r}")
+        elif check["kind"] == "python_assignment_equals":
+            try:
+                if path not in parsed_python:
+                    parsed_python[path] = ast.parse(content, filename=path)
+            except SyntaxError:
+                failures.append(f"check[{index}] expected {path!r} to contain valid Python")
+                continue
+            specification = json.loads(expected)
+            name = specification["name"]
+            matches: List[ast.AST] = []
+            for statement in parsed_python[path].body:
+                if isinstance(statement, ast.Assign):
+                    if any(isinstance(target, ast.Name) and target.id == name for target in statement.targets):
+                        matches.append(statement.value)
+                elif (
+                    isinstance(statement, ast.AnnAssign)
+                    and isinstance(statement.target, ast.Name)
+                    and statement.target.id == name
+                    and statement.value is not None
+                ):
+                    matches.append(statement.value)
+            if len(matches) != 1:
+                failures.append(
+                    f"check[{index}] expected one top-level assignment to {name!r} in {path!r}"
+                )
+                continue
+            try:
+                observed_value = ast.literal_eval(matches[0])
+            except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+                failures.append(
+                    f"check[{index}] expected {name!r} in {path!r} to be a literal value"
+                )
+                continue
+            if observed_value != specification["value"]:
+                failures.append(
+                    f"check[{index}] expected semantic assignment equality for {name!r} in {path!r}"
+                )
     return not failures, failures
 
 
