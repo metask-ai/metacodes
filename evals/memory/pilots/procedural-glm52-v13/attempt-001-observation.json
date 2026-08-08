@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "manifest_id": "coding-intent-families-2026080815-1",
+  "artifact_provenance": {
+    "local_only_artifact_tree": "~/.local/state/metacodes/memory-pilots/procedural-glm52-v13/artifacts/run-001",
+    "local_only_artifact_tree_bytes": 47111125,
+    "local_only_artifact_tree_files": 509,
+    "local_only_artifact_tree_sha256": "32cc6c845862db7d36b48ac1fe8fc35557ce0678c94a70d5c27a36c778746f3a",
+    "metacodes_binary_sha256": "32c0d1d103ad84c396e966dbb93c88b32c8a6464c6ebfc029d9739488e646c22",
+    "pilot_freeze_commit": "54eedb6",
+    "ripgrep_snapshot_mode": "0500",
+    "ripgrep_snapshot_sha256": "882ee4837235e252ce5ffecc3c1707f6d5b7db0054b7922301b5dc0f466a0fed",
+    "tinykg_binary_sha256": "66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee"
+  },
+  "budget_journal": {
+    "committed_cost_usd": 0.81372,
+    "committed_metered_tokens": 772238,
+    "estimated_cost_usd": 0.8137164,
+    "head_sha256": "d78ce016211d06d0e66b3cfd9af9748f6d574277155f2d53fb6f666144bf978e",
+    "journal_id": "080415b894977c28f48e98fdb2d2796a1a5d3ca504a0920278921b2852a4ba6c",
+    "revision": 27,
+    "sha256": "745bf9dbf6f4601ffcc71516ebcd65178599eeeae95896c196282a4fe88aeced",
+    "uncertain_authorized_transactions": 0
+  },
+  "failure": {
+    "classification": "post-run-runtime-receipt-validation",
+    "detail": "All nine rollout transactions committed, but final replay rejected memory observations[4].retrieval.query_variants[0].kind because the derived value was automatic rather than exact or semantic.",
+    "root_cause": "Host-scoped recall can inject evidence before the model issues KgRecall. The cassette derivation correctly reused the original task prompt but mislabeled that exact seed as automatic, even though automatic describes the issuer and is not a query kind in the result schema.",
+    "sequence": 4
+  },
+  "governance_signal": {
+    "host_scoped_recall_fallback_kind_observed": "automatic",
+    "host_scoped_recall_fallback_kind_required": "exact",
+    "online_tinykg_lexical_plan_status": "invalid",
+    "online_tinykg_lexical_plan_reason": "The model issued query-only KgRecall without lexical_plan because the provider tool schema required query but not lexical_plan.",
+    "query_only_execution_compatibility_preserved": true,
+    "tool_schema_must_require_lexical_plan": true
+  },
+  "outcome": {
+    "automatic_retry_forbidden": true,
+    "canonical_runtime_receipt_published": false,
+    "committed_rollout_transactions": 9,
+    "deterministic_failures": 4,
+    "deterministic_successes": 4,
+    "invalid_rollouts": 1,
+    "provider_http_requests": 78,
+    "quality_evidence": false,
+    "status": "invalid",
+    "uncertain_authorized_transactions": 0
+  },
+  "program_authority": {
+    "conservative_cost_usd_after_attempt": 9.9901358,
+    "conservative_metered_tokens_after_attempt": 6101602,
+    "user_authorization_max_cost_usd": 1000.0
+  },
+  "rollouts": [
+    {
+      "actual_cost_usd": 0.061218,
+      "actual_metered_tokens": 99805,
+      "arm": "no_memory",
+      "case_id": "coding:audit-receipt-transfer:evidence-snapshot",
+      "deterministic_success": true,
+      "evaluator_status": "ready",
+      "provider_http_requests": 12,
+      "sequence": 0,
+      "transaction_id": "22ec36746bb58f795e0762ce224d3731e9bd076388c0bc7ea1848c32a9a9b168"
+    },
+    {
+      "actual_cost_usd": 0.071269,
+      "actual_metered_tokens": 72949,
+      "arm": "markdown_memory",
+      "case_id": "coding:audit-receipt-transfer:evidence-snapshot",
+      "deterministic_success": true,
+      "evaluator_status": "ready",
+      "provider_http_requests": 9,
+      "sequence": 1,
+      "transaction_id": "da576104730ccb2a57859153fdca57865425d77cef2eda6866e494d3bb231e2a"
+    },
+    {
+      "actual_cost_usd": 0.082833,
+      "actual_metered_tokens": 59771,
+      "arm": "tinykg_lexical",
+      "case_id": "coding:audit-receipt-transfer:evidence-snapshot",
+      "deterministic_success": null,
+      "evaluator_status": "invalid",
+      "provider_http_requests": 5,
+      "query_plan_status": "invalid",
+      "sequence": 2,
+      "transaction_id": "70e81cf09142ba14352a48ef85eae6cdf667a8de15e80a63b2c6f0c4051ccf49"
+    },
+    {
+      "actual_cost_usd": 0.059456,
+      "actual_metered_tokens": 65660,
+      "arm": "markdown_memory",
+      "case_id": "coding:audit-receipt-transfer:budget-commit",
+      "deterministic_success": false,
+      "evaluator_status": "ready",
+      "provider_http_requests": 7,
+      "sequence": 3,
+      "transaction_id": "62fcaf5ede5fee2f48f5e07dc59f4c62f68299088dad6a4cec057dca3e9fc229"
+    },
+    {
+      "actual_cost_usd": 0.224601,
+      "actual_metered_tokens": 121283,
+      "arm": "tinykg_lexical",
+      "case_id": "coding:audit-receipt-transfer:budget-commit",
+      "deterministic_success": false,
+      "evaluator_status": "ready",
+      "provider_http_requests": 9,
+      "retrieved_evidence_ids": ["procedure:audit-receipt-transfer:v2"],
+      "sequence": 4,
+      "transaction_id": "84b76854d355e0662335d66d743f4ba0f51c8c9222b45d375d6447cd034ab175"
+    },
+    {
+      "actual_cost_usd": 0.076022,
+      "actual_metered_tokens": 40195,
+      "arm": "no_memory",
+      "case_id": "coding:audit-receipt-transfer:budget-commit",
+      "deterministic_success": false,
+      "evaluator_status": "ready",
+      "provider_http_requests": 5,
+      "sequence": 5,
+      "transaction_id": "45edd714e5bc80dc06473226681599b8562f287a6f40629978dfabafbd178d0e"
+    },
+    {
+      "actual_cost_usd": 0.078955,
+      "actual_metered_tokens": 104259,
+      "arm": "tinykg_lexical",
+      "case_id": "coding:audit-receipt-transfer:memory-migrate",
+      "deterministic_success": true,
+      "evaluator_status": "ready",
+      "provider_http_requests": 8,
+      "retrieved_evidence_ids": ["procedure:audit-receipt-transfer:v2"],
+      "sequence": 6,
+      "transaction_id": "d41d3acab751bad89ffccd98baf3b959262b49b862ac3a72f66b4241066344e6"
+    },
+    {
+      "actual_cost_usd": 0.067329,
+      "actual_metered_tokens": 92702,
+      "arm": "no_memory",
+      "case_id": "coding:audit-receipt-transfer:memory-migrate",
+      "deterministic_success": false,
+      "evaluator_status": "ready",
+      "provider_http_requests": 11,
+      "sequence": 7,
+      "transaction_id": "07833a8adeda207c23054e9e315e0b4c3d684400c3a31d4046dc417f54d20ecf"
+    },
+    {
+      "actual_cost_usd": 0.092037,
+      "actual_metered_tokens": 115614,
+      "arm": "markdown_memory",
+      "case_id": "coding:audit-receipt-transfer:memory-migrate",
+      "deterministic_success": true,
+      "evaluator_status": "ready",
+      "provider_http_requests": 12,
+      "sequence": 8,
+      "transaction_id": "52b1dc603db6f7deb85079e4c4febc9a8810fab290696b5dd6dd568cec717fca"
+    }
+  ]
+}

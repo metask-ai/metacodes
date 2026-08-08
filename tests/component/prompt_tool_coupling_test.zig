@@ -75,6 +75,10 @@ test "L2: 无 context 回退短描述 + Monitor 恒静态" {
 test "L2: KgRecall and KgContext schemas carry the staged semantic-neighborhood contract" {
     const kg_recall = cc.tools.getTool("KgRecall") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, kg_recall.description, "no embeddings and computes no vector distance") != null);
+    const required = kg_recall.input_schema.required orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), required.len);
+    try std.testing.expectEqualStrings("query", required[0]);
+    try std.testing.expectEqualStrings("lexical_plan", required[1]);
 
     const props = kg_recall.input_schema.prop_specs orelse return error.TestUnexpectedResult;
     var query_description: ?[]const u8 = null;

@@ -18,6 +18,7 @@ from scripts.eval.memory_agent_runtime import (
     _assert_production_sandbox_identity,
     _assert_executable_identity,
     _assert_production_secret_absent,
+    _cassette_tool_data,
     _copy_memory_tree,
     _estimated_costs_match,
     _host_recall_covers_missing_explicit_recall,
@@ -96,6 +97,45 @@ def digest(label: str) -> str:
 
 
 class MemoryAgentRuntimeContractTest(unittest.TestCase):
+    def test_host_scoped_recall_fallback_is_an_exact_query(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            (cassette / "req-001.json").write_text(
+                stable_json(
+                    {
+                        "messages": [
+                            {
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "Host recall injected node_id=7 before tools.",
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            observed = _cassette_tool_data(
+                cassette,
+                {7: "procedure:family:v2"},
+                "Register the sibling using the established protocol.",
+            )
+
+        self.assertEqual(observed["retrieved"], ["procedure:family:v2"])
+        self.assertEqual(
+            observed["query_variants"],
+            [
+                {
+                    "kind": "exact",
+                    "text": "Register the sibling using the established protocol.",
+                }
+            ],
+        )
+
     def test_failed_paid_validation_checkpoint_is_explicitly_invalid_and_recoverable(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1188,6 +1228,9 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
     def test_checked_in_pilot_v13_uses_fresh_identity_after_invalid_key(self):
         pilot = ROOT / "evals/memory/pilots/procedural-glm52-v13"
         contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        attempt = json.loads(
+            (pilot / "attempt-001-observation.json").read_text(encoding="utf-8")
+        )
         manifest = load_manifest(pilot / "manifest.json")
         execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
 
@@ -1230,6 +1273,35 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         )
         self.assertTrue(contract["current_phase"]["paid_rollouts_authorized"])
         self.assertFalse(contract["current_phase"]["quality_evidence"])
+        self.assertEqual(attempt["outcome"]["status"], "invalid")
+        self.assertFalse(attempt["outcome"]["quality_evidence"])
+        self.assertFalse(attempt["outcome"]["canonical_runtime_receipt_published"])
+        self.assertEqual(attempt["outcome"]["committed_rollout_transactions"], 9)
+        self.assertEqual(attempt["outcome"]["uncertain_authorized_transactions"], 0)
+        self.assertEqual(
+            attempt["failure"]["classification"],
+            "post-run-runtime-receipt-validation",
+        )
+        self.assertEqual(
+            attempt["governance_signal"]["host_scoped_recall_fallback_kind_observed"],
+            "automatic",
+        )
+        self.assertTrue(
+            attempt["governance_signal"]["tool_schema_must_require_lexical_plan"]
+        )
+        self.assertTrue(attempt["outcome"]["automatic_retry_forbidden"])
+        self.assertAlmostEqual(
+            sum(item["actual_cost_usd"] for item in attempt["rollouts"]),
+            attempt["budget_journal"]["committed_cost_usd"],
+        )
+        self.assertEqual(
+            sum(item["actual_metered_tokens"] for item in attempt["rollouts"]),
+            attempt["budget_journal"]["committed_metered_tokens"],
+        )
+        self.assertEqual(
+            sum(item["provider_http_requests"] for item in attempt["rollouts"]),
+            attempt["outcome"]["provider_http_requests"],
+        )
         ProductionRuntimeConfig(
             api_key="test-only",
             allow_paid_rollouts=True,

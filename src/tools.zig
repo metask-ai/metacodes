@@ -408,7 +408,7 @@ pub const registry: []const ToolEntry = &.{
                 },
                 .object_required = &.{ "schema_version", "intent", "stage", "variants", "variant_index", "seen_node_ids" },
             },
-        }, .required = &.{"query"} },
+        }, .required = &.{ "query", "lexical_plan" } },
         .execute = kg_tools.executeRecall,
         .tinykg_gated = true,
     },

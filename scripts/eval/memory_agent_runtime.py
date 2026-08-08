@@ -1317,7 +1317,11 @@ def _cassette_tool_data(
                         }
                     )
     if retrieved and not query_variants:
-        query_variants.append({"kind": "automatic", "text": fallback_query})
+        # Host-scoped recall uses the original task prompt when it injects
+        # evidence before the model can issue KgRecall.  The query is still
+        # the protocol's one exact seed; "automatic" describes who issued it,
+        # not a third query kind (the result schema only permits exact/semantic).
+        query_variants.append({"kind": "exact", "text": fallback_query})
     return {
         "query_variants": query_variants,
         "retrieved": retrieved,
