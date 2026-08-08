@@ -1541,6 +1541,9 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
     def test_checked_in_pilot_v16_freezes_multi_family_balanced_replication(self):
         pilot = ROOT / "evals/memory/pilots/procedural-glm52-v16"
         contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        attempt = json.loads(
+            (pilot / "attempt-001-observation.json").read_text(encoding="utf-8")
+        )
         source = json.loads((pilot / "source.json").read_text(encoding="utf-8"))
         validators = json.loads((pilot / "validators.json").read_text(encoding="utf-8"))
         manifest = load_manifest(pilot / "manifest.json")
@@ -1627,6 +1630,23 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 for item in contract["predecessor_attempts"]
             ],
             [("procedural-glm52-v15", "completed-pilot-signal")],
+        )
+        self.assertEqual(attempt["outcome"]["status"], "halted-runner-misclassification")
+        self.assertFalse(attempt["outcome"]["quality_evidence"])
+        self.assertFalse(attempt["outcome"]["canonical_runtime_receipt_published"])
+        self.assertEqual(attempt["outcome"]["completed_rollout_transactions"], 12)
+        self.assertEqual(attempt["outcome"]["uncertain_authorized_transactions"], 0)
+        self.assertEqual(attempt["failure"]["attempted_tool"], "Task")
+        self.assertFalse(attempt["failure"]["denial"]["tool_executed"])
+        self.assertFalse(attempt["failure"]["automatic_retry_performed"])
+        self.assertEqual(attempt["isolation"]["remote_store_writes"], 0)
+        self.assertAlmostEqual(
+            sum(item["cost_usd"] for item in attempt["rollouts"]),
+            attempt["budget_journal"]["committed_cost_usd"],
+        )
+        self.assertEqual(
+            sum(item["metered_tokens"] for item in attempt["rollouts"]),
+            attempt["budget_journal"]["committed_metered_tokens"],
         )
         budget = contract["budget_authority"]
         self.assertGreaterEqual(
