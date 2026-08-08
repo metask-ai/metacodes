@@ -146,6 +146,12 @@ PRODUCTION_RIPGREP_SNAPSHOT_PATH = "production-toolchain/.metacodes/toolchain/rg
 PRODUCTION_AUTO_COMPACT_POLICY = "disabled_threshold_reject_any_compact_event"
 PRODUCTION_FORCE_COMPACT_AT = "9223372036854775807"
 SCOPED_RECALL_PREFIX = "<system-reminder>\n# 相关持久记忆(按你的请求自动召回,可能不全)\n"
+LOOP_BREAKER_FINALIZATION = (
+    "[loop-breaker] Repeated ineffective tool actions were stopped. "
+    "Do not call any more tools. Using only the evidence already present, "
+    "provide a concise final answer covering completed work, verified results, "
+    "remaining blockers, and the next step."
+)
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
 TREATMENT_LEAK_TERMS = (
@@ -562,6 +568,12 @@ def _validate_production_provider_tool_schema(
         body = _load_unique_json(request_path, f"{where}.{request_path.name}")
         tools = body.get("tools")
         if not isinstance(tools, list):
+            if _is_final_toolless_loop_breaker_request(
+                body,
+                request_path=request_path,
+                final_request_path=request_paths[-1],
+            ):
+                continue
             _fail(f"{where}.{request_path.name}.tools", "expected an array")
         seen: set[str] = set()
         for index, raw_tool in enumerate(tools):
@@ -577,6 +589,43 @@ def _validate_production_provider_tool_schema(
                     f"{tool_where}.name",
                     f"provider schema exposed out-of-policy tool {name!r}",
                 )
+
+
+def _is_final_toolless_loop_breaker_request(
+    body: Mapping[str, Any],
+    *,
+    request_path: Path,
+    final_request_path: Path,
+) -> bool:
+    """Recognize the deliberately capability-free breaker finalization turn.
+
+    The native loop removes the provider tool schema for this one borrowed turn,
+    so omission is safer than an empty-but-drifting schema. Keep the exception
+    narrow: an explicit null, a non-final request, a changed instruction, or a
+    request without the triggering tool result remains invalid.
+    """
+
+    if "tools" in body or request_path != final_request_path:
+        return False
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return False
+    final_message = messages[-1]
+    if not isinstance(final_message, dict) or final_message.get("role") != "user":
+        return False
+    content = final_message.get("content")
+    if not isinstance(content, list):
+        return False
+    text_blocks = [
+        item.get("text")
+        for item in content
+        if isinstance(item, dict) and item.get("type") == "text"
+    ]
+    has_tool_result = any(
+        isinstance(item, dict) and item.get("type") == "tool_result"
+        for item in content
+    )
+    return has_tool_result and text_blocks == [LOOP_BREAKER_FINALIZATION]
 
 
 def _cassette_memory_exposure(

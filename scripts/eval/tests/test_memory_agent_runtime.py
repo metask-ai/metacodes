@@ -44,6 +44,7 @@ from scripts.eval.memory_budget_journal import (
 from scripts.eval.memory_query_plan import SIDECAR_NAME, build_query_plan_trace
 from scripts.eval.memory_replay import (
     LEGACY_RUNNER_SOURCE_MODULES,
+    LOOP_BREAKER_FINALIZATION,
     OBSERVATION_SCHEMA_VERSION,
     PRODUCTION_ALLOWED_PROVIDER_TOOLS,
     CONSOLIDATION_SCHEMA_VERSION,
@@ -69,6 +70,7 @@ from scripts.eval.memory_replay import (
     _cassette_treatment_activation,
     _production_harness_fingerprint,
     _query_plan_source_bound,
+    _validate_production_provider_tool_schema,
     _validate_consolidation_artifacts,
     load_manifest,
     load_observations,
@@ -98,6 +100,76 @@ def digest(label: str) -> str:
 
 
 class MemoryAgentRuntimeContractTest(unittest.TestCase):
+    def test_production_schema_accepts_only_final_toolless_breaker_closure(self):
+        allowed = list(PRODUCTION_ALLOWED_PROVIDER_TOOLS)
+        ordinary = {
+            "tools": [{"name": allowed[0]}],
+            "messages": [{"role": "user", "content": []}],
+        }
+        breaker = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "failed-tool",
+                            "content": "failed",
+                            "is_error": True,
+                        },
+                        {"type": "text", "text": LOOP_BREAKER_FINALIZATION},
+                    ],
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            (cassette / "req-001.json").write_text(
+                stable_json(ordinary) + "\n", encoding="utf-8"
+            )
+            (cassette / "req-002.json").write_text(
+                stable_json(breaker) + "\n", encoding="utf-8"
+            )
+            _validate_production_provider_tool_schema(cassette, "test", allowed)
+
+            breaker["tools"] = None
+            (cassette / "req-002.json").write_text(
+                stable_json(breaker) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValidationError, "tools: expected an array"):
+                _validate_production_provider_tool_schema(cassette, "test", allowed)
+
+    def test_production_schema_rejects_toolless_breaker_before_final_request(self):
+        allowed = list(PRODUCTION_ALLOWED_PROVIDER_TOOLS)
+        breaker = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "x", "content": "x"},
+                        {"type": "text", "text": LOOP_BREAKER_FINALIZATION},
+                    ],
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            (cassette / "req-001.json").write_text(
+                stable_json(breaker) + "\n", encoding="utf-8"
+            )
+            (cassette / "req-002.json").write_text(
+                stable_json(
+                    {
+                        "tools": [{"name": allowed[0]}],
+                        "messages": [{"role": "user", "content": []}],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValidationError, "tools: expected an array"):
+                _validate_production_provider_tool_schema(cassette, "test", allowed)
+
     def test_host_scoped_recall_fallback_is_an_exact_query(self):
         with tempfile.TemporaryDirectory() as directory:
             cassette = Path(directory)
