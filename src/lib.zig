@@ -29,6 +29,7 @@ pub const subagent = @import("core/subagent.zig");
 pub const tool_exec = @import("core/tool_exec.zig");
 pub const tool_observation_journal = @import("core/tool_observation_journal.zig");
 pub const rule_source_receipt = @import("core/rule_source_receipt.zig");
+pub const project_rule_spec = @import("core/project_rule_spec.zig");
 pub const rule_candidate = @import("core/rule_candidate.zig");
 pub const rule_lifecycle = @import("core/rule_lifecycle.zig");
 pub const message_repair = @import("core/message_repair.zig");

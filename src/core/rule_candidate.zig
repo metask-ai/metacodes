@@ -12,8 +12,9 @@ const observation_journal = @import("tool_observation_journal.zig");
 const source_receipt = @import("rule_source_receipt.zig");
 const session_id_mod = @import("session_id.zig");
 const util_fs = @import("../util/fs.zig");
+const project_rule_spec = @import("project_rule_spec.zig");
 
-pub const SCHEMA_VERSION = "metacodes-rule-candidate-v2";
+pub const SCHEMA_VERSION = "metacodes-rule-candidate-v3";
 pub const FILE_PREFIX = "rule-candidate-";
 pub const MAX_INVARIANT_BYTES: usize = 8 * 1024;
 pub const MAX_FALSIFIER_BYTES: usize = 8 * 1024;
@@ -49,6 +50,7 @@ pub const ProposalInput = struct {
     project_sha256: [64]u8,
     proposer_sha256: [64]u8,
     invariant: []const u8,
+    rule_spec: project_rule_spec.Spec,
     /// Untrusted candidate source. It is persisted for isolated build and
     /// axiom audit, but never compiled or loaded by this module.
     lean_source: []const u8,
@@ -73,6 +75,7 @@ pub const Loaded = struct {
     project_sha256: [64]u8,
     proposer_sha256: [64]u8,
     lean_source_sha256: [64]u8,
+    rule_spec: project_rule_spec.Spec,
     source_kind: SourceKind,
     source_receipt_id: ?[64]u8,
 
@@ -125,6 +128,7 @@ const CandidateBody = struct {
     project_sha256: []const u8,
     proposer_sha256: []const u8,
     invariant: []const u8,
+    rule_spec: project_rule_spec.Wire,
     lean_source: []const u8,
     source: WireSource,
 };
@@ -143,6 +147,7 @@ const RawCandidateRecord = struct {
         project_sha256: []const u8,
         proposer_sha256: []const u8,
         invariant: []const u8,
+        rule_spec: project_rule_spec.Wire,
         lean_source: []const u8,
         source: union(enum) {
             user_correction: struct {
@@ -179,6 +184,7 @@ pub fn persist(
         .project_sha256 = input.project_sha256[0..],
         .proposer_sha256 = input.proposer_sha256[0..],
         .invariant = input.invariant,
+        .rule_spec = project_rule_spec.toWire(input.rule_spec),
         .lean_source = input.lean_source,
         .source = source,
     };
@@ -271,6 +277,7 @@ pub fn load(
         !validText(record.body.invariant, MAX_INVARIANT_BYTES) or
         !validText(record.body.lean_source, MAX_LEAN_SOURCE_BYTES))
         return error.InvalidCandidate;
+    const spec = try project_rule_spec.fromWire(record.body.rule_spec);
 
     const body_json = try std.json.Stringify.valueAlloc(a, record.body, .{});
     const expected_id = observation.sha256Hex(body_json);
@@ -310,6 +317,7 @@ pub fn load(
         .project_sha256 = project,
         .proposer_sha256 = proposer,
         .lean_source_sha256 = observation.sha256Hex(record.body.lean_source),
+        .rule_spec = spec,
         .source_kind = source_kind,
         .source_receipt_id = source_receipt_id,
     };
@@ -321,6 +329,7 @@ fn validateInput(input: ProposalInput) !void {
         return error.InvalidIdentity;
     if (!validText(input.invariant, MAX_INVARIANT_BYTES))
         return error.InvalidInvariant;
+    try project_rule_spec.validate(input.rule_spec);
     if (!validText(input.lean_source, MAX_LEAN_SOURCE_BYTES))
         return error.InvalidLeanSource;
     switch (input.source) {
@@ -520,6 +529,7 @@ test "agent reflection candidate binds a completed observation interval and is i
         .project_sha256 = hex_a,
         .proposer_sha256 = hex_b,
         .invariant = "A completed tool effect must retain its terminal observation.",
+        .rule_spec = testRuleSpec(),
         .lean_source = "def preservesTerminalObservation : Bool := true",
         .source = .{ .agent_reflection = .{
             .observation = binding,
@@ -615,6 +625,7 @@ test "user correction source remains distinct and requires authority evidence" {
         .project_sha256 = hex_a,
         .proposer_sha256 = hex_b,
         .invariant = "Never promote a rule in the incident that proposed it.",
+        .rule_spec = testRuleSpec(),
         .lean_source = "def independentPromotion : Bool := true",
         .source = .{ .user_correction = .{
             .receipt_id = receipt.receipt_id,
@@ -633,4 +644,15 @@ test "user correction source remains distinct and requires authority evidence" {
         .authority_sha256 = hex_a,
     } };
     try std.testing.expectError(error.OpenFailed, persist(root, invalid));
+}
+
+fn testRuleSpec() project_rule_spec.Spec {
+    return .{
+        .target_tool = "Write",
+        .deny_target = false,
+        .max_input_bytes = 8192,
+        .max_agent_depth = 4,
+        .authoritative_only = true,
+        .effect_requirement = .file_mutation_v1_reobserved,
+    };
 }

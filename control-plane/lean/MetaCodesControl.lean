@@ -3,3 +3,4 @@ import MetaCodesControl.DurableAbort
 import MetaCodesControl.BudgetCheckpoint
 import MetaCodesControl.TreatmentActivation
 import MetaCodesControl.PaidBudgetJournal
+import MetaCodesControl.ProjectRule

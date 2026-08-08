@@ -941,6 +941,14 @@ const TestFixture = struct {
             .project_sha256 = project,
             .proposer_sha256 = .{'b'} ** 64,
             .invariant = "Completed effects retain a terminal observation.",
+            .rule_spec = .{
+                .target_tool = "Write",
+                .deny_target = false,
+                .max_input_bytes = 8192,
+                .max_agent_depth = 4,
+                .authoritative_only = true,
+                .effect_requirement = .file_mutation_v1_reobserved,
+            },
             .lean_source = "def candidateRule : Bool := true",
             .source = .{ .agent_reflection = .{
                 .observation = binding,
