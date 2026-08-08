@@ -1,7 +1,8 @@
 # Project-specific Harness Evolution
 
-Status: design contract plus the first observation-plane pilot. This document
-does not claim that automatic Lean rule evolution is already implemented.
+Status: design contract plus grounded and durable observation-plane pilots.
+This document does not claim that automatic Lean rule evolution is already
+implemented.
 
 ## Direction
 
@@ -138,11 +139,26 @@ Implemented in the first pilot:
 - synchronous subagents and TaskBatch inherit the observer;
 - an L2 test covers model tool use through the real Write dispatch.
 
+Implemented in the second pilot:
+
+- normal TUI, headless, and suspended-resume Runs append observations to a
+  session-side JSONL artifact outside the prompt and model-facing cache prefix;
+- each complete record crosses a checked file-fsync boundary before the sink
+  acknowledges it; this does not claim to prove filesystem power-loss semantics;
+- an exclusive run lease rejects concurrent writers and is deliberately left
+  behind after an unclosed Run so crash recovery requires explicit audit;
+- replay admission checks session/run identity, sequence, run lifecycle, and
+  exact start/finish pairing for every tool dispatch;
+- corrupt, partial, oversized, semantically incomplete, or concurrently owned
+  artifacts fail closed before tool dispatch.
+
 Not yet implemented:
 
-- a durable, receipt-producing observation journal;
-- observer ownership for detached background subagents whose lifetime exceeds
-  a synchronous Run;
+- a hash-chain/receipt binding the observation journal to transcript and
+  promoted rule candidates (the journal is durable evidence, not yet a receipt);
+- journal ownership in Web/daemon/skills adapters;
+- stable observer ownership for detached background subagents whose lifetime
+  exceeds a synchronous Run;
 - authoritative adoption/discard disposition for a speculative prefetch after
   the completed model turn is known;
 - a persistent RuleCandidate protocol and evidence store;

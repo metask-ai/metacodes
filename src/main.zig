@@ -126,6 +126,7 @@ pub const suspend_state = @import("core/suspend_state.zig");
 pub const tee_backend = @import("core/tee_backend.zig");
 pub const diagnostics_backend = @import("core/diagnostics_backend.zig");
 pub const evaluation_backend = @import("core/evaluation_backend.zig");
+pub const tool_observation_journal = @import("core/tool_observation_journal.zig");
 pub const repl_msg_queue = @import("repl/msg_queue.zig");
 pub const web_journal = @import("web/journal.zig");
 pub const web_backend = @import("web/backend.zig");

@@ -35,6 +35,7 @@ const writer_backend_mod = @import("../core/writer_backend.zig");
 const tee_backend_mod = @import("../core/tee_backend.zig");
 const diagnostics_backend_mod = @import("../core/diagnostics_backend.zig");
 const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
+const observation_journal_mod = @import("../core/tool_observation_journal.zig");
 const tui_backend_mod = @import("tui/tui_backend.zig");
 const terminal_title = @import("tui/terminal_title.zig");
 const goal_mod = @import("../core/goal.zig");
@@ -598,6 +599,16 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             }
         };
 
+        // Actual dispatch evidence is a product-level session artifact, not a
+        // UI projection and not an evaluation-only stream. Open and validate it
+        // before the provider can run; corruption or durability failure ends
+        // the run fail-closed.
+        var observation_journal: ?observation_journal_mod.Journal = if (app.sessionDir()) |dir|
+            try observation_journal_mod.Journal.init(dir, app.session_id)
+        else
+            null;
+        defer if (observation_journal) |*journal| journal.deinit();
+
         // Native evaluation events are a second decorator over the normal UI
         // (and optional diagnostics decorator). Each user submission is one
         // invocation inside the execution-grounded scenario rollout.
@@ -655,10 +666,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             app.provider(),
             app.tool_defs,
             &app.permission_ctx,
-            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .request_gate = eval_request_gate, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .lsp = app.lsp_service, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .swarm = &app.swarm, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = scoped_recall, .max_turns = maxTurnsFromEnv(), .cost_budget_usd = costBudgetFromEnv(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .execution_policy = eval_execution_policy, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.activeModel(), .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
+            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .request_gate = eval_request_gate, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .lsp = app.lsp_service, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .swarm = &app.swarm, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = scoped_recall, .max_turns = maxTurnsFromEnv(), .cost_budget_usd = costBudgetFromEnv(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .execution_policy = eval_execution_policy, .tool_observer = if (observation_journal) |*journal| journal.sink() else null, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.activeModel(), .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
             effective_be,
             allocator,
         ) catch |err| {
+            if (observation_journal) |*journal| try journal.finishRun(@errorName(err));
             // 停 watcher + 清 stdin 缓冲
             if (tui_be) |*tb| tb.stopInput();
             if (gen_region) |*r| r.leaveGenerating(app);
@@ -668,6 +680,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             std.debug.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
             continue;
         };
+        if (observation_journal) |*journal| try journal.finishRun(@tagName(result.stop_reason));
         app.clearPendingModelSwitchCompact();
         accountGoalUsageAfterRun(app, usage_before, mode_before, started_ns);
         // 停 watcher + 清 stdin 缓冲（生成期间用户可能误按的键，别污染下一轮）

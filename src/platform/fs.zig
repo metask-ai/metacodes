@@ -213,10 +213,16 @@ pub fn write(fd: c_int, buf: []const u8) isize {
 
 /// 刷盘。POSIX fsync / Windows _commit。
 pub fn fsync(fd: c_int) void {
+    fsyncChecked(fd) catch {};
+}
+
+/// 可观测的刷盘结果。安全控制面不能用上面的 best-effort 包装，否则磁盘错误会被
+/// 误报成“授权/观测已经持久化”。
+pub fn fsyncChecked(fd: c_int) error{SyncFailed}!void {
     if (is_windows) {
-        _ = _commit(fd);
+        if (_commit(fd) != 0) return error.SyncFailed;
     } else {
-        _ = std.c.fsync(fd);
+        if (std.c.fsync(fd) != 0) return error.SyncFailed;
     }
 }
 
@@ -263,6 +269,22 @@ pub fn exists(path: [*:0]const u8) bool {
     return std.c.access(path, std.c.F_OK) == 0;
 }
 extern "kernel32" fn GetFileAttributesW(lpFileName: [*:0]const u16) callconv(.winapi) u32;
+
+/// 删除一个已解析的普通文件路径。控制面 lease 用它显式释放独占标记；失败必须由
+/// 调用方处理，不能把“仍被占用”静默解释成成功。
+pub fn unlinkPath(path: [*:0]const u8) error{UnlinkFailed}!void {
+    if (is_windows) {
+        var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        const u8p = std.mem.span(path);
+        const wlen = std.unicode.utf8ToUtf16Le(&wbuf, u8p) catch return error.UnlinkFailed;
+        if (wlen >= wbuf.len) return error.UnlinkFailed;
+        wbuf[wlen] = 0;
+        if (DeleteFileW(@ptrCast(&wbuf)) == 0) return error.UnlinkFailed;
+        return;
+    }
+    if (std.c.unlink(path) != 0) return error.UnlinkFailed;
+}
+extern "kernel32" fn DeleteFileW(lpFileName: [*:0]const u16) callconv(.winapi) c_int;
 
 // ── 可移植 stat（文件类型探测）─────────────────────────────────────────────
 // POSIX 文件类型位（S_IFMT 家族，macOS/Linux 值一致）。用字面量避开 `std.posix.S`

@@ -6,6 +6,7 @@ const harness = @import("harness");
 const cc = @import("cc");
 
 const observation = cc.tools.tool_observation;
+const observation_journal = cc.tool_observation_journal;
 
 const Capture = struct {
     mutex: @import("platform").sync.Mutex = .{},
@@ -60,6 +61,44 @@ const Capture = struct {
         return true;
     }
 };
+
+const Fanout = struct {
+    capture: *Capture,
+    journal: *observation_journal.Journal,
+
+    fn sink(self: *Fanout) cc.tools.ToolObservationSink {
+        return .{ .ctx = @ptrCast(self), .emitFn = emit };
+    }
+
+    fn emit(raw: *anyopaque, event: observation.Event) bool {
+        const self: *Fanout = @ptrCast(@alignCast(raw));
+        if (!Capture.emit(@ptrCast(self.capture), event)) return false;
+        return self.journal.sink().emit(event);
+    }
+};
+
+fn readJournalArtifact(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
+    const pfs = @import("platform").fs;
+    const path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/{s}",
+        .{ root, observation_journal.FILE_NAME },
+        0,
+    );
+    defer allocator.free(path);
+    const fd = try pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0);
+    defer _ = pfs.close(fd);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = pfs.read(fd, &buf);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try out.appendSlice(allocator, buf[0..@intCast(n)]);
+    }
+    return out.toOwnedSlice(allocator);
+}
 
 const FINAL_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"done\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
@@ -125,6 +164,10 @@ test "L2 actual tool observation is independent of UI projection and depth" {
     var writer = cc.writer_backend.WriterBackend.initNull();
     const backend = writer.backend();
     var capture = Capture{};
+    const sid = cc.session_id.SessionId.fromSlice("0123456789abcdef01234567").?;
+    var journal = try observation_journal.Journal.init(root_buffer[0..root_len], sid);
+    defer journal.deinit();
+    var fanout = Fanout{ .capture = &capture, .journal = &journal };
 
     const result = try cc.agent_loop.run(
         &conversation,
@@ -136,13 +179,14 @@ test "L2 actual tool observation is independent of UI projection and depth" {
             .agent_depth = 7,
             .emit_tool_cards = false,
             .event_projection = .legacy,
-            .tool_observer = capture.sink(),
+            .tool_observer = fanout.sink(),
             .cwd_abs = root_buffer[0..root_len],
             .home_dir = root_buffer[0..root_len],
         },
         &backend,
         allocator,
     );
+    try journal.finishRun(@tagName(result.stop_reason));
 
     try std.testing.expect(result.stop_reason == .end_turn);
     try std.testing.expectEqual(@as(usize, 1), capture.starts);
@@ -164,4 +208,13 @@ test "L2 actual tool observation is independent of UI projection and depth" {
     try std.testing.expect(mutation.before_state == .missing);
     try std.testing.expect(mutation.change == .changed);
     try std.testing.expectEqual(@as(usize, "l2-grounded".len), mutation.after_bytes);
+    const summary = try observation_journal.validate(root_buffer[0..root_len], sid);
+    try std.testing.expectEqual(@as(u64, 4), summary.records);
+    const artifact = try readJournalArtifact(allocator, root_buffer[0..root_len]);
+    defer allocator.free(artifact);
+    try std.testing.expect(std.mem.indexOf(u8, artifact, "dispatch_started") != null);
+    try std.testing.expect(std.mem.indexOf(u8, artifact, "dispatch_finished") != null);
+    try std.testing.expect(std.mem.indexOf(u8, artifact, "file_mutation_v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, artifact, path) == null);
+    try std.testing.expect(std.mem.indexOf(u8, artifact, "l2-grounded") == null);
 }
