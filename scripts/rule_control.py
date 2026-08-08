@@ -2918,6 +2918,7 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
     receipt_validate = top_source("replay", "_validate_budget_transaction_receipt")
     journal_receipt_validate = top_source("replay", "_validate_budget_journal_receipt")
     artifact_validate = top_source("replay", "validate_runtime_artifacts")
+    resume_validate = top_source("runner", "validate_memory_agent_resume")
 
     reserve_lines = call_lines(runner, "budget_journal.reserve")
     pipe_lines = call_lines(runner, "os.pipe")
@@ -2987,6 +2988,18 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
     preauth_test = test_source(
         "runtime_tests", "MemoryBudgetRuntimeL2Test",
         "test_pre_authorization_os_failure_aborts_without_provider_request",
+    )
+    resume_test = test_source(
+        "runtime_tests", "MemoryBudgetRuntimeL2Test",
+        "test_rollout_checkpoint_resume_skips_already_committed_provider_request",
+    )
+    resume_advance_test = test_source(
+        "runtime_tests", "MemoryBudgetRuntimeL2Test",
+        "test_resume_rejects_journal_advance_without_replaying_provider",
+    )
+    resume_credential_test = test_source(
+        "runtime_tests", "MemoryBudgetRuntimeL2Test",
+        "test_resume_checkpoint_failure_precedes_credential_loading",
     )
     dry_run_test = test_source(
         "agent_tests", "MemoryAgentRuntimeContractTest",
@@ -3191,15 +3204,50 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
             ) and "CAS" in cas_test and "event count" in drift_test,
         },
         declarations[7]: {
-            "runtime exports checkpoint before final journal receipt": all(
+            "runtime publishes a validated atomic checkpoint after every committed rollout": all(
                 marker in runner_source
                 for marker in (
-                    "budget_journal.checkpoint_payload()", '"budget-journal-checkpoint.json"',
+                    "budget_journal.checkpoint_payload()", "rollout-budget-checkpoint-r",
                     '"checkpoint_sha256"', "budget_journal.snapshot()",
+                    "validate_runtime_receipt(", "validate_runtime_artifacts(",
+                    "_replace_private_file(", '"after_rollout_resume_checkpoint"',
                 )
             ) and all(
                 marker in journal_snapshot
                 for marker in ('"journal_id"', '"revision"', '"head_sha256"', '"transaction_states"')
+            ),
+            "resume revalidates a contiguous prefix and exact live journal before credentials": all(
+                marker in resume_validate
+                for marker in (
+                    "must be a non-empty prefix", "budget_journal.checkpoint_payload()",
+                    "journal advanced beyond the artifact checkpoint; replay is forbidden",
+                    "validate_runtime_receipt(", "validate_runtime_artifacts(",
+                )
+            ) and (
+                pilot_source.find("validate_memory_agent_resume(") >= 0
+                and pilot_source.find("validate_memory_agent_resume(")
+                < pilot_source.find("_load_api_key(")
+            ),
+            "fault L2 skips committed work and rejects ambiguous journal advance": all(
+                marker in resume_test
+                for marker in (
+                    '"after_rollout_resume_checkpoint"',
+                    "self.assertEqual(provider.requests, 1)",
+                    "resume_paid_run=True", "self.assertEqual(provider.requests, 2)",
+                )
+            ) and all(
+                marker in resume_advance_test
+                for marker in (
+                    "authorize_request(",
+                    "journal advanced beyond the artifact checkpoint",
+                    "self.assertEqual(provider.requests, 1)",
+                )
+            ) and all(
+                marker in resume_credential_test
+                for marker in (
+                    '"--resume-paid-run"', "load_key.assert_not_called()",
+                    "self.assertFalse(missing_auth.exists())",
+                )
             ),
             "replay recomputes transaction and journal identities": all(
                 marker in receipt_validate for marker in ("identity_sha256", "transaction_id", "reservation_revision")
@@ -3246,7 +3294,7 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                 for marker in ("1000.01", "must not exceed", "explicit paid-rollout authority")
             ),
             "quality flag and single physical provider attempt remain gated": (
-                '"quality_evidence": False' in runner_source
+                '"quality_evidence": False' in sources["runner"]
                 and 'value["quality_evidence"] is not False' in sources["replay"]
                 and 'test "L2 evaluation gate makes one physical provider attempt and never retries outside receipt"'
                 in sources["retry_test"]

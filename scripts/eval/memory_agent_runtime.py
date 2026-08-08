@@ -43,6 +43,7 @@ from .memory_benchmark import PROTOCOL_ID, file_sha256
 from .memory_budget_journal import (
     BudgetJournal,
     BudgetTransaction,
+    validate_checkpoint_payload,
     usd_to_microusd,
     usd_to_microusd_ceiling,
 )
@@ -83,6 +84,8 @@ from .memory_replay import (
     _production_harness_fingerprint,
     load_manifest,
     replay_observations,
+    validate_runtime_artifacts,
+    validate_runtime_receipt,
 )
 from .memory_tinykg_local import (
     LocalTinyKg,
@@ -141,6 +144,10 @@ ARM_TO_RUNTIME = {
 SAFE_STOP_REASONS = frozenset({"end_turn", "max_turns", "tool_loop", "budget"})
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 BudgetFaultHook = Callable[[str, Mapping[str, Any]], None]
+ROLLOUT_RESUME_CHECKPOINT_SCHEMA = "metacodes-memory-rollout-resume-v1"
+ROLLOUT_RESUME_CHECKPOINT_NAME = "rollout-resume-checkpoint.json"
+ROLLOUT_RESUME_CHECKPOINT_TEMP_NAME = ".rollout-resume-checkpoint.json.tmp"
+MAX_ROLLOUT_RESUME_FILE_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -362,6 +369,81 @@ def _write_new(path: Path, payload: bytes) -> None:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
+
+
+def _private_regular_payload(path: Path, where: str) -> bytes:
+    """Read and validate identity through one no-follow descriptor."""
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ValidationError(f"{where}: cannot open private file: {exc}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            _fail(where, "expected a regular file")
+        if info.st_nlink != 1:
+            _fail(where, "hard links are forbidden")
+        if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o077:
+            _fail(where, "permissions must be 0600 or stricter")
+        if info.st_size <= 0 or info.st_size > MAX_ROLLOUT_RESUME_FILE_BYTES:
+            _fail(where, "file is empty or exceeds the resume safety limit")
+        chunks: List[bytes] = []
+        observed = 0
+        while True:
+            chunk = os.read(fd, min(1024 * 1024, MAX_ROLLOUT_RESUME_FILE_BYTES + 1 - observed))
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+            observed += len(chunk)
+            if observed > MAX_ROLLOUT_RESUME_FILE_BYTES:
+                _fail(where, "file exceeds the resume safety limit")
+    except OSError as exc:
+        raise ValidationError(f"{where}: cannot read private file: {exc}") from exc
+    finally:
+        os.close(fd)
+
+
+def _replace_private_file(path: Path, payload: bytes) -> None:
+    """Durably replace one private file, leaving a detectable temp on failure."""
+
+    temporary = path.with_name(ROLLOUT_RESUME_CHECKPOINT_TEMP_NAME)
+    if temporary.exists() or temporary.is_symlink():
+        _fail("rollout resume checkpoint", "incomplete temporary file requires inspection")
+    if path.exists() or path.is_symlink():
+        _private_regular_payload(path, "rollout resume checkpoint")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(temporary, flags, 0o600)
+        offset = 0
+        while offset < len(payload):
+            written = os.write(fd, payload[offset:])
+            if written <= 0:
+                raise OSError("short write")
+            offset += written
+        os.fsync(fd)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            _fail("rollout resume checkpoint temporary file", "identity changed")
+        os.close(fd)
+        fd = -1
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def _write_failed_validation_checkpoint(
@@ -2018,6 +2100,312 @@ def _require_production_budget(
         )
 
 
+def _build_runtime_receipt(
+    *,
+    manifest: Mapping[str, Any],
+    source_sha: str,
+    runner_sources: Sequence[Mapping[str, str]],
+    observations: Sequence[Mapping[str, Any]],
+    rollout_receipts: Sequence[Mapping[str, Any]],
+    metacodes_sha: str,
+    tinykg_sha: str,
+    production: ProductionRuntimeConfig | None,
+    production_ripgrep: Path | None,
+    artifact_relative: Callable[[Path, str], str],
+    budget_journal_receipt: Mapping[str, Any] | None,
+) -> Mapping[str, Any]:
+    receipt: Dict[str, Any] = {
+        "protocol_id": PROTOCOL_ID,
+        "manifest_sha256": _canonical_sha256(manifest),
+        "observations_sha256": _canonical_sha256(list(observations)),
+        "dataset_sha256": source_sha,
+        "adapter_id": manifest["dataset"]["adapter_id"],
+        "adapter_revision": manifest["dataset"]["adapter_revision"],
+        "model_id": manifest["execution"]["model_id"],
+        "model_fingerprint": manifest["execution"]["model_fingerprint"],
+        "harness_revision": manifest["execution"]["harness_revision"],
+        "runner_sources": list(runner_sources),
+        "arms": list(manifest["execution"]["arms"]),
+        "graders": [
+            {"case_id": case["id"], "fingerprint": case["grader"]["fingerprint"]}
+            for case in manifest["cases"]
+        ],
+        "quality_evidence": False,
+        "metacodes_binary_sha256": metacodes_sha,
+        "tinykg_binary_sha256": tinykg_sha,
+        "estimated_cost_usd": sum(
+            float(rollout["estimated_cost_usd"]) for rollout in rollout_receipts
+        ),
+        "rollouts": list(rollout_receipts),
+    }
+    if production is not None:
+        if production_ripgrep is None or budget_journal_receipt is None:
+            _fail("production runtime receipt", "missing toolchain or budget checkpoint")
+        receipt.update(
+            {
+                "schema_version": PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                "execution_mode": PRODUCTION_EXECUTION_MODE,
+                "provider_id": PRODUCTION_PROVIDER_ID,
+                "model_provider": PRODUCTION_MODEL_PROVIDER,
+                "disallowed_provider_tools": list(PRODUCTION_DISALLOWED_PROVIDER_TOOLS),
+                "allowed_provider_tools": list(PRODUCTION_ALLOWED_PROVIDER_TOOLS),
+                "ripgrep_binary_sha256": production.ripgrep_binary_sha256,
+                "ripgrep_snapshot_path": artifact_relative(
+                    production_ripgrep,
+                    "frozen production ripgrep binary",
+                ),
+                "budget": production.public_budget(),
+                "provider_requests": sum(
+                    int(rollout["provider_requests"]) for rollout in rollout_receipts
+                ),
+                "tool_network_isolation": PRODUCTION_TOOL_NETWORK_ISOLATION,
+                "filesystem_isolation": PRODUCTION_FILESYSTEM_ISOLATION,
+                "auto_compact_policy": PRODUCTION_AUTO_COMPACT_POLICY,
+                "provider_billed_cost_usd": None,
+                "metered_tokens": sum(
+                    int(rollout["metered_tokens"]) for rollout in rollout_receipts
+                ),
+                "pricing_provenance": PRODUCTION_PRICING_PROVENANCE,
+                "budget_journal": budget_journal_receipt,
+            }
+        )
+    else:
+        receipt.update(
+            {
+                "schema_version": RUNTIME_RECEIPT_SCHEMA_VERSION,
+                "execution_mode": SCRIPTED_LIFECYCLE_MODE,
+                "external_network_calls": 0,
+                "paid_cost_usd": 0.0,
+            }
+        )
+    return receipt
+
+
+def validate_memory_agent_resume(
+    *,
+    run_dir: Path,
+    manifest: Mapping[str, Any],
+    source_sha: str,
+    metacodes_sha: str,
+    tinykg_sha: str,
+    ripgrep_sha: str,
+    budget_journal: BudgetJournal,
+) -> Mapping[str, Any]:
+    """Validate an explicit paid-run resume before credential access or network.
+
+    Only a fully checked contiguous prefix may resume.  Any journal transition
+    after the checkpoint, including a commit that lost its artifact checkpoint,
+    is an unrecoverable ambiguity and therefore fails closed.
+    """
+
+    root = run_dir.expanduser().resolve()
+    try:
+        root_info = run_dir.expanduser().lstat()
+    except OSError as exc:
+        raise ValidationError(f"paid-run resume directory: cannot inspect: {exc}") from exc
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        _fail("paid-run resume directory", "must be an existing real directory")
+    for forbidden in (
+        root / ROLLOUT_RESUME_CHECKPOINT_TEMP_NAME,
+        root / "observations.jsonl",
+        root / "runtime-receipt.json",
+    ):
+        if forbidden.exists() or forbidden.is_symlink():
+            _fail(
+                "paid-run resume",
+                f"ambiguous or already-published artifact {forbidden.name!r}",
+            )
+    checkpoint_path = root / ROLLOUT_RESUME_CHECKPOINT_NAME
+    checkpoint = _load_json_payload(
+        _private_regular_payload(checkpoint_path, "rollout resume checkpoint"),
+        "rollout resume checkpoint",
+    )
+    expected_fields = {
+        "schema_version",
+        "status",
+        "manifest_sha256",
+        "dataset_sha256",
+        "metacodes_binary_sha256",
+        "tinykg_binary_sha256",
+        "ripgrep_binary_sha256",
+        "runner_sources_sha256",
+        "completed_sequences",
+        "observations",
+        "candidate_runtime_receipt",
+        "budget_checkpoints",
+    }
+    if set(checkpoint) != expected_fields:
+        _fail("rollout resume checkpoint", "field set drift")
+    if (
+        checkpoint["schema_version"] != ROLLOUT_RESUME_CHECKPOINT_SCHEMA
+        or checkpoint["status"] != "partial"
+    ):
+        _fail("rollout resume checkpoint", "unsupported schema or status")
+    identity = {
+        "manifest_sha256": _canonical_sha256(manifest),
+        "dataset_sha256": source_sha,
+        "metacodes_binary_sha256": metacodes_sha,
+        "tinykg_binary_sha256": tinykg_sha,
+        "ripgrep_binary_sha256": ripgrep_sha,
+    }
+    for key, expected in identity.items():
+        if checkpoint.get(key) != expected:
+            _fail(f"rollout resume checkpoint.{key}", "identity drift")
+
+    observations = checkpoint["observations"]
+    receipt = checkpoint["candidate_runtime_receipt"]
+    completed = checkpoint["completed_sequences"]
+    if not isinstance(observations, list) or not isinstance(receipt, dict):
+        _fail("rollout resume checkpoint", "observations or receipt is malformed")
+    if not isinstance(completed, list) or any(
+        not isinstance(value, int) or isinstance(value, bool) for value in completed
+    ):
+        _fail("rollout resume checkpoint.completed_sequences", "expected integer array")
+    if not completed or completed != list(range(len(completed))):
+        _fail("rollout resume checkpoint.completed_sequences", "must be a non-empty prefix")
+    if len(completed) > len(manifest["schedule"]) or len(observations) != len(completed):
+        _fail("rollout resume checkpoint", "completed prefix length drift")
+    rollouts = receipt.get("rollouts")
+    if not isinstance(rollouts, list) or len(rollouts) != len(completed):
+        _fail("rollout resume checkpoint.candidate_runtime_receipt", "rollout count drift")
+    if receipt.get("schema_version") != PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+        _fail("rollout resume checkpoint.candidate_runtime_receipt", "not production v8")
+    if receipt.get("quality_evidence") is not False:
+        _fail("rollout resume checkpoint.candidate_runtime_receipt", "quality flag drift")
+    for key, expected in identity.items():
+        receipt_key = "dataset_sha256" if key == "dataset_sha256" else key
+        if receipt.get(receipt_key) != expected:
+            _fail(f"rollout resume checkpoint.candidate_runtime_receipt.{receipt_key}", "identity drift")
+    runner_sources = receipt.get("runner_sources")
+    if (
+        not isinstance(runner_sources, list)
+        or checkpoint["runner_sources_sha256"] != _canonical_sha256(runner_sources)
+    ):
+        _fail("rollout resume checkpoint.runner_sources_sha256", "source bundle drift")
+    expected_modules = list(PRODUCTION_RUNNER_SOURCE_MODULES)
+    if [item.get("module") for item in runner_sources if isinstance(item, dict)] != expected_modules:
+        _fail("rollout resume checkpoint.runner_sources", "module set or order drift")
+    runtime_source_root = Path(__file__).resolve().parent
+    for index, source_record in enumerate(runner_sources):
+        if not isinstance(source_record, dict) or set(source_record) != {"module", "path", "sha256"}:
+            _fail(f"rollout resume checkpoint.runner_sources[{index}]", "malformed record")
+        module = str(source_record["module"])
+        current_sha = file_sha256(runtime_source_root / f"{module}.py")
+        if source_record["sha256"] != current_sha:
+            _fail(
+                f"rollout resume checkpoint.runner_sources[{index}]",
+                "current runner source changed since checkpoint",
+            )
+    if receipt.get("observations_sha256") != _canonical_sha256(observations):
+        _fail("rollout resume checkpoint.observations", "receipt hash drift")
+    expected_rollout_dirs: set[str] = set()
+    for sequence in completed:
+        schedule = manifest["schedule"][sequence]
+        if schedule.get("sequence") != sequence:
+            _fail("rollout resume checkpoint", "manifest schedule is not contiguous")
+        case = manifest["cases"][next(
+            index
+            for index, item in enumerate(manifest["cases"])
+            if item["id"] == schedule["case_id"]
+        )]
+        observation = observations[sequence]
+        rollout = rollouts[sequence]
+        if not isinstance(observation, dict) or not isinstance(rollout, dict):
+            _fail(f"rollout resume checkpoint sequence {sequence}", "malformed row")
+        for key, expected in (
+            ("case_id", schedule["case_id"]),
+            ("trial", schedule["trial"]),
+            ("arm", schedule["arm"]),
+        ):
+            if observation.get(key) != expected or rollout.get(key) != expected:
+                _fail(f"rollout resume checkpoint sequence {sequence}", f"{key} drift")
+        if rollout.get("sequence") != sequence:
+            _fail(f"rollout resume checkpoint sequence {sequence}", "sequence drift")
+        if rollout.get("task_fingerprint") != _canonical_sha256(case):
+            _fail(f"rollout resume checkpoint sequence {sequence}", "task identity drift")
+        if rollout.get("observation_sha256") != _canonical_sha256(observation):
+            _fail(f"rollout resume checkpoint sequence {sequence}", "observation hash drift")
+        component = _safe_component(
+            f"{sequence}:{schedule['case_id']}:{schedule['trial']}:{schedule['arm']}"
+        )
+        expected_rollout_dirs.add(f"{sequence:05d}-{component}")
+    rollout_root = root / "rollouts"
+    observed_rollout_dirs = (
+        {path.name for path in rollout_root.iterdir() if path.is_dir() and not path.is_symlink()}
+        if rollout_root.is_dir() and not rollout_root.is_symlink()
+        else set()
+    )
+    if observed_rollout_dirs != expected_rollout_dirs:
+        _fail("paid-run resume rollouts", "contains missing or uncheckpointed directories")
+
+    budget_history = checkpoint["budget_checkpoints"]
+    if not isinstance(budget_history, list) or len(budget_history) != len(completed):
+        _fail("rollout resume checkpoint.budget_checkpoints", "history length drift")
+    seen_budget_paths: set[str] = set()
+    last_budget_payload = b""
+    last_budget_state: Mapping[str, Any] | None = None
+    for index, raw_entry in enumerate(budget_history):
+        if not isinstance(raw_entry, dict) or set(raw_entry) != {
+            "path",
+            "sha256",
+            "revision",
+            "head_sha256",
+        }:
+            _fail(f"rollout resume checkpoint.budget_checkpoints[{index}]", "malformed entry")
+        relative = raw_entry["path"]
+        if (
+            not isinstance(relative, str)
+            or not re.fullmatch(r"rollout-budget-checkpoint-r[0-9]+\.json", relative)
+            or relative in seen_budget_paths
+        ):
+            _fail(f"rollout resume checkpoint.budget_checkpoints[{index}].path", "invalid path")
+        seen_budget_paths.add(relative)
+        payload = _private_regular_payload(root / relative, f"rollout budget checkpoint {index}")
+        if _hash_bytes(payload) != raw_entry["sha256"]:
+            _fail(f"rollout resume checkpoint.budget_checkpoints[{index}]", "byte hash drift")
+        state = validate_checkpoint_payload(payload)
+        if state["revision"] != raw_entry["revision"] or state["head_sha256"] != raw_entry["head_sha256"]:
+            _fail(f"rollout resume checkpoint.budget_checkpoints[{index}]", "state drift")
+        states = [transaction["state"] for transaction in state["transactions"].values()]
+        if states.count("committed") != index + 1 or any(value != "committed" for value in states):
+            _fail(f"rollout resume checkpoint.budget_checkpoints[{index}]", "transaction prefix drift")
+        last_budget_payload = payload
+        last_budget_state = state
+    assert last_budget_state is not None
+    live_budget_payload = budget_journal.checkpoint_payload()
+    live_budget_state = validate_checkpoint_payload(live_budget_payload)
+    if (
+        _hash_bytes(live_budget_payload) != _hash_bytes(last_budget_payload)
+        or live_budget_state["revision"] != last_budget_state["revision"]
+        or live_budget_state["head_sha256"] != last_budget_state["head_sha256"]
+    ):
+        _fail(
+            "paid-run resume budget",
+            "journal advanced beyond the artifact checkpoint; replay is forbidden",
+        )
+    if len(live_budget_state["transactions"]) != len(completed):
+        _fail("paid-run resume budget", "committed transaction count drift")
+    journal_receipt = receipt.get("budget_journal")
+    if not isinstance(journal_receipt, dict):
+        _fail("rollout resume checkpoint.candidate_runtime_receipt", "budget receipt missing")
+    if (
+        journal_receipt.get("checkpoint_path") != budget_history[-1]["path"]
+        or journal_receipt.get("checkpoint_sha256") != budget_history[-1]["sha256"]
+        or journal_receipt.get("revision") != last_budget_state["revision"]
+        or journal_receipt.get("head_sha256") != last_budget_state["head_sha256"]
+    ):
+        _fail("rollout resume checkpoint.candidate_runtime_receipt", "budget binding drift")
+    validate_runtime_receipt(
+        receipt,
+        manifest,
+        observations,
+        source_sha,
+        "rollout resume checkpoint receipt",
+    )
+    validate_runtime_artifacts(receipt, root, "rollout resume checkpoint artifacts")
+    return checkpoint
+
+
 def run_memory_agent_schedule(
     *,
     metacodes_binary: Path,
@@ -2034,6 +2422,7 @@ def run_memory_agent_schedule(
     production: ProductionRuntimeConfig | None = None,
     budget_journal: BudgetJournal | None = None,
     budget_fault_hook: BudgetFaultHook | None = None,
+    resume_paid_run: bool = False,
 ) -> Tuple[List[Mapping[str, Any]], Mapping[str, Any]]:
     """Run one complete frozen schedule through scripted or production provider.
 
@@ -2092,6 +2481,8 @@ def run_memory_agent_schedule(
             _fail("production memory runtime", "budget journal authority drift")
     elif budget_journal is not None or budget_fault_hook is not None:
         _fail("memory agent runtime", "budget journal is only valid in production mode")
+    if resume_paid_run and production is None:
+        _fail("memory agent runtime", "resume is only supported for paid production runs")
 
     procedural_cases = _public_procedural_cases(source)
     public_cases = {
@@ -2111,38 +2502,68 @@ def run_memory_agent_schedule(
         _fail("memory agent runtime", "validator bundle is only valid for procedural adapter")
 
     resolved_run = run_dir.expanduser().resolve()
-    if resolved_run.exists():
-        _fail("memory agent run directory", "must not already exist")
     observations_output = _inside(observations_path, resolved_run, "memory observations output")
     receipt_output = _inside(runtime_receipt_path, resolved_run, "memory runtime receipt output")
     if observations_output == receipt_output:
         _fail("memory agent runtime", "observation and receipt outputs must be distinct")
-    resolved_run.mkdir(parents=True)
+    resume_checkpoint: Mapping[str, Any] | None = None
+    if resume_paid_run:
+        assert production is not None
+        assert production.ripgrep_binary_sha256 is not None
+        assert budget_journal is not None
+        resume_checkpoint = validate_memory_agent_resume(
+            run_dir=run_dir,
+            manifest=manifest,
+            source_sha=source_sha,
+            metacodes_sha=metacodes_sha,
+            tinykg_sha=tinykg_sha,
+            ripgrep_sha=production.ripgrep_binary_sha256,
+            budget_journal=budget_journal,
+        )
+    else:
+        if resolved_run.exists():
+            _fail("memory agent run directory", "must not already exist")
+        resolved_run.mkdir(parents=True)
     production_ripgrep: Path | None = None
     if production is not None:
         assert production.ripgrep_binary is not None
         assert production.ripgrep_binary_sha256 is not None
-        production_ripgrep = _materialize_pinned_ripgrep(
-            production.ripgrep_binary,
-            production.ripgrep_binary_sha256,
-            resolved_run / "production-toolchain",
-        )
+        if resume_checkpoint is not None:
+            production_ripgrep = resolved_run / str(
+                resume_checkpoint["candidate_runtime_receipt"]["ripgrep_snapshot_path"]
+            )
+            _assert_executable_identity(
+                production_ripgrep,
+                production.ripgrep_binary_sha256,
+                "resumed production ripgrep binary",
+            )
+        else:
+            production_ripgrep = _materialize_pinned_ripgrep(
+                production.ripgrep_binary,
+                production.ripgrep_binary_sha256,
+                resolved_run / "production-toolchain",
+            )
     runtime_source_root = Path(__file__).resolve().parent
     runner_sources: List[Mapping[str, str]] = []
     runner_source_modules = (
         PRODUCTION_RUNNER_SOURCE_MODULES if production_mode else RUNNER_SOURCE_MODULES
     )
-    for module in runner_source_modules:
-        runtime_source = runtime_source_root / f"{module}.py"
-        target = resolved_run / "runner-sources" / f"{module}.py"
-        _write_new(target, _read_regular_file(runtime_source, f"runtime source {module}"))
-        runner_sources.append(
-            {
-                "module": module,
-                "path": target.relative_to(resolved_run).as_posix(),
-                "sha256": file_sha256(target),
-            }
+    if resume_checkpoint is not None:
+        runner_sources = list(
+            resume_checkpoint["candidate_runtime_receipt"]["runner_sources"]
         )
+    else:
+        for module in runner_source_modules:
+            runtime_source = runtime_source_root / f"{module}.py"
+            target = resolved_run / "runner-sources" / f"{module}.py"
+            _write_new(target, _read_regular_file(runtime_source, f"runtime source {module}"))
+            runner_sources.append(
+                {
+                    "module": module,
+                    "path": target.relative_to(resolved_run).as_posix(),
+                    "sha256": file_sha256(target),
+                }
+            )
     runner_sources_sha = _canonical_sha256(runner_sources)
 
     def artifact_relative(path: Path, label: str) -> str:
@@ -2153,6 +2574,7 @@ def run_memory_agent_schedule(
         expected_sha256=expected_tinykg_sha256,
         run_dir=resolved_run / "local-tinykg",
         timeout_seconds=timeout_seconds,
+        resume=resume_checkpoint is not None,
     )
     cases = {case["id"]: case for case in manifest["cases"]}
     arms = {arm["id"]: arm for arm in manifest["execution"]["arms"]}
@@ -2160,11 +2582,66 @@ def run_memory_agent_schedule(
         if arm_id not in ARM_TO_RUNTIME:
             _fail("memory agent runtime", f"unsupported arm {arm_id!r}")
 
-    observations: List[Mapping[str, Any]] = []
-    rollout_receipts: List[Mapping[str, Any]] = []
+    observations: List[Mapping[str, Any]] = (
+        list(resume_checkpoint["observations"]) if resume_checkpoint is not None else []
+    )
+    rollout_receipts: List[Mapping[str, Any]] = (
+        list(resume_checkpoint["candidate_runtime_receipt"]["rollouts"])
+        if resume_checkpoint is not None
+        else []
+    )
+    budget_checkpoint_history: List[Mapping[str, Any]] = (
+        list(resume_checkpoint["budget_checkpoints"])
+        if resume_checkpoint is not None
+        else []
+    )
     procedural_stores: MutableMapping[Tuple[str, int, str], Mapping[str, Any]] = {}
 
+    if resume_checkpoint is not None:
+        for sequence, prior_rollout in enumerate(rollout_receipts):
+            schedule = manifest["schedule"][sequence]
+            case = cases[schedule["case_id"]]
+            if case["benchmark"] != "procedural_transfer":
+                continue
+            store_relative = prior_rollout["artifact_paths"].get("store")
+            if store_relative is None:
+                continue
+            store_path = _inside(
+                resolved_run / str(store_relative),
+                local.store_root,
+                "resumed procedural TinyKG store",
+            )
+            public_case = public_cases.get(case["id"])
+            procedure_id = (
+                public_case.get("_procedure_evidence_id")
+                if isinstance(public_case, dict)
+                else None
+            )
+            logical_ids: Dict[int, str] = {}
+            consolidation = prior_rollout.get("consolidation")
+            if isinstance(consolidation, dict) and isinstance(procedure_id, str):
+                projection_ids = consolidation.get("tinykg_projection_node_ids")
+                if isinstance(projection_ids, list):
+                    for node_id in projection_ids:
+                        if not isinstance(node_id, int) or isinstance(node_id, bool):
+                            _fail("paid-run resume", "invalid consolidation projection id")
+                        logical_ids[node_id] = procedure_id
+            family_key = (
+                str(case.get("family_id") or case["id"]),
+                int(schedule["trial"]),
+                str(schedule["arm"]),
+            )
+            procedural_stores[family_key] = {
+                "store": str(store_path),
+                "logical_ids": logical_ids,
+                "abstraction_nodes": int(
+                    observations[sequence]["memory"]["abstraction_nodes"]
+                ),
+            }
+
     for expected_sequence, schedule in enumerate(manifest["schedule"]):
+        if expected_sequence < len(observations):
+            continue
         if production_mode:
             _assert_executable_identity(
                 metacodes,
@@ -3362,87 +3839,130 @@ def run_memory_agent_schedule(
             )
         rollout_receipts.append(rollout_receipt)
 
+        if production is not None:
+            assert budget_journal is not None
+            budget_checkpoint_payload = budget_journal.checkpoint_payload()
+            budget_state = validate_checkpoint_payload(budget_checkpoint_payload)
+            budget_checkpoint_path = resolved_run / (
+                f"rollout-budget-checkpoint-r{int(budget_state['revision']):08d}.json"
+            )
+            _write_new(budget_checkpoint_path, budget_checkpoint_payload)
+            budget_checkpoint_entry = {
+                "path": budget_checkpoint_path.relative_to(resolved_run).as_posix(),
+                "sha256": _hash_bytes(budget_checkpoint_payload),
+                "revision": int(budget_state["revision"]),
+                "head_sha256": str(budget_state["head_sha256"]),
+            }
+            budget_checkpoint_history.append(budget_checkpoint_entry)
+            budget_snapshot = budget_journal.snapshot()
+            if (
+                budget_snapshot["unsettled_max_cost_microusd"] != 0
+                or budget_snapshot["unsettled_max_metered_tokens"] != 0
+            ):
+                _fail("production memory runtime", "checkpoint has unsettled budget exposure")
+            budget_journal_receipt = {
+                **budget_snapshot,
+                "checkpoint_path": budget_checkpoint_entry["path"],
+                "checkpoint_sha256": budget_checkpoint_entry["sha256"],
+            }
+            candidate_receipt = _build_runtime_receipt(
+                manifest=manifest,
+                source_sha=source_sha,
+                runner_sources=runner_sources,
+                observations=observations,
+                rollout_receipts=rollout_receipts,
+                metacodes_sha=metacodes_sha,
+                tinykg_sha=tinykg_sha,
+                production=production,
+                production_ripgrep=production_ripgrep,
+                artifact_relative=artifact_relative,
+                budget_journal_receipt=budget_journal_receipt,
+            )
+            validate_runtime_receipt(
+                candidate_receipt,
+                manifest,
+                observations,
+                source_sha,
+                f"rollout resume receipt {expected_sequence}",
+            )
+            # Validate the just-finished line before it becomes resumable.  A
+            # full historical validation is done once on resume/finalization;
+            # keeping this check O(1) avoids quadratic hashing across 144 rows.
+            latest_only_receipt = _build_runtime_receipt(
+                manifest=manifest,
+                source_sha=source_sha,
+                runner_sources=runner_sources,
+                observations=observations[-1:],
+                rollout_receipts=rollout_receipts[-1:],
+                metacodes_sha=metacodes_sha,
+                tinykg_sha=tinykg_sha,
+                production=production,
+                production_ripgrep=production_ripgrep,
+                artifact_relative=artifact_relative,
+                budget_journal_receipt=budget_journal_receipt,
+            )
+            validate_runtime_artifacts(
+                latest_only_receipt,
+                resolved_run,
+                f"rollout resume line {expected_sequence}",
+            )
+            resume_document = {
+                "schema_version": ROLLOUT_RESUME_CHECKPOINT_SCHEMA,
+                "status": "partial",
+                "manifest_sha256": _canonical_sha256(manifest),
+                "dataset_sha256": source_sha,
+                "metacodes_binary_sha256": metacodes_sha,
+                "tinykg_binary_sha256": tinykg_sha,
+                "ripgrep_binary_sha256": production.ripgrep_binary_sha256,
+                "runner_sources_sha256": runner_sources_sha,
+                "completed_sequences": list(range(len(observations))),
+                "observations": observations,
+                "candidate_runtime_receipt": candidate_receipt,
+                "budget_checkpoints": budget_checkpoint_history,
+            }
+            resume_payload = (stable_json(resume_document) + "\n").encode("utf-8")
+            _assert_production_secret_absent(
+                resolved_run,
+                production.api_key,
+                pending_payloads=(("pending rollout resume checkpoint", resume_payload),),
+            )
+            _replace_private_file(
+                resolved_run / ROLLOUT_RESUME_CHECKPOINT_NAME,
+                resume_payload,
+            )
+            if budget_fault_hook is not None:
+                budget_fault_hook("after_rollout_resume_checkpoint", resume_document)
+
     budget_journal_receipt: Mapping[str, Any] | None = None
     if production is not None:
         assert budget_journal is not None
-        budget_checkpoint_payload = budget_journal.checkpoint_payload()
-        budget_checkpoint_path = resolved_run / "budget-journal-checkpoint.json"
-        _write_new(budget_checkpoint_path, budget_checkpoint_payload)
         final_budget = budget_journal.snapshot()
         if (
             final_budget["unsettled_max_cost_microusd"] != 0
             or final_budget["unsettled_max_metered_tokens"] != 0
         ):
             _fail("production memory runtime", "successful schedule has unsettled budget exposure")
+        if not budget_checkpoint_history:
+            _fail("production memory runtime", "missing rollout budget checkpoint")
+        final_budget_checkpoint = budget_checkpoint_history[-1]
         budget_journal_receipt = {
             **final_budget,
-            "checkpoint_path": budget_checkpoint_path.relative_to(resolved_run).as_posix(),
-            "checkpoint_sha256": _hash_bytes(budget_checkpoint_payload),
+            "checkpoint_path": final_budget_checkpoint["path"],
+            "checkpoint_sha256": final_budget_checkpoint["sha256"],
         }
-
-    receipt_common: Dict[str, Any] = {
-        "protocol_id": PROTOCOL_ID,
-        "manifest_sha256": _canonical_sha256(manifest),
-        "observations_sha256": _canonical_sha256(observations),
-        "dataset_sha256": source_sha,
-        "adapter_id": manifest["dataset"]["adapter_id"],
-        "adapter_revision": manifest["dataset"]["adapter_revision"],
-        "model_id": manifest["execution"]["model_id"],
-        "model_fingerprint": manifest["execution"]["model_fingerprint"],
-        "harness_revision": manifest["execution"]["harness_revision"],
-        "runner_sources": runner_sources,
-        "arms": list(manifest["execution"]["arms"]),
-        "graders": [
-            {"case_id": case["id"], "fingerprint": case["grader"]["fingerprint"]}
-            for case in manifest["cases"]
-        ],
-        "quality_evidence": False,
-        "metacodes_binary_sha256": metacodes_sha,
-        "tinykg_binary_sha256": tinykg_sha,
-        "estimated_cost_usd": sum(
-            float(rollout["estimated_cost_usd"]) for rollout in rollout_receipts
-        ),
-        "rollouts": rollout_receipts,
-    }
-    if production is not None:
-        receipt_common.update(
-            {
-                "schema_version": PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
-                "execution_mode": PRODUCTION_EXECUTION_MODE,
-                "provider_id": PRODUCTION_PROVIDER_ID,
-                "model_provider": PRODUCTION_MODEL_PROVIDER,
-                "disallowed_provider_tools": list(PRODUCTION_DISALLOWED_PROVIDER_TOOLS),
-                "allowed_provider_tools": list(PRODUCTION_ALLOWED_PROVIDER_TOOLS),
-                "ripgrep_binary_sha256": production.ripgrep_binary_sha256,
-                "ripgrep_snapshot_path": artifact_relative(
-                    production_ripgrep,
-                    "frozen production ripgrep binary",
-                ),
-                "budget": production.public_budget(),
-                "provider_requests": sum(
-                    int(rollout["provider_requests"]) for rollout in rollout_receipts
-                ),
-                "tool_network_isolation": PRODUCTION_TOOL_NETWORK_ISOLATION,
-                "filesystem_isolation": PRODUCTION_FILESYSTEM_ISOLATION,
-                "auto_compact_policy": PRODUCTION_AUTO_COMPACT_POLICY,
-                "provider_billed_cost_usd": None,
-                "metered_tokens": sum(
-                    int(rollout["metered_tokens"]) for rollout in rollout_receipts
-                ),
-                "pricing_provenance": PRODUCTION_PRICING_PROVENANCE,
-                "budget_journal": budget_journal_receipt,
-            }
-        )
-    else:
-        receipt_common.update(
-            {
-                "schema_version": RUNTIME_RECEIPT_SCHEMA_VERSION,
-                "execution_mode": SCRIPTED_LIFECYCLE_MODE,
-                "external_network_calls": 0,
-                "paid_cost_usd": 0.0,
-            }
-        )
-    receipt: Mapping[str, Any] = receipt_common
+    receipt = _build_runtime_receipt(
+        manifest=manifest,
+        source_sha=source_sha,
+        runner_sources=runner_sources,
+        observations=observations,
+        rollout_receipts=rollout_receipts,
+        metacodes_sha=metacodes_sha,
+        tinykg_sha=tinykg_sha,
+        production=production,
+        production_ripgrep=production_ripgrep,
+        artifact_relative=artifact_relative,
+        budget_journal_receipt=budget_journal_receipt,
+    )
     observations_payload = b"".join(
         (stable_json(row) + "\n").encode("utf-8") for row in observations
     )

@@ -270,7 +270,11 @@ state machine and complete identity, durable authorization publication, one
 exclusive runner lock around credential and schedule access, the real
 authorization-before-provider call chain, both authorized crash windows,
 two-dimensional exposure and exact commit replay, fail-closed file/CAS checks,
-checkpoint-bound receipts, and dry-run plus one-physical-attempt regressions.
+checkpoint-bound receipts plus explicit paid-schedule resume, and dry-run plus
+one-physical-attempt regressions. Resume accepts only a fully revalidated
+contiguous rollout prefix whose live journal exactly matches the recorded
+revision/head; rejected resume runs fail before credential loading, and an
+extra authorized or committed transaction is never replayed.
 
 `PaidBudgetJournal.lean` proves the legal lifecycle, authorized maximum
 exposure, no authorized rollback/re-authorization, exact committed replay,
@@ -282,8 +286,11 @@ and reaches the provider only after that code path. A loopback MockServer opens
 the on-disk journal when the request arrives; fault injection covers crashes
 both immediately after authorization and after provider return but before
 commit. Recovered authorized requests retain maximum exposure and cannot be
-implicitly retried. The rule is a release gate for the pilot mechanism, not
-proof of filesystem power-loss semantics or memory quality.
+implicitly retried. A separate post-commit fault test proves that already
+checkpointed rollouts are skipped, while the commit-to-checkpoint ambiguity is
+detected and blocked rather than claimed recoverable. The rule is a release
+gate for the pilot mechanism, not proof of filesystem power-loss semantics or
+memory quality.
 
 ## Commands
 

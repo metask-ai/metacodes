@@ -411,6 +411,7 @@ class LocalTinyKg:
         expected_sha256: str,
         run_dir: Path,
         timeout_seconds: int = 60,
+        resume: bool = False,
     ) -> None:
         self.binary = binary.expanduser().resolve()
         if not self.binary.is_file() or not os.access(self.binary, os.X_OK):
@@ -419,15 +420,23 @@ class LocalTinyKg:
         if self.binary_sha256 != _hash(expected_sha256, "expected local TinyKG binary SHA-256"):
             _fail("local TinyKG binary", "SHA-256 mismatch")
         self.run_dir = run_dir.expanduser().resolve()
-        if self.run_dir.exists():
-            _fail("local TinyKG run directory", "must not already exist")
-        self.run_dir.mkdir(parents=True)
         self.store_root = self.run_dir / "stores"
         self.batch_root = self.run_dir / "batches"
         self.sealed_home = self.run_dir / "sealed-home"
         self.child_tmp = self.run_dir / "tmp"
-        for directory in (self.store_root, self.batch_root, self.sealed_home, self.child_tmp):
-            directory.mkdir()
+        directories = (self.store_root, self.batch_root, self.sealed_home, self.child_tmp)
+        if resume:
+            if not self.run_dir.is_dir() or self.run_dir.is_symlink():
+                _fail("local TinyKG resume directory", "must be an existing real directory")
+            for directory in directories:
+                if not directory.is_dir() or directory.is_symlink():
+                    _fail("local TinyKG resume directory", f"invalid layout entry {directory.name!r}")
+        else:
+            if self.run_dir.exists():
+                _fail("local TinyKG run directory", "must not already exist")
+            self.run_dir.mkdir(parents=True)
+            for directory in directories:
+                directory.mkdir()
         self.timeout_seconds = timeout_seconds
         self.parent_tinykg_env_keys = sorted(
             key for key in os.environ if key.startswith("TINYKG_")

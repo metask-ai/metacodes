@@ -1445,6 +1445,44 @@ class PaidBudgetJournalSensorTests(unittest.TestCase):
             observation.missing_declarations,
         )
 
+    def test_resume_after_credential_loading_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        pilot = root / "scripts/eval/memory_agent_runtime_pilot.py"
+        source = pilot.read_text(encoding="utf-8")
+        source = source.replace(
+            "        if args.resume_paid_run:\n",
+            "        api_key = _load_api_key(args.auth_file.expanduser().resolve())\n"
+            "        if args.resume_paid_run:\n",
+            1,
+        )
+        pilot.write_text(source, encoding="utf-8")
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "receipt_binds_final_journal_checkpoint",
+            observation.missing_declarations,
+        )
+
+    def test_missing_post_checkpoint_no_replay_l2_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        tests = root / "scripts/eval/tests/test_memory_budget_runtime.py"
+        tests.write_text(
+            tests.read_text(encoding="utf-8").replace(
+                'stage == "after_rollout_resume_checkpoint"',
+                'stage == "unobserved_checkpoint_stage"',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "receipt_binds_final_journal_checkpoint",
+            observation.missing_declarations,
+        )
+
     def test_dry_run_claim_without_zero_side_effect_l2_is_observed(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)

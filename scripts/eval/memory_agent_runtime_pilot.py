@@ -31,6 +31,7 @@ if __package__ in {None, ""}:
         _write_new,
         _validate_production_manifest,
         run_memory_agent_schedule,
+        validate_memory_agent_resume,
     )
     from scripts.eval.memory_benchmark import file_sha256  # type: ignore
     from scripts.eval.memory_budget_journal import (  # type: ignore
@@ -57,6 +58,7 @@ else:
         _write_new,
         _validate_production_manifest,
         run_memory_agent_schedule,
+        validate_memory_agent_resume,
     )
     from .memory_benchmark import file_sha256
     from .memory_budget_journal import BudgetAuthority, BudgetJournal, usd_to_microusd
@@ -308,6 +310,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-total-cost-usd", type=float, default=10.0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--allow-paid-rollouts", action="store_true")
+    parser.add_argument("--resume-paid-run", action="store_true")
     args = parser.parse_args(argv)
 
     metacodes = args.binary.expanduser().resolve()
@@ -353,7 +356,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.budget_journal is None:
         raise ValidationError("production pilot requires --budget-journal")
     run_dir = args.run_dir.expanduser().resolve()
-    if run_dir.exists():
+    if args.resume_paid_run and not run_dir.is_dir():
+        raise ValidationError("production --resume-paid-run requires an existing --run-dir")
+    if not args.resume_paid_run and run_dir.exists():
         raise ValidationError("production --run-dir must not already exist")
 
     journal_candidate = args.budget_journal.expanduser()
@@ -381,6 +386,19 @@ def main(argv: list[str] | None = None) -> int:
         total_metered_tokens=args.max_total_metered_tokens,
     )
     with BudgetJournal(journal_path, authority) as budget_journal:
+        if args.resume_paid_run:
+            # This preflight deliberately precedes credential loading. A stale,
+            # corrupt, or ambiguous checkpoint must fail with zero secret reads
+            # and zero opportunity for a provider request.
+            validate_memory_agent_resume(
+                run_dir=run_dir,
+                manifest=manifest,
+                source_sha=file_sha256(source),
+                metacodes_sha=metacodes_sha,
+                tinykg_sha=tinykg_sha,
+                ripgrep_sha=file_sha256(ripgrep),
+                budget_journal=budget_journal,
+            )
         api_key = _load_api_key(args.auth_file.expanduser().resolve())
         # The key was never present in this process's initial environment. The
         # metacodes child receives it only through an anonymous inherited FD and
@@ -404,6 +422,7 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_seconds=args.timeout_seconds,
                 production=production,
                 budget_journal=budget_journal,
+                resume_paid_run=args.resume_paid_run,
             )
             validate_runtime_artifacts(receipt, run_dir)
         except BaseException as exc:

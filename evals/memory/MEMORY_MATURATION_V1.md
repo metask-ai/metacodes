@@ -243,6 +243,16 @@ run-owned canonical toolchain path before any provider request. Every rollout re
 snapshot, and replay rechecks its canonical path, 0500 mode, single-link regular-file identity, and SHA-256.
 Historical observation v1 and production receipt v7 artifacts remain replayable with their original semantics.
 
+Paid production schedules additionally publish `rollout-resume-checkpoint.json` after each fully validated
+rollout. The checkpoint is explicitly partial and cannot masquerade as the canonical runtime receipt. It binds
+the contiguous schedule prefix, observations, candidate receipt, runner/binary identities, and a versioned
+hash-chain budget checkpoint. Resume is never automatic: rerun the exact frozen command with
+`--resume-paid-run`. Before loading the credential, the runner revalidates every completed artifact and requires
+the live journal to match the checkpoint revision/head exactly with only committed transactions. A later
+`request_authorized` or `committed` transaction without a matching rollout checkpoint is ambiguous and fails
+closed; the provider request is never replayed. The remaining commit-to-checkpoint crash window is therefore
+detectable, not falsely claimed to be recoverable.
+
 ## Frozen replay boundary
 
 `replay-memory` joins three deliberately separate artifacts:

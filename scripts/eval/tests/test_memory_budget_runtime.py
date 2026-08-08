@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 import scripts.eval.memory_agent_runtime as memory_runtime
+import scripts.eval.memory_agent_runtime_pilot as memory_pilot
 
 from scripts.eval.e2e_adapter import NATIVE_EVENT_SCHEMA_VERSION
 from scripts.eval.memory_agent_runtime import (
@@ -26,6 +27,7 @@ from scripts.eval.memory_benchmark import file_sha256
 from scripts.eval.memory_budget_journal import (
     BudgetAuthority,
     BudgetJournal,
+    BudgetTransaction,
     validate_checkpoint_payload,
     usd_to_microusd,
 )
@@ -315,6 +317,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
         run_name: str,
         fault_hook=None,
         production=None,
+        resume_paid_run=False,
     ):
         run_dir = root / run_name
         return run_memory_agent_schedule(
@@ -331,6 +334,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
             production=production or self._production(),
             budget_journal=journal,
             budget_fault_hook=fault_hook,
+            resume_paid_run=resume_paid_run,
         )
 
     def test_mock_provider_observes_durable_authorization_on_real_runner_path(self):
@@ -437,6 +441,137 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                                     run_name="run-retry",
                                 )
                         self.assertEqual(provider.requests, expected_requests)
+
+    def test_rollout_checkpoint_resume_skips_already_committed_provider_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path, manifest_path, manifest = self._materialize_contract(root)
+            journal_path = root / "budget-control" / "journal.json"
+            journal_path.parent.mkdir(mode=0o700)
+            run_name = "run-resume"
+            checkpoint_faults = 0
+
+            def crash_after_first_checkpoint(stage, receipt):
+                nonlocal checkpoint_faults
+                if (
+                    stage == "after_rollout_resume_checkpoint"
+                    and len(receipt["completed_sequences"]) == 1
+                    and checkpoint_faults == 0
+                ):
+                    checkpoint_faults += 1
+                    raise RuntimeError("injected crash after durable rollout checkpoint")
+
+            with _AuthorizationObservingServer(journal_path) as provider:
+                fake = root / "fake-metacodes"
+                self._write_fake_metacodes(fake, provider.url)
+                with BudgetJournal(journal_path, self._authority(manifest)) as journal:
+                    with self.assertRaisesRegex(RuntimeError, "durable rollout checkpoint"):
+                        self._run(
+                            root,
+                            journal,
+                            fake,
+                            source_path,
+                            manifest_path,
+                            run_name=run_name,
+                            fault_hook=crash_after_first_checkpoint,
+                        )
+                    self.assertEqual(
+                        journal.snapshot()["transaction_states"],
+                        {"committed": 1},
+                    )
+                self.assertEqual(provider.requests, 1)
+                checkpoint = json.loads(
+                    (root / run_name / "rollout-resume-checkpoint.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(checkpoint["status"], "partial")
+                self.assertEqual(checkpoint["completed_sequences"], [0])
+
+                with BudgetJournal(journal_path, self._authority(manifest)) as recovered:
+                    observations, receipt = self._run(
+                        root,
+                        recovered,
+                        fake,
+                        source_path,
+                        manifest_path,
+                        run_name=run_name,
+                        resume_paid_run=True,
+                    )
+                    self.assertEqual(
+                        recovered.snapshot()["transaction_states"],
+                        {"committed": 2},
+                    )
+            self.assertEqual(provider.requests, 2)
+            self.assertEqual([item["sequence"] for item in receipt["rollouts"]], [0, 1])
+            self.assertEqual(len(observations), 2)
+            validate_runtime_artifacts(receipt, root / run_name)
+
+    def test_resume_rejects_journal_advance_without_replaying_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path, manifest_path, manifest = self._materialize_contract(root)
+            journal_path = root / "budget-control" / "journal.json"
+            journal_path.parent.mkdir(mode=0o700)
+            run_name = "run-ambiguous"
+
+            def stop_after_checkpoint(stage, receipt):
+                if stage == "after_rollout_resume_checkpoint" and len(
+                    receipt["completed_sequences"]
+                ) == 1:
+                    raise RuntimeError("checkpoint stop")
+
+            with _AuthorizationObservingServer(journal_path) as provider:
+                fake = root / "fake-metacodes"
+                self._write_fake_metacodes(fake, provider.url)
+                with BudgetJournal(journal_path, self._authority(manifest)) as journal:
+                    with self.assertRaisesRegex(RuntimeError, "checkpoint stop"):
+                        self._run(
+                            root,
+                            journal,
+                            fake,
+                            source_path,
+                            manifest_path,
+                            run_name=run_name,
+                            fault_hook=stop_after_checkpoint,
+                        )
+                self.assertEqual(provider.requests, 1)
+
+                with BudgetJournal(journal_path, self._authority(manifest)) as advanced:
+                    reservation = advanced.reserve(
+                        BudgetTransaction(
+                            run_id="ambiguous-provider-attempt",
+                            manifest_sha256=hashlib.sha256(
+                                stable_json(manifest).encode("utf-8")
+                            ).hexdigest(),
+                            model_fingerprint=manifest["execution"]["model_fingerprint"],
+                            harness_fingerprint=hashlib.sha256(b"ambiguous").hexdigest(),
+                            provider_identity=PRODUCTION_PROVIDER_ID,
+                            max_cost_microusd=usd_to_microusd(1.0),
+                            max_metered_tokens=100_000,
+                        )
+                    )
+                    advanced.authorize_request(
+                        reservation["transaction_id"],
+                        expected_revision=reservation["journal_revision"],
+                        expected_head_sha256=reservation["journal_head_sha256"],
+                    )
+
+                with BudgetJournal(journal_path, self._authority(manifest)) as recovered:
+                    with self.assertRaisesRegex(
+                        ValidationError,
+                        "journal advanced beyond the artifact checkpoint",
+                    ):
+                        self._run(
+                            root,
+                            recovered,
+                            fake,
+                            source_path,
+                            manifest_path,
+                            run_name=run_name,
+                            resume_paid_run=True,
+                        )
+                self.assertEqual(provider.requests, 1)
 
     def test_external_ripgrep_may_disappear_after_run_snapshot_without_spending_gap(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -613,6 +748,61 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
             self.assertFalse(missing_auth.exists())
             self.assertFalse(invoked.exists())
             self.assertFalse((root / "loser-run").exists())
+
+    def test_resume_checkpoint_failure_precedes_credential_loading(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path, manifest_path, _manifest = self._materialize_contract(root)
+            run_dir = root / "corrupt-resume-run"
+            run_dir.mkdir(mode=0o700)
+            checkpoint = run_dir / "rollout-resume-checkpoint.json"
+            checkpoint.write_text("{}\n", encoding="utf-8")
+            checkpoint.chmod(0o600)
+            journal_path = root / "budget-control" / "journal.json"
+            journal_path.parent.mkdir(mode=0o700)
+            fake = root / "fake-metacodes"
+            fake.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+            fake.chmod(0o700)
+            tinykg = root / "fake-tinykg"
+            self._write_compatible_fake_tinykg(tinykg)
+            missing_auth = root / "credential-must-not-be-opened.json"
+            arguments = [
+                "--binary",
+                str(fake),
+                "--tinykg-binary",
+                str(tinykg),
+                "--ripgrep-binary",
+                str(TEST_RIPGREP),
+                "--source",
+                str(source_path),
+                "--manifest",
+                str(manifest_path),
+                "--run-dir",
+                str(run_dir),
+                "--budget-journal",
+                str(journal_path),
+                "--auth-file",
+                str(missing_auth),
+                "--max-total-cost-usd",
+                "3.0",
+                "--max-total-metered-tokens",
+                "300000",
+                "--max-rollout-cost-usd",
+                "1.0",
+                "--max-rollout-metered-tokens",
+                "100000",
+                "--allow-paid-rollouts",
+                "--resume-paid-run",
+            ]
+            with mock.patch.object(
+                memory_pilot,
+                "_probe_tinykg_compatibility",
+                return_value={"commands": [], "storage_format_version": 2, "schema_version": 3},
+            ), mock.patch.object(memory_pilot, "_load_api_key") as load_key:
+                with self.assertRaisesRegex(ValidationError, "field set drift"):
+                    memory_pilot.main(arguments)
+            load_key.assert_not_called()
+            self.assertFalse(missing_auth.exists())
 
     def test_pre_authorization_os_failure_aborts_without_provider_request(self):
         with tempfile.TemporaryDirectory() as directory:
