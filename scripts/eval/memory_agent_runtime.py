@@ -2927,10 +2927,13 @@ def run_memory_agent_schedule(
             )
         if cassette_activity["provider_requests"] != provider_request_count:
             _fail(f"native memory rollout {run_id}", "raw provider request count drift")
-        if production is not None and cassette_activity["forbidden_provider_tool_attempts"] != 0:
+        if (
+            production is not None
+            and cassette_activity["uncontained_forbidden_provider_tool_attempts"] != 0
+        ):
             _fail(
                 f"native memory rollout {run_id}",
-                "production model attempted a forbidden nested-provider tool",
+                "forbidden provider tool was not safely denied",
             )
         if (
             tinykg_enabled

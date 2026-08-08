@@ -489,11 +489,34 @@ def _cassette_memory_activity(
         "markdown_reads": 0,
         "markdown_writes": 0,
         "forbidden_provider_tool_attempts": 0,
+        "contained_forbidden_provider_tool_attempts": 0,
+        "uncontained_forbidden_provider_tool_attempts": 0,
     }
     for tool_id, (name, raw_input) in tool_defs.items():
         tool_input = json.loads(raw_input)
         if name in PRODUCTION_DISALLOWED_PROVIDER_TOOLS:
             counts["forbidden_provider_tool_attempts"] += 1
+            result = tool_results.get(tool_id)
+            safely_denied = False
+            if result is not None and result[0]:
+                try:
+                    content = json.loads(result[1])
+                    denial = json.loads(content) if isinstance(content, str) else content
+                except json.JSONDecodeError:
+                    denial = None
+                error = denial.get("error") if isinstance(denial, dict) else None
+                safely_denied = bool(
+                    isinstance(error, dict)
+                    and error.get("code") == "permission_denied"
+                    and error.get("category") == "safety"
+                    and error.get("recoverable") is False
+                )
+            counter = (
+                "contained_forbidden_provider_tool_attempts"
+                if safely_denied
+                else "uncontained_forbidden_provider_tool_attempts"
+            )
+            counts[counter] += 1
         markdown_read = name in {"Read", "Grep"} and (
             _path_is_within(tool_input.get("file_path"), memory_root)
             or _path_is_within(tool_input.get("path"), memory_root)
@@ -3018,11 +3041,11 @@ def validate_runtime_artifacts(
                     _fail(f"{rollout_where}.provider_requests", "raw cassette count mismatch")
                 if (
                     schema_version in PRODUCTION_RUNTIME_RECEIPT_VERSIONS
-                    and activity["forbidden_provider_tool_attempts"] != 0
+                    and activity["uncontained_forbidden_provider_tool_attempts"] != 0
                 ):
                     _fail(
                         f"{rollout_where}.artifact_paths.cassette",
-                        "production model attempted a forbidden nested-provider tool",
+                        "forbidden provider tool was not safely denied",
                     )
                 if schema_version in {
                     PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,

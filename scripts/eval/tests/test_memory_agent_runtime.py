@@ -2299,7 +2299,16 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                             {
                                 "type": "tool_result",
                                 "tool_use_id": "nested-provider",
-                                "content": "denied",
+                                "content": stable_json(
+                                    {
+                                        "error": {
+                                            "code": "permission_denied",
+                                            "category": "safety",
+                                            "detail": "tool 'WebSearch' denied by permission rule",
+                                            "recoverable": False,
+                                        }
+                                    }
+                                ),
                                 "is_error": True,
                             },
                             {
@@ -2347,6 +2356,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             self.assertEqual(activity["markdown_writes"], 1)
             self.assertEqual(activity["tinykg_reads"], 1)
             self.assertEqual(activity["forbidden_provider_tool_attempts"], 1)
+            self.assertEqual(activity["contained_forbidden_provider_tool_attempts"], 1)
+            self.assertEqual(activity["uncontained_forbidden_provider_tool_attempts"], 0)
 
     def test_dependency_free_xxhash_matches_zig_vectors(self):
         vectors = {
@@ -4253,7 +4264,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             attacked["rollouts"][0]["cassette_sha256"] = _artifact_tree_digest(cassette)
             with self.assertRaisesRegex(
                 ValidationError,
-                "forbidden nested-provider tool",
+                "forbidden provider tool was not safely denied",
             ):
                 validate_runtime_artifacts(attacked, root)
 
