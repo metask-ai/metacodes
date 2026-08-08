@@ -1421,6 +1421,9 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
     def test_checked_in_pilot_v15_uses_structural_grader_and_latent_protocol(self):
         pilot = ROOT / "evals/memory/pilots/procedural-glm52-v15"
         contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        attempt = json.loads(
+            (pilot / "attempt-001-observation.json").read_text(encoding="utf-8")
+        )
         source = json.loads((pilot / "source.json").read_text(encoding="utf-8"))
         validators = json.loads((pilot / "validators.json").read_text(encoding="utf-8"))
         manifest = load_manifest(pilot / "manifest.json")
@@ -1494,6 +1497,34 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         )
         self.assertTrue(contract["current_phase"]["paid_rollouts_authorized"])
         self.assertFalse(contract["current_phase"]["quality_evidence"])
+        self.assertEqual(attempt["outcome"]["status"], "completed-pilot-signal")
+        self.assertTrue(attempt["outcome"]["canonical_runtime_receipt_published"])
+        self.assertFalse(attempt["outcome"]["quality_evidence"])
+        self.assertEqual(attempt["outcome"]["committed_rollout_transactions"], 9)
+        self.assertEqual(attempt["outcome"]["uncertain_authorized_transactions"], 0)
+        self.assertTrue(attempt["evaluator_validation"]["all_rows_ready"])
+        self.assertFalse(attempt["evaluator_validation"]["surface_form_failure_observed"])
+        self.assertEqual(attempt["pilot_signal"]["no_memory"]["offline_successes"], 0)
+        self.assertEqual(attempt["pilot_signal"]["markdown_memory"]["offline_successes"], 2)
+        self.assertEqual(attempt["pilot_signal"]["tinykg_lexical"]["offline_successes"], 2)
+        self.assertEqual(attempt["query_plan_diagnostic"]["invalid"], 0)
+        self.assertEqual(attempt["query_plan_diagnostic"]["host_recall_satisfied"], 2)
+        self.assertEqual(
+            sum(item["provider_http_requests"] for item in attempt["rollouts"]),
+            attempt["outcome"]["provider_http_requests"],
+        )
+        self.assertEqual(
+            sum(item["actual_metered_tokens"] for item in attempt["rollouts"]),
+            attempt["budget_journal"]["committed_metered_tokens"],
+        )
+        self.assertAlmostEqual(
+            sum(item["actual_cost_usd"] for item in attempt["rollouts"]),
+            attempt["budget_journal"]["committed_cost_usd"],
+        )
+        self.assertLessEqual(
+            attempt["program_authority"]["conservative_cost_usd_after_attempt"],
+            attempt["program_authority"]["user_authorization_max_cost_usd"],
+        )
         ProductionRuntimeConfig(
             api_key="test-only",
             allow_paid_rollouts=True,
