@@ -15,16 +15,18 @@ from scripts import build_project_rule
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def candidate(source: str) -> tuple[str, bytes]:
+def candidate(source: str, **spec_overrides: object) -> tuple[str, bytes]:
     spec = {
-        "schema_version": "metacodes-project-rule-spec-v1",
+        "schema_version": "metacodes-project-rule-spec-v2",
         "target_tool": "Write",
+        "target_scope": "all",
         "deny_target": False,
         "max_input_bytes": 8192,
         "max_agent_depth": 4,
         "authoritative_only": True,
         "effect_requirement": "file_mutation_v1_reobserved",
     }
+    spec.update(spec_overrides)
     body = {
         "schema_version": "metacodes-rule-candidate-v3",
         "project_sha256": "a" * 64,
@@ -85,6 +87,15 @@ def isolation_available() -> bool:
 
 
 class ProjectRuleBuildTests(unittest.TestCase):
+    def test_existing_file_scope_is_typed_and_write_only(self) -> None:
+        identity, raw = candidate(
+            GOOD_SOURCE,
+            target_tool="Edit",
+            target_scope="existing_file",
+        )
+        with self.assertRaisesRegex(build_project_rule.BuildError, "requires Write"):
+            build_project_rule.validate_candidate(raw, identity)
+
     def test_duplicate_json_field_is_rejected(self) -> None:
         identity, raw = candidate(GOOD_SOURCE)
         duplicated = raw.replace(

@@ -48,6 +48,19 @@ effects such as parent-directory creation. Tool cards, TUI projection, and
 model-facing tool schemas are separate consumers and cannot disable the signal
 plane.
 
+The first pre-dispatch project signal is deliberately narrower than a general
+filesystem policy. `file_target_state` is one of `unobserved`, `missing`,
+`regular_existing`, `other_existing`, or `unavailable`. Zig derives it from the
+actual normalized `Write.file_path` with a no-follow final-component lookup;
+the model cannot supply the classification. `TargetScope.existing_file` is
+valid only for `Write`: it applies to `regular_existing`, admits only a proven
+`missing` target as outside the scope, and fails closed for every ambiguous or
+non-regular state. The same sensor and journal field run in signal-only,
+shadow, and enforced arms. After an enforced gate admits a proven-missing
+target, `Write` uses exclusive creation so a file appearing before open cannot
+be truncated. This does not claim atomic parent-directory resolution or prove
+the filesystem's power-loss model.
+
 Speculative prefetch is marked separately from authoritative execution. A
 discarded prefetch remains a real dispatch and therefore remains observable,
 but it cannot be mistaken for the action selected by the completed model turn.
@@ -177,6 +190,11 @@ Implemented runtime properties:
   `file_mutation_v2` after a real post-action re-read;
 - pre block prevents the dispatcher call; post block/fault occurs after the
   real outcome is re-observed and poisons the Run instead of hiding the effect;
+- `RuleSpec v2` can express the first real correction without banning new-file
+  creation: existing regular-file `Write` is blocked, missing-file `Write` is
+  admitted with exclusive creation, and `Edit` remains an available recovery;
+- pre target state is recorded in both dispatch and formal-decision evidence,
+  including blocked actions that never produce a dispatch-start event;
 - all active rules for one phase are sent to one fixed-kernel batch call (up to
   1024 requests / 4 MiB), while every member keeps its own request, candidate,
   binding and verdict identity; batching changes process topology, not rule
@@ -336,8 +354,8 @@ one benchmark answers everything:
   shifted recurrences of earlier corrections, plus ordinary tasks on which a
   rule should remain silent.
 
-The current bounded `RuleSpec` can only support claims about its narrow tool and
-file-mutation vocabulary.  New signal/effect types expand the evaluated corpus
+The current bounded `RuleSpec v2` can only support claims about its narrow tool,
+existing-file scope, and file-mutation vocabulary. New signal/effect types expand the evaluated corpus
 only after a real L2 proves that the actual dispatcher emits them and the host
 re-observes the claimed effect.
 

@@ -72,6 +72,7 @@ pub const RunDispatch = struct {
     agent_depth: u8,
     input_bytes: usize,
     input_sha256: [64]u8,
+    file_target_state: observation.FileTargetState,
     outcome: observation.Outcome,
     effect: ?observation.Effect,
     effect_valid: bool,
@@ -80,6 +81,7 @@ pub const RunDispatch = struct {
 pub const RunFormalDecision = struct {
     dispatch_id: []const u8,
     phase: observation.FormalPhase,
+    file_target_state: observation.FileTargetState = .unobserved,
     result: observation.FormalResult,
     candidate_id: [64]u8,
     project_sha256: [64]u8,
@@ -393,6 +395,7 @@ pub fn loadRunDispatches(
                 .formal_decision => |formal| try formal_decisions.append(a, .{
                     .dispatch_id = formal.dispatch_id,
                     .phase = formal.phase,
+                    .file_target_state = formal.file_target_state,
                     .result = formal.result,
                     .candidate_id = formal.candidate_id,
                     .project_sha256 = formal.project_sha256,
@@ -412,6 +415,7 @@ pub fn loadRunDispatches(
                     try formal_decisions.append(a, .{
                         .dispatch_id = batch.dispatch_id,
                         .phase = batch.phase,
+                        .file_target_state = batch.file_target_state,
                         .result = decision.result,
                         .candidate_id = decision.candidate_id,
                         .project_sha256 = batch.project_sha256,
@@ -440,6 +444,7 @@ pub fn loadRunDispatches(
                         .agent_depth = started.agent_depth,
                         .input_bytes = started.input_bytes,
                         .input_sha256 = started.input_sha256,
+                        .file_target_state = started.file_target_state,
                         .outcome = .host_fatal,
                         .effect = null,
                         .effect_valid = false,

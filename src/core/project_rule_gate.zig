@@ -46,6 +46,7 @@ pub const RuntimeGate = struct {
             .input_bytes = signal.input_bytes,
             .agent_depth = signal.agent_depth,
             .authoritative = signal.authoritative,
+            .file_target_state = signal.file_target_state,
         };
         const signal_json = try std.json.Stringify.valueAlloc(self.allocator, formal_signal, .{});
         defer self.allocator.free(signal_json);
@@ -93,7 +94,12 @@ pub const RuntimeGate = struct {
             self.abort,
         );
         defer batch.deinit(self.allocator);
-        return self.recordBatch(signal.dispatch_id, .pre, &batch);
+        return self.recordBatch(
+            signal.dispatch_id,
+            .pre,
+            signal.file_target_state,
+            &batch,
+        );
     }
 
     fn decidePost(self: *RuntimeGate, signal: protocol.PostSignal) !protocol.Result {
@@ -102,6 +108,7 @@ pub const RuntimeGate = struct {
             .input_bytes = signal.pre.input_bytes,
             .agent_depth = signal.pre.agent_depth,
             .authoritative = signal.pre.authoritative,
+            .file_target_state = signal.pre.file_target_state,
         };
         const formal_signal = spec_mod.PostSignal{
             .pre = formal_pre,
@@ -156,13 +163,19 @@ pub const RuntimeGate = struct {
             self.abort,
         );
         defer batch.deinit(self.allocator);
-        return self.recordBatch(signal.pre.dispatch_id, .post, &batch);
+        return self.recordBatch(
+            signal.pre.dispatch_id,
+            .post,
+            signal.pre.file_target_state,
+            &batch,
+        );
     }
 
     fn recordBatch(
         self: *RuntimeGate,
         dispatch_id: []const u8,
         phase: observation.FormalPhase,
+        file_target_state: observation.FileTargetState,
         batch: *const kernel.BatchInvocation,
     ) protocol.Result {
         // A production gate must publish both the payload and its journal
@@ -213,6 +226,7 @@ pub const RuntimeGate = struct {
         if (!sink.emit(.{ .formal_decision_batch = .{
             .dispatch_id = dispatch_id,
             .phase = phase,
+            .file_target_state = file_target_state,
             .project_sha256 = self.active.project_sha256,
             .bundle_sha256 = self.active.bundle_sha256,
             .bundle_revision = self.active.revision,

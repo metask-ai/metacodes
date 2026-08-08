@@ -6,11 +6,11 @@ namespace MetaCodesControl.ProjectHarness
 open MetaCodesControl.FormalKernel
 open MetaCodesControl.ProjectRule
 
-def requestSchema : String := "metacodes-project-harness-request-v1"
-def verdictSchema : String := "metacodes-project-harness-verdict-v1"
-def batchRequestSchema : String := "metacodes-project-harness-batch-request-v1"
-def batchVerdictSchema : String := "metacodes-project-harness-batch-verdict-v1"
-def checkerVersion : String := "metacodes-project-harness-kernel-v1"
+def requestSchema : String := "metacodes-project-harness-request-v2"
+def verdictSchema : String := "metacodes-project-harness-verdict-v2"
+def batchRequestSchema : String := "metacodes-project-harness-batch-request-v2"
+def batchVerdictSchema : String := "metacodes-project-harness-batch-verdict-v2"
+def checkerVersion : String := "metacodes-project-harness-kernel-v2"
 def maxBatchRequests : Nat := 1024
 def zeroSha256 : String := "0000000000000000000000000000000000000000000000000000000000000000"
 
@@ -173,12 +173,22 @@ theorem correction_promotion_requires_receipt (request : Request)
   have source := obligations.1
   simpa [sourceValid, kind] using source
 
-theorem denied_predecision_blocks (request : Request) (signal : PreSignal)
+theorem denied_all_predecision_blocks (request : Request) (signal : PreSignal)
     (payload : request.payload = .pre signal)
     (same : signal.tool = request.ruleSpec.targetTool)
+    (scope : request.ruleSpec.targetScope = .all)
     (denied : request.ruleSpec.denyTarget = true) :
     decide request = false := by
-  simp [decide, payload, preDecision, same, denied]
+  simp [decide, payload, preDecision, matchedDecision, same, scope, denied]
+
+theorem denied_existing_file_predecision_blocks (request : Request)
+    (signal : PreSignal) (payload : request.payload = .pre signal)
+    (same : signal.tool = request.ruleSpec.targetTool)
+    (scope : request.ruleSpec.targetScope = .existingFile)
+    (state : signal.fileTargetState = .regularExisting)
+    (denied : request.ruleSpec.denyTarget = true) :
+    decide request = false := by
+  simp [decide, payload, preDecision, matchedDecision, same, scope, state, denied]
 
 /-- A batch is admitted exactly when every independently bound request is
 admitted.  Batching changes process topology only; it cannot let one rule hide
@@ -204,6 +214,19 @@ def effectOfString? : String → Option EffectRequirement
   | "file_mutation_v1_reobserved" => some .fileMutationV1Reobserved
   | _ => none
 
+def scopeOfString? : String → Option TargetScope
+  | "all" => some .all
+  | "existing_file" => some .existingFile
+  | _ => none
+
+def fileTargetStateOfString? : String → Option FileTargetState
+  | "unobserved" => some .unobserved
+  | "missing" => some .missing
+  | "regular_existing" => some .regularExisting
+  | "other_existing" => some .otherExisting
+  | "unavailable" => some .unavailable
+  | _ => none
+
 def sourceOfString? : String → Option SourceKind
   | "user_correction" => some .userCorrection
   | "agent_reflection" => some .agentReflection
@@ -223,11 +246,27 @@ def parseEffectField (cursor : Cursor) (name : String) :
   | some effect => pure (effect, cursor)
   | none => throw "unsupported effect requirement"
 
+def parseScopeField (cursor : Cursor) (name : String) :
+    Except String (TargetScope × Cursor) := do
+  let (raw, cursor) ← parseStringField cursor name
+  match scopeOfString? raw with
+  | some scope => pure (scope, cursor)
+  | none => throw "unsupported target scope"
+
+def parseFileTargetStateField (cursor : Cursor) (name : String) :
+    Except String (FileTargetState × Cursor) := do
+  let (raw, cursor) ← parseStringField cursor name
+  match fileTargetStateOfString? raw with
+  | some state => pure (state, cursor)
+  | none => throw "unsupported file target state"
+
 def parseRuleSpec (cursor : Cursor) : Except String (RuleSpec × Cursor) := do
   let cursor ← expectLiteral cursor "{\"schema_version\":"
   let (schema, cursor) ← parseString cursor
   let cursor ← expectLiteral cursor ","
   let (targetTool, cursor) ← parseStringField cursor "target_tool"
+  let cursor ← expectLiteral cursor ","
+  let (targetScope, cursor) ← parseScopeField cursor "target_scope"
   let cursor ← expectLiteral cursor ","
   let (denyTarget, cursor) ← parseBoolField cursor "deny_target"
   let cursor ← expectLiteral cursor ","
@@ -242,6 +281,7 @@ def parseRuleSpec (cursor : Cursor) : Except String (RuleSpec × Cursor) := do
   if schema != specSchema then throw "unsupported project rule spec"
   let spec : RuleSpec := {
     targetTool := targetTool
+    targetScope := targetScope
     denyTarget := denyTarget
     maxInputBytes := maxInputBytes
     maxAgentDepth := maxAgentDepth
@@ -259,12 +299,16 @@ def parsePreSignal (cursor : Cursor) : Except String (PreSignal × Cursor) := do
   let (agentDepth, cursor) ← parseNatField cursor "agent_depth"
   let cursor ← expectLiteral cursor ","
   let (authoritative, cursor) ← parseBoolField cursor "authoritative"
+  let cursor ← expectLiteral cursor ","
+  let (fileTargetState, cursor) ←
+    parseFileTargetStateField cursor "file_target_state"
   let cursor ← expectLiteral cursor "}"
   let signal : PreSignal := {
     tool := tool
     inputBytes := inputBytes
     agentDepth := agentDepth
     authoritative := authoritative
+    fileTargetState := fileTargetState
   }
   pure (signal, cursor)
 

@@ -32,6 +32,18 @@ pub const Outcome = enum {
 pub const FormalPhase = enum { pre, post };
 pub const FormalResult = enum { admit, block, fault };
 
+/// Host-observed state of an operation's file target immediately before the
+/// formal gate.  It is carried in the dispatch journal so a later replay can
+/// reconstruct why the fixed kernel admitted or blocked without storing the
+/// plaintext path.
+pub const FileTargetState = enum {
+    unobserved,
+    missing,
+    regular_existing,
+    other_existing,
+    unavailable,
+};
+
 pub const FormalCandidateDecision = struct {
     result: FormalResult,
     candidate_id: [64]u8,
@@ -136,6 +148,7 @@ pub const Event = union(enum) {
         schema_version: []const u8 = FORMAL_SCHEMA_VERSION,
         dispatch_id: []const u8,
         phase: FormalPhase,
+        file_target_state: FileTargetState = .unobserved,
         result: FormalResult,
         candidate_id: [64]u8,
         project_sha256: [64]u8,
@@ -159,6 +172,7 @@ pub const Event = union(enum) {
         schema_version: []const u8 = FORMAL_BATCH_SCHEMA_VERSION,
         dispatch_id: []const u8,
         phase: FormalPhase,
+        file_target_state: FileTargetState = .unobserved,
         project_sha256: [64]u8,
         bundle_sha256: [64]u8,
         bundle_revision: u64,
@@ -179,6 +193,7 @@ pub const Event = union(enum) {
         agent_depth: u8,
         input_bytes: usize,
         input_sha256: [64]u8,
+        file_target_state: FileTargetState = .unobserved,
     },
     dispatch_finished: struct {
         schema_version: []const u8 = SCHEMA_VERSION,

@@ -65,7 +65,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // 自动建父目录（对齐 TS：Write 到不存在的目录会先 mkdir -p）。
     try mkdirParents(path);
 
-    const fd = pfs.openZ(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o666) catch return error.WriteError;
+    const write_flags: pfs.O = if (ctx.project_write_exclusive_create)
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .EXCL = true }
+    else
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
+    const fd = pfs.openZ(path, write_flags, 0o666) catch return error.WriteError;
     defer _ = pfs.close(fd);
 
     var pos: usize = 0;

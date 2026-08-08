@@ -16,8 +16,8 @@ const build_bundle = @import("rule_build_bundle.zig");
 const spec_mod = @import("project_rule_spec.zig");
 const kernel = @import("../formal/project_harness_runtime.zig");
 
-pub const BUNDLE_SCHEMA = "metacodes-project-rule-bundle-v1";
-pub const ACTIVE_SCHEMA = "metacodes-project-rule-active-v1";
+pub const BUNDLE_SCHEMA = "metacodes-project-rule-bundle-v2";
+pub const ACTIVE_SCHEMA = "metacodes-project-rule-active-v2";
 pub const BUNDLE_PREFIX = "project-rule-bundle-";
 pub const REQUEST_PREFIX = "project-rule-promotion-request-";
 pub const VERDICT_PREFIX = "project-rule-promotion-verdict-";

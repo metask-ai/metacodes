@@ -20,6 +20,7 @@ const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
 const pfs = platform.fs;
 const project_gate_protocol = @import("../tools/project_rule_gate.zig");
+const project_rule_signal = @import("../tools/project_rule_signal.zig");
 
 /// 给任意 allocator 加互斥视图。ArenaAllocator 只隔离自己的链表元数据，它增长时仍会
 /// 调后备 allocator；多个 worker 直接以同一个 session arena 为后备会破坏 arena 状态。
@@ -142,6 +143,7 @@ fn emitDispatchStarted(
     requested_name: []const u8,
     dispatched_name: []const u8,
     input: []const u8,
+    file_target_state: tool_observation.FileTargetState,
 ) bool {
     const sink = ctx.tool_observer orelse return true;
     return sink.emit(.{ .dispatch_started = .{
@@ -152,6 +154,7 @@ fn emitDispatchStarted(
         .agent_depth = ctx.agent_depth,
         .input_bytes = input.len,
         .input_sha256 = tool_observation.sha256Hex(input),
+        .file_target_state = file_target_state,
     } });
 }
 
@@ -200,9 +203,17 @@ const DispatchObservation = struct {
     started: bool = false,
     terminal_attempted: bool = false,
     input_bytes: usize = 0,
+    file_target_state: @import("project_rule_spec.zig").FileTargetState = .unobserved,
 
     fn start(self: *DispatchObservation, input: []const u8) bool {
-        if (!emitDispatchStarted(self.ctx, self.id, self.requested_name, self.dispatched_name, input)) return false;
+        if (!emitDispatchStarted(
+            self.ctx,
+            self.id,
+            self.requested_name,
+            self.dispatched_name,
+            input,
+            self.file_target_state,
+        )) return false;
         self.input_bytes = input.len;
         self.started = true;
         return true;
@@ -228,6 +239,7 @@ const DispatchObservation = struct {
                 .input_bytes = self.input_bytes,
                 .agent_depth = self.ctx.agent_depth,
                 .authoritative = self.ctx.tool_observation_origin == .authoritative,
+                .file_target_state = self.file_target_state,
             },
             .outcome = outcome,
             .effect = self.effect_slot.effect,
@@ -459,15 +471,27 @@ pub fn executeOne(
             } };
         }
     }
+    // Observe once for both signal-only and formally governed Runs.  If this
+    // were conditional on an active rule, the treatment arm would receive a
+    // different sensor and the causal experiment could not separate sensing
+    // from actuation.
+    var project_pre_signal: ?project_gate_protocol.PreSignal = null;
+    if (job_ctx.project_rule_gate != null or job_ctx.tool_observer != null) {
+        project_pre_signal = project_rule_signal.observePre(
+            &job_ctx,
+            id,
+            dispatched_name,
+            input,
+        );
+        dispatch_observation.file_target_state = project_pre_signal.?.file_target_state;
+    }
     if (job_ctx.project_rule_gate) |gate| {
-        switch (gate.pre(.{
-            .dispatch_id = id,
-            .tool = dispatched_name,
-            .input_bytes = input.len,
-            .agent_depth = job_ctx.agent_depth,
-            .authoritative = job_ctx.tool_observation_origin == .authoritative,
-        })) {
-            .admit => {},
+        switch (gate.pre(project_pre_signal.?)) {
+            .admit => {
+                if (std.mem.eql(u8, dispatched_name, "Write") and
+                    project_pre_signal.?.file_target_state == .missing)
+                    job_ctx.project_write_exclusive_create = true;
+            },
             .block => {
                 const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
                 const denied = @import("tool_error.zig").errorToJson(

@@ -8,8 +8,9 @@
 //! JSON with this host-owned representation byte-for-byte.
 
 const std = @import("std");
+const observation = @import("../tools/observation.zig");
 
-pub const SCHEMA_VERSION = "metacodes-project-rule-spec-v1";
+pub const SCHEMA_VERSION = "metacodes-project-rule-spec-v2";
 pub const MAX_TOOL_NAME_BYTES: usize = 128;
 pub const MAX_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_AGENT_DEPTH: u8 = 16;
@@ -19,8 +20,25 @@ pub const EffectRequirement = enum {
     file_mutation_v1_reobserved,
 };
 
+/// Selects which concrete host state makes a rule applicable.  This remains a
+/// closed enum rather than a candidate-provided predicate: the fixed kernel,
+/// not untrusted Lean source, owns the production decision function.
+pub const TargetScope = enum {
+    all,
+    existing_file,
+};
+
+/// Pre-dispatch filesystem state observed by the native host.  `unobserved`
+/// is valid for tools that do not expose a file target; it is never accepted
+/// as evidence that a Write target is new.  `other_existing` includes
+/// directories and symlinks/reparse points.  Ambiguous errors are
+/// `unavailable`, so an existing-file rule fails closed rather than silently
+/// treating them as a safe create.
+pub const FileTargetState = observation.FileTargetState;
+
 pub const Spec = struct {
     target_tool: []const u8,
+    target_scope: TargetScope = .all,
     deny_target: bool,
     max_input_bytes: u64,
     max_agent_depth: u8,
@@ -31,6 +49,7 @@ pub const Spec = struct {
 pub const Wire = struct {
     schema_version: []const u8 = SCHEMA_VERSION,
     target_tool: []const u8,
+    target_scope: TargetScope = .all,
     deny_target: bool,
     max_input_bytes: u64,
     max_agent_depth: u8,
@@ -43,6 +62,7 @@ pub const PreSignal = struct {
     input_bytes: usize,
     agent_depth: u8,
     authoritative: bool,
+    file_target_state: FileTargetState = .unobserved,
 };
 
 pub const PostSignal = struct {
@@ -55,6 +75,9 @@ pub const PostSignal = struct {
 
 pub fn validate(spec: Spec) !void {
     if (!validToolName(spec.target_tool)) return error.InvalidTargetTool;
+    if (spec.target_scope == .existing_file and
+        !std.mem.eql(u8, spec.target_tool, "Write"))
+        return error.InvalidTargetScope;
     if (spec.max_input_bytes == 0 or spec.max_input_bytes > MAX_INPUT_BYTES)
         return error.InvalidInputBound;
     if (spec.max_agent_depth > MAX_AGENT_DEPTH) return error.InvalidDepthBound;
@@ -65,6 +88,7 @@ pub fn validate(spec: Spec) !void {
 pub fn toWire(spec: Spec) Wire {
     return .{
         .target_tool = spec.target_tool,
+        .target_scope = spec.target_scope,
         .deny_target = spec.deny_target,
         .max_input_bytes = spec.max_input_bytes,
         .max_agent_depth = spec.max_agent_depth,
@@ -78,6 +102,7 @@ pub fn fromWire(wire: Wire) !Spec {
         return error.UnsupportedRuleSpec;
     const spec = Spec{
         .target_tool = wire.target_tool,
+        .target_scope = wire.target_scope,
         .deny_target = wire.deny_target,
         .max_input_bytes = wire.max_input_bytes,
         .max_agent_depth = wire.max_agent_depth,
@@ -95,6 +120,17 @@ pub fn renderCanonical(allocator: std.mem.Allocator, spec: Spec) ![]u8 {
 
 pub fn preDecision(spec: Spec, signal: PreSignal) bool {
     if (!std.mem.eql(u8, signal.tool, spec.target_tool)) return true;
+    switch (spec.target_scope) {
+        .all => {},
+        .existing_file => switch (signal.file_target_state) {
+            // A missing target is outside this rule's scope.  Every state that
+            // fails to prove a regular existing file is conservative except
+            // the explicit, host-observed missing state.
+            .missing => return true,
+            .regular_existing => {},
+            .unobserved, .other_existing, .unavailable => return false,
+        },
+    }
     if (spec.deny_target) return false;
     if (signal.input_bytes > spec.max_input_bytes or
         signal.agent_depth > spec.max_agent_depth) return false;
@@ -165,6 +201,48 @@ test "project rule spec denies target and requires grounded post effects" {
         .effect_valid = true,
         .has_file_mutation_v1 = true,
         .post_reobserved = true,
+    }));
+}
+
+test "existing-file scope blocks regular Write but admits a proven new file" {
+    const spec = Spec{
+        .target_tool = "Write",
+        .target_scope = .existing_file,
+        .deny_target = true,
+        .max_input_bytes = 8192,
+        .max_agent_depth = 4,
+        .authoritative_only = true,
+        .effect_requirement = .none,
+    };
+    try validate(spec);
+    const base = PreSignal{
+        .tool = "Write",
+        .input_bytes = 128,
+        .agent_depth = 0,
+        .authoritative = true,
+    };
+    var signal = base;
+    signal.file_target_state = .regular_existing;
+    try std.testing.expect(!preDecision(spec, signal));
+    signal.file_target_state = .missing;
+    try std.testing.expect(preDecision(spec, signal));
+    signal.file_target_state = .other_existing;
+    try std.testing.expect(!preDecision(spec, signal));
+    signal.file_target_state = .unavailable;
+    try std.testing.expect(!preDecision(spec, signal));
+    signal.file_target_state = .unobserved;
+    try std.testing.expect(!preDecision(spec, signal));
+}
+
+test "existing-file scope is only valid for Write" {
+    try std.testing.expectError(error.InvalidTargetScope, validate(.{
+        .target_tool = "Edit",
+        .target_scope = .existing_file,
+        .deny_target = true,
+        .max_input_bytes = 8192,
+        .max_agent_depth = 4,
+        .authoritative_only = true,
+        .effect_requirement = .none,
     }));
 }
 

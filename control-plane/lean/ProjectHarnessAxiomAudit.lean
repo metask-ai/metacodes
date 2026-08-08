@@ -2,5 +2,6 @@ import MetaCodesControl.ProjectHarness
 
 #print axioms MetaCodesControl.ProjectHarness.safePromotion_sound
 #print axioms MetaCodesControl.ProjectHarness.correction_promotion_requires_receipt
-#print axioms MetaCodesControl.ProjectHarness.denied_predecision_blocks
+#print axioms MetaCodesControl.ProjectHarness.denied_all_predecision_blocks
+#print axioms MetaCodesControl.ProjectHarness.denied_existing_file_predecision_blocks
 #print axioms MetaCodesControl.ProjectHarness.decideBatch_sound

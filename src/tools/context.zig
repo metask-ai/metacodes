@@ -423,6 +423,10 @@ pub const ToolContext = struct {
     project_rule_gate: ?ProjectRuleGate = null,
     tool_observation_origin: ToolObservationOrigin = .authoritative,
     effect_slot: ?*@import("observation.zig").EffectSlot = null,
+    /// executeOne sets this only after a formal gate admits a Write whose
+    /// target was observed missing.  Write then uses O_EXCL so a file created
+    /// in the observation-to-open window is not silently truncated.
+    project_write_exclusive_create: bool = false,
 
     /// **U6 A2:工具→父 backend 通知通路**。Task 生 subagent → emit agent_lifecycle;
     /// TaskUpdate 改 DAG → emit tasks_changed。agent_loop(depth==0)注入,转发到 backend.emitEvent

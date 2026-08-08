@@ -26,7 +26,7 @@ from typing import Any, Sequence
 
 
 CANDIDATE_SCHEMA = "metacodes-rule-candidate-v3"
-SPEC_SCHEMA = "metacodes-project-rule-spec-v1"
+SPEC_SCHEMA = "metacodes-project-rule-spec-v2"
 MANIFEST_SCHEMA = "metacodes-project-rule-build-v1"
 MAX_CANDIDATE_BYTES = 128 * 1024
 MAX_SOURCE_BYTES = 32 * 1024
@@ -203,6 +203,7 @@ def validate_candidate(raw: bytes, expected_id: str | None) -> tuple[dict[str, A
     expected_keys = {
         "schema_version",
         "target_tool",
+        "target_scope",
         "deny_target",
         "max_input_bytes",
         "max_agent_depth",
@@ -218,6 +219,11 @@ def validate_candidate(raw: bytes, expected_id: str | None) -> tuple[dict[str, A
         or len(target_tool.encode("ascii")) > 128
     ):
         raise BuildError("candidate target tool syntax is invalid")
+    target_scope = spec["target_scope"]
+    if target_scope not in {"all", "existing_file"}:
+        raise BuildError("candidate target scope is invalid")
+    if target_scope == "existing_file" and target_tool != "Write":
+        raise BuildError("existing_file target scope requires Write")
     for name in ("deny_target", "authoritative_only"):
         if type(spec[name]) is not bool:
             raise BuildError(f"candidate {name} must be boolean")

@@ -29,6 +29,37 @@ const GovernedGateProbe = struct {
     }
 };
 
+const CreateRaceGate = struct {
+    path: [:0]const u8,
+    pre_calls: usize = 0,
+    post_calls: usize = 0,
+
+    fn pre(raw: *anyopaque, signal: cc.project_rule_gate_protocol.PreSignal) cc.project_rule_gate_protocol.Result {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.pre_calls += 1;
+        if (signal.file_target_state != .missing) return .fault;
+        const fd = pfs.open(
+            self.path.ptr,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true },
+            0o600,
+        );
+        if (fd < 0) return .fault;
+        defer pfs.close(fd);
+        if (pfs.write(fd, "racer") != 5) return .fault;
+        return .admit;
+    }
+
+    fn post(raw: *anyopaque, signal: cc.project_rule_gate_protocol.PostSignal) cc.project_rule_gate_protocol.Result {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.post_calls += 1;
+        return if (signal.outcome == .tool_error) .admit else .fault;
+    }
+
+    fn gate(self: *@This()) cc.project_rule_gate_protocol.Gate {
+        return .{ .ctx = @ptrCast(self), .preFn = pre, .postFn = post };
+    }
+};
+
 fn parseHex(value: []const u8) ?[64]u8 {
     if (value.len != 64) return null;
     var result: [64]u8 = undefined;
@@ -47,6 +78,50 @@ fn testKernel() ?cc.project_harness_runtime.Config {
     const hash = parseHex(std.mem.span(hash_raw)) orelse return null;
     if (!std.fs.path.isAbsolute(path)) return null;
     return .{ .checker_path = path, .expected_sha256 = hash };
+}
+
+test "L2 admitted new-file Write cannot truncate a target created after observation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/raced.txt",
+        .{root_buffer[0..root_len]},
+        0,
+    );
+    defer allocator.free(path);
+    const args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"agent\"}}",
+        .{path},
+    );
+    defer allocator.free(args);
+    var race = CreateRaceGate{ .path = path };
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.project_rule_gate = race.gate();
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        args,
+        "write-race",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    const bytes = try readArtifact(allocator, path);
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("racer", bytes);
+    try std.testing.expectEqual(@as(usize, 1), race.pre_calls);
+    try std.testing.expectEqual(@as(usize, 1), race.post_calls);
 }
 
 const Probe = struct {
@@ -666,6 +741,18 @@ fn promoteFixture(
                 .input_bytes = negative_bytes,
                 .agent_depth = 0,
                 .authoritative = true,
+                .file_target_state = .regular_existing,
+            } },
+        },
+        .{
+            .case_id = "target-proven-missing",
+            .expected_admit = spec.target_scope == .existing_file or !spec.deny_target,
+            .signal = .{ .pre = .{
+                .tool = spec.target_tool,
+                .input_bytes = 2,
+                .agent_depth = 0,
+                .authoritative = true,
+                .file_target_state = .missing,
             } },
         },
     };
@@ -713,6 +800,190 @@ fn promoteFixture(
         .trusted_build_files = build.trusted,
         .config = config,
     });
+}
+
+test "L2 evolved existing-file rule blocks overwrite, permits creation, and leaves Edit recovery" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
+    defer allocator.free(evidence_dir);
+    const rules_dir = try std.fmt.allocPrint(allocator, "{s}/project-rules", .{root});
+    defer allocator.free(rules_dir);
+    const project = cc.project_rule_bundle.projectIdentity(root);
+    _ = try promoteFixture(
+        allocator,
+        evidence_dir,
+        rules_dir,
+        project,
+        config,
+        .{
+            .target_tool = "Write",
+            .target_scope = .existing_file,
+            .deny_target = true,
+            .max_input_bytes = 8192,
+            .max_agent_depth = 4,
+            .authoritative_only = true,
+            .effect_requirement = .none,
+        },
+        "def spec : RuleSpec := { targetTool := \"Write\", targetScope := .existingFile, denyTarget := true, maxInputBytes := 8192, maxAgentDepth := 4, authoritativeOnly := true, effectRequirement := .none }; theorem spec_valid : valid spec = true := by rfl",
+    );
+    var active = (try cc.project_rule_bundle.loadVerifiedActive(
+        allocator,
+        rules_dir,
+        project,
+        config,
+        null,
+    )) orelse return error.MissingActiveBundle;
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+    };
+    const runtime_sid = cc.session_id.SessionId.fromSlice("fedcba9876543210fedcba98").?;
+    var journal = try cc.tool_observation_journal.Journal.init(evidence_dir, runtime_sid);
+    const sink = journal.sink();
+    runtime.evidence_dir = evidence_dir;
+    runtime.observation_sink = sink;
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.project_rule_gate = runtime.protocolGate();
+    ctx.tool_observer = sink;
+
+    const existing_path = try std.fmt.allocPrint(allocator, "{s}/existing.txt", .{root});
+    defer allocator.free(existing_path);
+    try overwriteArtifact(allocator, existing_path, "old");
+    const overwrite_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"destroyed\"}}",
+        .{existing_path},
+    );
+    defer allocator.free(overwrite_args);
+    const blocked = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        overwrite_args,
+        "existing-write",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (blocked) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                done.content orelse return error.MissingToolError,
+                "project_rule_blocked",
+            ) != null);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    const preserved = try readArtifact(allocator, existing_path);
+    defer allocator.free(preserved);
+    try std.testing.expectEqualStrings("old", preserved);
+
+    const edit_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"old_string\":\"old\",\"new_string\":\"new\"}}",
+        .{existing_path},
+    );
+    defer allocator.free(edit_args);
+    const recovered = try cc.tool_exec.executeOne(
+        &ctx,
+        "Edit",
+        edit_args,
+        "existing-edit-recovery",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (recovered) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(!done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+
+    const new_path = try std.fmt.allocPrintSentinel(allocator, "{s}/created.txt", .{root}, 0);
+    defer allocator.free(new_path);
+    const create_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"created\"}}",
+        .{new_path},
+    );
+    defer allocator.free(create_args);
+    const created = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        create_args,
+        "new-write",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (created) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(!done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    try std.testing.expect(pfs.exists(new_path.ptr));
+
+    const directory_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"must-not-run\"}}",
+        .{root},
+    );
+    defer allocator.free(directory_args);
+    const directory_block = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        directory_args,
+        "directory-write",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (directory_block) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+
+    try journal.finishRun("end_turn");
+    const binding = try journal.runBinding();
+    journal.deinit();
+    var observed = try cc.tool_observation_journal.loadRunDispatches(
+        allocator,
+        evidence_dir,
+        binding,
+    );
+    defer observed.deinit();
+    // Only the Edit recovery and the new-file Write reached the dispatcher.
+    try std.testing.expectEqual(@as(usize, 2), observed.dispatches.len);
+    try std.testing.expectEqual(@as(usize, 6), observed.formal_decisions.len);
+    var blocked_regular: usize = 0;
+    var admitted_missing: usize = 0;
+    var blocked_other: usize = 0;
+    for (observed.formal_decisions) |decision| {
+        if (decision.phase != .pre) continue;
+        if (decision.file_target_state == .regular_existing and decision.result == .block)
+            blocked_regular += 1;
+        if (decision.file_target_state == .missing and decision.result == .admit)
+            admitted_missing += 1;
+        if (decision.file_target_state == .other_existing and decision.result == .block)
+            blocked_other += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), blocked_regular);
+    try std.testing.expectEqual(@as(usize, 1), admitted_missing);
+    try std.testing.expectEqual(@as(usize, 1), blocked_other);
 }
 
 test "L2 active project rules fail closed before dispatch on artifact or kernel drift" {
@@ -1200,7 +1471,7 @@ test "L2 malformed Lean batch verdict fails before the real dispatcher" {
     defer allocator.free(checker_path);
     const checker_script =
         "#!/bin/sh\n" ++
-        "printf '%s\\n' '{\"schema_version\":\"metacodes-project-harness-batch-verdict-v1\",\"checker_version\":\"metacodes-project-harness-kernel-v1\",\"verdicts\":[]}'\n";
+        "printf '%s\\n' '{\"schema_version\":\"metacodes-project-harness-batch-verdict-v2\",\"checker_version\":\"metacodes-project-harness-kernel-v2\",\"verdicts\":[]}'\n";
     try overwriteArtifact(allocator, checker_path, checker_script);
     const checker_z = try allocator.dupeZ(u8, checker_path);
     defer allocator.free(checker_z);

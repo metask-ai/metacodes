@@ -14,10 +14,10 @@ const spec_mod = @import("project_rule_spec.zig");
 const journal_mod = @import("tool_observation_journal.zig");
 const kernel = @import("../formal/project_harness_runtime.zig");
 
-pub const REPLAY_CORPUS_SCHEMA = "metacodes-project-rule-replay-corpus-v1";
-pub const REPLAY_RESULT_SCHEMA = "metacodes-project-rule-replay-result-v1";
-pub const SHADOW_TRACE_SCHEMA = "metacodes-project-rule-shadow-trace-v1";
-pub const SHADOW_RESULT_SCHEMA = "metacodes-project-rule-shadow-result-v1";
+pub const REPLAY_CORPUS_SCHEMA = "metacodes-project-rule-replay-corpus-v2";
+pub const REPLAY_RESULT_SCHEMA = "metacodes-project-rule-replay-result-v2";
+pub const SHADOW_TRACE_SCHEMA = "metacodes-project-rule-shadow-trace-v2";
+pub const SHADOW_RESULT_SCHEMA = "metacodes-project-rule-shadow-result-v2";
 /// Project rules begin deliberately narrow.  Keeping one reviewed evaluation
 /// set bounded also limits promotion-time native checker invocations until the
 /// protocol grows a machine-checked batch operation.
@@ -688,7 +688,8 @@ fn preMatches(dispatch: journal_mod.RunDispatch, signal: spec_mod.PreSignal) boo
     return std.mem.eql(u8, dispatch.dispatched_name, signal.tool) and
         dispatch.input_bytes == signal.input_bytes and
         dispatch.agent_depth == signal.agent_depth and
-        (dispatch.origin == .authoritative) == signal.authoritative;
+        (dispatch.origin == .authoritative) == signal.authoritative and
+        dispatch.file_target_state == signal.file_target_state;
 }
 
 fn postMatches(dispatch: journal_mod.RunDispatch, signal: spec_mod.PostSignal) bool {

@@ -19,6 +19,7 @@ const Capture = struct {
     effect_valid: bool = false,
     input_bytes: usize = 0,
     input_sha256: [64]u8 = [_]u8{'0'} ** 64,
+    file_target_state: observation.FileTargetState = .unobserved,
     result_present: bool = false,
     result_bytes: usize = 0,
     names_are_write: bool = false,
@@ -40,6 +41,7 @@ const Capture = struct {
                 self.origin = started.origin;
                 self.input_bytes = started.input_bytes;
                 self.input_sha256 = started.input_sha256;
+                self.file_target_state = started.file_target_state;
                 self.names_are_write = std.mem.eql(u8, started.requested_name, "Write") and
                     std.mem.eql(u8, started.dispatched_name, "Write");
                 self.schema_is_v1 = std.mem.eql(u8, started.schema_version, observation.SCHEMA_VERSION);
@@ -198,6 +200,7 @@ test "L2 actual tool observation is independent of UI projection and depth" {
     try std.testing.expect(capture.effect_valid);
     try std.testing.expectEqual(arguments.len, capture.input_bytes);
     try std.testing.expectEqualSlices(u8, &observation.sha256Hex(arguments), &capture.input_sha256);
+    try std.testing.expectEqual(observation.FileTargetState.missing, capture.file_target_state);
     try std.testing.expect(capture.result_present);
     try std.testing.expect(capture.result_bytes > 0);
     try std.testing.expect(capture.names_are_write);
@@ -220,6 +223,10 @@ test "L2 actual tool observation is independent of UI projection and depth" {
     try std.testing.expect(std.mem.indexOf(u8, artifact, "dispatch_started") != null);
     try std.testing.expect(std.mem.indexOf(u8, artifact, "dispatch_finished") != null);
     try std.testing.expect(std.mem.indexOf(u8, artifact, "file_mutation_v2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, artifact, "\"file_target_state\":\"missing\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, artifact, path) == null);
     try std.testing.expect(std.mem.indexOf(u8, artifact, "l2-grounded") == null);
+    const provider_body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, provider_body, "file_target_state") == null);
+    try std.testing.expect(std.mem.indexOf(u8, provider_body, "project_rule") == null);
 }

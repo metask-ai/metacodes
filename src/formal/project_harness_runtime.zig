@@ -13,11 +13,11 @@ const observation = @import("../tools/observation.zig");
 const spec_mod = @import("../core/project_rule_spec.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
-pub const REQUEST_SCHEMA = "metacodes-project-harness-request-v1";
-pub const VERDICT_SCHEMA = "metacodes-project-harness-verdict-v1";
-pub const BATCH_REQUEST_SCHEMA = "metacodes-project-harness-batch-request-v1";
-pub const BATCH_VERDICT_SCHEMA = "metacodes-project-harness-batch-verdict-v1";
-pub const CHECKER_VERSION = "metacodes-project-harness-kernel-v1";
+pub const REQUEST_SCHEMA = "metacodes-project-harness-request-v2";
+pub const VERDICT_SCHEMA = "metacodes-project-harness-verdict-v2";
+pub const BATCH_REQUEST_SCHEMA = "metacodes-project-harness-batch-request-v2";
+pub const BATCH_VERDICT_SCHEMA = "metacodes-project-harness-batch-verdict-v2";
+pub const CHECKER_VERSION = "metacodes-project-harness-kernel-v2";
 pub const MAX_REQUEST_BYTES: usize = 128 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 pub const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;

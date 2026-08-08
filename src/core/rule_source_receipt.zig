@@ -13,6 +13,7 @@ const observation = @import("../tools/observation.zig");
 const observation_journal = @import("tool_observation_journal.zig");
 const session_id_mod = @import("session_id.zig");
 const util_fs = @import("../util/fs.zig");
+const project_runtime = @import("../formal/project_harness_runtime.zig");
 
 pub const SCHEMA_VERSION = "metacodes-rule-source-receipt-v1";
 pub const FILE_PREFIX = "rule-source-receipt-";
@@ -394,8 +395,8 @@ fn validateBlockedVerdict(
     defer parsed.deinit();
     const legacy = std.mem.eql(u8, parsed.value.schema_version, "metacodes-formal-verdict-v2") and
         std.mem.eql(u8, parsed.value.checker_version, "metacodes-formal-kernel-v2");
-    const project = std.mem.eql(u8, parsed.value.schema_version, "metacodes-project-harness-verdict-v1") and
-        std.mem.eql(u8, parsed.value.checker_version, "metacodes-project-harness-kernel-v1") and
+    const project = std.mem.eql(u8, parsed.value.schema_version, project_runtime.VERDICT_SCHEMA) and
+        std.mem.eql(u8, parsed.value.checker_version, project_runtime.CHECKER_VERSION) and
         (std.mem.eql(u8, parsed.value.operation, "pre_decision") or
             std.mem.eql(u8, parsed.value.operation, "post_decision")) and
         parsed.value.kernel_sha256 != null and
