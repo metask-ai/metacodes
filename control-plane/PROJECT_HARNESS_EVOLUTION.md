@@ -1,8 +1,9 @@
 # Project-specific Harness Evolution
 
-Status: design contract plus grounded and durable observation-plane pilots.
-This document does not claim that automatic Lean rule evolution is already
-implemented.
+Status: design contract plus grounded observation, durable journal, authentic
+source receipt, immutable candidate, and non-authorizing lifecycle-evidence
+pilots. This document does not claim that automatic Lean rule evolution or
+runtime bundle admission is already implemented.
 
 ## Direction
 
@@ -178,6 +179,23 @@ Implemented as a proposal-only third pilot:
 - candidate Lean source is bounded and persisted as untrusted input only;
 - this API cannot build, promote, load, grant permission, or change prompts.
 
+Implemented as a non-authorizing fourth pilot:
+
+- `user_correction` requires a host-issued, content-addressed receipt grounded
+  in an exact durable user transcript line; a source label alone is rejected;
+- `runtime_counterexample` requires a completed observation interval and a
+  blocked formal verdict receipt;
+- build, axiom-audit, replay, shadow, rejection, promotion, and supersession
+  evidence have immutable typed receipt schemas and exact predecessor links;
+- a per-candidate cross-process lease plus durable head rejects concurrent or
+  stale branches; a crash after receipt publication leaves the lease fail
+  closed for explicit audit rather than silently advancing another branch;
+- build/audit/replay/shadow evidence enforces bounded isolation, independent
+  actors, positive and negative replay cases, and side-effect-free shadowing;
+- the public proposal-side API cannot create `promoted` or `superseded`
+  receipts. Those transitions remain reserved for the independent Lean
+  admission path and therefore still have no runtime authority.
+
 Not yet implemented:
 
 - a hash-chain/receipt binding the observation journal to transcript and
@@ -187,9 +205,10 @@ Not yet implemented:
   exceeds a synchronous Run;
 - authoritative adoption/discard disposition for a speculative prefetch after
   the completed model turn is known;
-- host-issued correction and formal-verdict source receipts;
-- build/axiom/replay/shadow/promotion receipt artifacts for RuleCandidate;
+- persisted build logs, compiled artifacts, axiom outputs, replay corpora, and
+  shadow traces behind the hashes carried by lifecycle receipts;
 - isolated candidate Lean compilation, replay, shadow, and promotion;
+- independent Lean creation of promotion/supersession receipts;
 - a project bundle loader or runtime verdict gate;
 - TinyKG atomic MemoryMigration commit/rollback integration.
 
