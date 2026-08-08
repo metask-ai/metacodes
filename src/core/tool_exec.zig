@@ -19,6 +19,7 @@ const tool_observation = @import("../tools/observation.zig");
 const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
 const pfs = platform.fs;
+const project_gate_protocol = @import("../tools/project_rule_gate.zig");
 
 /// 给任意 allocator 加互斥视图。ArenaAllocator 只隔离自己的链表元数据，它增长时仍会
 /// 调后备 allocator；多个 worker 直接以同一个 session arena 为后备会破坏 arena 状态。
@@ -198,9 +199,11 @@ const DispatchObservation = struct {
     effect_slot: *tool_observation.EffectSlot,
     started: bool = false,
     terminal_attempted: bool = false,
+    input_bytes: usize = 0,
 
     fn start(self: *DispatchObservation, input: []const u8) bool {
         if (!emitDispatchStarted(self.ctx, self.id, self.requested_name, self.dispatched_name, input)) return false;
+        self.input_bytes = input.len;
         self.started = true;
         return true;
     }
@@ -218,7 +221,24 @@ const DispatchObservation = struct {
         self.terminal_attempted = true;
         reobserveFileEffect(self.effect_slot);
         const elapsed: u64 = @intCast(@max(util_time.nowMs() - self.started_at_ms, 0));
-        return emitDispatchFinished(
+        const formal = if (self.ctx.project_rule_gate) |gate| gate.post(.{
+            .pre = .{
+                .dispatch_id = self.id,
+                .tool = self.dispatched_name,
+                .input_bytes = self.input_bytes,
+                .agent_depth = self.ctx.agent_depth,
+                .authoritative = self.ctx.tool_observation_origin == .authoritative,
+            },
+            .outcome = outcome,
+            .effect = self.effect_slot.effect,
+            .effect_valid = self.effect_slot.valid,
+        }) else project_gate_protocol.Result.admit;
+        // Formal admission precedes terminal acceptance, but the already-real
+        // outcome must still be durably recorded even when the gate blocks or
+        // faults.  This ordering prevents an observation sink from treating a
+        // side effect as accepted before the fixed kernel has judged it while
+        // preserving the evidence needed for recovery and a future candidate.
+        const observed = emitDispatchFinished(
             self.ctx,
             self.id,
             self.requested_name,
@@ -229,6 +249,7 @@ const DispatchObservation = struct {
             result,
             self.effect_slot.*,
         );
+        return observed and formal == .admit;
     }
 
     fn ensureTerminal(self: *DispatchObservation) void {
@@ -350,6 +371,7 @@ const ObservationCapture = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         switch (event) {
+            .formal_decision => return true,
             .dispatch_started => |started| {
                 self.starts += 1;
                 self.depth = started.agent_depth;
@@ -435,6 +457,35 @@ pub fn executeOne(
                 .is_error = true,
                 .elapsed_ms = elapsed,
             } };
+        }
+    }
+    if (job_ctx.project_rule_gate) |gate| {
+        switch (gate.pre(.{
+            .dispatch_id = id,
+            .tool = dispatched_name,
+            .input_bytes = input.len,
+            .agent_depth = job_ctx.agent_depth,
+            .authoritative = job_ctx.tool_observation_origin == .authoritative,
+        })) {
+            .admit => {},
+            .block => {
+                const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
+                const denied = @import("tool_error.zig").errorToJson(
+                    "ProjectRuleBlocked",
+                    "Project formal rule blocked tool '{s}' before dispatch",
+                    .{dispatched_name},
+                    parent_allocator,
+                ) catch return error.OutOfMemory;
+                return .{ .done = .{
+                    .content = denied,
+                    .is_error = true,
+                    .elapsed_ms = elapsed,
+                } };
+            },
+            .fault => {
+                log.warnId("agent", rid, "project formal gate failed closed before dispatch name={s} id={s}", .{ name, id });
+                return .host_fatal;
+            },
         }
     }
     if (!dispatch_observation.start(input)) {
@@ -1413,6 +1464,98 @@ test "tool observation: finish rejection poisons dispatch after preserving actua
     try std.testing.expectEqual(@as(usize, 1), capture.finishes);
     try std.testing.expect(capture.outcome == .succeeded);
     try std.testing.expect(capture.effect_valid);
+    try std.testing.expect(capture.effect != null);
+    try std.testing.expect(platform.fs.exists(path.ptr));
+}
+
+test "project post gate runs before terminal observation and block preserves actual effect" {
+    const GateProbe = struct {
+        post_called: bool = false,
+        saw_matched_reobservation: bool = false,
+
+        fn pre(_: *anyopaque, _: project_gate_protocol.PreSignal) project_gate_protocol.Result {
+            return .admit;
+        }
+
+        fn post(raw: *anyopaque, signal: project_gate_protocol.PostSignal) project_gate_protocol.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.post_called = true;
+            self.saw_matched_reobservation = switch (signal.effect orelse return .block) {
+                .file_mutation_v1 => false,
+                .file_mutation_v2 => |value| value.reobservation.state == .matched,
+            };
+            return .block;
+        }
+
+        fn gate(self: *@This()) project_gate_protocol.Gate {
+            return .{ .ctx = @ptrCast(self), .preFn = pre, .postFn = post };
+        }
+    };
+    const TerminalCapture = struct {
+        gate_probe: *const GateProbe,
+        starts: usize = 0,
+        finishes: usize = 0,
+        finish_saw_post: bool = false,
+        effect: ?tool_observation.Effect = null,
+
+        fn emit(raw: *anyopaque, event: tool_observation.Event) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            switch (event) {
+                .formal_decision => {},
+                .dispatch_started => self.starts += 1,
+                .dispatch_finished => |finished| {
+                    self.finishes += 1;
+                    self.finish_saw_post = self.gate_probe.post_called;
+                    self.effect = finished.effect;
+                },
+            }
+            return true;
+        }
+
+        fn sink(self: *@This()) tools_mod.ToolObservationSink {
+            return .{ .ctx = @ptrCast(self), .emitFn = emit };
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/post-blocked.txt",
+        .{root_buffer[0..root_len]},
+        0,
+    );
+    defer allocator.free(path);
+    const args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"effect-happened\"}}",
+        .{path},
+    );
+    defer allocator.free(args);
+
+    var gate_probe = GateProbe{};
+    var capture = TerminalCapture{ .gate_probe = &gate_probe };
+    var ctx = tools_mod.ToolContext.simple(allocator);
+    ctx.project_rule_gate = gate_probe.gate();
+    ctx.tool_observer = capture.sink();
+    const result = try executeOne(
+        &ctx,
+        "Write",
+        args,
+        "post-blocked",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+
+    try std.testing.expect(result == .host_fatal);
+    try std.testing.expect(gate_probe.post_called);
+    try std.testing.expect(gate_probe.saw_matched_reobservation);
+    try std.testing.expectEqual(@as(usize, 1), capture.starts);
+    try std.testing.expectEqual(@as(usize, 1), capture.finishes);
+    try std.testing.expect(capture.finish_saw_post);
     try std.testing.expect(capture.effect != null);
     try std.testing.expect(platform.fs.exists(path.ptr));
 }

@@ -12,6 +12,7 @@
 const std = @import("std");
 
 pub const SCHEMA_VERSION = "metacodes-tool-observation-v1";
+pub const FORMAL_SCHEMA_VERSION = "metacodes-project-formal-decision-v1";
 
 pub const Origin = enum {
     authoritative,
@@ -26,6 +27,9 @@ pub const Outcome = enum {
     host_rejected,
     host_fatal,
 };
+
+pub const FormalPhase = enum { pre, post };
+pub const FormalResult = enum { admit, block, fault };
 
 pub const BeforeState = enum {
     missing,
@@ -116,6 +120,25 @@ pub const EffectSlot = struct {
 };
 
 pub const Event = union(enum) {
+    formal_decision: struct {
+        // This is an additive journal event with a separate schema. Reusing
+        // the dispatch-v1 label made a new authority-bearing payload look like
+        // an old observation record and obscured forward-compatibility audits.
+        schema_version: []const u8 = FORMAL_SCHEMA_VERSION,
+        dispatch_id: []const u8,
+        phase: FormalPhase,
+        result: FormalResult,
+        candidate_id: [64]u8,
+        project_sha256: [64]u8,
+        bundle_sha256: [64]u8,
+        bundle_revision: u64,
+        kernel_sha256: [64]u8,
+        request_sha256: [64]u8,
+        verdict_sha256: ?[64]u8,
+        checker_failure: ?[]const u8,
+        checker_elapsed_ns: u64,
+        checker_bytes: u64,
+    },
     dispatch_started: struct {
         schema_version: []const u8 = SCHEMA_VERSION,
         id: []const u8,

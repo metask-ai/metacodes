@@ -170,10 +170,23 @@ pub fn persistRuntimeCounterexample(
         !validLowerHex64(input.issuer_sha256) or
         !validLowerHex64(input.checker_sha256))
         return error.InvalidIdentity;
-    try validateBlockedVerdict(input.verdict_payload);
+    const verdict_binding = try validateBlockedVerdict(
+        input.verdict_payload,
+        input.checker_sha256,
+        input.project_sha256,
+    );
     const binding = try observation_journal.validateRunBinding(session_dir, input.observation);
     if (!binding.summary.complete) return error.ObservationJournalIncomplete;
     const verdict_sha256 = observation.sha256Hex(input.verdict_payload);
+    if (!try observation_journal.runContainsBlockedVerdict(
+        std.heap.c_allocator,
+        session_dir,
+        input.observation,
+        input.checker_sha256,
+        verdict_sha256,
+        input.project_sha256,
+        verdict_binding,
+    )) return error.VerdictNotInObservationRun;
     const run = WireRun{
         .session_id = input.observation.session_id.asSlice(),
         .run_id = input.observation.run_id.asSlice(),
@@ -289,12 +302,17 @@ fn persistBody(session_dir: []const u8, body: WireBody) !PersistResult {
         .NOFOLLOW = true,
     }, @as(std.c.mode_t, 0o600));
     if (fd >= 0) {
-        errdefer _ = pfs.close(fd);
-        try pfs.makeCloseOnExec(fd);
-        try writeAll(fd, record_json);
-        try writeAll(fd, "\n");
-        try pfs.fsyncChecked(fd);
-        _ = pfs.close(fd);
+        var write_fd = fd;
+        errdefer {
+            if (write_fd >= 0) _ = pfs.close(write_fd);
+        }
+        try pfs.makeCloseOnExec(write_fd);
+        try writeAll(write_fd, record_json);
+        try writeAll(write_fd, "\n");
+        try pfs.fsyncChecked(write_fd);
+        _ = pfs.close(write_fd);
+        write_fd = -1;
+        try fsyncDirectory(session_dir);
         return .{ .receipt_id = receipt_id, .created = true };
     }
     const existing = try readBounded(std.heap.c_allocator, path[0 .. path.len - 1], MAX_RECORD_BYTES);
@@ -351,11 +369,20 @@ const VerdictProbe = struct {
     checker_version: []const u8,
     request_id: []const u8,
     operation: []const u8,
+    kernel_sha256: ?[]const u8 = null,
+    candidate_id: ?[]const u8 = null,
+    project_sha256: ?[]const u8 = null,
+    bundle_sha256: ?[]const u8 = null,
+    bundle_revision: ?u64 = null,
     decision: []const u8,
     admitted: bool,
 };
 
-fn validateBlockedVerdict(payload: []const u8) !void {
+fn validateBlockedVerdict(
+    payload: []const u8,
+    checker_sha256: [64]u8,
+    project_sha256: [64]u8,
+) !?observation_journal.BlockedVerdictBinding {
     if (payload.len == 0 or payload.len > MAX_VERDICT_BYTES or
         std.mem.indexOfAny(u8, payload, "\r\n") != null)
         return error.InvalidVerdict;
@@ -365,13 +392,35 @@ fn validateBlockedVerdict(payload: []const u8) !void {
         .duplicate_field_behavior = .@"error",
     }) catch return error.InvalidVerdict;
     defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.schema_version, "metacodes-formal-verdict-v2") or
-        !std.mem.eql(u8, parsed.value.checker_version, "metacodes-formal-kernel-v2") or
-        parseLowerHex64(parsed.value.request_id) == null or
+    const legacy = std.mem.eql(u8, parsed.value.schema_version, "metacodes-formal-verdict-v2") and
+        std.mem.eql(u8, parsed.value.checker_version, "metacodes-formal-kernel-v2");
+    const project = std.mem.eql(u8, parsed.value.schema_version, "metacodes-project-harness-verdict-v1") and
+        std.mem.eql(u8, parsed.value.checker_version, "metacodes-project-harness-kernel-v1") and
+        (std.mem.eql(u8, parsed.value.operation, "pre_decision") or
+            std.mem.eql(u8, parsed.value.operation, "post_decision")) and
+        parsed.value.kernel_sha256 != null and
+        std.mem.eql(u8, parsed.value.kernel_sha256.?, &checker_sha256) and
+        parsed.value.candidate_id != null and
+        parsed.value.project_sha256 != null and
+        parsed.value.bundle_sha256 != null and
+        parsed.value.bundle_revision != null and
+        parsed.value.bundle_revision.? > 0;
+    if ((!legacy and !project) or parseLowerHex64(parsed.value.request_id) == null or
         !validText(parsed.value.operation, 128) or
         parsed.value.admitted or
         !std.mem.eql(u8, parsed.value.decision, "block"))
         return error.NotCounterexample;
+    if (!project) return null;
+    const candidate = parseLowerHex64(parsed.value.candidate_id.?) orelse return error.InvalidVerdict;
+    const verdict_project = parseLowerHex64(parsed.value.project_sha256.?) orelse return error.InvalidVerdict;
+    const bundle = parseLowerHex64(parsed.value.bundle_sha256.?) orelse return error.InvalidVerdict;
+    if (!std.mem.eql(u8, &verdict_project, &project_sha256)) return error.ProjectIdentityMismatch;
+    return .{
+        .candidate_id = candidate,
+        .project_sha256 = verdict_project,
+        .bundle_sha256 = bundle,
+        .bundle_revision = parsed.value.bundle_revision.?,
+    };
 }
 
 fn readTranscript(session_dir: []const u8) ![]u8 {
@@ -387,7 +436,7 @@ fn readBounded(allocator: std.mem.Allocator, path: []const u8, max: usize) ![]u8
     if (fd < 0) return error.OpenFailed;
     defer _ = pfs.close(fd);
     const before = pfs.fileInfo(fd) catch return error.StatFailed;
-    if (!before.is_regular or before.size == 0 or before.size > max)
+    if (!before.is_regular or before.link_count != 1 or before.size == 0 or before.size > max)
         return error.InvalidFile;
     const bytes = try allocator.alloc(u8, @intCast(before.size));
     errdefer allocator.free(bytes);
@@ -398,7 +447,8 @@ fn readBounded(allocator: std.mem.Allocator, path: []const u8, max: usize) ![]u8
         offset += @intCast(count);
     }
     const after = pfs.fileInfo(fd) catch return error.StatFailed;
-    if (!after.is_regular or after.size != before.size) return error.ChangedDuringRead;
+    if (!after.is_regular or after.link_count != 1 or after.size != before.size)
+        return error.ChangedDuringRead;
     return bytes;
 }
 
@@ -429,6 +479,16 @@ fn writeAll(fd: pfs.Fd, bytes: []const u8) !void {
         if (count <= 0) return error.WriteFailed;
         offset += @intCast(count);
     }
+}
+
+fn fsyncDirectory(directory: []const u8) !void {
+    if (@import("builtin").os.tag == .windows) return;
+    const path_z = try std.heap.c_allocator.dupeZ(u8, directory);
+    defer std.heap.c_allocator.free(path_z);
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.DirectoryOpenFailed;
+    defer _ = pfs.close(fd);
+    try pfs.fsyncChecked(fd);
 }
 
 test "user correction receipt is grounded in an exact durable user transcript line" {
@@ -471,11 +531,26 @@ test "runtime counterexample receipt requires blocked verdict and completed run"
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
     const root = root_buf[0..root_len];
     const sid = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
+    const blocked = "{\"schema_version\":\"metacodes-formal-verdict-v2\",\"checker_version\":\"metacodes-formal-kernel-v2\",\"request_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operation\":\"task_audit\",\"decision\":\"block\",\"admitted\":false}";
     var journal = try observation_journal.Journal.init(root, sid);
+    try std.testing.expect(journal.sink().emit(.{ .formal_decision = .{
+        .dispatch_id = "blocked-before-dispatch",
+        .phase = .pre,
+        .result = .block,
+        .candidate_id = .{'1'} ** 64,
+        .project_sha256 = .{'b'} ** 64,
+        .bundle_sha256 = .{'2'} ** 64,
+        .bundle_revision = 1,
+        .kernel_sha256 = .{'d'} ** 64,
+        .request_sha256 = .{'a'} ** 64,
+        .verdict_sha256 = observation.sha256Hex(blocked),
+        .checker_failure = null,
+        .checker_elapsed_ns = 1,
+        .checker_bytes = 1,
+    } }));
     try journal.finishRun("end_turn");
     const binding = try journal.runBinding();
     journal.deinit();
-    const blocked = "{\"schema_version\":\"metacodes-formal-verdict-v2\",\"checker_version\":\"metacodes-formal-kernel-v2\",\"request_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operation\":\"task_audit\",\"decision\":\"block\",\"admitted\":false}";
     const result = try persistRuntimeCounterexample(root, .{
         .project_sha256 = .{'b'} ** 64,
         .issuer_sha256 = .{'c'} ** 64,

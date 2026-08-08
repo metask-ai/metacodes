@@ -15,16 +15,20 @@ const project_rule_spec = @import("project_rule_spec.zig");
 
 pub const MANIFEST_SCHEMA = "metacodes-project-rule-build-v1";
 pub const AXIOM_POLICY = "metacodes-project-rule-axiom-policy-empty-v1";
+/// A verified manifest hash is also the durable build-bundle identity.  The
+/// individual files are persisted under this prefix before lifecycle receipts
+/// are created, so promotion can reopen the exact evidence across processes.
+pub const EVIDENCE_PREFIX = "project-rule-build-evidence-";
 pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 
-const FileRecord = struct {
+pub const FileRecord = struct {
     name: []const u8,
     bytes: usize,
     sha256: []const u8,
 };
 
-const Manifest = struct {
+pub const Manifest = struct {
     schema_version: []const u8,
     candidate_id: []const u8,
     project_sha256: []const u8,
@@ -53,7 +57,7 @@ const Manifest = struct {
     completion_marker: bool,
 };
 
-const expected_names = [_][]const u8{
+pub const ARTIFACT_NAMES = [_][]const u8{
     "candidate.json",
     "rule-spec.json",
     "candidate.olean",
@@ -106,7 +110,7 @@ pub fn verifyAndRecord(
     trusted: TrustedFiles,
     actors: Actors,
 ) !Recorded {
-    const verified = try verify(
+    const source_verified = try verify(
         allocator,
         session_dir,
         bundle_dir,
@@ -114,6 +118,25 @@ pub fn verifyAndRecord(
         project_sha256,
         trusted,
     );
+    try persistVerifiedArtifacts(
+        allocator,
+        session_dir,
+        bundle_dir,
+        source_verified.manifest_sha256,
+    );
+    // Do not create a lifecycle receipt from the first read.  Reopen the
+    // durable, content-addressed copy and make that copy the authoritative
+    // build/axiom evidence consumed by promotion.
+    const verified = try verifyStored(
+        allocator,
+        session_dir,
+        source_verified.manifest_sha256,
+        candidate_id,
+        project_sha256,
+        trusted,
+    );
+    if (!verifiedEqual(source_verified, verified))
+        return error.BuildEvidenceChangedBeforePersistence;
     const built = try lifecycle.persist(session_dir, .{
         .candidate_id = candidate_id,
         .project_sha256 = project_sha256,
@@ -165,6 +188,56 @@ pub fn verify(
     project_sha256: [64]u8,
     trusted: TrustedFiles,
 ) !Verified {
+    return verifySource(
+        allocator,
+        session_dir,
+        .{ .directory = bundle_dir },
+        candidate_id,
+        project_sha256,
+        trusted,
+    );
+}
+
+/// Reopen a durable build bundle by the manifest identity carried in the
+/// `built` lifecycle receipt.  No caller-selected build directory participates
+/// in promotion.
+pub fn verifyStored(
+    allocator: std.mem.Allocator,
+    session_dir: []const u8,
+    manifest_sha256: [64]u8,
+    candidate_id: [64]u8,
+    project_sha256: [64]u8,
+    trusted: TrustedFiles,
+) !Verified {
+    const verified = try verifySource(
+        allocator,
+        session_dir,
+        .{ .stored = .{ .directory = session_dir, .manifest_sha256 = manifest_sha256 } },
+        candidate_id,
+        project_sha256,
+        trusted,
+    );
+    if (!std.mem.eql(u8, &verified.manifest_sha256, &manifest_sha256))
+        return error.BuildManifestIdentityMismatch;
+    return verified;
+}
+
+const BundleSource = union(enum) {
+    directory: []const u8,
+    stored: struct {
+        directory: []const u8,
+        manifest_sha256: [64]u8,
+    },
+};
+
+fn verifySource(
+    allocator: std.mem.Allocator,
+    session_dir: []const u8,
+    source: BundleSource,
+    candidate_id: [64]u8,
+    project_sha256: [64]u8,
+    trusted: TrustedFiles,
+) !Verified {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -174,7 +247,7 @@ pub fn verify(
     if (!std.mem.eql(u8, &candidate.project_sha256, &project_sha256))
         return error.ProjectIdentityMismatch;
 
-    const manifest_raw = try readNamed(a, bundle_dir, "manifest.json", MAX_MANIFEST_BYTES, false);
+    const manifest_raw = try readBundleNamed(a, source, "manifest.json", MAX_MANIFEST_BYTES, false);
     var parsed = std.json.parseFromSlice(Manifest, a, manifest_raw, .{
         .ignore_unknown_fields = false,
         .allocate = .alloc_always,
@@ -197,12 +270,12 @@ pub fn verify(
         !validIsolationBackend(manifest.isolation_backend))
         return error.IncompleteBuildEvidence;
 
-    var contents: [expected_names.len][]const u8 = undefined;
-    for (expected_names, 0..) |name, index| {
-        contents[index] = try readNamed(a, bundle_dir, name, MAX_FILE_BYTES, true);
+    var contents: [ARTIFACT_NAMES.len][]const u8 = undefined;
+    for (ARTIFACT_NAMES, 0..) |name, index| {
+        contents[index] = try readBundleNamed(a, source, name, MAX_FILE_BYTES, true);
     }
-    if (manifest.files.len != expected_names.len) return error.InvalidFileManifest;
-    var seen = [_]bool{false} ** expected_names.len;
+    if (manifest.files.len != ARTIFACT_NAMES.len) return error.InvalidFileManifest;
+    var seen = [_]bool{false} ** ARTIFACT_NAMES.len;
     for (manifest.files) |record| {
         const index = expectedIndex(record.name) orelse return error.InvalidFileManifest;
         if (seen[index]) return error.InvalidFileManifest;
@@ -282,7 +355,7 @@ fn hashLogs(logs: []const []const u8) [64]u8 {
 }
 
 fn expectedIndex(name: []const u8) ?usize {
-    for (expected_names, 0..) |expected, index| {
+    for (ARTIFACT_NAMES, 0..) |expected, index| {
         if (std.mem.eql(u8, name, expected)) return index;
     }
     return null;
@@ -301,7 +374,7 @@ fn equalHex(value: []const u8, expected: [64]u8) bool {
     return std.mem.eql(u8, value, &expected);
 }
 
-fn readNamed(
+fn readNamedDirectory(
     allocator: std.mem.Allocator,
     directory: []const u8,
     name: []const u8,
@@ -311,7 +384,141 @@ fn readNamed(
     if (expectedIndex(name) == null and !std.mem.eql(u8, name, "manifest.json"))
         return error.InvalidArtifactName;
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ directory, name });
+    defer allocator.free(path);
     return readPath(allocator, path, maximum, allow_empty);
+}
+
+fn readBundleNamed(
+    allocator: std.mem.Allocator,
+    source: BundleSource,
+    name: []const u8,
+    maximum: usize,
+    allow_empty: bool,
+) ![]u8 {
+    return switch (source) {
+        .directory => |directory| readNamedDirectory(allocator, directory, name, maximum, allow_empty),
+        .stored => |stored| blk: {
+            const path = try storedArtifactPath(
+                allocator,
+                stored.directory,
+                stored.manifest_sha256,
+                name,
+            );
+            defer allocator.free(path);
+            break :blk readPath(allocator, path, maximum, allow_empty);
+        },
+    };
+}
+
+/// Allocator-owned path for auditing and fault-injection tests.  `name` is
+/// restricted to the fixed build-bundle vocabulary; untrusted path fragments
+/// never enter this namespace.
+pub fn storedArtifactPath(
+    allocator: std.mem.Allocator,
+    directory: []const u8,
+    manifest_sha256: [64]u8,
+    name: []const u8,
+) ![]u8 {
+    if (expectedIndex(name) == null and !std.mem.eql(u8, name, "manifest.json"))
+        return error.InvalidArtifactName;
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}{s}-{s}",
+        .{ directory, EVIDENCE_PREFIX, manifest_sha256[0..], name },
+    );
+}
+
+fn persistVerifiedArtifacts(
+    allocator: std.mem.Allocator,
+    evidence_dir: []const u8,
+    source_dir: []const u8,
+    manifest_sha256: [64]u8,
+) !void {
+    // Persist the manifest last.  A crash may leave harmless addressed files,
+    // but can never leave a completion marker followed by missing members.
+    for (ARTIFACT_NAMES) |name| {
+        const bytes = try readNamedDirectory(allocator, source_dir, name, MAX_FILE_BYTES, true);
+        defer allocator.free(bytes);
+        try persistStoredArtifact(allocator, evidence_dir, manifest_sha256, name, bytes);
+    }
+    const manifest = try readNamedDirectory(
+        allocator,
+        source_dir,
+        "manifest.json",
+        MAX_MANIFEST_BYTES,
+        false,
+    );
+    defer allocator.free(manifest);
+    if (!std.mem.eql(u8, &observation.sha256Hex(manifest), &manifest_sha256))
+        return error.BuildManifestIdentityMismatch;
+    try persistStoredArtifact(
+        allocator,
+        evidence_dir,
+        manifest_sha256,
+        "manifest.json",
+        manifest,
+    );
+    try fsyncDirectory(evidence_dir);
+}
+
+fn persistStoredArtifact(
+    allocator: std.mem.Allocator,
+    directory: []const u8,
+    manifest_sha256: [64]u8,
+    name: []const u8,
+    bytes: []const u8,
+) !void {
+    const path = try storedArtifactPath(allocator, directory, manifest_sha256, name);
+    defer allocator.free(path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = pfs.open(path_z.ptr, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .EXCL = true,
+        .NOFOLLOW = true,
+    }, @as(std.c.mode_t, 0o600));
+    if (fd >= 0) {
+        var closed = false;
+        errdefer {
+            if (!closed) _ = pfs.close(fd);
+        }
+        try pfs.makeCloseOnExec(fd);
+        try writeAll(fd, bytes);
+        try pfs.fsyncChecked(fd);
+        _ = pfs.close(fd);
+        closed = true;
+        return;
+    }
+    const existing = try readPath(allocator, path, MAX_FILE_BYTES, true);
+    defer allocator.free(existing);
+    if (!std.mem.eql(u8, existing, bytes)) return error.BuildEvidenceCollision;
+}
+
+fn verifiedEqual(a: Verified, b: Verified) bool {
+    inline for (std.meta.fields(Verified)) |field| {
+        if (!std.mem.eql(u8, &@field(a, field.name), &@field(b, field.name))) return false;
+    }
+    return true;
+}
+
+fn writeAll(fd: pfs.Fd, bytes: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const count = pfs.write(fd, bytes[offset..]);
+        if (count <= 0) return error.ArtifactWriteFailed;
+        offset += @intCast(count);
+    }
+}
+
+fn fsyncDirectory(directory: []const u8) !void {
+    if (@import("builtin").os.tag == .windows) return;
+    const path_z = try std.heap.c_allocator.dupeZ(u8, directory);
+    defer std.heap.c_allocator.free(path_z);
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.DirectoryOpenFailed;
+    defer _ = pfs.close(fd);
+    try pfs.fsyncChecked(fd);
 }
 
 fn readPath(
@@ -326,9 +533,10 @@ fn readPath(
     if (fd < 0) return error.ArtifactOpenFailed;
     defer _ = pfs.close(fd);
     const before = pfs.fileInfo(fd) catch return error.ArtifactStatFailed;
-    if (!before.is_regular or before.size > maximum or (!allow_empty and before.size == 0))
+    if (!before.is_regular or before.link_count != 1 or before.size > maximum or (!allow_empty and before.size == 0))
         return error.InvalidArtifact;
     const bytes = try allocator.alloc(u8, @intCast(before.size));
+    errdefer allocator.free(bytes);
     var offset: usize = 0;
     while (offset < bytes.len) {
         const count = pfs.read(fd, bytes[offset..]);
@@ -336,7 +544,8 @@ fn readPath(
         offset += @intCast(count);
     }
     const after = pfs.fileInfo(fd) catch return error.ArtifactStatFailed;
-    if (!after.is_regular or after.size != before.size) return error.ArtifactChangedDuringRead;
+    if (!after.is_regular or after.link_count != 1 or after.size != before.size)
+        return error.ArtifactChangedDuringRead;
     return bytes;
 }
 
@@ -410,9 +619,9 @@ test "build bundle verifier re-reads real artifacts before lifecycle receipts" {
         audit,
         "",
     };
-    var artifact_hashes: [expected_names.len][64]u8 = undefined;
-    var records: [expected_names.len]FileRecord = undefined;
-    for (expected_names, artifact_contents, 0..) |name, bytes, index| {
+    var artifact_hashes: [ARTIFACT_NAMES.len][64]u8 = undefined;
+    var records: [ARTIFACT_NAMES.len]FileRecord = undefined;
+    for (ARTIFACT_NAMES, artifact_contents, 0..) |name, bytes, index| {
         const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ root, name });
         defer std.testing.allocator.free(path);
         try testWrite(path, bytes);
@@ -480,6 +689,18 @@ test "build bundle verifier re-reads real artifacts before lifecycle receipts" {
     var loaded = try lifecycle.load(std.testing.allocator, root, recorded.axiom_receipt_id);
     defer loaded.deinit();
     try std.testing.expectEqual(lifecycle.Stage.axiom_audited, loaded.stage);
+    _ = try verifyStored(
+        std.testing.allocator,
+        root,
+        recorded.verified.manifest_sha256,
+        candidate_result.candidate_id,
+        project,
+        .{
+            .toolchain_path = trusted_paths[0],
+            .sdk_source_path = trusted_paths[1],
+            .sdk_olean_path = trusted_paths[2],
+        },
+    );
 
     const olean_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/candidate.olean", .{root});
     defer std.testing.allocator.free(olean_path);
@@ -488,6 +709,39 @@ test "build bundle verifier re-reads real artifacts before lifecycle receipts" {
         std.testing.allocator,
         root,
         root,
+        candidate_result.candidate_id,
+        project,
+        .{
+            .toolchain_path = trusted_paths[0],
+            .sdk_source_path = trusted_paths[1],
+            .sdk_olean_path = trusted_paths[2],
+        },
+    ));
+    // The source bundle is no longer authoritative once receipts exist.
+    _ = try verifyStored(
+        std.testing.allocator,
+        root,
+        recorded.verified.manifest_sha256,
+        candidate_result.candidate_id,
+        project,
+        .{
+            .toolchain_path = trusted_paths[0],
+            .sdk_source_path = trusted_paths[1],
+            .sdk_olean_path = trusted_paths[2],
+        },
+    );
+    const stored_olean = try storedArtifactPath(
+        std.testing.allocator,
+        root,
+        recorded.verified.manifest_sha256,
+        "candidate.olean",
+    );
+    defer std.testing.allocator.free(stored_olean);
+    try testWrite(stored_olean, "tampered");
+    try std.testing.expectError(error.BuildArtifactHashMismatch, verifyStored(
+        std.testing.allocator,
+        root,
+        recorded.verified.manifest_sha256,
         candidate_result.candidate_id,
         project,
         .{

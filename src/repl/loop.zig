@@ -35,7 +35,7 @@ const writer_backend_mod = @import("../core/writer_backend.zig");
 const tee_backend_mod = @import("../core/tee_backend.zig");
 const diagnostics_backend_mod = @import("../core/diagnostics_backend.zig");
 const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
-const observation_journal_mod = @import("../core/tool_observation_journal.zig");
+const project_activation = @import("../core/project_rule_activation.zig");
 const tui_backend_mod = @import("tui/tui_backend.zig");
 const terminal_title = @import("tui/terminal_title.zig");
 const goal_mod = @import("../core/goal.zig");
@@ -603,11 +603,26 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // UI projection and not an evaluation-only stream. Open and validate it
         // before the provider can run; corruption or durability failure ends
         // the run fail-closed.
-        var observation_journal: ?observation_journal_mod.Journal = if (app.sessionDir()) |dir|
-            try observation_journal_mod.Journal.init(dir, app.session_id)
+        const run_control: ?*project_activation.RunControl = if (app.sessionDir()) |dir|
+            try project_activation.RunControl.init(
+                allocator,
+                dir,
+                app.session_id,
+                if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
+                &app.abort,
+            )
         else
             null;
-        defer if (observation_journal) |*journal| journal.deinit();
+        defer if (run_control) |control| control.deinit();
+        if (run_control) |control| control.requireDetachedIdle(
+            (if (app.jobs) |*jobs| jobs.runningCount() else 0) +|
+                (if (app.agent_jobs) |*jobs| jobs.runningCount() else 0),
+            app.swarm.hasTeam(),
+        ) catch |err| {
+            try control.finishRun(@errorName(err));
+            std.debug.print("\x1b[31m项目形式化规则拒绝启动本轮: {s}\x1b[0m\n", .{@errorName(err)});
+            continue;
+        };
 
         // Native evaluation events are a second decorator over the normal UI
         // (and optional diagnostics decorator). Each user submission is one
@@ -666,11 +681,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             app.provider(),
             app.tool_defs,
             &app.permission_ctx,
-            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .request_gate = eval_request_gate, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .lsp = app.lsp_service, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .swarm = &app.swarm, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = scoped_recall, .max_turns = maxTurnsFromEnv(), .cost_budget_usd = costBudgetFromEnv(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .execution_policy = eval_execution_policy, .tool_observer = if (observation_journal) |*journal| journal.sink() else null, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.activeModel(), .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
+            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .request_gate = eval_request_gate, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .lsp = app.lsp_service, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .swarm = &app.swarm, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = scoped_recall, .max_turns = maxTurnsFromEnv(), .cost_budget_usd = costBudgetFromEnv(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .execution_policy = eval_execution_policy, .tool_observer = if (run_control) |control| control.observer() else null, .project_rule_gate = if (run_control) |control| control.formalGate() else null, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.activeModel(), .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
             effective_be,
             allocator,
         ) catch |err| {
-            if (observation_journal) |*journal| try journal.finishRun(@errorName(err));
+            if (run_control) |control| try control.finishRun(@errorName(err));
             // 停 watcher + 清 stdin 缓冲
             if (tui_be) |*tb| tb.stopInput();
             if (gen_region) |*r| r.leaveGenerating(app);
@@ -680,7 +695,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             std.debug.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
             continue;
         };
-        if (observation_journal) |*journal| try journal.finishRun(@tagName(result.stop_reason));
+        if (run_control) |control| try control.finishRun(@tagName(result.stop_reason));
         app.clearPendingModelSwitchCompact();
         accountGoalUsageAfterRun(app, usage_before, mode_before, started_ns);
         // 停 watcher + 清 stdin 缓冲（生成期间用户可能误按的键，别污染下一轮）
@@ -751,9 +766,13 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 成功才 reset 前台开新会话。顺序铁律:先 clone 再 spawn 再 reset(失败不 reset,保留对话重试)。
         if (result.stop_reason == .backgrounded) {
             app.background_request.store(false, .monotonic); // 复位信号(否则下一轮 run 立即又转后台)
-            backgroundCurrentSession(app) catch |err| {
-                std.debug.print("\x1b[31m转后台失败: {s}(对话保留前台)\x1b[0m\n", .{@errorName(err)});
-            };
+            if (run_control != null and run_control.?.project_gate != null) {
+                std.debug.print("\x1b[33m项目形式化规则已启用；当前版本拒绝把受治理 Run 转为脱离 journal 生命周期的后台任务。\x1b[0m\n", .{});
+            } else {
+                backgroundCurrentSession(app) catch |err| {
+                    std.debug.print("\x1b[31m转后台失败: {s}(对话保留前台)\x1b[0m\n", .{@errorName(err)});
+                };
+            }
         }
     }
 }

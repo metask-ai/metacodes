@@ -116,6 +116,7 @@ pub const ToolProgressReporter = struct {
 };
 
 pub const ToolObservationSink = @import("observation.zig").Sink;
+pub const ProjectRuleGate = @import("project_rule_gate.zig").Gate;
 pub const ToolObservationOrigin = @import("observation.zig").Origin;
 
 /// Admission-fixed Run identity, passed by value down the execution chain.
@@ -416,6 +417,10 @@ pub const ToolContext = struct {
     /// rule-promotion capability. `effect_slot` is installed by executeOne for
     /// one synchronous dispatch and must never escape that call.
     tool_observer: ?ToolObservationSink = null,
+    /// Hash-pinned project-specific formal gate. Unlike permission policy it
+    /// is evaluated inside executeOne at the actual dispatch seam, so TUI,
+    /// headless, Web, subagents, TaskBatch, and prefetch cannot bypass it.
+    project_rule_gate: ?ProjectRuleGate = null,
     tool_observation_origin: ToolObservationOrigin = .authoritative,
     effect_slot: ?*@import("observation.zig").EffectSlot = null,
 

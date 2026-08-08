@@ -20,6 +20,12 @@ const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
+    // Monitor is detached by definition.  Until background workers own an
+    // independent durable RunControl/journal, it cannot participate in a
+    // governed Run without making the post verdict lie about quiescence.
+    // Reject before sandbox profile creation or process spawn.
+    if (ctx.project_rule_gate != null)
+        return error.ProjectRulesRequireSynchronousExecution;
     const command = common.extractJsonArg(args, "command") orelse return error.MissingCommand;
     if (command.len == 0) return error.EmptyCommand;
     const description = common.extractJsonArg(args, "description") orelse "background monitor";

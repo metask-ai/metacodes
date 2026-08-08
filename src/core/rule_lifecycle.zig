@@ -11,8 +11,8 @@ const std = @import("std");
 const pfs = @import("platform").fs;
 const observation = @import("../tools/observation.zig");
 const rule_candidate = @import("rule_candidate.zig");
-const source_receipt = @import("rule_source_receipt.zig");
 const project_rule_spec = @import("project_rule_spec.zig");
+const project_harness_runtime = @import("../formal/project_harness_runtime.zig");
 
 pub const SCHEMA_VERSION = "metacodes-rule-stage-receipt-v2";
 pub const LEGACY_SCHEMA_VERSION = "metacodes-rule-stage-receipt-v1";
@@ -88,6 +88,8 @@ pub const PromotionEvidence = struct {
     previous_bundle_sha256: [64]u8,
     bundle_revision: u64,
     checker_admitted: bool,
+    checker_elapsed_ns: u64,
+    checker_bytes: u64,
 };
 
 pub const SupersessionEvidence = struct {
@@ -201,6 +203,8 @@ const WireEvidence = union(Stage) {
         previous_bundle_sha256: []const u8,
         bundle_revision: u64,
         checker_admitted: bool,
+        checker_elapsed_ns: u64,
+        checker_bytes: u64,
     },
     superseded: struct {
         replacement_candidate_id: []const u8,
@@ -293,6 +297,39 @@ pub fn persist(session_dir: []const u8, input: Input) !PersistResult {
         .promoted, .superseded => error.FormalAdmissionRequired,
         else => persistInternal(session_dir, input),
     };
+}
+
+/// The only authorizing lifecycle entry point. It consumes the exact native
+/// invocation result produced by the hash-pinned Lean project kernel; a caller
+/// cannot turn a proposal-side `checker_admitted` boolean into authority.
+pub fn persistPromotion(
+    session_dir: []const u8,
+    input: Input,
+    invocation: *const project_harness_runtime.Invocation,
+) !PersistResult {
+    const evidence = switch (input.evidence) {
+        .promoted => |value| value,
+        else => return error.PromotionEvidenceRequired,
+    };
+    const bindings = invocation.bindings orelse return error.FormalAdmissionMismatch;
+    if (bindings.operation != .promote or
+        !std.mem.eql(u8, &bindings.candidate_id, &input.candidate_id) or
+        !std.mem.eql(u8, &bindings.project_sha256, &input.project_sha256) or
+        !std.mem.eql(u8, &bindings.bundle_sha256, &evidence.bundle_sha256) or
+        bindings.bundle_revision != evidence.bundle_revision or
+        !std.mem.eql(u8, &bindings.kernel_sha256, &evidence.runtime_kernel_sha256) or
+        invocation.failure != .none or invocation.verdict == null or
+        !invocation.verdict.?.admitted or !invocation.verdict.?.checks.all() or
+        invocation.verdict_sha256 == null or
+        !std.mem.eql(u8, &invocation.request_sha256, &evidence.lifecycle_request_sha256) or
+        !std.mem.eql(u8, &invocation.verdict_sha256.?, &evidence.lifecycle_verdict_sha256) or
+        !std.mem.eql(u8, &invocation.actual_checker_sha256, &evidence.runtime_kernel_sha256) or
+        !std.mem.eql(u8, &input.checker_sha256, &evidence.runtime_kernel_sha256) or
+        !evidence.checker_admitted or
+        evidence.checker_elapsed_ns != invocation.checker_elapsed_ns or
+        evidence.checker_bytes != invocation.checker_bytes)
+        return error.FormalAdmissionMismatch;
+    return persistInternal(session_dir, input);
 }
 
 fn persistInternal(session_dir: []const u8, input: Input) !PersistResult {
@@ -519,7 +556,7 @@ fn validateTransition(
         },
         .rejected => {},
         .promoted => |e| {
-            if (!e.checker_admitted or e.bundle_revision == 0)
+            if (!e.checker_admitted or e.bundle_revision == 0 or e.checker_bytes == 0)
                 return error.PromotionNotAdmitted;
             try validatePromotionChain(candidate, session_dir, predecessor.?, input.actor_sha256);
         },
@@ -551,12 +588,8 @@ fn validatePromotionChain(
     shadow: Loaded,
     promoter: [64]u8,
 ) !void {
-    if (candidate.source_receipt_id) |receipt_id| {
-        var source = try source_receipt.load(std.heap.c_allocator, session_dir, receipt_id);
-        defer source.deinit();
-        if (!std.mem.eql(u8, &source.project_sha256, &candidate.project_sha256))
-            return error.SourceReceiptMismatch;
-    }
+    if (!try candidate.sourceIsBound(std.heap.c_allocator, session_dir))
+        return error.SourceReceiptMismatch;
     var replay = try loadPrevious(std.heap.c_allocator, session_dir, shadow, .replay_passed);
     defer replay.deinit();
     var axiom = try loadPrevious(std.heap.c_allocator, session_dir, replay, .axiom_audited);
@@ -660,6 +693,8 @@ fn wireEvidence(evidence: *const Evidence) WireEvidence {
             .previous_bundle_sha256 = e.previous_bundle_sha256[0..],
             .bundle_revision = e.bundle_revision,
             .checker_admitted = e.checker_admitted,
+            .checker_elapsed_ns = e.checker_elapsed_ns,
+            .checker_bytes = e.checker_bytes,
         } },
         .superseded => |*e| .{ .superseded = .{
             .replacement_candidate_id = e.replacement_candidate_id[0..],
@@ -722,6 +757,8 @@ fn parseEvidence(evidence: WireEvidence) !ParsedEvidence {
             .previous_bundle_sha256 = parseHex(e.previous_bundle_sha256) orelse return error.InvalidReceipt,
             .bundle_revision = e.bundle_revision,
             .checker_admitted = e.checker_admitted,
+            .checker_elapsed_ns = e.checker_elapsed_ns,
+            .checker_bytes = e.checker_bytes,
         } },
         .superseded => |e| .{ .superseded = .{
             .replacement_candidate_id = parseHex(e.replacement_candidate_id) orelse return error.InvalidReceipt,
@@ -741,12 +778,17 @@ fn persistExact(session_dir: []const u8, receipt_id: [64]u8, bytes: []const u8) 
         .NOFOLLOW = true,
     }, @as(std.c.mode_t, 0o600));
     if (fd >= 0) {
-        errdefer _ = pfs.close(fd);
-        try pfs.makeCloseOnExec(fd);
-        try writeAll(fd, bytes);
-        try writeAll(fd, "\n");
-        try pfs.fsyncChecked(fd);
-        _ = pfs.close(fd);
+        var write_fd = fd;
+        errdefer {
+            if (write_fd >= 0) _ = pfs.close(write_fd);
+        }
+        try pfs.makeCloseOnExec(write_fd);
+        try writeAll(write_fd, bytes);
+        try writeAll(write_fd, "\n");
+        try pfs.fsyncChecked(write_fd);
+        _ = pfs.close(write_fd);
+        write_fd = -1;
+        try fsyncDirectory(session_dir);
         return true;
     }
     const existing = try readBounded(std.heap.c_allocator, path[0 .. path.len - 1]);
@@ -772,7 +814,8 @@ fn loadHead(
     }
     defer _ = pfs.close(fd);
     const info = pfs.fileInfo(fd) catch return error.HeadStatFailed;
-    if (!info.is_regular or info.size == 0 or info.size > 4096) return error.InvalidHead;
+    if (!info.is_regular or info.link_count != 1 or info.size == 0 or info.size > 4096)
+        return error.InvalidHead;
     const bytes = try allocator.alloc(u8, @intCast(info.size));
     defer allocator.free(bytes);
     var offset: usize = 0;
@@ -782,7 +825,8 @@ fn loadHead(
         offset += @intCast(count);
     }
     const after = pfs.fileInfo(fd) catch return error.HeadStatFailed;
-    if (!after.is_regular or after.size != info.size) return error.HeadChangedDuringRead;
+    if (!after.is_regular or after.link_count != 1 or after.size != info.size)
+        return error.HeadChangedDuringRead;
     var parsed = std.json.parseFromSlice(Head, allocator, bytes, .{
         .ignore_unknown_fields = false,
         .allocate = .alloc_always,
@@ -834,6 +878,17 @@ fn publishHead(
     fd = -1;
     if (pfs.renameReplace(@ptrCast(temp.ptr), @ptrCast(final.ptr)) != 0)
         return error.HeadPublishFailed;
+    try fsyncDirectory(session_dir);
+}
+
+fn fsyncDirectory(directory: []const u8) !void {
+    if (@import("builtin").os.tag == .windows) return;
+    var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}\x00", .{directory});
+    const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.DirectoryOpenFailed;
+    defer _ = pfs.close(fd);
+    try pfs.fsyncChecked(fd);
 }
 
 fn readBounded(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -843,7 +898,7 @@ fn readBounded(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     if (fd < 0) return error.OpenFailed;
     defer _ = pfs.close(fd);
     const before = pfs.fileInfo(fd) catch return error.StatFailed;
-    if (!before.is_regular or before.size == 0 or before.size > MAX_RECORD_BYTES)
+    if (!before.is_regular or before.link_count != 1 or before.size == 0 or before.size > MAX_RECORD_BYTES)
         return error.InvalidReceipt;
     const bytes = try allocator.alloc(u8, @intCast(before.size));
     errdefer allocator.free(bytes);
@@ -854,7 +909,8 @@ fn readBounded(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
         offset += @intCast(count);
     }
     const after = pfs.fileInfo(fd) catch return error.StatFailed;
-    if (!after.is_regular or after.size != before.size) return error.ChangedDuringRead;
+    if (!after.is_regular or after.link_count != 1 or after.size != before.size)
+        return error.ChangedDuringRead;
     return bytes;
 }
 
@@ -939,6 +995,8 @@ test "promotion requires the complete chain and an independent promoter" {
         .previous_bundle_sha256 = .{'0'} ** 64,
         .bundle_revision = 1,
         .checker_admitted = true,
+        .checker_elapsed_ns = 1,
+        .checker_bytes = 1,
     };
     try std.testing.expectError(error.PromoterNotIndependent, persistInternal(fixture.root, .{
         .candidate_id = fixture.candidate_id,
@@ -956,6 +1014,39 @@ test "promotion requires the complete chain and an independent promoter" {
         .predecessor_receipt_id = shadow.receipt_id,
         .evidence = .{ .promoted = evidence },
     }));
+    var wrong_operation = project_harness_runtime.Invocation{
+        .bindings = .{
+            .request_id = .{'1'} ** 64,
+            .operation = .pre_decision,
+            .kernel_sha256 = .{'9'} ** 64,
+            .candidate_id = fixture.candidate_id,
+            .project_sha256 = fixture.project,
+            .bundle_sha256 = evidence.bundle_sha256,
+            .bundle_revision = evidence.bundle_revision,
+        },
+        .actual_checker_sha256 = .{'9'} ** 64,
+        .request_sha256 = evidence.lifecycle_request_sha256,
+        .verdict_sha256 = evidence.lifecycle_verdict_sha256,
+        .checker_elapsed_ns = evidence.checker_elapsed_ns,
+        .checker_bytes = evidence.checker_bytes,
+        .verdict = .{
+            .admitted = true,
+            .checks = .{
+                .request_valid = true,
+                .rule_valid = true,
+                .lifecycle_valid = true,
+                .decision_valid = true,
+            },
+        },
+    };
+    try std.testing.expectError(error.FormalAdmissionMismatch, persistPromotion(fixture.root, .{
+        .candidate_id = fixture.candidate_id,
+        .project_sha256 = fixture.project,
+        .actor_sha256 = .{'7'} ** 64,
+        .checker_sha256 = .{'9'} ** 64,
+        .predecessor_receipt_id = shadow.receipt_id,
+        .evidence = .{ .promoted = evidence },
+    }, &wrong_operation));
     const promoted = try persistInternal(fixture.root, .{
         .candidate_id = fixture.candidate_id,
         .project_sha256 = fixture.project,

@@ -1,9 +1,10 @@
 # Project-specific Harness Evolution
 
-Status: design contract plus grounded observation, durable journal, authentic
-source receipt, immutable candidate, and non-authorizing lifecycle-evidence
-pilots. This document does not claim that automatic Lean rule evolution or
-runtime bundle admission is already implemented.
+Status: bounded end-to-end production pilot. Grounded tool observations can
+produce governed candidates; durable build/replay/shadow evidence can be
+promoted by a fixed Lean kernel into a hash-pinned active bundle; real tool
+dispatch is gated before and after execution. Candidate discovery is not yet
+automatic, and active supersession/TinyKG mutation remain future work.
 
 ## Direction
 
@@ -145,83 +146,149 @@ does not gate a real action is documentation, not a control loop.
 
 ## Current implementation boundary
 
-Implemented in the first pilot:
+The pilot now closes one real vertical slice:
 
-- `tool_exec.executeOne` emits start/finish observations around actual dispatch;
-- observations are independent of UI projection and work at nested depth;
-- observer rejection before dispatch prevents the dispatcher call;
-- observer rejection after an effect poisons the Run instead of reporting an
-  unobserved success;
-- Write/Edit can publish `file_mutation_v1` evidence;
-- synchronous subagents and TaskBatch inherit the observer;
-- an L2 test covers model tool use through the real Write dispatch.
+```text
+host-issued correction / completed-run reflection / blocked runtime verdict
+  -> immutable RuleCandidate
+  -> sandboxed Lean build + empty-axiom audit
+  -> manifest-addressed durable build evidence
+  -> positive/negative replay + side-effect-free shadow
+  -> promotion request to the fixed hash-pinned Lean kernel
+  -> crash-safe active bundle CAS
+  -> executeOne pre gate
+  -> real dispatch + typed effect + host re-observation
+  -> executeOne post gate
+  -> durable verdict and terminal observation
+  -> runtime_counterexample source for a later candidate
+```
 
-Implemented in the second pilot:
+The authority boundary is intentionally asymmetric. Candidate Lean source is
+compiled and axiom-audited as proof evidence, but production authorization is
+computed only by the fixed `metacodes-project-kernel` over bounded `RuleSpec`
+data. A candidate can therefore evolve the project Harness without replacing
+the trusted kernel or executing agent-generated code in the runtime.
 
-- normal TUI, headless, and suspended-resume Runs append observations to a
-  session-side JSONL artifact outside the prompt and model-facing cache prefix;
-- each complete record crosses a checked file-fsync boundary before the sink
-  acknowledges it; this does not claim to prove filesystem power-loss semantics;
-- an exclusive run lease rejects concurrent writers and is deliberately left
-  behind after an unclosed Run so crash recovery requires explicit audit;
-- replay admission checks session/run identity, sequence, run lifecycle, and
-  exact start/finish pairing for every tool dispatch;
-- corrupt, partial, oversized, semantically incomplete, or concurrently owned
-  artifacts fail closed before tool dispatch.
+Implemented runtime properties:
 
-Implemented as a proposal-only third pilot:
+- `tool_exec.executeOne` is the single actual-dispatch seam and emits
+  UI-independent start/finish events at every depth;
+- Write/Edit attach `file_mutation_v1`; the host upgrades it to
+  `file_mutation_v2` after a real post-action re-read;
+- pre block prevents the dispatcher call; post block/fault occurs after the
+  real outcome is re-observed and poisons the Run instead of hiding the effect;
+- the durable journal validates exact `pre -> dispatch -> post -> finish`
+  ordering, rejects duplicate candidate/phase decisions and dispatch-id reuse,
+  requires one post verdict per admitted active rule unless a terminal
+  post block/fault short-circuits the conjunction, and permits the explicit
+  `pre block/fault -> no dispatch` terminal path;
+- TUI, headless, suspended resume, Web, daemon, Skill CLI, synchronous Agent,
+  and TaskBatch create a stable-address `RunControl` containing the journal and
+  re-attested active gate;
+- concurrent TaskBatch decisions are serialized inside the runtime gate;
+- while rules are active, detached Agent, teammate/TeamCreate, Ctrl+B
+  backgrounding, explicit background Bash, Monitor, and starting a governed Run
+  beside an existing Bash/subagent background job or team fail closed;
+- governed foreground Bash remains synchronous instead of taking the normal
+  15-second auto-background path. Independent worker journals are required
+  before any of these detached modes can be enabled safely.
 
-- `RuleCandidate` files are immutable and content-addressed beside the session;
-- `user_correction`, `agent_reflection`, and `runtime_counterexample` remain
-  distinct source variants rather than a mutable authority flag;
-- reflections must carry a falsifier and bind an exact completed observation
-  interval whose digest remains stable as later Runs append to the journal;
-- candidate Lean source is bounded and persisted as untrusted input only;
-- this API cannot build, promote, load, grant permission, or change prompts.
+Implemented lifecycle properties:
 
-Implemented as a non-authorizing fourth pilot:
+- correction and counterexample source labels are reopened against exact host
+  transcript/journal/verdict evidence; cross-project relabeling is rejected;
+- immutable candidate and lifecycle files are content addressed, single-link
+  regular files with bounded strict schemas;
+- build/axiom receipts are created only after the host verifies a real build
+  bundle, persists its ten artifacts by manifest hash, and reopens that durable
+  copy;
+- promotion reopens the durable build bundle, current toolchain/SDK, replay and
+  shadow artifacts, the exact completed Run, and every lifecycle predecessor;
+- builder, auditor, replay evaluator, shadow evaluator, promoter, and proposer
+  independence is checked before promotion;
+- the fixed Lean kernel proves the bounded promotion and pre/post decision
+  invariants; Zig never reimplements an alternative admission result;
+- promotion serializes the full state-dependent transition, persists request,
+  verdict, receipt, and bundle, then publishes `active.json` by revision/bundle
+  CAS. Incomplete lock/temp markers poison runtime loading;
+- extending an existing active bundle first re-executes its prior promotion
+  request with the pinned kernel; a missing/tampered old request or verdict
+  cannot be laundered into the next revision;
+- candidate, source, evaluation, lifecycle, build, journal, verdict, bundle,
+  and active-pointer publication use checked file flushes and parent-directory
+  flushes where the platform exposes them; this is an observable durability
+  boundary, not a claim about the filesystem's power-loss model;
+- every Run re-attests the promotion request/verdict with the pinned kernel;
+  artifact, receipt, project, revision, bundle, or kernel drift fails closed.
 
-- `user_correction` requires a host-issued, content-addressed receipt grounded
-  in an exact durable user transcript line; a source label alone is rejected;
-- `runtime_counterexample` requires a completed observation interval and a
-  blocked formal verdict receipt;
-- build, axiom-audit, replay, shadow, rejection, promotion, and supersession
-  evidence have immutable typed receipt schemas and exact predecessor links;
-- a per-candidate cross-process lease plus durable head rejects concurrent or
-  stale branches; a crash after receipt publication leaves the lease fail
-  closed for explicit audit rather than silently advancing another branch;
-- build/audit/replay/shadow evidence enforces bounded isolation, independent
-  actors, positive and negative replay cases, and side-effect-free shadowing;
-- the public proposal-side API cannot create `promoted` or `superseded`
-  receipts. Those transitions remain reserved for the independent Lean
-  admission path and therefore still have no runtime authority.
+The checker is hashed before and after execution. This protects accidental
+drift and ordinary replacement/tamper. A malicious process with the same OS
+user can also mutate this process or win a precise path-to-exec race and is
+outside the pilot threat model; solving that stronger boundary requires an
+opened executable fd plus `fexecve`/platform equivalent or a separately
+privileged kernel service. The project does not claim same-user adversarial
+isolation.
 
-Not yet implemented:
+### Runtime surface coverage
 
-- a hash-chain/receipt binding the observation journal to transcript and
-  promoted rule candidates (the journal is durable evidence, not yet a receipt);
-- journal ownership in Web/daemon/skills adapters;
-- stable observer ownership for detached background subagents whose lifetime
-  exceeds a synchronous Run;
-- authoritative adoption/discard disposition for a speculative prefetch after
-  the completed model turn is known;
-- persisted build logs, compiled artifacts, axiom outputs, replay corpora, and
-  shadow traces behind the hashes carried by lifecycle receipts;
-- isolated candidate Lean compilation, replay, shadow, and promotion;
-- independent Lean creation of promotion/supersession receipts;
-- a project bundle loader or runtime verdict gate;
-- TinyKG atomic MemoryMigration commit/rollback integration.
+The production boundary is deliberately explicit:
 
-Consequently, the current milestone is a grounded observation and immutable
-proposal foundation, not yet a self-evolving formal Harness.
+| Surface | Rule/evidence ownership |
+| --- | --- |
+| TUI, headless, suspended resume, Web, daemon, Skill CLI | create one durable `RunControl` before the provider request |
+| synchronous Agent and TaskBatch | inherit the parent's gate and observation sink through `ToolContext` |
+| stream prefetch | uses the same gate/journal and is marked `speculative_prefetch` |
+| Bash/Monitor/background Agent/team workers | remain disabled while an active bundle is loaded |
+| AgentCore embedding ABI | host-owned lifecycle; project-bundle adoption is not part of this pilot |
+
+An active bundle is snapshotted and re-attested at Run start. A later promotion
+governs future Runs; it does not retroactively change an in-flight Run. Because
+detached workers do not yet own a durable RunControl, an operator must quiesce
+them before an out-of-band promotion. The product prevents starting a governed
+Run beside existing detached work and prevents creating new detached work from
+one, but this pilot does not claim a machine-checked global quiescence protocol.
+
+The pilot still does not implement:
+
+- automatic LLM reflection/candidate generation after every trigger;
+- automatic active-bundle removal or machine-checked supersession. The typed
+  supersession topology exists, but no public API can publish it yet;
+- detached worker-owned RunControl/journal lifetimes;
+- AgentCore host integration or a global quiescence receipt for out-of-band
+  promotion;
+- authoritative adoption/discard receipts for speculative prefetch;
+- TinyKG MemoryMigration snapshot/CAS/rollback integration;
+- semantic proof that a natural-language correction or reflection is true.
+
+These are explicit boundaries, not silently accepted paths. Lean starts with a
+small fixed meta-kernel and a narrow rule vocabulary; each project grows rules
+only as corrections, counterexamples, and reviewed reflections justify them.
 
 ## Evaluation and paper data
 
-Retain event counts, dropped/rejected events, effect coverage by tool and depth,
-observer latency, candidate source, correction/reflection provenance, build and
-axiom-audit outcomes, replay false-positive/false-negative cases, shadow
-divergences, promotion/rejection reasons, bundle hashes, runtime blocks, and
-post-action re-observation results.
+The artifacts are the primary paper dataset, not console logs:
+
+| Question | Durable source |
+| --- | --- |
+| candidate source and provenance | `rule-candidate-*.json` plus source receipt |
+| build isolation, toolchain, SDK, axiom policy, build latency | `project-rule-build-evidence-<manifest>-manifest.json` |
+| replay cases and FP/FN | `rule-replay-corpus-*` and `rule-replay-result-*` |
+| shadow cases, interval, divergence, side effects | `rule-shadow-trace-*` and `rule-shadow-result-*` |
+| lifecycle acceptance/rejection and actors | `rule-stage-receipt-*` chain |
+| promotion/kernel latency and artifact size | promoted receipt `checker_elapsed_ns/checker_bytes` |
+| runtime checker calls/latency, blocks/faults | journal `formal_decision` events |
+| actual effect/re-observation outcome | paired journal dispatch events |
+| active revision and provenance | `active.json`, bundle, promotion request/verdict |
+
+Retain rejected candidates and failed lifecycle transitions as negative results;
+do not publish only successful rules. The runtime journal records checker calls,
+latency, binary bytes, phase, result, candidate, bundle revision, request and
+verdict identity. Candidate/source/lifecycle artifacts preserve correction and
+reflection provenance, replay FP/FN, shadow divergence and revision history.
+External experiment manifests should add model/harness fingerprints, task arm,
+human-review count, wall-clock proposal-to-promotion duration and cost; those
+experiment labels are not authorization inputs and therefore do not belong in
+the fixed kernel request.
 
 Compare at least:
 
@@ -233,3 +300,9 @@ Use matched tasks, models, tool/token/cost caps, and isolated local TinyKG data
 for memory benchmarks. Report rule growth and maintenance cost as well as task
 success; a safer Harness that destroys context/cache reuse or consumes more
 maintenance budget than it saves is not an improvement.
+
+This control plane never changes the provider-visible Conversation, system
+prompt, tool schema, or tool ordering. Its journal and sidecar artifacts live
+beside the session and are consumed by the host, so a promoted project rule
+does not invalidate the model's warm prefix merely by being observed or
+checked. Cache-prefix drift remains a release regression gate.

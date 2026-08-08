@@ -98,6 +98,16 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     if (raw_command.len == 0) return error.EmptyCommand;
     try security.validateBashCommand(raw_command);
 
+    // A governed Run owns one synchronous observation/formal-decision
+    // lifetime.  A background command would return a successful tool result
+    // while its real effects continue after the post gate and Run terminal
+    // receipt, so reject the explicit detached path before any process is
+    // created.  The foreground path below also bypasses JobRegistry while a
+    // project gate is active, preventing the 15-second auto-background path.
+    if (ctx.project_rule_gate != null and
+        (util_json.extractBoolField(args, "run_in_background") orelse false))
+        return error.ProjectRulesRequireSynchronousExecution;
+
     // description 仅作日志用途，本期透传但不输出
     _ = common.extractJsonArg(args, "description");
 
@@ -164,11 +174,13 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     //   - 进程已退出 → 读 stdout/stderr 文件返回
     //   - 未退出 + 达到 AUTO_BACKGROUND_MS & ctx.jobs 可用 → 返回 {auto_backgrounded, job_id}
     //   - 未退出 + 达到用户 timeout → kill + error.Timeout
-    if (ctx.jobs) |registry| {
-        // 走 job_registry:命令可能自动转后台,届时 profile 文件不能删 → detach。
-        // 代价:即便命令同步完成,profile 也泄漏到 TMPDIR(系统/重启清理),换取正确性。
-        if (sandbox_wrap) |*sw| sw.detached = true;
-        return try runAutoBackgroundable(allocator, registry, command, timeout_ms, ctx.abort);
+    if (ctx.project_rule_gate == null) {
+        if (ctx.jobs) |registry| {
+            // 走 job_registry:命令可能自动转后台,届时 profile 文件不能删 → detach。
+            // 代价:即便命令同步完成,profile 也泄漏到 TMPDIR(系统/重启清理),换取正确性。
+            if (sandbox_wrap) |*sw| sw.detached = true;
+            return try runAutoBackgroundable(allocator, registry, command, timeout_ms, ctx.abort);
+        }
     }
 
     // 可移植 shell(复刻 codex):POSIX /bin/sh -c;Windows 原生 PowerShell/cmd,零 git-bash。

@@ -12,6 +12,7 @@ const sync = @import("platform").sync;
 const observation = @import("../tools/observation.zig");
 const session_id_mod = @import("session_id.zig");
 const util_time = @import("../util/time.zig");
+const util_fs = @import("../util/fs.zig");
 
 pub const SCHEMA_VERSION = "metacodes-tool-observation-journal-v1";
 pub const FILE_NAME = "tool-observations.jsonl";
@@ -57,6 +58,57 @@ pub const RunBinding = struct {
 pub const BindingValidation = struct {
     summary: ValidationSummary,
     interval_sha256: [64]u8,
+};
+
+/// One exact, paired dispatch recovered from an immutable completed Run.
+/// Borrowed strings live in `LoadedRunDispatches.arena`; scalar effect data is
+/// copied by value.  This is the authoritative bridge from the host journal to
+/// replay/shadow validation, not a model-supplied summary.
+pub const RunDispatch = struct {
+    id: []const u8,
+    requested_name: []const u8,
+    dispatched_name: []const u8,
+    origin: observation.Origin,
+    agent_depth: u8,
+    input_bytes: usize,
+    input_sha256: [64]u8,
+    outcome: observation.Outcome,
+    effect: ?observation.Effect,
+    effect_valid: bool,
+};
+
+pub const RunFormalDecision = struct {
+    dispatch_id: []const u8,
+    phase: observation.FormalPhase,
+    result: observation.FormalResult,
+    candidate_id: [64]u8,
+    project_sha256: [64]u8,
+    bundle_sha256: [64]u8,
+    bundle_revision: u64,
+    kernel_sha256: [64]u8,
+    request_sha256: [64]u8,
+    verdict_sha256: ?[64]u8,
+    checker_elapsed_ns: u64,
+    checker_bytes: u64,
+};
+
+pub const BlockedVerdictBinding = struct {
+    candidate_id: [64]u8,
+    project_sha256: [64]u8,
+    bundle_sha256: [64]u8,
+    bundle_revision: u64,
+};
+
+pub const LoadedRunDispatches = struct {
+    arena: std.heap.ArenaAllocator,
+    interval_sha256: [64]u8,
+    dispatches: []const RunDispatch,
+    formal_decisions: []const RunFormalDecision,
+
+    pub fn deinit(self: *LoadedRunDispatches) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
 };
 
 pub const Journal = struct {
@@ -135,6 +187,7 @@ pub const Journal = struct {
         try journal.appendEvent(.{ .run_started = .{
             .started_wall_ns = util_time.nowWallNs(),
         } });
+        try fsyncDirectory(session_dir);
         return journal;
     }
 
@@ -224,6 +277,9 @@ pub const Journal = struct {
     fn unlinkLock(self: *Journal) !void {
         self.lock_path[self.lock_path_len] = 0;
         try pfs.unlinkPath(@ptrCast(&self.lock_path));
+        const directory = std.fs.path.dirname(self.lock_path[0..self.lock_path_len]) orelse
+            return error.InvalidLockPath;
+        try fsyncDirectory(directory);
         self.lock_released = true;
     }
 };
@@ -274,6 +330,154 @@ pub fn validateRunBinding(
     return .{ .summary = summary, .interval_sha256 = interval_sha256 };
 }
 
+/// Reopen a completed Run and recover the concrete paired dispatches used by
+/// shadow evaluation.  The exact interval is validated first and its digest is
+/// rechecked against the second read, so an append is harmless while a rewrite
+/// or replacement between the two reads fails closed.
+pub fn loadRunDispatches(
+    allocator: std.mem.Allocator,
+    session_dir: []const u8,
+    binding: RunBinding,
+) !LoadedRunDispatches {
+    const validated = try validateRunBinding(session_dir, binding);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ session_dir, FILE_NAME });
+    const path_z = try a.dupeZ(u8, path);
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.OpenFailed;
+    defer _ = pfs.close(fd);
+    const info = pfs.fileInfo(fd) catch return error.StatFailed;
+    if (!info.is_regular or info.link_count != 1 or info.size > MAX_ARTIFACT_BYTES) return error.NotRegularFile;
+    const bytes = try a.alloc(u8, @intCast(info.size));
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const count = pfs.read(fd, bytes[offset..]);
+        if (count <= 0) return error.ReadFailed;
+        offset += @intCast(count);
+    }
+    const after = pfs.fileInfo(fd) catch return error.StatFailed;
+    if (!after.is_regular or after.link_count != 1 or after.size != info.size) return error.ArtifactChanged;
+    if (bytes.len == 0 or bytes[bytes.len - 1] != '\n') return error.PartialRecord;
+
+    var interval_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var records: std.ArrayList(RunDispatch) = .empty;
+    var formal_decisions: std.ArrayList(RunFormalDecision) = .empty;
+    var open = std.AutoHashMap([32]u8, usize).init(a);
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const envelope = std.json.parseFromSliceLeaky(Envelope, a, line, .{
+            .ignore_unknown_fields = false,
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        }) catch return error.InvalidRecord;
+        if (envelope.sequence < binding.first_sequence or
+            envelope.sequence > binding.last_sequence) continue;
+        if (!std.mem.eql(u8, envelope.session_id, binding.session_id.asSlice()) or
+            !std.mem.eql(u8, envelope.run_id, binding.run_id.asSlice()))
+            return error.InvalidRunBinding;
+        interval_hasher.update(line);
+        interval_hasher.update("\n");
+        switch (envelope.event) {
+            .run_started => if (envelope.sequence != binding.first_sequence)
+                return error.InvalidRunBinding,
+            .run_finished => if (envelope.sequence != binding.last_sequence)
+                return error.InvalidRunBinding,
+            .tool_observation => |event| switch (event) {
+                .formal_decision => |formal| try formal_decisions.append(a, .{
+                    .dispatch_id = formal.dispatch_id,
+                    .phase = formal.phase,
+                    .result = formal.result,
+                    .candidate_id = formal.candidate_id,
+                    .project_sha256 = formal.project_sha256,
+                    .bundle_sha256 = formal.bundle_sha256,
+                    .bundle_revision = formal.bundle_revision,
+                    .kernel_sha256 = formal.kernel_sha256,
+                    .request_sha256 = formal.request_sha256,
+                    .verdict_sha256 = formal.verdict_sha256,
+                    .checker_elapsed_ns = formal.checker_elapsed_ns,
+                    .checker_bytes = formal.checker_bytes,
+                }),
+                .dispatch_started => |started| {
+                    const key = dispatchKey(started.id);
+                    if (open.contains(key)) return error.InvalidRecord;
+                    const index = records.items.len;
+                    try records.append(a, .{
+                        .id = started.id,
+                        .requested_name = started.requested_name,
+                        .dispatched_name = started.dispatched_name,
+                        .origin = started.origin,
+                        .agent_depth = started.agent_depth,
+                        .input_bytes = started.input_bytes,
+                        .input_sha256 = started.input_sha256,
+                        .outcome = .host_fatal,
+                        .effect = null,
+                        .effect_valid = false,
+                    });
+                    try open.put(key, index);
+                },
+                .dispatch_finished => |finished| {
+                    const index = open.fetchRemove(dispatchKey(finished.id)) orelse
+                        return error.InvalidRecord;
+                    const record = &records.items[index.value];
+                    if (!std.mem.eql(u8, record.requested_name, finished.requested_name) or
+                        !std.mem.eql(u8, record.dispatched_name, finished.dispatched_name) or
+                        record.origin != finished.origin or
+                        record.agent_depth != finished.agent_depth)
+                        return error.InvalidRecord;
+                    record.outcome = finished.outcome;
+                    record.effect = finished.effect;
+                    record.effect_valid = finished.effect_valid;
+                },
+            },
+        }
+    }
+    if (open.count() != 0) return error.InvalidRecord;
+    var raw_digest: [32]u8 = undefined;
+    interval_hasher.final(&raw_digest);
+    const interval_sha256 = std.fmt.bytesToHex(raw_digest, .lower);
+    if (!std.mem.eql(u8, &interval_sha256, &validated.interval_sha256))
+        return error.ArtifactChanged;
+    return .{
+        .arena = arena,
+        .interval_sha256 = interval_sha256,
+        .dispatches = try records.toOwnedSlice(a),
+        .formal_decisions = try formal_decisions.toOwnedSlice(a),
+    };
+}
+
+pub fn runContainsBlockedVerdict(
+    allocator: std.mem.Allocator,
+    session_dir: []const u8,
+    binding: RunBinding,
+    checker_sha256: [64]u8,
+    verdict_sha256: [64]u8,
+    project_sha256: [64]u8,
+    verdict_binding: ?BlockedVerdictBinding,
+) !bool {
+    var run = try loadRunDispatches(allocator, session_dir, binding);
+    defer run.deinit();
+    for (run.formal_decisions) |formal| {
+        if (formal.result == .block and formal.verdict_sha256 != null and
+            std.mem.eql(u8, &formal.kernel_sha256, &checker_sha256) and
+            std.mem.eql(u8, &formal.project_sha256, &project_sha256) and
+            std.mem.eql(u8, &formal.verdict_sha256.?, &verdict_sha256))
+        {
+            if (verdict_binding) |verdict_identity| {
+                if (!std.mem.eql(u8, &formal.candidate_id, &verdict_identity.candidate_id) or
+                    !std.mem.eql(u8, &formal.project_sha256, &verdict_identity.project_sha256) or
+                    !std.mem.eql(u8, &formal.bundle_sha256, &verdict_identity.bundle_sha256) or
+                    formal.bundle_revision != verdict_identity.bundle_revision)
+                    continue;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 fn validateFd(
     fd: pfs.Fd,
     expected_session: session_id_mod.SessionId,
@@ -281,7 +485,7 @@ fn validateFd(
     interval_sha256_out: ?*[64]u8,
 ) !ValidationSummary {
     const info = pfs.fileInfo(fd) catch return error.StatFailed;
-    if (!info.is_regular) return error.NotRegularFile;
+    if (!info.is_regular or info.link_count != 1) return error.NotRegularFile;
     if (info.size > MAX_ARTIFACT_BYTES) return error.ArtifactTooLarge;
     const size: usize = @intCast(info.size);
     if (pfs.lseek(fd, 0, .set) < 0) return error.SeekFailed;
@@ -302,14 +506,23 @@ fn validateFd(
     var binding_started = false;
     var binding_finished = false;
     var binding_hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    var open_dispatches = std.AutoHashMap([32]u8, void).init(std.heap.c_allocator);
+    var open_dispatches = std.AutoHashMap([32]u8, OpenDispatch).init(std.heap.c_allocator);
     defer open_dispatches.deinit();
+    var seen_dispatches = std.AutoHashMap([32]u8, u8).init(std.heap.c_allocator);
+    defer seen_dispatches.deinit();
+    var formal_events = std.AutoHashMap([32]u8, u8).init(std.heap.c_allocator);
+    defer formal_events.deinit();
+    var pre_decisions = std.AutoHashMap([32]u8, PreDecision).init(std.heap.c_allocator);
+    defer pre_decisions.deinit();
+    var formal_dispatches = std.AutoHashMap([32]u8, FormalDispatchState).init(std.heap.c_allocator);
+    defer formal_dispatches.deinit();
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         var parsed = std.json.parseFromSlice(Envelope, std.heap.c_allocator, line, .{
             .ignore_unknown_fields = false,
             .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
         }) catch return error.InvalidRecord;
         defer parsed.deinit();
         const envelope = parsed.value;
@@ -350,12 +563,125 @@ fn validateFd(
                     }
                 }
                 switch (tool_event) {
+                    .formal_decision => |formal| {
+                        if (!std.mem.eql(u8, formal.schema_version, observation.FORMAL_SCHEMA_VERSION) or
+                            formal.dispatch_id.len == 0 or formal.dispatch_id.len > 256 or
+                            formal.bundle_revision == 0 or
+                            !validHex(formal.candidate_id) or
+                            !validHex(formal.project_sha256) or
+                            !validHex(formal.bundle_sha256) or
+                            !validHex(formal.kernel_sha256) or
+                            !validHex(formal.request_sha256))
+                            return error.InvalidRecord;
+                        switch (formal.result) {
+                            .admit, .block => if (formal.verdict_sha256 == null or
+                                !validHex(formal.verdict_sha256.?) or
+                                formal.checker_failure != null or formal.checker_bytes == 0)
+                                return error.InvalidRecord,
+                            .fault => if (!validCheckerFailure(formal.checker_failure))
+                                return error.InvalidRecord,
+                        }
+                        const dispatch_key = dispatchKey(formal.dispatch_id);
+                        const event_key = formalKey(
+                            formal.dispatch_id,
+                            formal.candidate_id,
+                            formal.phase,
+                        );
+                        if (formal_events.contains(event_key)) return error.InvalidRecord;
+                        try formal_events.put(event_key, 0);
+                        const identity = formalIdentity(formal);
+                        switch (formal.phase) {
+                            .pre => {
+                                if (seen_dispatches.contains(dispatch_key) or
+                                    open_dispatches.contains(dispatch_key))
+                                    return error.InvalidRecord;
+                                const state_entry = try formal_dispatches.getOrPut(dispatch_key);
+                                if (!state_entry.found_existing) {
+                                    state_entry.value_ptr.* = .{
+                                        .identity = identity,
+                                        .pre_count = 0,
+                                        .terminal_pre = false,
+                                        .started = false,
+                                    };
+                                } else if (!std.meta.eql(state_entry.value_ptr.identity, identity) or
+                                    state_entry.value_ptr.terminal_pre)
+                                    return error.InvalidRecord;
+                                state_entry.value_ptr.pre_count = std.math.add(
+                                    u32,
+                                    state_entry.value_ptr.pre_count,
+                                    1,
+                                ) catch return error.InvalidRecord;
+                                if (formal.result != .admit)
+                                    state_entry.value_ptr.terminal_pre = true;
+                                try pre_decisions.put(
+                                    formalKey(formal.dispatch_id, formal.candidate_id, .pre),
+                                    .{ .identity = identity, .result = formal.result },
+                                );
+                            },
+                            .post => {
+                                const opened = open_dispatches.getPtr(dispatch_key) orelse
+                                    return error.InvalidRecord;
+                                const state = formal_dispatches.get(dispatch_key) orelse
+                                    return error.InvalidRecord;
+                                const prior = pre_decisions.get(
+                                    formalKey(formal.dispatch_id, formal.candidate_id, .pre),
+                                ) orelse return error.InvalidRecord;
+                                if (!opened.governed or opened.terminal_post or
+                                    prior.result != .admit or
+                                    !std.meta.eql(prior.identity, identity) or
+                                    !std.meta.eql(state.identity, identity))
+                                    return error.InvalidRecord;
+                                opened.post_count = std.math.add(
+                                    u32,
+                                    opened.post_count,
+                                    1,
+                                ) catch return error.InvalidRecord;
+                                if (formal.result != .admit)
+                                    opened.terminal_post = true;
+                            },
+                        }
+                    },
                     .dispatch_started => |started| {
-                        const entry = try open_dispatches.getOrPut(dispatchKey(started.id));
+                        if (!std.mem.eql(u8, started.schema_version, observation.SCHEMA_VERSION))
+                            return error.InvalidRecord;
+                        const key = dispatchKey(started.id);
+                        if (seen_dispatches.contains(key)) return error.InvalidRecord;
+                        try seen_dispatches.put(key, 0);
+                        const formal_state = formal_dispatches.getPtr(key);
+                        if (formal_state) |state| {
+                            if (state.terminal_pre or state.pre_count == 0 or state.started)
+                                return error.InvalidRecord;
+                            state.started = true;
+                        }
+                        const entry = try open_dispatches.getOrPut(key);
                         if (entry.found_existing) return error.InvalidRecord;
+                        entry.value_ptr.* = .{
+                            .identity = dispatchIdentity(
+                                started.requested_name,
+                                started.dispatched_name,
+                                started.origin,
+                                started.agent_depth,
+                            ),
+                            .governed = formal_state != null,
+                            .expected_post_count = if (formal_state) |state| state.pre_count else 0,
+                            .post_count = 0,
+                            .terminal_post = false,
+                        };
                     },
                     .dispatch_finished => |finished| {
-                        if (!open_dispatches.remove(dispatchKey(finished.id)))
+                        if (!std.mem.eql(u8, finished.schema_version, observation.SCHEMA_VERSION))
+                            return error.InvalidRecord;
+                        const entry = open_dispatches.fetchRemove(dispatchKey(finished.id)) orelse
+                            return error.InvalidRecord;
+                        if (!std.meta.eql(entry.value.identity, dispatchIdentity(
+                            finished.requested_name,
+                            finished.dispatched_name,
+                            finished.origin,
+                            finished.agent_depth,
+                        )) or (entry.value.governed and
+                            (entry.value.post_count == 0 or
+                                (!entry.value.terminal_post and
+                                    entry.value.post_count != entry.value.expected_post_count))))
                             return error.InvalidRecord;
                     },
                 }
@@ -366,6 +692,14 @@ fn validateFd(
                     envelope.monotonic_elapsed_ns < active_elapsed_ns or
                     open_dispatches.count() != 0)
                     return error.InvalidRecord;
+                var formal_states = formal_dispatches.valueIterator();
+                while (formal_states.next()) |state| {
+                    // A pre block/fault is a complete no-dispatch outcome.  A
+                    // set of all-admit pre decisions without a subsequent real
+                    // dispatch is not a closed control loop.
+                    if (!state.started and !state.terminal_pre)
+                        return error.InvalidRecord;
+                }
                 if (expected_binding) |binding| {
                     if (std.mem.eql(u8, binding.run_id.asSlice(), run_id.asSlice())) {
                         if (!binding_started or binding_finished or
@@ -378,6 +712,10 @@ fn validateFd(
                 }
                 active_run = null;
                 active_elapsed_ns = 0;
+                seen_dispatches.clearRetainingCapacity();
+                formal_events.clearRetainingCapacity();
+                pre_decisions.clearRetainingCapacity();
+                formal_dispatches.clearRetainingCapacity();
             },
         }
         expected_sequence += 1;
@@ -403,6 +741,99 @@ fn dispatchKey(id: []const u8) [32]u8 {
     return digest;
 }
 
+fn validHex(value: [64]u8) bool {
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
+    return true;
+}
+
+fn validCheckerFailure(value: ?[]const u8) bool {
+    const name = value orelse return false;
+    const kind = std.meta.stringToEnum(
+        @import("../formal/project_harness_runtime.zig").FailureKind,
+        name,
+    ) orelse return false;
+    return kind != .none;
+}
+
+const DispatchIdentity = struct {
+    requested_sha256: [32]u8,
+    dispatched_sha256: [32]u8,
+    origin: observation.Origin,
+    agent_depth: u8,
+};
+
+const FormalControlIdentity = struct {
+    project_sha256: [64]u8,
+    bundle_sha256: [64]u8,
+    bundle_revision: u64,
+    kernel_sha256: [64]u8,
+};
+
+const FormalDispatchState = struct {
+    identity: FormalControlIdentity,
+    pre_count: u32,
+    terminal_pre: bool,
+    started: bool,
+};
+
+const PreDecision = struct {
+    identity: FormalControlIdentity,
+    result: observation.FormalResult,
+};
+
+const OpenDispatch = struct {
+    identity: DispatchIdentity,
+    governed: bool,
+    expected_post_count: u32,
+    post_count: u32,
+    terminal_post: bool,
+};
+
+fn formalIdentity(formal: anytype) FormalControlIdentity {
+    return .{
+        .project_sha256 = formal.project_sha256,
+        .bundle_sha256 = formal.bundle_sha256,
+        .bundle_revision = formal.bundle_revision,
+        .kernel_sha256 = formal.kernel_sha256,
+    };
+}
+
+fn formalKey(
+    dispatch_id: []const u8,
+    candidate_id: [64]u8,
+    phase: observation.FormalPhase,
+) [32]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("metacodes-formal-event-key-v1\x00");
+    hasher.update(dispatch_id);
+    hasher.update("\x00");
+    hasher.update(&candidate_id);
+    hasher.update(&.{@intFromEnum(phase)});
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn dispatchIdentity(
+    requested_name: []const u8,
+    dispatched_name: []const u8,
+    origin: observation.Origin,
+    agent_depth: u8,
+) DispatchIdentity {
+    var requested: [32]u8 = undefined;
+    var dispatched: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(requested_name, &requested, .{});
+    std.crypto.hash.sha2.Sha256.hash(dispatched_name, &dispatched, .{});
+    return .{
+        .requested_sha256 = requested,
+        .dispatched_sha256 = dispatched,
+        .origin = origin,
+        .agent_depth = agent_depth,
+    };
+}
+
 fn writeAll(fd: pfs.Fd, bytes: []const u8) !void {
     var offset: usize = 0;
     while (offset < bytes.len) {
@@ -412,11 +843,184 @@ fn writeAll(fd: pfs.Fd, bytes: []const u8) !void {
     }
 }
 
+fn fsyncDirectory(directory: []const u8) !void {
+    if (@import("builtin").os.tag == .windows) return;
+    const path_z = try std.heap.c_allocator.dupeZ(u8, directory);
+    defer std.heap.c_allocator.free(path_z);
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.DirectoryOpenFailed;
+    defer _ = pfs.close(fd);
+    try pfs.fsyncChecked(fd);
+}
+
 fn elapsedNs(started_ns: i128) u64 {
     const now = util_time.nowNs();
     if (now <= started_ns) return 0;
     const delta: u128 = @intCast(now - started_ns);
     return @intCast(@min(delta, std.math.maxInt(u64)));
+}
+
+fn testFormalEvent(
+    dispatch_id: []const u8,
+    phase: observation.FormalPhase,
+    result: observation.FormalResult,
+) observation.Event {
+    return testFormalEventFor('a', dispatch_id, phase, result);
+}
+
+fn testFormalEventFor(
+    candidate_byte: u8,
+    dispatch_id: []const u8,
+    phase: observation.FormalPhase,
+    result: observation.FormalResult,
+) observation.Event {
+    return .{ .formal_decision = .{
+        .dispatch_id = dispatch_id,
+        .phase = phase,
+        .result = result,
+        .candidate_id = .{candidate_byte} ** 64,
+        .project_sha256 = .{'b'} ** 64,
+        .bundle_sha256 = .{'c'} ** 64,
+        .bundle_revision = 1,
+        .kernel_sha256 = .{'d'} ** 64,
+        .request_sha256 = .{'e'} ** 64,
+        .verdict_sha256 = if (result == .fault) null else .{'f'} ** 64,
+        .checker_failure = if (result == .fault) "spawn_failed" else null,
+        .checker_elapsed_ns = 1,
+        .checker_bytes = if (result == .fault) 0 else 1,
+    } };
+}
+
+fn testDispatchStart(id: []const u8) observation.Event {
+    return .{ .dispatch_started = .{
+        .id = id,
+        .requested_name = "Write",
+        .dispatched_name = "Write",
+        .origin = .authoritative,
+        .agent_depth = 0,
+        .input_bytes = 2,
+        .input_sha256 = observation.sha256Hex("{}"),
+    } };
+}
+
+fn testDispatchFinish(id: []const u8) observation.Event {
+    return .{ .dispatch_finished = .{
+        .id = id,
+        .requested_name = "Write",
+        .dispatched_name = "Write",
+        .origin = .authoritative,
+        .agent_depth = 0,
+        .outcome = .succeeded,
+        .error_code = null,
+        .elapsed_ms = 1,
+        .result_present = true,
+        .result_bytes = 2,
+        .result_sha256 = observation.sha256Hex("ok"),
+        .effect = null,
+        .effect_valid = true,
+    } };
+}
+
+fn writeTestRun(
+    directory: []const u8,
+    sid: session_id_mod.SessionId,
+    events: []const observation.Event,
+) !void {
+    try util_fs.mkdirParents(directory);
+    var journal = try Journal.init(directory, sid);
+    for (events) |event| {
+        if (!journal.sink().emit(event)) return error.TestJournalRejected;
+    }
+    try journal.finishRun("end_turn");
+    journal.deinit();
+}
+
+test "formal journal enforces pre dispatch post finish wiring and permits pre block" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const sid = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
+
+    const blocked_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/blocked", .{root});
+    defer std.testing.allocator.free(blocked_dir);
+    const blocked = [_]observation.Event{testFormalEvent("blocked", .pre, .block)};
+    try writeTestRun(blocked_dir, sid, &blocked);
+    _ = try validate(blocked_dir, sid);
+
+    const admitted_only_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/admitted-only", .{root});
+    defer std.testing.allocator.free(admitted_only_dir);
+    const admitted_only = [_]observation.Event{testFormalEvent("admitted-only", .pre, .admit)};
+    try writeTestRun(admitted_only_dir, sid, &admitted_only);
+    try std.testing.expectError(error.InvalidRecord, validate(admitted_only_dir, sid));
+
+    const duplicate_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/duplicate", .{root});
+    defer std.testing.allocator.free(duplicate_dir);
+    const duplicate = [_]observation.Event{
+        testFormalEvent("duplicate", .pre, .admit),
+        testFormalEvent("duplicate", .pre, .admit),
+    };
+    try writeTestRun(duplicate_dir, sid, &duplicate);
+    try std.testing.expectError(error.InvalidRecord, validate(duplicate_dir, sid));
+
+    const missing_post_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/missing-post", .{root});
+    defer std.testing.allocator.free(missing_post_dir);
+    const missing_post = [_]observation.Event{
+        testFormalEvent("missing-post", .pre, .admit),
+        testDispatchStart("missing-post"),
+        testDispatchFinish("missing-post"),
+    };
+    try writeTestRun(missing_post_dir, sid, &missing_post);
+    try std.testing.expectError(error.InvalidRecord, validate(missing_post_dir, sid));
+
+    const complete_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/complete", .{root});
+    defer std.testing.allocator.free(complete_dir);
+    const complete = [_]observation.Event{
+        testFormalEvent("complete", .pre, .admit),
+        testDispatchStart("complete"),
+        testFormalEvent("complete", .post, .admit),
+        testDispatchFinish("complete"),
+    };
+    try writeTestRun(complete_dir, sid, &complete);
+    _ = try validate(complete_dir, sid);
+
+    const multi_missing_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/multi-missing", .{root});
+    defer std.testing.allocator.free(multi_missing_dir);
+    const multi_missing = [_]observation.Event{
+        testFormalEventFor('1', "multi-missing", .pre, .admit),
+        testFormalEventFor('2', "multi-missing", .pre, .admit),
+        testDispatchStart("multi-missing"),
+        testFormalEventFor('1', "multi-missing", .post, .admit),
+        testDispatchFinish("multi-missing"),
+    };
+    try writeTestRun(multi_missing_dir, sid, &multi_missing);
+    try std.testing.expectError(error.InvalidRecord, validate(multi_missing_dir, sid));
+
+    // Conjunctive rules short-circuit after a terminal post block/fault.  The
+    // remaining admitted pre decisions do not need synthetic post verdicts,
+    // but the real dispatch finish must still be present.
+    const multi_block_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/multi-block", .{root});
+    defer std.testing.allocator.free(multi_block_dir);
+    const multi_block = [_]observation.Event{
+        testFormalEventFor('1', "multi-block", .pre, .admit),
+        testFormalEventFor('2', "multi-block", .pre, .admit),
+        testDispatchStart("multi-block"),
+        testFormalEventFor('1', "multi-block", .post, .block),
+        testDispatchFinish("multi-block"),
+    };
+    try writeTestRun(multi_block_dir, sid, &multi_block);
+    _ = try validate(multi_block_dir, sid);
+
+    // Fault telemetry is authority-bearing evidence, not an arbitrary log
+    // string.  Only a real non-`none` runtime FailureKind is admissible.
+    const invalid_failure_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/invalid-failure", .{root});
+    defer std.testing.allocator.free(invalid_failure_dir);
+    var invalid_failure = testFormalEvent("invalid-failure", .pre, .fault);
+    invalid_failure.formal_decision.checker_failure = "made_up_failure";
+    const invalid_failure_events = [_]observation.Event{invalid_failure};
+    try writeTestRun(invalid_failure_dir, sid, &invalid_failure_events);
+    try std.testing.expectError(error.InvalidRecord, validate(invalid_failure_dir, sid));
 }
 
 test "tool observation journal durably appends, validates, and resumes sequence" {

@@ -12,3 +12,7 @@ root = "Main"
 [[lean_exe]]
 name = "metacodes-formal-kernel"
 root = "FormalMain"
+
+[[lean_exe]]
+name = "metacodes-project-kernel"
+root = "ProjectHarnessMain"

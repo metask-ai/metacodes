@@ -15,7 +15,7 @@ const pfs = @import("platform").fs;
 const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
-const observation_journal_mod = @import("../core/tool_observation_journal.zig");
+const project_activation = @import("../core/project_rule_activation.zig");
 const request_gate_mod = @import("../core/request_gate.zig");
 const tee_backend_mod = @import("../core/tee_backend.zig");
 const ui_backend_mod = @import("../core/protocol/ui_backend.zig");
@@ -46,11 +46,25 @@ pub fn run(
 
     var wb = writer_backend.WriterBackend.initNullWithUsage(&app.usage);
     var be = wb.backend();
-    var observation_journal: ?observation_journal_mod.Journal = if (app.sessionDir()) |dir|
-        try observation_journal_mod.Journal.init(dir, app.session_id)
+    const run_control: ?*project_activation.RunControl = if (app.sessionDir()) |dir|
+        try project_activation.RunControl.init(
+            allocator,
+            dir,
+            app.session_id,
+            if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
+            &app.abort,
+        )
     else
         null;
-    defer if (observation_journal) |*journal| journal.deinit();
+    defer if (run_control) |control| control.deinit();
+    if (run_control) |control| control.requireDetachedIdle(
+        (if (app.jobs) |*jobs| jobs.runningCount() else 0) +|
+            (if (app.agent_jobs) |*jobs| jobs.runningCount() else 0),
+        app.swarm.hasTeam(),
+    ) catch |err| {
+        try control.finishRun(@errorName(err));
+        return err;
+    };
     var eval_be: ?evaluation_backend_mod.EvaluationBackend = if (eval_runtime) |*runtime| blk: {
         const active_provider = app.provider();
         runtime.configureBudgetReserve(
@@ -107,16 +121,17 @@ pub fn run(
             eval_request_gate,
             eval_execution_policy,
             eval_be != null,
-            if (observation_journal) |*journal| journal.sink() else null,
+            if (run_control) |control| control.observer() else null,
+            if (run_control) |control| control.formalGate() else null,
         ),
         effective_be,
         allocator,
     ) catch |err| {
-        if (observation_journal) |*journal| try journal.finishRun(@errorName(err));
+        if (run_control) |control| try control.finishRun(@errorName(err));
         std.debug.print("error: {s}\n", .{@errorName(err)});
         return 1;
     };
-    if (observation_journal) |*journal| try journal.finishRun(@tagName(result.stop_reason));
+    if (run_control) |control| try control.finishRun(@tagName(result.stop_reason));
 
     // Streaming writes every complete event as it is emitted; the final flush
     // is still mandatory so a short write or transient sink error cannot leave
@@ -176,6 +191,7 @@ fn buildOptions(
     execution_policy: ?@import("../tools/context.zig").ToolExecutionPolicy,
     emit_semantic_tool_events: bool,
     tool_observer: ?@import("../tools/context.zig").ToolObservationSink,
+    project_rule_gate: ?@import("../tools/context.zig").ProjectRuleGate,
 ) agent_loop.Options {
     return .{
         // task#20:--suspendable 时装恒 .pending requester → headless 遇 UI 工具挂起而非 NotATty。
@@ -188,6 +204,7 @@ fn buildOptions(
         .request_gate = request_gate,
         .execution_policy = execution_policy,
         .tool_observer = tool_observer,
+        .project_rule_gate = project_rule_gate,
         // Tool lifecycle events are part of the evaluation protocol even
         // though the null writer renders no cards.  Leaving this false made
         // headless traces contain policy decisions without tool attempts.
@@ -259,8 +276,22 @@ pub fn resumeSuspended(
 
     var wb = writer_backend.WriterBackend.initNullWithUsage(&app.usage);
     const be = wb.backend();
-    var observation_journal = try observation_journal_mod.Journal.init(dir, app.session_id);
-    defer observation_journal.deinit();
+    var run_control = try project_activation.RunControl.init(
+        allocator,
+        dir,
+        app.session_id,
+        if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
+        &app.abort,
+    );
+    defer run_control.deinit();
+    run_control.requireDetachedIdle(
+        (if (app.jobs) |*jobs| jobs.runningCount() else 0) +|
+            (if (app.agent_jobs) |*jobs| jobs.runningCount() else 0),
+        app.swarm.hasTeam(),
+    ) catch |err| {
+        try run_control.finishRun(@errorName(err));
+        return err;
+    };
 
     // suspend_state.CompletedResult → agent_loop.SuspendInfo.CompletedResult(同形状,异 nominal 类型)。
     const CR = agent_loop.SuspendInfo.CompletedResult;
@@ -281,15 +312,15 @@ pub fn resumeSuspended(
         state.tool_use_id,
         response_json,
         crs,
-        buildOptions(app, null, null, null, false, observation_journal.sink()), // resume 不重新召回;fresh eval metadata 已在原进程消费
+        buildOptions(app, null, null, null, false, run_control.observer(), run_control.formalGate()), // resume 不重新召回;fresh eval metadata 已在原进程消费
         &be,
         allocator,
     ) catch |err| {
-        try observation_journal.finishRun(@errorName(err));
+        try run_control.finishRun(@errorName(err));
         std.debug.print("error: resumeRun 失败({s})\n", .{@errorName(err)});
         return 1;
     };
-    try observation_journal.finishRun(@tagName(result.stop_reason));
+    try run_control.finishRun(@tagName(result.stop_reason));
 
     app.persistTranscript();
 

@@ -15,6 +15,7 @@
 const std = @import("std");
 
 pub const VERSION = "0.1.0";
+pub const util_fs = @import("util/fs.zig");
 
 // ── 引擎 ─────────────────────────────────────────────────────────────────
 pub const agent_loop = @import("core/agent_loop.zig"); // run(), Options, RunResult, StopReason
@@ -28,12 +29,17 @@ pub const message = @import("core/message.zig");
 pub const subagent = @import("core/subagent.zig");
 pub const tool_exec = @import("core/tool_exec.zig");
 pub const tool_observation_journal = @import("core/tool_observation_journal.zig");
+pub const project_rule_gate_protocol = @import("tools/project_rule_gate.zig");
 pub const rule_source_receipt = @import("core/rule_source_receipt.zig");
 pub const project_rule_spec = @import("core/project_rule_spec.zig");
 pub const rule_candidate = @import("core/rule_candidate.zig");
 pub const rule_lifecycle = @import("core/rule_lifecycle.zig");
 pub const rule_build_bundle = @import("core/rule_build_bundle.zig");
 pub const rule_evaluation = @import("core/rule_evaluation.zig");
+pub const project_harness_runtime = @import("formal/project_harness_runtime.zig");
+pub const project_rule_bundle = @import("core/project_rule_bundle.zig");
+pub const project_rule_gate = @import("core/project_rule_gate.zig");
+pub const project_rule_activation = @import("core/project_rule_activation.zig");
 pub const message_repair = @import("core/message_repair.zig");
 pub const tool_error = @import("core/tool_error.zig");
 pub const read_state = @import("core/read_state.zig");

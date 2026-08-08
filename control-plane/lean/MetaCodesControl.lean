@@ -4,3 +4,4 @@ import MetaCodesControl.BudgetCheckpoint
 import MetaCodesControl.TreatmentActivation
 import MetaCodesControl.PaidBudgetJournal
 import MetaCodesControl.ProjectRule
+import MetaCodesControl.ProjectHarness

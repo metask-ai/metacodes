@@ -30,6 +30,10 @@ pub const MAX_AGENT_DEPTH = @import("context.zig").MAX_AGENT_DEPTH;
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // Precondition: depth guard
     if (ctx.agent_depth >= MAX_AGENT_DEPTH) return error.AgentDepthExceeded;
+    if (ctx.project_rule_gate != null and
+        ((util_json.extractBoolField(args, "run_in_background") orelse false) or
+            util_json.extractStringField(args, "name") != null))
+        return error.ProjectRulesRequireSynchronousAgent;
 
     const api_client = ctx.api_client;
     if (ctx.provider == null and api_client == null) return error.AgentUnavailable;
@@ -62,6 +66,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const bg = requested_background or (if (def_opt) |d| d.background else false);
     const teammate_request = util_json.extractStringField(args, "name") != null;
     const out_of_process_teammate = teammate_request and ctx.swarm != null and ctx.swarm.?.out_of_process;
+    if (ctx.project_rule_gate != null and (bg or teammate_request))
+        return error.ProjectRulesRequireSynchronousAgent;
 
     // AgentDef.memory:解析唯一受限目录，并把它同时接到 system prompt、permission memdir
     // 豁免和 sandbox additional_dirs。三层必须同源，避免“提示说能写但权限/沙箱拒绝”。
@@ -459,6 +465,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .tool_defs_override = if (filtered_owned != null) effective_tool_defs else null,
             .execution_policy = child_execution_policy,
             .tool_observer = ctx.tool_observer,
+            .project_rule_gate = ctx.project_rule_gate,
             .permission_mode_override = perm_override,
             .model_override = model_override,
             .reasoning_effort_override = if (def_opt) |d| d.effort else null,
@@ -598,6 +605,34 @@ test "Task depth guard rejects at MAX" {
         .agent_depth = MAX_AGENT_DEPTH,
     };
     try testing.expectError(error.AgentDepthExceeded, execute(&ctx, "{\"prompt\":\"hi\"}"));
+}
+
+test "active project rules reject detached Agent before provider or worker side effects" {
+    const GateProbe = struct {
+        fn pre(_: *anyopaque, _: @import("project_rule_gate.zig").PreSignal) @import("project_rule_gate.zig").Result {
+            return .admit;
+        }
+        fn post(_: *anyopaque, _: @import("project_rule_gate.zig").PostSignal) @import("project_rule_gate.zig").Result {
+            return .admit;
+        }
+    };
+    var marker: u8 = 0;
+    const ctx = ToolContext{
+        .allocator = testing.allocator,
+        .project_rule_gate = .{
+            .ctx = @ptrCast(&marker),
+            .preFn = GateProbe.pre,
+            .postFn = GateProbe.post,
+        },
+    };
+    try testing.expectError(
+        error.ProjectRulesRequireSynchronousAgent,
+        execute(&ctx, "{\"prompt\":\"hi\",\"run_in_background\":true}"),
+    );
+    try testing.expectError(
+        error.ProjectRulesRequireSynchronousAgent,
+        execute(&ctx, "{\"prompt\":\"hi\",\"name\":\"worker\"}"),
+    );
 }
 
 test "parseUintField extracts max_turns" {

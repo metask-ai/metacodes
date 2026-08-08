@@ -78,10 +78,61 @@ pub const Loaded = struct {
     rule_spec: project_rule_spec.Spec,
     source_kind: SourceKind,
     source_receipt_id: ?[64]u8,
+    /// Exact source bindings committed by the candidate body. Promotion uses
+    /// these to reopen the host receipt/journal instead of trusting that this
+    /// file necessarily came through `persist` in the current process.
+    source_subject_sha256: ?[64]u8,
+    source_issuer_sha256: ?[64]u8,
+    source_observation: ?observation_journal.RunBinding,
+    source_interval_sha256: ?[64]u8,
 
     pub fn deinit(self: *Loaded) void {
         self.arena.deinit();
         self.* = undefined;
+    }
+
+    pub fn sourceIsBound(
+        self: *const Loaded,
+        allocator: std.mem.Allocator,
+        session_dir: []const u8,
+    ) !bool {
+        return switch (self.source_kind) {
+            .user_correction => blk: {
+                const receipt_id = self.source_receipt_id orelse break :blk false;
+                const subject = self.source_subject_sha256 orelse break :blk false;
+                const issuer = self.source_issuer_sha256 orelse break :blk false;
+                var receipt = try source_receipt.load(allocator, session_dir, receipt_id);
+                defer receipt.deinit();
+                break :blk receipt.kind == .user_correction and
+                    std.mem.eql(u8, &receipt.project_sha256, &self.project_sha256) and
+                    std.mem.eql(u8, &receipt.subject_sha256, &subject) and
+                    std.mem.eql(u8, &receipt.issuer_sha256, &issuer);
+            },
+            .agent_reflection => blk: {
+                const binding = self.source_observation orelse break :blk false;
+                const expected = self.source_interval_sha256 orelse break :blk false;
+                const validated = try observation_journal.validateRunBinding(session_dir, binding);
+                break :blk validated.summary.complete and
+                    std.mem.eql(u8, &validated.interval_sha256, &expected);
+            },
+            .runtime_counterexample => blk: {
+                const receipt_id = self.source_receipt_id orelse break :blk false;
+                const subject = self.source_subject_sha256 orelse break :blk false;
+                const binding = self.source_observation orelse break :blk false;
+                const expected = self.source_interval_sha256 orelse break :blk false;
+                var receipt = try source_receipt.load(allocator, session_dir, receipt_id);
+                defer receipt.deinit();
+                if (receipt.kind != .runtime_counterexample or
+                    !std.mem.eql(u8, &receipt.project_sha256, &self.project_sha256) or
+                    !std.mem.eql(u8, &receipt.subject_sha256, &subject) or
+                    receipt.observation_interval_sha256 == null or
+                    !std.mem.eql(u8, &receipt.observation_interval_sha256.?, &expected))
+                    break :blk false;
+                const validated = try observation_journal.validateRunBinding(session_dir, binding);
+                break :blk validated.summary.complete and
+                    std.mem.eql(u8, &validated.interval_sha256, &expected);
+            },
+        };
     }
 };
 
@@ -209,12 +260,17 @@ pub fn persist(
         @as(std.c.mode_t, 0o600),
     );
     if (fd >= 0) {
-        errdefer _ = pfs.close(fd);
-        try pfs.makeCloseOnExec(fd);
-        try writeAll(fd, record_json);
-        try writeAll(fd, "\n");
-        try pfs.fsyncChecked(fd);
-        _ = pfs.close(fd);
+        var write_fd = fd;
+        errdefer {
+            if (write_fd >= 0) _ = pfs.close(write_fd);
+        }
+        try pfs.makeCloseOnExec(write_fd);
+        try writeAll(write_fd, record_json);
+        try writeAll(write_fd, "\n");
+        try pfs.fsyncChecked(write_fd);
+        _ = pfs.close(write_fd);
+        write_fd = -1;
+        try fsyncDirectory(session_dir);
         return .{
             .candidate_id = candidate_id,
             .created = true,
@@ -284,29 +340,35 @@ pub fn load(
     if (!std.mem.eql(u8, &expected_id, &candidate_id)) return error.CandidateHashMismatch;
 
     var source_receipt_id: ?[64]u8 = null;
+    var source_subject_sha256: ?[64]u8 = null;
+    var source_issuer_sha256: ?[64]u8 = null;
+    var source_observation: ?observation_journal.RunBinding = null;
+    var source_interval_sha256: ?[64]u8 = null;
     const source_kind: SourceKind = switch (record.body.source) {
         .user_correction => |source| blk: {
             source_receipt_id = parseLowerHex64(source.receipt_id) orelse return error.InvalidCandidate;
-            if (parseLowerHex64(source.correction_sha256) == null or
-                parseLowerHex64(source.authority_sha256) == null)
+            source_subject_sha256 = parseLowerHex64(source.correction_sha256) orelse
+                return error.InvalidCandidate;
+            source_issuer_sha256 = parseLowerHex64(source.authority_sha256) orelse
                 return error.InvalidCandidate;
             break :blk .user_correction;
         },
         .agent_reflection => |source| blk: {
-            if (session_id_mod.SessionId.fromSlice(source.observation.session_id) == null or
-                session_id_mod.SessionId.fromSlice(source.observation.run_id) == null or
-                parseLowerHex64(source.observation.interval_sha256) == null or
-                parseLowerHex64(source.reflector_sha256) == null or
-                !validText(source.falsifier, MAX_FALSIFIER_BYTES))
+            const parsed_run = parseWireRun(source.observation) orelse return error.InvalidCandidate;
+            source_observation = parsed_run.binding;
+            source_interval_sha256 = parsed_run.interval_sha256;
+            source_issuer_sha256 = parseLowerHex64(source.reflector_sha256) orelse
+                return error.InvalidCandidate;
+            if (!validText(source.falsifier, MAX_FALSIFIER_BYTES))
                 return error.InvalidCandidate;
             break :blk .agent_reflection;
         },
         .runtime_counterexample => |source| blk: {
             source_receipt_id = parseLowerHex64(source.receipt_id) orelse return error.InvalidCandidate;
-            if (session_id_mod.SessionId.fromSlice(source.observation.session_id) == null or
-                session_id_mod.SessionId.fromSlice(source.observation.run_id) == null or
-                parseLowerHex64(source.observation.interval_sha256) == null or
-                parseLowerHex64(source.verdict_sha256) == null)
+            const parsed_run = parseWireRun(source.observation) orelse return error.InvalidCandidate;
+            source_observation = parsed_run.binding;
+            source_interval_sha256 = parsed_run.interval_sha256;
+            source_subject_sha256 = parseLowerHex64(source.verdict_sha256) orelse
                 return error.InvalidCandidate;
             break :blk .runtime_counterexample;
         },
@@ -320,6 +382,28 @@ pub fn load(
         .rule_spec = spec,
         .source_kind = source_kind,
         .source_receipt_id = source_receipt_id,
+        .source_subject_sha256 = source_subject_sha256,
+        .source_issuer_sha256 = source_issuer_sha256,
+        .source_observation = source_observation,
+        .source_interval_sha256 = source_interval_sha256,
+    };
+}
+
+const ParsedWireRun = struct {
+    binding: observation_journal.RunBinding,
+    interval_sha256: [64]u8,
+};
+
+fn parseWireRun(value: WireRun) ?ParsedWireRun {
+    if (value.first_sequence > value.last_sequence) return null;
+    return .{
+        .binding = .{
+            .session_id = session_id_mod.SessionId.fromSlice(value.session_id) orelse return null,
+            .run_id = session_id_mod.SessionId.fromSlice(value.run_id) orelse return null,
+            .first_sequence = value.first_sequence,
+            .last_sequence = value.last_sequence,
+        },
+        .interval_sha256 = parseLowerHex64(value.interval_sha256) orelse return null,
     };
 }
 
@@ -486,6 +570,16 @@ fn writeAll(fd: pfs.Fd, bytes: []const u8) !void {
     }
 }
 
+fn fsyncDirectory(directory: []const u8) !void {
+    if (@import("builtin").os.tag == .windows) return;
+    const path_z = try std.heap.c_allocator.dupeZ(u8, directory);
+    defer std.heap.c_allocator.free(path_z);
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.DirectoryOpenFailed;
+    defer _ = pfs.close(fd);
+    try pfs.fsyncChecked(fd);
+}
+
 fn readExisting(path: [*:0]const u8) ![]u8 {
     const fd = pfs.open(
         path,
@@ -495,7 +589,7 @@ fn readExisting(path: [*:0]const u8) ![]u8 {
     if (fd < 0) return error.CreateFailed;
     defer _ = pfs.close(fd);
     const info = pfs.fileInfo(fd) catch return error.StatFailed;
-    if (!info.is_regular or info.size == 0 or info.size > MAX_RECORD_BYTES)
+    if (!info.is_regular or info.link_count != 1 or info.size == 0 or info.size > MAX_RECORD_BYTES)
         return error.InvalidExistingCandidate;
     const bytes = try std.heap.c_allocator.alloc(u8, @intCast(info.size));
     errdefer std.heap.c_allocator.free(bytes);
@@ -505,6 +599,9 @@ fn readExisting(path: [*:0]const u8) ![]u8 {
         if (n <= 0) return error.ReadFailed;
         offset += @intCast(n);
     }
+    const after = pfs.fileInfo(fd) catch return error.StatFailed;
+    if (!after.is_regular or after.link_count != 1 or after.size != info.size)
+        return error.ChangedDuringRead;
     return bytes;
 }
 
@@ -555,6 +652,9 @@ test "agent reflection candidate binds a completed observation interval and is i
     try std.testing.expect(std.mem.indexOf(u8, artifact, binding.run_id.asSlice()) != null);
     try std.testing.expect(std.mem.indexOf(u8, artifact, input.invariant) != null);
     try std.testing.expect(std.mem.indexOf(u8, artifact, input.lean_source) != null);
+    var loaded = try load(std.testing.allocator, root, created.candidate_id);
+    defer loaded.deinit();
+    try std.testing.expect(try loaded.sourceIsBound(std.testing.allocator, root));
 
     var bad_binding = binding;
     bad_binding.last_sequence += 1;
@@ -636,6 +736,11 @@ test "user correction source remains distinct and requires authority evidence" {
     const result = try persist(root, input);
     try std.testing.expect(result.created);
     try std.testing.expect(result.observation_interval_sha256 == null);
+    var loaded = try load(std.testing.allocator, root, result.candidate_id);
+    defer loaded.deinit();
+    try std.testing.expect(try loaded.sourceIsBound(std.testing.allocator, root));
+    loaded.source_subject_sha256 = [_]u8{'d'} ** 64;
+    try std.testing.expect(!try loaded.sourceIsBound(std.testing.allocator, root));
 
     var invalid = input;
     invalid.source = .{ .user_correction = .{

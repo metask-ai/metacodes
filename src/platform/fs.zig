@@ -104,6 +104,7 @@ const S_IFREG: u32 = 0o100000;
 pub const FileInfo = struct {
     size: u64,
     is_regular: bool,
+    link_count: u64,
 };
 
 /// 对已打开 fd 做类型与大小检查。安全敏感读取必须先 open(O_NOFOLLOW)，再 fstat fd，
@@ -115,6 +116,7 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
         return .{
             .size = @intCast(st.st_size),
             .is_regular = (@as(u32, st.st_mode) & S_IFMT) == S_IFREG,
+            .link_count = @intCast(@max(st.st_nlink, 0)),
         };
     }
     if (builtin.os.tag == .linux) {
@@ -126,6 +128,7 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
         return .{
             .size = stx.size,
             .is_regular = (@as(u32, stx.mode) & S_IFMT) == S_IFREG,
+            .link_count = stx.nlink,
         };
     }
     var st: std.c.Stat = undefined;
@@ -133,6 +136,7 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
     return .{
         .size = @intCast(st.size),
         .is_regular = (@as(u32, @intCast(st.mode)) & S_IFMT) == S_IFREG,
+        .link_count = @intCast(st.nlink),
     };
 }
 

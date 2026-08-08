@@ -33,6 +33,7 @@ const Capture = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         switch (event) {
+            .formal_decision => {},
             .dispatch_started => |started| {
                 self.starts += 1;
                 self.depth = started.agent_depth;

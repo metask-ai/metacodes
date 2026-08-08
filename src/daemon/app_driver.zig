@@ -17,6 +17,7 @@
 const std = @import("std");
 const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
+const project_activation = @import("../core/project_rule_activation.zig");
 const web_session = @import("../web/session.zig");
 const WebBackend = @import("../web/backend.zig").WebBackend;
 const registry = @import("registry.zig");
@@ -78,6 +79,32 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
             continue;
         };
 
+        const run_control: ?*project_activation.RunControl = if (app.sessionDir()) |dir|
+            project_activation.RunControl.init(
+                app_alloc,
+                dir,
+                app.session_id,
+                if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
+                &app.abort,
+            ) catch |err| {
+                log.err("daemon", "run control failed closed: {s}", .{@errorName(err)});
+                web_session.announceRunDone(&host.journal, infra, "error", @errorName(err));
+                continue;
+            }
+        else
+            null;
+        defer if (run_control) |control| control.deinit();
+        if (run_control) |control| control.requireDetachedIdle(
+            (if (app.jobs) |*jobs| jobs.runningCount() else 0) +|
+                (if (app.agent_jobs) |*jobs| jobs.runningCount() else 0),
+            app.swarm.hasTeam(),
+        ) catch |err| {
+            control.finishRun(@errorName(err)) catch {};
+            log.err("daemon", "project rules rejected detached workers: {s}", .{@errorName(err)});
+            web_session.announceRunDone(&host.journal, infra, "error", @errorName(err));
+            continue;
+        };
+
         const scoped_recall = if (app.kg) |*k| (@import("../kg/scoped_recall.zig").build(app_alloc, k, &app.conversation, &app.abort) catch null) else null;
         defer if (scoped_recall) |s| app_alloc.free(s);
 
@@ -85,16 +112,27 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
         host.generating.store(true, .seq_cst);
         defer host.generating.store(false, .seq_cst);
 
+        var options = web_session.buildWebOptions(app, dctx.wb, scoped_recall);
+        options.tool_observer = if (run_control) |control| control.observer() else null;
+        options.project_rule_gate = if (run_control) |control| control.formalGate() else null;
         const result = agent_loop.run(
             &app.conversation,
             app.provider(),
             app.tool_defs,
             &app.permission_ctx,
-            web_session.buildWebOptions(app, dctx.wb, scoped_recall),
+            options,
             &be,
             app_alloc, // 与 conversation 同源
         ) catch |err| {
+            if (run_control) |control| control.finishRun(@errorName(err)) catch |finish_err| {
+                log.err("daemon", "run control finish failed: {s}", .{@errorName(finish_err)});
+            };
             log.err("daemon", "agent_loop failed: {s}", .{@errorName(err)});
+            web_session.announceRunDone(&host.journal, infra, "error", @errorName(err));
+            continue;
+        };
+        if (run_control) |control| control.finishRun(@tagName(result.stop_reason)) catch |err| {
+            log.err("daemon", "run control finish failed: {s}", .{@errorName(err)});
             web_session.announceRunDone(&host.journal, infra, "error", @errorName(err));
             continue;
         };
