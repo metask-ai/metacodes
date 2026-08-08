@@ -28,6 +28,7 @@ pub const message = @import("core/message.zig");
 pub const subagent = @import("core/subagent.zig");
 pub const tool_exec = @import("core/tool_exec.zig");
 pub const tool_observation_journal = @import("core/tool_observation_journal.zig");
+pub const rule_candidate = @import("core/rule_candidate.zig");
 pub const message_repair = @import("core/message_repair.zig");
 pub const tool_error = @import("core/tool_error.zig");
 pub const read_state = @import("core/read_state.zig");

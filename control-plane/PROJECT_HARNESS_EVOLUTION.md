@@ -72,6 +72,22 @@ type checking, the axiom policy, replay, shadow execution, or runtime evidence.
 For example, a correction can establish “never do X in this project”; it cannot
 make a malformed checker artifact safe.
 
+Persistence does not authenticate a source label by itself. A stored
+`user_correction` still needs a host-issued correction receipt at admission;
+`runtime_counterexample` still needs the referenced verdict artifact. In
+contrast, `agent_reflection` can already bind the exact completed observation
+interval because that evidence is emitted by the runtime. Until the other
+receipts exist, their hashes are immutable claims, not proof of authority.
+
+The preferred reflection trigger is post-Run and event-driven. A separate
+review call receives a bounded observation interval and proposes a candidate;
+its output is not appended to the main Conversation and therefore does not
+rewrite the provider-visible history or its warm cache prefix. It should run
+after user correction, a failed/blocked Run, a formal counterexample, or a
+repeated anomaly—not after every successful turn. The main actor may author
+that hypothesis, but the later builder, shadow evaluator, and promoter remain
+independent roles.
+
 ## Candidate lifecycle
 
 The intended persistent states are:
@@ -152,6 +168,16 @@ Implemented in the second pilot:
 - corrupt, partial, oversized, semantically incomplete, or concurrently owned
   artifacts fail closed before tool dispatch.
 
+Implemented as a proposal-only third pilot:
+
+- `RuleCandidate` files are immutable and content-addressed beside the session;
+- `user_correction`, `agent_reflection`, and `runtime_counterexample` remain
+  distinct source variants rather than a mutable authority flag;
+- reflections must carry a falsifier and bind an exact completed observation
+  interval whose digest remains stable as later Runs append to the journal;
+- candidate Lean source is bounded and persisted as untrusted input only;
+- this API cannot build, promote, load, grant permission, or change prompts.
+
 Not yet implemented:
 
 - a hash-chain/receipt binding the observation journal to transcript and
@@ -161,13 +187,14 @@ Not yet implemented:
   exceeds a synchronous Run;
 - authoritative adoption/discard disposition for a speculative prefetch after
   the completed model turn is known;
-- a persistent RuleCandidate protocol and evidence store;
+- host-issued correction and formal-verdict source receipts;
+- build/axiom/replay/shadow/promotion receipt artifacts for RuleCandidate;
 - isolated candidate Lean compilation, replay, shadow, and promotion;
 - a project bundle loader or runtime verdict gate;
 - TinyKG atomic MemoryMigration commit/rollback integration.
 
-Consequently, the current milestone is an observation-plane foundation, not a
-self-evolving formal Harness.
+Consequently, the current milestone is a grounded observation and immutable
+proposal foundation, not yet a self-evolving formal Harness.
 
 ## Evaluation and paper data
 

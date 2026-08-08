@@ -42,6 +42,21 @@ pub const ValidationSummary = struct {
     records: u64,
     bytes: usize,
     complete: bool,
+    artifact_sha256: [64]u8,
+};
+
+/// Immutable source interval for a later reflection/counterexample candidate.
+/// The interval includes this Run's `run_started` and `run_finished` records.
+pub const RunBinding = struct {
+    session_id: session_id_mod.SessionId,
+    run_id: session_id_mod.SessionId,
+    first_sequence: u64,
+    last_sequence: u64,
+};
+
+pub const BindingValidation = struct {
+    summary: ValidationSummary,
+    interval_sha256: [64]u8,
 };
 
 pub const Journal = struct {
@@ -52,6 +67,7 @@ pub const Journal = struct {
     lock_path_len: usize,
     session_id: session_id_mod.SessionId,
     run_id: session_id_mod.SessionId,
+    run_first_sequence: u64,
     sequence: u64,
     file_bytes: usize,
     started_ns: i128,
@@ -100,7 +116,7 @@ pub const Journal = struct {
         errdefer _ = pfs.close(fd);
         try pfs.makeCloseOnExec(fd);
 
-        const summary = try validateFd(fd, session_id);
+        const summary = try validateFd(fd, session_id, null, null);
         if (!summary.complete) return error.UnfinishedRun;
         if (pfs.lseek(fd, 0, .end) < 0) return error.SeekFailed;
 
@@ -111,6 +127,7 @@ pub const Journal = struct {
             .lock_path_len = lock_path.len - 1,
             .session_id = session_id,
             .run_id = session_id_mod.gen(),
+            .run_first_sequence = summary.records,
             .sequence = summary.records,
             .file_bytes = summary.bytes,
             .started_ns = util_time.nowNs(),
@@ -138,6 +155,17 @@ pub const Journal = struct {
 
     pub fn runId(self: *const Journal) []const u8 {
         return self.run_id.asSlice();
+    }
+
+    pub fn runBinding(self: *const Journal) !RunBinding {
+        if (!self.finished or !self.lock_released or self.sequence == 0)
+            return error.RunNotFinished;
+        return .{
+            .session_id = self.session_id,
+            .run_id = self.run_id,
+            .first_sequence = self.run_first_sequence,
+            .last_sequence = self.sequence - 1,
+        };
     }
 
     pub fn finishRun(self: *Journal, stop_reason: []const u8) !void {
@@ -218,12 +246,39 @@ pub fn validate(
     );
     if (fd < 0) return error.OpenFailed;
     defer _ = pfs.close(fd);
-    return validateFd(fd, session_id);
+    return validateFd(fd, session_id, null, null);
+}
+
+/// Reopen the artifact and prove that the exact run interval still exists.
+/// Candidate creation uses the returned artifact digest as immutable source
+/// evidence; callers cannot satisfy it with a detached run id alone.
+pub fn validateRunBinding(
+    session_dir: []const u8,
+    binding: RunBinding,
+) !BindingValidation {
+    var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buf,
+        "{s}/{s}\x00",
+        .{ session_dir, FILE_NAME },
+    );
+    const fd = pfs.open(
+        @ptrCast(path.ptr),
+        .{ .ACCMODE = .RDONLY, .NOFOLLOW = true },
+        @as(std.c.mode_t, 0),
+    );
+    if (fd < 0) return error.OpenFailed;
+    defer _ = pfs.close(fd);
+    var interval_sha256: [64]u8 = undefined;
+    const summary = try validateFd(fd, binding.session_id, binding, &interval_sha256);
+    return .{ .summary = summary, .interval_sha256 = interval_sha256 };
 }
 
 fn validateFd(
     fd: pfs.Fd,
     expected_session: session_id_mod.SessionId,
+    expected_binding: ?RunBinding,
+    interval_sha256_out: ?*[64]u8,
 ) !ValidationSummary {
     const info = pfs.fileInfo(fd) catch return error.StatFailed;
     if (!info.is_regular) return error.NotRegularFile;
@@ -244,6 +299,9 @@ fn validateFd(
     var expected_sequence: u64 = 0;
     var active_run: ?session_id_mod.SessionId = null;
     var active_elapsed_ns: u64 = 0;
+    var binding_started = false;
+    var binding_finished = false;
+    var binding_hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var open_dispatches = std.AutoHashMap([32]u8, void).init(std.heap.c_allocator);
     defer open_dispatches.deinit();
     var lines = std.mem.splitScalar(u8, bytes, '\n');
@@ -267,6 +325,15 @@ fn validateFd(
                     return error.InvalidRecord;
                 active_run = run_id;
                 active_elapsed_ns = envelope.monotonic_elapsed_ns;
+                if (expected_binding) |binding| {
+                    if (std.mem.eql(u8, binding.run_id.asSlice(), run_id.asSlice())) {
+                        if (binding_started or envelope.sequence != binding.first_sequence)
+                            return error.InvalidRunBinding;
+                        binding_started = true;
+                        binding_hasher.update(line);
+                        binding_hasher.update("\n");
+                    }
+                }
             },
             .tool_observation => |tool_event| {
                 const current = active_run orelse return error.InvalidRecord;
@@ -274,6 +341,14 @@ fn validateFd(
                     envelope.monotonic_elapsed_ns < active_elapsed_ns)
                     return error.InvalidRecord;
                 active_elapsed_ns = envelope.monotonic_elapsed_ns;
+                if (expected_binding) |binding| {
+                    if (binding_started and !binding_finished and
+                        std.mem.eql(u8, binding.run_id.asSlice(), run_id.asSlice()))
+                    {
+                        binding_hasher.update(line);
+                        binding_hasher.update("\n");
+                    }
+                }
                 switch (tool_event) {
                     .dispatch_started => |started| {
                         const entry = try open_dispatches.getOrPut(dispatchKey(started.id));
@@ -291,16 +366,34 @@ fn validateFd(
                     envelope.monotonic_elapsed_ns < active_elapsed_ns or
                     open_dispatches.count() != 0)
                     return error.InvalidRecord;
+                if (expected_binding) |binding| {
+                    if (std.mem.eql(u8, binding.run_id.asSlice(), run_id.asSlice())) {
+                        if (!binding_started or binding_finished or
+                            envelope.sequence != binding.last_sequence)
+                            return error.InvalidRunBinding;
+                        binding_hasher.update(line);
+                        binding_hasher.update("\n");
+                        binding_finished = true;
+                    }
+                }
                 active_run = null;
                 active_elapsed_ns = 0;
             },
         }
         expected_sequence += 1;
     }
+    if (expected_binding != null and (!binding_started or !binding_finished))
+        return error.InvalidRunBinding;
+    if (interval_sha256_out) |out| {
+        var raw: [32]u8 = undefined;
+        binding_hasher.final(&raw);
+        out.* = std.fmt.bytesToHex(raw, .lower);
+    }
     return .{
         .records = expected_sequence,
         .bytes = size,
         .complete = active_run == null,
+        .artifact_sha256 = observation.sha256Hex(bytes),
     };
 }
 
@@ -362,6 +455,7 @@ test "tool observation journal durably appends, validates, and resumes sequence"
         .effect_valid = true,
     } }));
     try journal.finishRun("end_turn");
+    const first_binding = try journal.runBinding();
     try std.testing.expect(!sink.emit(.{ .dispatch_started = .{
         .id = "late",
         .requested_name = "Read",
@@ -376,6 +470,12 @@ test "tool observation journal durably appends, validates, and resumes sequence"
     const first = try validate(root, sid);
     try std.testing.expectEqual(@as(u64, 4), first.records);
     try std.testing.expect(first.complete);
+    const bound = try validateRunBinding(root, first_binding);
+    try std.testing.expectEqual(@as(u64, 4), bound.summary.records);
+    try std.testing.expectEqualSlices(u8, &first.artifact_sha256, &bound.interval_sha256);
+    var wrong_binding = first_binding;
+    wrong_binding.last_sequence -= 1;
+    try std.testing.expectError(error.InvalidRunBinding, validateRunBinding(root, wrong_binding));
 
     var resumed = try Journal.init(root, sid);
     defer resumed.deinit();
@@ -385,6 +485,9 @@ test "tool observation journal durably appends, validates, and resumes sequence"
     try std.testing.expectEqual(@as(u64, 6), second.records);
     try std.testing.expect(second.complete);
     try std.testing.expect(second.bytes > first.bytes);
+    try std.testing.expect(!std.mem.eql(u8, &second.artifact_sha256, &first.artifact_sha256));
+    const rebound = try validateRunBinding(root, first_binding);
+    try std.testing.expectEqualSlices(u8, &bound.interval_sha256, &rebound.interval_sha256);
 }
 
 test "tool observation journal lease rejects a concurrent writer" {
