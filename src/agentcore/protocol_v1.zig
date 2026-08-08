@@ -77,6 +77,7 @@ pub fn event(value: InternalEvent) ?public.CoreEvent {
         .diag_breaker_tripped,
         .diag_cache_break,
         .diag_continuation,
+        .context_projection,
         .policy_decision,
         .diag_run_end,
         .config_changed,
@@ -185,6 +186,14 @@ test "internal-only events are explicitly excluded from ABI v1" {
     try std.testing.expect(event(.{ .diag_breaker_tripped = .{ .trace_id = trace_id, .depth = 0, .same_err_count = 1 } }) == null);
     try std.testing.expect(event(.{ .diag_cache_break = .{ .trace_id = trace_id, .depth = 0, .cache_read = 1, .cache_creation = 2 } }) == null);
     try std.testing.expect(event(.{ .diag_continuation = .{ .trace_id = trace_id, .depth = 0, .n = 1, .max = 2 } }) == null);
+    try std.testing.expect(event(.{ .context_projection = .{
+        .kind = "large_tool_result_truncation",
+        .changed_items = 1,
+        .bytes_before = 1024,
+        .bytes_after = 512,
+        .active_messages = 3,
+        .cause = "threshold",
+    } }) == null);
     try std.testing.expect(event(.{ .policy_decision = .{ .trace_id = trace_id, .depth = 0, .id = "tool-id", .tool = "Bash", .decision = "deny", .source = "settings", .allowed = false } }) == null);
     try std.testing.expect(event(.{ .diag_run_end = .{ .trace_id = trace_id, .depth = 0, .turns = 1, .tool_calls = 0, .stop_reason_name = "end_turn" } }) == null);
     try std.testing.expect(event(.{ .config_changed = .{ .model = "x" } }) == null);

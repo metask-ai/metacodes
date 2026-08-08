@@ -50,7 +50,8 @@ LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 4
 BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 5
 PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 6
 PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 7
-PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 8
+PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 8
+PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 9
 NATIVE_RUNTIME_RECEIPT_VERSIONS = frozenset(
     {
         LEGACY_RUNTIME_RECEIPT_SCHEMA_VERSION,
@@ -59,6 +60,7 @@ NATIVE_RUNTIME_RECEIPT_VERSIONS = frozenset(
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }
 )
@@ -68,6 +70,7 @@ PRODUCTION_RUNTIME_RECEIPT_VERSIONS = frozenset(
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }
 )
@@ -269,6 +272,7 @@ def _query_plan_source_bound(receipt: Mapping[str, Any], where: str) -> bool:
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }:
         expected_sources = {
@@ -277,6 +281,8 @@ def _query_plan_source_bound(receipt: Mapping[str, Any], where: str) -> bool:
             PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
                 PRE_CONSOLIDATION_PRODUCTION_RUNNER_SOURCE_MODULES,
             PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+                PRODUCTION_RUNNER_SOURCE_MODULES,
+            PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
                 PRODUCTION_RUNNER_SOURCE_MODULES,
             PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
                 PRODUCTION_RUNNER_SOURCE_MODULES,
@@ -830,6 +836,218 @@ def _cassette_treatment_activation(
     return {**evidence, "fingerprint": _canonical_sha256(evidence)}
 
 
+def _cassette_context_cache(
+    root: Path,
+    model_id: str,
+    where: str = "production context/cache",
+) -> Mapping[str, Any]:
+    """Recompute the provider-visible cache prefix from every raw request.
+
+    A treatment must not buy memory quality by silently changing the stable
+    system/tools prefix on each turn. The one capability-free loop-breaker
+    finalization request is counted separately and cannot impersonate a normal
+    cacheable request.
+    """
+
+    requests = sorted(root.glob("req-*.json"))
+    if not requests:
+        _fail(where, "provider cassette is empty")
+    expected_cache_control = {"type": "ephemeral"}
+    normal_prefixes: set[str] = set()
+    system_hashes: set[str] = set()
+    system_sizes: set[int] = set()
+    tool_hashes: set[str] = set()
+    tool_sizes: set[int] = set()
+    normal_requests = 0
+    tool_less_finalizations = 0
+    for request_path in requests:
+        body = _load_unique_json(request_path, f"{where}.{request_path.name}")
+        if body.get("model") != model_id:
+            _fail(f"{where}.{request_path.name}.model", "request model drift")
+        if body.get("cache_control") != expected_cache_control:
+            _fail(
+                f"{where}.{request_path.name}.cache_control",
+                "production request must keep the sealed ephemeral cache contract",
+            )
+        tools = body.get("tools")
+        if not isinstance(tools, list):
+            if _is_final_toolless_loop_breaker_request(
+                body,
+                request_path=request_path,
+                final_request_path=requests[-1],
+            ):
+                tool_less_finalizations += 1
+                continue
+            _fail(f"{where}.{request_path.name}.tools", "normal request has no tool schema")
+        system = body.get("system")
+        if not isinstance(system, str) or not system:
+            _fail(f"{where}.{request_path.name}.system", "cacheable system prompt is missing")
+        system_bytes = system.encode("utf-8")
+        # Preserve provider-visible map/list order. Canonical sort_keys hashing
+        # would hide a property-order drift that can change the model-facing
+        # tool prefix even when the parsed JSON values compare equal.
+        tools_bytes = json.dumps(
+            tools,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=False,
+        ).encode("utf-8")
+        normal_requests += 1
+        system_hashes.add(hashlib.sha256(system_bytes).hexdigest())
+        system_sizes.add(len(system_bytes))
+        tool_hashes.add(hashlib.sha256(tools_bytes).hexdigest())
+        tool_sizes.add(len(tools_bytes))
+        prefix_bytes = json.dumps(
+            {
+                "model": model_id,
+                "system": system,
+                "tools": tools,
+                "cache_control": expected_cache_control,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=False,
+        ).encode("utf-8")
+        normal_prefixes.add(hashlib.sha256(prefix_bytes).hexdigest())
+    if normal_requests < 1:
+        _fail(where, "cassette has no normal cacheable provider request")
+    if any(
+        len(values) != 1
+        for values in (
+            normal_prefixes,
+            system_hashes,
+            system_sizes,
+            tool_hashes,
+            tool_sizes,
+        )
+    ):
+        _fail(where, "system or full tool schema changed within one rollout")
+    return {
+        "normal_request_count": normal_requests,
+        "tool_less_finalization_request_count": tool_less_finalizations,
+        "cache_control": expected_cache_control,
+        "system_prompt_sha256": next(iter(system_hashes)),
+        "system_prompt_bytes": next(iter(system_sizes)),
+        "tools_schema_sha256": next(iter(tool_hashes)),
+        "tools_schema_bytes": next(iter(tool_sizes)),
+        "cacheable_prefix_sha256": next(iter(normal_prefixes)),
+        "prefix_stable": True,
+    }
+
+
+def _summarize_context_cache(
+    rollout_receipts: Sequence[Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    """Aggregate arm-level context/cache evidence and derive a claim gate."""
+
+    by_arm: Dict[str, Dict[str, Any]] = {}
+    blockers: List[str] = []
+    for arm in sorted({str(item["arm"]) for item in rollout_receipts}):
+        rows = [item for item in rollout_receipts if item["arm"] == arm]
+        contexts = [item.get("context_cache") for item in rows]
+        if any(not isinstance(item, dict) for item in contexts):
+            _fail("production context/cache summary", f"arm {arm!r} is missing evidence")
+        typed = [item for item in contexts if isinstance(item, dict)]
+        input_tokens = sum(int(item["input_tokens"]) for item in typed)
+        cache_read_tokens = sum(int(item["cache_read_tokens"]) for item in typed)
+        cache_write_tokens = sum(int(item["cache_write_tokens"]) for item in typed)
+        prompt_tokens = input_tokens + cache_read_tokens + cache_write_tokens
+        prefixes = sorted({str(item["cacheable_prefix_sha256"]) for item in typed})
+        system_hashes = sorted({str(item["system_prompt_sha256"]) for item in typed})
+        system_sizes = sorted({int(item["system_prompt_bytes"]) for item in typed})
+        tool_hashes = sorted({str(item["tools_schema_sha256"]) for item in typed})
+        tool_sizes = sorted({int(item["tools_schema_bytes"]) for item in typed})
+        prefix_stable = all(
+            len(values) == 1
+            for values in (prefixes, system_hashes, system_sizes, tool_hashes, tool_sizes)
+        ) and all(
+            item.get("prefix_stable") is True for item in typed
+        )
+        original_context_preserved = all(
+            item.get("original_context_preserved") is True for item in typed
+        )
+        normal_request_count = sum(
+            int(item["normal_request_count"]) for item in typed
+        )
+        tool_less_finalization_request_count = sum(
+            int(item["tool_less_finalization_request_count"]) for item in typed
+        )
+        summary = {
+            "rollouts": len(rows),
+            "normal_request_count": normal_request_count,
+            "tool_less_finalization_request_count": tool_less_finalization_request_count,
+            "input_tokens": input_tokens,
+            "output_tokens": sum(int(item["output_tokens"]) for item in typed),
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
+            "cache_reuse_ratio": (
+                cache_read_tokens / prompt_tokens if prompt_tokens > 0 else 0.0
+            ),
+            "cache_break_count": sum(int(item["cache_break_count"]) for item in typed),
+            "system_prompt_sha256": system_hashes[0] if len(system_hashes) == 1 else None,
+            "system_prompt_bytes": system_sizes[0] if len(system_sizes) == 1 else None,
+            "tools_schema_sha256": tool_hashes[0] if len(tool_hashes) == 1 else None,
+            "tools_schema_bytes": tool_sizes[0] if len(tool_sizes) == 1 else None,
+            "cacheable_prefix_sha256": prefixes[0] if len(prefixes) == 1 else None,
+            "prefix_stable": prefix_stable,
+            "compact_request_count": sum(
+                int(item["compact_request_count"]) for item in typed
+            ),
+            "auto_compact_event_count": sum(
+                int(item["auto_compact_event_count"]) for item in typed
+            ),
+            "context_projection_count": sum(
+                int(item["context_projection_count"]) for item in typed
+            ),
+            "context_projected_bytes": sum(
+                int(item["context_projected_bytes"]) for item in typed
+            ),
+            "memory_exposed_tokens": sum(
+                int(item["memory_exposed_tokens"]) for item in typed
+            ),
+            "estimated_cost_usd": sum(
+                float(row["estimated_cost_usd"]) for row in rows
+            ),
+            "metered_tokens": sum(int(row["metered_tokens"]) for row in rows),
+            "host_elapsed_ms": sum(float(row["host_elapsed_ms"]) for row in rows),
+            "original_context_preserved": original_context_preserved,
+        }
+        if not prefix_stable:
+            blockers.append(f"{arm}:cacheable_prefix_drift")
+        if normal_request_count < 2:
+            blockers.append(f"{arm}:insufficient_cache_reuse_opportunity")
+        elif cache_read_tokens == 0:
+            # Equal zero-hit ratios across arms are absence of evidence, not
+            # evidence that memory preserved the provider cache contract.
+            blockers.append(f"{arm}:cache_reuse_unobserved")
+        if summary["cache_break_count"] != 0:
+            blockers.append(f"{arm}:cache_break")
+        if summary["compact_request_count"] != 0 or summary["auto_compact_event_count"] != 0:
+            blockers.append(f"{arm}:compact")
+        if summary["context_projection_count"] != 0 or not original_context_preserved:
+            blockers.append(f"{arm}:context_projection")
+        by_arm[arm] = summary
+
+    baseline = by_arm.get("no_memory")
+    if baseline is None:
+        blockers.append("missing_no_memory_baseline")
+    else:
+        baseline_ratio = float(baseline["cache_reuse_ratio"])
+        for arm in ("markdown_memory", "tinykg_lexical"):
+            candidate = by_arm.get(arm)
+            if candidate is None:
+                blockers.append(f"missing_{arm}")
+            elif float(candidate["cache_reuse_ratio"]) + 1e-12 < baseline_ratio:
+                blockers.append(f"{arm}:cache_reuse_below_no_memory")
+    return {
+        "schema_version": 1,
+        "cache_reuse_ratio_denominator": "input_plus_cache_read_plus_cache_write_tokens",
+        "by_arm": by_arm,
+        "context_cache_claim_gate_passed": not blockers,
+        "claim_blockers": blockers,
+    }
+
+
 def _native_pricing_provenance(path: Path, where: str) -> str:
     observed: set[str] = set()
     try:
@@ -1149,24 +1367,31 @@ def _validate_production_runtime_receipt(
     if schema_version not in PRODUCTION_RUNTIME_RECEIPT_VERSIONS:
         _fail(
             f"{where}.schema_version",
-            "expected production runtime receipt v4, v5, v6, v7, or v8",
+            "expected production runtime receipt v4 through v9",
         )
     journal_bound = schema_version in {
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }
     toolchain_bound = schema_version in {
         PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }
     scoped_recall_bound = schema_version in {
         PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }
-    workspace_outcome_bound = schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
+    workspace_outcome_bound = schema_version in {
+        PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+    }
+    context_cache_bound = schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
     value = _object(
         receipt,
         where,
@@ -1203,6 +1428,7 @@ def _validate_production_runtime_receipt(
             "metered_tokens",
             "pricing_provenance",
             *(("budget_journal",) if journal_bound else ()),
+            *(("context_cache_summary", "unconditional_memory_claim_eligible") if context_cache_bound else ()),
             "rollouts",
         ),
     )
@@ -1298,6 +1524,7 @@ def _validate_production_runtime_receipt(
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION: PRE_QUERY_PLAN_PRODUCTION_RUNNER_SOURCE_MODULES,
         PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION: PRE_CONSOLIDATION_PRODUCTION_RUNNER_SOURCE_MODULES,
         PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION: PRODUCTION_RUNNER_SOURCE_MODULES,
+        PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION: PRODUCTION_RUNNER_SOURCE_MODULES,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION: PRODUCTION_RUNNER_SOURCE_MODULES,
     }[schema_version]
     if tuple(source_modules) != expected_source_modules:
@@ -1418,6 +1645,7 @@ def _validate_production_runtime_receipt(
                 "compact_event_count",
                 "memory_auto_injected_bytes",
                 "memory_tool_result_bytes",
+                *(("context_cache",) if context_cache_bound else ()),
                 "treatment_activation",
                 *(("scoped_recall",) if scoped_recall_bound else ()),
                 *(("consolidation",) if scoped_recall_bound else ()),
@@ -1661,6 +1889,101 @@ def _validate_production_runtime_receipt(
             rollout["memory_tool_result_bytes"],
             f"{rollout_where}.memory_tool_result_bytes",
         )
+        if context_cache_bound:
+            context_cache = _object(
+                rollout["context_cache"],
+                f"{rollout_where}.context_cache",
+                (
+                    "normal_request_count",
+                    "tool_less_finalization_request_count",
+                    "cache_control",
+                    "system_prompt_sha256",
+                    "system_prompt_bytes",
+                    "tools_schema_sha256",
+                    "tools_schema_bytes",
+                    "cacheable_prefix_sha256",
+                    "prefix_stable",
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_tokens",
+                    "cache_write_tokens",
+                    "cache_break_count",
+                    "compact_request_count",
+                    "auto_compact_event_count",
+                    "context_projection_count",
+                    "context_projected_bytes",
+                    "memory_exposed_tokens",
+                    "original_context_preserved",
+                ),
+            )
+            normal_requests = _integer(
+                context_cache["normal_request_count"],
+                f"{rollout_where}.context_cache.normal_request_count",
+                minimum=1,
+            )
+            tool_less_requests = _integer(
+                context_cache["tool_less_finalization_request_count"],
+                f"{rollout_where}.context_cache.tool_less_finalization_request_count",
+            )
+            if normal_requests + tool_less_requests != provider_requests:
+                _fail(f"{rollout_where}.context_cache", "request classification mismatch")
+            if context_cache["cache_control"] != {"type": "ephemeral"}:
+                _fail(f"{rollout_where}.context_cache.cache_control", "contract drift")
+            _hash(
+                context_cache["cacheable_prefix_sha256"],
+                f"{rollout_where}.context_cache.cacheable_prefix_sha256",
+            )
+            for key in ("system_prompt_sha256", "tools_schema_sha256"):
+                _hash(context_cache[key], f"{rollout_where}.context_cache.{key}")
+            for key in ("system_prompt_bytes", "tools_schema_bytes"):
+                _integer(
+                    context_cache[key],
+                    f"{rollout_where}.context_cache.{key}",
+                    minimum=1,
+                )
+            if context_cache["prefix_stable"] is not True:
+                _fail(f"{rollout_where}.context_cache.prefix_stable", "must be true")
+            token_total = 0
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+            ):
+                token_total += _integer(
+                    context_cache[key], f"{rollout_where}.context_cache.{key}"
+                )
+            if token_total != metered_tokens:
+                _fail(f"{rollout_where}.context_cache", "usage total mismatch")
+            for key in (
+                "cache_break_count",
+                "compact_request_count",
+                "auto_compact_event_count",
+                "context_projection_count",
+                "context_projected_bytes",
+                "memory_exposed_tokens",
+            ):
+                _integer(context_cache[key], f"{rollout_where}.context_cache.{key}")
+            if context_cache["compact_request_count"] != compact_events:
+                _fail(f"{rollout_where}.context_cache.compact_request_count", "drift")
+            if context_cache["memory_exposed_tokens"] != (
+                auto_injected_bytes + tool_result_bytes + 3
+            ) // 4:
+                _fail(f"{rollout_where}.context_cache.memory_exposed_tokens", "drift")
+            # A paid summary request may be rejected by the no-savings gate;
+            # that costs time/tokens and blocks the cache claim, but it does
+            # not itself mutate the provider-visible conversation. Actual
+            # loss is grounded only by committed compact/projection events.
+            expected_preserved = (
+                context_cache["auto_compact_event_count"] == 0
+                and context_cache["context_projection_count"] == 0
+            )
+            if context_cache["original_context_preserved"] is not expected_preserved:
+                _fail(f"{rollout_where}.context_cache.original_context_preserved", "drift")
+            if (context_cache["context_projection_count"] == 0) != (
+                context_cache["context_projected_bytes"] == 0
+            ):
+                _fail(f"{rollout_where}.context_cache.context_projected_bytes", "drift")
         _finite_number(rollout["host_elapsed_ms"], f"{rollout_where}.host_elapsed_ms")
 
         activation = _object(
@@ -1936,6 +2259,19 @@ def _validate_production_runtime_receipt(
         elif graph.get("revision") != state_after:
             _fail(f"{rollout_where}.observation.graph.revision", "does not bind memory state")
 
+    if context_cache_bound:
+        expected_context_cache_summary = _summarize_context_cache(rollouts)
+        if value["context_cache_summary"] != expected_context_cache_summary:
+            _fail(
+                f"{where}.context_cache_summary",
+                "does not equal the rollout-derived context/cache summary",
+            )
+        if value["unconditional_memory_claim_eligible"] is not False:
+            _fail(
+                f"{where}.unconditional_memory_claim_eligible",
+                "a small production pilot cannot authorize an unconditional memory claim",
+            )
+
     estimated_total = sum(float(item["estimated_cost_usd"]) for item in rollouts)
     metered_total = sum(int(item["metered_tokens"]) for item in rollouts)
     observed_estimated_total = _finite_number(
@@ -1997,7 +2333,7 @@ def validate_runtime_receipt(
     if schema_version not in {REPLAY_SCHEMA_VERSION, *NATIVE_RUNTIME_RECEIPT_VERSIONS}:
         _fail(
             f"{where}.schema_version",
-            "expected replay v1, native wiring v2, native lifecycle v3, or production v4-v8",
+            "expected replay v1, native wiring v2, native lifecycle v3, or production v4-v9",
         )
     if schema_version in PRODUCTION_RUNTIME_RECEIPT_VERSIONS:
         _validate_production_runtime_receipt(
@@ -2102,6 +2438,7 @@ def validate_runtime_receipt(
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }:
         raw_sources = value["runner_sources"]
@@ -2512,6 +2849,7 @@ def validate_runtime_artifacts(
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }:
         raw_sources = receipt.get("runner_sources")
@@ -2541,7 +2879,10 @@ def validate_runtime_artifacts(
             expected_runner_sha = _hash(raw_source.get("sha256"), f"{source_where}.sha256")
             if observed_runner_sha != expected_runner_sha:
                 _fail(f"{source_where}.sha256", "runtime source mismatch")
-    if schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+    if schema_version in {
+        PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+    }:
         snapshot_relative = _artifact_relative_path(
             receipt.get("ripgrep_snapshot_path"),
             f"{where}.ripgrep_snapshot_path",
@@ -2572,6 +2913,7 @@ def validate_runtime_artifacts(
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }:
         journal_receipt = receipt.get("budget_journal")
@@ -2647,12 +2989,16 @@ def validate_runtime_artifacts(
     for index, raw_rollout in enumerate(rollouts):
         rollout_where = f"{where}.rollouts[{index}]"
         native_scoped_recalls: List[Mapping[str, Any]] | None = None
+        observed_context_cache: Dict[str, Any] | None = (
+            {} if schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION else None
+        )
         if not isinstance(raw_rollout, dict):
             _fail(rollout_where, "expected an object")
         if schema_version in {
             BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
             PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
             PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+            PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
             PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         }:
             assert checkpoint_transactions is not None
@@ -2898,6 +3244,7 @@ def validate_runtime_artifacts(
                 BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
             }
             and paths.get("memory_state") is not None
@@ -3018,6 +3365,26 @@ def validate_runtime_artifacts(
                     "pricing_provenance"
                 ):
                     _fail(f"{rollout_where}.pricing_provenance", "native event provenance mismatch")
+                if observed_context_cache is not None:
+                    observed_context_cache.update(
+                        {
+                            "input_tokens": int(metrics["input_tokens"]),
+                            "output_tokens": int(metrics["output_tokens"]),
+                            "cache_read_tokens": int(metrics["cache_read_tokens"]),
+                            "cache_write_tokens": int(metrics["cache_write_tokens"]),
+                            "cache_break_count": int(metrics["cache_break_count"]),
+                            "compact_request_count": int(metrics["compact_request_count"]),
+                            "auto_compact_event_count": int(
+                                metrics["auto_compact_event_count"]
+                            ),
+                            "context_projection_count": int(
+                                metrics["context_projection_count"]
+                            ),
+                            "context_projected_bytes": int(
+                                metrics["context_projected_bytes"]
+                            ),
+                        }
+                    )
         for path_key, digest_key in tree_specs:
             raw_path = paths.get(path_key)
             relative = _artifact_relative_path(
@@ -3043,6 +3410,7 @@ def validate_runtime_artifacts(
                 in {
                     PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                     PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                    PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                     PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 }
             ):
@@ -3069,6 +3437,7 @@ def validate_runtime_artifacts(
                 BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
             }:
                 activity = _cassette_memory_activity(
@@ -3079,12 +3448,21 @@ def validate_runtime_artifacts(
                 if schema_version in {
                     PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                     PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                    PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                     PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 }:
                     _validate_production_provider_tool_schema(
                         path,
                         f"{rollout_where}.artifact_paths.cassette",
                         receipt["allowed_provider_tools"],
+                    )
+                if observed_context_cache is not None:
+                    observed_context_cache.update(
+                        _cassette_context_cache(
+                            path,
+                            PRODUCTION_MODEL_ID,
+                            f"{rollout_where}.context_cache",
+                        )
                     )
                 if activity["provider_requests"] != raw_rollout.get("provider_requests"):
                     _fail(f"{rollout_where}.provider_requests", "raw cassette count mismatch")
@@ -3098,6 +3476,7 @@ def validate_runtime_artifacts(
                     )
                 if schema_version in {
                     PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                    PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                     PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 }:
                     if native_scoped_recalls is None:
@@ -3234,6 +3613,23 @@ def validate_runtime_artifacts(
                             f"{rollout_where}.memory_tool_result_bytes",
                             "raw cassette count mismatch",
                         )
+                    if observed_context_cache is not None:
+                        exposed_bytes = int(exposure["auto_injected_bytes"]) + int(
+                            exposure["tool_result_bytes"]
+                        )
+                        observed_context_cache["memory_exposed_tokens"] = (
+                            exposed_bytes + 3
+                        ) // 4
+                        observed_context_cache["original_context_preserved"] = (
+                            observed_context_cache["auto_compact_event_count"] == 0
+                            and observed_context_cache["context_projection_count"] == 0
+                        )
+        if observed_context_cache is not None:
+            if observed_context_cache != raw_rollout.get("context_cache"):
+                _fail(
+                    f"{rollout_where}.context_cache",
+                    "does not match independently re-observed native events and cassette",
+                )
         store_path = paths.get("store")
         tinykg_enabled = raw_rollout.get("tinykg_binary_sha256") is not None
         if tinykg_enabled:
@@ -3317,6 +3713,7 @@ def validate_runtime_artifacts(
                     )
             if schema_version in {
                 PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
             }:
                 consolidation_required = bool(
@@ -3338,6 +3735,19 @@ def validate_runtime_artifacts(
                         f"{rollout_where}.consolidation",
                         "only online memory arms may consolidate",
                     )
+
+    if schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+        observed_summary = _summarize_context_cache(rollouts)
+        if receipt.get("context_cache_summary") != observed_summary:
+            _fail(
+                f"{where}.context_cache_summary",
+                "does not match independently re-observed rollout context/cache evidence",
+            )
+        if receipt.get("unconditional_memory_claim_eligible") is not False:
+            _fail(
+                f"{where}.unconditional_memory_claim_eligible",
+                "must remain false for the production pilot",
+            )
 
 
 def summarize_runtime_query_plans(

@@ -890,14 +890,22 @@ pub fn run(
             var api_messages = try buildApiMessages(conversation, allocator, opts.inject_user_context, synthetic_user_input);
             defer freeApiMessages(&api_messages, allocator);
 
-            // 击穿检测:发请求前记录 system/tools/model 指纹(tools 用工具名拼接 hash)。
+            // 击穿检测必须跟真实 provider 前缀走：plan/swarm 会改变 effective
+            // system prompt，同名工具也可能改变 description/input_schema。只看基础
+            // system 或工具名会把真实前缀漂移误报成 TTL/server-side miss。
             {
                 var th = std.hash.Wyhash.init(0);
                 for (gated_tool_defs) |d| th.update(d.name);
                 var tbuf: [16]u8 = undefined;
                 std.mem.writeInt(u64, tbuf[0..8], th.final(), .little);
+                const tool_schema = serializeToolSchemasForCache(allocator, gated_tool_defs) catch null;
+                defer if (tool_schema) |bytes| allocator.free(bytes);
                 const model_for_req = opts.model_override orelse provider.model();
-                cache_detector.recordRequest(opts.system_prompt orelse "", tbuf[0..8], model_for_req);
+                cache_detector.recordRequest(
+                    effective_system_prompt orelse "",
+                    tool_schema orelse tbuf[0..8],
+                    model_for_req,
+                );
             }
 
             stream = provider.sendStreamRetry(
@@ -1999,6 +2007,21 @@ fn estimateNextRequestTokensOrFallback(
 
 const AutoCompactOutcome = enum { not_needed, compacted, skipped_no_savings, aborted, api_error };
 
+fn serializeToolSchemasForCache(
+    allocator: std.mem.Allocator,
+    tool_defs: []const json_mod.ToolDefinition,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.append(allocator, '[');
+    for (tool_defs, 0..) |tool, index| {
+        if (index > 0) try out.append(allocator, ',');
+        try @import("../api/request.zig").serializeOneTool(tool, &out, allocator);
+    }
+    try out.append(allocator, ']');
+    return try out.toOwnedSlice(allocator);
+}
+
 fn recoverContextWindowExceeded(
     conversation: *Conversation,
     provider: provider_mod.Provider,
@@ -2054,6 +2077,26 @@ fn buildPostCompactStdin(allocator: std.mem.Allocator, trigger: []const u8, summ
     try std.json.Stringify.encodeJsonString(summary, .{}, &aw.writer);
     try aw.writer.writeAll("}");
     return try aw.toOwnedSlice();
+}
+
+fn emitContextProjection(
+    backend: *const UiBackend,
+    sess: @import("session_id.zig").SessionId,
+    conversation: *const Conversation,
+    kind: []const u8,
+    cause: []const u8,
+    reduction: Conversation.ToolResultReduction,
+) void {
+    if (!reduction.changed()) return;
+    const changed = reduction.cleared +| reduction.truncated;
+    backend.emitEvent(sess, .{ .context_projection = .{
+        .kind = kind,
+        .changed_items = @intCast(@min(changed, @as(usize, std.math.maxInt(u32)))),
+        .bytes_before = @intCast(reduction.bytes_before),
+        .bytes_after = @intCast(reduction.bytes_after),
+        .active_messages = @intCast(@min(conversation.activeMessages().len, @as(usize, std.math.maxInt(u32)))),
+        .cause = cause,
+    } });
 }
 
 /// 构造 Stop hook 的 stdin JSON(last_message 自由文本须转义)。供记忆提取等 side-effect hook 用。
@@ -2126,6 +2169,7 @@ fn runAutoCompactIfNeeded(
     if (preflight_truncated.changed()) {
         outcome = .compacted;
         log.info("agent", "tool-result truncate: truncated={d} cleared={d} bytes={d}->{d} max_inline={d}", .{ preflight_truncated.truncated, preflight_truncated.cleared, preflight_truncated.bytes_before, preflight_truncated.bytes_after, tool_result_limit });
+        emitContextProjection(backend, sess, conversation, "large_tool_result_truncation", trigger_cause, preflight_truncated);
     }
 
     var request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
@@ -2143,6 +2187,7 @@ fn runAutoCompactIfNeeded(
         if (reduced.changed()) {
             outcome = .compacted;
             log.info("agent", "microcompact: cleared={d} truncated={d} old tool_results bytes={d}->{d} keep_recent_results={d} threshold={d} cause={s}", .{ reduced.cleared, reduced.truncated, reduced.bytes_before, reduced.bytes_after, conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP, micro_threshold, trigger_cause });
+            emitContextProjection(backend, sess, conversation, "stale_tool_result_microcompact", trigger_cause, reduced);
             request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
             pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), configured_threshold, request_tokens_before);
         }
@@ -2298,6 +2343,10 @@ fn runAutoCompactIfNeeded(
             request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
             pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), configured_threshold, request_tokens_before);
             log.warn("agent", "blocking-limit recovery microcompact: bytes={d}->{d} before_tokens={d} after_tokens={d} cause={s}", .{ reduced.bytes_before, reduced.bytes_after, before_block_tokens, request_tokens_before, trigger_cause });
+            // This is the same lossy operation as the earlier stale-result
+            // pressure valve.  Keep the mechanism kind stable; the trigger
+            // cause already records that this happened at the blocking limit.
+            emitContextProjection(backend, sess, conversation, "stale_tool_result_microcompact", trigger_cause, reduced);
         }
         if (pressure.isAtBlockingLimit()) {
             log.err("agent", "context blocking limit reached: tokens={d} blocking_limit={d} raw_window={d} effective_window={d} cause={s}", .{ request_tokens_before, pressure.blocking_limit, pressure.raw_context_window, pressure.effective_context_window, trigger_cause });
@@ -2662,6 +2711,43 @@ test "estimateNextRequestTokens serializes the actual next Anthropic request" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"output_config\":{\"effort\":\"medium\"}") != null);
 }
 
+test "cache-break fingerprint binds full schemas for same-named tools" {
+    const a = std.testing.allocator;
+    const first = [_]json_mod.ToolDefinition{.{
+        .name = "Read",
+        .description = "read a file",
+        .input_schema = .{
+            .prop_specs = &.{.{ .name = "file_path", .type = "string" }},
+            .required = &.{"file_path"},
+        },
+    }};
+    const changed = [_]json_mod.ToolDefinition{.{
+        .name = "Read",
+        .description = "read a bounded file slice",
+        .input_schema = .{
+            .prop_specs = &.{
+                .{ .name = "file_path", .type = "string" },
+                .{ .name = "limit", .type = "integer" },
+            },
+            .required = &.{"file_path"},
+        },
+    }};
+    const first_bytes = try serializeToolSchemasForCache(a, &first);
+    defer a.free(first_bytes);
+    const changed_bytes = try serializeToolSchemasForCache(a, &changed);
+    defer a.free(changed_bytes);
+    try std.testing.expect(!std.mem.eql(u8, first_bytes, changed_bytes));
+
+    var detector = @import("cache_break.zig").CacheBreakDetector{};
+    detector.recordRequest("stable-system", first_bytes, "glm-5.2");
+    _ = detector.checkResponse(5_000, 0);
+    detector.recordRequest("stable-system", changed_bytes, "glm-5.2");
+    try std.testing.expectEqualStrings(
+        "tool schemas changed",
+        detector.checkResponse(100, 4_900).?,
+    );
+}
+
 test "usage anchor: estimate = server tokens + suffix estimate; no anchor falls back to serialize" {
     const a = std.testing.allocator;
     var c = Conversation.init(a);
@@ -2810,8 +2896,61 @@ test "auto-compact preflight truncates huge recent tool_result before next reque
         .tools = &.{},
     }, a);
     defer a.free(body_before);
-    const reduced = c.truncateLargeToolResults(limit);
-    try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
+    const Capture = struct {
+        count: u32 = 0,
+        kind: ?[]const u8 = null,
+        changed_items: u32 = 0,
+        bytes_before: u64 = 0,
+        bytes_after: u64 = 0,
+        fn emit(ctx: *anyopaque, _: @import("session_id.zig").SessionId, ev: CoreEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (ev) {
+                .context_projection => |projection| {
+                    self.count += 1;
+                    self.kind = projection.kind;
+                    self.changed_items = projection.changed_items;
+                    self.bytes_before = projection.bytes_before;
+                    self.bytes_after = projection.bytes_after;
+                },
+                else => {},
+            }
+        }
+        fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+            return null;
+        }
+    };
+    var cap = Capture{};
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = Capture.emit, .poll = Capture.poll };
+    const outcome = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        null,
+        null,
+        null,
+        &.{},
+        null,
+        null,
+        null,
+        2,
+        "post_tool_follow_up_threshold",
+        &backend,
+        .single,
+        [_]u8{0} ** 12,
+        0,
+        0,
+        null,
+        a,
+        null,
+        null,
+        null,
+        null,
+        null,
+    );
+    try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
+    try std.testing.expectEqual(@as(u32, 1), cap.count);
+    try std.testing.expectEqualStrings("large_tool_result_truncation", cap.kind.?);
+    try std.testing.expectEqual(@as(u32, 1), cap.changed_items);
+    try std.testing.expect(cap.bytes_after < cap.bytes_before);
     const after = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
     try std.testing.expect(after < before);
 
@@ -2830,6 +2969,119 @@ test "auto-compact preflight truncates huge recent tool_result before next reque
     try std.testing.expect(std.mem.indexOf(u8, body, "Z") != null);
     try std.testing.expectEqual(Conversation.estimateTokens(body), after);
     try std.testing.expect(body.len < body_before.len);
+}
+
+test "auto-compact emits stale tool-result projection from the real microcompact path" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "inspect the accumulated results");
+
+    const result_count = 14;
+    const tool_uses = try a.alloc(msg.Block, result_count);
+    for (tool_uses, 0..) |*block, index| {
+        var id_buf: [24]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "micro-{d}", .{index});
+        block.* = .{ .tool_use = .{
+            .id = try a.dupe(u8, id),
+            .name = try a.dupe(u8, "Read"),
+            .input = try a.dupe(u8, "{}"),
+        } };
+    }
+    try c.append(.{ .role = .assistant, .blocks = tool_uses });
+
+    const tool_results = try a.alloc(msg.Block, result_count);
+    for (tool_results, 0..) |*block, index| {
+        var id_buf: [24]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "micro-{d}", .{index});
+        const content = try a.alloc(u8, 12 * 1024);
+        @memset(content, 'r');
+        block.* = .{ .tool_result = .{
+            .tool_use_id = try a.dupe(u8, id),
+            .content = content,
+            .is_error = false,
+        } };
+    }
+    try c.append(.{ .role = .user, .blocks = tool_results });
+
+    var provider_state = TestProviderState{
+        .allocator = a,
+        .max_input_tokens = 100_000,
+        .max_tokens = 32_000,
+    };
+    const provider = testProvider(&provider_state);
+    const base_tokens = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
+    const target_tokens: usize = 51_000;
+    const padding_len = if (base_tokens < target_tokens)
+        (target_tokens - base_tokens) * 4
+    else
+        0;
+    const system_prompt = try a.alloc(u8, padding_len);
+    defer a.free(system_prompt);
+    @memset(system_prompt, 's');
+    const before_tokens = try estimateNextRequestTokens(a, provider, &c, system_prompt, null, null, &.{}, null);
+    const pressure = context_pressure_mod.ContextPressure.fromModel(
+        provider.maxInputTokens(),
+        provider.maxTokens(),
+        null,
+        before_tokens,
+    );
+    try std.testing.expect(before_tokens > pressure.warning_threshold);
+    try std.testing.expect(before_tokens < pressure.auto_compact_threshold);
+
+    const Capture = struct {
+        count: u32 = 0,
+        kind: ?[]const u8 = null,
+        changed_items: u32 = 0,
+        fn emit(ctx: *anyopaque, _: @import("session_id.zig").SessionId, ev: CoreEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (ev) {
+                .context_projection => |projection| {
+                    self.count += 1;
+                    self.kind = projection.kind;
+                    self.changed_items = projection.changed_items;
+                },
+                else => {},
+            }
+        }
+        fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+            return null;
+        }
+    };
+    var cap = Capture{};
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = Capture.emit, .poll = Capture.poll };
+    const outcome = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        system_prompt,
+        null,
+        null,
+        &.{},
+        null,
+        null,
+        null,
+        2,
+        "post_tool_follow_up_threshold",
+        &backend,
+        .single,
+        [_]u8{0} ** 12,
+        0,
+        0,
+        null,
+        a,
+        null,
+        null,
+        null,
+        null,
+        null,
+    );
+    try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
+    try std.testing.expectEqual(@as(u32, 1), cap.count);
+    try std.testing.expectEqualStrings("stale_tool_result_microcompact", cap.kind.?);
+    try std.testing.expectEqual(
+        @as(u32, result_count - conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP),
+        cap.changed_items,
+    );
 }
 
 test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool suffix" {

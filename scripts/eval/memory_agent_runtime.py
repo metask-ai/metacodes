@@ -78,6 +78,8 @@ from .memory_replay import (
     _cassette_memory_exposure,
     _cassette_scoped_recall_injections,
     _cassette_treatment_activation,
+    _cassette_context_cache,
+    _summarize_context_cache,
     _validate_production_provider_tool_schema,
     _native_pricing_provenance,
     _path_is_within,
@@ -98,7 +100,7 @@ from .model import ValidationError, stable_json
 
 
 RUNTIME_RECEIPT_SCHEMA_VERSION = 3
-PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 8
+PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 9
 RUNTIME_METADATA_SCHEMA_VERSION = NATIVE_EVENT_SCHEMA_VERSION
 SCRIPTED_PROVIDER_ID = "metacodes-memory-scripted-lifecycle-v3"
 SCRIPTED_LIFECYCLE_MODE = "native-agent-loop-scripted-lifecycle-smoke"
@@ -2167,6 +2169,8 @@ def _build_runtime_receipt(
                 ),
                 "pricing_provenance": PRODUCTION_PRICING_PROVENANCE,
                 "budget_journal": budget_journal_receipt,
+                "context_cache_summary": _summarize_context_cache(rollout_receipts),
+                "unconditional_memory_claim_eligible": False,
             }
         )
     else:
@@ -2269,7 +2273,7 @@ def validate_memory_agent_resume(
     if not isinstance(rollouts, list) or len(rollouts) != len(completed):
         _fail("rollout resume checkpoint.candidate_runtime_receipt", "rollout count drift")
     if receipt.get("schema_version") != PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
-        _fail("rollout resume checkpoint.candidate_runtime_receipt", "not production v8")
+        _fail("rollout resume checkpoint.candidate_runtime_receipt", "not production v9")
     if receipt.get("quality_evidence") is not False:
         _fail("rollout resume checkpoint.candidate_runtime_receipt", "quality flag drift")
     for key, expected in identity.items():
@@ -2427,7 +2431,7 @@ def run_memory_agent_schedule(
     """Run one complete frozen schedule through scripted or production provider.
 
     The default remains the v3 zero-cost lifecycle smoke. Passing ``production``
-    selects the stricter v8 contract and requires an exclusively locked,
+    selects the stricter v9 contract and requires an exclusively locked,
     persistent authorization journal before any provider-capable subprocess.
     """
 
@@ -3396,11 +3400,17 @@ def run_memory_agent_schedule(
             f"native memory rollout {run_id} cassette",
             memory_root=memory_dir,
         )
+        context_cache_contract: Mapping[str, Any] | None = None
         if production is not None:
             _validate_production_provider_tool_schema(
                 cassette,
                 f"native memory rollout {run_id} cassette",
                 PRODUCTION_ALLOWED_PROVIDER_TOOLS,
+            )
+            context_cache_contract = _cassette_context_cache(
+                cassette,
+                PRODUCTION_MODEL_ID,
+                f"native memory rollout {run_id} context/cache",
             )
         if cassette_activity["provider_requests"] != provider_request_count:
             _fail(f"native memory rollout {run_id}", "raw provider request count drift")
@@ -3488,6 +3498,32 @@ def run_memory_agent_schedule(
             }
         )
         exposed_bytes = int(exposure["total_bytes"])
+        context_cache: Mapping[str, Any] | None = None
+        if production_mode:
+            assert context_cache_contract is not None
+            context_cache = {
+                **context_cache_contract,
+                "input_tokens": int(metrics["input_tokens"]),
+                "output_tokens": int(metrics["output_tokens"]),
+                "cache_read_tokens": int(metrics["cache_read_tokens"]),
+                "cache_write_tokens": int(metrics["cache_write_tokens"]),
+                "cache_break_count": int(metrics.get("cache_break_count", 0)),
+                "compact_request_count": int(metrics["compact_request_count"]),
+                "auto_compact_event_count": int(
+                    metrics.get("auto_compact_event_count", 0)
+                ),
+                "context_projection_count": int(
+                    metrics.get("context_projection_count", 0)
+                ),
+                "context_projected_bytes": int(
+                    metrics.get("context_projected_bytes", 0)
+                ),
+                "memory_exposed_tokens": (exposed_bytes + 3) // 4,
+                "original_context_preserved": (
+                    int(metrics.get("auto_compact_event_count", 0)) == 0
+                    and int(metrics.get("context_projection_count", 0)) == 0
+                ),
+            }
         remembered_node_ids = [int(node_id) for node_id in tool_data["remembered_node_ids"]]
         if memory_backend == "tinykg":
             memory_reads = int(cassette_activity["tinykg_reads"])
@@ -3810,6 +3846,7 @@ def run_memory_agent_schedule(
                     "compact_event_count": compact_event_count,
                     "memory_auto_injected_bytes": int(exposure["auto_injected_bytes"]),
                     "memory_tool_result_bytes": int(exposure["tool_result_bytes"]),
+                    "context_cache": context_cache,
                     "treatment_activation": treatment_activation,
                     "scoped_recall": scoped_recall_activation,
                     "consolidation": consolidation_receipt,

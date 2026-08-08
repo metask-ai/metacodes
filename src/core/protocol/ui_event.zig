@@ -228,6 +228,19 @@ pub const CoreEvent = union(enum) {
         cause: []const u8 = "trigger",
     },
 
+    /// 本地上下文投影：没有发 compact-summary 请求，但活跃 provider 上下文已被
+    /// 截断或把旧 tool_result 替换成 stub。原始 transcript 仍可保留；该事件只说明
+    /// 下一次模型请求看到的上下文发生了有损变化，供评测禁止静默宣称保真/cache 优势。
+    context_projection: struct {
+        /// large_tool_result_truncation | stale_tool_result_microcompact
+        kind: []const u8,
+        changed_items: u32,
+        bytes_before: u64,
+        bytes_after: u64,
+        active_messages: u32,
+        cause: []const u8,
+    },
+
     /// 流式建连重试提示(第 attempt/max 次,退避 delay_ms)。
     retry_notice: struct {
         attempt: u32,

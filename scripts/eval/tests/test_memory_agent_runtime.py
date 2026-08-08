@@ -59,6 +59,7 @@ from scripts.eval.memory_replay import (
     PRE_CONSOLIDATION_PRODUCTION_RUNNER_SOURCE_MODULES,
     PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+    PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     PRODUCTION_SANDBOX_BACKEND,
     PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION,
     PRODUCTION_TOOL_NETWORK_ISOLATION,
@@ -66,8 +67,10 @@ from scripts.eval.memory_replay import (
     RUNNER_SOURCE_MODULES,
     _artifact_tree_digest,
     _cassette_memory_activity,
+    _cassette_context_cache,
     _cassette_memory_exposure,
     _cassette_treatment_activation,
+    _summarize_context_cache,
     _production_harness_fingerprint,
     _query_plan_source_bound,
     _validate_production_provider_tool_schema,
@@ -100,6 +103,234 @@ def digest(label: str) -> str:
 
 
 class MemoryAgentRuntimeContractTest(unittest.TestCase):
+    def test_context_cache_contract_binds_full_prefix_and_breaker_finalization(self):
+        def normal(system="stable-system", tools=None):
+            return {
+                "model": "glm-5.2",
+                "system": system,
+                "tools": copy.deepcopy(
+                    tools
+                    if tools is not None
+                    else [{"name": "Read", "input_schema": {"type": "object"}}]
+                ),
+                "cache_control": {"type": "ephemeral"},
+                "messages": [{"role": "user", "content": []}],
+            }
+
+        breaker = {
+            "model": "glm-5.2",
+            "system": "stable-system",
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "failed-tool",
+                            "content": "failed",
+                            "is_error": True,
+                        },
+                        {"type": "text", "text": LOOP_BREAKER_FINALIZATION},
+                    ],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+
+            def write(*bodies):
+                for path in cassette.glob("req-*.json"):
+                    path.unlink()
+                for index, body in enumerate(bodies, 1):
+                    (cassette / f"req-{index:03d}.json").write_text(
+                        json.dumps(
+                            body,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            sort_keys=False,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+
+            write(normal(), normal(), breaker)
+            observed = _cassette_context_cache(cassette, "glm-5.2", "test")
+            self.assertEqual(observed["normal_request_count"], 2)
+            self.assertEqual(observed["tool_less_finalization_request_count"], 1)
+            self.assertTrue(observed["prefix_stable"])
+            self.assertEqual(observed["system_prompt_bytes"], len("stable-system"))
+            self.assertEqual(
+                observed["tools_schema_bytes"],
+                len(
+                    json.dumps(
+                        normal()["tools"],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=False,
+                    ).encode("utf-8")
+                ),
+            )
+            self.assertEqual(
+                observed["system_prompt_sha256"], digest("stable-system")
+            )
+
+            variants = {
+                "system or full tool schema changed": (normal(), normal(system="drift")),
+                "tool schema": (
+                    normal(),
+                    normal(tools=[{"name": "Bash", "input_schema": {"type": "object"}}]),
+                ),
+                "tool property order": (
+                    normal(),
+                    normal(
+                        tools=[
+                            {
+                                "input_schema": {"type": "object"},
+                                "name": "Read",
+                            }
+                        ]
+                    ),
+                ),
+                "cache_control": (
+                    normal(),
+                    {key: value for key, value in normal().items() if key != "cache_control"},
+                ),
+            }
+            for label, bodies in variants.items():
+                with self.subTest(label=label):
+                    write(*bodies)
+                    with self.assertRaises(ValidationError):
+                        _cassette_context_cache(cassette, "glm-5.2", "test")
+
+    def test_context_cache_summary_blocks_lower_reuse_than_no_memory(self):
+        rows = []
+        for arm, cache_read in (
+            ("no_memory", 80),
+            ("markdown_memory", 60),
+            ("tinykg_lexical", 80),
+        ):
+            rows.append(
+                {
+                    "arm": arm,
+                    "estimated_cost_usd": 0.1,
+                    "metered_tokens": 200,
+                    "host_elapsed_ms": 10,
+                    "context_cache": {
+                        "normal_request_count": 2,
+                        "tool_less_finalization_request_count": 0,
+                        "cacheable_prefix_sha256": digest(arm),
+                        "system_prompt_sha256": digest(f"system:{arm}"),
+                        "system_prompt_bytes": 100,
+                        "tools_schema_sha256": digest(f"tools:{arm}"),
+                        "tools_schema_bytes": 200,
+                        "prefix_stable": True,
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "cache_read_tokens": cache_read,
+                        "cache_write_tokens": 20,
+                        "cache_break_count": 0,
+                        "compact_request_count": 0,
+                        "auto_compact_event_count": 0,
+                        "context_projection_count": 0,
+                        "context_projected_bytes": 0,
+                        "memory_exposed_tokens": 0,
+                        "original_context_preserved": True,
+                    },
+                }
+            )
+        summary = _summarize_context_cache(rows)
+        self.assertFalse(summary["context_cache_claim_gate_passed"])
+        self.assertIn(
+            "markdown_memory:cache_reuse_below_no_memory",
+            summary["claim_blockers"],
+        )
+
+    def test_noop_compact_request_blocks_cache_claim_without_faking_context_loss(self):
+        rows = []
+        for arm in ("no_memory", "markdown_memory", "tinykg_lexical"):
+            rows.append(
+                {
+                    "arm": arm,
+                    "estimated_cost_usd": 0.1,
+                    "metered_tokens": 200,
+                    "host_elapsed_ms": 10,
+                    "context_cache": {
+                        "normal_request_count": 2,
+                        "tool_less_finalization_request_count": 0,
+                        "cacheable_prefix_sha256": digest(arm),
+                        "system_prompt_sha256": digest(f"system:{arm}"),
+                        "system_prompt_bytes": 100,
+                        "tools_schema_sha256": digest(f"tools:{arm}"),
+                        "tools_schema_bytes": 200,
+                        "prefix_stable": True,
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "cache_read_tokens": 60,
+                        "cache_write_tokens": 20,
+                        "cache_break_count": 0,
+                        "compact_request_count": 1 if arm == "tinykg_lexical" else 0,
+                        "auto_compact_event_count": 0,
+                        "context_projection_count": 0,
+                        "context_projected_bytes": 0,
+                        "memory_exposed_tokens": 0,
+                        "original_context_preserved": True,
+                    },
+                }
+            )
+        summary = _summarize_context_cache(rows)
+        self.assertFalse(summary["context_cache_claim_gate_passed"])
+        self.assertIn("tinykg_lexical:compact", summary["claim_blockers"])
+        self.assertNotIn(
+            "tinykg_lexical:context_projection", summary["claim_blockers"]
+        )
+        self.assertTrue(
+            summary["by_arm"]["tinykg_lexical"]["original_context_preserved"]
+        )
+
+    def test_context_cache_summary_does_not_launder_equal_zero_hits(self):
+        rows = []
+        for arm in ("no_memory", "markdown_memory", "tinykg_lexical"):
+            rows.append(
+                {
+                    "arm": arm,
+                    "estimated_cost_usd": 0.1,
+                    "metered_tokens": 120,
+                    "host_elapsed_ms": 10,
+                    "context_cache": {
+                        "normal_request_count": 2,
+                        "tool_less_finalization_request_count": 0,
+                        "cacheable_prefix_sha256": digest(arm),
+                        "system_prompt_sha256": digest(f"system:{arm}"),
+                        "system_prompt_bytes": 100,
+                        "tools_schema_sha256": digest(f"tools:{arm}"),
+                        "tools_schema_bytes": 200,
+                        "prefix_stable": True,
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "cache_read_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "cache_break_count": 0,
+                        "compact_request_count": 0,
+                        "auto_compact_event_count": 0,
+                        "context_projection_count": 0,
+                        "context_projected_bytes": 0,
+                        "memory_exposed_tokens": 0,
+                        "original_context_preserved": True,
+                    },
+                }
+            )
+        summary = _summarize_context_cache(rows)
+        self.assertFalse(summary["context_cache_claim_gate_passed"])
+        self.assertEqual(
+            [
+                "markdown_memory:cache_reuse_unobserved",
+                "no_memory:cache_reuse_unobserved",
+                "tinykg_lexical:cache_reuse_unobserved",
+            ],
+            summary["claim_blockers"],
+        )
+
     def test_production_schema_accepts_only_final_toolless_breaker_closure(self):
         allowed = list(PRODUCTION_ALLOWED_PROVIDER_TOOLS)
         ordinary = {
@@ -3382,6 +3613,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 request_body["model"] = body["model"]
                 request_body["system"] = body["system"]
                 request_body["tools"] = copy.deepcopy(body["tools"])
+                request_body["cache_control"] = {"type": "ephemeral"}
                 request_path.write_text(
                     stable_json(request_body) + "\n",
                     encoding="utf-8",
@@ -3547,6 +3779,24 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             rollout["memory_auto_injected_bytes"] = exposure["auto_injected_bytes"]
             rollout["memory_tool_result_bytes"] = exposure["tool_result_bytes"]
             observation["memory"]["exposed_tokens"] = (exposure["total_bytes"] + 3) // 4
+            rollout["context_cache"] = {
+                **_cassette_context_cache(
+                    cassette,
+                    "glm-5.2",
+                    f"test v9 context/cache {sequence}",
+                ),
+                "input_tokens": rollout["metered_tokens"],
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "cache_break_count": 0,
+                "compact_request_count": 0,
+                "auto_compact_event_count": 0,
+                "context_projection_count": 0,
+                "context_projected_bytes": 0,
+                "memory_exposed_tokens": (exposure["total_bytes"] + 3) // 4,
+                "original_context_preserved": True,
+            }
             rollout["treatment_activation"] = _cassette_treatment_activation(
                 cassette,
                 runtime_arm,
@@ -3612,6 +3862,10 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         receipt["observations_sha256"] = hashlib.sha256(
             stable_json(observations).encode("utf-8")
         ).hexdigest()
+        receipt["context_cache_summary"] = _summarize_context_cache(
+            receipt["rollouts"]
+        )
+        receipt["unconditional_memory_claim_eligible"] = False
         return manifest, observations, receipt
 
     def _v4(self, root):
@@ -4361,16 +4615,55 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             )
             validate_runtime_artifacts(receipt, root)
 
+            projected_receipt = copy.deepcopy(receipt)
+            projected = projected_receipt["rollouts"][0]["context_cache"]
+            projected["context_projection_count"] = 1
+            projected["context_projected_bytes"] = 64
+            projected["original_context_preserved"] = False
+            projected_receipt["context_cache_summary"] = _summarize_context_cache(
+                projected_receipt["rollouts"]
+            )
+            validate_runtime_receipt(
+                projected_receipt,
+                manifest,
+                observations,
+                manifest["dataset"]["source_sha256"],
+            )
+            with self.assertRaisesRegex(
+                ValidationError,
+                "independently re-observed native events and cassette",
+            ):
+                validate_runtime_artifacts(projected_receipt, root)
+
+            v8_receipt = copy.deepcopy(receipt)
+            v8_receipt["schema_version"] = (
+                PRE_CONTEXT_CACHE_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
+            )
+            v8_receipt.pop("context_cache_summary")
+            v8_receipt.pop("unconditional_memory_claim_eligible")
+            for v8_rollout in v8_receipt["rollouts"]:
+                v8_rollout.pop("context_cache")
+            validate_runtime_receipt(
+                v8_receipt,
+                manifest,
+                observations,
+                manifest["dataset"]["source_sha256"],
+            )
+            validate_runtime_artifacts(v8_receipt, root)
+
             legacy_observations = copy.deepcopy(observations)
             legacy_receipt = copy.deepcopy(receipt)
             legacy_receipt["schema_version"] = (
                 PRE_WORKSPACE_OUTCOME_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
             )
             legacy_receipt.pop("ripgrep_snapshot_path")
+            legacy_receipt.pop("context_cache_summary")
+            legacy_receipt.pop("unconditional_memory_claim_eligible")
             for legacy_observation, legacy_rollout in zip(
                 legacy_observations,
                 legacy_receipt["rollouts"],
             ):
+                legacy_rollout.pop("context_cache")
                 legacy_observation["schema_version"] = 1
                 legacy_observation.pop("workspace")
                 legacy_rollout["observation_sha256"] = hashlib.sha256(
@@ -4481,6 +4774,12 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 exposed = (
                     inactive_rollout["memory_auto_injected_bytes"]
                     + inactive_rollout["memory_tool_result_bytes"]
+                )
+                inactive_rollout["context_cache"]["memory_exposed_tokens"] = (
+                    exposed + 3
+                ) // 4
+                inactive_receipt["context_cache_summary"] = _summarize_context_cache(
+                    inactive_receipt["rollouts"]
                 )
                 inactive_observation["memory"]["exposed_tokens"] = (exposed + 3) // 4
                 inactive_observation["evaluator"] = {

@@ -666,6 +666,17 @@ class E2EAdapterTest(unittest.TestCase):
                 }
             },
             {
+                "context_projection": {
+                    "trace_id": "partial",
+                    "kind": "large_tool_result_truncation",
+                    "changed_items": 1,
+                    "bytes_before": 1000,
+                    "bytes_after": 400,
+                    "active_messages": 3,
+                    "cause": "post_tool_follow_up_threshold",
+                }
+            },
+            {
                 "usage": {
                     "trace_id": "partial",
                     "input_tokens": 100,
@@ -712,7 +723,9 @@ class E2EAdapterTest(unittest.TestCase):
             self.assertEqual(native["stop_reasons"], ["incomplete"])
             self.assertEqual(native["metrics"]["model_request_count"], 2)
             self.assertEqual(native["metrics"]["compact_request_count"], 1)
-            self.assertEqual(native["metrics"]["wall_time_ms"], 5000)
+            self.assertEqual(native["metrics"]["context_projection_count"], 1)
+            self.assertEqual(native["metrics"]["context_projected_bytes"], 600)
+            self.assertEqual(native["metrics"]["wall_time_ms"], 6000)
             self.assertEqual(native["metrics"]["cost_usd"], 0.01)
 
             path.write_text('{"schema_version":3}', encoding="utf-8")

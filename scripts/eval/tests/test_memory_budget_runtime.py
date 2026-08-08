@@ -173,8 +173,9 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
             record_dir = os.environ["METACODES_RECORD_DIR"]
             request_body = {{
                 "model": "glm-5.2",
-                "system": "",
+                "system": "budget-runtime-l2-system",
                 "tools": [],
+                "cache_control": {{"type": "ephemeral"}},
                 "messages": [{{
                     "role": "user",
                     "content": [{{"type": "text", "text": "budget-runtime-l2"}}],

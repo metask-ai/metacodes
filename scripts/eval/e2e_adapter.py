@@ -1163,6 +1163,7 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
                 "cache_break",
                 "continuation",
                 "auto_compact",
+                "context_projection",
                 "run_finished",
             }
             if kind not in known_kinds:
@@ -1293,6 +1294,12 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
             "cache_break": ("depth", "cache_read", "cache_creation"),
             "continuation": ("depth", "n", "max"),
             "auto_compact": ("dropped", "kept", "before_tokens", "after_tokens"),
+            "context_projection": (
+                "changed_items",
+                "bytes_before",
+                "bytes_after",
+                "active_messages",
+            ),
             "run_finished": ("depth", "turns", "tool_calls", "wall_time_ms", "dropped_events"),
             "scoped_recall": (
                 "result_count",
@@ -1353,6 +1360,20 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
             not isinstance(payload.get("cause"), str) or not payload.get("cause")
         ):
             return None, "compact_request_finished has invalid cause"
+        if kind == "context_projection":
+            projection_kind = payload.get("kind")
+            if projection_kind not in {
+                "large_tool_result_truncation",
+                "stale_tool_result_microcompact",
+            }:
+                return None, "context_projection has invalid kind"
+            if (
+                payload.get("changed_items", 0) < 1
+                or payload.get("bytes_after", 0) >= payload.get("bytes_before", 0)
+                or not isinstance(payload.get("cause"), str)
+                or not payload.get("cause")
+            ):
+                return None, "context_projection does not describe a real reduction"
         if kind == "run_finished" and (
             not isinstance(payload.get("stop_reason"), str)
             or not payload.get("stop_reason")
@@ -1501,6 +1522,15 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
     scoped_recalls = [
         payload for kind, payload, _seq, _session in events if kind == "scoped_recall"
     ]
+    context_projections = [
+        payload for kind, payload, _seq, _session in events if kind == "context_projection"
+    ]
+    cache_breaks = [
+        payload for kind, payload, _seq, _session in events if kind == "cache_break"
+    ]
+    auto_compacts = [
+        payload for kind, payload, _seq, _session in events if kind == "auto_compact"
+    ]
     if len(scoped_recalls) > len(starts):
         return None, "native trace has more scoped recall receipts than invocations"
     failures = [item for item in tool_finishes if item.get("is_error")]
@@ -1611,6 +1641,13 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
             int(item.get("elapsed_ms", 0)) for item in compact_requests
         ),
         "compact_request_outcomes": compact_request_outcomes,
+        "cache_break_count": len(cache_breaks),
+        "auto_compact_event_count": len(auto_compacts),
+        "context_projection_count": len(context_projections),
+        "context_projected_bytes": sum(
+            int(item["bytes_before"]) - int(item["bytes_after"])
+            for item in context_projections
+        ),
         "tool_time_ms": tool_time_ms,
         "tool_stage_time_ms": tool_stage_time_ms,
         "tool_parallelism_factor": tool_parallelism_factor,

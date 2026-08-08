@@ -416,6 +416,15 @@ pub const EvalEvent = union(enum) {
         after_tokens: u64,
         cause: []const u8,
     },
+    context_projection: struct {
+        trace_id: []const u8,
+        kind: []const u8,
+        changed_items: u32,
+        bytes_before: u64,
+        bytes_after: u64,
+        active_messages: u32,
+        cause: []const u8,
+    },
     run_finished: struct {
         trace_id: []const u8,
         depth: u8,
@@ -712,6 +721,15 @@ pub const EvaluationBackend = struct {
                 .after_tokens = a.after_tokens,
                 .cause = a.cause,
             } }),
+            .context_projection => |p| self.append(session, .{ .context_projection = .{
+                .trace_id = self.traceSlice(),
+                .kind = p.kind,
+                .changed_items = p.changed_items,
+                .bytes_before = p.bytes_before,
+                .bytes_after = p.bytes_after,
+                .active_messages = p.active_messages,
+                .cause = p.cause,
+            } }),
             .diag_run_end => |d| {
                 self.setTrace(d.trace_id);
                 self.ensureRunStarted(session);
@@ -895,6 +913,14 @@ test "EvaluationBackend projects versioned redacted events" {
     be.emit(be.ctx, .single, .{ .diag_turn_begin = .{ .trace_id = tid, .depth = 0, .turn = 1 } });
     be.emit(be.ctx, .single, .{ .diag_model_request = .{ .trace_id = tid, .depth = 0, .turn = 1, .attempt = 0, .elapsed_ms = 23, .outcome = "success" } });
     be.emit(be.ctx, .single, .{ .diag_compact_request = .{ .trace_id = tid, .depth = 0, .turn = 1, .elapsed_ms = 17, .outcome = "success", .cause = "threshold" } });
+    be.emit(be.ctx, .single, .{ .context_projection = .{
+        .kind = "large_tool_result_truncation",
+        .changed_items = 1,
+        .bytes_before = 4096,
+        .bytes_after = 1024,
+        .active_messages = 3,
+        .cause = "post_tool_follow_up_threshold",
+    } });
     be.emit(be.ctx, .single, .{ .tool_start = .{ .id = "tu-1", .name = "Write", .input = "{\"secret\":\"do-not-store\"}" } });
     be.emit(be.ctx, .single, .{ .tool_result = .{
         .id = "tu-1",
@@ -924,6 +950,8 @@ test "EvaluationBackend projects versioned redacted events" {
     try std.testing.expect(std.mem.indexOf(u8, out, "tool_finished") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "model_request_finished") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "compact_request_finished") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "context_projection") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "large_tool_result_truncation") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "tool_stage_finished") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "invalid_args") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"error_category\":\"user_error\"") != null);
@@ -933,7 +961,7 @@ test "EvaluationBackend projects versioned redacted events" {
     try std.testing.expect(std.mem.indexOf(u8, out, "run_finished") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "do-not-store") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "private") == null);
-    try std.testing.expectEqual(@as(u64, 10), eval.sequence);
+    try std.testing.expectEqual(@as(u64, 11), eval.sequence);
 }
 
 test "EvaluationBackend binds one scoped recall receipt after run start" {

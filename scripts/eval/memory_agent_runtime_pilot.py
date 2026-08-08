@@ -446,6 +446,13 @@ def main(argv: list[str] | None = None) -> int:
             "provider_billed_cost_usd": receipt["provider_billed_cost_usd"],
             "estimated_cost_usd": receipt["estimated_cost_usd"],
             "metered_tokens": receipt["metered_tokens"],
+            "context_cache_summary": receipt["context_cache_summary"],
+            "context_cache_claim_gate_passed": receipt["context_cache_summary"][
+                "context_cache_claim_gate_passed"
+            ],
+            "unconditional_memory_claim_eligible": receipt[
+                "unconditional_memory_claim_eligible"
+            ],
             "budget_journal_id": receipt["budget_journal"]["journal_id"],
             "budget_journal_revision": receipt["budget_journal"]["revision"],
             "budget_journal_head_sha256": receipt["budget_journal"]["head_sha256"],
