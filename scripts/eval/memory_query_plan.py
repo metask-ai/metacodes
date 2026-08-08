@@ -20,7 +20,7 @@ from .model import ValidationError, stable_json
 
 
 TRACE_SCHEMA_VERSION = "metacodes-memory-query-plan-trace-v1"
-REPORT_SCHEMA_VERSION = "metacodes-memory-query-plan-report-v1"
+REPORT_SCHEMA_VERSION = "metacodes-memory-query-plan-report-v2"
 LEXICAL_PLAN_SCHEMA_VERSION = "lexical-query-plan-v1"
 SIDECAR_NAME = "query-plan.json"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -553,18 +553,61 @@ def load_and_verify_query_plan_sidecar(
     return value
 
 
-def summarize_query_plan_traces(traces: Sequence[Mapping[str, Any] | None]) -> Dict[str, Any]:
-    status_counts = {key: 0 for key in ("verified", "invalid", "not_applicable", "legacy_unavailable")}
+def summarize_query_plan_traces(
+    traces: Sequence[Mapping[str, Any] | None],
+    *,
+    host_recall_satisfied: Sequence[bool] | None = None,
+) -> Dict[str, Any]:
+    """Summarize explicit plans without erasing host-scoped recall.
+
+    Query-plan sidecars deliberately describe only model-issued ``KgRecall``
+    calls.  A production runtime may already have completed and committed a
+    host-scoped lookup before the model starts.  The caller may provide that
+    independently verified fact here; it only reclassifies the exact
+    no-explicit-call gap and can never launder a malformed explicit plan.
+    """
+
+    if host_recall_satisfied is None:
+        host_recall_satisfied = [False] * len(traces)
+    if len(host_recall_satisfied) != len(traces):
+        _fail("memory query-plan summary", "host recall status length mismatch")
+    status_counts = {
+        key: 0
+        for key in (
+            "explicit_plan_verified",
+            "host_recall_satisfied",
+            "invalid",
+            "not_applicable",
+            "legacy_unavailable",
+        )
+    }
     calls: List[Mapping[str, Any]] = []
     plans: set[Tuple[str, str]] = set()
     rollout_rows: List[Mapping[str, Any]] = []
-    for trace in traces:
+    for trace, host_satisfied in zip(traces, host_recall_satisfied):
         if trace is None:
+            if host_satisfied:
+                _fail("memory query-plan summary", "legacy trace cannot claim host recall")
             status_counts["legacy_unavailable"] += 1
             rollout_rows.append({"status": "legacy_unavailable"})
             continue
         validate_query_plan_trace(trace)
-        status = str(trace["status"])
+        trace_status = str(trace["status"])
+        if host_satisfied and trace["memory_backend"] not in TINYKG_BACKENDS:
+            _fail(
+                "memory query-plan summary",
+                "non-TinyKG trace cannot claim host recall",
+            )
+        if trace_status == "verified":
+            status = "explicit_plan_verified"
+        elif (
+            trace_status == "invalid"
+            and host_satisfied
+            and trace["invalid_reasons"] == ["TinyKG backend executed no KgRecall"]
+        ):
+            status = "host_recall_satisfied"
+        else:
+            status = trace_status
         status_counts[status] += 1
         rollout_rows.append(
             {
@@ -572,11 +615,13 @@ def summarize_query_plan_traces(traces: Sequence[Mapping[str, Any] | None]) -> D
                 "arm": trace["arm"],
                 "memory_backend": trace["memory_backend"],
                 "status": status,
+                "trace_status": trace_status,
+                "host_recall_satisfied": host_satisfied,
                 "kg_recall_count": trace["kg_recall_count"],
                 "invalid_reasons": trace["invalid_reasons"],
             }
         )
-        if status != "verified":
+        if status != "explicit_plan_verified":
             continue
         for call in trace["calls"]:
             calls.append(call)
@@ -610,8 +655,8 @@ def summarize_query_plan_traces(traces: Sequence[Mapping[str, Any] | None]) -> D
         "schema_version": REPORT_SCHEMA_VERSION,
         "rollouts": len(traces),
         "status_counts": status_counts,
-        "verified_calls": len(calls),
-        "verified_plans": len(plans),
+        "explicit_verified_calls": len(calls),
+        "explicit_verified_plans": len(plans),
         "new_hit_count": new_total,
         "repeated_hit_count": repeated_total,
         "unique_gain_ratio": new_total / denominator if denominator else None,
@@ -644,8 +689,8 @@ def render_query_plan_markdown(summary: Mapping[str, Any], title: str) -> str:
         "",
         "## Governed retrieval",
         "",
-        f"- Verified calls: {summary['verified_calls']}",
-        f"- Verified plans: {summary['verified_plans']}",
+        f"- Explicit verified calls: {summary['explicit_verified_calls']}",
+        f"- Explicit verified plans: {summary['explicit_verified_plans']}",
         f"- New/repeated hits: {summary['new_hit_count']} / {summary['repeated_hit_count']}",
         f"- Unique gain ratio: {number(summary['unique_gain_ratio'])}",
         f"- Mean calls before stopping: {number(summary['mean_calls_before_stopping'])}",

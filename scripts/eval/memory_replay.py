@@ -3281,6 +3281,7 @@ def summarize_runtime_query_plans(
     if not isinstance(rollouts, list):
         _fail(where, "runtime receipt has no rollouts")
     traces: List[Mapping[str, Any] | None] = []
+    host_recall_satisfied: List[bool] = []
     for index, rollout in enumerate(rollouts):
         rollout_where = f"{where}.rollouts[{index}]"
         if not isinstance(rollout, dict):
@@ -3298,17 +3299,26 @@ def summarize_runtime_query_plans(
             f"{rollout_where}.artifact_paths.cassette",
             directory=True,
         )
-        traces.append(
-            load_and_verify_query_plan_sidecar(
-                cassette,
-                run_id=str(rollout.get("run_id")),
-                arm=str(rollout.get("arm")),
-                memory_backend=str(rollout.get("memory_backend")),
-                required=query_plan_bound,
-                where=f"{rollout_where}.query_plan",
+        trace = load_and_verify_query_plan_sidecar(
+            cassette,
+            run_id=str(rollout.get("run_id")),
+            arm=str(rollout.get("arm")),
+            memory_backend=str(rollout.get("memory_backend")),
+            required=query_plan_bound,
+            where=f"{rollout_where}.query_plan",
+        )
+        traces.append(trace)
+        scoped_recall = rollout.get("scoped_recall")
+        host_recall_satisfied.append(
+            bool(
+                isinstance(scoped_recall, dict)
+                and scoped_recall.get("status") in {"injected", "no_hits"}
             )
         )
-    return summarize_query_plan_traces(traces)
+    return summarize_query_plan_traces(
+        traces,
+        host_recall_satisfied=host_recall_satisfied,
+    )
 
 
 def validate_manifest(manifest: Mapping[str, Any], where: str = "memory manifest") -> None:

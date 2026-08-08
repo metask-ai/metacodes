@@ -142,7 +142,7 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             )
             self.assertEqual(replayed, trace)
             summary = summarize_query_plan_traces([trace])
-            self.assertEqual(summary["verified_calls"], 2)
+            self.assertEqual(summary["explicit_verified_calls"], 2)
             self.assertEqual(summary["new_hit_count"], 3)
             self.assertEqual(summary["repeated_hit_count"], 1)
             self.assertEqual(summary["unique_gain_ratio"], 0.75)
@@ -277,6 +277,78 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             summary = summarize_query_plan_traces([None, trace])
             self.assertEqual(summary["status_counts"]["legacy_unavailable"], 1)
             self.assertEqual(summary["status_counts"]["not_applicable"], 1)
+
+    def test_verified_host_recall_only_covers_missing_explicit_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            (cassette / "req-001.json").write_text(
+                json.dumps({"messages": []}) + "\n",
+                encoding="utf-8",
+            )
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-host-recall",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+            self.assertEqual(trace["status"], "invalid")
+            summary = summarize_query_plan_traces(
+                [trace],
+                host_recall_satisfied=[True],
+            )
+            self.assertEqual(summary["status_counts"]["host_recall_satisfied"], 1)
+            self.assertEqual(summary["status_counts"]["invalid"], 0)
+            self.assertEqual(
+                summary["rollout_status"][0]["trace_status"],
+                "invalid",
+            )
+
+    def test_host_recall_cannot_launder_malformed_explicit_plan(self):
+        variants = [{"kind": "exact", "text": "needle"}]
+        forged = self._call(
+            "kg-1",
+            variants=variants,
+            hits=(7,),
+            count_override=(0, 0),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(cassette, [forged])
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-forged-host",
+                arm="tinykg_lexical",
+                memory_backend="tinykg",
+            )
+            summary = summarize_query_plan_traces(
+                [trace],
+                host_recall_satisfied=[True],
+            )
+            self.assertEqual(summary["status_counts"]["invalid"], 1)
+            self.assertEqual(summary["status_counts"]["host_recall_satisfied"], 0)
+
+    def test_host_recall_vector_must_align_with_traces(self):
+        with self.assertRaisesRegex(ValidationError, "status length mismatch"):
+            summarize_query_plan_traces([], host_recall_satisfied=[True])
+
+    def test_non_tinykg_trace_cannot_claim_host_recall(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            (cassette / "req-001.json").write_text(
+                json.dumps({"messages": []}) + "\n",
+                encoding="utf-8",
+            )
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-control",
+                arm="no_memory",
+                memory_backend="none",
+            )
+            with self.assertRaisesRegex(ValidationError, "non-TinyKG"):
+                summarize_query_plan_traces(
+                    [trace],
+                    host_recall_satisfied=[True],
+                )
 
 
 if __name__ == "__main__":
