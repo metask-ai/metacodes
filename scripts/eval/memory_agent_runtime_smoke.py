@@ -525,7 +525,7 @@ def main(argv: list[str] | None = None) -> int:
                 tinykg_sha,
             )
 
-            procedural_fixture = REPO_ROOT / "evals/memory/fixtures/procedural-coding-source.json"
+            procedural_fixture = REPO_ROOT / "evals/memory/fixtures/procedural-coding-source-v3.json"
             procedural_slice, validators, procedural_manifest = adapt_procedural(
                 procedural_fixture,
                 _execution(),
