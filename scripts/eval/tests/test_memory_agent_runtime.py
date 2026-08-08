@@ -1673,6 +1673,89 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
         ).validate(len(manifest["schedule"]))
 
+    def test_checked_in_pilot_v17_is_a_new_contained_stop_replication(self):
+        pilot = ROOT / "evals/memory/pilots/procedural-glm52-v17"
+        contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        source = json.loads((pilot / "source.json").read_text(encoding="utf-8"))
+        manifest = load_manifest(pilot / "manifest.json")
+        execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
+
+        for name, identity in contract["artifacts"].items():
+            payload = (pilot / name).read_bytes()
+            self.assertEqual(len(payload), identity["bytes"])
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), identity["sha256"])
+        fixture = ROOT / contract["generation"]["source_path"]
+        self.assertEqual(
+            hashlib.sha256(fixture.read_bytes()).hexdigest(),
+            contract["generation"]["expected_upstream_sha256"],
+        )
+        self.assertEqual(
+            sorted(family["id"] for family in source["families"]),
+            contract["generation"]["family_ids"],
+        )
+        self.assertEqual(manifest["execution"], execution)
+        self.assertEqual(manifest["manifest_id"], "coding-intent-families-2026080818-4")
+        self.assertEqual(len(manifest["schedule"]), 144)
+        self.assertNotEqual(
+            manifest["dataset"]["source_sha256"],
+            load_manifest(
+                ROOT / "evals/memory/pilots/procedural-glm52-v16/manifest.json"
+            )["dataset"]["source_sha256"],
+        )
+
+        positions = {}
+        cases = {case["id"]: case for case in manifest["cases"]}
+        offline_by_arm = {}
+        for offset in range(0, len(manifest["schedule"]), 3):
+            for position, row in enumerate(manifest["schedule"][offset : offset + 3]):
+                key = (row["arm"], position)
+                positions[key] = positions.get(key, 0) + 1
+                if cases[row["case_id"]]["split"] == "offline":
+                    offline_by_arm[row["arm"]] = offline_by_arm.get(row["arm"], 0) + 1
+        self.assertEqual(
+            set(positions.values()),
+            {contract["schedule"]["arm_position_counts"]},
+        )
+        self.assertEqual(
+            set(offline_by_arm.values()),
+            {contract["schedule"]["offline_rows_per_arm"]},
+        )
+        rows = [
+            [item["sequence"], item["case_id"], item["trial"], item["arm"]]
+            for item in manifest["schedule"]
+        ]
+        ordered_tsv = "".join("\t".join(str(value) for value in row) + "\n" for row in rows)
+        self.assertEqual(
+            hashlib.sha256(ordered_tsv.encode("utf-8")).hexdigest(),
+            contract["schedule"]["ordered_tsv_sha256"],
+        )
+        self.assertFalse(contract["incident_guard"]["provider_schema_exposes_disallowed_tools"])
+        self.assertFalse(contract["incident_guard"]["v16_transaction_reuse"])
+        self.assertIn("fail closed", contract["incident_guard"]["uncontained_attempt"])
+        self.assertEqual(
+            [
+                (item["pilot_id"], item["status"], item["uncertain_authorized_transactions"])
+                for item in contract["predecessor_attempts"]
+            ],
+            [("procedural-glm52-v16", "halted-runner-misclassification", 0)],
+        )
+        budget = contract["budget_authority"]
+        self.assertLessEqual(
+            budget["prior_conservative_cost_usd"] + budget["max_total_cost_usd"],
+            budget["user_authorization_max_cost_usd"],
+        )
+        ProductionRuntimeConfig(
+            api_key="test-only",
+            allow_paid_rollouts=True,
+            max_total_cost_usd=budget["max_total_cost_usd"],
+            max_total_metered_tokens=budget["max_total_metered_tokens"],
+            max_rollout_cost_usd=budget["max_rollout_cost_usd"],
+            max_rollout_metered_tokens=budget["max_rollout_metered_tokens"],
+            max_output_tokens=budget["max_output_tokens"],
+            ripgrep_binary=TEST_RIPGREP,
+            ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
+        ).validate(len(manifest["schedule"]))
+
     def _materialize_valid_production_events(self, root, rollout, grader_fingerprint):
         cassette = root / rollout["artifact_paths"]["cassette"]
         uses = {}
