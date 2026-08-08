@@ -1,0 +1,145 @@
+{
+  "schema_version": 1,
+  "manifest_id": "coding-intent-families-2026080817-1",
+  "artifact_provenance": {
+    "local_only_artifact_tree": "~/.local/state/metacodes/memory-pilots/procedural-glm52-v14/artifacts/run-001",
+    "local_only_artifact_tree_bytes": 45620425,
+    "local_only_artifact_tree_files": 435,
+    "local_only_artifact_tree_sha256": "6c5148cde014d62c91107ae2374d6e2e16f1902c6cd31d2614ce2ba646f37f3e",
+    "metacodes_binary_sha256": "80d10a08698a3f820dc260d98e1394056bd87c9fd7fb48fedabb4b3b125952aa",
+    "pilot_freeze_commit": "064b115",
+    "ripgrep_snapshot_mode": "0500",
+    "ripgrep_snapshot_sha256": "882ee4837235e252ce5ffecc3c1707f6d5b7db0054b7922301b5dc0f466a0fed",
+    "tinykg_binary_sha256": "66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee"
+  },
+  "budget_journal": {
+    "committed_cost_usd": 0.487632,
+    "committed_metered_tokens": 610032,
+    "estimated_cost_usd": 0.4876296,
+    "head_sha256": "7f49e30b410430f76ae1ecdfda9458348e5eb86f63067ebbd676c0a8707577e2",
+    "journal_id": "3b3a49681103d670daec85e907c53a8ae486f4476b2842566fbf257a2181888a",
+    "revision": 27,
+    "sha256": "a6084594aa0e4ea578616b66ef57f801f013b617b637f1d763c8dd0437f81f2c",
+    "uncertain_authorized_transactions": 0
+  },
+  "measurement_failure": {
+    "classification": "completed-but-benchmark-uninformative",
+    "detail": "All nine candidates failed the same hidden documentation check because it required one pinned English sentence. Every candidate documented the canonical key and legacy input alias with semantically equivalent wording. Three candidates also used semantically equivalent parser control flow that did not contain the grader's pinned source substring.",
+    "root_cause": "The workspace validator treated natural-language phrasing and one Python spelling as the semantics under test. It therefore confounded implementation correctness with surface-form agreement and collapsed all three arms to zero.",
+    "required_follow_up": "Freeze this result without regrading it. A new fixture and grader identity must use structural semantics and must not be used to rewrite v14 outcomes."
+  },
+  "outcome": {
+    "automatic_retry_forbidden": true,
+    "canonical_runtime_receipt_published": true,
+    "committed_rollout_transactions": 9,
+    "deterministic_failures": 9,
+    "provider_http_requests": 61,
+    "quality_evidence": false,
+    "status": "completed-but-benchmark-uninformative",
+    "uncertain_authorized_transactions": 0
+  },
+  "program_authority": {
+    "conservative_cost_usd_after_attempt": 10.4777678,
+    "conservative_metered_tokens_after_attempt": 6711634,
+    "user_authorization_max_cost_usd": 1000.0
+  },
+  "query_plan_diagnostic": {
+    "host_recall_satisfied_but_reported_invalid": 2,
+    "legacy_unavailable": 0,
+    "not_applicable": 6,
+    "verified_explicit_plan": 1,
+    "verified_explicit_plan_new_hits": 4,
+    "verified_explicit_plan_repeated_hits": 0
+  },
+  "retrieval_diagnostic": {
+    "markdown_mean_exposed_tokens": 315.5,
+    "offline_write_leakage": 0,
+    "tinykg_mean_exposed_tokens": 1600.0,
+    "tinykg_offline_evidence_precision_at_k": 1.0,
+    "tinykg_offline_evidence_recall_at_k": 1.0,
+    "tinykg_verified_evidence_recall_at_k": 1.0
+  },
+  "rollouts": [
+    {
+      "actual_cost_usd": 0.030462,
+      "actual_metered_tokens": 37246,
+      "arm": "no_memory",
+      "case_id": "coding:config-field-migration:trace-header",
+      "provider_http_requests": 5,
+      "sequence": 0,
+      "transaction_id": "efe66b9a197a59d18c795bafc4943a0c7ce4858cb4b7be05cb76e8de8985bd56"
+    },
+    {
+      "actual_cost_usd": 0.034879,
+      "actual_metered_tokens": 39499,
+      "arm": "markdown_memory",
+      "case_id": "coding:config-field-migration:trace-header",
+      "provider_http_requests": 5,
+      "sequence": 1,
+      "transaction_id": "86161b6618eb5633a94193cccf9956da95033ac9ce6a5d6db14773c16247b524"
+    },
+    {
+      "actual_cost_usd": 0.050833,
+      "actual_metered_tokens": 55573,
+      "arm": "tinykg_lexical",
+      "case_id": "coding:config-field-migration:trace-header",
+      "provider_http_requests": 5,
+      "sequence": 2,
+      "transaction_id": "3374f7d9b0b977776079b7161781f4089869aecc43fb9b3e0917ac490b74112d"
+    },
+    {
+      "actual_cost_usd": 0.063659,
+      "actual_metered_tokens": 82382,
+      "arm": "markdown_memory",
+      "case_id": "coding:config-field-migration:cache-ttl",
+      "provider_http_requests": 9,
+      "sequence": 3,
+      "transaction_id": "324c5dded62403756be924330db150eb49a17411314338f8f0be2c17f0a838a6"
+    },
+    {
+      "actual_cost_usd": 0.1074,
+      "actual_metered_tokens": 145035,
+      "arm": "tinykg_lexical",
+      "case_id": "coding:config-field-migration:cache-ttl",
+      "provider_http_requests": 10,
+      "sequence": 4,
+      "transaction_id": "6568e96a0bdc1b8327f452ce2066400c8873a6bffc0924f394309f1b7fc69e02"
+    },
+    {
+      "actual_cost_usd": 0.051657,
+      "actual_metered_tokens": 58723,
+      "arm": "no_memory",
+      "case_id": "coding:config-field-migration:cache-ttl",
+      "provider_http_requests": 7,
+      "sequence": 5,
+      "transaction_id": "c155e2139b196aa58b4bca3477240632a731c4e87b1f3aaade7020c8cb093a66"
+    },
+    {
+      "actual_cost_usd": 0.06219,
+      "actual_metered_tokens": 88265,
+      "arm": "tinykg_lexical",
+      "case_id": "coding:config-field-migration:retry-cap",
+      "provider_http_requests": 7,
+      "sequence": 6,
+      "transaction_id": "77c32d90571bc1f2865daae3680c7a03aaeb6e69d2a904a408592337943c834d"
+    },
+    {
+      "actual_cost_usd": 0.041072,
+      "actual_metered_tokens": 45601,
+      "arm": "no_memory",
+      "case_id": "coding:config-field-migration:retry-cap",
+      "provider_http_requests": 6,
+      "sequence": 7,
+      "transaction_id": "fc180d5ca3381f4f9a51d1f7250bcca874d5bdae4f410de6cc865d28f5608941"
+    },
+    {
+      "actual_cost_usd": 0.04548,
+      "actual_metered_tokens": 57708,
+      "arm": "markdown_memory",
+      "case_id": "coding:config-field-migration:retry-cap",
+      "provider_http_requests": 7,
+      "sequence": 8,
+      "transaction_id": "10351de63aa5c7046f7a557f2d353b5568dcad9b1e66b6b332bfca788c0d87c9"
+    }
+  ]
+}
