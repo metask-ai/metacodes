@@ -1846,6 +1846,21 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
         manifest = load_manifest(pilot / "manifest.json")
         execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
+        attempt = json.loads(
+            (pilot / "attempt-001-observation.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(
+            attempt["outcome"]["status"], "halted-provider-authentication-rejected"
+        )
+        self.assertEqual(attempt["outcome"]["completed_rollout_transactions"], 0)
+        self.assertEqual(attempt["outcome"]["uncertain_authorized_transactions"], 1)
+        self.assertEqual(
+            attempt["budget_journal"]["transaction_states"],
+            {"request_authorized": 1},
+        )
+        self.assertFalse(attempt["failure"]["automatic_retry_performed"])
+        self.assertFalse(attempt["isolation"]["raw_artifacts_uploaded"])
 
         for name, identity in contract["artifacts"].items():
             payload = (pilot / name).read_bytes()

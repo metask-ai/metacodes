@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "pilot_id": "procedural-glm52-v18",
+  "manifest_id": "coding-intent-families-2026080819-4",
+  "outcome": {
+    "status": "halted-provider-authentication-rejected",
+    "quality_evidence": false,
+    "canonical_runtime_receipt_published": false,
+    "completed_rollout_transactions": 0,
+    "scheduled_rollouts": 144,
+    "uncertain_authorized_transactions": 1
+  },
+  "failure": {
+    "sequence": 0,
+    "case_id": "coding:lease-release-transfer-v4:worker-alpha",
+    "trial": 0,
+    "arm": "no_memory",
+    "classification": "provider-rejected-credential-after-durable-request-authorization",
+    "provider_status": 401,
+    "provider_code": "INVALID_API_KEY",
+    "provider_request_observed": true,
+    "journal_settled": false,
+    "automatic_retry_performed": false,
+    "credential_material_recorded": false
+  },
+  "budget_journal": {
+    "revision": 2,
+    "head_sha256": "df8b9e41b98e063098761957a6e104e1e54ea6e786efe0f04fd1528f510f11d2",
+    "sha256": "f2f7725ce7ca76eae979b6a4fe046e9745024d7fd9f3285ea66a1421223e1333",
+    "committed_cost_usd": 0.0,
+    "committed_metered_tokens": 0,
+    "unsettled_max_cost_usd": 1.5,
+    "unsettled_max_metered_tokens": 600000,
+    "transaction_states": {
+      "request_authorized": 1
+    }
+  },
+  "artifact_provenance": {
+    "local_only_artifact_tree": "~/.local/state/metacodes/memory-pilots/procedural-glm52-v18/artifacts/run-001",
+    "local_only_artifact_tree_files": 30,
+    "local_only_artifact_tree_bytes": 8810841,
+    "partial_artifact_tree_sha256_with_budget_checkpoint": "845130fe18cd43e5ed4e67ea4ab6a99ec6e995b35d842d05144633cde1e282ff",
+    "failed_run_diagnostic_sha256": "a108a61139d98def81cc25a0cb69aced754655c6e69d225de4ee1dbae7028815",
+    "failed_run_budget_checkpoint_sha256": "f2f7725ce7ca76eae979b6a4fe046e9745024d7fd9f3285ea66a1421223e1333",
+    "metacodes_binary_sha256": "80d10a08698a3f820dc260d98e1394056bd87c9fd7fb48fedabb4b3b125952aa",
+    "tinykg_binary_sha256": "66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee",
+    "ripgrep_snapshot_sha256": "882ee4837235e252ce5ffecc3c1707f6d5b7db0054b7922301b5dc0f466a0fed"
+  },
+  "isolation": {
+    "benchmark_tinykg": "fresh local stores only",
+    "skill_harness_invocations": 0,
+    "remote_api_calls": 0,
+    "remote_store_writes": 0,
+    "raw_artifacts_uploaded": false
+  },
+  "program_authority": {
+    "conservative_cost_usd_after_attempt": 20.1836198,
+    "conservative_metered_tokens_after_attempt": 18635513,
+    "user_authorization_max_cost_usd": 1000.0
+  },
+  "next_attempt": {
+    "blocked_on": "replace the local 0600 provider credential with a valid key",
+    "requires_new_manifest_identity": true,
+    "requires_new_budget_journal": true,
+    "may_reuse_authorized_transaction_id": false
+  }
+}
