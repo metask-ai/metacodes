@@ -79,6 +79,7 @@ from scripts.eval.memory_replay import (
 )
 from scripts.eval.memory_agent_runtime_pilot import (
     _load_api_key,
+    _write_failed_run_checkpoint,
     main as production_pilot_main,
 )
 from scripts.eval.e2e_adapter import NATIVE_EVENT_SCHEMA_VERSION
@@ -1846,6 +1847,196 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         object.__setattr__(no_headroom, "max_total_cost_usd", 8.1)
         with self.assertRaisesRegex(ValidationError, "strictly cover"):
             no_headroom.validate(9)
+
+    def test_failed_paid_run_persists_budget_and_artifact_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "run"
+            rollout_dir = run_dir / "rollouts" / "00000-example"
+            rollout_dir.mkdir(parents=True)
+            (rollout_dir / "result.json").write_text("{}\n", encoding="utf-8")
+            journal_parent = root / "budget"
+            journal_parent.mkdir(mode=0o700)
+            authority = BudgetAuthority(
+                manifest_sha256=digest("manifest"),
+                model_fingerprint=digest("model"),
+                provider_identity="provider",
+                total_cost_microusd=usd_to_microusd(10.0),
+                total_metered_tokens=1_000_000,
+            )
+            with BudgetJournal(journal_parent / "journal.json", authority) as journal:
+                transaction = BudgetTransaction(
+                    run_id="run:0",
+                    manifest_sha256=authority.manifest_sha256,
+                    model_fingerprint=authority.model_fingerprint,
+                    harness_fingerprint=digest("harness"),
+                    provider_identity=authority.provider_identity,
+                    max_cost_microusd=usd_to_microusd(1.0),
+                    max_metered_tokens=100_000,
+                )
+                reserved = journal.reserve(transaction)
+                authorized = journal.authorize_request(
+                    reserved["transaction_id"],
+                    expected_revision=reserved["journal_revision"],
+                    expected_head_sha256=reserved["journal_head_sha256"],
+                )
+                journal.commit(
+                    authorized["transaction_id"],
+                    actual_cost_microusd=usd_to_microusd(0.2),
+                    actual_metered_tokens=20_000,
+                )
+                diagnostic = _write_failed_run_checkpoint(
+                    run_dir,
+                    journal,
+                    ValidationError("post-provider invariant failed"),
+                )
+
+            checkpoint = run_dir / diagnostic["budget_checkpoint_file"]
+            self.assertEqual(
+                hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+                diagnostic["budget_checkpoint_sha256"],
+            )
+            self.assertEqual(diagnostic["rollout_directories"], 1)
+            self.assertIsNotNone(
+                diagnostic["partial_artifact_tree_sha256_with_budget_checkpoint"]
+            )
+            self.assertIsNone(diagnostic["artifact_tree_error_type"])
+            self.assertEqual(
+                diagnostic["budget_snapshot"]["transaction_states"],
+                {"committed": 1},
+            )
+            self.assertTrue(diagnostic["automatic_retry_forbidden"])
+            persisted = json.loads(
+                (run_dir / "failed-run-diagnostic.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(persisted, diagnostic)
+
+    def test_failed_paid_run_writes_budget_before_artifact_digest_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            journal_parent = root / "budget"
+            journal_parent.mkdir(mode=0o700)
+            authority = BudgetAuthority(
+                manifest_sha256=digest("manifest-corrupt-artifact"),
+                model_fingerprint=digest("model-corrupt-artifact"),
+                provider_identity="provider",
+                total_cost_microusd=usd_to_microusd(1.0),
+                total_metered_tokens=100_000,
+            )
+            with BudgetJournal(journal_parent / "journal.json", authority) as journal:
+                with mock.patch(
+                    "scripts.eval.memory_agent_runtime_pilot._artifact_tree_digest",
+                    side_effect=ValidationError("artifact tree is corrupt"),
+                ):
+                    diagnostic = _write_failed_run_checkpoint(
+                        run_dir,
+                        journal,
+                        ValidationError("run failed"),
+                    )
+
+            self.assertTrue((run_dir / "failed-run-budget-checkpoint.json").is_file())
+            self.assertIsNone(
+                diagnostic["partial_artifact_tree_sha256_with_budget_checkpoint"]
+            )
+            self.assertEqual(diagnostic["artifact_tree_error_type"], "ValidationError")
+            self.assertIsNotNone(diagnostic["artifact_tree_error_sha256"])
+            self.assertFalse(diagnostic["automatic_retry_forbidden"])
+
+    def test_paid_pilot_main_checkpoints_a_committed_mid_schedule_failure(self):
+        manifest = copy.deepcopy(load_manifest(FIXTURES / "smoke-manifest.json"))
+        manifest["execution"]["model_id"] = "glm-5.2"
+        manifest["execution"]["model_fingerprint"] = PRODUCTION_MODEL_FINGERPRINT
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(stable_json(manifest) + "\n", encoding="utf-8")
+            tinykg = root / "fake-tinykg"
+            tinykg.write_text(
+                "#!/bin/sh\n"
+                "case \"$1\" in\n"
+                "  init) mkdir \"$2\" ;;\n"
+                "  apply) printf 'apply version=1 nodes_created=1 nodes_existing=0 edges_created=0 edges_existing=0\\n' ;;\n"
+                "  store-info) printf 'nodes=1\\nedges=0\\nstorage_format_version=2\\nschema_version=3\\n' ;;\n"
+                "  *) exit 91 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            tinykg.chmod(0o700)
+            auth = root / "auth.json"
+            auth.write_text(stable_json({"api_key": "test-only-secret"}) + "\n", encoding="utf-8")
+            auth.chmod(0o600)
+            run_dir = root / "run"
+            journal_path = root / "budget" / "journal.json"
+            journal_path.parent.mkdir(mode=0o700)
+
+            def fail_after_commit(**kwargs):
+                owned_run = kwargs["run_dir"]
+                rollout = owned_run / "rollouts" / "00000-real-main-path"
+                rollout.mkdir(parents=True)
+                (rollout / "provider-result.json").write_text("{}\n", encoding="utf-8")
+                journal = kwargs["budget_journal"]
+                snapshot = journal.snapshot()
+                transaction = BudgetTransaction(
+                    run_id="paid-main:0",
+                    manifest_sha256=snapshot["authority"]["manifest_sha256"],
+                    model_fingerprint=snapshot["authority"]["model_fingerprint"],
+                    harness_fingerprint=digest("paid-main-harness"),
+                    provider_identity=snapshot["authority"]["provider_identity"],
+                    max_cost_microusd=usd_to_microusd(0.9),
+                    max_metered_tokens=300_000,
+                )
+                reserved = journal.reserve(transaction)
+                authorized = journal.authorize_request(
+                    reserved["transaction_id"],
+                    expected_revision=reserved["journal_revision"],
+                    expected_head_sha256=reserved["journal_head_sha256"],
+                )
+                journal.commit(
+                    authorized["transaction_id"],
+                    actual_cost_microusd=usd_to_microusd(0.1),
+                    actual_metered_tokens=10_000,
+                )
+                raise ValidationError("post-provider real main-path failure")
+
+            with mock.patch(
+                "scripts.eval.memory_agent_runtime_pilot.run_memory_agent_schedule",
+                side_effect=fail_after_commit,
+            ):
+                with self.assertRaisesRegex(ValidationError, "real main-path failure"):
+                    production_pilot_main(
+                        [
+                            "--binary",
+                            "/bin/echo",
+                            "--tinykg-binary",
+                            str(tinykg),
+                            "--ripgrep-binary",
+                            str(TEST_RIPGREP),
+                            "--source",
+                            str(FIXTURES / "smoke-source.json"),
+                            "--manifest",
+                            str(manifest_path),
+                            "--run-dir",
+                            str(run_dir),
+                            "--budget-journal",
+                            str(journal_path),
+                            "--auth-file",
+                            str(auth),
+                            "--allow-paid-rollouts",
+                        ]
+                    )
+
+            diagnostic = json.loads(
+                (run_dir / "failed-run-diagnostic.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(diagnostic["rollout_directories"], 1)
+            self.assertEqual(
+                diagnostic["budget_snapshot"]["transaction_states"],
+                {"committed": 1},
+            )
+            self.assertTrue(diagnostic["automatic_retry_forbidden"])
+            self.assertNotIn("test-only-secret", stable_json(diagnostic))
 
     def test_runtime_paths_do_not_reveal_treatment_labels(self):
         component = _safe_component("task:0:tinykg_lexical:no_memory:markdown_memory")

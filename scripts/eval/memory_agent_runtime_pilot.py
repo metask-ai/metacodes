@@ -28,6 +28,7 @@ if __package__ in {None, ""}:
         PRODUCTION_MODEL_FINGERPRINT,
         PRODUCTION_MODEL_ID,
         ProductionRuntimeConfig,
+        _write_new,
         _validate_production_manifest,
         run_memory_agent_schedule,
     )
@@ -43,6 +44,7 @@ if __package__ in {None, ""}:
         PRODUCTION_DISALLOWED_PROVIDER_TOOLS,
         PRODUCTION_FILESYSTEM_ISOLATION,
         PRODUCTION_TOOL_NETWORK_ISOLATION,
+        _artifact_tree_digest,
         load_manifest,
         validate_runtime_artifacts,
     )
@@ -52,6 +54,7 @@ else:
         PRODUCTION_MODEL_FINGERPRINT,
         PRODUCTION_MODEL_ID,
         ProductionRuntimeConfig,
+        _write_new,
         _validate_production_manifest,
         run_memory_agent_schedule,
     )
@@ -63,6 +66,7 @@ else:
         PRODUCTION_DISALLOWED_PROVIDER_TOOLS,
         PRODUCTION_FILESYSTEM_ISOLATION,
         PRODUCTION_TOOL_NETWORK_ISOLATION,
+        _artifact_tree_digest,
         load_manifest,
         validate_runtime_artifacts,
     )
@@ -229,6 +233,62 @@ def _public_plan(
     }
 
 
+def _write_failed_run_checkpoint(
+    run_dir: Path,
+    budget_journal: BudgetJournal,
+    error: BaseException,
+) -> Mapping[str, Any]:
+    """Preserve paid evidence when a schedule fails before final publication."""
+
+    if not run_dir.is_dir():
+        raise ValidationError("failed paid run has no owned artifact directory")
+    budget_payload = budget_journal.checkpoint_payload()
+    budget_path = run_dir / "failed-run-budget-checkpoint.json"
+    _write_new(budget_path, budget_payload)
+    budget_snapshot = budget_journal.snapshot()
+    transaction_states = budget_snapshot["transaction_states"]
+    automatic_retry_forbidden = any(
+        int(transaction_states.get(state, 0)) > 0
+        for state in ("request_authorized", "committed")
+    )
+    try:
+        partial_artifact_tree_sha256 = _artifact_tree_digest(run_dir)
+        artifact_tree_error_type = None
+        artifact_tree_error_sha256 = None
+    except BaseException as artifact_error:
+        partial_artifact_tree_sha256 = None
+        artifact_tree_error_type = type(artifact_error).__name__
+        artifact_tree_error_sha256 = hashlib.sha256(
+            str(artifact_error).encode("utf-8")
+        ).hexdigest()
+    rollout_root = run_dir / "rollouts"
+    rollout_directories = (
+        sum(1 for path in rollout_root.iterdir() if path.is_dir())
+        if rollout_root.is_dir()
+        else 0
+    )
+    diagnostic = {
+        "schema_version": "metacodes-memory-paid-run-failure-v1",
+        "status": "invalid",
+        "classification": "mid-schedule-runtime-failure",
+        "error_type": type(error).__name__,
+        "error_sha256": hashlib.sha256(str(error).encode("utf-8")).hexdigest(),
+        "partial_artifact_tree_sha256_with_budget_checkpoint": partial_artifact_tree_sha256,
+        "artifact_tree_error_type": artifact_tree_error_type,
+        "artifact_tree_error_sha256": artifact_tree_error_sha256,
+        "rollout_directories": rollout_directories,
+        "budget_checkpoint_file": budget_path.name,
+        "budget_checkpoint_sha256": hashlib.sha256(budget_payload).hexdigest(),
+        "budget_snapshot": budget_snapshot,
+        "automatic_retry_forbidden": automatic_retry_forbidden,
+    }
+    _write_new(
+        run_dir / "failed-run-diagnostic.json",
+        (stable_json(diagnostic) + "\n").encode("utf-8"),
+    )
+    return diagnostic
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
@@ -327,24 +387,34 @@ def main(argv: list[str] | None = None) -> int:
         # closes that descriptor before App/tools/subprocesses are initialized.
         production = _config(args, api_key, authorized=True)
         production.validate(len(manifest["schedule"]))
-        observations, receipt = run_memory_agent_schedule(
-            metacodes_binary=metacodes,
-            expected_metacodes_sha256=metacodes_sha,
-            tinykg_binary=tinykg,
-            expected_tinykg_sha256=tinykg_sha,
-            source_path=source,
-            manifest_path=manifest_path,
-            run_dir=run_dir,
-            observations_path=run_dir / "observations.jsonl",
-            runtime_receipt_path=run_dir / "runtime-receipt.json",
-            validator_bundle_path=(
-                args.validators.expanduser().resolve() if args.validators else None
-            ),
-            timeout_seconds=args.timeout_seconds,
-            production=production,
-            budget_journal=budget_journal,
-        )
-        validate_runtime_artifacts(receipt, run_dir)
+        try:
+            observations, receipt = run_memory_agent_schedule(
+                metacodes_binary=metacodes,
+                expected_metacodes_sha256=metacodes_sha,
+                tinykg_binary=tinykg,
+                expected_tinykg_sha256=tinykg_sha,
+                source_path=source,
+                manifest_path=manifest_path,
+                run_dir=run_dir,
+                observations_path=run_dir / "observations.jsonl",
+                runtime_receipt_path=run_dir / "runtime-receipt.json",
+                validator_bundle_path=(
+                    args.validators.expanduser().resolve() if args.validators else None
+                ),
+                timeout_seconds=args.timeout_seconds,
+                production=production,
+                budget_journal=budget_journal,
+            )
+            validate_runtime_artifacts(receipt, run_dir)
+        except BaseException as exc:
+            try:
+                _write_failed_run_checkpoint(run_dir, budget_journal, exc)
+            except BaseException as checkpoint_error:
+                raise ValidationError(
+                    "paid run failed and its failure checkpoint could not be persisted: "
+                    f"{type(checkpoint_error).__name__}"
+                ) from exc
+            raise
         summary = {
             "dry_run": False,
             "quality_evidence": receipt["quality_evidence"],
