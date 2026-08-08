@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping
+from typing import Any, Callable, Dict, Mapping, Tuple
 
 try:
     import fcntl
@@ -872,6 +872,25 @@ class BudgetJournal:
             "actual_cost_microusd": current["actual_cost_microusd"],
             "actual_metered_tokens": current["actual_metered_tokens"],
         }
+
+    def transaction_receipts(self) -> Tuple[Mapping[str, Any], ...]:
+        """Return every transaction in durable reservation order.
+
+        Callers use this bounded view to detect authorized or committed work
+        that has no matching artifact checkpoint.  Returning receipts instead
+        of the internal replay table keeps journal mutation encapsulated.
+        """
+
+        self._require_open()
+        assert self._state is not None
+        ordered = sorted(
+            self._state["transactions"].values(),
+            key=lambda item: int(item["reservation_revision"]),
+        )
+        return tuple(
+            self.transaction_receipt(str(item["transaction_id"]))
+            for item in ordered
+        )
 
     def snapshot(self) -> Mapping[str, Any]:
         self._require_open()

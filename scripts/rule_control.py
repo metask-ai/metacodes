@@ -2796,10 +2796,15 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
         "journal": "scripts/eval/memory_budget_journal.py",
         "runner": "scripts/eval/memory_agent_runtime.py",
         "pilot": "scripts/eval/memory_agent_runtime_pilot.py",
+        "multi_runner": "scripts/eval/paired_runner.py",
+        "multi_cli": "scripts/eval/cli.py",
         "replay": "scripts/eval/memory_replay.py",
         "journal_tests": "scripts/eval/tests/test_memory_budget_journal.py",
         "runtime_tests": "scripts/eval/tests/test_memory_budget_runtime.py",
         "agent_tests": "scripts/eval/tests/test_memory_agent_runtime.py",
+        "multi_tests": "scripts/eval/tests/test_experiment.py",
+        "multi_fd_tests": "scripts/eval/tests/test_paid_multi_arm_fd.py",
+        "e2e_lib": "tests/e2e/lib.sh",
         "retry_test": "tests/component/stream_retry_test.zig",
     }
     paths = {name: repo / relative for name, relative in relative_sources.items()}
@@ -2820,7 +2825,7 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
         trees = {
             name: ast.parse(source, filename=str(paths[name]))
             for name, source in sources.items()
-            if name != "retry_test"
+            if name not in {"retry_test", "e2e_lib"}
         }
     except (ControlError, SyntaxError) as exc:
         return Observation(
@@ -2915,6 +2920,12 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
     runner_source = node_source("runner", runner)
     pilot = top_function("pilot", "main")
     pilot_source = node_source("pilot", pilot)
+    multi_runner = top_function("multi_runner", "run_multi_arm")
+    multi_runner_source = node_source("multi_runner", multi_runner)
+    multi_locked = top_function("multi_runner", "_run_multi_arm_locked")
+    multi_locked_source = node_source("multi_runner", multi_locked)
+    multi_once = top_function("multi_runner", "_run_once")
+    multi_once_source = node_source("multi_runner", multi_once)
     receipt_validate = top_source("replay", "_validate_budget_transaction_receipt")
     journal_receipt_validate = top_source("replay", "_validate_budget_journal_receipt")
     artifact_validate = top_source("replay", "validate_runtime_artifacts")
@@ -2929,9 +2940,22 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
     credential_lines = call_lines(pilot, "_load_api_key")
     schedule_lines = call_lines(pilot, "run_memory_agent_schedule")
     runner_calls = call_names(runner)
+    multi_runner_calls = call_names(multi_locked)
     alternate_launchers = {
         name
         for name in runner_calls
+        if name in {
+            "subprocess.Popen", "subprocess.call", "subprocess.check_call",
+            "subprocess.check_output", "os.system", "os.popen", "os.posix_spawn",
+            "os.posix_spawnp", "urllib.request.urlopen", "http.client.HTTPConnection",
+            "http.client.HTTPSConnection", "socket.create_connection",
+        }
+        or name.startswith("os.spawn")
+        or name.startswith("os.exec")
+    }
+    multi_alternate_launchers = {
+        name
+        for name in multi_runner_calls
         if name in {
             "subprocess.Popen", "subprocess.call", "subprocess.check_call",
             "subprocess.check_output", "os.system", "os.popen", "os.posix_spawn",
@@ -3013,6 +3037,26 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
         "agent_tests", "MemoryAgentRuntimeContractTest",
         "test_v5_receipt_binds_durable_budget_transactions_and_checkpoint",
     )
+    multi_resume_test = test_source(
+        "multi_tests", "LongHorizonExperimentTest",
+        "test_multi_arm_checkpoints_resume_without_repeating_rollouts",
+    )
+    multi_crash_test = test_source(
+        "multi_tests", "LongHorizonExperimentTest",
+        "test_multi_arm_crash_windows_leave_unreplayable_orphans_before_credential",
+    )
+    multi_fd_test = test_source(
+        "multi_fd_tests", "PaidMultiArmCredentialFdL2Test",
+        "test_e2e_shell_transports_anonymous_fd_without_secret_environment",
+    )
+    multi_fd_helper = method_source(
+        "multi_fd_tests", "PaidMultiArmCredentialFdL2Test",
+        "_write_fake_metacodes",
+    )
+    multi_fd_runner_test = test_source(
+        "multi_fd_tests", "PaidMultiArmCredentialFdL2Test",
+        "test_run_once_crosses_real_shell_bridge_with_one_shot_fd",
+    )
 
     obligations = {
         declarations[0]: {
@@ -3088,6 +3132,13 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                     'self.assertFalse((root / "loser-run").exists())',
                 )
             ) and "self.assertEqual(journal.snapshot(), before)" in lock_test,
+            "multi-arm runner holds the same exclusive journal lock for the schedule": all(
+                marker in multi_runner_source
+                for marker in (
+                    "with BudgetJournal(journal_path, authority) as budget_journal:",
+                    "return _run_multi_arm_locked(",
+                )
+            ),
         },
         declarations[3]: {
             "production spawn has one authorization predecessor": (
@@ -3097,6 +3148,20 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                 and pipe_lines and pipe_lines[0] < authorize_lines[0]
             ),
             "no alternate provider-capable launcher bypasses the gate": not alternate_launchers,
+            "multi-arm provider call has one durable authorization predecessor": all(
+                marker in multi_locked_source
+                for marker in (
+                    "reserved = budget_journal.reserve(transaction)",
+                    "authorization = budget_journal.authorize_request(",
+                    "run_dir = _run_once(",
+                    "budget_receipt = budget_journal.commit(",
+                )
+            ) and (
+                multi_locked_source.find("budget_journal.authorize_request(")
+                < multi_locked_source.find("run_dir = _run_once(")
+                < multi_locked_source.find("budget_journal.commit(")
+            ),
+            "multi-arm provider path has no alternate launcher": not multi_alternate_launchers,
             "authorization receipt is marked before subprocess": (
                 runner_source.find("budget_request_authorized = True")
                 > runner_source.find("budget_journal.authorize_request(")
@@ -3122,6 +3187,14 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                 for marker in (
                     '"scripts.eval.memory_agent_runtime.os.fpathconf"',
                     '"aborted_pre_request": 1', "self.assertEqual(provider.requests, 0)",
+                )
+            ),
+            "multi-arm real runner reopens durable authorization at provider seam": all(
+                marker in multi_resume_test
+                for marker in (
+                    "validate_checkpoint_payload(journal_path.read_bytes())",
+                    'self.assertEqual(latest["state"], "request_authorized")',
+                    'self.assertEqual(runtime_api_key, "test-only-private-key")',
                 )
             ),
         },
@@ -3150,6 +3223,17 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                     '"after_provider_return_before_commit", 1',
                     '{"request_authorized": 1}', '"unsettled_max_cost_microusd"',
                     '"retry is forbidden"',
+                )
+            ),
+            "multi-arm authorization commit crash windows become unreplayable orphans": all(
+                marker in multi_crash_test
+                for marker in (
+                    '"after_request_authorized", 0, "request_authorized"',
+                    '"after_provider_return_before_commit", 1, "request_authorized"',
+                    '"after_budget_commit", 1, "committed"',
+                    '"without a matching rollout checkpoint"',
+                    "load_key.assert_not_called()",
+                    "rerun.assert_not_called()",
                 )
             ),
         },
@@ -3268,6 +3352,26 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                     "checkpoint bytes drifted", "validate_runtime_artifacts",
                 )
             ),
+            "multi-arm checkpoints bind committed receipt and reject journal orphans before credentials": all(
+                marker in multi_locked_source
+                for marker in (
+                    "_validate_checkpoint_budget_receipt(",
+                    "_require_no_orphan_budget_transactions(",
+                    "runtime_api_key = _load_api_key(",
+                    "write_rollouts(outputs[arm_id], collected[arm_id])",
+                    '"after_rollout_checkpoint"',
+                )
+            ) and (
+                multi_locked_source.find("_require_no_orphan_budget_transactions(")
+                < multi_locked_source.find("runtime_api_key = _load_api_key(")
+            ) and all(
+                marker in multi_resume_test
+                for marker in (
+                    'stage == "after_rollout_checkpoint"',
+                    "self.assertEqual(len(invocations), 2)",
+                    "self.assertEqual(len(invocations), 16)",
+                )
+            ),
         },
         declarations[8]: {
             "dry run returns before lock credential journal or network": (
@@ -3299,6 +3403,36 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                 and 'test "L2 evaluation gate makes one physical provider attempt and never retries outside receipt"'
                 in sources["retry_test"]
             ),
+            "multi-arm credential crosses only an anonymous one-shot FD": all(
+                marker in multi_once_source
+                for marker in (
+                    "credential_read_fd, credential_write_fd = os.pipe()",
+                    'env["E2E_API_KEY_FD"] = str(credential_read_fd)',
+                    'subprocess_options["pass_fds"] = (credential_read_fd,)',
+                    "os.write(credential_write_fd, credential)",
+                )
+            ) and all(
+                marker in sources["e2e_lib"]
+                for marker in (
+                    'auth_env+=("METACODES_API_KEY_FD=$runtime_api_key_fd")',
+                    "unset E2E_API_KEY_FD",
+                )
+            ) and all(
+                marker in multi_fd_helper
+                for marker in (
+                    'if "METASK_API_KEY" in os.environ',
+                    'os.environ["METACODES_API_KEY_FD"]',
+                    'if os.read(fd, 1) != b"":',
+                )
+            ) and 'self.assertNotIn("paid-fd-private-key"' in multi_fd_test and all(
+                marker in multi_fd_runner_test
+                for marker in (
+                    "run_dir = _run_once(",
+                    'runtime_api_key="paid-fd-private-key"',
+                    'self.assertIn("anonymous-fd-consumed"',
+                    'self.assertNotIn(',
+                )
+            ),
         },
     }
 
@@ -3323,6 +3457,8 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
             {"unittest": "scripts.eval.tests.test_memory_budget_journal"},
             {"unittest": "scripts.eval.tests.test_memory_budget_runtime"},
             {"unittest": "scripts.eval.tests.test_memory_agent_runtime"},
+            {"unittest": "scripts.eval.tests.test_experiment"},
+            {"unittest": "scripts.eval.tests.test_paid_multi_arm_fd"},
             {"step": "test:new", "filter": "L2 evaluation gate makes one physical provider attempt"},
         ],
         errors=errors,

@@ -18,6 +18,7 @@ from scripts.eval.experiment import (
     validate_experiment,
 )
 from scripts.eval.model import ValidationError, load_json, load_rollouts, write_rollouts
+from scripts.eval.memory_budget_journal import validate_checkpoint_payload
 from scripts.eval.paired_runner import InfrastructureRunError, run_multi_arm
 from scripts.eval.promotion import build_promotion_receipt
 from scripts.eval.treatment_activation import (
@@ -40,6 +41,20 @@ CONFIRMATORY_EXPERIMENT_PATH = (
     ROOT / "evals/experiments/long-horizon-three-arm-confirmatory-v2.json"
 )
 CONFIRMATORY_SUITE_PATH = ROOT / "evals/suites/long-horizon-repository-pk.json"
+
+
+def budget_journal_path(root: Path) -> Path:
+    parent = root / "budget-control"
+    parent.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(parent, 0o700)
+    return parent / "multi-arm-budget.json"
+
+
+def auth_file_path(root: Path) -> Path:
+    path = root / "paid-auth.json"
+    path.write_text('{"api_key":"test-only-private-key"}\n', encoding="utf-8")
+    path.chmod(0o600)
+    return path
 
 
 def fake_formal_artifact(root: Path) -> tuple[Path, dict]:
@@ -447,9 +462,10 @@ class LongHorizonExperimentTest(unittest.TestCase):
             }
             formal, formal_identity = fake_formal_artifact(root)
             output_dir = root / "checkpoints"
+            journal_path = budget_journal_path(root)
             invocations = []
             run_state = {}
-            fail_after = [2]
+            fail_after_checkpoint = [2]
 
             def fake_run_once(
                 _repo_root,
@@ -468,9 +484,15 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 timeout_seconds=None,
                 max_metered_tokens=None,
                 max_cost_usd=None,
+                runtime_api_key=None,
             ):
-                if fail_after[0] is not None and len(invocations) >= fail_after[0]:
-                    raise RuntimeError("simulated interruption")
+                self.assertEqual(runtime_api_key, "test-only-private-key")
+                journal = validate_checkpoint_payload(journal_path.read_bytes())
+                latest = max(
+                    journal["transactions"].values(),
+                    key=lambda item: item["reservation_revision"],
+                )
+                self.assertEqual(latest["state"], "request_authorized")
                 token = root / f"run-{len(invocations)}"
                 invocations.append((arm_id, trial, selector))
                 run_state[token] = (
@@ -566,6 +588,15 @@ class LongHorizonExperimentTest(unittest.TestCase):
                     }
                 ]
 
+            def interrupt_after_durable_checkpoint(stage, _receipt):
+                if (
+                    stage == "after_rollout_checkpoint"
+                    and fail_after_checkpoint[0] is not None
+                    and len(invocations) >= fail_after_checkpoint[0]
+                ):
+                    fail_after_checkpoint[0] = None
+                    raise RuntimeError("simulated interruption")
+
             patches = (
                 mock.patch("scripts.eval.paired_runner._run_once", side_effect=fake_run_once),
                 mock.patch("scripts.eval.paired_runner.import_run", side_effect=fake_import),
@@ -591,6 +622,9 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         output_dir=output_dir,
                         suite_path=SUITE_PATH,
                         allow_paid_rollouts=True,
+                        budget_journal_path=journal_path,
+                        auth_file=auth_file_path(root),
+                        budget_fault_hook=interrupt_after_durable_checkpoint,
                     )
                 self.assertEqual(len(invocations), 2)
                 checkpoint_path = sorted(output_dir.glob("*.jsonl"))[0]
@@ -612,9 +646,11 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         output_dir=output_dir,
                         suite_path=SUITE_PATH,
                         allow_paid_rollouts=True,
+                        budget_journal_path=journal_path,
+                        auth_file=auth_file_path(root),
+                        budget_fault_hook=interrupt_after_durable_checkpoint,
                     )
                 checkpoint_path.write_bytes(checkpoint_bytes)
-                fail_after[0] = None
                 invocations.clear()
                 result = run_multi_arm(
                     experiment,
@@ -627,6 +663,9 @@ class LongHorizonExperimentTest(unittest.TestCase):
                     output_dir=output_dir,
                     suite_path=SUITE_PATH,
                     allow_paid_rollouts=True,
+                    budget_journal_path=journal_path,
+                    auth_file=auth_file_path(root),
+                    budget_fault_hook=interrupt_after_durable_checkpoint,
                 )
             self.assertEqual(len(invocations), 16)
             self.assertEqual(sum(len(rows) for rows in result.values()), 18)
@@ -678,9 +717,162 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         output_dir=root / "checkpoints",
                         suite_path=SUITE_PATH,
                         allow_paid_rollouts=True,
+                        budget_journal_path=budget_journal_path(root),
+                        auth_file=auth_file_path(root),
                         budget_used_tokens=3_400_000,
                     )
             run_once.assert_not_called()
+
+    def test_multi_arm_crash_windows_leave_unreplayable_orphans_before_credential(self):
+        for crash_stage, expected_calls, expected_state in (
+            ("after_request_authorized", 0, "request_authorized"),
+            ("after_provider_return_before_commit", 1, "request_authorized"),
+            ("after_budget_commit", 1, "committed"),
+        ):
+            with self.subTest(crash_stage=crash_stage), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                binary = root / "metacodes"
+                binary.write_bytes(b"paid-crash-window-metacodes")
+                binary.chmod(0o755)
+                tinykg = root / "tinykg"
+                tinykg.write_bytes(b"paid-crash-window-tinykg")
+                tinykg.chmod(0o755)
+                metacodes_sha = hashlib.sha256(binary.read_bytes()).hexdigest()
+                tinykg_sha = hashlib.sha256(tinykg.read_bytes()).hexdigest()
+                tinykg_identity = {
+                    "path": str(tinykg.resolve()),
+                    "sha256": tinykg_sha,
+                    "version": "tinykg test",
+                }
+                formal, formal_identity = fake_formal_artifact(root)
+                revision = "paid-crash-window-revision"
+                seeds = write_multi_arm_checkpoints(
+                    root / "seed",
+                    self.experiment,
+                    self.suite,
+                    ROOT,
+                    metacodes_sha256=metacodes_sha,
+                    tinykg_sha256=tinykg_sha,
+                    formal_kernel_fingerprint=formal_identity[
+                        "artifact_fingerprint"
+                    ],
+                    revision=revision,
+                )
+                seed_rows = {
+                    arm_id: load_rollouts(path) for arm_id, path in seeds.items()
+                }
+                journal_path = budget_journal_path(root)
+                output_dir = root / "checkpoints"
+                auth_file = auth_file_path(root)
+                invocations = []
+                run_state = {}
+
+                def fake_run_once(
+                    _repo_root,
+                    _binary,
+                    arm_id,
+                    trial,
+                    selector,
+                    _model_provider,
+                    _model_id,
+                    _suite_path,
+                    _revision,
+                    **kwargs,
+                ):
+                    self.assertEqual(
+                        kwargs.get("runtime_api_key"), "test-only-private-key"
+                    )
+                    journal = validate_checkpoint_payload(journal_path.read_bytes())
+                    latest = max(
+                        journal["transactions"].values(),
+                        key=lambda item: item["reservation_revision"],
+                    )
+                    self.assertEqual(latest["state"], "request_authorized")
+                    run_dir = root / f"run-{len(invocations)}"
+                    run_dir.mkdir()
+                    invocations.append((arm_id, selector, trial))
+                    run_state[run_dir] = (arm_id, selector, trial)
+                    return run_dir
+
+                def fake_import(_suite, _repo_root, run_dir):
+                    arm_id, task_id, trial = run_state[run_dir]
+                    return [
+                        copy.deepcopy(row)
+                        for row in seed_rows[arm_id]
+                        if row["task_id"] == task_id and row["trial"] == trial
+                    ]
+
+                def crash(stage, _receipt):
+                    if stage == crash_stage:
+                        raise RuntimeError(f"injected crash at {stage}")
+
+                patches = (
+                    mock.patch(
+                        "scripts.eval.paired_runner.tinykg_binary_identity",
+                        return_value=tinykg_identity,
+                    ),
+                    mock.patch(
+                        "scripts.eval.paired_runner.formal_kernel_identity",
+                        return_value=formal_identity,
+                    ),
+                    mock.patch(
+                        "scripts.eval.paired_runner._run_once",
+                        side_effect=fake_run_once,
+                    ),
+                    mock.patch(
+                        "scripts.eval.paired_runner.import_run",
+                        side_effect=fake_import,
+                    ),
+                )
+                with patches[0], patches[1], patches[2], patches[3]:
+                    with self.assertRaisesRegex(RuntimeError, "injected crash"):
+                        run_multi_arm(
+                            self.experiment,
+                            self.suite,
+                            ROOT,
+                            binary,
+                            tinykg_binary=tinykg,
+                            formal_kernel=formal,
+                            revision=revision,
+                            output_dir=output_dir,
+                            suite_path=SUITE_PATH,
+                            allow_paid_rollouts=True,
+                            budget_journal_path=journal_path,
+                            auth_file=auth_file,
+                            budget_fault_hook=crash,
+                        )
+                self.assertEqual(len(invocations), expected_calls)
+                journal = validate_checkpoint_payload(journal_path.read_bytes())
+                latest = max(
+                    journal["transactions"].values(),
+                    key=lambda item: item["reservation_revision"],
+                )
+                self.assertEqual(latest["state"], expected_state)
+
+                with patches[0], patches[1], mock.patch(
+                    "scripts.eval.paired_runner._load_api_key"
+                ) as load_key, mock.patch(
+                    "scripts.eval.paired_runner._run_once"
+                ) as rerun:
+                    with self.assertRaisesRegex(
+                        ValidationError, "without a matching rollout checkpoint"
+                    ):
+                        run_multi_arm(
+                            self.experiment,
+                            self.suite,
+                            ROOT,
+                            binary,
+                            tinykg_binary=tinykg,
+                            formal_kernel=formal,
+                            revision=revision,
+                            output_dir=output_dir,
+                            suite_path=SUITE_PATH,
+                            allow_paid_rollouts=True,
+                            budget_journal_path=journal_path,
+                            auth_file=auth_file,
+                        )
+                load_key.assert_not_called()
+                rerun.assert_not_called()
 
     def test_multi_arm_checkpoints_runtime_budget_overrun_before_abort(self):
         experiment = copy.deepcopy(self.experiment)
@@ -752,6 +944,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         output_dir=output_dir,
                         suite_path=SUITE_PATH,
                         allow_paid_rollouts=True,
+                        budget_journal_path=budget_journal_path(root),
+                        auth_file=auth_file_path(root),
                     )
 
             checkpoint = load_rollouts(output_dir / "codex_style.jsonl")
@@ -832,6 +1026,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         output_dir=output_dir,
                         suite_path=SUITE_PATH,
                         allow_paid_rollouts=True,
+                        budget_journal_path=budget_journal_path(root),
+                        auth_file=auth_file_path(root),
                     )
 
             attester.assert_called_once()
@@ -911,6 +1107,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         output_dir=output_dir,
                         suite_path=SUITE_PATH,
                         allow_paid_rollouts=True,
+                        budget_journal_path=budget_journal_path(root),
+                        auth_file=auth_file_path(root),
                     )
 
             attester.assert_called_once()
@@ -1000,6 +1198,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         output_dir=output_dir,
                         suite_path=SUITE_PATH,
                         allow_paid_rollouts=True,
+                        budget_journal_path=budget_journal_path(root),
+                        auth_file=auth_file_path(root),
                     )
             verifier.assert_called_once()
             run_once.assert_not_called()
@@ -1112,6 +1312,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         output_dir=output_dir,
                         suite_path=SUITE_PATH,
                         allow_paid_rollouts=True,
+                        budget_journal_path=budget_journal_path(root),
+                        auth_file=auth_file_path(root),
                     )
 
             persisted = load_rollouts(output_dir / "codex_style.jsonl")
@@ -1154,8 +1356,12 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 revision="real-activation-revision",
             )
 
-            def normalize(arm_id):
-                item = load_rollouts(seed_paths[arm_id])[0]
+            def normalize(arm_id, task_id, trial):
+                item = next(
+                    row
+                    for row in load_rollouts(seed_paths[arm_id])
+                    if row["task_id"] == task_id and row["trial"] == trial
+                )
                 task = next(
                     task
                     for task in self.suite["tasks"]
@@ -1180,26 +1386,59 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 return item
 
             output_dir = root / "checkpoints"
-            for arm_id in ("codex_style", "claude_style"):
-                write_rollouts(output_dir / f"{arm_id}.jsonl", [normalize(arm_id)])
-
-            tinykg_rollout = normalize("tinykg")
             workspace = root / "tinykg-workspace"
             workspace.mkdir()
-            write_activation_artifacts(
-                workspace,
-                tinykg,
-                metadata={
-                    "run_id": tinykg_rollout["run_id"],
-                    "trial": tinykg_rollout["trial"],
-                    "suite_id": tinykg_rollout["suite_id"],
-                    "task_id": tinykg_rollout["task_id"],
-                    "harness_config_id": tinykg_rollout["harness"]["config_id"],
-                },
-            )
-            tinykg_rollout["artifacts"] = {"workspace": str(workspace)}
-            run_dir = root / "run"
-            run_dir.mkdir()
+            run_state = {}
+
+            def fake_run_once(
+                _repo_root,
+                _binary,
+                arm_id,
+                trial,
+                selector,
+                _model_provider,
+                _model_id,
+                _suite_path,
+                _revision,
+                **_kwargs,
+            ):
+                self.assertEqual(
+                    _kwargs.get("runtime_api_key"), "test-only-private-key"
+                )
+                run_dir = root / f"run-{len(run_state)}"
+                run_state[run_dir] = (arm_id, selector, trial)
+                return run_dir
+
+            def fake_import(_suite, _repo_root, run_dir):
+                arm_id, task_id, trial = run_state[run_dir]
+                item = normalize(arm_id, task_id, trial)
+                if arm_id == "tinykg":
+                    write_activation_artifacts(
+                        workspace,
+                        tinykg,
+                        metadata={
+                            "run_id": item["run_id"],
+                            "trial": item["trial"],
+                            "suite_id": item["suite_id"],
+                            "task_id": item["task_id"],
+                            "harness_config_id": item["harness"]["config_id"],
+                        },
+                    )
+                    item["artifacts"] = {"workspace": str(workspace)}
+                return [item]
+
+            def attach_activation(rollout, arm_id, binary_path, binary_sha256):
+                if arm_id == "tinykg":
+                    real_attach_treatment_activation(
+                        rollout, arm_id, binary_path, binary_sha256
+                    )
+
+            def stop_after_tinykg_checkpoint(stage, receipt):
+                if (
+                    stage == "after_rollout_checkpoint"
+                    and ":tinykg:" in str(receipt["run_id"])
+                ):
+                    raise RuntimeError("stop after real activation")
 
             with mock.patch(
                 "scripts.eval.paired_runner.tinykg_binary_identity",
@@ -1209,13 +1448,13 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 return_value=formal_identity,
             ), mock.patch(
                 "scripts.eval.paired_runner._run_once",
-                side_effect=[run_dir, RuntimeError("stop after real activation")],
+                side_effect=fake_run_once,
             ), mock.patch(
                 "scripts.eval.paired_runner.import_run",
-                return_value=[tinykg_rollout],
+                side_effect=fake_import,
             ), mock.patch(
                 "scripts.eval.paired_runner.attach_treatment_activation",
-                new=real_attach_treatment_activation,
+                side_effect=attach_activation,
             ):
                 with self.assertRaisesRegex(RuntimeError, "stop after real activation"):
                     run_multi_arm(
@@ -1229,6 +1468,9 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         output_dir=output_dir,
                         suite_path=SUITE_PATH,
                         allow_paid_rollouts=True,
+                        budget_journal_path=budget_journal_path(root),
+                        auth_file=auth_file_path(root),
+                        budget_fault_hook=stop_after_tinykg_checkpoint,
                     )
 
             persisted = load_rollouts(output_dir / "tinykg.jsonl")
@@ -1427,6 +1669,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         output_dir=root / "checkpoints",
                         suite_path=SUITE_PATH,
                         allow_paid_rollouts=True,
+                        budget_journal_path=budget_journal_path(root),
+                        auth_file=auth_file_path(root),
                     )
             imported.assert_not_called()
 
@@ -1478,6 +1722,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         output_dir=root / "checkpoints",
                         suite_path=SUITE_PATH,
                         allow_paid_rollouts=True,
+                        budget_journal_path=budget_journal_path(root),
+                        auth_file=auth_file_path(root),
                     )
             imported.assert_not_called()
 
@@ -1520,6 +1766,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 timeout_seconds=None,
                 max_metered_tokens=None,
                 max_cost_usd=None,
+                runtime_api_key=None,
             ):
                 _ = (
                     observed_binary,
@@ -1531,6 +1778,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                     runtime_env,
                 )
                 self.assertTrue(allow_invalid_run)
+                self.assertEqual(runtime_api_key, "test-only-private-key")
                 self.assertEqual(timeout_seconds, 900)
                 self.assertGreater(max_metered_tokens, 0)
                 self.assertGreater(max_cost_usd, 0)
@@ -1562,6 +1810,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         output_dir=output_dir,
                         suite_path=SUITE_PATH,
                         allow_paid_rollouts=True,
+                        budget_journal_path=budget_journal_path(root),
+                        auth_file=auth_file_path(root),
                     )
             checkpoint = load_rollouts(output_dir / "codex_style.jsonl")
             self.assertEqual(len(checkpoint), 1)
@@ -1621,6 +1871,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         output_dir=root / "missing-receipt",
                         suite_path=CONFIRMATORY_SUITE_PATH,
                         allow_paid_rollouts=True,
+                        budget_journal_path=budget_journal_path(root),
+                        auth_file=auth_file_path(root),
                     )
 
             calibration_paths = write_multi_arm_checkpoints(
@@ -1662,6 +1914,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         output_dir=root / "missing-checkpoints",
                         suite_path=CONFIRMATORY_SUITE_PATH,
                         allow_paid_rollouts=True,
+                        budget_journal_path=budget_journal_path(root),
+                        auth_file=auth_file_path(root),
                         promotion_receipt=receipt,
                     )
             with mock.patch(
@@ -1686,6 +1940,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         output_dir=root / "accepted-receipt",
                         suite_path=CONFIRMATORY_SUITE_PATH,
                         allow_paid_rollouts=True,
+                        budget_journal_path=budget_journal_path(root),
+                        auth_file=auth_file_path(root),
                         promotion_receipt=receipt,
                         calibration_checkpoints=calibration_paths,
                     )
@@ -1713,6 +1969,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         output_dir=root / "bad-receipt",
                         suite_path=CONFIRMATORY_SUITE_PATH,
                         allow_paid_rollouts=True,
+                        budget_journal_path=budget_journal_path(root),
+                        auth_file=auth_file_path(root),
                         promotion_receipt=broken,
                         calibration_checkpoints=calibration_paths,
                     )
@@ -1741,6 +1999,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         output_dir=root / "tampered-checkpoint",
                         suite_path=CONFIRMATORY_SUITE_PATH,
                         allow_paid_rollouts=True,
+                        budget_journal_path=budget_journal_path(root),
+                        auth_file=auth_file_path(root),
                         promotion_receipt=receipt,
                         calibration_checkpoints=calibration_paths,
                     )

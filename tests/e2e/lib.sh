@@ -222,10 +222,16 @@ PY
   [[ -n "$CONF_ANSWERS" ]] && cli_args+=(--answers-file "$E2E_DIR/$CONF_ANSWERS")
 
   # --- 真实模型认证:fake HOME 不复制用户 auth.json。---
-  # 优先继承显式 METASK_API_KEY；否则从 E2E_AUTH_FILE（默认宿主 auth.json）只读 api_key。
+  # 付费控制面传入匿名 fd；普通手工 E2E 保留旧的 env/auth-file 兼容路径。
+  local runtime_api_key_fd="${E2E_API_KEY_FD:-}"
   local eval_api_key="${METASK_API_KEY:-}"
   local auth_source="${E2E_AUTH_FILE:-${E2E_HOST_HOME:+$E2E_HOST_HOME/.metacodes/auth.json}}"
-  if [[ -z "$eval_api_key" && -n "$auth_source" && -f "$auth_source" ]]; then
+  if [[ -n "$runtime_api_key_fd" && -n "$eval_api_key" ]]; then
+    echo "ambiguous E2E provider credentials" >&2
+    echo 96
+    return 0
+  fi
+  if [[ -z "$runtime_api_key_fd" && -z "$eval_api_key" && -n "$auth_source" && -f "$auth_source" ]]; then
     eval_api_key="$(python3 - "$auth_source" <<'PY'
 import json
 import sys
@@ -239,7 +245,13 @@ PY
 )"
   fi
   local -a auth_env=()
-  [[ -n "$eval_api_key" ]] && auth_env+=("METASK_API_KEY=$eval_api_key")
+  if [[ -n "$runtime_api_key_fd" ]]; then
+    [[ "$runtime_api_key_fd" =~ ^[0-9]+$ ]] || { echo "invalid E2E_API_KEY_FD" >&2; echo 96; return 0; }
+    auth_env+=("METACODES_API_KEY_FD=$runtime_api_key_fd")
+    unset E2E_API_KEY_FD
+  elif [[ -n "$eval_api_key" ]]; then
+    auth_env+=("METASK_API_KEY=$eval_api_key")
+  fi
 
   # --- record 模式(Stage 7):E2E_RECORD=1 时录 cassette 到 <workdir>/cassette/ ---
   if [[ "${E2E_RECORD:-0}" == "1" ]]; then

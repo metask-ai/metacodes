@@ -664,6 +664,8 @@
             "scripts.eval.tests.test_memory_budget_journal",
             "scripts.eval.tests.test_memory_budget_runtime",
             "scripts.eval.tests.test_memory_agent_runtime",
+            "scripts.eval.tests.test_experiment",
+            "scripts.eval.tests.test_paid_multi_arm_fd",
             "-v"
           ],
           [

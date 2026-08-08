@@ -1290,10 +1290,15 @@ class PaidBudgetJournalSensorTests(unittest.TestCase):
         "scripts/eval/memory_budget_journal.py",
         "scripts/eval/memory_agent_runtime.py",
         "scripts/eval/memory_agent_runtime_pilot.py",
+        "scripts/eval/paired_runner.py",
+        "scripts/eval/cli.py",
         "scripts/eval/memory_replay.py",
         "scripts/eval/tests/test_memory_budget_journal.py",
         "scripts/eval/tests/test_memory_budget_runtime.py",
         "scripts/eval/tests/test_memory_agent_runtime.py",
+        "scripts/eval/tests/test_experiment.py",
+        "scripts/eval/tests/test_paid_multi_arm_fd.py",
+        "tests/e2e/lib.sh",
         "tests/component/stream_retry_test.zig",
     )
 
@@ -1314,7 +1319,7 @@ class PaidBudgetJournalSensorTests(unittest.TestCase):
         self.assertTrue(observation.sensor_ok, observation.errors)
         self.assertEqual(9, observation.declared)
         self.assertEqual(9, observation.covered)
-        self.assertEqual(5, len(observation.feedback_bindings))
+        self.assertEqual(7, len(observation.feedback_bindings))
 
     def test_spawn_without_real_authorization_predecessor_is_observed(self) -> None:
         temporary, root = self.make_repo()
@@ -1351,6 +1356,63 @@ class PaidBudgetJournalSensorTests(unittest.TestCase):
         self.assertFalse(observation.sensor_ok)
         self.assertIn(
             "real_runner_provider_requires_durable_authorization",
+            observation.missing_declarations,
+        )
+
+    def test_multi_arm_provider_cannot_bypass_durable_authorization(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        runner = root / "scripts/eval/paired_runner.py"
+        runner.write_text(
+            runner.read_text(encoding="utf-8").replace(
+                "authorization = budget_journal.authorize_request(",
+                "authorization = trust_unpersisted_authorization(",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "real_runner_provider_requires_durable_authorization",
+            observation.missing_declarations,
+        )
+
+    def test_multi_arm_fd_bridge_is_part_of_the_paid_boundary(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        bridge = root / "tests/e2e/lib.sh"
+        bridge.write_text(
+            bridge.read_text(encoding="utf-8").replace(
+                'auth_env+=("METACODES_API_KEY_FD=$runtime_api_key_fd")',
+                'auth_env+=("METASK_API_KEY=leaked")',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "dry_run_and_paid_regression_gates_remain_zero_side_effect",
+            observation.missing_declarations,
+        )
+
+    def test_multi_arm_fd_l2_must_cross_the_real_runner_seam(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        tests = root / "scripts/eval/tests/test_paid_multi_arm_fd.py"
+        tests.write_text(
+            tests.read_text(encoding="utf-8").replace(
+                "run_dir = _run_once(",
+                "run_dir = bypass_real_runner(",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "dry_run_and_paid_regression_gates_remain_zero_side_effect",
             observation.missing_declarations,
         )
 
@@ -1416,6 +1478,25 @@ class PaidBudgetJournalSensorTests(unittest.TestCase):
             tests.read_text(encoding="utf-8").replace(
                 '"after_provider_return_before_commit", 1',
                 '"unobserved_post_provider_window", 1',
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "authorized_crash_recovery_consumes_maximum_without_retry",
+            observation.missing_declarations,
+        )
+
+    def test_multi_arm_orphan_replay_counterexample_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        tests = root / "scripts/eval/tests/test_experiment.py"
+        tests.write_text(
+            tests.read_text(encoding="utf-8").replace(
+                "load_key.assert_not_called()",
+                "load_key.assert_called_once()",
+                1,
             ),
             encoding="utf-8",
         )
@@ -1917,6 +1998,8 @@ class TopologyTests(unittest.TestCase):
                     "scripts.eval.tests.test_memory_budget_journal",
                     "scripts.eval.tests.test_memory_budget_runtime",
                     "scripts.eval.tests.test_memory_agent_runtime",
+                    "scripts.eval.tests.test_experiment",
+                    "scripts.eval.tests.test_paid_multi_arm_fd",
                 ],
                 [
                     "zig",

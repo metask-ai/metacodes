@@ -534,6 +534,10 @@ def cmd_run_multi(args: argparse.Namespace) -> int:
         ),
         budget_used_cost_usd=args.budget_used_cost_usd,
         budget_used_tokens=args.budget_used_tokens,
+        budget_journal_path=(
+            Path(args.budget_journal) if args.budget_journal else None
+        ),
+        auth_file=args.auth_file,
     )
     print(
         "multi-arm E2E complete: "
@@ -1239,6 +1243,22 @@ def parser() -> argparse.ArgumentParser:
     multi_parser.add_argument("--dry-run", action="store_true")
     multi_parser.add_argument("--plan-output")
     multi_parser.add_argument("--allow-paid-rollouts", action="store_true")
+    multi_parser.add_argument(
+        "--budget-journal",
+        help=(
+            "private local budget journal outside --output-dir; required for "
+            "paid execution and ignored by --dry-run"
+        ),
+    )
+    multi_parser.add_argument(
+        "--auth-file",
+        type=Path,
+        default=Path.home() / ".metacodes" / "auth.json",
+        help=(
+            "private 0600 credential file loaded only after journal/checkpoint "
+            "validation; ignored by --dry-run"
+        ),
+    )
     multi_parser.add_argument(
         "--promotion-receipt",
         help="calibration receipt required by the confirmatory stage",

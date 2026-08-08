@@ -9,7 +9,7 @@ import os
 import subprocess
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
 
 from .e2e_adapter import comparison_fingerprints, import_run
 from .experiment import (
@@ -22,7 +22,15 @@ from .experiment import (
     tinykg_binary_identity,
     validate_experiment,
 )
-from .model import ValidationError, load_rollouts, write_rollouts
+from .memory_budget_journal import (
+    BudgetAuthority,
+    BudgetJournal,
+    BudgetTransaction,
+    usd_to_microusd,
+    usd_to_microusd_ceiling,
+)
+from .memory_agent_runtime_pilot import _load_api_key
+from .model import ValidationError, load_rollouts, stable_json, write_rollouts
 from .promotion import validate_calibration_bundle
 from .treatment_activation import (
     attach_treatment_activation,
@@ -36,6 +44,7 @@ TOKEN_METRICS = (
     "cache_read_tokens",
     "cache_write_tokens",
 )
+BudgetFaultHook = Callable[[str, Mapping[str, Any]], None]
 RUNTIME_ENV_ALLOWLIST = frozenset(
     {
         "METACODES_LONG_HORIZON_ARM",
@@ -284,6 +293,197 @@ def _require_remaining_schedule_capacity(
     return rollout_cost_cap, rollout_token_cap
 
 
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()
+
+
+def _multi_arm_budget_authority(
+    experiment: Mapping[str, Any],
+    suite: Mapping[str, Any],
+    *,
+    stage_prior_cost_usd: float,
+    stage_prior_tokens: int,
+    aggregate_prior_cost_usd: float,
+    aggregate_prior_tokens: int,
+) -> BudgetAuthority:
+    """Bind one local journal to the exact stage, carryover, and authority."""
+
+    budget = experiment["budget"]
+    stage_limit_cost = usd_to_microusd(budget["max_stage_cost_usd"])
+    aggregate_limit_cost = usd_to_microusd(budget["max_aggregate_cost_usd"])
+    stage_prior_cost = usd_to_microusd_ceiling(stage_prior_cost_usd)
+    aggregate_prior_cost = usd_to_microusd_ceiling(aggregate_prior_cost_usd)
+    remaining_cost = min(
+        stage_limit_cost - stage_prior_cost,
+        aggregate_limit_cost - aggregate_prior_cost,
+    )
+    remaining_tokens = min(
+        int(budget["max_stage_tokens"]) - stage_prior_tokens,
+        int(budget["max_aggregate_tokens"]) - aggregate_prior_tokens,
+    )
+    if remaining_cost <= 0 or remaining_tokens <= 0:
+        raise ValidationError("paid budget journal authority is exhausted; fail-closed")
+    experiment_sha256 = _canonical_sha256(experiment)
+    suite_sha256 = _canonical_sha256(suite)
+    authority_manifest = {
+        "contract": "metacodes-multi-arm-budget-authority-v1",
+        "experiment_id": experiment["experiment_id"],
+        "stage_id": experiment["stage"]["id"],
+        "experiment_sha256": experiment_sha256,
+        "suite_id": suite["suite_id"],
+        "suite_sha256": suite_sha256,
+        "stage_prior_cost_microusd": stage_prior_cost,
+        "stage_prior_metered_tokens": stage_prior_tokens,
+        "aggregate_prior_cost_microusd": aggregate_prior_cost,
+        "aggregate_prior_metered_tokens": aggregate_prior_tokens,
+        "effective_total_cost_microusd": remaining_cost,
+        "effective_total_metered_tokens": remaining_tokens,
+    }
+    return BudgetAuthority(
+        manifest_sha256=_canonical_sha256(authority_manifest),
+        model_fingerprint=_canonical_sha256(experiment["model"]),
+        provider_identity=str(experiment["model"]["provider"]),
+        total_cost_microusd=remaining_cost,
+        total_metered_tokens=remaining_tokens,
+    )
+
+
+def _multi_arm_budget_transaction(
+    experiment: Mapping[str, Any],
+    task: Mapping[str, Any],
+    *,
+    authority: BudgetAuthority,
+    arm_id: str,
+    trial: int,
+    revision: str,
+    config_id: str,
+    metacodes_sha256: str,
+    tinykg_sha256: str,
+    formal_kernel_fingerprint: str,
+    runtime_env: Mapping[str, str],
+    max_cost_usd: float,
+    max_metered_tokens: int,
+) -> BudgetTransaction:
+    run_id = (
+        f"{experiment['experiment_id']}:{experiment['stage']['id']}:"
+        f"{arm_id}:{task['id']}:{trial}"
+    )
+    harness_fingerprint = _canonical_sha256(
+        {
+            "contract": "metacodes-multi-arm-budget-transaction-v1",
+            "experiment_id": experiment["experiment_id"],
+            "stage_id": experiment["stage"]["id"],
+            "arm_id": arm_id,
+            "task_id": task["id"],
+            "task_sha256": _canonical_sha256(task),
+            "trial": trial,
+            "revision": revision,
+            "config_id": config_id,
+            "metacodes_sha256": metacodes_sha256,
+            "tinykg_sha256": tinykg_sha256,
+            "formal_kernel_fingerprint": formal_kernel_fingerprint,
+            "runtime_env": dict(sorted(runtime_env.items())),
+            "max_cost_microusd": usd_to_microusd(max_cost_usd),
+            "max_metered_tokens": max_metered_tokens,
+        }
+    )
+    return BudgetTransaction(
+        run_id=run_id,
+        manifest_sha256=authority.manifest_sha256,
+        model_fingerprint=authority.model_fingerprint,
+        harness_fingerprint=harness_fingerprint,
+        provider_identity=authority.provider_identity,
+        max_cost_microusd=usd_to_microusd(max_cost_usd),
+        max_metered_tokens=max_metered_tokens,
+    )
+
+
+def _require_external_budget_journal(path: Path, output_dir: Path) -> Path:
+    journal_path = path.expanduser()
+    if not journal_path.is_absolute():
+        journal_path = (Path.cwd() / journal_path).absolute()
+    output = output_dir.expanduser()
+    if not output.is_absolute():
+        output = (Path.cwd() / output).absolute()
+    journal_path = journal_path.resolve(strict=False)
+    output = output.resolve(strict=False)
+    try:
+        journal_path.relative_to(output)
+    except ValueError:
+        return journal_path
+    raise ValidationError(
+        "paid budget journal must be outside the multi-arm output directory"
+    )
+
+
+def _rollout_metered_tokens(rollout: Mapping[str, Any]) -> int:
+    return sum(int(rollout["metrics"][key]) for key in TOKEN_METRICS)
+
+
+def _validate_checkpoint_budget_receipt(
+    rollout: Mapping[str, Any],
+    *,
+    journal: BudgetJournal,
+    transaction: BudgetTransaction,
+) -> str:
+    stored = rollout.get("budget_transaction")
+    if not isinstance(stored, dict):
+        raise ValidationError(
+            f"rollout {rollout.get('run_id', 'unknown')} is missing its paid budget receipt"
+        )
+    transaction_id = stored.get("transaction_id")
+    if not isinstance(transaction_id, str):
+        raise ValidationError("paid budget receipt transaction id is missing")
+    live = journal.transaction_receipt(transaction_id)
+    immutable_keys = set(live) - {"journal_revision", "journal_head_sha256"}
+    mismatches = sorted(
+        key for key in immutable_keys if stored.get(key) != live.get(key)
+    )
+    if mismatches:
+        raise ValidationError(
+            "paid budget receipt does not match the live journal transaction: "
+            f"{mismatches}"
+        )
+    identity = transaction.record()
+    identity_mismatches = sorted(
+        key for key, expected in identity.items() if stored.get(key) != expected
+    )
+    if identity_mismatches:
+        raise ValidationError(
+            "paid budget receipt transaction identity drift: "
+            f"{identity_mismatches}"
+        )
+    expected_cost = usd_to_microusd_ceiling(rollout["metrics"]["cost_usd"])
+    expected_tokens = _rollout_metered_tokens(rollout)
+    if (
+        stored.get("state") != "committed"
+        or stored.get("actual_cost_microusd") != expected_cost
+        or stored.get("actual_metered_tokens") != expected_tokens
+    ):
+        raise ValidationError("paid budget receipt is not an exact committed usage record")
+    if (
+        stored.get("journal_revision") != stored.get("commit_revision")
+        or stored.get("journal_head_sha256") != stored.get("commit_head_sha256")
+    ):
+        raise ValidationError(
+            "paid budget receipt is not bound to its commit journal revision/head"
+        )
+    return transaction_id
+
+
+def _require_no_orphan_budget_transactions(
+    journal: BudgetJournal, checkpoint_transaction_ids: set[str]
+) -> None:
+    for receipt in journal.transaction_receipts():
+        if receipt["state"] == "aborted_pre_request":
+            continue
+        if receipt["transaction_id"] not in checkpoint_transaction_ids:
+            raise ValidationError(
+                "paid budget journal contains an authorized, reserved, or committed "
+                "transaction without a matching rollout checkpoint; replay is forbidden"
+            )
+
+
 def _require_scoring_rollout(rollout: Dict[str, Any], *, variant: str) -> None:
     if not rollout.get("judgement", {}).get("valid_for_scoring", False):
         task_id = rollout.get("task_id", "unknown")
@@ -478,6 +678,7 @@ def _run_once(
     timeout_seconds: int | None = None,
     max_metered_tokens: int | None = None,
     max_cost_usd: float | None = None,
+    runtime_api_key: str | None = None,
 ) -> Path:
     runs_dir = repo_root / "tests/e2e/runs"
     before = (
@@ -534,12 +735,38 @@ def _run_once(
         env["E2E_MAX_METERED_TOKENS"] = str(max_metered_tokens)
     if max_cost_usd is not None:
         env["E2E_MAX_COST_USD"] = format(float(max_cost_usd), ".17g")
-    completed = subprocess.run(
-        [str(repo_root / "tests/e2e/run_e2e.sh"), scenario_glob],
-        cwd=repo_root,
-        env=env,
-        check=False,
-    )
+    credential_read_fd = -1
+    credential_write_fd = -1
+    subprocess_options: Dict[str, Any] = {}
+    try:
+        if runtime_api_key is not None:
+            credential = runtime_api_key.encode("utf-8")
+            if not credential or len(credential) > 16 * 1024:
+                raise ValidationError(
+                    "multi-arm provider credential must contain 1-16384 UTF-8 bytes"
+                )
+            credential_read_fd, credential_write_fd = os.pipe()
+            pipe_buf = os.fpathconf(credential_write_fd, "PC_PIPE_BUF")
+            if len(credential) > pipe_buf:
+                raise ValidationError("multi-arm provider credential exceeds atomic pipe limit")
+            if os.write(credential_write_fd, credential) != len(credential):
+                raise ValidationError("multi-arm provider credential pipe write was short")
+            os.close(credential_write_fd)
+            credential_write_fd = -1
+            env["E2E_API_KEY_FD"] = str(credential_read_fd)
+            subprocess_options["pass_fds"] = (credential_read_fd,)
+        completed = subprocess.run(
+            [str(repo_root / "tests/e2e/run_e2e.sh"), scenario_glob],
+            cwd=repo_root,
+            env=env,
+            check=False,
+            **subprocess_options,
+        )
+    finally:
+        if credential_write_fd >= 0:
+            os.close(credential_write_fd)
+        if credential_read_fd >= 0:
+            os.close(credential_read_fd)
     after = {path.resolve() for path in runs_dir.iterdir() if path.is_dir()}
     created = sorted(after - before)
     # run_e2e.sh uses exit 2 specifically for deterministic EXPECT_HARD
@@ -847,6 +1074,9 @@ def run_multi_arm(
     calibration_checkpoints: Mapping[str, Path] | None = None,
     budget_used_cost_usd: float = 0.0,
     budget_used_tokens: int = 0,
+    budget_journal_path: Path | None = None,
+    auth_file: Path | None = None,
+    budget_fault_hook: BudgetFaultHook | None = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Execute a resumable three-arm experiment from its frozen contract."""
     validate_experiment(experiment, repo_root, suite)
@@ -924,6 +1154,73 @@ def run_multi_arm(
         tinykg_identity["sha256"],
         formal_identity["artifact_fingerprint"],
     )
+    budget = experiment["budget"]
+    if budget_journal_path is None:
+        raise ValidationError("multi-arm execution requires explicit --budget-journal")
+    if auth_file is None:
+        raise ValidationError("multi-arm execution requires explicit --auth-file")
+    journal_path = _require_external_budget_journal(budget_journal_path, output_dir)
+    authority = _multi_arm_budget_authority(
+        experiment,
+        suite,
+        stage_prior_cost_usd=stage_prior_cost_usd,
+        stage_prior_tokens=stage_prior_tokens,
+        aggregate_prior_cost_usd=aggregate_prior_cost_usd,
+        aggregate_prior_tokens=aggregate_prior_tokens,
+    )
+    with BudgetJournal(journal_path, authority) as budget_journal:
+        return _run_multi_arm_locked(
+            experiment,
+            suite,
+            repo_root,
+            binary,
+            budget_journal=budget_journal,
+            budget_authority=authority,
+            tinykg_identity=tinykg_identity,
+            formal_identity=formal_identity,
+            revision=revision,
+            output_dir=output_dir,
+            suite_path=suite_path,
+            metacodes_sha256=metacodes_sha256,
+            config_ids=config_ids,
+            fixed_rollout_cost_usd=fixed_rollout_cost_usd,
+            fixed_rollout_tokens=fixed_rollout_tokens,
+            stage_prior_cost_usd=stage_prior_cost_usd,
+            stage_prior_tokens=stage_prior_tokens,
+            aggregate_prior_cost_usd=aggregate_prior_cost_usd,
+            aggregate_prior_tokens=aggregate_prior_tokens,
+            auth_file=auth_file,
+            budget_fault_hook=budget_fault_hook,
+        )
+
+
+def _run_multi_arm_locked(
+    experiment: Dict[str, Any],
+    suite: Dict[str, Any],
+    repo_root: Path,
+    binary: Path,
+    *,
+    budget_journal: BudgetJournal,
+    budget_authority: BudgetAuthority,
+    tinykg_identity: Mapping[str, Any],
+    formal_identity: Mapping[str, Any],
+    revision: str,
+    output_dir: Path,
+    suite_path: Path,
+    metacodes_sha256: str,
+    config_ids: Mapping[str, str],
+    fixed_rollout_cost_usd: float,
+    fixed_rollout_tokens: int,
+    stage_prior_cost_usd: float,
+    stage_prior_tokens: int,
+    aggregate_prior_cost_usd: float,
+    aggregate_prior_tokens: int,
+    auth_file: Path,
+    budget_fault_hook: BudgetFaultHook | None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Run the paid schedule while one exclusive journal lock is held."""
+
+    expected_tasks = {task["id"]: task for task in suite["tasks"]}
     outputs = {arm_id: output_dir / f"{arm_id}.jsonl" for arm_id in ARM_IDS}
     collected = {
         arm_id: _load_checkpoint(
@@ -940,8 +1237,8 @@ def run_multi_arm(
             harness_config_id=config_ids[arm_id],
             require_runtime_budget=True,
             treatment_verifier=(
-                Path(tinykg_identity["path"]),
-                tinykg_identity["sha256"],
+                Path(str(tinykg_identity["path"])),
+                str(tinykg_identity["sha256"]),
             ),
         )
         for arm_id in ARM_IDS
@@ -951,13 +1248,50 @@ def run_multi_arm(
         for arm_id in ARM_IDS
     }
     budget = experiment["budget"]
-    for rows in collected.values():
+    checkpoint_transaction_ids: set[str] = set()
+    for arm_id, rows in collected.items():
+        runtime_env = arm_runtime_env(
+            experiment,
+            arm_id,
+            Path(str(tinykg_identity["path"])),
+            formal_identity,
+        )
         for rollout in rows:
             _require_runtime_budget_provenance(
                 rollout,
                 max_metered_tokens=fixed_rollout_tokens,
                 max_cost_usd=fixed_rollout_cost_usd,
             )
+            transaction = _multi_arm_budget_transaction(
+                experiment,
+                expected_tasks[rollout["task_id"]],
+                authority=budget_authority,
+                arm_id=arm_id,
+                trial=rollout["trial"],
+                revision=revision,
+                config_id=config_ids[arm_id],
+                metacodes_sha256=metacodes_sha256,
+                tinykg_sha256=str(tinykg_identity["sha256"]),
+                formal_kernel_fingerprint=str(
+                    formal_identity["artifact_fingerprint"]
+                ),
+                runtime_env=runtime_env,
+                max_cost_usd=fixed_rollout_cost_usd,
+                max_metered_tokens=fixed_rollout_tokens,
+            )
+            transaction_id = _validate_checkpoint_budget_receipt(
+                rollout,
+                journal=budget_journal,
+                transaction=transaction,
+            )
+            if transaction_id in checkpoint_transaction_ids:
+                raise ValidationError(
+                    "paid budget transaction is attached to more than one rollout checkpoint"
+                )
+            checkpoint_transaction_ids.add(transaction_id)
+    _require_no_orphan_budget_transactions(
+        budget_journal, checkpoint_transaction_ids
+    )
     _require_multi_budget(
         collected,
         budget,
@@ -966,19 +1300,30 @@ def run_multi_arm(
         aggregate_prior_cost_usd=aggregate_prior_cost_usd,
         aggregate_prior_tokens=aggregate_prior_tokens,
     )
+    remaining_rollouts = _remaining_schedule_count(
+        experiment, expected_tasks, completed_keys
+    )
     _require_remaining_schedule_capacity(
         collected,
         budget,
-        remaining_rollouts=_remaining_schedule_count(
-            experiment, expected_tasks, completed_keys
-        ),
+        remaining_rollouts=remaining_rollouts,
         stage_prior_cost_usd=stage_prior_cost_usd,
         stage_prior_tokens=stage_prior_tokens,
         aggregate_prior_cost_usd=aggregate_prior_cost_usd,
         aggregate_prior_tokens=aggregate_prior_tokens,
     )
+    if remaining_rollouts == 0:
+        return collected
+    runtime_api_key = _load_api_key(auth_file.expanduser().resolve())
     output_dir.mkdir(parents=True, exist_ok=True)
+
     for trial, arm_id in counterbalanced_schedule(ARM_IDS, experiment["trials"]):
+        runtime_env = arm_runtime_env(
+            experiment,
+            arm_id,
+            Path(str(tinykg_identity["path"])),
+            formal_identity,
+        )
         for task_id in sorted(expected_tasks):
             if (task_id, trial) in completed_keys[arm_id]:
                 continue
@@ -990,24 +1335,71 @@ def run_multi_arm(
                 aggregate_prior_cost_usd=aggregate_prior_cost_usd,
                 aggregate_prior_tokens=aggregate_prior_tokens,
             )
-            runtime_max_cost_usd, runtime_max_metered_tokens = _require_remaining_schedule_capacity(
-                collected,
-                budget,
-                remaining_rollouts=_remaining_schedule_count(
-                    experiment, expected_tasks, completed_keys
-                ),
-                stage_prior_cost_usd=stage_prior_cost_usd,
-                stage_prior_tokens=stage_prior_tokens,
-                aggregate_prior_cost_usd=aggregate_prior_cost_usd,
-                aggregate_prior_tokens=aggregate_prior_tokens,
+            runtime_max_cost_usd, runtime_max_metered_tokens = (
+                _require_remaining_schedule_capacity(
+                    collected,
+                    budget,
+                    remaining_rollouts=_remaining_schedule_count(
+                        experiment, expected_tasks, completed_keys
+                    ),
+                    stage_prior_cost_usd=stage_prior_cost_usd,
+                    stage_prior_tokens=stage_prior_tokens,
+                    aggregate_prior_cost_usd=aggregate_prior_cost_usd,
+                    aggregate_prior_tokens=aggregate_prior_tokens,
+                )
             )
             _require_sha256(binary, metacodes_sha256, "metacodes binary")
             _require_sha256(
-                Path(tinykg_identity["path"]),
-                tinykg_identity["sha256"],
+                Path(str(tinykg_identity["path"])),
+                str(tinykg_identity["sha256"]),
                 "TinyKG binary",
             )
             _require_formal_identity(formal_identity)
+
+            transaction = _multi_arm_budget_transaction(
+                experiment,
+                expected_tasks[task_id],
+                authority=budget_authority,
+                arm_id=arm_id,
+                trial=trial,
+                revision=revision,
+                config_id=config_ids[arm_id],
+                metacodes_sha256=metacodes_sha256,
+                tinykg_sha256=str(tinykg_identity["sha256"]),
+                formal_kernel_fingerprint=str(
+                    formal_identity["artifact_fingerprint"]
+                ),
+                runtime_env=runtime_env,
+                max_cost_usd=runtime_max_cost_usd,
+                max_metered_tokens=runtime_max_metered_tokens,
+            )
+            reserved = budget_journal.reserve(transaction)
+            transaction_id = str(reserved["transaction_id"])
+            authorization_started = False
+            try:
+                # Re-observe immutable executables after reservation and before
+                # durable request admission. Any safe pre-request failure aborts
+                # the reservation without exposing provider budget.
+                _require_sha256(binary, metacodes_sha256, "metacodes binary")
+                _require_sha256(
+                    Path(str(tinykg_identity["path"])),
+                    str(tinykg_identity["sha256"]),
+                    "TinyKG binary",
+                )
+                _require_formal_identity(formal_identity)
+                authorization_started = True
+                authorization = budget_journal.authorize_request(
+                    transaction_id,
+                    expected_revision=int(reserved["journal_revision"]),
+                    expected_head_sha256=str(reserved["journal_head_sha256"]),
+                )
+            except BaseException:
+                if not authorization_started:
+                    budget_journal.abort_pre_request(transaction_id)
+                raise
+            if budget_fault_hook is not None:
+                budget_fault_hook("after_request_authorized", authorization)
+
             infrastructure_error: InfrastructureRunError | None = None
             try:
                 run_dir = _run_once(
@@ -1021,27 +1413,30 @@ def run_multi_arm(
                     suite_path,
                     revision,
                     harness_config_id=config_ids[arm_id],
-                    runtime_env=arm_runtime_env(
-                        experiment,
-                        arm_id,
-                        Path(tinykg_identity["path"]),
-                        formal_identity,
-                    ),
+                    runtime_env=runtime_env,
                     allow_invalid_run=True,
-                    timeout_seconds=expected_tasks[task_id]["constraints"]["timeout_seconds"],
+                    timeout_seconds=expected_tasks[task_id]["constraints"][
+                        "timeout_seconds"
+                    ],
                     max_metered_tokens=runtime_max_metered_tokens,
                     max_cost_usd=runtime_max_cost_usd,
+                    runtime_api_key=runtime_api_key,
                 )
             except InfrastructureRunError as exc:
                 infrastructure_error = exc
                 run_dir = exc.run_dir
+            if budget_fault_hook is not None:
+                budget_fault_hook(
+                    "after_provider_return_before_commit", authorization
+                )
+
             if infrastructure_error is None:
                 # Catch replacement during the paid rollout, including the
                 # final sample where there is no subsequent preflight.
                 _require_sha256(binary, metacodes_sha256, "metacodes binary")
                 _require_sha256(
-                    Path(tinykg_identity["path"]),
-                    tinykg_identity["sha256"],
+                    Path(str(tinykg_identity["path"])),
+                    str(tinykg_identity["sha256"]),
                     "TinyKG binary",
                 )
                 _require_formal_identity(formal_identity)
@@ -1059,10 +1454,13 @@ def run_multi_arm(
                     for rollout in imported
                     if rollout["task_id"] == task_id
                     and rollout["trial"] == trial
-                    and rollout["task_fingerprint_provenance"] == "recorded_at_execution"
+                    and rollout["task_fingerprint_provenance"]
+                    == "recorded_at_execution"
                 ]
             else:
-                selected = [rollout for rollout in imported if rollout["task_id"] == task_id]
+                selected = [
+                    rollout for rollout in imported if rollout["task_id"] == task_id
+                ]
                 if len(selected) != 1:
                     detail = (
                         str(import_error)
@@ -1095,6 +1493,7 @@ def run_multi_arm(
                     f"{arm_id} trial {trial} task {task_id}: expected one "
                     "execution-grounded rollout"
                 )
+
             runtime_budget_error: ValidationError | None = None
             try:
                 _require_runtime_budget_provenance(
@@ -1106,14 +1505,31 @@ def run_multi_arm(
             except ValidationError as exc:
                 runtime_budget_error = exc
                 _mark_runtime_budget_invalid(selected[0], str(exc))
+
+            if infrastructure_error is None and runtime_budget_error is None:
+                budget_receipt = budget_journal.commit(
+                    transaction_id,
+                    actual_cost_microusd=usd_to_microusd_ceiling(
+                        selected[0]["metrics"]["cost_usd"]
+                    ),
+                    actual_metered_tokens=_rollout_metered_tokens(selected[0]),
+                )
+                selected[0]["budget_transaction"] = dict(budget_receipt)
+                if budget_fault_hook is not None:
+                    budget_fault_hook("after_budget_commit", budget_receipt)
+            else:
+                selected[0]["budget_transaction"] = dict(
+                    budget_journal.transaction_receipt(transaction_id)
+                )
+
             treatment_error: ValidationError | None = None
             if infrastructure_error is None and runtime_budget_error is None:
                 try:
                     attach_treatment_activation(
                         selected[0],
                         arm_id,
-                        Path(tinykg_identity["path"]),
-                        tinykg_identity["sha256"],
+                        Path(str(tinykg_identity["path"])),
+                        str(tinykg_identity["sha256"]),
                     )
                 except ValidationError as exc:
                     treatment_error = exc
@@ -1121,6 +1537,10 @@ def run_multi_arm(
             collected[arm_id].extend(selected)
             completed_keys[arm_id].add((task_id, trial))
             write_rollouts(outputs[arm_id], collected[arm_id])
+            if budget_fault_hook is not None:
+                budget_fault_hook(
+                    "after_rollout_checkpoint", selected[0]["budget_transaction"]
+                )
             if infrastructure_error is not None:
                 raise infrastructure_error
             if runtime_budget_error is not None:
