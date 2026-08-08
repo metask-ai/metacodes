@@ -461,19 +461,6 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         source = json.loads((pilot / "source.json").read_text(encoding="utf-8"))
         manifest = load_manifest(pilot / "manifest.json")
         execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
-        attempt = json.loads(
-            (pilot / "attempt-001-observation.json").read_text(encoding="utf-8")
-        )
-
-        self.assertEqual(
-            attempt["outcome"]["status"],
-            "halted-evidence-validator-protocol-drift",
-        )
-        self.assertEqual(attempt["outcome"]["completed_rollout_transactions"], 111)
-        self.assertEqual(attempt["outcome"]["uncertain_authorized_transactions"], 0)
-        self.assertFalse(attempt["failure"]["automatic_retry_performed"])
-        self.assertEqual(attempt["failure"]["fix_commit"], "89285db")
-        self.assertFalse(attempt["isolation"]["raw_artifacts_uploaded"])
 
         for name, identity in contract["artifacts"].items():
             payload = (pilot / name).read_bytes()
@@ -1764,6 +1751,19 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         source = json.loads((pilot / "source.json").read_text(encoding="utf-8"))
         manifest = load_manifest(pilot / "manifest.json")
         execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
+        attempt = json.loads(
+            (pilot / "attempt-001-observation.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(
+            attempt["outcome"]["status"],
+            "halted-evidence-validator-protocol-drift",
+        )
+        self.assertEqual(attempt["outcome"]["completed_rollout_transactions"], 111)
+        self.assertEqual(attempt["outcome"]["uncertain_authorized_transactions"], 0)
+        self.assertFalse(attempt["failure"]["automatic_retry_performed"])
+        self.assertEqual(attempt["failure"]["fix_commit"], "89285db")
+        self.assertFalse(attempt["isolation"]["raw_artifacts_uploaded"])
 
         for name, identity in contract["artifacts"].items():
             payload = (pilot / name).read_bytes()
@@ -1823,6 +1823,78 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 for item in contract["predecessor_attempts"]
             ],
             [("procedural-glm52-v16", "halted-runner-misclassification", 0)],
+        )
+        budget = contract["budget_authority"]
+        self.assertLessEqual(
+            budget["prior_conservative_cost_usd"] + budget["max_total_cost_usd"],
+            budget["user_authorization_max_cost_usd"],
+        )
+        ProductionRuntimeConfig(
+            api_key="test-only",
+            allow_paid_rollouts=True,
+            max_total_cost_usd=budget["max_total_cost_usd"],
+            max_total_metered_tokens=budget["max_total_metered_tokens"],
+            max_rollout_cost_usd=budget["max_rollout_cost_usd"],
+            max_rollout_metered_tokens=budget["max_rollout_metered_tokens"],
+            max_output_tokens=budget["max_output_tokens"],
+            ripgrep_binary=TEST_RIPGREP,
+            ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
+        ).validate(len(manifest["schedule"]))
+
+    def test_checked_in_pilot_v18_has_fresh_paid_identity_and_balanced_schedule(self):
+        pilot = ROOT / "evals/memory/pilots/procedural-glm52-v18"
+        contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        manifest = load_manifest(pilot / "manifest.json")
+        execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
+
+        for name, identity in contract["artifacts"].items():
+            payload = (pilot / name).read_bytes()
+            self.assertEqual(len(payload), identity["bytes"])
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), identity["sha256"])
+        self.assertEqual(manifest["execution"], execution)
+        self.assertEqual(manifest["manifest_id"], "coding-intent-families-2026080819-4")
+        self.assertEqual(len(manifest["schedule"]), 144)
+        self.assertNotEqual(
+            hashlib.sha256((pilot / "manifest.json").read_bytes()).hexdigest(),
+            hashlib.sha256(
+                (
+                    ROOT
+                    / "evals/memory/pilots/procedural-glm52-v17/manifest.json"
+                ).read_bytes()
+            ).hexdigest(),
+        )
+
+        positions = {}
+        cases = {case["id"]: case for case in manifest["cases"]}
+        offline_by_arm = {}
+        for offset in range(0, len(manifest["schedule"]), 3):
+            for position, row in enumerate(manifest["schedule"][offset : offset + 3]):
+                positions[(row["arm"], position)] = (
+                    positions.get((row["arm"], position), 0) + 1
+                )
+                if cases[row["case_id"]]["split"] == "offline":
+                    offline_by_arm[row["arm"]] = offline_by_arm.get(row["arm"], 0) + 1
+        self.assertEqual(set(positions.values()), {16})
+        self.assertEqual(set(offline_by_arm.values()), {32})
+        rows = [
+            [item["sequence"], item["case_id"], item["trial"], item["arm"]]
+            for item in manifest["schedule"]
+        ]
+        ordered_tsv = "".join("\t".join(str(value) for value in row) + "\n" for row in rows)
+        self.assertEqual(
+            hashlib.sha256(ordered_tsv.encode("utf-8")).hexdigest(),
+            contract["schedule"]["ordered_tsv_sha256"],
+        )
+        self.assertFalse(contract["incident_guard"]["v17_transaction_reuse"])
+        self.assertEqual(
+            [
+                (item["pilot_id"], item["status"], item["uncertain_authorized_transactions"])
+                for item in contract["predecessor_attempts"]
+            ],
+            [
+                ("procedural-glm52-v16", "halted-runner-misclassification", 0),
+                ("procedural-glm52-v17", "halted-evidence-validator-protocol-drift", 0),
+            ],
         )
         budget = contract["budget_authority"]
         self.assertLessEqual(
