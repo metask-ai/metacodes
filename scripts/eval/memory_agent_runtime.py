@@ -1308,6 +1308,22 @@ def _cassette_tool_data(
     memory_dir: Path | None = None,
 ) -> Mapping[str, Any]:
     query_variants: List[Mapping[str, str]] = []
+    normalized_queries: set[str] = set()
+
+    def append_query_variant(text: str) -> None:
+        # A failed/denied KgRecall still belongs in the audit trace, but its
+        # model-supplied lexical plan can repeat the same text under both the
+        # exact and semantic slots.  Keep the first occurrence so an invalid
+        # recall remains a row-level invalid outcome instead of poisoning the
+        # whole post-run observation join.
+        normalized = " ".join(text.casefold().split())
+        if not normalized or normalized in normalized_queries:
+            return
+        normalized_queries.add(normalized)
+        query_variants.append(
+            {"kind": "exact" if not query_variants else "semantic", "text": text}
+        )
+
     retrieved: List[str] = []
     verified: List[str] = []
     graph_truncated = False
@@ -1351,9 +1367,7 @@ def _cassette_tool_data(
             if name == "KgRecall":
                 query = tool_input.get("query")
                 if isinstance(query, str):
-                    query_variants.append(
-                        {"kind": "exact" if not query_variants else "semantic", "text": query}
-                    )
+                    append_query_variant(query)
                 try:
                     parsed = json.loads(raw_result)
                 except json.JSONDecodeError:
@@ -1394,18 +1408,15 @@ def _cassette_tool_data(
             ):
                 if not query_variants:
                     observed_query = tool_input.get("pattern") if name == "Grep" else fallback_query
-                    query_variants.append(
-                        {
-                            "kind": "exact",
-                            "text": observed_query if isinstance(observed_query, str) else fallback_query,
-                        }
+                    append_query_variant(
+                        observed_query if isinstance(observed_query, str) else fallback_query
                     )
     if retrieved and not query_variants:
         # Host-scoped recall uses the original task prompt when it injects
         # evidence before the model can issue KgRecall.  The query is still
         # the protocol's one exact seed; "automatic" describes who issued it,
         # not a third query kind (the result schema only permits exact/semantic).
-        query_variants.append({"kind": "exact", "text": fallback_query})
+        append_query_variant(fallback_query)
     return {
         "query_variants": query_variants,
         "retrieved": retrieved,

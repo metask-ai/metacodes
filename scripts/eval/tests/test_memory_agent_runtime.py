@@ -440,6 +440,62 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             ],
         )
 
+    def test_failed_recall_deduplicates_equivalent_query_variants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            (cassette / "req-001.json").write_text(
+                stable_json(
+                    {
+                        "messages": [
+                            {
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "id": "recall-1",
+                                        "name": "KgRecall",
+                                        "input": {"query": "worker_alpha lease protocol"},
+                                    },
+                                    {
+                                        "type": "tool_use",
+                                        "id": "recall-2",
+                                        "name": "KgRecall",
+                                        "input": {"query": " WORKER_ALPHA   lease protocol "},
+                                    },
+                                    {
+                                        "type": "tool_use",
+                                        "id": "recall-3",
+                                        "name": "KgRecall",
+                                        "input": {"query": "worker_alpha registration"},
+                                    },
+                                ]
+                            },
+                            {
+                                "content": [
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": tool_id,
+                                        "content": '{"error":{"code":"permission_denied"}}',
+                                    }
+                                    for tool_id in ("recall-1", "recall-2", "recall-3")
+                                ]
+                            },
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            observed = _cassette_tool_data(cassette, {}, "fallback query")
+
+        self.assertEqual(
+            observed["query_variants"],
+            [
+                {"kind": "exact", "text": "worker_alpha lease protocol"},
+                {"kind": "semantic", "text": "worker_alpha registration"},
+            ],
+        )
+
     def test_failed_paid_validation_checkpoint_is_explicitly_invalid_and_recoverable(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
