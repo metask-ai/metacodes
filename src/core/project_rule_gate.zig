@@ -19,6 +19,11 @@ pub const RuntimeGate = struct {
     active: *const bundle_mod.LoadedActive,
     config: kernel.Config,
     abort: ?*const @import("../util/abort.zig").AbortSignal,
+    /// Production construction leaves this at `enforced`.  Evaluation-only
+    /// callers may select `shadow`: the same kernel call and durable verdict
+    /// are produced, but the protocol result is projected to `admit` so the
+    /// counterfactual decision cannot change the observed tool trajectory.
+    actuation: observation.FormalActuation = .enforced,
     evidence_dir: ?[]const u8 = null,
     observation_sink: ?observation.Sink = null,
 
@@ -30,14 +35,20 @@ pub const RuntimeGate = struct {
         const self: *RuntimeGate = @ptrCast(@alignCast(raw));
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.decidePre(signal) catch .fault;
+        const decision = self.decidePre(signal) catch .fault;
+        return self.actuate(decision);
     }
 
     fn postThunk(raw: *anyopaque, signal: protocol.PostSignal) protocol.Result {
         const self: *RuntimeGate = @ptrCast(@alignCast(raw));
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.decidePost(signal) catch .fault;
+        const decision = self.decidePost(signal) catch .fault;
+        return self.actuate(decision);
+    }
+
+    fn actuate(self: *const RuntimeGate, decision: protocol.Result) protocol.Result {
+        return if (self.actuation == .shadow) .admit else decision;
     }
 
     fn decidePre(self: *RuntimeGate, signal: protocol.PreSignal) !protocol.Result {
@@ -226,6 +237,7 @@ pub const RuntimeGate = struct {
         if (!sink.emit(.{ .formal_decision_batch = .{
             .dispatch_id = dispatch_id,
             .phase = phase,
+            .actuation = self.actuation,
             .file_target_state = file_target_state,
             .project_sha256 = self.active.project_sha256,
             .bundle_sha256 = self.active.bundle_sha256,

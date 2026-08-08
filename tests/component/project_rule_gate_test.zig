@@ -986,6 +986,115 @@ test "L2 evolved existing-file rule blocks overwrite, permits creation, and leav
     try std.testing.expectEqual(@as(usize, 1), blocked_other);
 }
 
+test "L2 shadow project rule records Lean blocks without changing real dispatch" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
+    defer allocator.free(evidence_dir);
+    const rules_dir = try std.fmt.allocPrint(allocator, "{s}/project-rules", .{root});
+    defer allocator.free(rules_dir);
+    const project = cc.project_rule_bundle.projectIdentity(root);
+    _ = try promoteFixture(
+        allocator,
+        evidence_dir,
+        rules_dir,
+        project,
+        config,
+        .{
+            .target_tool = "Write",
+            .target_scope = .existing_file,
+            .deny_target = true,
+            .max_input_bytes = 8192,
+            .max_agent_depth = 4,
+            .authoritative_only = true,
+            .effect_requirement = .none,
+        },
+        "def spec : RuleSpec := { targetTool := \"Write\", targetScope := .existingFile, denyTarget := true, maxInputBytes := 8192, maxAgentDepth := 4, authoritativeOnly := true, effectRequirement := .none }; theorem spec_valid : valid spec = true := by rfl",
+    );
+    var active = (try cc.project_rule_bundle.loadVerifiedActive(
+        allocator,
+        rules_dir,
+        project,
+        config,
+        null,
+    )) orelse return error.MissingActiveBundle;
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+        .actuation = .shadow,
+    };
+    const sid = cc.session_id.SessionId.fromSlice("fedcba9876543210fedcba98").?;
+    var journal = try cc.tool_observation_journal.Journal.init(evidence_dir, sid);
+    const sink = journal.sink();
+    runtime.evidence_dir = evidence_dir;
+    runtime.observation_sink = sink;
+
+    const existing_path = try std.fmt.allocPrint(allocator, "{s}/existing.txt", .{root});
+    defer allocator.free(existing_path);
+    try overwriteArtifact(allocator, existing_path, "old");
+    const args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"shadow-wrote\"}}",
+        .{existing_path},
+    );
+    defer allocator.free(args);
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.project_rule_gate = runtime.protocolGate();
+    ctx.tool_observer = sink;
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        args,
+        "shadow-existing-write",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(!done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    const changed = try readArtifact(allocator, existing_path);
+    defer allocator.free(changed);
+    try std.testing.expectEqualStrings("shadow-wrote", changed);
+
+    try journal.finishRun("end_turn");
+    const binding = try journal.runBinding();
+    journal.deinit();
+    var observed = try cc.tool_observation_journal.loadRunDispatches(
+        allocator,
+        evidence_dir,
+        binding,
+    );
+    defer observed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), observed.dispatches.len);
+    try std.testing.expectEqual(@as(usize, 2), observed.formal_decisions.len);
+    for (observed.formal_decisions) |decision| {
+        try std.testing.expectEqual(
+            cc.tools.tool_observation.FormalActuation.shadow,
+            decision.actuation,
+        );
+        try std.testing.expectEqual(
+            cc.tools.tool_observation.FormalResult.block,
+            decision.result,
+        );
+        try std.testing.expectEqual(
+            cc.tools.tool_observation.FileTargetState.regular_existing,
+            decision.file_target_state,
+        );
+    }
+}
+
 test "L2 active project rules fail closed before dispatch on artifact or kernel drift" {
     const config = testKernel() orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;

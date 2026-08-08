@@ -81,6 +81,7 @@ pub const RunDispatch = struct {
 pub const RunFormalDecision = struct {
     dispatch_id: []const u8,
     phase: observation.FormalPhase,
+    actuation: observation.FormalActuation,
     file_target_state: observation.FileTargetState = .unobserved,
     result: observation.FormalResult,
     candidate_id: [64]u8,
@@ -395,6 +396,7 @@ pub fn loadRunDispatches(
                 .formal_decision => |formal| try formal_decisions.append(a, .{
                     .dispatch_id = formal.dispatch_id,
                     .phase = formal.phase,
+                    .actuation = formal.actuation,
                     .file_target_state = formal.file_target_state,
                     .result = formal.result,
                     .candidate_id = formal.candidate_id,
@@ -415,6 +417,7 @@ pub fn loadRunDispatches(
                     try formal_decisions.append(a, .{
                         .dispatch_id = batch.dispatch_id,
                         .phase = batch.phase,
+                        .actuation = batch.actuation,
                         .file_target_state = batch.file_target_state,
                         .result = decision.result,
                         .candidate_id = decision.candidate_id,
@@ -493,7 +496,8 @@ pub fn runContainsBlockedVerdict(
     var run = try loadRunDispatches(allocator, session_dir, binding);
     defer run.deinit();
     for (run.formal_decisions) |formal| {
-        if (formal.result == .block and formal.verdict_sha256 != null and
+        if (formal.actuation == .enforced and formal.result == .block and
+            formal.verdict_sha256 != null and
             std.mem.eql(u8, &formal.kernel_sha256, &checker_sha256) and
             std.mem.eql(u8, &formal.project_sha256, &project_sha256) and
             std.mem.eql(u8, &formal.verdict_sha256.?, &verdict_sha256))
@@ -604,11 +608,21 @@ fn validateFd(
                 }
                 switch (tool_event) {
                     .formal_decision => |formal| {
-                        if (!std.mem.eql(u8, formal.schema_version, observation.FORMAL_SCHEMA_VERSION))
+                        const legacy = std.mem.eql(
+                            u8,
+                            formal.schema_version,
+                            observation.FORMAL_SCHEMA_VERSION_V1,
+                        );
+                        if ((!legacy and !std.mem.eql(
+                            u8,
+                            formal.schema_version,
+                            observation.FORMAL_SCHEMA_VERSION,
+                        )) or (legacy and formal.actuation != .enforced))
                             return error.InvalidRecord;
                         try acceptFormalDecision(&formal_validation, .{
                             .dispatch_id = formal.dispatch_id,
                             .phase = formal.phase,
+                            .actuation = formal.actuation,
                             .result = formal.result,
                             .candidate_id = formal.candidate_id,
                             .project_sha256 = formal.project_sha256,
@@ -626,7 +640,16 @@ fn validateFd(
                         });
                     },
                     .formal_decision_batch => |batch| {
-                        if (!std.mem.eql(u8, batch.schema_version, observation.FORMAL_BATCH_SCHEMA_VERSION) or
+                        const legacy = std.mem.eql(
+                            u8,
+                            batch.schema_version,
+                            observation.FORMAL_BATCH_SCHEMA_VERSION_V1,
+                        );
+                        if ((!legacy and !std.mem.eql(
+                            u8,
+                            batch.schema_version,
+                            observation.FORMAL_BATCH_SCHEMA_VERSION,
+                        )) or (legacy and batch.actuation != .enforced) or
                             batch.decisions.len == 0 or
                             batch.decisions.len > batch.checker_batch_size or
                             batch.checker_batch_size > @import("../formal/project_harness_runtime.zig").MAX_BATCH_REQUESTS or
@@ -637,6 +660,7 @@ fn validateFd(
                             try acceptFormalDecision(&formal_validation, .{
                                 .dispatch_id = batch.dispatch_id,
                                 .phase = batch.phase,
+                                .actuation = batch.actuation,
                                 .result = decision.result,
                                 .candidate_id = decision.candidate_id,
                                 .project_sha256 = batch.project_sha256,
@@ -782,6 +806,7 @@ const FormalControlIdentity = struct {
     bundle_sha256: [64]u8,
     bundle_revision: u64,
     kernel_sha256: [64]u8,
+    actuation: observation.FormalActuation,
 };
 
 const FormalDispatchState = struct {
@@ -807,6 +832,7 @@ const OpenDispatch = struct {
 const FormalRecord = struct {
     dispatch_id: []const u8,
     phase: observation.FormalPhase,
+    actuation: observation.FormalActuation,
     result: observation.FormalResult,
     candidate_id: [64]u8,
     project_sha256: [64]u8,
@@ -865,6 +891,7 @@ fn acceptFormalDecision(state: *FormalValidationState, formal: FormalRecord) !vo
         .bundle_sha256 = formal.bundle_sha256,
         .bundle_revision = formal.bundle_revision,
         .kernel_sha256 = formal.kernel_sha256,
+        .actuation = formal.actuation,
     };
     switch (formal.phase) {
         .pre => {
@@ -887,7 +914,8 @@ fn acceptFormalDecision(state: *FormalValidationState, formal: FormalRecord) !vo
                 state_entry.value_ptr.pre_count,
                 1,
             ) catch return error.InvalidRecord;
-            if (formal.result != .admit) state_entry.value_ptr.terminal_pre = true;
+            if (formal.actuation == .enforced and formal.result != .admit)
+                state_entry.value_ptr.terminal_pre = true;
             try state.pre_decisions.put(
                 formalKey(formal.dispatch_id, formal.candidate_id, .pre),
                 .{ .identity = identity, .result = formal.result },
@@ -902,13 +930,14 @@ fn acceptFormalDecision(state: *FormalValidationState, formal: FormalRecord) !vo
                 formalKey(formal.dispatch_id, formal.candidate_id, .pre),
             ) orelse return error.InvalidRecord;
             if (!opened.governed or opened.terminal_post or
-                prior.result != .admit or
+                (formal.actuation == .enforced and prior.result != .admit) or
                 !std.meta.eql(prior.identity, identity) or
                 !std.meta.eql(dispatch_state.identity, identity))
                 return error.InvalidRecord;
             opened.post_count = std.math.add(u32, opened.post_count, 1) catch
                 return error.InvalidRecord;
-            if (formal.result != .admit) opened.terminal_post = true;
+            if (formal.actuation == .enforced and formal.result != .admit)
+                opened.terminal_post = true;
         },
     }
 }
@@ -919,6 +948,7 @@ fn formalIdentity(formal: anytype) FormalControlIdentity {
         .bundle_sha256 = formal.bundle_sha256,
         .bundle_revision = formal.bundle_revision,
         .kernel_sha256 = formal.kernel_sha256,
+        .actuation = formal.actuation,
     };
 }
 
@@ -996,9 +1026,26 @@ fn testFormalEventFor(
     phase: observation.FormalPhase,
     result: observation.FormalResult,
 ) observation.Event {
+    return testFormalEventForActuation(
+        candidate_byte,
+        dispatch_id,
+        phase,
+        result,
+        .enforced,
+    );
+}
+
+fn testFormalEventForActuation(
+    candidate_byte: u8,
+    dispatch_id: []const u8,
+    phase: observation.FormalPhase,
+    result: observation.FormalResult,
+    actuation: observation.FormalActuation,
+) observation.Event {
     return .{ .formal_decision = .{
         .dispatch_id = dispatch_id,
         .phase = phase,
+        .actuation = actuation,
         .result = result,
         .candidate_id = .{candidate_byte} ** 64,
         .project_sha256 = .{'b'} ** 64,
@@ -1092,6 +1139,83 @@ test "formal journal enforces pre dispatch post finish wiring and permits pre bl
     const blocked = [_]observation.Event{testFormalEvent("blocked", .pre, .block)};
     try writeTestRun(blocked_dir, sid, &blocked);
     _ = try validate(blocked_dir, sid);
+
+    const shadow_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/shadow-block", .{root});
+    defer std.testing.allocator.free(shadow_dir);
+    const shadow = [_]observation.Event{
+        testFormalEventForActuation('a', "shadow-block", .pre, .block, .shadow),
+        testDispatchStart("shadow-block"),
+        testFormalEventForActuation('a', "shadow-block", .post, .block, .shadow),
+        testDispatchFinish("shadow-block"),
+    };
+    try writeTestRun(shadow_dir, sid, &shadow);
+    _ = try validate(shadow_dir, sid);
+
+    const mixed_actuation_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/mixed-actuation",
+        .{root},
+    );
+    defer std.testing.allocator.free(mixed_actuation_dir);
+    const mixed_actuation = [_]observation.Event{
+        testFormalEventForActuation('a', "mixed-actuation", .pre, .block, .shadow),
+        testDispatchStart("mixed-actuation"),
+        testFormalEvent("mixed-actuation", .post, .block),
+        testDispatchFinish("mixed-actuation"),
+    };
+    try writeTestRun(mixed_actuation_dir, sid, &mixed_actuation);
+    try std.testing.expectError(error.InvalidRecord, validate(mixed_actuation_dir, sid));
+
+    const legacy_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/legacy-v1", .{root});
+    defer std.testing.allocator.free(legacy_dir);
+    var legacy_pre = testFormalEvent("legacy-v1", .pre, .admit);
+    legacy_pre.formal_decision.schema_version = observation.FORMAL_SCHEMA_VERSION_V1;
+    var legacy_post = testFormalEvent("legacy-v1", .post, .admit);
+    legacy_post.formal_decision.schema_version = observation.FORMAL_SCHEMA_VERSION_V1;
+    const legacy = [_]observation.Event{
+        legacy_pre,
+        testDispatchStart("legacy-v1"),
+        legacy_post,
+        testDispatchFinish("legacy-v1"),
+    };
+    try writeTestRun(legacy_dir, sid, &legacy);
+    _ = try validate(legacy_dir, sid);
+
+    const forged_legacy_shadow_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/legacy-v1-shadow",
+        .{root},
+    );
+    defer std.testing.allocator.free(forged_legacy_shadow_dir);
+    var forged_legacy_shadow = testFormalEventForActuation(
+        'a',
+        "legacy-v1-shadow",
+        .pre,
+        .block,
+        .shadow,
+    );
+    forged_legacy_shadow.formal_decision.schema_version = observation.FORMAL_SCHEMA_VERSION_V1;
+    const forged_legacy_shadow_events = [_]observation.Event{forged_legacy_shadow};
+    try writeTestRun(forged_legacy_shadow_dir, sid, &forged_legacy_shadow_events);
+    try std.testing.expectError(
+        error.InvalidRecord,
+        validate(forged_legacy_shadow_dir, sid),
+    );
+
+    const forged_shadow_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/enforced-block-dispatched",
+        .{root},
+    );
+    defer std.testing.allocator.free(forged_shadow_dir);
+    const forged_shadow = [_]observation.Event{
+        testFormalEvent("enforced-block-dispatched", .pre, .block),
+        testDispatchStart("enforced-block-dispatched"),
+        testFormalEvent("enforced-block-dispatched", .post, .block),
+        testDispatchFinish("enforced-block-dispatched"),
+    };
+    try writeTestRun(forged_shadow_dir, sid, &forged_shadow);
+    try std.testing.expectError(error.InvalidRecord, validate(forged_shadow_dir, sid));
 
     const admitted_only_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/admitted-only", .{root});
     defer std.testing.allocator.free(admitted_only_dir);

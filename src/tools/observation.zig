@@ -12,8 +12,10 @@
 const std = @import("std");
 
 pub const SCHEMA_VERSION = "metacodes-tool-observation-v1";
-pub const FORMAL_SCHEMA_VERSION = "metacodes-project-formal-decision-v1";
-pub const FORMAL_BATCH_SCHEMA_VERSION = "metacodes-project-formal-decision-batch-v1";
+pub const FORMAL_SCHEMA_VERSION_V1 = "metacodes-project-formal-decision-v1";
+pub const FORMAL_BATCH_SCHEMA_VERSION_V1 = "metacodes-project-formal-decision-batch-v1";
+pub const FORMAL_SCHEMA_VERSION = "metacodes-project-formal-decision-v2";
+pub const FORMAL_BATCH_SCHEMA_VERSION = "metacodes-project-formal-decision-batch-v2";
 
 pub const Origin = enum {
     authoritative,
@@ -31,6 +33,12 @@ pub const Outcome = enum {
 
 pub const FormalPhase = enum { pre, post };
 pub const FormalResult = enum { admit, block, fault };
+
+/// Separates the fixed kernel's counterfactual decision from whether the host
+/// applies it to the real dispatch.  Production gates are always `enforced`;
+/// an isolated evaluation Run may use `shadow` to record the identical verdict
+/// while deliberately leaving the tool trajectory unchanged.
+pub const FormalActuation = enum { enforced, shadow };
 
 /// Host-observed state of an operation's file target immediately before the
 /// formal gate.  It is carried in the dispatch journal so a later replay can
@@ -148,6 +156,7 @@ pub const Event = union(enum) {
         schema_version: []const u8 = FORMAL_SCHEMA_VERSION,
         dispatch_id: []const u8,
         phase: FormalPhase,
+        actuation: FormalActuation = .enforced,
         file_target_state: FileTargetState = .unobserved,
         result: FormalResult,
         candidate_id: [64]u8,
@@ -172,6 +181,7 @@ pub const Event = union(enum) {
         schema_version: []const u8 = FORMAL_BATCH_SCHEMA_VERSION,
         dispatch_id: []const u8,
         phase: FormalPhase,
+        actuation: FormalActuation = .enforced,
         file_target_state: FileTargetState = .unobserved,
         project_sha256: [64]u8,
         bundle_sha256: [64]u8,

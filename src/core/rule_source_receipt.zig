@@ -563,6 +563,80 @@ test "runtime counterexample receipt requires blocked verdict and completed run"
     defer loaded.deinit();
     try std.testing.expectEqual(Kind.runtime_counterexample, loaded.kind);
     try std.testing.expect(loaded.observation_interval_sha256 != null);
+
+    // A shadow verdict is counterfactual evaluation evidence, not proof that
+    // the runtime actually blocked the operation.  It must not be laundered
+    // into an enforced runtime-counterexample source receipt.
+    var shadow_journal = try observation_journal.Journal.init(root, sid);
+    try std.testing.expect(shadow_journal.sink().emit(.{ .formal_decision = .{
+        .dispatch_id = "shadow-blocked-before-dispatch",
+        .phase = .pre,
+        .actuation = .shadow,
+        .result = .block,
+        .candidate_id = .{'1'} ** 64,
+        .project_sha256 = .{'b'} ** 64,
+        .bundle_sha256 = .{'2'} ** 64,
+        .bundle_revision = 1,
+        .kernel_sha256 = .{'d'} ** 64,
+        .request_sha256 = .{'a'} ** 64,
+        .verdict_sha256 = observation.sha256Hex(blocked),
+        .checker_failure = null,
+        .checker_elapsed_ns = 1,
+        .checker_bytes = 1,
+    } }));
+    try std.testing.expect(shadow_journal.sink().emit(.{ .dispatch_started = .{
+        .id = "shadow-blocked-before-dispatch",
+        .requested_name = "Write",
+        .dispatched_name = "Write",
+        .origin = .authoritative,
+        .agent_depth = 0,
+        .input_bytes = 2,
+        .input_sha256 = observation.sha256Hex("{}"),
+    } }));
+    try std.testing.expect(shadow_journal.sink().emit(.{ .formal_decision = .{
+        .dispatch_id = "shadow-blocked-before-dispatch",
+        .phase = .post,
+        .actuation = .shadow,
+        .result = .block,
+        .candidate_id = .{'1'} ** 64,
+        .project_sha256 = .{'b'} ** 64,
+        .bundle_sha256 = .{'2'} ** 64,
+        .bundle_revision = 1,
+        .kernel_sha256 = .{'d'} ** 64,
+        .request_sha256 = .{'e'} ** 64,
+        .verdict_sha256 = .{'f'} ** 64,
+        .checker_failure = null,
+        .checker_elapsed_ns = 1,
+        .checker_bytes = 1,
+    } }));
+    try std.testing.expect(shadow_journal.sink().emit(.{ .dispatch_finished = .{
+        .id = "shadow-blocked-before-dispatch",
+        .requested_name = "Write",
+        .dispatched_name = "Write",
+        .origin = .authoritative,
+        .agent_depth = 0,
+        .outcome = .succeeded,
+        .error_code = null,
+        .elapsed_ms = 1,
+        .result_present = true,
+        .result_bytes = 2,
+        .result_sha256 = observation.sha256Hex("ok"),
+        .effect = null,
+        .effect_valid = true,
+    } }));
+    try shadow_journal.finishRun("end_turn");
+    const shadow_binding = try shadow_journal.runBinding();
+    shadow_journal.deinit();
+    try std.testing.expectError(
+        error.VerdictNotInObservationRun,
+        persistRuntimeCounterexample(root, .{
+            .project_sha256 = .{'b'} ** 64,
+            .issuer_sha256 = .{'c'} ** 64,
+            .observation = shadow_binding,
+            .checker_sha256 = .{'d'} ** 64,
+            .verdict_payload = blocked,
+        }),
+    );
     const admitted = "{\"schema_version\":\"x\",\"checker_version\":\"y\",\"request_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operation\":\"z\",\"decision\":\"admit\",\"admitted\":true}";
     try std.testing.expectError(error.NotCounterexample, persistRuntimeCounterexample(root, .{
         .project_sha256 = .{'b'} ** 64,

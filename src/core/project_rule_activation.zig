@@ -134,6 +134,7 @@ pub const RunGate = struct {
             .active = &self.active,
             .config = config,
             .abort = abort,
+            .actuation = .enforced,
             .evidence_dir = session_dir,
             .observation_sink = observation_sink,
         };

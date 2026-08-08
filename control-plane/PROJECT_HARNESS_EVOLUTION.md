@@ -190,6 +190,12 @@ Implemented runtime properties:
   `file_mutation_v2` after a real post-action re-read;
 - pre block prevents the dispatcher call; post block/fault occurs after the
   real outcome is re-observed and poisons the Run instead of hiding the effect;
+- formal-decision schema v2 separates the kernel verdict from host actuation:
+  production is always `enforced`, while an isolated experiment may use
+  `shadow` to persist the identical verdict but project it to `admit` at the
+  protocol boundary. Pre/post actuation must match, legacy v1 records are
+  accepted only as enforced, and a shadow block cannot be promoted into an
+  enforced runtime-counterexample receipt;
 - `RuleSpec v2` can express the first real correction without banning new-file
   creation: existing regular-file `Write` is blocked, missing-file `Write` is
   admitted with exclusive creation, and `Edit` remains an available recovery;
@@ -321,6 +327,19 @@ The central empirical claim is narrower than “Lean improves agents”:
 > unacceptable loss of trustworthy task completion, context/cache reuse, or
 > operating cost.
 
+Evidence is cumulative and may not be promoted across levels by wording:
+
+| Level | Question | Required evidence | Permitted claim |
+| --- | --- | --- | --- |
+| E0 theorem | Is the bounded transition predicate internally sound? | Lean build, axiom audit and mutation of rejected inputs | theorem boundary only |
+| E1 mechanism | Does the real sidecar gate the real dispatcher and preserve shadow trajectories? | fixed kernel, `executeOne`, durable journal, typed effect and host re-observation | control wiring works |
+| E2 evolution | Can a temporally prior real correction become the exact promoted bundle later loaded by runtime? | transcript/source/candidate/build/replay/shadow/promotion/active receipt chain | governed lifecycle works |
+| E3 outcome | Does that evolved Harness improve later unseen model tasks at acceptable cost? | preregistered paired model trials with cache-prefix equality and statistical analysis | empirical project benefit |
+
+E0 cannot establish E1, E1 cannot establish E2, and E2 cannot establish E3.
+In particular, a scripted tool driver is useful for causal mechanism
+calibration but is not a model-quality benchmark.
+
 The experiment must preserve temporal direction.  An incident at time `t` may
 create a candidate, but replay and evaluation cases at `t+1` must not be used to
 author that candidate.  Fresh project/TinyKG stores per rollout prevent one arm
@@ -398,6 +417,18 @@ Run evaluation in four cost stages:
 4. only after a written power analysis, a paid temporally ordered continual
    evaluation within the authorized budget.
 
+The confirmatory E3 unit is a correction family, not an individual model
+request. Each family freezes one earlier correction, later unseen recurrence
+variants, oracle-safe negatives, initial filesystem, model/provider, harness
+and tool schema, system/tool/cache prefix, token/turn limits and evaluator.
+Every task/seed is run under all four arms in randomized order with fresh local
+state. Primary analysis uses paired recurrence and trustworthy-success
+differences; confidence intervals are clustered by correction family so a
+large paraphrase family cannot masquerade as many independent discoveries.
+False intervention is reported separately, not hidden inside a composite
+score. The preregistration fixes sample size, exclusions, timeout treatment,
+non-inferiority margin and stopping rule before the first confirmatory request.
+
 Use paired task/trial analysis.  Report raw counts and confidence intervals;
 use an exact paired binary test for success/hazard outcomes and bootstrap
 paired deltas for latency, tokens and cost.  Freeze exclusions and stopping
@@ -425,6 +456,40 @@ post checker -> durable artifact/journal` path.  Execute-time p50/p95 was
 17.659/17.943 ms at 1 rule, 18.161/18.506 ms at 4, 20.374/20.894 ms at 16 and
 30.011/30.830 ms at 64.  This is mechanism overhead, not model-task outcome
 evidence; the ignored raw report remains under `zig-out/reports`.
+
+### Zero-provider four-arm mechanism calibration
+
+`scripts/eval/project_harness_experiment.py` and the native
+`metacodes-project-harness-eval` driver implement E1 without an LLM or provider.
+Each rollout invokes the real `tool_exec.executeOne` seam, fixed compiled Lean
+kernel and durable journal in a fresh local directory. The analyzer reopens a
+single-link journal snapshot, verifies run/project/kernel/bundle/candidate/spec
+identity and causal event order, and derives success and hazardous effects from
+`dispatch_finished -> file_mutation_v2 -> reobservation`; it does not trust the
+driver's metric fields. All artifacts are marked `quality_evidence=false`.
+
+The frozen 5-case x 4-arm calibration on 2026-08-09 produced:
+
+| Arm | Prohibited dispatches | Realized hazardous effects | Safe false interventions | Recovery after block | Trustworthy successes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `signal_only` | 3/3 | 2/3 | 0/2 | 0/1 | 2/5 |
+| `static_enforced` | 3/3 | 2/3 | 0/2 | 0/1 | 2/5 |
+| `evolved_shadow` | 3/3, with 3 counterfactual blocks | 2/3 | 0/2 | 0/1 | 2/5 |
+| `evolved_enforced` | 0/3 | 0/3 | 0/2 | 1/1 | 4/5 |
+
+The directory-target case reached the dispatcher in the first three arms but
+the tool itself rejected it, so it counts as a prohibited dispatch and not a
+realized mutation. This distinction prevents a failed low-level call from
+inflating the hazardous-effect rate while still penalizing the missing
+pre-side-effect control. The one non-success in `evolved_enforced` is the plain
+overwrite case with no scripted recovery; the paired recovery case shows that
+an admitted `Edit` can complete the task after `Write` is blocked.
+
+This establishes the narrow mechanism claim only: enforced decisions actuate,
+shadow decisions do not, safe negatives remain admitted and recovery remains
+possible. It does not establish E2 because the active identity is synthetic,
+and it does not establish E3 because tool choice is scripted and there are no
+provider requests, cache measurements or model outcomes.
 
 Report rule growth and maintenance cost as well as task success; a safer
 Harness that destroys context/cache reuse or consumes more maintenance budget
