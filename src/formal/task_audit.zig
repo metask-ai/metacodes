@@ -308,6 +308,7 @@ fn auditSnapshotTimed(
         .checker_stdout = invocation.stdout,
         .checker_stderr = invocation.stderr,
         .checker_provenance = if (checker_provenance) |*loaded| loaded.raw else null,
+        .checker_build_receipt = if (checker_provenance) |*loaded| loaded.build_receipt_raw else null,
     });
 }
 
@@ -550,8 +551,8 @@ fn renderReceipt(allocator: std.mem.Allocator, receipt: Receipt) ![]u8 {
         try writer.print(",\"provenance_elapsed_ns\":{d},\"provenance\":", .{receipt.provenance_elapsed_ns});
         if (receipt.provenance) |loaded| {
             try writer.print(
-                "{{\"schema_version\":\"{s}\",\"manifest_sha256\":\"{s}\",\"kernel_source_sha256\":\"{s}\",\"memory_kernel_source_sha256\":\"{s}\",\"main_source_sha256\":\"{s}\",\"axiom_audit_source_sha256\":\"{s}\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"source_identity_claim\":\"builder_reported_manifest_unpinned\",\"host_os\":",
-                .{ provenance.MANIFEST_SCHEMA, loaded.manifest_sha256[0..], loaded.kernel_source_sha256[0..], loaded.memory_kernel_source_sha256[0..], loaded.main_source_sha256[0..], loaded.axiom_audit_source_sha256[0..] },
+                "{{\"schema_version\":\"{s}\",\"manifest_sha256\":\"{s}\",\"build_receipt_schema\":\"{s}\",\"build_receipt_sha256\":\"{s}\",\"kernel_source_sha256\":\"{s}\",\"memory_kernel_source_sha256\":\"{s}\",\"main_source_sha256\":\"{s}\",\"axiom_audit_source_sha256\":\"{s}\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"source_identity_claim\":\"binary_hash_and_build_receipt_bound\",\"host_os\":",
+                .{ provenance.MANIFEST_SCHEMA, loaded.manifest_sha256[0..], provenance.BUILD_RECEIPT_SCHEMA, loaded.build_receipt_sha256[0..], loaded.kernel_source_sha256[0..], loaded.memory_kernel_source_sha256[0..], loaded.main_source_sha256[0..], loaded.axiom_audit_source_sha256[0..] },
             );
             try std.json.Stringify.encodeJsonString(loaded.host_os, .{}, writer);
             try writer.writeAll(",\"host_arch\":");
@@ -711,6 +712,10 @@ const audit_fixture =
     \\{"schema_version":"tinykg-task-snapshot-v1","root_id":1,"revision":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"task_count":2,"hierarchy_edge_count":1,"dependency_edge_count":0,"evidence_count":1,"verified_by_edge_count":1,"used_text_bytes":10,"truncated":false,"truncate_reason":null,"max_tasks":256,"max_edges":1024,"max_chars":200000},"tasks":[{"id":1,"status":"open","claimed_by":null,"text":"root"},{"id":2,"status":"completed","claimed_by":null,"text":"done"}],"hierarchy":[{"src":1,"rel":"contain","dst":2}],"dependencies":[],"evidence":[{"id":9,"kind":"verification","text":"ok"}],"verified_by":[{"src":2,"rel":"verified_by","dst":9}]}
 ;
 
+const audit_blocked_fixture =
+    \\{"schema_version":"tinykg-task-snapshot-v1","root_id":1,"revision":"1111111111111111111111111111111111111111111111111111111111111111","summary":{"task_count":1,"hierarchy_edge_count":0,"dependency_edge_count":0,"evidence_count":0,"verified_by_edge_count":0,"used_text_bytes":4,"truncated":false,"truncate_reason":null,"max_tasks":256,"max_edges":1024,"max_chars":200000},"tasks":[{"id":1,"status":"completed","claimed_by":null,"text":"done"}],"hierarchy":[],"dependencies":[],"evidence":[],"verified_by":[]}
+;
+
 test "task audit facts require evidence for every terminal task" {
     var graph = try projection.parseSnapshot(std.testing.allocator, projection.TaskId.fromInt(1), audit_fixture);
     defer graph.deinit();
@@ -852,6 +857,7 @@ test "native formal task audit binds sidecar verdict and persists mechanism rece
         .{ .name = "checker-stdout.bin", .expected_hash = null },
         .{ .name = "checker-stderr.bin", .expected_hash = null },
         .{ .name = "checker-provenance.json", .expected_hash = parsed.value.checker.provenance.manifest_sha256 },
+        .{ .name = "checker-build-receipt.json", .expected_hash = null },
         .{ .name = "manifest.json", .expected_hash = index.value.manifest_sha256 },
     };
     for (artifact_expectations) |expectation| {
@@ -879,7 +885,7 @@ test "native formal task audit binds sidecar verdict and persists mechanism rece
     try std.testing.expectEqualStrings(artifact_store.BUNDLE_SCHEMA, manifest.value.schema_version);
     try std.testing.expectEqualStrings(index.value.event_id, manifest.value.event_id);
     try std.testing.expect(manifest.value.completion_marker);
-    try std.testing.expectEqual(@as(usize, 9), manifest.value.files.len);
+    try std.testing.expectEqual(@as(usize, 10), manifest.value.files.len);
     for (manifest.value.files) |record| {
         const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ bundle_dir, record.name });
         defer std.testing.allocator.free(path);
@@ -889,6 +895,124 @@ test "native formal task audit binds sidecar verdict and persists mechanism rece
         const actual = artifact_store.sha256Hex(bytes);
         try std.testing.expectEqualStrings(record.sha256, actual[0..]);
     }
+
+    // A machine-checked block is returned as a typed counterexample receipt,
+    // not as an opaque process failure. This snapshot is structurally valid
+    // but a terminal task has no verified_by evidence, so Lean must name the
+    // violated invariant and the pipeline must remain closed.
+    const counterexample = try auditSnapshot(
+        std.testing.allocator,
+        1,
+        audit_blocked_fixture,
+        .{ .checker_path = checker_path, .expected_sha256 = expected_sha256 },
+        telemetry_path,
+        null,
+        time.nowWallNs(),
+        time.nowNs(),
+    );
+    defer std.testing.allocator.free(counterexample);
+    const CounterexampleProbe = struct {
+        verdict: struct { checker_admitted: bool, reason_codes: []const []const u8 },
+        pipeline: struct { admitted: bool, failure_kind: []const u8, telemetry_persisted: bool },
+    };
+    var counterexample_parsed = try std.json.parseFromSlice(
+        CounterexampleProbe,
+        std.testing.allocator,
+        counterexample,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer counterexample_parsed.deinit();
+    try std.testing.expect(!counterexample_parsed.value.verdict.checker_admitted);
+    try std.testing.expectEqual(@as(usize, 1), counterexample_parsed.value.verdict.reason_codes.len);
+    try std.testing.expectEqualStrings(
+        "terminal_evidence_missing",
+        counterexample_parsed.value.verdict.reason_codes[0],
+    );
+    try std.testing.expect(!counterexample_parsed.value.pipeline.admitted);
+    try std.testing.expectEqualStrings("checker_blocked", counterexample_parsed.value.pipeline.failure_kind);
+    try std.testing.expect(counterexample_parsed.value.pipeline.telemetry_persisted);
+
+    // Regression for a production contract drift: the compiled checker may
+    // return a valid admit verdict while its adjacent build provenance is
+    // absent or malformed.  Exercise that ordering through the whole audit
+    // pipeline and prove the receipt never upgrades the checker verdict into
+    // pipeline admission without valid provenance.
+    const copied_checker_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/checker-with-invalid-provenance",
+        .{root_buffer[0..root_len]},
+    );
+    defer std.testing.allocator.free(copied_checker_path);
+    try copyTestFile(checker_path, copied_checker_path, runtime.MAX_CHECKER_BYTES);
+    const copied_checker_path_z = try std.testing.allocator.dupeZ(u8, copied_checker_path);
+    defer std.testing.allocator.free(copied_checker_path_z);
+    if (std.c.chmod(copied_checker_path_z.ptr, 0o700) != 0) return error.SkipZigTest;
+
+    const source_provenance_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}.provenance.json",
+        .{checker_path},
+    );
+    defer std.testing.allocator.free(source_provenance_path);
+    const copied_provenance_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}.provenance.json",
+        .{copied_checker_path},
+    );
+    defer std.testing.allocator.free(copied_provenance_path);
+    try copyTestFile(source_provenance_path, copied_provenance_path, 64 * 1024);
+    const copied_receipt_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}.build-receipt.json",
+        .{copied_checker_path},
+    );
+    defer std.testing.allocator.free(copied_receipt_path);
+    try writeTestFile(copied_receipt_path, "{not-json}\n");
+
+    const provenance_blocked = try auditSnapshot(
+        std.testing.allocator,
+        1,
+        audit_fixture,
+        .{ .checker_path = copied_checker_path, .expected_sha256 = expected_sha256 },
+        telemetry_path,
+        null,
+        time.nowWallNs(),
+        time.nowNs(),
+    );
+    defer std.testing.allocator.free(provenance_blocked);
+    const ProvenanceBlockedProbe = struct {
+        checker: struct { runtime_failure_kind: []const u8, provenance: ?std.json.Value },
+        verdict: struct { checker_admitted: bool },
+        pipeline: struct {
+            admitted: bool,
+            failure_kind: []const u8,
+            source_error: ?[]const u8,
+            telemetry_persisted: bool,
+        },
+    };
+    var provenance_blocked_parsed = try std.json.parseFromSlice(
+        ProvenanceBlockedProbe,
+        std.testing.allocator,
+        provenance_blocked,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer provenance_blocked_parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "none",
+        provenance_blocked_parsed.value.checker.runtime_failure_kind,
+    );
+    try std.testing.expect(provenance_blocked_parsed.value.checker.provenance == null);
+    try std.testing.expect(provenance_blocked_parsed.value.verdict.checker_admitted);
+    try std.testing.expect(!provenance_blocked_parsed.value.pipeline.admitted);
+    try std.testing.expectEqualStrings(
+        "checker_provenance_invalid",
+        provenance_blocked_parsed.value.pipeline.failure_kind,
+    );
+    try std.testing.expectEqualStrings(
+        "InvalidBuildReceiptJson",
+        provenance_blocked_parsed.value.pipeline.source_error orelse return error.MissingProvenanceError,
+    );
+    try std.testing.expect(provenance_blocked_parsed.value.pipeline.telemetry_persisted);
 
     var tampered_hash = expected_sha256;
     tampered_hash[0] = if (tampered_hash[0] == '0') '1' else '0';
@@ -931,4 +1055,64 @@ fn readSmallFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
         try out.appendSlice(allocator, buffer[0..count]);
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn copyTestFile(source_path: []const u8, target_path: []const u8, max_bytes: u64) !void {
+    const source_path_z = try std.testing.allocator.dupeZ(u8, source_path);
+    defer std.testing.allocator.free(source_path_z);
+    const source_fd = pfs.open(source_path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (source_fd < 0) return error.FileNotFound;
+    defer _ = pfs.close(source_fd);
+    const info = pfs.fileInfo(source_fd) catch return error.FileStatFailed;
+    if (!info.is_regular or info.size == 0 or info.size > max_bytes) return error.FileTooLarge;
+
+    const target_path_z = try std.testing.allocator.dupeZ(u8, target_path);
+    defer std.testing.allocator.free(target_path_z);
+    const target_fd = pfs.open(target_path_z.ptr, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .EXCL = true,
+        .NOFOLLOW = true,
+    }, @as(std.c.mode_t, 0o600));
+    if (target_fd < 0) return error.FileCreateFailed;
+    defer _ = pfs.close(target_fd);
+
+    var copied: u64 = 0;
+    var buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const count = pfs.readZ(source_fd, &buffer) catch return error.FileReadFailed;
+        if (count == 0) break;
+        copied = std.math.add(u64, copied, count) catch return error.FileTooLarge;
+        if (copied > info.size or copied > max_bytes) return error.FileTooLarge;
+        var offset: usize = 0;
+        while (offset < count) {
+            const written = pfs.write(target_fd, buffer[offset..count]);
+            if (written <= 0) return error.FileWriteFailed;
+            const written_count: usize = @intCast(written);
+            if (written_count > count - offset) return error.FileWriteFailed;
+            offset += written_count;
+        }
+    }
+    if (copied != info.size) return error.FileChangedDuringRead;
+}
+
+fn writeTestFile(path: []const u8, bytes: []const u8) !void {
+    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    defer std.testing.allocator.free(path_z);
+    const fd = pfs.open(path_z.ptr, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .EXCL = true,
+        .NOFOLLOW = true,
+    }, @as(std.c.mode_t, 0o600));
+    if (fd < 0) return error.FileCreateFailed;
+    defer _ = pfs.close(fd);
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const written = pfs.write(fd, bytes[offset..]);
+        if (written <= 0) return error.FileWriteFailed;
+        const count: usize = @intCast(written);
+        if (count > bytes.len - offset) return error.FileWriteFailed;
+        offset += count;
+    }
 }

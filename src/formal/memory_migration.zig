@@ -255,6 +255,7 @@ pub fn persistMechanismEvidence(
             .checker_stdout = evaluation.invocation.stdout,
             .checker_stderr = evaluation.invocation.stderr,
             .checker_provenance = if (evaluation.provenance) |loaded| loaded.raw else null,
+            .checker_build_receipt = if (evaluation.provenance) |loaded| loaded.build_receipt_raw else null,
         },
         .{
             .started_wall_ns = started_wall_ns,

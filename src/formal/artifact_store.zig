@@ -20,7 +20,7 @@ pub const ARTIFACT_DIR_NAME = "artifacts-v1";
 const MAX_INDEX_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_INDEX_LINE_BYTES: usize = 4096;
 const MAX_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_FILES: usize = 9;
+const MAX_FILES: usize = 10;
 
 var event_counter = std.atomic.Value(u64).init(0);
 
@@ -33,6 +33,7 @@ pub const Artifacts = struct {
     checker_stdout: ?[]const u8 = null,
     checker_stderr: ?[]const u8 = null,
     checker_provenance: ?[]const u8 = null,
+    checker_build_receipt: ?[]const u8 = null,
 };
 
 pub const IndexMetadata = struct {
@@ -141,6 +142,7 @@ pub fn persist(
     try maybeWrite(allocator, event_dir, &records, "checker-stdout.bin", artifacts.checker_stdout);
     try maybeWrite(allocator, event_dir, &records, "checker-stderr.bin", artifacts.checker_stderr);
     try maybeWrite(allocator, event_dir, &records, "checker-provenance.json", artifacts.checker_provenance);
+    try maybeWrite(allocator, event_dir, &records, "checker-build-receipt.json", artifacts.checker_build_receipt);
     try writeArtifact(allocator, event_dir, &records, "receipt.json", receipt);
 
     const pre_manifest_persistence_elapsed_ns = elapsedSince(persistence_started);
@@ -251,9 +253,9 @@ pub fn verifyBundle(allocator: std.mem.Allocator, event_dir: []const u8) !Verifi
 
 fn validArtifactName(name: []const u8) bool {
     const names = [_][]const u8{
-        "snapshot-source.bin", "snapshot.json",      "proposal.json",      "request.json",
-        "verdict.json",        "checker-stdout.bin", "checker-stderr.bin", "checker-provenance.json",
-        "receipt.json",
+        "snapshot-source.bin",        "snapshot.json",      "proposal.json",      "request.json",
+        "verdict.json",               "checker-stdout.bin", "checker-stderr.bin", "checker-provenance.json",
+        "checker-build-receipt.json", "receipt.json",
     };
     for (names) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
     return false;
