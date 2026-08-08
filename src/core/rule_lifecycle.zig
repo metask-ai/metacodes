@@ -12,8 +12,11 @@ const pfs = @import("platform").fs;
 const observation = @import("../tools/observation.zig");
 const rule_candidate = @import("rule_candidate.zig");
 const source_receipt = @import("rule_source_receipt.zig");
+const project_rule_spec = @import("project_rule_spec.zig");
 
-pub const SCHEMA_VERSION = "metacodes-rule-stage-receipt-v1";
+pub const SCHEMA_VERSION = "metacodes-rule-stage-receipt-v2";
+pub const LEGACY_SCHEMA_VERSION = "metacodes-rule-stage-receipt-v1";
+const ZERO_SHA256_TEXT = "0000000000000000000000000000000000000000000000000000000000000000";
 pub const FILE_PREFIX = "rule-stage-receipt-";
 pub const HEAD_PREFIX = "rule-stage-head-";
 pub const LOCK_PREFIX = "rule-stage-lock-";
@@ -30,10 +33,13 @@ pub const Stage = enum {
 };
 
 pub const BuildEvidence = struct {
+    manifest_sha256: [64]u8,
     lean_source_sha256: [64]u8,
+    rule_spec_sha256: [64]u8,
     compiled_artifact_sha256: [64]u8,
     toolchain_sha256: [64]u8,
     sdk_sha256: [64]u8,
+    sdk_olean_sha256: [64]u8,
     build_log_sha256: [64]u8,
     network_disabled: bool,
     secrets_absent: bool,
@@ -125,6 +131,7 @@ pub const Loaded = struct {
     predecessor_receipt_id: ?[64]u8,
     stage: Stage,
     evidence: ParsedEvidence,
+    legacy_schema: bool,
 
     pub fn deinit(self: *Loaded) void {
         self.arena.deinit();
@@ -144,10 +151,13 @@ pub const ParsedEvidence = union(Stage) {
 
 const WireEvidence = union(Stage) {
     built: struct {
+        manifest_sha256: []const u8 = ZERO_SHA256_TEXT,
         lean_source_sha256: []const u8,
+        rule_spec_sha256: []const u8 = ZERO_SHA256_TEXT,
         compiled_artifact_sha256: []const u8,
         toolchain_sha256: []const u8,
         sdk_sha256: []const u8,
+        sdk_olean_sha256: []const u8 = ZERO_SHA256_TEXT,
         build_log_sha256: []const u8,
         network_disabled: bool,
         secrets_absent: bool,
@@ -376,11 +386,17 @@ pub fn load(
         parseHex(raw_id) orelse return error.InvalidReceipt
     else
         null;
-    if (!std.mem.eql(u8, record.body.schema_version, SCHEMA_VERSION) or
+    const legacy_schema = std.mem.eql(u8, record.body.schema_version, LEGACY_SCHEMA_VERSION);
+    if ((!legacy_schema and !std.mem.eql(u8, record.body.schema_version, SCHEMA_VERSION)) or
         !std.mem.eql(u8, &parsed_id, &receipt_id))
         return error.InvalidReceipt;
-    const body_json = try std.json.Stringify.valueAlloc(a, record.body, .{});
-    const expected_id = observation.sha256Hex(body_json);
+    const prefix = "{\"receipt_id\":\"";
+    const body_marker = "\",\"body\":";
+    if (!std.mem.startsWith(u8, raw, prefix) or raw.len < prefix.len + 64 + body_marker.len + 3 or
+        !std.mem.eql(u8, raw[prefix.len + 64 .. prefix.len + 64 + body_marker.len], body_marker) or
+        raw[raw.len - 2] != '}') return error.InvalidReceipt;
+    const body_start = prefix.len + 64 + body_marker.len;
+    const expected_id = observation.sha256Hex(raw[body_start .. raw.len - 2]);
     if (!std.mem.eql(u8, &expected_id, &receipt_id)) return error.ReceiptHashMismatch;
     const parsed_evidence = try parseEvidence(record.body.evidence);
     return .{
@@ -393,6 +409,7 @@ pub fn load(
         .predecessor_receipt_id = predecessor,
         .stage = std.meta.activeTag(parsed_evidence),
         .evidence = parsed_evidence,
+        .legacy_schema = legacy_schema,
     };
 }
 
@@ -403,8 +420,10 @@ fn validateIdentities(input: Input) !void {
     if (input.predecessor_receipt_id) |id| if (!validHex(id)) return error.InvalidIdentity;
     switch (input.evidence) {
         .built => |e| {
-            if (!validHex(e.lean_source_sha256) or !validHex(e.compiled_artifact_sha256) or
+            if (!validHex(e.manifest_sha256) or !validHex(e.lean_source_sha256) or
+                !validHex(e.rule_spec_sha256) or !validHex(e.compiled_artifact_sha256) or
                 !validHex(e.toolchain_sha256) or !validHex(e.sdk_sha256) or
+                !validHex(e.sdk_olean_sha256) or
                 !validHex(e.build_log_sha256)) return error.InvalidEvidence;
         },
         .axiom_audited => |e| if (!validHex(e.audit_sha256) or !validHex(e.policy_sha256)) return error.InvalidEvidence,
@@ -442,7 +461,14 @@ fn validateTransition(
     }
     switch (input.evidence) {
         .built => |e| {
+            const canonical_spec = try project_rule_spec.renderCanonical(
+                std.heap.c_allocator,
+                candidate.rule_spec,
+            );
+            defer std.heap.c_allocator.free(canonical_spec);
+            const canonical_spec_sha256 = observation.sha256Hex(canonical_spec);
             if (!std.mem.eql(u8, &e.lean_source_sha256, &candidate.lean_source_sha256) or
+                !std.mem.eql(u8, &e.rule_spec_sha256, &canonical_spec_sha256) or
                 !e.network_disabled or !e.secrets_absent or !e.source_bounded or
                 !e.output_bounded or !e.completed)
                 return error.BuildEvidenceIncomplete;
@@ -463,6 +489,12 @@ fn validateTransition(
                 return error.ReplayFailed;
             if (std.mem.eql(u8, &candidate.proposer_sha256, &input.actor_sha256))
                 return error.ReplayEvaluatorNotIndependent;
+            const axiom = predecessor.?;
+            var build = try loadPrevious(std.heap.c_allocator, session_dir, axiom, .built);
+            defer build.deinit();
+            if (std.mem.eql(u8, &axiom.actor_sha256, &input.actor_sha256) or
+                std.mem.eql(u8, &build.actor_sha256, &input.actor_sha256))
+                return error.ReplayEvaluatorNotIndependent;
         },
         .shadow_passed => |e| {
             if (!e.completed or e.observed_decisions == 0 or e.divergence_count != 0 or
@@ -471,6 +503,18 @@ fn validateTransition(
             if (std.mem.eql(u8, &candidate.proposer_sha256, &input.actor_sha256))
                 return error.ShadowEvaluatorNotIndependent;
             if (std.mem.eql(u8, &predecessor.?.actor_sha256, &input.actor_sha256))
+                return error.ShadowEvaluatorNotIndependent;
+            var axiom = try loadPrevious(
+                std.heap.c_allocator,
+                session_dir,
+                predecessor.?,
+                .axiom_audited,
+            );
+            defer axiom.deinit();
+            var build = try loadPrevious(std.heap.c_allocator, session_dir, axiom, .built);
+            defer build.deinit();
+            if (std.mem.eql(u8, &axiom.actor_sha256, &input.actor_sha256) or
+                std.mem.eql(u8, &build.actor_sha256, &input.actor_sha256))
                 return error.ShadowEvaluatorNotIndependent;
         },
         .rejected => {},
@@ -519,6 +563,11 @@ fn validatePromotionChain(
     defer axiom.deinit();
     var build = try loadPrevious(std.heap.c_allocator, session_dir, axiom, .built);
     defer build.deinit();
+    if (build.legacy_schema or
+        isZeroHex(build.evidence.built.manifest_sha256) or
+        isZeroHex(build.evidence.built.rule_spec_sha256) or
+        isZeroHex(build.evidence.built.sdk_olean_sha256))
+        return error.LegacyBuildEvidenceNotPromotable;
     if (std.mem.eql(u8, &promoter, &candidate.proposer_sha256) or
         std.mem.eql(u8, &promoter, &build.actor_sha256) or
         std.mem.eql(u8, &promoter, &axiom.actor_sha256) or
@@ -561,10 +610,13 @@ fn allowedTransition(from: Stage, to: Stage) bool {
 fn wireEvidence(evidence: *const Evidence) WireEvidence {
     return switch (evidence.*) {
         .built => |*e| .{ .built = .{
+            .manifest_sha256 = e.manifest_sha256[0..],
             .lean_source_sha256 = e.lean_source_sha256[0..],
+            .rule_spec_sha256 = e.rule_spec_sha256[0..],
             .compiled_artifact_sha256 = e.compiled_artifact_sha256[0..],
             .toolchain_sha256 = e.toolchain_sha256[0..],
             .sdk_sha256 = e.sdk_sha256[0..],
+            .sdk_olean_sha256 = e.sdk_olean_sha256[0..],
             .build_log_sha256 = e.build_log_sha256[0..],
             .network_disabled = e.network_disabled,
             .secrets_absent = e.secrets_absent,
@@ -620,10 +672,13 @@ fn wireEvidence(evidence: *const Evidence) WireEvidence {
 fn parseEvidence(evidence: WireEvidence) !ParsedEvidence {
     return switch (evidence) {
         .built => |e| .{ .built = .{
+            .manifest_sha256 = parseHex(e.manifest_sha256) orelse return error.InvalidReceipt,
             .lean_source_sha256 = parseHex(e.lean_source_sha256) orelse return error.InvalidReceipt,
+            .rule_spec_sha256 = parseHex(e.rule_spec_sha256) orelse return error.InvalidReceipt,
             .compiled_artifact_sha256 = parseHex(e.compiled_artifact_sha256) orelse return error.InvalidReceipt,
             .toolchain_sha256 = parseHex(e.toolchain_sha256) orelse return error.InvalidReceipt,
             .sdk_sha256 = parseHex(e.sdk_sha256) orelse return error.InvalidReceipt,
+            .sdk_olean_sha256 = parseHex(e.sdk_olean_sha256) orelse return error.InvalidReceipt,
             .build_log_sha256 = parseHex(e.build_log_sha256) orelse return error.InvalidReceipt,
             .network_disabled = e.network_disabled,
             .secrets_absent = e.secrets_absent,
@@ -807,6 +862,10 @@ fn validHex(value: [64]u8) bool {
     return parseHex(value[0..]) != null;
 }
 
+fn isZeroHex(value: [64]u8) bool {
+    return std.mem.allEqual(u8, &value, '0');
+}
+
 fn parseHex(value: []const u8) ?[64]u8 {
     if (value.len != 64) return null;
     var result: [64]u8 = undefined;
@@ -920,6 +979,45 @@ test "promotion requires the complete chain and an independent promoter" {
     try std.testing.expectEqual(Stage.promoted, loaded.stage);
 }
 
+test "v1 lifecycle receipts remain readable but cannot satisfy new promotion evidence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const body = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema_version\":\"{s}\",\"candidate_id\":\"{s}\",\"project_sha256\":\"{s}\",\"actor_sha256\":\"{s}\",\"checker_sha256\":\"{s}\",\"predecessor_receipt_id\":null,\"evidence\":{{\"built\":{{\"lean_source_sha256\":\"{s}\",\"compiled_artifact_sha256\":\"{s}\",\"toolchain_sha256\":\"{s}\",\"sdk_sha256\":\"{s}\",\"build_log_sha256\":\"{s}\",\"network_disabled\":true,\"secrets_absent\":true,\"source_bounded\":true,\"output_bounded\":true,\"completed\":true}}}}}}",
+        .{
+            LEGACY_SCHEMA_VERSION,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            "3333333333333333333333333333333333333333333333333333333333333333",
+        },
+    );
+    defer std.testing.allocator.free(body);
+    const receipt_id = observation.sha256Hex(body);
+    const record = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"receipt_id\":\"{s}\",\"body\":{s}}}",
+        .{ receipt_id, body },
+    );
+    defer std.testing.allocator.free(record);
+    _ = try persistExact(root, receipt_id, record);
+    var loaded = try load(std.testing.allocator, root, receipt_id);
+    defer loaded.deinit();
+    try std.testing.expect(loaded.legacy_schema);
+    try std.testing.expect(isZeroHex(loaded.evidence.built.manifest_sha256));
+    try std.testing.expect(isZeroHex(loaded.evidence.built.rule_spec_sha256));
+    try std.testing.expect(isZeroHex(loaded.evidence.built.sdk_olean_sha256));
+}
+
 const TestFixture = struct {
     tmp: std.testing.TmpDir,
     root: []const u8,
@@ -967,6 +1065,11 @@ const TestFixture = struct {
     fn build(self: *TestFixture) !PersistResult {
         var candidate = try rule_candidate.load(std.testing.allocator, self.root, self.candidate_id);
         defer candidate.deinit();
+        const canonical_spec = try project_rule_spec.renderCanonical(
+            std.testing.allocator,
+            candidate.rule_spec,
+        );
+        defer std.testing.allocator.free(canonical_spec);
         return persist(self.root, .{
             .candidate_id = self.candidate_id,
             .project_sha256 = self.project,
@@ -974,10 +1077,13 @@ const TestFixture = struct {
             .checker_sha256 = .{'d'} ** 64,
             .predecessor_receipt_id = null,
             .evidence = .{ .built = .{
+                .manifest_sha256 = .{'9'} ** 64,
                 .lean_source_sha256 = candidate.lean_source_sha256,
+                .rule_spec_sha256 = observation.sha256Hex(canonical_spec),
                 .compiled_artifact_sha256 = .{'e'} ** 64,
                 .toolchain_sha256 = .{'f'} ** 64,
                 .sdk_sha256 = .{'1'} ** 64,
+                .sdk_olean_sha256 = .{'b'} ** 64,
                 .build_log_sha256 = .{'2'} ** 64,
                 .network_disabled = true,
                 .secrets_absent = true,

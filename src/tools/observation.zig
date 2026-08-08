@@ -54,8 +54,29 @@ pub const FileMutationV1 = struct {
     change: ChangeState,
 };
 
+pub const ReobservationState = enum {
+    matched,
+    mismatched,
+    unavailable,
+};
+
+/// Host re-read performed after the tool implementation returned and before
+/// its terminal dispatch observation was accepted. The plaintext path remains
+/// in the per-dispatch slot and never enters the journal.
+pub const FileReobservationV1 = struct {
+    state: ReobservationState,
+    observed_sha256: [64]u8,
+    observed_bytes: usize,
+};
+
+pub const FileMutationV2 = struct {
+    mutation: FileMutationV1,
+    reobservation: FileReobservationV1,
+};
+
 pub const Effect = union(enum) {
     file_mutation_v1: FileMutationV1,
+    file_mutation_v2: FileMutationV2,
 };
 
 /// Per-dispatch stack slot. A tool can publish at most one effect. A second
@@ -64,6 +85,11 @@ pub const Effect = union(enum) {
 pub const EffectSlot = struct {
     effect: ?Effect = null,
     valid: bool = true,
+    /// Stable per-dispatch copy. Tool-local normalized path buffers are freed
+    /// before dispatch returns, so retaining a borrowed slice here would make
+    /// post-action re-observation read dangling memory.
+    file_path: [std.fs.max_path_bytes]u8 = undefined,
+    file_path_len: usize = 0,
 
     pub fn record(self: *EffectSlot, effect: Effect) void {
         if (self.effect != null) {
@@ -71,6 +97,21 @@ pub const EffectSlot = struct {
             return;
         }
         self.effect = effect;
+    }
+
+    pub fn recordFileMutation(self: *EffectSlot, path: []const u8, effect: FileMutationV1) void {
+        if (self.effect != null or self.file_path_len != 0 or path.len == 0 or path.len > self.file_path.len) {
+            self.valid = false;
+            return;
+        }
+        @memcpy(self.file_path[0..path.len], path);
+        self.file_path_len = path.len;
+        self.effect = .{ .file_mutation_v1 = effect };
+    }
+
+    pub fn filePath(self: *const EffectSlot) ?[]const u8 {
+        if (self.file_path_len == 0) return null;
+        return self.file_path[0..self.file_path_len];
     }
 };
 

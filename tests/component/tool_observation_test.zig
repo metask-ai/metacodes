@@ -202,19 +202,23 @@ test "L2 actual tool observation is independent of UI projection and depth" {
     try std.testing.expect(capture.names_are_write);
     try std.testing.expect(capture.schema_is_v1);
     const effect = capture.effect orelse return error.MissingToolEffect;
-    const mutation = switch (effect) {
-        .file_mutation_v1 => |value| value,
+    const observed = switch (effect) {
+        .file_mutation_v1 => return error.MissingPostReobservation,
+        .file_mutation_v2 => |value| value,
     };
+    const mutation = observed.mutation;
     try std.testing.expect(mutation.before_state == .missing);
     try std.testing.expect(mutation.change == .changed);
     try std.testing.expectEqual(@as(usize, "l2-grounded".len), mutation.after_bytes);
+    try std.testing.expect(observed.reobservation.state == .matched);
+    try std.testing.expectEqualSlices(u8, &mutation.after_sha256, &observed.reobservation.observed_sha256);
     const summary = try observation_journal.validate(root_buffer[0..root_len], sid);
     try std.testing.expectEqual(@as(u64, 4), summary.records);
     const artifact = try readJournalArtifact(allocator, root_buffer[0..root_len]);
     defer allocator.free(artifact);
     try std.testing.expect(std.mem.indexOf(u8, artifact, "dispatch_started") != null);
     try std.testing.expect(std.mem.indexOf(u8, artifact, "dispatch_finished") != null);
-    try std.testing.expect(std.mem.indexOf(u8, artifact, "file_mutation_v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, artifact, "file_mutation_v2") != null);
     try std.testing.expect(std.mem.indexOf(u8, artifact, path) == null);
     try std.testing.expect(std.mem.indexOf(u8, artifact, "l2-grounded") == null);
 }

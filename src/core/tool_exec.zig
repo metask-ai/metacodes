@@ -18,6 +18,7 @@ const ToolContext = tools_mod.ToolContext;
 const tool_observation = @import("../tools/observation.zig");
 const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
+const pfs = platform.fs;
 
 /// 给任意 allocator 加互斥视图。ArenaAllocator 只隔离自己的链表元数据，它增长时仍会
 /// 调后备 allocator；多个 worker 直接以同一个 session arena 为后备会破坏 arena 状态。
@@ -194,7 +195,7 @@ const DispatchObservation = struct {
     requested_name: []const u8,
     dispatched_name: []const u8,
     started_at_ms: i64,
-    effect_slot: *const tool_observation.EffectSlot,
+    effect_slot: *tool_observation.EffectSlot,
     started: bool = false,
     terminal_attempted: bool = false,
 
@@ -215,6 +216,7 @@ const DispatchObservation = struct {
         // assertion alone would compile the guard away.
         if (!self.started or self.terminal_attempted) return false;
         self.terminal_attempted = true;
+        reobserveFileEffect(self.effect_slot);
         const elapsed: u64 = @intCast(@max(util_time.nowMs() - self.started_at_ms, 0));
         return emitDispatchFinished(
             self.ctx,
@@ -234,6 +236,96 @@ const DispatchObservation = struct {
         _ = self.finish(.host_fatal, "DispatchObservationUnwound", null);
     }
 };
+
+fn reobserveFileEffect(slot: *tool_observation.EffectSlot) void {
+    const effect = slot.effect orelse return;
+    const mutation = switch (effect) {
+        .file_mutation_v1 => |value| value,
+        .file_mutation_v2 => return,
+    };
+    const unavailable = tool_observation.FileReobservationV1{
+        .state = .unavailable,
+        .observed_sha256 = [_]u8{'0'} ** 64,
+        .observed_bytes = 0,
+    };
+    const path = slot.filePath() orelse {
+        slot.effect = .{ .file_mutation_v2 = .{
+            .mutation = mutation,
+            .reobservation = unavailable,
+        } };
+        return;
+    };
+    var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= path_buf.len) {
+        slot.effect = .{ .file_mutation_v2 = .{ .mutation = mutation, .reobservation = unavailable } };
+        return;
+    }
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    const fd = pfs.open(@ptrCast(&path_buf), .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (fd < 0) {
+        slot.effect = .{ .file_mutation_v2 = .{ .mutation = mutation, .reobservation = unavailable } };
+        return;
+    }
+    defer _ = pfs.close(fd);
+    const before = pfs.fileInfo(fd) catch {
+        slot.effect = .{ .file_mutation_v2 = .{ .mutation = mutation, .reobservation = unavailable } };
+        return;
+    };
+    if (!before.is_regular or before.size > std.math.maxInt(usize)) {
+        slot.effect = .{ .file_mutation_v2 = .{ .mutation = mutation, .reobservation = unavailable } };
+        return;
+    }
+    const observed_bytes: usize = @intCast(before.size);
+    if (observed_bytes != mutation.after_bytes) {
+        slot.effect = .{ .file_mutation_v2 = .{
+            .mutation = mutation,
+            .reobservation = .{
+                .state = .mismatched,
+                .observed_sha256 = [_]u8{'0'} ** 64,
+                .observed_bytes = observed_bytes,
+            },
+        } };
+        return;
+    }
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var total: usize = 0;
+    while (true) {
+        const count = pfs.read(fd, &buffer);
+        if (count < 0) {
+            slot.effect = .{ .file_mutation_v2 = .{ .mutation = mutation, .reobservation = unavailable } };
+            return;
+        }
+        if (count == 0) break;
+        const n: usize = @intCast(count);
+        total += n;
+        if (total > observed_bytes) {
+            slot.effect = .{ .file_mutation_v2 = .{ .mutation = mutation, .reobservation = unavailable } };
+            return;
+        }
+        hasher.update(buffer[0..n]);
+    }
+    const after = pfs.fileInfo(fd) catch {
+        slot.effect = .{ .file_mutation_v2 = .{ .mutation = mutation, .reobservation = unavailable } };
+        return;
+    };
+    if (!after.is_regular or after.size != before.size or total != observed_bytes) {
+        slot.effect = .{ .file_mutation_v2 = .{ .mutation = mutation, .reobservation = unavailable } };
+        return;
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    const observed_sha256 = std.fmt.bytesToHex(digest, .lower);
+    slot.effect = .{ .file_mutation_v2 = .{
+        .mutation = mutation,
+        .reobservation = .{
+            .state = if (std.mem.eql(u8, &observed_sha256, &mutation.after_sha256)) .matched else .mismatched,
+            .observed_sha256 = observed_sha256,
+            .observed_bytes = observed_bytes,
+        },
+    } };
+}
 
 const ObservationCapture = struct {
     mutex: platform.sync.Mutex = .{},
@@ -1262,9 +1354,11 @@ test "tool observation: actual Write dispatch emits UI-independent typed effect 
     try std.testing.expect(capture.dispatched_as_write);
     try std.testing.expect(capture.effect_valid);
     const effect = capture.effect orelse return error.MissingToolEffect;
-    const mutation = switch (effect) {
-        .file_mutation_v1 => |value| value,
+    const observed = switch (effect) {
+        .file_mutation_v1 => return error.MissingPostReobservation,
+        .file_mutation_v2 => |value| value,
     };
+    const mutation = observed.mutation;
     try std.testing.expect(mutation.before_state == .missing);
     try std.testing.expect(mutation.change == .changed);
     try std.testing.expectEqual(@as(usize, "grounded".len), mutation.after_bytes);
@@ -1272,6 +1366,12 @@ test "tool observation: actual Write dispatch emits UI-independent typed effect 
         u8,
         &tool_observation.sha256Hex(path),
         &mutation.path_sha256,
+    );
+    try std.testing.expect(observed.reobservation.state == .matched);
+    try std.testing.expectEqualSlices(
+        u8,
+        &mutation.after_sha256,
+        &observed.reobservation.observed_sha256,
     );
     try std.testing.expect(platform.fs.exists(path.ptr));
 }

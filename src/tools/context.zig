@@ -469,7 +469,8 @@ pub const ToolContext = struct {
         after: []const u8,
     ) void {
         const slot = self.effect_slot orelse return;
-        slot.record(@import("observation.zig").fileMutation(path, before, after));
+        const effect = @import("observation.zig").fileMutation(path, before, after).file_mutation_v1;
+        slot.recordFileMutation(path, effect);
     }
 
     pub fn isPrefetchSafe(self: *const ToolContext, name: []const u8) bool {
