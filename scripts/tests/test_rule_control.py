@@ -957,6 +957,67 @@ class EvalBudgetCheckpointSensorTests(unittest.TestCase):
             "checkpoint_committed_before_abort", observation.missing_declarations
         )
 
+    def test_disconnected_locked_runner_cannot_impersonate_budget_control(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        runner = root / "scripts/eval/paired_runner.py"
+        runner.write_text(
+            runner.read_text(encoding="utf-8").replace(
+                "return _run_multi_arm_locked(\n",
+                "return disconnected_paid_runner(\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_eval_budget_checkpoint(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "whole_schedule_capacity_before_network",
+            observation.missing_declarations,
+        )
+
+    def test_missing_initial_capacity_gate_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        runner = root / "scripts/eval/paired_runner.py"
+        source = runner.read_text(encoding="utf-8")
+        initial_gate = """    _require_remaining_schedule_capacity(
+        collected,
+        budget,
+        remaining_rollouts=remaining_rollouts,
+        stage_prior_cost_usd=stage_prior_cost_usd,
+        stage_prior_tokens=stage_prior_tokens,
+        aggregate_prior_cost_usd=aggregate_prior_cost_usd,
+        aggregate_prior_tokens=aggregate_prior_tokens,
+    )
+"""
+        self.assertIn(initial_gate, source)
+        runner.write_text(source.replace(initial_gate, "", 1), encoding="utf-8")
+        observation = rule_control.observe_eval_budget_checkpoint(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "whole_schedule_capacity_before_network",
+            observation.missing_declarations,
+        )
+
+    def test_native_call_without_sealed_cost_cap_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        runner = root / "scripts/eval/paired_runner.py"
+        source = runner.read_text(encoding="utf-8")
+        marker = "max_cost_usd=runtime_max_cost_usd,"
+        self.assertIn(marker, source)
+        runner.write_text(
+            source.replace(marker, "unsealed_max_cost_usd=runtime_max_cost_usd,"),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_eval_budget_checkpoint(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "runtime_usage_bound_to_sealed_cap",
+            observation.missing_declarations,
+        )
+
     def test_source_order_without_disk_counterexample_is_not_durable_evidence(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
@@ -1074,6 +1135,29 @@ class TreatmentActivationSensorTests(unittest.TestCase):
         self.assertFalse(observation.sensor_ok)
         self.assertIn(
             "treatment_failure_checkpoint_before_abort",
+            observation.missing_declarations,
+        )
+
+    def test_disconnected_locked_runner_cannot_impersonate_treatment_control(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        runner = root / "scripts/eval/paired_runner.py"
+        runner.write_text(
+            runner.read_text(encoding="utf-8").replace(
+                "return _run_multi_arm_locked(\n",
+                "return disconnected_paid_runner(\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_treatment_activation(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "treatment_failure_checkpoint_before_abort",
+            observation.missing_declarations,
+        )
+        self.assertIn(
+            "resume_reverification_before_network",
             observation.missing_declarations,
         )
 

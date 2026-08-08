@@ -1671,7 +1671,10 @@ def observe_eval_budget_checkpoint(repo: Path) -> Observation:
             key=lambda node: node.lineno,
         )
 
-    runner = function_node("runner", "run_multi_arm")
+    entrypoint = function_node("runner", "run_multi_arm")
+    runner = function_node("runner", "_run_multi_arm_locked")
+    locked_runner_calls = call_nodes(entrypoint, "_run_multi_arm_locked")
+    locked_runner_reachable = len(locked_runner_calls) == 1
     capacity_calls = call_nodes(runner, "_require_remaining_schedule_capacity")
     run_once_calls = call_nodes(runner, "_run_once")
     mark_calls = call_nodes(runner, "_mark_runtime_budget_invalid")
@@ -1716,7 +1719,14 @@ def observe_eval_budget_checkpoint(repo: Path) -> Observation:
         "experiment_tests", "test_promotion_rechecks_fixed_runtime_budget_and_usage"
     )
 
-    call_text = "\n".join(ast.unparse(node) for node in run_once_calls)
+    run_once_bindings = [
+        {
+            keyword.arg: ast.unparse(keyword.value)
+            for keyword in call.keywords
+            if keyword.arg is not None
+        }
+        for call in run_once_calls
+    ]
     first_run_line = min((node.lineno for node in run_once_calls), default=-1)
     capacity_lines = [node.lineno for node in capacity_calls]
     mark_lines = [node.lineno for node in mark_calls]
@@ -1746,6 +1756,7 @@ def observe_eval_budget_checkpoint(repo: Path) -> Observation:
             ),
         },
         declarations[1]: {
+            "public entrypoint reaches the locked paid runner": locked_runner_reachable,
             "initial and per-rollout capacity checks precede network": (
                 len(capacity_lines) >= 2
                 and first_run_line > 0
@@ -1768,12 +1779,12 @@ def observe_eval_budget_checkpoint(repo: Path) -> Observation:
             ),
         },
         declarations[2]: {
-            "native call receives the frozen two-dimensional cap": all(
-                marker in call_text
-                for marker in (
-                    "max_metered_tokens=runtime_max_metered_tokens",
-                    "max_cost_usd=runtime_max_cost_usd",
-                )
+            "native call receives the frozen two-dimensional cap": (
+                len(run_once_bindings) == 1
+                and run_once_bindings[0].get("max_metered_tokens")
+                == "runtime_max_metered_tokens"
+                and run_once_bindings[0].get("max_cost_usd")
+                == "runtime_max_cost_usd"
             ),
             "normalized telemetry is compared with sealed provenance": all(
                 marker in provenance_source
@@ -1786,6 +1797,7 @@ def observe_eval_budget_checkpoint(repo: Path) -> Observation:
             "resume and new evidence both pass provenance validation": len(provenance_lines) >= 2,
         },
         declarations[3]: {
+            "failure order belongs to the connected paid runner": locked_runner_reachable,
             "invalid marker executes before checkpoint publication": (
                 len(mark_lines) == 1
                 and len(write_lines) == 1
@@ -1802,6 +1814,7 @@ def observe_eval_budget_checkpoint(repo: Path) -> Observation:
             ),
         },
         declarations[4]: {
+            "abort order belongs to the connected paid runner": locked_runner_reachable,
             "checkpoint publication precedes budget abort": (
                 len(write_lines) == 1
                 and len(budget_abort_lines) == 1
@@ -1988,7 +2001,11 @@ def observe_treatment_activation(repo: Path) -> Observation:
             )
         )
 
-    runner = function_node("runner", "run_multi_arm")
+    entrypoint = function_node("runner", "run_multi_arm")
+    runner = function_node("runner", "_run_multi_arm_locked")
+    locked_runner_reachable = (
+        len(call_lines(entrypoint, "_run_multi_arm_locked")) == 1
+    )
     attach_lines = call_lines(runner, "attach_treatment_activation")
     mark_lines = call_lines(runner, "_mark_treatment_activation_invalid")
     write_lines = call_lines(runner, "write_rollouts")
@@ -2045,14 +2062,16 @@ def observe_treatment_activation(repo: Path) -> Observation:
     )
 
     failure_order = (
-        len(attach_lines) == 1
+        locked_runner_reachable
+        and len(attach_lines) == 1
         and len(mark_lines) == 1
         and len(write_lines) == 1
         and len(treatment_abort_lines) == 1
         and attach_lines[0] < mark_lines[0] < write_lines[0] < treatment_abort_lines[0]
     )
     resume_before_network = (
-        len(load_lines) == 1
+        locked_runner_reachable
+        and len(load_lines) == 1
         and len(run_lines) == 1
         and load_lines[0] < run_lines[0]
         and "reverify_treatment_activation" in load_source
