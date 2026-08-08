@@ -27,7 +27,8 @@ host_os=$(uname -s)
 axiom_audit=$(cd "$lean_dir" && "$lake" env lean ProjectHarnessAxiomAudit.lean 2>&1)
 expected_axioms="'MetaCodesControl.ProjectHarness.safePromotion_sound' depends on axioms: [propext]
 'MetaCodesControl.ProjectHarness.correction_promotion_requires_receipt' depends on axioms: [propext]
-'MetaCodesControl.ProjectHarness.denied_predecision_blocks' depends on axioms: [propext]"
+'MetaCodesControl.ProjectHarness.denied_predecision_blocks' depends on axioms: [propext]
+'MetaCodesControl.ProjectHarness.decideBatch_sound' does not depend on any axioms"
 if [[ "$axiom_audit" != "$expected_axioms" ]]; then
   echo "build-project-harness-kernel: unexpected axiom set" >&2
   printf '%s\n' "$axiom_audit" >&2
@@ -80,6 +81,20 @@ admit_verdict=$(printf '%s' "$admit_request" | "$output")
   echo "build-project-harness-kernel: admit smoke failed" >&2
   exit 1
 }
+batch_request="{\"schema_version\":\"metacodes-project-harness-batch-request-v1\",\"requests\":[$admit_request,$deny_request]}"
+batch_verdict=$(printf '%s' "$batch_request" | "$output")
+[[ "$batch_verdict" == *'"schema_version":"metacodes-project-harness-batch-verdict-v1"'* &&
+  "$batch_verdict" == *'"verdicts":['* &&
+  "$batch_verdict" == *'"decision":"admit"'* &&
+  "$batch_verdict" == *'"decision":"block"'* ]] || {
+  echo "build-project-harness-kernel: batch smoke failed" >&2
+  exit 1
+}
+if printf '%s' '{"schema_version":"metacodes-project-harness-batch-request-v1","requests":[]}' \
+  | "$output" >/dev/null 2>&1; then
+  echo "build-project-harness-kernel: empty batch was not rejected" >&2
+  exit 1
+fi
 
 if command -v shasum >/dev/null 2>&1; then
   hash_file() { shasum -a 256 "$1" | awk '{print $1}'; }
@@ -99,7 +114,7 @@ fi
 host_arch=$(uname -m)
 lean_version=$(cd "$lean_dir" && "$lake" env lean --version | tr -d '\n')
 printf '%s\n' \
-  "{\"schema_version\":\"metacodes-project-kernel-artifact-v1\",\"checker_version\":\"metacodes-project-harness-kernel-v1\",\"request_schema\":\"metacodes-project-harness-request-v1\",\"verdict_schema\":\"metacodes-project-harness-verdict-v1\",\"binary_sha256\":\"$binary_sha256\",\"binary_bytes\":$binary_bytes,\"kernel_source_sha256\":\"$kernel_source_sha256\",\"rule_source_sha256\":\"$rule_source_sha256\",\"main_source_sha256\":\"$main_source_sha256\",\"axiom_audit_source_sha256\":\"$axiom_source_sha256\",\"axiom_policy\":\"propext\",\"axiom_audit\":\"passed\",\"host_os\":\"$host_os\",\"host_arch\":\"$host_arch\",\"linker\":\"$linker\",\"lean_version\":\"$lean_version\",\"native_smoke\":\"passed\"}" >"$manifest"
+  "{\"schema_version\":\"metacodes-project-kernel-artifact-v1\",\"checker_version\":\"metacodes-project-harness-kernel-v1\",\"request_schema\":\"metacodes-project-harness-request-v1\",\"verdict_schema\":\"metacodes-project-harness-verdict-v1\",\"batch_request_schema\":\"metacodes-project-harness-batch-request-v1\",\"batch_verdict_schema\":\"metacodes-project-harness-batch-verdict-v1\",\"max_batch_requests\":1024,\"binary_sha256\":\"$binary_sha256\",\"binary_bytes\":$binary_bytes,\"kernel_source_sha256\":\"$kernel_source_sha256\",\"rule_source_sha256\":\"$rule_source_sha256\",\"main_source_sha256\":\"$main_source_sha256\",\"axiom_audit_source_sha256\":\"$axiom_source_sha256\",\"axiom_policy\":\"propext\",\"axiom_audit\":\"passed\",\"host_os\":\"$host_os\",\"host_arch\":\"$host_arch\",\"linker\":\"$linker\",\"lean_version\":\"$lean_version\",\"native_smoke\":\"passed\",\"native_batch_smoke\":\"passed\"}" >"$manifest"
 
 echo "project harness kernel: $output"
 echo "sha256: $binary_sha256"

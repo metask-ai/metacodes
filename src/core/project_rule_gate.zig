@@ -11,6 +11,7 @@ const pfs = @import("platform").fs;
 const sync = @import("platform").sync;
 
 pub const RUNTIME_VERDICT_PREFIX = "project-rule-runtime-verdict-";
+pub const RUNTIME_BATCH_VERDICT_PREFIX = "project-rule-runtime-batch-verdict-";
 
 pub const RuntimeGate = struct {
     mutex: sync.Mutex = .{},
@@ -48,47 +49,51 @@ pub const RuntimeGate = struct {
         };
         const signal_json = try std.json.Stringify.valueAlloc(self.allocator, formal_signal, .{});
         defer self.allocator.free(signal_json);
-        for (self.active.rules) |entry| {
+        const requests = try self.allocator.alloc(kernel.Request, self.active.rules.len);
+        defer self.allocator.free(requests);
+        const bindings = try self.allocator.alloc(kernel.Bindings, self.active.rules.len);
+        defer self.allocator.free(bindings);
+        const request_ids = try self.allocator.alloc([64]u8, self.active.rules.len);
+        defer self.allocator.free(request_ids);
+        for (self.active.rules, 0..) |entry, index| {
             const candidate_id = parseHex(entry.candidate_id) orelse return error.InvalidCandidateId;
-            const id = kernel.requestId(
+            request_ids[index] = kernel.requestId(
                 .pre_decision,
                 candidate_id,
                 self.active.bundle_sha256,
                 self.active.revision,
                 signal_json,
             );
-            const request = kernel.Request{
-                .request_id = id[0..],
+            requests[index] = .{
+                .request_id = request_ids[index][0..],
                 .operation = .pre_decision,
                 .kernel_sha256 = self.active.kernel_sha256[0..],
-                .candidate_id = candidate_id[0..],
+                .candidate_id = entry.candidate_id,
                 .project_sha256 = self.active.project_sha256[0..],
                 .bundle_sha256 = self.active.bundle_sha256[0..],
                 .bundle_revision = self.active.revision,
                 .rule_spec = entry.rule_spec,
                 .payload = .{ .pre = formal_signal },
             };
-            var invocation = try kernel.invoke(self.allocator, self.config, request, .{
-                .request_id = id,
+            bindings[index] = .{
+                .request_id = request_ids[index],
                 .operation = .pre_decision,
                 .kernel_sha256 = self.active.kernel_sha256,
                 .candidate_id = candidate_id,
                 .project_sha256 = self.active.project_sha256,
                 .bundle_sha256 = self.active.bundle_sha256,
                 .bundle_revision = self.active.revision,
-            }, self.abort);
-            defer invocation.deinit(self.allocator);
-            if (!self.recordInvocation(
-                signal.dispatch_id,
-                .pre,
-                candidate_id,
-                &invocation,
-            )) return .fault;
-            if (invocation.failure != .none or invocation.verdict == null)
-                return .fault;
-            if (!invocation.verdict.?.admitted) return .block;
+            };
         }
-        return .admit;
+        var batch = try kernel.invokeBatch(
+            self.allocator,
+            self.config,
+            requests,
+            bindings,
+            self.abort,
+        );
+        defer batch.deinit(self.allocator);
+        return self.recordBatch(signal.dispatch_id, .pre, &batch);
     }
 
     fn decidePost(self: *RuntimeGate, signal: protocol.PostSignal) !protocol.Result {
@@ -107,103 +112,151 @@ pub const RuntimeGate = struct {
         };
         const signal_json = try std.json.Stringify.valueAlloc(self.allocator, formal_signal, .{});
         defer self.allocator.free(signal_json);
-        for (self.active.rules) |entry| {
+        const requests = try self.allocator.alloc(kernel.Request, self.active.rules.len);
+        defer self.allocator.free(requests);
+        const bindings = try self.allocator.alloc(kernel.Bindings, self.active.rules.len);
+        defer self.allocator.free(bindings);
+        const request_ids = try self.allocator.alloc([64]u8, self.active.rules.len);
+        defer self.allocator.free(request_ids);
+        for (self.active.rules, 0..) |entry, index| {
             const candidate_id = parseHex(entry.candidate_id) orelse return error.InvalidCandidateId;
-            const id = kernel.requestId(
+            request_ids[index] = kernel.requestId(
                 .post_decision,
                 candidate_id,
                 self.active.bundle_sha256,
                 self.active.revision,
                 signal_json,
             );
-            const request = kernel.Request{
-                .request_id = id[0..],
+            requests[index] = .{
+                .request_id = request_ids[index][0..],
                 .operation = .post_decision,
                 .kernel_sha256 = self.active.kernel_sha256[0..],
-                .candidate_id = candidate_id[0..],
+                .candidate_id = entry.candidate_id,
                 .project_sha256 = self.active.project_sha256[0..],
                 .bundle_sha256 = self.active.bundle_sha256[0..],
                 .bundle_revision = self.active.revision,
                 .rule_spec = entry.rule_spec,
                 .payload = .{ .post = formal_signal },
             };
-            var invocation = try kernel.invoke(self.allocator, self.config, request, .{
-                .request_id = id,
+            bindings[index] = .{
+                .request_id = request_ids[index],
                 .operation = .post_decision,
                 .kernel_sha256 = self.active.kernel_sha256,
                 .candidate_id = candidate_id,
                 .project_sha256 = self.active.project_sha256,
                 .bundle_sha256 = self.active.bundle_sha256,
                 .bundle_revision = self.active.revision,
-            }, self.abort);
-            defer invocation.deinit(self.allocator);
-            if (!self.recordInvocation(
-                signal.pre.dispatch_id,
-                .post,
-                candidate_id,
-                &invocation,
-            )) return .fault;
-            if (invocation.failure != .none or invocation.verdict == null)
-                return .fault;
-            if (!invocation.verdict.?.admitted) return .block;
+            };
         }
-        return .admit;
+        var batch = try kernel.invokeBatch(
+            self.allocator,
+            self.config,
+            requests,
+            bindings,
+            self.abort,
+        );
+        defer batch.deinit(self.allocator);
+        return self.recordBatch(signal.pre.dispatch_id, .post, &batch);
     }
 
-    fn recordInvocation(
+    fn recordBatch(
         self: *RuntimeGate,
         dispatch_id: []const u8,
         phase: observation.FormalPhase,
-        candidate_id: [64]u8,
-        invocation: *const kernel.Invocation,
-    ) bool {
+        batch: *const kernel.BatchInvocation,
+    ) protocol.Result {
         // A production gate must publish both the payload and its journal
         // binding.  Test-only direct gates may deliberately configure neither.
-        if ((self.evidence_dir != null) != (self.observation_sink != null)) return false;
-        if (self.evidence_dir) |directory| {
-            if (invocation.verdict_payload) |payload| {
-                const verdict_sha = invocation.verdict_sha256 orelse return false;
-                persistRuntimeVerdict(directory, verdict_sha, payload) catch return false;
+        if ((self.evidence_dir != null) != (self.observation_sink != null)) return .fault;
+        var decision_count: usize = 0;
+        var result = protocol.Result.admit;
+        for (batch.invocations) |invocation| {
+            decision_count += 1;
+            if (invocation.failure != .none or invocation.verdict == null) {
+                result = .fault;
+                break;
+            }
+            if (!invocation.verdict.?.admitted) {
+                result = .block;
+                break;
             }
         }
-        const sink = self.observation_sink orelse return true;
-        const result: observation.FormalResult = if (invocation.failure != .none)
-            .fault
-        else if (invocation.verdict != null and invocation.verdict.?.admitted)
-            .admit
-        else
-            .block;
-        return sink.emit(.{ .formal_decision = .{
+        if (decision_count == 0) return .fault;
+        if (self.evidence_dir) |directory| {
+            if (batch.verdict_payload) |payload| {
+                const verdict_sha = batch.verdict_sha256 orelse return .fault;
+                persistRuntimeBatchVerdict(directory, verdict_sha, payload) catch return .fault;
+            }
+        }
+        const sink = self.observation_sink orelse return result;
+        const decisions = self.allocator.alloc(observation.FormalCandidateDecision, decision_count) catch
+            return .fault;
+        defer self.allocator.free(decisions);
+        for (batch.invocations[0..decision_count], decisions) |invocation, *decision| {
+            decision.* = .{
+                .result = if (invocation.failure != .none)
+                    .fault
+                else if (invocation.verdict != null and invocation.verdict.?.admitted)
+                    .admit
+                else
+                    .block,
+                .candidate_id = invocation.bindings.?.candidate_id,
+                .request_sha256 = invocation.request_sha256,
+                .verdict_sha256 = invocation.verdict_sha256,
+                .checker_failure = if (invocation.failure == .none)
+                    null
+                else
+                    @tagName(invocation.failure),
+            };
+        }
+        const first = &batch.invocations[0];
+        if (!sink.emit(.{ .formal_decision_batch = .{
             .dispatch_id = dispatch_id,
             .phase = phase,
-            .result = result,
-            .candidate_id = candidate_id,
             .project_sha256 = self.active.project_sha256,
             .bundle_sha256 = self.active.bundle_sha256,
             .bundle_revision = self.active.revision,
             .kernel_sha256 = self.active.kernel_sha256,
-            .request_sha256 = invocation.request_sha256,
-            .verdict_sha256 = invocation.verdict_sha256,
-            .checker_failure = if (invocation.failure == .none) null else @tagName(invocation.failure),
-            .checker_elapsed_ns = invocation.checker_elapsed_ns,
-            .checker_bytes = invocation.checker_bytes,
-        } });
+            .checker_call_sha256 = first.checker_call_sha256 orelse return .fault,
+            .checker_verdict_sha256 = batch.verdict_sha256,
+            .checker_batch_size = first.checker_batch_size,
+            .checker_elapsed_ns = first.checker_elapsed_ns,
+            .checker_bytes = first.checker_bytes,
+            .decisions = decisions,
+        } })) return .fault;
+        return result;
     }
 };
 
-fn persistRuntimeVerdict(
+fn persistRuntimeBatchVerdict(
     directory: []const u8,
     verdict_sha256: [64]u8,
     payload: []const u8,
 ) !void {
-    if (payload.len == 0 or payload.len > kernel.MAX_OUTPUT_BYTES or
+    return persistRuntimeArtifact(
+        directory,
+        RUNTIME_BATCH_VERDICT_PREFIX,
+        verdict_sha256,
+        payload,
+        kernel.MAX_BATCH_BYTES,
+    );
+}
+
+fn persistRuntimeArtifact(
+    directory: []const u8,
+    prefix: []const u8,
+    verdict_sha256: [64]u8,
+    payload: []const u8,
+    max_payload_bytes: usize,
+) !void {
+    if (payload.len == 0 or payload.len > max_payload_bytes or
         !std.mem.eql(u8, &observation.sha256Hex(payload), &verdict_sha256))
         return error.InvalidRuntimeVerdict;
     var path_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
     const path = try std.fmt.bufPrint(
         &path_buffer,
         "{s}/{s}{s}.json\x00",
-        .{ directory, RUNTIME_VERDICT_PREFIX, verdict_sha256[0..] },
+        .{ directory, prefix, verdict_sha256[0..] },
     );
     const fd = pfs.open(@ptrCast(path.ptr), .{
         .ACCMODE = .WRONLY,
@@ -224,7 +277,13 @@ fn persistRuntimeVerdict(
         try fsyncDirectory(directory);
         return;
     }
-    const existing = try readRuntimeVerdict(std.heap.c_allocator, directory, verdict_sha256);
+    const existing = try readRuntimeArtifact(
+        std.heap.c_allocator,
+        directory,
+        prefix,
+        verdict_sha256,
+        max_payload_bytes,
+    );
     defer std.heap.c_allocator.free(existing);
     if (!std.mem.eql(u8, existing, payload)) return error.RuntimeVerdictCollision;
 }
@@ -234,17 +293,47 @@ pub fn readRuntimeVerdict(
     directory: []const u8,
     verdict_sha256: [64]u8,
 ) ![]u8 {
+    return readRuntimeArtifact(
+        allocator,
+        directory,
+        RUNTIME_VERDICT_PREFIX,
+        verdict_sha256,
+        kernel.MAX_OUTPUT_BYTES,
+    );
+}
+
+pub fn readRuntimeBatchVerdict(
+    allocator: std.mem.Allocator,
+    directory: []const u8,
+    verdict_sha256: [64]u8,
+) ![]u8 {
+    return readRuntimeArtifact(
+        allocator,
+        directory,
+        RUNTIME_BATCH_VERDICT_PREFIX,
+        verdict_sha256,
+        kernel.MAX_BATCH_BYTES,
+    );
+}
+
+fn readRuntimeArtifact(
+    allocator: std.mem.Allocator,
+    directory: []const u8,
+    prefix: []const u8,
+    verdict_sha256: [64]u8,
+    max_payload_bytes: usize,
+) ![]u8 {
     var path_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
     const path = try std.fmt.bufPrint(
         &path_buffer,
         "{s}/{s}{s}.json\x00",
-        .{ directory, RUNTIME_VERDICT_PREFIX, verdict_sha256[0..] },
+        .{ directory, prefix, verdict_sha256[0..] },
     );
     const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
     if (fd < 0) return error.RuntimeVerdictOpenFailed;
     defer _ = pfs.close(fd);
     const before = pfs.fileInfo(fd) catch return error.RuntimeVerdictStatFailed;
-    if (!before.is_regular or before.link_count != 1 or before.size == 0 or before.size > kernel.MAX_OUTPUT_BYTES)
+    if (!before.is_regular or before.link_count != 1 or before.size == 0 or before.size > max_payload_bytes)
         return error.InvalidRuntimeVerdict;
     const bytes = try allocator.alloc(u8, @intCast(before.size));
     errdefer allocator.free(bytes);
@@ -324,4 +413,32 @@ test "runtime post signal recognizes only matched host re-observation" {
             .observed_bytes = 1,
         },
     } }));
+}
+
+test "runtime batch verdict artifact exceeds the legacy single-verdict ceiling" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const payload = try allocator.alloc(u8, kernel.MAX_OUTPUT_BYTES + 1);
+    defer allocator.free(payload);
+    @memset(payload, 'x');
+    const sha256 = observation.sha256Hex(payload);
+
+    try persistRuntimeBatchVerdict(root, sha256, payload);
+    const reopened = try readRuntimeBatchVerdict(allocator, root, sha256);
+    defer allocator.free(reopened);
+    try std.testing.expectEqualSlices(u8, payload, reopened);
+    try std.testing.expectError(
+        error.InvalidRuntimeVerdict,
+        persistRuntimeArtifact(
+            root,
+            RUNTIME_VERDICT_PREFIX,
+            sha256,
+            payload,
+            kernel.MAX_OUTPUT_BYTES,
+        ),
+    );
 }

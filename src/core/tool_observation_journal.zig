@@ -87,7 +87,11 @@ pub const RunFormalDecision = struct {
     bundle_revision: u64,
     kernel_sha256: [64]u8,
     request_sha256: [64]u8,
+    checker_call_sha256: ?[64]u8,
+    checker_verdict_sha256: ?[64]u8,
+    checker_batch_size: u32,
     verdict_sha256: ?[64]u8,
+    checker_failure: ?[]const u8,
     checker_elapsed_ns: u64,
     checker_bytes: u64,
 };
@@ -396,10 +400,34 @@ pub fn loadRunDispatches(
                     .bundle_revision = formal.bundle_revision,
                     .kernel_sha256 = formal.kernel_sha256,
                     .request_sha256 = formal.request_sha256,
+                    .checker_call_sha256 = formal.checker_call_sha256,
+                    .checker_verdict_sha256 = formal.checker_verdict_sha256,
+                    .checker_batch_size = formal.checker_batch_size,
                     .verdict_sha256 = formal.verdict_sha256,
+                    .checker_failure = formal.checker_failure,
                     .checker_elapsed_ns = formal.checker_elapsed_ns,
                     .checker_bytes = formal.checker_bytes,
                 }),
+                .formal_decision_batch => |batch| for (batch.decisions) |decision| {
+                    try formal_decisions.append(a, .{
+                        .dispatch_id = batch.dispatch_id,
+                        .phase = batch.phase,
+                        .result = decision.result,
+                        .candidate_id = decision.candidate_id,
+                        .project_sha256 = batch.project_sha256,
+                        .bundle_sha256 = batch.bundle_sha256,
+                        .bundle_revision = batch.bundle_revision,
+                        .kernel_sha256 = batch.kernel_sha256,
+                        .request_sha256 = decision.request_sha256,
+                        .checker_call_sha256 = batch.checker_call_sha256,
+                        .checker_verdict_sha256 = batch.checker_verdict_sha256,
+                        .checker_batch_size = batch.checker_batch_size,
+                        .verdict_sha256 = decision.verdict_sha256,
+                        .checker_failure = decision.checker_failure,
+                        .checker_elapsed_ns = batch.checker_elapsed_ns,
+                        .checker_bytes = batch.checker_bytes,
+                    });
+                },
                 .dispatch_started => |started| {
                     const key = dispatchKey(started.id);
                     if (open.contains(key)) return error.InvalidRecord;
@@ -516,6 +544,13 @@ fn validateFd(
     defer pre_decisions.deinit();
     var formal_dispatches = std.AutoHashMap([32]u8, FormalDispatchState).init(std.heap.c_allocator);
     defer formal_dispatches.deinit();
+    var formal_validation = FormalValidationState{
+        .open_dispatches = &open_dispatches,
+        .seen_dispatches = &seen_dispatches,
+        .formal_events = &formal_events,
+        .pre_decisions = &pre_decisions,
+        .formal_dispatches = &formal_dispatches,
+    };
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
@@ -564,81 +599,54 @@ fn validateFd(
                 }
                 switch (tool_event) {
                     .formal_decision => |formal| {
-                        if (!std.mem.eql(u8, formal.schema_version, observation.FORMAL_SCHEMA_VERSION) or
-                            formal.dispatch_id.len == 0 or formal.dispatch_id.len > 256 or
-                            formal.bundle_revision == 0 or
-                            !validHex(formal.candidate_id) or
-                            !validHex(formal.project_sha256) or
-                            !validHex(formal.bundle_sha256) or
-                            !validHex(formal.kernel_sha256) or
-                            !validHex(formal.request_sha256))
+                        if (!std.mem.eql(u8, formal.schema_version, observation.FORMAL_SCHEMA_VERSION))
                             return error.InvalidRecord;
-                        switch (formal.result) {
-                            .admit, .block => if (formal.verdict_sha256 == null or
-                                !validHex(formal.verdict_sha256.?) or
-                                formal.checker_failure != null or formal.checker_bytes == 0)
-                                return error.InvalidRecord,
-                            .fault => if (!validCheckerFailure(formal.checker_failure))
-                                return error.InvalidRecord,
-                        }
-                        const dispatch_key = dispatchKey(formal.dispatch_id);
-                        const event_key = formalKey(
-                            formal.dispatch_id,
-                            formal.candidate_id,
-                            formal.phase,
-                        );
-                        if (formal_events.contains(event_key)) return error.InvalidRecord;
-                        try formal_events.put(event_key, 0);
-                        const identity = formalIdentity(formal);
-                        switch (formal.phase) {
-                            .pre => {
-                                if (seen_dispatches.contains(dispatch_key) or
-                                    open_dispatches.contains(dispatch_key))
-                                    return error.InvalidRecord;
-                                const state_entry = try formal_dispatches.getOrPut(dispatch_key);
-                                if (!state_entry.found_existing) {
-                                    state_entry.value_ptr.* = .{
-                                        .identity = identity,
-                                        .pre_count = 0,
-                                        .terminal_pre = false,
-                                        .started = false,
-                                    };
-                                } else if (!std.meta.eql(state_entry.value_ptr.identity, identity) or
-                                    state_entry.value_ptr.terminal_pre)
-                                    return error.InvalidRecord;
-                                state_entry.value_ptr.pre_count = std.math.add(
-                                    u32,
-                                    state_entry.value_ptr.pre_count,
-                                    1,
-                                ) catch return error.InvalidRecord;
-                                if (formal.result != .admit)
-                                    state_entry.value_ptr.terminal_pre = true;
-                                try pre_decisions.put(
-                                    formalKey(formal.dispatch_id, formal.candidate_id, .pre),
-                                    .{ .identity = identity, .result = formal.result },
-                                );
-                            },
-                            .post => {
-                                const opened = open_dispatches.getPtr(dispatch_key) orelse
-                                    return error.InvalidRecord;
-                                const state = formal_dispatches.get(dispatch_key) orelse
-                                    return error.InvalidRecord;
-                                const prior = pre_decisions.get(
-                                    formalKey(formal.dispatch_id, formal.candidate_id, .pre),
-                                ) orelse return error.InvalidRecord;
-                                if (!opened.governed or opened.terminal_post or
-                                    prior.result != .admit or
-                                    !std.meta.eql(prior.identity, identity) or
-                                    !std.meta.eql(state.identity, identity))
-                                    return error.InvalidRecord;
-                                opened.post_count = std.math.add(
-                                    u32,
-                                    opened.post_count,
-                                    1,
-                                ) catch return error.InvalidRecord;
-                                if (formal.result != .admit)
-                                    opened.terminal_post = true;
-                            },
+                        try acceptFormalDecision(&formal_validation, .{
+                            .dispatch_id = formal.dispatch_id,
+                            .phase = formal.phase,
+                            .result = formal.result,
+                            .candidate_id = formal.candidate_id,
+                            .project_sha256 = formal.project_sha256,
+                            .bundle_sha256 = formal.bundle_sha256,
+                            .bundle_revision = formal.bundle_revision,
+                            .kernel_sha256 = formal.kernel_sha256,
+                            .request_sha256 = formal.request_sha256,
+                            .checker_call_sha256 = formal.checker_call_sha256,
+                            .checker_verdict_sha256 = formal.checker_verdict_sha256,
+                            .checker_batch_size = formal.checker_batch_size,
+                            .verdict_sha256 = formal.verdict_sha256,
+                            .checker_failure = formal.checker_failure,
+                            .checker_bytes = formal.checker_bytes,
+                            .is_batch = false,
+                        });
+                    },
+                    .formal_decision_batch => |batch| {
+                        if (!std.mem.eql(u8, batch.schema_version, observation.FORMAL_BATCH_SCHEMA_VERSION) or
+                            batch.decisions.len == 0 or
+                            batch.decisions.len > batch.checker_batch_size or
+                            batch.checker_batch_size > @import("../formal/project_harness_runtime.zig").MAX_BATCH_REQUESTS or
+                            (batch.decisions.len < batch.checker_batch_size and
+                                batch.decisions[batch.decisions.len - 1].result == .admit))
+                            return error.InvalidRecord;
+                        for (batch.decisions) |decision| {
+                            try acceptFormalDecision(&formal_validation, .{
+                                .dispatch_id = batch.dispatch_id,
+                                .phase = batch.phase,
+                                .result = decision.result,
+                                .candidate_id = decision.candidate_id,
+                                .project_sha256 = batch.project_sha256,
+                                .bundle_sha256 = batch.bundle_sha256,
+                                .bundle_revision = batch.bundle_revision,
+                                .kernel_sha256 = batch.kernel_sha256,
+                                .request_sha256 = decision.request_sha256,
+                                .checker_call_sha256 = batch.checker_call_sha256,
+                                .checker_verdict_sha256 = batch.checker_verdict_sha256,
+                                .checker_batch_size = batch.checker_batch_size,
+                                .verdict_sha256 = decision.verdict_sha256,
+                                .checker_failure = decision.checker_failure,
+                                .checker_bytes = batch.checker_bytes,
+                                .is_batch = true,
+                            });
                         }
                     },
                     .dispatch_started => |started| {
@@ -791,6 +799,115 @@ const OpenDispatch = struct {
     terminal_post: bool,
 };
 
+const FormalRecord = struct {
+    dispatch_id: []const u8,
+    phase: observation.FormalPhase,
+    result: observation.FormalResult,
+    candidate_id: [64]u8,
+    project_sha256: [64]u8,
+    bundle_sha256: [64]u8,
+    bundle_revision: u64,
+    kernel_sha256: [64]u8,
+    request_sha256: [64]u8,
+    checker_call_sha256: ?[64]u8,
+    checker_verdict_sha256: ?[64]u8,
+    checker_batch_size: u32,
+    verdict_sha256: ?[64]u8,
+    checker_failure: ?[]const u8,
+    checker_bytes: u64,
+    is_batch: bool,
+};
+
+const FormalValidationState = struct {
+    open_dispatches: *std.AutoHashMap([32]u8, OpenDispatch),
+    seen_dispatches: *std.AutoHashMap([32]u8, u8),
+    formal_events: *std.AutoHashMap([32]u8, u8),
+    pre_decisions: *std.AutoHashMap([32]u8, PreDecision),
+    formal_dispatches: *std.AutoHashMap([32]u8, FormalDispatchState),
+};
+
+fn acceptFormalDecision(state: *FormalValidationState, formal: FormalRecord) !void {
+    if (formal.dispatch_id.len == 0 or formal.dispatch_id.len > 256 or
+        formal.bundle_revision == 0 or
+        !validHex(formal.candidate_id) or
+        !validHex(formal.project_sha256) or
+        !validHex(formal.bundle_sha256) or
+        !validHex(formal.kernel_sha256) or
+        !validHex(formal.request_sha256) or
+        formal.checker_batch_size == 0 or
+        formal.checker_batch_size > @import("../formal/project_harness_runtime.zig").MAX_BATCH_REQUESTS or
+        (formal.checker_call_sha256 != null and !validHex(formal.checker_call_sha256.?)) or
+        (formal.checker_verdict_sha256 != null and !validHex(formal.checker_verdict_sha256.?)) or
+        (formal.is_batch and formal.checker_call_sha256 == null))
+        return error.InvalidRecord;
+    switch (formal.result) {
+        .admit, .block => if (formal.verdict_sha256 == null or
+            !validHex(formal.verdict_sha256.?) or
+            formal.checker_failure != null or formal.checker_bytes == 0 or
+            (formal.is_batch and formal.checker_verdict_sha256 == null))
+            return error.InvalidRecord,
+        .fault => if (!validCheckerFailure(formal.checker_failure) or
+            formal.verdict_sha256 != null or
+            (formal.is_batch and formal.checker_verdict_sha256 != null))
+            return error.InvalidRecord,
+    }
+    const dispatch_key = dispatchKey(formal.dispatch_id);
+    const event_key = formalKey(formal.dispatch_id, formal.candidate_id, formal.phase);
+    if (state.formal_events.contains(event_key)) return error.InvalidRecord;
+    try state.formal_events.put(event_key, 0);
+    const identity = FormalControlIdentity{
+        .project_sha256 = formal.project_sha256,
+        .bundle_sha256 = formal.bundle_sha256,
+        .bundle_revision = formal.bundle_revision,
+        .kernel_sha256 = formal.kernel_sha256,
+    };
+    switch (formal.phase) {
+        .pre => {
+            if (state.seen_dispatches.contains(dispatch_key) or
+                state.open_dispatches.contains(dispatch_key))
+                return error.InvalidRecord;
+            const state_entry = try state.formal_dispatches.getOrPut(dispatch_key);
+            if (!state_entry.found_existing) {
+                state_entry.value_ptr.* = .{
+                    .identity = identity,
+                    .pre_count = 0,
+                    .terminal_pre = false,
+                    .started = false,
+                };
+            } else if (!std.meta.eql(state_entry.value_ptr.identity, identity) or
+                state_entry.value_ptr.terminal_pre)
+                return error.InvalidRecord;
+            state_entry.value_ptr.pre_count = std.math.add(
+                u32,
+                state_entry.value_ptr.pre_count,
+                1,
+            ) catch return error.InvalidRecord;
+            if (formal.result != .admit) state_entry.value_ptr.terminal_pre = true;
+            try state.pre_decisions.put(
+                formalKey(formal.dispatch_id, formal.candidate_id, .pre),
+                .{ .identity = identity, .result = formal.result },
+            );
+        },
+        .post => {
+            const opened = state.open_dispatches.getPtr(dispatch_key) orelse
+                return error.InvalidRecord;
+            const dispatch_state = state.formal_dispatches.get(dispatch_key) orelse
+                return error.InvalidRecord;
+            const prior = state.pre_decisions.get(
+                formalKey(formal.dispatch_id, formal.candidate_id, .pre),
+            ) orelse return error.InvalidRecord;
+            if (!opened.governed or opened.terminal_post or
+                prior.result != .admit or
+                !std.meta.eql(prior.identity, identity) or
+                !std.meta.eql(dispatch_state.identity, identity))
+                return error.InvalidRecord;
+            opened.post_count = std.math.add(u32, opened.post_count, 1) catch
+                return error.InvalidRecord;
+            if (formal.result != .admit) opened.terminal_post = true;
+        },
+    }
+}
+
 fn formalIdentity(formal: anytype) FormalControlIdentity {
     return .{
         .project_sha256 = formal.project_sha256,
@@ -891,6 +1008,28 @@ fn testFormalEventFor(
     } };
 }
 
+fn testFormalBatchEvent(
+    dispatch_id: []const u8,
+    phase: observation.FormalPhase,
+    batch_size: u32,
+    decisions: []const observation.FormalCandidateDecision,
+) observation.Event {
+    return .{ .formal_decision_batch = .{
+        .dispatch_id = dispatch_id,
+        .phase = phase,
+        .project_sha256 = .{'b'} ** 64,
+        .bundle_sha256 = .{'c'} ** 64,
+        .bundle_revision = 1,
+        .kernel_sha256 = .{'d'} ** 64,
+        .checker_call_sha256 = if (phase == .pre) .{'1'} ** 64 else .{'2'} ** 64,
+        .checker_verdict_sha256 = if (phase == .pre) .{'3'} ** 64 else .{'4'} ** 64,
+        .checker_batch_size = batch_size,
+        .checker_elapsed_ns = 1,
+        .checker_bytes = 1,
+        .decisions = decisions,
+    } };
+}
+
 fn testDispatchStart(id: []const u8) observation.Event {
     return .{ .dispatch_started = .{
         .id = id,
@@ -984,6 +1123,61 @@ test "formal journal enforces pre dispatch post finish wiring and permits pre bl
     };
     try writeTestRun(complete_dir, sid, &complete);
     _ = try validate(complete_dir, sid);
+
+    const batch_pre_decisions = [_]observation.FormalCandidateDecision{
+        .{
+            .result = .admit,
+            .candidate_id = .{'1'} ** 64,
+            .request_sha256 = .{'5'} ** 64,
+            .verdict_sha256 = .{'6'} ** 64,
+            .checker_failure = null,
+        },
+        .{
+            .result = .admit,
+            .candidate_id = .{'2'} ** 64,
+            .request_sha256 = .{'7'} ** 64,
+            .verdict_sha256 = .{'8'} ** 64,
+            .checker_failure = null,
+        },
+    };
+    const batch_post_decisions = [_]observation.FormalCandidateDecision{
+        .{
+            .result = .admit,
+            .candidate_id = .{'1'} ** 64,
+            .request_sha256 = .{'9'} ** 64,
+            .verdict_sha256 = .{'a'} ** 64,
+            .checker_failure = null,
+        },
+        .{
+            .result = .admit,
+            .candidate_id = .{'2'} ** 64,
+            .request_sha256 = .{'b'} ** 64,
+            .verdict_sha256 = .{'c'} ** 64,
+            .checker_failure = null,
+        },
+    };
+    const batch_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/batch-complete", .{root});
+    defer std.testing.allocator.free(batch_dir);
+    const batch_complete = [_]observation.Event{
+        testFormalBatchEvent("batch-complete", .pre, 2, &batch_pre_decisions),
+        testDispatchStart("batch-complete"),
+        testFormalBatchEvent("batch-complete", .post, 2, &batch_post_decisions),
+        testDispatchFinish("batch-complete"),
+    };
+    try writeTestRun(batch_dir, sid, &batch_complete);
+    _ = try validate(batch_dir, sid);
+
+    const truncated_batch_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/batch-truncated",
+        .{root},
+    );
+    defer std.testing.allocator.free(truncated_batch_dir);
+    const truncated_batch = [_]observation.Event{
+        testFormalBatchEvent("batch-truncated", .pre, 2, batch_pre_decisions[0..1]),
+    };
+    try writeTestRun(truncated_batch_dir, sid, &truncated_batch);
+    try std.testing.expectError(error.InvalidRecord, validate(truncated_batch_dir, sid));
 
     const multi_missing_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/multi-missing", .{root});
     defer std.testing.allocator.free(multi_missing_dir);

@@ -1008,6 +1008,331 @@ const VanishingWrite = struct {
     }
 };
 
+fn syntheticActive(
+    allocator: std.mem.Allocator,
+    rule_count: usize,
+    config: cc.project_harness_runtime.Config,
+) !cc.project_rule_bundle.LoadedActive {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const rules = try a.alloc(cc.project_rule_bundle.RuleEntry, rule_count);
+    for (rules, 0..) |*rule, index| {
+        var name_buffer: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "batch-rule-{d}", .{index});
+        const candidate = cc.tools.tool_observation.sha256Hex(name);
+        rule.* = .{
+            .candidate_id = try a.dupe(u8, &candidate),
+            // The real dispatch below is Read. Every rule must therefore
+            // admit independently in both phases while still producing one
+            // candidate-bound verdict per entry.
+            .rule_spec = cc.project_rule_spec.toWire(.{
+                .target_tool = "Write",
+                .deny_target = false,
+                .max_input_bytes = 8192,
+                .max_agent_depth = 4,
+                .authoritative_only = true,
+                .effect_requirement = .file_mutation_v1_reobserved,
+            }),
+        };
+    }
+    return .{
+        .arena = arena,
+        .project_sha256 = .{'a'} ** 64,
+        .bundle_sha256 = .{'b'} ** 64,
+        .revision = 7,
+        .kernel_sha256 = config.expected_sha256,
+        .promotion_receipt_id = .{'c'} ** 64,
+        .promotion_request_sha256 = .{'d'} ** 64,
+        .promotion_verdict_sha256 = .{'e'} ** 64,
+        .active_pointer_sha256 = .{'f'} ** 64,
+        .rules = rules,
+    };
+}
+
+const BatchRuntimeStats = struct {
+    elapsed_ns: u64,
+    checker_elapsed_ns: u64,
+};
+
+fn runBatchRuntimeFixture(rule_count: usize) !BatchRuntimeStats {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
+    defer allocator.free(evidence_dir);
+    try cc.util_fs.mkdirParents(evidence_dir);
+
+    var active = try syntheticActive(allocator, rule_count, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+    };
+    const sid = cc.session_id.SessionId.fromSlice("0123456789abcdef01234567").?;
+    var journal = try cc.tool_observation_journal.Journal.init(evidence_dir, sid);
+    const sink = journal.sink();
+    runtime.evidence_dir = evidence_dir;
+    runtime.observation_sink = sink;
+    var probe = Probe{};
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.tool_dispatcher = probe.dispatcher();
+    ctx.project_rule_gate = runtime.protocolGate();
+    ctx.tool_observer = sink;
+    const dispatch_id = try std.fmt.allocPrint(allocator, "batch-runtime-{d}", .{rule_count});
+    defer allocator.free(dispatch_id);
+    const started = cc.util_time.nowNs();
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Read",
+        "{}",
+        dispatch_id,
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    const elapsed = cc.util_time.nowNs() - started;
+    switch (result) {
+        .done => |done| {
+            if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(!done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try journal.finishRun("end_turn");
+    const binding = try journal.runBinding();
+    journal.deinit();
+
+    var observed = try cc.tool_observation_journal.loadRunDispatches(
+        allocator,
+        evidence_dir,
+        binding,
+    );
+    defer observed.deinit();
+    try std.testing.expectEqual(rule_count * 2, observed.formal_decisions.len);
+    var pre_call: ?[64]u8 = null;
+    var post_call: ?[64]u8 = null;
+    var pre_count: usize = 0;
+    var post_count: usize = 0;
+    var pre_elapsed: u64 = 0;
+    var post_elapsed: u64 = 0;
+    for (observed.formal_decisions) |formal| {
+        try std.testing.expectEqual(cc.tools.tool_observation.FormalResult.admit, formal.result);
+        try std.testing.expectEqual(@as(u32, @intCast(rule_count)), formal.checker_batch_size);
+        const call = formal.checker_call_sha256 orelse return error.MissingCheckerCallIdentity;
+        switch (formal.phase) {
+            .pre => {
+                pre_count += 1;
+                if (pre_call) |expected| {
+                    try std.testing.expectEqualSlices(u8, &expected, &call);
+                    try std.testing.expectEqual(pre_elapsed, formal.checker_elapsed_ns);
+                } else {
+                    pre_call = call;
+                    pre_elapsed = formal.checker_elapsed_ns;
+                }
+            },
+            .post => {
+                post_count += 1;
+                if (post_call) |expected| {
+                    try std.testing.expectEqualSlices(u8, &expected, &call);
+                    try std.testing.expectEqual(post_elapsed, formal.checker_elapsed_ns);
+                } else {
+                    post_call = call;
+                    post_elapsed = formal.checker_elapsed_ns;
+                }
+            },
+        }
+    }
+    try std.testing.expectEqual(rule_count, pre_count);
+    try std.testing.expectEqual(rule_count, post_count);
+    try std.testing.expect(!std.mem.eql(u8, &(pre_call orelse unreachable), &(post_call orelse unreachable)));
+    const stats = BatchRuntimeStats{
+        .elapsed_ns = @intCast(@max(elapsed, 0)),
+        .checker_elapsed_ns = pre_elapsed + post_elapsed,
+    };
+    if (std.c.getenv("METACODES_BENCH_REPORT") != null) {
+        std.debug.print("batch-runtime-metric rules={d} execute_ms={d:.3} checker_ms={d:.3}\n", .{
+            rule_count,
+            @as(f64, @floatFromInt(stats.elapsed_ns)) / std.time.ns_per_ms,
+            @as(f64, @floatFromInt(stats.checker_elapsed_ns)) / std.time.ns_per_ms,
+        });
+    }
+    return stats;
+}
+
+test "L2 project rule batch runtime uses two checker calls for 1 rule" {
+    _ = try runBatchRuntimeFixture(1);
+}
+
+test "L2 project rule batch runtime uses two checker calls for 4 rules" {
+    _ = try runBatchRuntimeFixture(4);
+}
+
+test "L2 project rule batch runtime uses two checker calls for 16 rules" {
+    _ = try runBatchRuntimeFixture(16);
+}
+
+test "L2 project rule batch runtime uses two checker calls for 64 rules" {
+    const stats = try runBatchRuntimeFixture(64);
+    // A generous regression ceiling catches accidental reintroduction of 128
+    // process spawns without turning a correctness test into a microbenchmark.
+    try std.testing.expect(stats.elapsed_ns < 750 * std.time.ns_per_ms);
+}
+
+test "L2 malformed Lean batch verdict fails before the real dispatcher" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
+    defer allocator.free(evidence_dir);
+    try cc.util_fs.mkdirParents(evidence_dir);
+    const checker_path = try std.fmt.allocPrint(allocator, "{s}/partial-batch-checker", .{root});
+    defer allocator.free(checker_path);
+    const checker_script =
+        "#!/bin/sh\n" ++
+        "printf '%s\\n' '{\"schema_version\":\"metacodes-project-harness-batch-verdict-v1\",\"checker_version\":\"metacodes-project-harness-kernel-v1\",\"verdicts\":[]}'\n";
+    try overwriteArtifact(allocator, checker_path, checker_script);
+    const checker_z = try allocator.dupeZ(u8, checker_path);
+    defer allocator.free(checker_z);
+    if (std.c.chmod(checker_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    const config = cc.project_harness_runtime.Config{
+        .checker_path = checker_path,
+        .expected_sha256 = cc.tools.tool_observation.sha256Hex(checker_script),
+    };
+    var active = try syntheticActive(allocator, 4, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+    };
+    const sid = cc.session_id.SessionId.fromSlice("0123456789abcdef01234567").?;
+    var journal = try cc.tool_observation_journal.Journal.init(evidence_dir, sid);
+    const sink = journal.sink();
+    runtime.evidence_dir = evidence_dir;
+    runtime.observation_sink = sink;
+    var probe = Probe{};
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.tool_dispatcher = probe.dispatcher();
+    ctx.project_rule_gate = runtime.protocolGate();
+    ctx.tool_observer = sink;
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Read",
+        "{}",
+        "malformed-batch",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    try std.testing.expect(result == .host_fatal);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    try journal.finishRun("HostToolFatal");
+    const binding = try journal.runBinding();
+    journal.deinit();
+    var observed = try cc.tool_observation_journal.loadRunDispatches(
+        allocator,
+        evidence_dir,
+        binding,
+    );
+    defer observed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), observed.dispatches.len);
+    try std.testing.expectEqual(@as(usize, 1), observed.formal_decisions.len);
+    try std.testing.expectEqual(
+        cc.tools.tool_observation.FormalResult.fault,
+        observed.formal_decisions[0].result,
+    );
+    try std.testing.expectEqualStrings(
+        "verdict_binding_mismatch",
+        observed.formal_decisions[0].checker_failure orelse return error.MissingCheckerFailure,
+    );
+}
+
+test "L2 same-cardinality batch binding drift has no durable verdict and no dispatch" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const real_kernel = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
+    defer allocator.free(evidence_dir);
+    try cc.util_fs.mkdirParents(evidence_dir);
+    const checker_path = try std.fmt.allocPrint(allocator, "{s}/binding-drift-checker", .{root});
+    defer allocator.free(checker_path);
+    const checker_script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\n\"{s}\" | sed 's/\"candidate_id\":\"[0-9a-f]*\"/\"candidate_id\":\"{s}\"/'\n",
+        .{ real_kernel.checker_path, &([_]u8{'f'} ** 64) },
+    );
+    defer allocator.free(checker_script);
+    try overwriteArtifact(allocator, checker_path, checker_script);
+    const checker_z = try allocator.dupeZ(u8, checker_path);
+    defer allocator.free(checker_z);
+    if (std.c.chmod(checker_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    const config = cc.project_harness_runtime.Config{
+        .checker_path = checker_path,
+        .expected_sha256 = cc.tools.tool_observation.sha256Hex(checker_script),
+    };
+    var active = try syntheticActive(allocator, 4, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+    };
+    const sid = cc.session_id.SessionId.fromSlice("0123456789abcdef01234567").?;
+    var journal = try cc.tool_observation_journal.Journal.init(evidence_dir, sid);
+    const sink = journal.sink();
+    runtime.evidence_dir = evidence_dir;
+    runtime.observation_sink = sink;
+    var probe = Probe{};
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.tool_dispatcher = probe.dispatcher();
+    ctx.project_rule_gate = runtime.protocolGate();
+    ctx.tool_observer = sink;
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Read",
+        "{}",
+        "binding-drift-batch",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    try std.testing.expect(result == .host_fatal);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    try journal.finishRun("HostToolFatal");
+    const binding = try journal.runBinding();
+    journal.deinit();
+    var observed = try cc.tool_observation_journal.loadRunDispatches(
+        allocator,
+        evidence_dir,
+        binding,
+    );
+    defer observed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), observed.formal_decisions.len);
+    const formal = observed.formal_decisions[0];
+    try std.testing.expectEqual(cc.tools.tool_observation.FormalResult.fault, formal.result);
+    try std.testing.expectEqual(@as(?[64]u8, null), formal.checker_verdict_sha256);
+    try std.testing.expectEqualStrings(
+        "verdict_binding_mismatch",
+        formal.checker_failure orelse return error.MissingCheckerFailure,
+    );
+}
+
 test "L2 promoted Lean post rule admits matched Write and poisons unavailable reobservation" {
     const config = testKernel() orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -1131,29 +1456,40 @@ test "L2 promoted Lean post rule admits matched Write and poisons unavailable re
     try std.testing.expectEqual(@as(usize, 1), matched_count);
     try std.testing.expectEqual(@as(usize, 1), unavailable_count);
     var blocked_verdict: ?[64]u8 = null;
+    var blocked_batch_verdict: ?[64]u8 = null;
     for (observed.formal_decisions) |formal| {
-        if (formal.phase == .post and formal.result == .block)
+        if (formal.phase == .post and formal.result == .block) {
             blocked_verdict = formal.verdict_sha256;
+            blocked_batch_verdict = formal.checker_verdict_sha256;
+        }
     }
     const verdict_sha256 = blocked_verdict orelse return error.MissingBlockedPostVerdict;
-    const verdict_payload = try cc.project_rule_gate.readRuntimeVerdict(
+    const batch_verdict_sha256 = blocked_batch_verdict orelse return error.MissingBlockedBatchVerdict;
+    const verdict_payload = try cc.project_rule_gate.readRuntimeBatchVerdict(
         allocator,
         evidence_dir,
-        verdict_sha256,
+        batch_verdict_sha256,
     );
     defer allocator.free(verdict_payload);
+    try std.testing.expect(std.mem.indexOf(u8, verdict_payload, "\"decision\":\"block\"") != null);
     const verdict_path = try std.fmt.allocPrint(
         allocator,
         "{s}/{s}{s}.json",
-        .{ evidence_dir, cc.project_rule_gate.RUNTIME_VERDICT_PREFIX, verdict_sha256[0..] },
+        .{ evidence_dir, cc.project_rule_gate.RUNTIME_BATCH_VERDICT_PREFIX, batch_verdict_sha256[0..] },
     );
     defer allocator.free(verdict_path);
     try overwriteArtifact(allocator, verdict_path, "{}");
     try std.testing.expectError(
         error.InvalidRuntimeVerdict,
-        cc.project_rule_gate.readRuntimeVerdict(allocator, evidence_dir, verdict_sha256),
+        cc.project_rule_gate.readRuntimeBatchVerdict(allocator, evidence_dir, batch_verdict_sha256),
     );
     try overwriteArtifact(allocator, verdict_path, verdict_payload);
+    const individual_verdict_payload = try cc.project_harness_runtime.extractBatchVerdict(
+        allocator,
+        verdict_payload,
+        verdict_sha256,
+    );
+    defer allocator.free(individual_verdict_payload);
     var wrong_project = project;
     wrong_project[0] = if (wrong_project[0] == '0') '1' else '0';
     try std.testing.expectError(
@@ -1163,7 +1499,7 @@ test "L2 promoted Lean post rule admits matched Write and poisons unavailable re
             .issuer_sha256 = .{'8'} ** 64,
             .observation = runtime_binding,
             .checker_sha256 = config.expected_sha256,
-            .verdict_payload = verdict_payload,
+            .verdict_payload = individual_verdict_payload,
         }),
     );
     const source = try cc.rule_source_receipt.persistRuntimeCounterexample(evidence_dir, .{
@@ -1171,7 +1507,7 @@ test "L2 promoted Lean post rule admits matched Write and poisons unavailable re
         .issuer_sha256 = .{'8'} ** 64,
         .observation = runtime_binding,
         .checker_sha256 = config.expected_sha256,
-        .verdict_payload = verdict_payload,
+        .verdict_payload = individual_verdict_payload,
     });
     const next = try cc.rule_candidate.persist(evidence_dir, .{
         .project_sha256 = project,

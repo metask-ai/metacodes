@@ -8,7 +8,10 @@ open MetaCodesControl.ProjectRule
 
 def requestSchema : String := "metacodes-project-harness-request-v1"
 def verdictSchema : String := "metacodes-project-harness-verdict-v1"
+def batchRequestSchema : String := "metacodes-project-harness-batch-request-v1"
+def batchVerdictSchema : String := "metacodes-project-harness-batch-verdict-v1"
 def checkerVersion : String := "metacodes-project-harness-kernel-v1"
+def maxBatchRequests : Nat := 1024
 def zeroSha256 : String := "0000000000000000000000000000000000000000000000000000000000000000"
 
 inductive SourceKind where
@@ -176,6 +179,15 @@ theorem denied_predecision_blocks (request : Request) (signal : PreSignal)
     (denied : request.ruleSpec.denyTarget = true) :
     decide request = false := by
   simp [decide, payload, preDecision, same, denied]
+
+/-- A batch is admitted exactly when every independently bound request is
+admitted.  Batching changes process topology only; it cannot let one rule hide
+another rule's block or malformed binding. -/
+def decideBatch (requests : List Request) : Bool := requests.all decide
+
+theorem decideBatch_sound (requests : List Request) :
+    decideBatch requests = requests.all decide := by
+  rfl
 
 def sourceName : SourceKind → String
   | .userCorrection => "user_correction"
@@ -397,8 +409,7 @@ def parsePromotionFacts (cursor : Cursor) : Except String (PromotionFacts × Cur
   }
   pure (facts, cursor)
 
-def decodeCanonicalRequest (input : String) : Except String Request := do
-  let cursor : Cursor := { remaining := input.toList }
+def parseCanonicalRequest (cursor : Cursor) : Except String (Request × Cursor) := do
   let cursor ← expectLiteral cursor "{\"schema_version\":"
   let (schemaVersion, cursor) ← parseString cursor
   let cursor ← expectLiteral cursor ","
@@ -439,8 +450,7 @@ def decodeCanonicalRequest (input : String) : Except String Request := do
         let (signal, cursor) ← parsePostSignal cursor
         let cursor ← expectLiteral cursor "}}"
         pure (Payload.post signal, cursor)
-  if !cursor.remaining.isEmpty then throw "trailing bytes after project harness request"
-  pure {
+  pure ({
     schemaVersion := schemaVersion
     requestId := requestId
     operation := operation
@@ -452,7 +462,35 @@ def decodeCanonicalRequest (input : String) : Except String Request := do
     bundleRevision := bundleRevision
     ruleSpec := ruleSpec
     payload := payload
-  }
+  }, cursor)
+
+def decodeCanonicalRequest (input : String) : Except String Request := do
+  let (request, cursor) ← parseCanonicalRequest { remaining := input.toList }
+  if !cursor.remaining.isEmpty then throw "trailing bytes after project harness request"
+  pure request
+
+partial def parseBatchRequests (cursor : Cursor) (acc : List Request := []) :
+    Except String (List Request × Cursor) := do
+  if acc.length >= maxBatchRequests then throw "project harness batch exceeds rule bound"
+  let (request, cursor) ← parseCanonicalRequest cursor
+  let acc := request :: acc
+  match cursor.remaining with
+  | ',' :: rest => parseBatchRequests { remaining := rest } acc
+  | ']' :: rest => pure (acc.reverse, { remaining := rest })
+  | _ => throw "expected comma or end of project harness batch"
+
+def decodeCanonicalBatchRequest (input : String) : Except String (List Request) := do
+  let cursor : Cursor := { remaining := input.toList }
+  let cursor ← expectLiteral cursor "{\"schema_version\":"
+  let (schema, cursor) ← parseString cursor
+  if schema != batchRequestSchema then throw "unsupported project harness batch schema"
+  let cursor ← expectLiteral cursor ",\"requests\":["
+  if cursor.remaining.take 1 == "]".toList then
+    throw "project harness batch must contain at least one request"
+  let (requests, cursor) ← parseBatchRequests cursor
+  let cursor ← expectLiteral cursor "}"
+  if !cursor.remaining.isEmpty then throw "trailing bytes after project harness batch request"
+  pure requests
 
 def lifecycleValid (request : Request) : Bool :=
   match request.payload with
@@ -498,5 +536,11 @@ def verdictJson (request : Request) : String :=
     "\"rule_valid\":" ++ FormalKernel.boolJson (valid request.ruleSpec) ++ "," ++
     "\"lifecycle_valid\":" ++ FormalKernel.boolJson (lifecycleValid request) ++ "," ++
     "\"decision_valid\":true}}"
+
+def batchVerdictJson (requests : List Request) : String :=
+  "{" ++
+  "\"schema_version\":\"" ++ batchVerdictSchema ++ "\"," ++
+  "\"checker_version\":\"" ++ checkerVersion ++ "\"," ++
+  "\"verdicts\":[" ++ String.intercalate "," (requests.map verdictJson) ++ "]}"
 
 end MetaCodesControl.ProjectHarness

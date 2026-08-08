@@ -15,9 +15,13 @@ const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
 pub const REQUEST_SCHEMA = "metacodes-project-harness-request-v1";
 pub const VERDICT_SCHEMA = "metacodes-project-harness-verdict-v1";
+pub const BATCH_REQUEST_SCHEMA = "metacodes-project-harness-batch-request-v1";
+pub const BATCH_VERDICT_SCHEMA = "metacodes-project-harness-batch-verdict-v1";
 pub const CHECKER_VERSION = "metacodes-project-harness-kernel-v1";
 pub const MAX_REQUEST_BYTES: usize = 128 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 128 * 1024;
+pub const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_BATCH_REQUESTS: usize = 1024;
 pub const MAX_CHECKER_BYTES: u64 = 128 * 1024 * 1024;
 
 pub const Config = struct {
@@ -111,6 +115,11 @@ pub const Request = struct {
     payload: Payload,
 };
 
+const BatchRequest = struct {
+    schema_version: []const u8 = BATCH_REQUEST_SCHEMA,
+    requests: []const Request,
+};
+
 pub const Bindings = struct {
     request_id: [64]u8,
     operation: Operation,
@@ -172,6 +181,9 @@ pub const Invocation = struct {
     failure: FailureKind = .none,
     actual_checker_sha256: [64]u8 = [_]u8{'0'} ** 64,
     request_sha256: [64]u8 = [_]u8{'0'} ** 64,
+    checker_call_sha256: ?[64]u8 = null,
+    checker_verdict_sha256: ?[64]u8 = null,
+    checker_batch_size: u32 = 1,
     verdict_sha256: ?[64]u8 = null,
     checker_bytes: u64 = 0,
     checker_elapsed_ns: u64 = 0,
@@ -192,6 +204,22 @@ pub const Invocation = struct {
     }
 };
 
+pub const BatchInvocation = struct {
+    invocations: []Invocation,
+    stdout: ?[]u8 = null,
+    stderr: ?[]u8 = null,
+    verdict_payload: ?[]const u8 = null,
+    verdict_sha256: ?[64]u8 = null,
+
+    pub fn deinit(self: *BatchInvocation, allocator: std.mem.Allocator) void {
+        for (self.invocations) |*invocation| invocation.deinit(allocator);
+        allocator.free(self.invocations);
+        if (self.stdout) |bytes| allocator.free(bytes);
+        if (self.stderr) |bytes| allocator.free(bytes);
+        self.* = undefined;
+    }
+};
+
 const RawVerdict = struct {
     schema_version: []const u8,
     checker_version: []const u8,
@@ -206,6 +234,12 @@ const RawVerdict = struct {
     admitted: bool,
     reason_codes: [][]const u8,
     checks: Checks,
+};
+
+const RawBatchVerdict = struct {
+    schema_version: []const u8,
+    checker_version: []const u8,
+    verdicts: []RawVerdict,
 };
 
 pub fn requestId(
@@ -234,19 +268,36 @@ pub fn renderRequest(allocator: std.mem.Allocator, request: Request) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, request, .{});
 }
 
-pub fn invoke(
+pub fn renderBatchRequest(allocator: std.mem.Allocator, requests: []const Request) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, BatchRequest{ .requests = requests }, .{});
+}
+
+const CheckerExecution = struct {
+    failure: FailureKind = .none,
+    actual_checker_sha256: [64]u8 = [_]u8{'0'} ** 64,
+    checker_bytes: u64 = 0,
+    checker_elapsed_ns: u64 = 0,
+    stdout: ?[]u8 = null,
+    stderr: ?[]u8 = null,
+
+    fn deinit(self: *CheckerExecution, allocator: std.mem.Allocator) void {
+        if (self.stdout) |bytes| allocator.free(bytes);
+        if (self.stderr) |bytes| allocator.free(bytes);
+        self.* = undefined;
+    }
+};
+
+fn executeChecker(
     allocator: std.mem.Allocator,
     config: Config,
-    request: Request,
-    bindings: Bindings,
+    input: []const u8,
+    max_input_bytes: usize,
+    max_output_bytes: usize,
     abort: ?*const AbortSignal,
-) error{OutOfMemory}!Invocation {
-    var result = Invocation{ .bindings = bindings };
+) error{OutOfMemory}!CheckerExecution {
+    var result = CheckerExecution{};
     errdefer result.deinit(allocator);
-    const input = renderRequest(allocator, request) catch return error.OutOfMemory;
-    defer allocator.free(input);
-    result.request_sha256 = observation.sha256Hex(input);
-    if (input.len == 0 or input.len > MAX_REQUEST_BYTES) {
+    if (input.len == 0 or input.len > max_input_bytes) {
         result.failure = .request_oversize;
         return result;
     }
@@ -282,7 +333,7 @@ pub fn invoke(
     const started = time.nowNs();
     const captured = process.capture(&argv, allocator, .{
         .timeout_ms = config.timeout_ms,
-        .max_bytes = MAX_OUTPUT_BYTES,
+        .max_bytes = max_output_bytes,
         .want_stderr = true,
         .stdin_data = input,
         .inherit_env = false,
@@ -303,7 +354,7 @@ pub fn invoke(
     result.stdout = captured.stdout;
     result.stderr = captured.stderr;
     result.checker_elapsed_ns = elapsedNs(started);
-    if (captured.stdout.len >= MAX_OUTPUT_BYTES or captured.stderr.len >= MAX_OUTPUT_BYTES) {
+    if (captured.stdout.len >= max_output_bytes or captured.stderr.len >= max_output_bytes) {
         result.failure = .output_capped;
         return result;
     }
@@ -325,15 +376,53 @@ pub fn invoke(
         !std.mem.eql(u8, &post_digest.sha256, &config.expected_sha256))
     {
         result.failure = .checker_changed_after_execution;
-        return result;
     }
+    return result;
+}
 
-    const payload = verdictPayload(captured.stdout) orelse {
+fn transferExecution(result: *Invocation, execution: *CheckerExecution) void {
+    result.failure = execution.failure;
+    result.actual_checker_sha256 = execution.actual_checker_sha256;
+    result.checker_bytes = execution.checker_bytes;
+    result.checker_elapsed_ns = execution.checker_elapsed_ns;
+    result.stdout = execution.stdout;
+    result.stderr = execution.stderr;
+    execution.stdout = null;
+    execution.stderr = null;
+}
+
+pub fn invoke(
+    allocator: std.mem.Allocator,
+    config: Config,
+    request: Request,
+    bindings: Bindings,
+    abort: ?*const AbortSignal,
+) error{OutOfMemory}!Invocation {
+    var result = Invocation{ .bindings = bindings };
+    errdefer result.deinit(allocator);
+    const input = renderRequest(allocator, request) catch return error.OutOfMemory;
+    defer allocator.free(input);
+    result.request_sha256 = observation.sha256Hex(input);
+    result.checker_call_sha256 = result.request_sha256;
+    var execution = try executeChecker(
+        allocator,
+        config,
+        input,
+        MAX_REQUEST_BYTES,
+        MAX_OUTPUT_BYTES,
+        abort,
+    );
+    defer execution.deinit(allocator);
+    transferExecution(&result, &execution);
+    if (result.failure != .none) return result;
+
+    const payload = verdictPayload(result.stdout.?) orelse {
         result.failure = .malformed_verdict;
         return result;
     };
     result.verdict_payload = payload;
     result.verdict_sha256 = observation.sha256Hex(payload);
+    result.checker_verdict_sha256 = result.verdict_sha256;
     result.verdict = parseVerdict(allocator, payload, bindings) catch |err| {
         result.failure = switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -348,6 +437,135 @@ pub fn invoke(
     return result;
 }
 
+pub fn invokeBatch(
+    allocator: std.mem.Allocator,
+    config: Config,
+    requests: []const Request,
+    bindings: []const Bindings,
+    abort: ?*const AbortSignal,
+) error{ OutOfMemory, InvalidBatch }!BatchInvocation {
+    if (requests.len == 0 or requests.len != bindings.len or
+        requests.len > MAX_BATCH_REQUESTS)
+        return error.InvalidBatch;
+    const invocations = allocator.alloc(Invocation, requests.len) catch return error.OutOfMemory;
+    var initialized: usize = 0;
+    errdefer {
+        for (invocations[0..initialized]) |*invocation| invocation.deinit(allocator);
+        allocator.free(invocations);
+    }
+    for (requests, bindings, 0..) |request, binding, index| {
+        invocations[index] = .{ .bindings = binding };
+        initialized += 1;
+        const individual = renderRequest(allocator, request) catch return error.OutOfMemory;
+        defer allocator.free(individual);
+        invocations[index].request_sha256 = observation.sha256Hex(individual);
+    }
+    var result = BatchInvocation{ .invocations = invocations };
+    errdefer result.deinit(allocator);
+    const input = renderBatchRequest(allocator, requests) catch return error.OutOfMemory;
+    defer allocator.free(input);
+    const call_sha256 = observation.sha256Hex(input);
+    const batch_size: u32 = @intCast(requests.len);
+    for (result.invocations) |*invocation| {
+        invocation.checker_call_sha256 = call_sha256;
+        invocation.checker_batch_size = batch_size;
+    }
+    var execution = try executeChecker(
+        allocator,
+        config,
+        input,
+        MAX_BATCH_BYTES,
+        MAX_BATCH_BYTES,
+        abort,
+    );
+    defer execution.deinit(allocator);
+    for (result.invocations) |*invocation| {
+        invocation.failure = execution.failure;
+        invocation.actual_checker_sha256 = execution.actual_checker_sha256;
+        invocation.checker_bytes = execution.checker_bytes;
+        invocation.checker_elapsed_ns = execution.checker_elapsed_ns;
+    }
+    result.stdout = execution.stdout;
+    result.stderr = execution.stderr;
+    execution.stdout = null;
+    execution.stderr = null;
+    if (execution.failure != .none) return result;
+    const payload = verdictPayload(result.stdout.?) orelse {
+        invalidateBatch(allocator, result.invocations, .malformed_verdict);
+        return result;
+    };
+    var parsed = std.json.parseFromSlice(RawBatchVerdict, allocator, payload, .{
+        .ignore_unknown_fields = false,
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            invalidateBatch(allocator, result.invocations, .malformed_verdict);
+            return result;
+        },
+    };
+    defer parsed.deinit();
+    const canonical = std.json.Stringify.valueAlloc(allocator, parsed.value, .{}) catch
+        return error.OutOfMemory;
+    defer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, payload)) {
+        invalidateBatch(allocator, result.invocations, .malformed_verdict);
+        return result;
+    }
+    if (!std.mem.eql(u8, parsed.value.schema_version, BATCH_VERDICT_SCHEMA)) {
+        invalidateBatch(allocator, result.invocations, .verdict_schema_mismatch);
+        return result;
+    }
+    if (!std.mem.eql(u8, parsed.value.checker_version, CHECKER_VERSION)) {
+        invalidateBatch(allocator, result.invocations, .checker_version_mismatch);
+        return result;
+    }
+    if (parsed.value.verdicts.len != result.invocations.len) {
+        invalidateBatch(allocator, result.invocations, .verdict_binding_mismatch);
+        return result;
+    }
+    const batch_verdict_sha256 = observation.sha256Hex(payload);
+    for (parsed.value.verdicts, result.invocations) |raw, *invocation| {
+        invocation.verdict = validateRawVerdict(raw, invocation.bindings.?) catch |err| {
+            invalidateBatch(allocator, result.invocations, parseFailure(err));
+            return result;
+        };
+        const item_payload = std.json.Stringify.valueAlloc(allocator, raw, .{}) catch
+            return error.OutOfMemory;
+        invocation.stdout = item_payload;
+        invocation.verdict_payload = item_payload;
+        invocation.verdict_sha256 = observation.sha256Hex(item_payload);
+    }
+    // The outer payload is a verdict only after every member has passed its
+    // exact binding check.  Publishing its hash earlier would let a
+    // same-cardinality batch with one mismatched member look like durable
+    // checker evidence even though the whole call must fail closed.
+    result.verdict_payload = payload;
+    result.verdict_sha256 = batch_verdict_sha256;
+    for (result.invocations) |*invocation|
+        invocation.checker_verdict_sha256 = batch_verdict_sha256;
+    return result;
+}
+
+fn invalidateBatch(
+    allocator: std.mem.Allocator,
+    invocations: []Invocation,
+    failure: FailureKind,
+) void {
+    for (invocations) |*invocation| {
+        if (invocation.stdout) |bytes| allocator.free(bytes);
+        if (invocation.stderr) |bytes| allocator.free(bytes);
+        invocation.stdout = null;
+        invocation.stderr = null;
+        invocation.verdict_payload = null;
+        invocation.verdict_sha256 = null;
+        invocation.checker_verdict_sha256 = null;
+        invocation.verdict = null;
+        invocation.failure = failure;
+    }
+}
+
 const ParseError = error{ OutOfMemory, InvalidJson, SchemaMismatch, VersionMismatch, BindingMismatch, Inconsistent };
 
 fn parseVerdict(allocator: std.mem.Allocator, payload: []const u8, bindings: Bindings) ParseError!Verdict {
@@ -360,7 +578,10 @@ fn parseVerdict(allocator: std.mem.Allocator, payload: []const u8, bindings: Bin
         else => return error.InvalidJson,
     };
     defer parsed.deinit();
-    const raw = parsed.value;
+    return validateRawVerdict(parsed.value, bindings);
+}
+
+fn validateRawVerdict(raw: RawVerdict, bindings: Bindings) ParseError!Verdict {
     if (!std.mem.eql(u8, raw.schema_version, VERDICT_SCHEMA)) return error.SchemaMismatch;
     if (!std.mem.eql(u8, raw.checker_version, CHECKER_VERSION)) return error.VersionMismatch;
     if (!equalHex(raw.request_id, bindings.request_id) or
@@ -377,6 +598,56 @@ fn parseVerdict(allocator: std.mem.Allocator, payload: []const u8, bindings: Bin
         !raw.checks.decision_valid or (raw.admitted and !raw.checks.all()))
         return error.Inconsistent;
     return .{ .admitted = raw.admitted, .checks = raw.checks };
+}
+
+fn parseFailure(err: ParseError) FailureKind {
+    return switch (err) {
+        error.OutOfMemory => unreachable,
+        error.InvalidJson => .malformed_verdict,
+        error.SchemaMismatch => .verdict_schema_mismatch,
+        error.VersionMismatch => .checker_version_mismatch,
+        error.BindingMismatch => .verdict_binding_mismatch,
+        error.Inconsistent => .inconsistent_verdict,
+    };
+}
+
+/// Recover one exact candidate verdict from a canonical batch artifact. The
+/// caller supplies the candidate verdict hash recorded in the durable journal;
+/// a missing or duplicated member fails closed instead of trusting array order.
+pub fn extractBatchVerdict(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    verdict_sha256: [64]u8,
+) ![]u8 {
+    var parsed = std.json.parseFromSlice(RawBatchVerdict, allocator, payload, .{
+        .ignore_unknown_fields = false,
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    }) catch return error.InvalidBatchVerdict;
+    defer parsed.deinit();
+    const canonical = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+    defer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, payload) or
+        !std.mem.eql(u8, parsed.value.schema_version, BATCH_VERDICT_SCHEMA) or
+        !std.mem.eql(u8, parsed.value.checker_version, CHECKER_VERSION) or
+        parsed.value.verdicts.len == 0 or
+        parsed.value.verdicts.len > MAX_BATCH_REQUESTS)
+        return error.InvalidBatchVerdict;
+    var found: ?[]u8 = null;
+    errdefer if (found) |bytes| allocator.free(bytes);
+    for (parsed.value.verdicts) |raw| {
+        const item = try std.json.Stringify.valueAlloc(allocator, raw, .{});
+        if (std.mem.eql(u8, &observation.sha256Hex(item), &verdict_sha256)) {
+            if (found != null) {
+                allocator.free(item);
+                return error.DuplicateBatchVerdict;
+            }
+            found = item;
+        } else {
+            allocator.free(item);
+        }
+    }
+    return found orelse error.BatchVerdictNotFound;
 }
 
 const HashError = error{ OutOfMemory, OpenFailed, NotRegular, SizeInvalid, ReadFailed, ChangedDuringHash };

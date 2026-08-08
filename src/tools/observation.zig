@@ -13,6 +13,7 @@ const std = @import("std");
 
 pub const SCHEMA_VERSION = "metacodes-tool-observation-v1";
 pub const FORMAL_SCHEMA_VERSION = "metacodes-project-formal-decision-v1";
+pub const FORMAL_BATCH_SCHEMA_VERSION = "metacodes-project-formal-decision-batch-v1";
 
 pub const Origin = enum {
     authoritative,
@@ -30,6 +31,14 @@ pub const Outcome = enum {
 
 pub const FormalPhase = enum { pre, post };
 pub const FormalResult = enum { admit, block, fault };
+
+pub const FormalCandidateDecision = struct {
+    result: FormalResult,
+    candidate_id: [64]u8,
+    request_sha256: [64]u8,
+    verdict_sha256: ?[64]u8,
+    checker_failure: ?[]const u8,
+};
 
 pub const BeforeState = enum {
     missing,
@@ -134,10 +143,32 @@ pub const Event = union(enum) {
         bundle_revision: u64,
         kernel_sha256: [64]u8,
         request_sha256: [64]u8,
+        /// Identity and cardinality of the physical checker process call.
+        /// Single-request legacy events omit the identity and default to one;
+        /// batch consumers deduplicate latency by this hash instead of
+        /// incorrectly summing the same process time once per candidate.
+        checker_call_sha256: ?[64]u8 = null,
+        checker_verdict_sha256: ?[64]u8 = null,
+        checker_batch_size: u32 = 1,
         verdict_sha256: ?[64]u8,
         checker_failure: ?[]const u8,
         checker_elapsed_ns: u64,
         checker_bytes: u64,
+    },
+    formal_decision_batch: struct {
+        schema_version: []const u8 = FORMAL_BATCH_SCHEMA_VERSION,
+        dispatch_id: []const u8,
+        phase: FormalPhase,
+        project_sha256: [64]u8,
+        bundle_sha256: [64]u8,
+        bundle_revision: u64,
+        kernel_sha256: [64]u8,
+        checker_call_sha256: [64]u8,
+        checker_verdict_sha256: ?[64]u8,
+        checker_batch_size: u32,
+        checker_elapsed_ns: u64,
+        checker_bytes: u64,
+        decisions: []const FormalCandidateDecision,
     },
     dispatch_started: struct {
         schema_version: []const u8 = SCHEMA_VERSION,
