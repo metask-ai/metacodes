@@ -1537,6 +1537,121 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
         ).validate(len(manifest["schedule"]))
 
+    def test_checked_in_pilot_v16_freezes_multi_family_balanced_replication(self):
+        pilot = ROOT / "evals/memory/pilots/procedural-glm52-v16"
+        contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        source = json.loads((pilot / "source.json").read_text(encoding="utf-8"))
+        validators = json.loads((pilot / "validators.json").read_text(encoding="utf-8"))
+        manifest = load_manifest(pilot / "manifest.json")
+        execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
+
+        for name, identity in contract["artifacts"].items():
+            payload = (pilot / name).read_bytes()
+            self.assertEqual(len(payload), identity["bytes"])
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), identity["sha256"])
+        fixture = ROOT / contract["generation"]["source_path"]
+        self.assertEqual(
+            hashlib.sha256(fixture.read_bytes()).hexdigest(),
+            contract["generation"]["expected_upstream_sha256"],
+        )
+        self.assertEqual(
+            sorted(family["id"] for family in source["families"]),
+            contract["generation"]["family_ids"],
+        )
+        offline_prompts = [
+            case["prompt"]
+            for family in source["families"]
+            for case in family["cases"]
+            if case["split"] == "offline"
+        ]
+        self.assertEqual(len(offline_prompts), 8)
+        hidden_terms = (
+            "CAP4_",
+            "LEASE4_",
+            "EVID4_",
+            "ROLL4_",
+            "manual_reconcile",
+            "deny_on_timeout",
+            "abstain_on_gap",
+            "operator_ack",
+        )
+        self.assertTrue(
+            all(term not in prompt for prompt in offline_prompts for term in hidden_terms)
+        )
+        check_kinds = {
+            check["kind"]
+            for case in validators["cases"]
+            for check in case["validator"]["checks"]
+        }
+        self.assertEqual(check_kinds, {"python_assignment_equals"})
+        self.assertEqual(manifest["execution"], execution)
+        self.assertEqual(manifest["manifest_id"], "coding-intent-families-2026080816-4")
+        self.assertEqual(len(manifest["cases"]), 12)
+        self.assertEqual(len(manifest["schedule"]), 144)
+
+        positions = {}
+        for offset in range(0, len(manifest["schedule"]), 3):
+            for position, row in enumerate(manifest["schedule"][offset : offset + 3]):
+                key = (row["arm"], position)
+                positions[key] = positions.get(key, 0) + 1
+        self.assertEqual(
+            set(positions.values()),
+            {contract["schedule"]["arm_position_counts"]},
+        )
+        cases = {case["id"]: case for case in manifest["cases"]}
+        offline_by_arm = {}
+        for row in manifest["schedule"]:
+            if cases[row["case_id"]]["split"] == "offline":
+                offline_by_arm[row["arm"]] = offline_by_arm.get(row["arm"], 0) + 1
+        self.assertEqual(
+            set(offline_by_arm.values()),
+            {contract["schedule"]["offline_rows_per_arm"]},
+        )
+        rows = [
+            [item["sequence"], item["case_id"], item["trial"], item["arm"]]
+            for item in manifest["schedule"]
+        ]
+        ordered_tsv = "".join("\t".join(str(value) for value in row) + "\n" for row in rows)
+        self.assertEqual(
+            hashlib.sha256(ordered_tsv.encode("utf-8")).hexdigest(),
+            contract["schedule"]["ordered_tsv_sha256"],
+        )
+        self.assertIn("McNemar", contract["analysis_plan"]["primary_test"])
+        self.assertIn("10000", contract["analysis_plan"]["uncertainty"])
+        self.assertFalse(contract["current_phase"]["quality_evidence"])
+        self.assertTrue(contract["current_phase"]["paid_rollouts_authorized"])
+        self.assertEqual(
+            [
+                (item["pilot_id"], item["status"])
+                for item in contract["predecessor_attempts"]
+            ],
+            [("procedural-glm52-v15", "completed-pilot-signal")],
+        )
+        budget = contract["budget_authority"]
+        self.assertGreaterEqual(
+            budget["max_total_cost_usd"],
+            budget["max_rollout_cost_usd"] * len(manifest["schedule"]),
+        )
+        self.assertGreaterEqual(
+            budget["max_total_metered_tokens"],
+            budget["max_rollout_metered_tokens"] * len(manifest["schedule"]),
+        )
+        self.assertLessEqual(
+            budget["prior_conservative_cost_usd"] + budget["max_total_cost_usd"],
+            budget["user_authorization_max_cost_usd"],
+        )
+        ProductionRuntimeConfig(
+            api_key="test-only",
+            allow_paid_rollouts=True,
+            max_total_cost_usd=budget["max_total_cost_usd"],
+            max_total_metered_tokens=budget["max_total_metered_tokens"],
+            max_rollout_cost_usd=budget["max_rollout_cost_usd"],
+            max_rollout_metered_tokens=budget["max_rollout_metered_tokens"],
+            max_output_tokens=budget["max_output_tokens"],
+            ripgrep_binary=TEST_RIPGREP,
+            ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
+        ).validate(len(manifest["schedule"]))
+
     def _materialize_valid_production_events(self, root, rollout, grader_fingerprint):
         cassette = root / rollout["artifact_paths"]["cassette"]
         uses = {}
