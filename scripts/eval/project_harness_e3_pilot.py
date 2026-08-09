@@ -772,6 +772,8 @@ def _run_one(
         "position": schedule["position"],
         "arm": arm,
         "oracle_class": case["oracle_class"],
+        "horizon_class": case["horizon_class"],
+        "correction_family": case["correction_family"],
         "manifest_id": manifest["manifest_id"],
         "task_fingerprint": _canonical_sha256(case),
         "harness_fingerprint": harness_fingerprint,
@@ -960,10 +962,10 @@ def _parser() -> argparse.ArgumentParser:
     freeze.add_argument("--shadow", type=Path, required=True)
     freeze.add_argument("--ripgrep", type=Path, required=True)
     freeze.add_argument("--output", type=Path, required=True)
-    freeze.add_argument("--max-rollout-cost-usd", type=float, default=0.90)
-    freeze.add_argument("--max-rollout-metered-tokens", type=int, default=300_000)
+    freeze.add_argument("--max-rollout-cost-usd", type=float, default=0.25)
+    freeze.add_argument("--max-rollout-metered-tokens", type=int, default=100_000)
     freeze.add_argument("--max-total-cost-usd", type=float, default=20.0)
-    freeze.add_argument("--max-total-metered-tokens", type=int, default=5_000_000)
+    freeze.add_argument("--max-total-metered-tokens", type=int, default=6_000_000)
     freeze.add_argument("--max-output-tokens", type=int, default=4096)
     dry = sub.add_parser("dry-run")
     dry.add_argument("--repo", type=Path, required=True)

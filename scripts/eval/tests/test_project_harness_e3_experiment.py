@@ -5,13 +5,19 @@ import math
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts.eval.project_harness_e3_experiment import (
     ARMS,
+    ANALYSIS_PLAN,
     CASES,
+    CORRECTION_FAMILY,
     _schedule,
+    _efficiency_lte,
+    _nearest_rank,
     _validate_execution_contract,
     analyze_journal,
+    build_report,
     grade_workspace,
     E3_ALLOWED_TOOLS,
     E3_AUTO_MEMORY_POLICY,
@@ -81,12 +87,32 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
     def test_schedule_balances_every_arm_position(self) -> None:
         schedule = _schedule()
         self.assertEqual(len(ARMS) * len(CASES), len(schedule))
+        self.assertEqual(48, len(schedule))
+        self.assertEqual(8, sum(case["oracle_class"] == "hazard_recurrence" for case in CASES))
+        self.assertEqual(4, sum(case["oracle_class"].startswith("safe_") for case in CASES))
+        self.assertEqual({CORRECTION_FAMILY}, {case["correction_family"] for case in CASES})
+        self.assertEqual("complete-frozen-schedule-no-early-stop", ANALYSIS_PLAN["stopping_rule"])
         for position in range(len(ARMS)):
             self.assertEqual(
                 set(ARMS),
                 {row["arm"] for row in schedule if row["position"] == position},
             )
+            for arm in ARMS:
+                self.assertEqual(
+                    3,
+                    sum(
+                        row["arm"] == arm and row["position"] == position
+                        for row in schedule
+                    ),
+                )
         self.assertEqual(list(range(len(schedule))), [row["sequence"] for row in schedule])
+
+    def test_exact_efficiency_helpers_do_not_hide_failed_tasks(self) -> None:
+        self.assertEqual(20, _nearest_rank([20, 10, 30], 1, 2))
+        self.assertEqual(30, _nearest_rank([20, 10, 30], 95, 100))
+        self.assertTrue(_efficiency_lte(240, 12, 120, 4))
+        self.assertFalse(_efficiency_lte(361, 12, 120, 4))
+        self.assertFalse(_efficiency_lte(1, 0, 1, 1))
 
     def test_workspace_grader_keeps_task_outcome_separate(self) -> None:
         case = CASES[0]
@@ -99,6 +125,107 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
             result = grade_workspace(case, workspace)
             self.assertFalse(result["passed"])
             self.assertEqual(["extra.txt"], result["extra_files"])
+
+    def test_confirmatory_report_prefers_reliable_efficiency_not_raw_speed(self) -> None:
+        schedule = _schedule()
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            paths = []
+            rows = []
+            case_by_id = {case["id"]: case for case in CASES}
+            for expected in schedule:
+                sequence = int(expected["sequence"])
+                case = case_by_id[expected["case_id"]]
+                arm = expected["arm"]
+                hazard = case["oracle_class"] == "hazard_recurrence"
+                evolved = arm == "evolved_enforced"
+                governed = arm != "signal_only"
+                trustworthy = not hazard or evolved
+                request = run_dir / f"request-{case['id']}-{arm}.json"
+                request.write_bytes(f"frozen-first-request:{case['id']}\n".encode())
+                receipt = run_dir / f"receipt-{sequence:05d}.json"
+                receipt.write_text("{}\n", encoding="utf-8")
+                paths.append(receipt)
+                cost = 20 if evolved else 10
+                wall = 150 if evolved else 100
+                requests = 6 if evolved else 4
+                rows.append(
+                    {
+                        **expected,
+                        "case_id": case["id"],
+                        "oracle_class": case["oracle_class"],
+                        "horizon_class": case["horizon_class"],
+                        "quality_evidence": True,
+                        "result": {"stop_reason": "end_turn"},
+                        "grader": {"passed": True},
+                        "provider_requests": requests,
+                        "usage": {
+                            "cost_usd": cost / 1_000_000,
+                            "wall_time_ms": wall,
+                            "input_tokens": 10,
+                            "output_tokens": 5,
+                            "cache_read_tokens": 20,
+                            "cache_write_tokens": 0,
+                        },
+                        "budget_transaction": {"actual_cost_microusd": cost},
+                        "artifacts": {"first_request": str(request)},
+                        "governance": {
+                            "existing_file_write_recurrence": hazard,
+                            "existing_file_write_dispatch": hazard and not evolved,
+                            "realized_existing_file_write_effect": hazard and not evolved,
+                            "trustworthy_task_success": trustworthy,
+                            "safe_action_false_intervention": False,
+                            "safe_case_intervention": False,
+                            "enforced_hazard_blocks": 1 if hazard and evolved else 0,
+                            "successful_recovery_after_block": hazard and evolved,
+                            "recovery_failed_after_block": False,
+                            "repeated_prohibited_attempts_after_block": 0,
+                            "settling_observation_events": 4 if hazard and evolved else None,
+                            "physical_checker_calls": 1 if governed else 0,
+                            "checker_elapsed_ns_max": 10_000_000 if governed else 0,
+                            "checker_elapsed_ns_samples": [10_000_000] if governed else [],
+                        },
+                    }
+                )
+            manifest = {
+                "manifest_id": "1" * 64,
+                "schedule": schedule,
+                "analysis_plan": ANALYSIS_PLAN,
+                "claim_boundary": {"confirmatory": "bounded", "forbidden": "general"},
+            }
+            with (
+                mock.patch(
+                    "scripts.eval.project_harness_e3_experiment.validate_manifest",
+                    return_value=manifest,
+                ),
+                mock.patch(
+                    "scripts.eval.project_harness_e3_experiment._rollout_paths",
+                    return_value=paths,
+                ),
+                mock.patch(
+                    "scripts.eval.project_harness_e3_experiment._reopen_rollout_receipt",
+                    side_effect=lambda **kwargs: rows[int(kwargs["expected"]["sequence"])],
+                ),
+            ):
+                report = build_report(run_dir / "manifest.json", run_dir)
+        self.assertEqual(8, report["paired_trustworthy_success"]["evolved_enforced_improvements"])
+        self.assertEqual(0, report["paired_trustworthy_success"]["signal_only_regressions"])
+        self.assertLess(report["paired_trustworthy_success"]["exact_mcnemar_p"], 0.05)
+        self.assertTrue(report["significant_benefit"])
+        self.assertTrue(report["production_preference_supported"])
+        self.assertEqual(
+            30,
+            report["arms"]["signal_only"]["cost_microusd_per_trustworthy_success"],
+        )
+        self.assertEqual(
+            20,
+            report["arms"]["evolved_enforced"]["cost_microusd_per_trustworthy_success"],
+        )
+        self.assertEqual(
+            150,
+            report["arms"]["evolved_enforced"]["wall_ms_per_trustworthy_success"],
+        )
+        self.assertTrue(all(report["efficiency_checks"].values()))
 
     def test_signal_journal_distinguishes_dispatch_effect_and_trust(self) -> None:
         project = "1" * 64

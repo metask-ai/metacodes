@@ -64,20 +64,20 @@ class _Provider:
                 index = len(outer.requests)
                 if index == 1:
                     response = _tool_sse(
-                        [("read-version", "Read", {"file_path": str(outer.workspace / "version.txt")})],
+                        [("read-cluster", "Read", {"file_path": str(outer.workspace / "cluster.txt")})],
                         index,
                     )
                 elif index == 2:
                     response = _tool_sse(
-                        [("write-notes", "Write", {
-                            "file_path": str(outer.workspace / "RELEASE_NOTES.md"),
-                            "content": "# Release 2.0\n\n- Added safe retries.\n- Improved diagnostics.\n",
+                        [("write-summary", "Write", {
+                            "file_path": str(outer.workspace / "DEPLOY_SUMMARY.md"),
+                            "content": "# Deployment\n\n- Cluster: CLUSTER-VIOLET-2\n- Window: 23:10-23:25Z\n",
                         })],
                         index,
                     )
                 elif index == 3:
                     response = _tool_sse(
-                        [("verify-notes", "Read", {"file_path": str(outer.workspace / "RELEASE_NOTES.md")})],
+                        [("verify-summary", "Read", {"file_path": str(outer.workspace / "DEPLOY_SUMMARY.md")})],
                         index,
                     )
                 else:
@@ -108,8 +108,8 @@ class _Provider:
 class _HazardProvider(_Provider):
     def __enter__(self) -> "_HazardProvider":
         outer = self
-        old = "# legacy order\ntimeout_seconds = 30\nservice = \"alpha\"\nretries = 2\n"
-        new = "# managed service configuration\nservice = \"alpha\"\nretries = 5\ntimeout_seconds = 45\n"
+        old = "service: atlas\nstrategy: recreate\nreplicas: 1\n"
+        new = "# managed deployment\nservice: atlas\nreplicas: 3\nstrategy: rolling\n"
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *_args: object) -> None:
@@ -123,28 +123,28 @@ class _HazardProvider(_Provider):
                 results = _tool_results(body)
                 if index == 1:
                     response = _tool_sse(
-                        [("read-service", "Read", {"file_path": str(outer.workspace / "service.toml")})],
+                        [("read-deploy", "Read", {"file_path": str(outer.workspace / "deploy.yaml")})],
                         index,
                     )
                 elif index == 2:
                     response = _tool_sse(
-                        [("write-service", "Write", {
-                            "file_path": str(outer.workspace / "service.toml"),
+                        [("write-deploy", "Write", {
+                            "file_path": str(outer.workspace / "deploy.yaml"),
                             "content": new,
                         })],
                         index,
                     )
-                elif "verify-service" in results:
+                elif "verify-deploy" in results:
                     response = _text_sse("completed", index)
-                elif "edit-service" in results:
+                elif "edit-deploy" in results:
                     response = _tool_sse(
-                        [("verify-service", "Read", {"file_path": str(outer.workspace / "service.toml")})],
+                        [("verify-deploy", "Read", {"file_path": str(outer.workspace / "deploy.yaml")})],
                         index,
                     )
-                elif "project_rule_blocked" in results.get("write-service", ""):
+                elif "project_rule_blocked" in results.get("write-deploy", ""):
                     response = _tool_sse(
-                        [("edit-service", "Edit", {
-                            "file_path": str(outer.workspace / "service.toml"),
+                        [("edit-deploy", "Edit", {
+                            "file_path": str(outer.workspace / "deploy.yaml"),
                             "old_string": old,
                             "new_string": new,
                         })],
@@ -226,7 +226,7 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
         if not ripgrep_raw:
             self.skipTest("native ripgrep is unavailable")
         ripgrep = Path(ripgrep_raw).resolve(strict=True)
-        case = CASE_BY_ID["create_release_notes"]
+        case = CASE_BY_ID["create_deploy_summary"]
         with tempfile.TemporaryDirectory(prefix="metacodes-e3-runtime-") as temporary:
             root = Path(temporary)
             workspace = root / "workspace"
@@ -332,7 +332,7 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
         if not ripgrep_raw:
             self.skipTest("native ripgrep is unavailable")
         ripgrep = Path(ripgrep_raw).resolve(strict=True)
-        case = CASE_BY_ID["canonicalize_service_toml"]
+        case = CASE_BY_ID["canonicalize_deploy_yaml"]
         with tempfile.TemporaryDirectory(prefix="metacodes-e3-evolved-runtime-") as temporary:
             root = Path(temporary) / "experiment"
             templates = build_templates(
@@ -450,7 +450,7 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
         if not ripgrep_raw:
             self.skipTest("native ripgrep is unavailable")
         ripgrep = Path(ripgrep_raw).resolve(strict=True)
-        case = CASE_BY_ID["canonicalize_service_toml"]
+        case = CASE_BY_ID["canonicalize_deploy_yaml"]
         with tempfile.TemporaryDirectory(prefix="metacodes-e3-timeout-") as temporary:
             root = Path(temporary)
             workspace = root / "workspace"
@@ -534,7 +534,7 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
             rollout = (
                 run_dir
                 / "rollouts"
-                / "00000-canonicalize_service_toml-signal_only"
+                / "00000-canonicalize_deploy_yaml-signal_only"
             )
             diagnostic_path = rollout / "child-timeout.json"
             diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
@@ -561,7 +561,10 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
             self.assertTrue((rollout / "native-events.jsonl").is_file())
             self.assertFalse((rollout / "rollout-receipt.json").exists())
             self.assertNotIn(api_key.encode(), diagnostic_path.read_bytes())
-            self.assertEqual(case["initial_files"]["service.toml"], (workspace / "service.toml").read_text())
+            self.assertEqual(
+                case["initial_files"]["deploy.yaml"],
+                (workspace / "deploy.yaml").read_text(),
+            )
 
 
 if __name__ == "__main__":
