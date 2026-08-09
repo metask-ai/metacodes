@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import time
@@ -34,6 +35,7 @@ MAX_METERED_TOKENS = 33_024
 TOTAL_COST_MICROUSD = 1_000_000
 TOTAL_METERED_TOKENS = 100_000
 MAX_CREDENTIAL_BYTES = 16 * 1024
+CHILD_FAILURE_SCHEMA = "metacodes-rule-author-feasibility-failure-v1"
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -201,6 +203,23 @@ def validate_result(value: Mapping[str, Any]) -> None:
         raise ValidationError("abstention must not create a candidate")
 
 
+def child_error_code(stderr: str) -> str | None:
+    try:
+        value = unique_json(stderr, "rule-author child failure")
+    except ValidationError:
+        return None
+    if set(value) != {"schema_version", "error_code"}:
+        return None
+    code = value.get("error_code")
+    if (
+        value.get("schema_version") != CHILD_FAILURE_SCHEMA
+        or not isinstance(code, str)
+        or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,127}", code) is None
+    ):
+        return None
+    return code
+
+
 def private_write(path: Path, value: Mapping[str, Any]) -> None:
     payload = (stable_json(value) + "\n").encode("utf-8")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -340,6 +359,7 @@ def main() -> int:
                     str(reserved["transaction_id"])
                 ),
                 "child_returncode": completed.returncode,
+                "child_error_code": child_error_code(completed.stderr),
                 "child_stderr_sha256": sha256_bytes(completed.stderr.encode("utf-8")),
                 "uncertain_request_not_retried": True,
             }

@@ -44,7 +44,24 @@ const Output = struct {
     provider_elapsed_ns: u64,
 };
 
-pub fn main(init: std.process.Init) !void {
+const FailureOutput = struct {
+    schema_version: []const u8 = "metacodes-rule-author-feasibility-failure-v1",
+    error_code: []const u8,
+};
+
+pub fn main(init: std.process.Init) void {
+    run(init) catch |err| {
+        var stderr_buffer: [512]u8 = undefined;
+        var stderr_file_writer: std.Io.File.Writer = .init(.stderr(), init.io, &stderr_buffer);
+        const stderr = &stderr_file_writer.interface;
+        std.json.Stringify.value(FailureOutput{ .error_code = @errorName(err) }, .{}, stderr) catch {};
+        stderr.writeByte('\n') catch {};
+        stderr.flush() catch {};
+        std.process.exit(1);
+    };
+}
+
+fn run(init: std.process.Init) !void {
     const allocator = std.heap.c_allocator;
     var args = std.process.Args.iterateAllocator(init.minimal.args, allocator) catch
         return error.InvalidArguments;

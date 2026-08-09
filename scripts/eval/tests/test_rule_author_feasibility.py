@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from scripts.eval.run_rule_author_feasibility import child_error_code
+
 
 REPO = Path(__file__).resolve().parents[3]
 
@@ -67,6 +69,22 @@ print({result!r})
 
 
 class RuleAuthorFeasibilityRunnerTest(unittest.TestCase):
+    def test_structured_child_error_is_bounded_and_strict(self) -> None:
+        self.assertEqual(
+            child_error_code(
+                '{"schema_version":"metacodes-rule-author-feasibility-failure-v1",'
+                '"error_code":"InvalidAuthorResponse"}\n'
+            ),
+            "InvalidAuthorResponse",
+        )
+        self.assertIsNone(child_error_code("error: InvalidAuthorResponse\n"))
+        self.assertIsNone(
+            child_error_code(
+                '{"schema_version":"metacodes-rule-author-feasibility-failure-v1",'
+                '"error_code":"InvalidAuthorResponse","raw":"forbidden"}'
+            )
+        )
+
     def test_dry_run_reads_no_credential_and_mutates_no_budget_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
