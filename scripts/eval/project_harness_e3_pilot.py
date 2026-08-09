@@ -341,6 +341,23 @@ def _checkpoint_payload(
     return (stable_json(value) + "\n").encode("utf-8")
 
 
+def _rollout_window(
+    schedule: Sequence[Mapping[str, Any]],
+    completed_count: int,
+    max_rollouts: int | None,
+) -> List[Mapping[str, Any]]:
+    if completed_count < 0 or completed_count > len(schedule):
+        raise E3Error("E3 completed rollout count is outside the frozen schedule")
+    if max_rollouts is not None and (
+        not isinstance(max_rollouts, int)
+        or isinstance(max_rollouts, bool)
+        or max_rollouts <= 0
+    ):
+        raise E3Error("E3 invocation rollout limit must be an integer > 0")
+    remaining = schedule[completed_count:]
+    return list(remaining if max_rollouts is None else remaining[:max_rollouts])
+
+
 def _load_resume(
     *,
     run_dir: Path,
@@ -823,9 +840,13 @@ def run_paid(
     auth_file: Path,
     timeout_seconds: int,
     resume: bool,
+    max_rollouts: int | None = None,
 ) -> Mapping[str, Any]:
     repo = repo.resolve(strict=True)
     manifest = validate_manifest(manifest_path.resolve(strict=True), repo)
+    # Reject a malformed host-only pause control before creating a run
+    # directory, opening the budget journal, or loading the credential.
+    _rollout_window(manifest["schedule"], 0, max_rollouts)
     templates = verify_templates(Path(str(manifest["templates_manifest"]["path"])), repo)
     root = Path(str(manifest["root"]))
     run_dir = run_dir.absolute()
@@ -862,7 +883,11 @@ def run_paid(
             _replace_private_file(run_dir / CHECKPOINT_NAME, _checkpoint_payload(manifest, completed, budget))
         api_key = _load_api_key(auth_file.resolve(strict=True))
         try:
-            for schedule in manifest["schedule"][len(completed):]:
+            for schedule in _rollout_window(
+                manifest["schedule"],
+                len(completed),
+                max_rollouts,
+            ):
                 item = _run_one(
                     repo=repo,
                     manifest=manifest,
@@ -881,6 +906,20 @@ def run_paid(
                 _replace_private_file(run_dir / CHECKPOINT_NAME, _checkpoint_payload(manifest, completed, budget))
         finally:
             _assert_production_secret_absent(root, api_key)
+        if len(completed) < len(manifest["schedule"]):
+            checkpoint = run_dir / CHECKPOINT_NAME
+            return {
+                "run_dir": str(run_dir),
+                "manifest_id": manifest["manifest_id"],
+                "status": "paused_after_rollout_limit",
+                "completed_rollouts": len(completed),
+                "remaining_rollouts": len(manifest["schedule"]) - len(completed),
+                "quality_evidence": False,
+                "report_path": None,
+                "checkpoint_path": str(checkpoint),
+                "checkpoint_sha256": _sha256_file(checkpoint),
+                "budget": budget.snapshot(),
+            }
         report = build_report(manifest_path, run_dir)
         report_path = run_dir / "report.json"
         _write_new(report_path, (stable_json(report) + "\n").encode("utf-8"))
@@ -926,6 +965,11 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--budget-journal", type=Path, required=True)
     run.add_argument("--auth-file", type=Path, default=Path.home() / ".metacodes/auth.json")
     run.add_argument("--timeout-seconds", type=int, default=300)
+    run.add_argument(
+        "--max-rollouts-this-invocation",
+        type=int,
+        help="durably checkpoint and pause after this many newly completed rollouts",
+    )
     run.add_argument("--allow-paid-rollouts", action="store_true")
     run.add_argument("--resume", action="store_true")
     report = sub.add_parser("report")
@@ -992,6 +1036,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         auth_file=args.auth_file,
         timeout_seconds=args.timeout_seconds,
         resume=args.resume,
+        max_rollouts=args.max_rollouts_this_invocation,
     )
     print(stable_json(summary))
     return 0

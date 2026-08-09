@@ -36,6 +36,7 @@ from scripts.eval.project_harness_e3_experiment import (
 from scripts.eval.project_harness_e3_pilot import (
     MAX_TIMEOUT_STREAM_BYTES,
     _bounded_timeout_stream,
+    _rollout_window,
     _run_one,
 )
 from scripts.eval.project_harness_e3_templates import build_templates
@@ -190,6 +191,17 @@ class _StallingProvider(_Provider):
 
 
 class ProjectHarnessE3RuntimeTest(unittest.TestCase):
+    def test_rollout_window_pauses_without_reordering_resume_prefix(self) -> None:
+        schedule = [{"sequence": index} for index in range(4)]
+        self.assertEqual([{"sequence": 1}], _rollout_window(schedule, 1, 1))
+        self.assertEqual(
+            [{"sequence": 2}, {"sequence": 3}],
+            _rollout_window(schedule, 2, None),
+        )
+        for invalid in (True, 0, -1):
+            with self.assertRaisesRegex(E3Error, "integer > 0"):
+                _rollout_window(schedule, 0, invalid)
+
     def test_timeout_capture_is_bounded_and_redacts_credential(self) -> None:
         secret = "private-e3-test-key"
         raw = b"prefix:" + secret.encode() + b":" + (b"x" * (MAX_TIMEOUT_STREAM_BYTES + 128))
