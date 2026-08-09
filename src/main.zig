@@ -406,14 +406,20 @@ pub fn main(init: std.process.Init) !void {
 
     // U8:`--resume-response <json>` → 恢复挂起的 session(read suspend.json→resumeRun),不进 REPL。
     if (config.resume_response) |resp| {
-        const code = @import("repl/headless.zig").resumeSuspended(app, allocator, resp, config.json_output) catch 1;
+        const code = @import("repl/headless.zig").resumeSuspended(app, allocator, resp, config.json_output) catch |err| blk: {
+            std.debug.print("error: headless resume setup failed: {s}\n", .{@errorName(err)});
+            break :blk 1;
+        };
         app.deinit(); // 同上:reap MCP/LSP 子进程(恢复运行已结束,quiescent)
         std.process.exit(code);
     }
 
     // Headless 模式：`-p "..."` / stdin pipe → 跑单次 prompt 后退出，不进 REPL。
     if (config.prompt) |p| {
-        const code = @import("repl/headless.zig").run(app, allocator, p, config.json_output) catch 1;
+        const code = @import("repl/headless.zig").run(app, allocator, p, config.json_output) catch |err| blk: {
+            std.debug.print("error: headless setup failed: {s}\n", .{@errorName(err)});
+            break :blk 1;
+        };
         app.deinit(); // 同上:headless 一样跑 MCP/LSP,同款孤儿病(agent loop 已结束,quiescent)
         std.process.exit(code);
     }

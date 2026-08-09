@@ -1575,11 +1575,43 @@ def _production_sandbox_profile(
     )
     readonly: List[Path] = []
     for raw in read_only_files:
-        path = raw.expanduser().resolve()
+        # dyld opens Homebrew dependencies through their install-name spelling
+        # (for example /opt/homebrew/opt/gmp/...), while the integrity check is
+        # necessarily over the resolved Cellar file.  Seatbelt matches the
+        # spelling used by the syscall, so preserve both identities.  Callers
+        # must still hash/reopen these files before and after the child run.
+        spelled = raw.expanduser().absolute()
+        path = spelled.resolve()
         if not path.is_file():
             _fail("production sandbox read-only file", "is unavailable")
-        if path not in readonly:
-            readonly.append(path)
+        for candidate in (spelled, path):
+            if candidate not in readonly:
+                readonly.append(candidate)
+        # A literal grant for the final file is insufficient when an install
+        # name traverses a symlinked directory: dyld must read the link itself
+        # before it can open the resolved Cellar object.  Grant only those
+        # symlink path components, never their directory contents.
+        component = spelled
+        symlink_spellings: List[Path] = []
+        while component != component.parent:
+            candidates = (component, component.parent.resolve(strict=False) / component.name)
+            for link_candidate in candidates:
+                try:
+                    component_info = link_candidate.lstat()
+                except OSError:
+                    continue
+                if stat.S_ISLNK(component_info.st_mode):
+                    if link_candidate not in readonly:
+                        readonly.append(link_candidate)
+                    if link_candidate not in symlink_spellings:
+                        symlink_spellings.append(link_candidate)
+            component = component.parent
+        # dyld realpath resolution reads the exact directory containing an
+        # intermediate dylib symlink.  A literal directory grant permits that
+        # lookup/list operation but does not grant data reads for its children.
+        for link in symlink_spellings:
+            if link.parent not in readonly:
+                readonly.append(link.parent)
     sealed = sorted({path.expanduser().resolve(strict=False) for path in sealed_files}, key=str)
     for path in sealed:
         if not any(_path_is_within(str(path), root) for root in minimal_roots):
@@ -1708,6 +1740,7 @@ def _materialize_production_sandbox(
     metacodes: Path,
     tinykg: Path | None,
     ripgrep: Path,
+    additional_read_only_files: Sequence[Path] = (),
     read_only_roots: Sequence[Path] = (),
     tinykg_read_only_store: Path | None = None,
 ) -> ProductionSandbox:
@@ -1716,7 +1749,11 @@ def _materialize_production_sandbox(
         roots.append(store)
     profile = _production_sandbox_profile(
         read_write_roots=roots,
-        read_only_files=(metacodes, ripgrep) if tinykg is None else (metacodes, tinykg, ripgrep),
+        read_only_files=(
+            (metacodes, ripgrep, *additional_read_only_files)
+            if tinykg is None
+            else (metacodes, tinykg, ripgrep, *additional_read_only_files)
+        ),
         sealed_files=(profile_path, evidence_path, ripgrep),
         sealed_roots=read_only_roots,
         transient_write_roots=(
