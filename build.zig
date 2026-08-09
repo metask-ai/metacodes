@@ -804,6 +804,28 @@ pub fn build(b: *std.Build) void {
         "Build the zero-provider project-Harness causal calibration driver",
     );
     project_harness_eval_driver_step.dependOn(&install_project_harness_eval_driver.step);
+    const project_harness_lifecycle_driver_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/project_harness_lifecycle_driver.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    project_harness_lifecycle_driver_mod.addImport("cc", core_test_mod);
+    const project_harness_lifecycle_driver = b.addExecutable(.{
+        .name = "metacodes-project-harness-lifecycle",
+        .root_module = project_harness_lifecycle_driver_mod,
+    });
+    const install_project_harness_lifecycle_driver = b.addInstallArtifact(
+        project_harness_lifecycle_driver,
+        .{},
+    );
+    const project_harness_lifecycle_driver_step = b.step(
+        "eval:project-harness-lifecycle-driver",
+        "Build the zero-provider real correction-to-promotion lifecycle driver",
+    );
+    project_harness_lifecycle_driver_step.dependOn(
+        &install_project_harness_lifecycle_driver.step,
+    );
     const core_test = b.addTest(.{
         .name = "metacodes-core-test",
         .root_module = core_test_mod,

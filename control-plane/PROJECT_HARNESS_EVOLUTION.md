@@ -501,6 +501,48 @@ possible. It does not establish E2 because the active identity is synthetic,
 and it does not establish E3 because tool choice is scripted and there are no
 provider requests, cache measurements or model outcomes.
 
+### Real correction-to-production E2 lifecycle
+
+`scripts/eval/project_harness_evolution.py` and the native
+`metacodes-project-harness-lifecycle` driver evaluate the next evidence level
+without a provider. The orchestrator freezes the driver, fixed kernel, direct
+Lean toolchain binary, isolated builder, SDK source/olean and repository
+identity before running four separate phases:
+
+```text
+real transcript-backed user correction
+  -> host source receipt + typed candidate
+  -> Seatbelt/bubblewrap Lean build + empty-axiom audit
+  -> replay + shadow + fixed-kernel promotion + active CAS
+  -> production RunControl reload
+  -> existing-file Write blocked before dispatch
+  -> Edit admitted, executed and re-observed
+  -> independent-process native audit
+  -> independent Python artifact audit
+```
+
+The Python audit does not trust the driver's booleans. It reopens the source
+transcript/receipt, content-addressed candidate, isolated build manifest,
+lifecycle predecessor chain and actor identities, active pointer/bundle,
+runtime journal and final file state. It independently checks the causal event
+order `Write pre-block -> no Write dispatch` and
+`Edit pre-admit -> dispatch -> post-admit -> successful re-observed effect`.
+Journal tamper, hard-linked active state and a falsified final result are
+negative regression cases and fail closed.
+
+The retained 2026-08-09 local run under
+`zig-out/reports/project-harness-e2-20260809` passed all nine E2 gates. Its
+manifest SHA-256 is
+`a21bc6d9cecb0da6ad71f830626e54a308e2b294b3c582323cdb93cfe1504b35`;
+candidate identity is
+`7b80afc89f841ac2f360f3e728f4d92dfe913e59885a4dd481f1bcb3cc6740d5`;
+promoted bundle identity is
+`d57ad4f1b891d900e72d6145428bd63cec752105f546c465a153a14694894c4c`.
+Provider requests and paid cost were both zero. This permits the claim that
+the governed correction-to-production lifecycle works for the bounded pilot.
+It still does not establish semantic generalization, model-task benefit or
+cache preservation; those remain E3 outcomes.
+
 Report rule growth and maintenance cost as well as task success; a safer
 Harness that destroys context/cache reuse or consumes more maintenance budget
 than it saves is not an improvement.
