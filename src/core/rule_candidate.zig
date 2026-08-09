@@ -74,6 +74,7 @@ pub const Loaded = struct {
     candidate_id: [64]u8,
     project_sha256: [64]u8,
     proposer_sha256: [64]u8,
+    invariant_sha256: [64]u8,
     lean_source_sha256: [64]u8,
     rule_spec: project_rule_spec.Spec,
     source_kind: SourceKind,
@@ -85,6 +86,7 @@ pub const Loaded = struct {
     source_issuer_sha256: ?[64]u8,
     source_observation: ?observation_journal.RunBinding,
     source_interval_sha256: ?[64]u8,
+    source_falsifier_sha256: ?[64]u8,
 
     pub fn deinit(self: *Loaded) void {
         self.arena.deinit();
@@ -344,6 +346,7 @@ pub fn load(
     var source_issuer_sha256: ?[64]u8 = null;
     var source_observation: ?observation_journal.RunBinding = null;
     var source_interval_sha256: ?[64]u8 = null;
+    var source_falsifier_sha256: ?[64]u8 = null;
     const source_kind: SourceKind = switch (record.body.source) {
         .user_correction => |source| blk: {
             source_receipt_id = parseLowerHex64(source.receipt_id) orelse return error.InvalidCandidate;
@@ -361,6 +364,7 @@ pub fn load(
                 return error.InvalidCandidate;
             if (!validText(source.falsifier, MAX_FALSIFIER_BYTES))
                 return error.InvalidCandidate;
+            source_falsifier_sha256 = observation.sha256Hex(source.falsifier);
             break :blk .agent_reflection;
         },
         .runtime_counterexample => |source| blk: {
@@ -378,6 +382,7 @@ pub fn load(
         .candidate_id = candidate_id,
         .project_sha256 = project,
         .proposer_sha256 = proposer,
+        .invariant_sha256 = observation.sha256Hex(record.body.invariant),
         .lean_source_sha256 = observation.sha256Hex(record.body.lean_source),
         .rule_spec = spec,
         .source_kind = source_kind,
@@ -386,6 +391,7 @@ pub fn load(
         .source_issuer_sha256 = source_issuer_sha256,
         .source_observation = source_observation,
         .source_interval_sha256 = source_interval_sha256,
+        .source_falsifier_sha256 = source_falsifier_sha256,
     };
 }
 

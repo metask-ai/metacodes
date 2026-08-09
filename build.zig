@@ -1255,6 +1255,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/base_url_flag_test.zig",
         "tests/component/task_error_test.zig",
         "tests/component/tool_loop_breaker_test.zig",
+        "tests/component/rule_author_test.zig",
         "tests/component/plan_mode_inject_test.zig",
         "tests/component/agent_background_test.zig",
         "tests/component/skill_fileref_test.zig",

@@ -38,6 +38,7 @@ test {
     _ = @import("component/tool_concurrency_test.zig");
     _ = @import("component/tool_observation_test.zig");
     _ = @import("component/project_rule_gate_test.zig");
+    _ = @import("component/rule_author_test.zig");
     _ = @import("component/tool_result_storage_test.zig");
     _ = @import("component/cache_break_test.zig");
     _ = @import("component/microcompact_test.zig");
