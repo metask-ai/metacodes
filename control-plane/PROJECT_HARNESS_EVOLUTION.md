@@ -15,7 +15,8 @@ reveals its failure modes:
 ```text
 actual tool signals
   -> user correction / agent reflection / runtime counterexample
-  -> candidate Lean rule
+  -> isolated rule-author provider call
+  -> typed invariant + falsifier + candidate Lean rule
   -> isolated build + axiom audit + historical replay + shadow execution
   -> independent promotion
   -> hash-pinned project rule bundle
@@ -95,13 +96,102 @@ interval because that evidence is emitted by the runtime. Until the other
 receipts exist, their hashes are immutable claims, not proof of authority.
 
 The preferred reflection trigger is post-Run and event-driven. A separate
-review call receives a bounded observation interval and proposes a candidate;
-its output is not appended to the main Conversation and therefore does not
-rewrite the provider-visible history or its warm cache prefix. It should run
-after user correction, a failed/blocked Run, a formal counterexample, or a
-repeated anomaly—not after every successful turn. The main actor may author
-that hypothesis, but the later builder, shadow evaluator, and promoter remain
-independent roles.
+rule-author provider call receives a bounded observation interval and proposes
+a candidate; its output is not appended to the main Conversation and therefore
+does not rewrite the actor's provider-visible history or warm cache prefix. It
+should run after user correction, a failed/blocked Run, a formal
+counterexample, or a repeated anomaly—not after every successful turn. The
+main actor may emit a low-authority reflection as source evidence, but it does
+not author the executable rule. The rule author, builder, shadow evaluator,
+and promoter are distinct roles.
+
+### Provider-isolated rule authoring
+
+All semantic model capability in metacodes comes from configured providers;
+there is no privileged in-process LLM. Turning natural-language correction or
+reflection into a Lean candidate is therefore an explicit provider operation,
+not an implicit capability of Zig or Lean:
+
+```text
+actor provider
+  -> performs the project task and emits bounded actual observations
+
+rule-author provider
+  -> reads the correction/reflection plus a bounded observation snapshot
+  -> emits a typed invariant, scope, positive cases, falsifier and Lean draft
+
+host + Lean lifecycle
+  -> schema validation, build, axiom audit, replay, shadow and fixed-kernel gate
+
+independent promoter
+  -> publishes a hash-pinned revision; the author cannot self-promote
+```
+
+The rule-author role has its own frozen system prompt, provider/model
+fingerprint, Conversation, run id, credential capability and cache namespace.
+Its prompt teaches the project signal ontology, candidate schema, theorem
+boundary, falsifier requirement and forbidden authority claims; it is not a
+variant of the actor system prompt. It receives no future confirmatory cases,
+cannot dispatch project tools, cannot mutate the active bundle and cannot
+classify its own output as proven or promoted. Every candidate binds the exact
+source receipt and observation interval from which it was derived.
+
+Using a different provider or independently trained model for rule authoring
+is the preferred evidence boundary because it reduces correlated actor/author
+failure. Reusing one provider with separate model, prompt and state is only
+role isolation and must be reported as weaker evidence, not provider
+independence. An optional independent semantic reviewer may reject underscoped
+or overbroad candidates before replay, but it cannot replace the mechanical
+Lean/Zig gates.
+
+Rule-author usage is accounted separately: requests, tokens, cache reads and
+writes, latency, dollars, candidate compile rate, replay FP/FN, shadow
+divergence, human interventions and proposal-to-promotion time. None of its
+messages enter the actor Conversation, so project rule evolution cannot claim
+an actor-cache benefit by silently moving authoring tokens into the actor
+prefix.
+
+The default authoring policy is sparse, not continuous trajectory analysis.
+`core/rule_impact_stats.zig` already provides the first local observer: it
+folds a completed, hash-bound journal interval into integer sufficient
+statistics for authoritative/speculative dispatch, outcome, realized effect,
+re-observation failure, per-rule admit/block/fault, shadow divergence,
+post-block progress, physical checker calls and checker time. External
+grader/user/task-audit labels may add task/trustworthy success, drift, cost and
+metered tokens without pretending that `end_turn` means success. Provider
+request count, wall time and cache read/write usage should enter through the
+same authenticated Run usage receipt; they do not justify re-reading the full
+Conversation.
+
+The cheap path remains entirely local:
+
+```text
+completed journal + evidence-bound outcome/usage labels
+  -> deterministic impact statistics
+  -> threshold/repetition/correction trigger
+  -> bounded observation packet with interval hash and evidence locators
+  -> optional rule-author provider call
+```
+
+Ordinary successful Runs stop before the provider step. Triggering is limited
+to explicit user correction, repeated typed failure, formal counterexample,
+high-confidence drift or a stable aggregate threshold. The packet contains
+derived statistics and only the smallest necessary evidence window, never the
+whole trajectory by default. Multiple related events may be batched into one
+author call. A per-project request/token/dollar authority and cooldown fail
+closed before authoring; if measured avoided rework does not repay authoring,
+review and runtime overhead, the controller reduces frequency or disables
+automatic authoring. A cheaper independent provider is therefore preferred
+when it preserves candidate quality and independence.
+
+Task-direction control should also start with a small typed actuator set such
+as `continue`, `replan`, `branch`, `stop`, `escalate`, or `reject_side_effect`.
+The control provider proposes which direction best serves the observed
+success/stability/time/cost objective; Lean checks only that the proposed
+transition stays inside the promoted safety, evidence and budget envelope;
+Zig executes it and re-observes the next state. Lean is not asked to infer the
+best project strategy from prose, and an efficiency score cannot override a
+hard safety invariant.
 
 ## Candidate lifecycle
 
@@ -594,6 +684,44 @@ claims. The corrected contract rejects sub-reserve caps during freeze and the
 real loopback runner L2 proves that the frozen minimum reaches a provider
 socket before a new paid manifest is admitted. This negative result is part of
 the control-plane evidence: expected spend is not a safe authorization cap.
+
+The corrected confirmatory run completed all 48 frozen rollouts. All 48 budget
+transactions committed with zero unsettled authorization; the authoritative
+journal charged USD 0.641806 for 1,117,895 metered tokens. Every one of the
+twelve cases preserved a byte-identical first provider request and cacheable
+prefix across arms, all rollouts stopped safely, all four safe cases had zero
+false interventions, and formal-checker p95 remained below 5.1 ms.
+
+The safety actuator itself was decisive: `signal_only`, `static_enforced` and
+`evolved_shadow` each dispatched and realized the prohibited existing-file
+`Write` in 8/8 hazard cases, while `evolved_enforced` dispatched and realized
+it in 0/8, with no repeated prohibited attempt after a block. Context fidelity
+was not the limiting failure: all six evolved long-context rollouts completed,
+including the multi-source cases that had to retain opaque values across
+several reads. Cache reads remained active in every arm.
+
+The preregistered outcome claim nevertheless failed. GLM recovered exactly in
+only 4/8 enforced hazard cases, yielding four paired trustworthy-success
+improvements, zero regressions and two-sided exact McNemar `p=0.125`, below the
+frozen minimum of six improvements and not statistically significant. The four
+failures were short full-file replacements: after the `Write` block the actor
+switched to admitted `Edit`, but omitted the source file's terminal newline
+from `old_string`, left an extra blank line, then incorrectly declared exact
+completion. This is a useful actor/tool-contract counterexample, not a Lean,
+dispatcher, context or cache failure. `evolved_enforced` also used more total
+requests and dollars than `signal_only` (61 versus 54 requests; USD 0.177402
+versus 0.148837), although its cost, requests and wall time per trustworthy
+success were lower because it produced twice as many trustworthy successes.
+The stability gate therefore rejects a production preference.
+
+The retained local report has manifest id
+`dbf52121cbef1a0f11f4f99c27f6d8f0b18529047ca38dada0bba75e54288485`
+and SHA-256
+`362697aab9b353f4c35e6c90913d045d2f64e83c394fbf96a14bb23cb9490d0a`.
+Raw prompts, cassettes, journals and rollout artifacts remain outside the
+repository in the isolated local experiment tree. This E3 run evaluates a
+frozen evolved rule against a GLM actor; it does not evaluate provider-backed
+rule authoring. That authoring path is the next independent vertical slice.
 
 ### Compile-time actuation and native provider-boundary L2
 
