@@ -66,6 +66,8 @@ pub const BindingValidation = struct {
 /// replay/shadow validation, not a model-supplied summary.
 pub const RunDispatch = struct {
     id: []const u8,
+    started_sequence: u64,
+    finished_sequence: u64,
     requested_name: []const u8,
     dispatched_name: []const u8,
     origin: observation.Origin,
@@ -79,6 +81,7 @@ pub const RunDispatch = struct {
 };
 
 pub const RunFormalDecision = struct {
+    sequence: u64,
     dispatch_id: []const u8,
     phase: observation.FormalPhase,
     actuation: observation.FormalActuation,
@@ -394,6 +397,7 @@ pub fn loadRunDispatches(
                 return error.InvalidRunBinding,
             .tool_observation => |event| switch (event) {
                 .formal_decision => |formal| try formal_decisions.append(a, .{
+                    .sequence = envelope.sequence,
                     .dispatch_id = formal.dispatch_id,
                     .phase = formal.phase,
                     .actuation = formal.actuation,
@@ -415,6 +419,7 @@ pub fn loadRunDispatches(
                 }),
                 .formal_decision_batch => |batch| for (batch.decisions) |decision| {
                     try formal_decisions.append(a, .{
+                        .sequence = envelope.sequence,
                         .dispatch_id = batch.dispatch_id,
                         .phase = batch.phase,
                         .actuation = batch.actuation,
@@ -441,6 +446,8 @@ pub fn loadRunDispatches(
                     const index = records.items.len;
                     try records.append(a, .{
                         .id = started.id,
+                        .started_sequence = envelope.sequence,
+                        .finished_sequence = envelope.sequence,
                         .requested_name = started.requested_name,
                         .dispatched_name = started.dispatched_name,
                         .origin = started.origin,
@@ -464,6 +471,7 @@ pub fn loadRunDispatches(
                         record.agent_depth != finished.agent_depth)
                         return error.InvalidRecord;
                     record.outcome = finished.outcome;
+                    record.finished_sequence = envelope.sequence;
                     record.effect = finished.effect;
                     record.effect_valid = finished.effect_valid;
                 },

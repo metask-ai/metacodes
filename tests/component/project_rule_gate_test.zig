@@ -984,6 +984,20 @@ test "L2 evolved existing-file rule blocks overwrite, permits creation, and leav
     try std.testing.expectEqual(@as(usize, 1), blocked_regular);
     try std.testing.expectEqual(@as(usize, 1), admitted_missing);
     try std.testing.expectEqual(@as(usize, 1), blocked_other);
+
+    var impact = try cc.rule_impact_stats.derive(allocator, &observed, .{});
+    defer impact.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 6), impact.formal_decisions);
+    try std.testing.expectEqual(@as(u64, 6), impact.physical_checker_calls);
+    try std.testing.expectEqual(@as(u64, 2), impact.enforced_pre_blocks_before_dispatch);
+    try std.testing.expectEqual(@as(u64, 2), impact.authoritative_dispatches);
+    try std.testing.expectEqual(@as(u64, 2), impact.authoritative_successes);
+    try std.testing.expectEqual(@as(u64, 2), impact.realized_file_changes);
+    try std.testing.expectEqual(@as(u64, 2), impact.subsequent_authoritative_successes);
+    try std.testing.expectEqual(@as(usize, 1), impact.rules.len);
+    try std.testing.expectEqual(@as(u64, 2), impact.rules[0].enforced_pre_blocks_before_dispatch);
+    // A completed host Run is not automatically labeled as a successful task.
+    try std.testing.expect(impact.labels.task_success == null);
 }
 
 test "L2 shadow project rule records Lean blocks without changing real dispatch" {
@@ -1093,6 +1107,14 @@ test "L2 shadow project rule records Lean blocks without changing real dispatch"
             decision.file_target_state,
         );
     }
+    var impact = try cc.rule_impact_stats.derive(allocator, &observed, .{});
+    defer impact.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 1), impact.shadow_pre_blocks_followed_by_dispatch);
+    try std.testing.expectEqual(@as(u64, 0), impact.enforced_pre_blocks_before_dispatch);
+    try std.testing.expectEqual(@as(u64, 1), impact.authoritative_dispatches);
+    try std.testing.expectEqual(@as(u64, 1), impact.realized_file_changes);
+    try std.testing.expectEqual(@as(usize, 1), impact.rules.len);
+    try std.testing.expectEqual(@as(u64, 1), impact.rules[0].shadow_pre_blocks_followed_by_dispatch);
 }
 
 test "L2 active project rules fail closed before dispatch on artifact or kernel drift" {
@@ -1636,6 +1658,12 @@ test "L2 malformed Lean batch verdict fails before the real dispatcher" {
         "verdict_binding_mismatch",
         observed.formal_decisions[0].checker_failure orelse return error.MissingCheckerFailure,
     );
+    var impact = try cc.rule_impact_stats.derive(allocator, &observed, .{});
+    defer impact.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 0), impact.enforced_pre_blocks_before_dispatch);
+    try std.testing.expectEqual(@as(u64, 1), impact.enforced_pre_faults_before_dispatch);
+    try std.testing.expectEqual(@as(u64, 1), impact.formal_faults);
+    try std.testing.expectEqual(@as(u64, 0), impact.authoritative_dispatches);
 }
 
 test "L2 same-cardinality batch binding drift has no durable verdict and no dispatch" {
