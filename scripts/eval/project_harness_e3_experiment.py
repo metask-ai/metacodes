@@ -85,6 +85,13 @@ E3_DISALLOWED_TOOLS = (
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_JOURNAL_BYTES = 64 * 1024 * 1024
 MAX_KERNEL_RUNTIME_DEPENDENCIES = 64
+# The production runner deliberately disables model probing. The native
+# provider therefore reserves its full conservative 200K fallback input
+# window plus output, priced at the worst input/cache-write guardrail rate.
+# Keep the Python authority strictly above that native pre-request gate; the
+# real loopback L2 remains the executable cross-check for implementation drift.
+E3_MIN_ROLLOUT_COST_USD = 0.90
+E3_MIN_ROLLOUT_METERED_TOKENS = 300_000
 
 
 def _canonical_sha256(value: Any) -> str:
@@ -382,10 +389,11 @@ def _validate_execution_contract(execution: Any, schedule_length: int) -> Mappin
     total_tokens = positive_integer("max_total_metered_tokens")
     max_output = positive_integer("max_output_tokens")
     if (
-        rollout_cost <= 0
+        rollout_cost < E3_MIN_ROLLOUT_COST_USD
         or total_cost <= 0
         or total_cost > 1000
         or rollout_cost * schedule_length >= total_cost
+        or rollout_tokens < E3_MIN_ROLLOUT_METERED_TOKENS
         or rollout_tokens * schedule_length >= total_tokens
         or max_output > 64 * 1024
     ):

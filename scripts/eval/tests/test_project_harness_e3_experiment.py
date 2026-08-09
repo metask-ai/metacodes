@@ -70,6 +70,8 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
         }
         self.assertIs(execution, _validate_execution_contract(execution, 16))
         mutations = (
+            ("max_rollout_cost_usd", 0.89),
+            ("max_rollout_metered_tokens", 299_999),
             ("max_total_cost_usd", 1000.01),
             ("max_total_cost_usd", math.nan),
             ("max_total_cost_usd", False),

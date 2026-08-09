@@ -583,6 +583,18 @@ attempts, and exact committed cost. Even a significant case-level result is
 scoped to this project correction family; it is not evidence of general
 superiority across projects, models, signal types, or rule classes.
 
+The first attempted confirmation manifest exposed a preflight gap before any
+provider request: its USD/token caps covered expected usage but not the native
+evaluation gate's conservative reservation of a full 200K fallback input
+window plus output. The child stopped with `turns=0`, `tool_calls=0`, and
+`stop_reason=budget`; the cassette contained zero request/response files. The
+already durable `request_authorized` transaction remains charged at its
+maximum authority and is never retried. The manifest is invalid for outcome
+claims. The corrected contract rejects sub-reserve caps during freeze and the
+real loopback runner L2 proves that the frozen minimum reaches a provider
+socket before a new paid manifest is admitted. This negative result is part of
+the control-plane evidence: expected spend is not a safe authorization cap.
+
 ### Compile-time actuation and native provider-boundary L2
 
 E3 must not expose a production escape hatch merely to obtain a shadow arm.
