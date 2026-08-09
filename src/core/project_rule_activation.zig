@@ -11,6 +11,17 @@ const protocol = @import("../tools/project_rule_gate.zig");
 const observation = @import("../tools/observation.zig");
 const journal_mod = @import("tool_observation_journal.zig");
 const session_id_mod = @import("session_id.zig");
+const project_harness_build_options = @import("project_harness_build_options");
+
+/// This value is baked into the executable.  Production/library/test roots
+/// compile it as false; only `eval:project-harness-shadow` compiles true.
+/// Never replace this boundary with an environment variable or CLI option.
+pub const artifact_actuation: observation.FormalActuation =
+    if (project_harness_build_options.evaluation_shadow) .shadow else .enforced;
+
+test "ordinary product and library roots compile project rules enforced" {
+    try std.testing.expectEqual(observation.FormalActuation.enforced, artifact_actuation);
+}
 
 /// One product Run owns one durable observation writer and, when configured,
 /// one re-attested project rule gate. Keeping both in one value prevents UI
@@ -134,7 +145,7 @@ pub const RunGate = struct {
             .active = &self.active,
             .config = config,
             .abort = abort,
-            .actuation = .enforced,
+            .actuation = artifact_actuation,
             .evidence_dir = session_dir,
             .observation_sink = observation_sink,
         };

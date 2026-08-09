@@ -6,11 +6,25 @@ const std = @import("std");
 // optimize 编译;未用的 import 零成本)。tree-sitter 已于 2026-07-13 整体移除。
 var g_hl_mod: ?*std.Build.Module = null;
 fn addHl(b: *std.Build, mod: *std.Build.Module) void {
+    addHlWithProjectHarnessActuation(b, mod, false);
+}
+
+/// Project-Harness actuation is an artifact property, never a runtime switch.
+/// Every ordinary product/test/library root is compiled enforced.  The sole
+/// shadow artifact is wired explicitly below and is not part of `install`.
+fn addHlWithProjectHarnessActuation(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    evaluation_shadow: bool,
+) void {
     if (g_hl_mod == null) {
         g_hl_mod = b.createModule(.{ .root_source_file = b.path("lib/highlight-zig/src/lib.zig") });
     }
     mod.addImport("hl", g_hl_mod.?);
     addPlatform(b, mod); // platform 底座与 hl 同套模块（凡编译 app 代码者都需要）
+    const project_harness_options = b.addOptions();
+    project_harness_options.addOption(bool, "evaluation_shadow", evaluation_shadow);
+    mod.addOptions("project_harness_build_options", project_harness_options);
 }
 
 // platform —— 可移植系统抽象层(sync/process/fs/signal/rng/paths)。作为命名模块暴露,
@@ -219,6 +233,30 @@ pub fn build(b: *std.Build) void {
         .root_module = release_mod,
     });
     b.installArtifact(exe);
+
+    // E3 causal evaluation only: same product root/provider/agent/tool path,
+    // but formal blocks are observed rather than actuated.  There is no env or
+    // CLI switch and this artifact is deliberately absent from default install.
+    const project_harness_shadow_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = .ReleaseSmall,
+        .link_libc = true,
+    });
+    addHlWithProjectHarnessActuation(b, project_harness_shadow_mod, true);
+    const project_harness_shadow_exe = b.addExecutable(.{
+        .name = "metacodes-project-harness-shadow",
+        .root_module = project_harness_shadow_mod,
+    });
+    const install_project_harness_shadow = b.addInstallArtifact(
+        project_harness_shadow_exe,
+        .{ .dest_dir = .{ .override = .{ .custom = "eval/bin" } } },
+    );
+    const project_harness_shadow_step = b.step(
+        "eval:project-harness-shadow",
+        "Build the compile-time-bound E3 shadow app (not a production install artifact)",
+    );
+    project_harness_shadow_step.dependOn(&install_project_harness_shadow.step);
 
     // tinykg —— KG 记忆/计划/任务 DAG 引擎(subprocess CLI)。从 **vendored 源**(lib/tinykg,
     // 源码快照非 submodule → plain clone 即可构建)交叉编译到当前 -Dtarget,装到
@@ -826,6 +864,40 @@ pub fn build(b: *std.Build) void {
     project_harness_lifecycle_driver_step.dependOn(
         &install_project_harness_lifecycle_driver.step,
     );
+    // Explicit, expensive native L2: it builds a real promoted rule, starts a
+    // loopback provider, and runs both full CLI artifacts. Keep it out of the
+    // default aggregate so routine CI health does not pay Lean-build latency.
+    const project_harness_kernel_cmd = b.addSystemCommand(&.{
+        "bash",
+        "scripts/build-project-harness-kernel.sh",
+    });
+    const project_harness_python = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const project_harness_binary_boundary_cmd = b.addSystemCommand(&.{
+        project_harness_python,
+        "scripts/eval/project_harness_binary_boundary.py",
+        "--repo",
+        b.build_root.path orelse ".",
+        "--production",
+    });
+    project_harness_binary_boundary_cmd.addArtifactArg(exe);
+    project_harness_binary_boundary_cmd.addArg("--shadow");
+    project_harness_binary_boundary_cmd.addArtifactArg(project_harness_shadow_exe);
+    project_harness_binary_boundary_cmd.addArg("--driver");
+    project_harness_binary_boundary_cmd.addArtifactArg(project_harness_lifecycle_driver);
+    project_harness_binary_boundary_cmd.addArgs(&.{
+        "--kernel",
+        b.pathFromRoot("zig-out/libexec/metacodes/metacodes-project-kernel"),
+        "--builder",
+        b.pathFromRoot("scripts/build_project_rule.py"),
+        "--output",
+        b.pathFromRoot("zig-out/reports/project-harness-binary-boundary.json"),
+    });
+    project_harness_binary_boundary_cmd.step.dependOn(&project_harness_kernel_cmd.step);
+    const project_harness_binary_boundary_step = b.step(
+        "test:project-harness-binary-boundary",
+        "Run the real production/enforced vs eval/shadow loopback-provider L2",
+    );
+    project_harness_binary_boundary_step.dependOn(&project_harness_binary_boundary_cmd.step);
     const core_test = b.addTest(.{
         .name = "metacodes-core-test",
         .root_module = core_test_mod,

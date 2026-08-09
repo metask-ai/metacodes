@@ -543,6 +543,38 @@ the governed correction-to-production lifecycle works for the bounded pilot.
 It still does not establish semantic generalization, model-task benefit or
 cache preservation; those remain E3 outcomes.
 
+### Compile-time actuation and native provider-boundary L2
+
+E3 must not expose a production escape hatch merely to obtain a shadow arm.
+The ordinary `metacodes`, debug, library and test roots therefore compile
+`project_harness_build_options.evaluation_shadow=false`. The only true value is
+the separately requested `metacodes-project-harness-shadow` artifact built by
+`zig build eval:project-harness-shadow`; it is absent from the default install,
+and there is no environment or CLI actuation switch.
+
+`zig build test:project-harness-binary-boundary` is the explicit native L2 for
+this boundary. It creates a real transcript-backed candidate through the full
+isolated Lean lifecycle, promotes it for one stable project root, then drives
+the production and shadow CLI artifacts through the same loopback provider and
+real headless agent/tool path. The test requires:
+
+- byte-identical first provider request bodies across both artifacts;
+- a shadow block verdict followed by a real `Write` dispatcher entry;
+- an enforced block verdict with no `Write` dispatcher entry;
+- a real `Read -> Edit` recovery and matching final file re-observation;
+- production remaining enforced even when a hostile-looking shadow environment
+  variable is present; and
+- durable journals whose actuation mode matches the compiled artifact.
+
+The retained local report is
+`zig-out/reports/project-harness-binary-boundary.json`. The first verified run
+used a 55,312-byte byte-identical causal prefix, two loopback requests in shadow
+and four in enforced recovery, with zero external provider requests and zero
+paid cost. `Write` reached the shadow dispatcher but was then rejected by the
+independent must-read-first policy; that is correctly recorded as a shadow
+dispatch without a realized file mutation, not misclassified as formal
+actuation. This remains E2 mechanism/boundary evidence, not E3 outcome evidence.
+
 Report rule growth and maintenance cost as well as task success; a safer
 Harness that destroys context/cache reuse or consumes more maintenance budget
 than it saves is not an improvement.
