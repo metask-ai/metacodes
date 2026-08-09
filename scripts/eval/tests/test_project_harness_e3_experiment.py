@@ -14,6 +14,8 @@ from scripts.eval.project_harness_e3_experiment import (
     analyze_journal,
     grade_workspace,
     E3_ALLOWED_TOOLS,
+    E3_AUTO_MEMORY_POLICY,
+    E3_LONG_HORIZON_ARM,
     E3_DISALLOWED_TOOLS,
     E3Error,
 )
@@ -57,6 +59,8 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
             "serial_rollouts": True,
             "fresh_home_per_rollout": True,
             "stable_absolute_project_root": True,
+            "auto_memory_policy": E3_AUTO_MEMORY_POLICY,
+            "long_horizon_arm": E3_LONG_HORIZON_ARM,
         }
         self.assertIs(execution, _validate_execution_contract(execution, 16))
         mutations = (
@@ -65,6 +69,8 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
             ("max_total_cost_usd", False),
             ("max_total_metered_tokens", 4_800_000),
             ("model_provider", "drifted-provider"),
+            ("auto_memory_policy", "enabled"),
+            ("long_horizon_arm", "tinykg"),
         )
         for field, value in mutations:
             with self.subTest(field=field, value=value):

@@ -61,6 +61,8 @@ if __package__ in {None, ""}:
     from scripts.eval.project_harness_e3_experiment import (  # type: ignore
         ARMS,
         CASE_BY_ID,
+        E3_AUTO_MEMORY_POLICY,
+        E3_LONG_HORIZON_ARM,
         E3_ALLOWED_TOOLS,
         E3_DISALLOWED_TOOLS,
         E3Error,
@@ -119,6 +121,8 @@ else:
     from .project_harness_e3_experiment import (
         ARMS,
         CASE_BY_ID,
+        E3_AUTO_MEMORY_POLICY,
+        E3_LONG_HORIZON_ARM,
         E3_ALLOWED_TOOLS,
         E3_DISALLOWED_TOOLS,
         E3Error,
@@ -258,6 +262,8 @@ def _environment_fingerprint(
             "kernel_sha256": kernel_sha256,
             "child_path": PRODUCTION_CHILD_PATH,
             "auto_compact_policy": PRODUCTION_AUTO_COMPACT_POLICY,
+            "auto_memory_policy": E3_AUTO_MEMORY_POLICY,
+            "long_horizon_arm": E3_LONG_HORIZON_ARM,
         }
     )
 
@@ -285,6 +291,8 @@ def _harness_fingerprint(
             "allowed_tools": list(E3_ALLOWED_TOOLS),
             "disallowed_tools": list(E3_DISALLOWED_TOOLS),
             "ripgrep_sha256": ripgrep_sha256,
+            "auto_memory_policy": E3_AUTO_MEMORY_POLICY,
+            "long_horizon_arm": E3_LONG_HORIZON_ARM,
             "repository": manifest["repository"],
         }
     )
@@ -530,6 +538,8 @@ def _run_one(
             "METACODES_EVAL_FD": str(events_file.fileno()),
             "METACODES_FORCE_COMPACT_AT": PRODUCTION_FORCE_COMPACT_AT,
             "METACODES_NO_AUTO_RECALL": "1",
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+            "METACODES_LONG_HORIZON_ARM": E3_LONG_HORIZON_ARM,
             "METACODES_PROJECT_KERNEL_PATH": str(kernel),
             "METACODES_PROJECT_KERNEL_SHA256": kernel_sha256,
             "RG_BIN": str(pinned_ripgrep),
@@ -754,6 +764,8 @@ def _run_one(
             "E3-paid-model-rollout" if test_base_url is None else "E2-loopback-runner-boundary"
         ),
         "quality_evidence": test_base_url is None,
+        "auto_memory_policy": E3_AUTO_MEMORY_POLICY,
+        "long_horizon_arm": E3_LONG_HORIZON_ARM,
         "sequence": sequence,
         "case_id": case["id"],
         "trial": schedule["trial"],

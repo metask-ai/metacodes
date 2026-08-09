@@ -45,6 +45,8 @@ from .statistics import exact_mcnemar, wilson_interval
 
 MANIFEST_SCHEMA = "metacodes-project-harness-e3-manifest-v1"
 ROLLOUT_SCHEMA = "metacodes-project-harness-e3-rollout-v1"
+E3_AUTO_MEMORY_POLICY = "disabled-for-provider-prefix-equivalence-v1"
+E3_LONG_HORIZON_ARM = "codex_style"
 REPORT_SCHEMA = "metacodes-project-harness-e3-report-v1"
 ARMS = (
     "signal_only",
@@ -204,6 +206,8 @@ def _validate_execution_contract(execution: Any, schedule_length: int) -> Mappin
         or execution.get("serial_rollouts") is not True
         or execution.get("fresh_home_per_rollout") is not True
         or execution.get("stable_absolute_project_root") is not True
+        or execution.get("auto_memory_policy") != E3_AUTO_MEMORY_POLICY
+        or execution.get("long_horizon_arm") != E3_LONG_HORIZON_ARM
     ):
         raise E3Error("E3 execution contract drift")
     return execution
@@ -365,6 +369,8 @@ def freeze_manifest(
             "serial_rollouts": True,
             "fresh_home_per_rollout": True,
             "stable_absolute_project_root": True,
+            "auto_memory_policy": E3_AUTO_MEMORY_POLICY,
+            "long_horizon_arm": E3_LONG_HORIZON_ARM,
         },
         "arms": ARM_CONFIG,
         "cases": list(CASES),
@@ -738,6 +744,8 @@ def _reopen_rollout_receipt(
         or row.get("bundle_sha256") != (
             expected_template["bundle_sha256"] if expected_template is not None else None
         )
+        or row.get("auto_memory_policy") != manifest["execution"]["auto_memory_policy"]
+        or row.get("long_horizon_arm") != manifest["execution"]["long_horizon_arm"]
     ):
         raise E3Error("E3 rollout treatment identity drift")
 

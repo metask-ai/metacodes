@@ -26,6 +26,7 @@ from scripts.eval.memory_replay import (
 )
 from scripts.eval.project_harness_e3_experiment import (
     ARMS,
+    ARM_CONFIG,
     CASE_BY_ID,
     E3_ALLOWED_TOOLS,
     E3_DISALLOWED_TOOLS,
@@ -310,6 +311,10 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
             self.assertEqual(2, receipt["governance"]["speculative_prefetch_dispatches"])
             self.assertEqual(4, receipt["provider_requests"])
             self.assertEqual(1, snapshot["transaction_states"]["committed"])
+            first_system = provider.requests[0]["system"]
+            self.assertNotIn("# Memory", first_system)
+            self.assertNotIn("# Knowledge Graph", first_system)
+            self.assertNotIn(str(run_dir), first_system)
 
     def test_real_evolved_runner_blocks_before_dispatch_and_recovers(self) -> None:
         binary_raw = os.environ.get("METACODES_TEST_PROJECT_HARNESS_PRODUCTION_BIN")
@@ -370,20 +375,20 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
                     "max_total_cost_usd": 2.0,
                     "max_total_metered_tokens": 600_001,
                 },
-                "arms": {
-                    arm: {
-                        "binary": "production_binary",
-                        "rule_flavor": "evolved",
-                        "actuation": "enforced",
-                    }
-                    for arm in ARMS
-                },
+                "arms": ARM_CONFIG,
             }
-            schedule = {
+            signal_schedule = {
                 "sequence": 0,
                 "case_id": case["id"],
                 "trial": 0,
                 "position": 0,
+                "arm": "signal_only",
+            }
+            evolved_schedule = {
+                "sequence": 1,
+                "case_id": case["id"],
+                "trial": 0,
+                "position": 3,
                 "arm": "evolved_enforced",
             }
             authority = BudgetAuthority(
@@ -393,20 +398,36 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
                 total_cost_microusd=usd_to_microusd(2.0),
                 total_metered_tokens=600_001,
             )
-            with _HazardProvider(workspace) as provider, BudgetJournal(root / "budget.json", authority) as budget:
-                item = _run_one(
-                    repo=repo,
-                    manifest=manifest,
-                    templates=templates,
-                    schedule=schedule,
-                    run_dir=run_dir,
-                    ripgrep=ripgrep,
-                    ripgrep_sha256=file_sha256(ripgrep),
-                    api_key="loopback-secret-not-for-production",
-                    budget=budget,
-                    timeout_seconds=30,
-                    test_base_url=provider.url,
-                )
+            with BudgetJournal(root / "budget.json", authority) as budget:
+                with _HazardProvider(workspace) as signal_provider:
+                    _run_one(
+                        repo=repo,
+                        manifest=manifest,
+                        templates=templates,
+                        schedule=signal_schedule,
+                        run_dir=run_dir,
+                        ripgrep=ripgrep,
+                        ripgrep_sha256=file_sha256(ripgrep),
+                        api_key="loopback-secret-not-for-production",
+                        budget=budget,
+                        timeout_seconds=30,
+                        test_base_url=signal_provider.url,
+                    )
+                with _HazardProvider(workspace) as provider:
+                    item = _run_one(
+                        repo=repo,
+                        manifest=manifest,
+                        templates=templates,
+                        schedule=evolved_schedule,
+                        run_dir=run_dir,
+                        ripgrep=ripgrep,
+                        ripgrep_sha256=file_sha256(ripgrep),
+                        api_key="loopback-secret-not-for-production",
+                        budget=budget,
+                        timeout_seconds=30,
+                        test_base_url=provider.url,
+                    )
+            self.assertEqual(signal_provider.requests[0], provider.requests[0])
             receipt = json.loads(Path(item["receipt_path"]).read_text(encoding="utf-8"))
             governance = receipt["governance"]
             self.assertTrue(receipt["grader"]["passed"])
