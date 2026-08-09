@@ -139,6 +139,8 @@ else:
 CHECKPOINT_SCHEMA = "metacodes-project-harness-e3-checkpoint-v1"
 CHECKPOINT_NAME = "checkpoint.json"
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
+MAX_TIMEOUT_STREAM_BYTES = 1024 * 1024
+TIMEOUT_TRUNCATION_MARKER = b"\n[metacodes timeout diagnostic truncated]\n"
 
 
 def _safe_component(value: str) -> str:
@@ -146,6 +148,62 @@ def _safe_component(value: str) -> str:
     if not encoded or len(encoded) > 160:
         raise E3Error("invalid rollout path component")
     return encoded
+
+
+def _timeout_stream_bytes(value: str | bytes | None) -> bytes:
+    """Normalize TimeoutExpired streams without trusting text-mode behavior.
+
+    CPython documents ``TimeoutExpired.output`` as bytes even when the child
+    was launched with ``text=True``.  Other runtimes may preserve ``str``.
+    Treating either representation explicitly avoids losing the only provider
+    diagnostic at the paid authorization boundary.
+    """
+
+    if value is None:
+        return b""
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    raise E3Error("paid E3 timeout returned an unsupported stream type")
+
+
+def _bounded_timeout_stream(
+    value: str | bytes | None,
+    *,
+    api_key: str,
+) -> tuple[bytes, Mapping[str, Any]]:
+    """Redact the credential and retain a bounded head/tail diagnostic."""
+
+    raw = _timeout_stream_bytes(value)
+    redacted = raw
+    redactions = 0
+    encodings = {
+        api_key.encode("utf-8"),
+        json.dumps(api_key, ensure_ascii=False)[1:-1].encode("utf-8"),
+    }
+    for secret in sorted(encodings, key=len, reverse=True):
+        if not secret:
+            continue
+        count = redacted.count(secret)
+        if count:
+            redacted = redacted.replace(secret, b"[REDACTED_CREDENTIAL]")
+            redactions += count
+    truncated = len(redacted) > MAX_TIMEOUT_STREAM_BYTES
+    if truncated:
+        retained = MAX_TIMEOUT_STREAM_BYTES - len(TIMEOUT_TRUNCATION_MARKER)
+        head = retained // 2
+        tail = retained - head
+        persisted = redacted[:head] + TIMEOUT_TRUNCATION_MARKER + redacted[-tail:]
+    else:
+        persisted = redacted
+    return persisted, {
+        "captured_bytes": len(raw),
+        "persisted_bytes": len(persisted),
+        "persisted_sha256": hashlib.sha256(persisted).hexdigest(),
+        "truncated": truncated,
+        "credential_redactions": redactions,
+    }
 
 
 def _reset_workspace(workspace: Path, case: Mapping[str, Any], root: Path) -> None:
@@ -516,8 +574,82 @@ def _run_one(
             check=False,
             pass_fds=(metadata_fd, events_file.fileno(), credential_read_fd),
         )
+    except subprocess.TimeoutExpired as exc:
+        elapsed_ms = (time.monotonic_ns() - started) // 1_000_000
+        stdout_payload, stdout_evidence = _bounded_timeout_stream(
+            exc.stdout,
+            api_key=api_key,
+        )
+        stderr_payload, stderr_evidence = _bounded_timeout_stream(
+            exc.stderr,
+            api_key=api_key,
+        )
+        stdout_path = artifact_dir / "stdout.ndjson"
+        stderr_path = artifact_dir / "stderr.log"
+        _write_new(stdout_path, stdout_payload)
+        _write_new(stderr_path, stderr_payload)
+        native_events: Mapping[str, Any]
+        try:
+            finalize_evaluation_fd(events_file.fileno(), events)
+            native_events = {
+                "persisted": True,
+                "bytes": events.stat().st_size,
+                "sha256": _sha256_file(events),
+            }
+        except BaseException as finalize_error:
+            native_events = {
+                "persisted": False,
+                "error_type": type(finalize_error).__name__,
+                "error_sha256": hashlib.sha256(
+                    str(finalize_error).encode("utf-8")
+                ).hexdigest(),
+            }
+        finally:
+            events_file.close()
+        snapshot = budget.snapshot()
+        failure = {
+            "schema_version": "metacodes-project-harness-e3-child-timeout-v1",
+            "quality_evidence": False,
+            "sequence": sequence,
+            "run_id_sha256": hashlib.sha256(run_id.encode("utf-8")).hexdigest(),
+            "timed_out": True,
+            "timeout_seconds": timeout_seconds,
+            "elapsed_ms_host": elapsed_ms,
+            # subprocess.run raises only after killing and waiting for its
+            # direct child. This does not claim that arbitrary descendants or
+            # the remote provider stopped processing the authorized request.
+            "direct_child_killed_and_reaped": True,
+            "remote_request_outcome": "unknown",
+            "automatic_retry_forbidden": True,
+            "budget_transaction": authorized,
+            "budget_journal": {
+                "journal_id": snapshot["journal_id"],
+                "revision": snapshot["revision"],
+                "head_sha256": snapshot["head_sha256"],
+                "transaction_states": snapshot["transaction_states"],
+                "exposure_cost_microusd": snapshot["exposure_cost_microusd"],
+                "exposure_metered_tokens": snapshot["exposure_metered_tokens"],
+            },
+            "cassette": {
+                "request_files": len(list(cassette.glob("req-*.json"))),
+                "response_files": len(list(cassette.glob("resp-*.json"))),
+            },
+            "stdout": stdout_evidence,
+            "stderr": stderr_evidence,
+            "native_events": native_events,
+        }
+        _write_new(
+            artifact_dir / "child-timeout.json",
+            (stable_json(failure) + "\n").encode("utf-8"),
+        )
+        _assert_production_secret_absent(root, api_key)
+        raise E3Error(
+            f"paid E3 child timed out at sequence {sequence} after "
+            f"{timeout_seconds}s; automatic retry is forbidden"
+        ) from exc
     except BaseException:
-        events_file.close()
+        if not events_file.closed:
+            events_file.close()
         if authorized is None:
             budget.abort_pre_request(str(reserved["transaction_id"]))
         _assert_production_secret_absent(root, api_key)
