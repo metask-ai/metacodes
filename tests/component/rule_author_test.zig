@@ -16,6 +16,7 @@ const TEST_MODEL = "claude-sonnet-4-20250514";
 const PROJECT = [_]u8{'a'} ** 64;
 const AUTHOR = [_]u8{'b'} ** 64;
 const PROVIDER = [_]u8{'c'} ** 64;
+const BUDGET_AUTHORIZATION = [_]u8{'8'} ** 64;
 const PRICING = rule_author.PricingAuthority{
     .provenance_sha256 = .{'9'} ** 64,
     .input_microusd_per_mtok = 3_000_000,
@@ -72,6 +73,7 @@ fn prepareFailurePacket(
         .project_sha256 = PROJECT,
         .author_sha256 = AUTHOR,
         .provider_sha256 = PROVIDER,
+        .budget_authorization_sha256 = BUDGET_AUTHORIZATION,
         .model = model,
         .observation = binding,
         .trigger = .repeated_typed_failure,

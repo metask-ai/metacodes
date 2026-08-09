@@ -90,6 +90,7 @@ pub const PrepareInput = struct {
     project_sha256: [64]u8,
     author_sha256: [64]u8,
     provider_sha256: [64]u8,
+    budget_authorization_sha256: [64]u8,
     model: []const u8,
     observation: journal_mod.RunBinding,
     labels: impact_stats.RunLabels = .{},
@@ -128,6 +129,7 @@ pub const PreparedRequest = struct {
     project_sha256: [64]u8,
     author_sha256: [64]u8,
     provider_sha256: [64]u8,
+    budget_authorization_sha256: [64]u8,
     model: []const u8,
     model_sha256: [64]u8,
     system_prompt_sha256: [64]u8,
@@ -152,6 +154,7 @@ pub fn prepare(allocator: std.mem.Allocator, input: PrepareInput) !PreparedReque
     try validateIdentity(input.project_sha256);
     try validateIdentity(input.author_sha256);
     try validateIdentity(input.provider_sha256);
+    try validateIdentity(input.budget_authorization_sha256);
     if (!validText(input.model, MAX_MODEL_BYTES)) return error.InvalidModel;
     try validateCaps(input.caps);
     try validatePricing(input.pricing);
@@ -207,6 +210,7 @@ pub fn prepare(allocator: std.mem.Allocator, input: PrepareInput) !PreparedReque
         .project_sha256 = input.project_sha256,
         .author_sha256 = input.author_sha256,
         .provider_sha256 = input.provider_sha256,
+        .budget_authorization_sha256 = input.budget_authorization_sha256,
         .model = model,
         .model_sha256 = observation.sha256Hex(model),
         .system_prompt_sha256 = systemPromptSha256(),
@@ -663,6 +667,7 @@ const PreparedIdentity = struct {
     project_sha256: []const u8,
     author_sha256: []const u8,
     provider_sha256: []const u8,
+    budget_authorization_sha256: []const u8,
     model_sha256: []const u8,
     system_prompt_sha256: []const u8,
     packet_sha256: []const u8,
@@ -687,6 +692,7 @@ fn preparedIdentity(prepared: *const PreparedRequest) ![64]u8 {
         .project_sha256 = prepared.project_sha256[0..],
         .author_sha256 = prepared.author_sha256[0..],
         .provider_sha256 = prepared.provider_sha256[0..],
+        .budget_authorization_sha256 = prepared.budget_authorization_sha256[0..],
         .model_sha256 = prepared.model_sha256[0..],
         .system_prompt_sha256 = prepared.system_prompt_sha256[0..],
         .packet_sha256 = prepared.packet_sha256[0..],
@@ -742,6 +748,27 @@ pub fn worstCaseCost(caps: CallCaps, pricing: PricingAuthority) !u64 {
     return std.math.add(u64, input_cost, output_cost) catch error.CostOverflow;
 }
 
+pub fn actualCost(usage: Usage, pricing: PricingAuthority) !u64 {
+    try validatePricing(pricing);
+    var total = try ceilTokenCost(usage.input_tokens, pricing.input_microusd_per_mtok);
+    total = std.math.add(
+        u64,
+        total,
+        try ceilTokenCost(usage.output_tokens, pricing.output_microusd_per_mtok),
+    ) catch return error.CostOverflow;
+    total = std.math.add(
+        u64,
+        total,
+        try ceilTokenCost(usage.cache_read_input_tokens, pricing.cache_read_microusd_per_mtok),
+    ) catch return error.CostOverflow;
+    total = std.math.add(
+        u64,
+        total,
+        try ceilTokenCost(usage.cache_creation_input_tokens, pricing.cache_write_microusd_per_mtok),
+    ) catch return error.CostOverflow;
+    return total;
+}
+
 fn validateIdentity(value: [64]u8) !void {
     for (value) |byte| if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f'))
         return error.InvalidIdentity;
@@ -775,6 +802,7 @@ const ReceiptBody = struct {
     project_sha256: []const u8,
     author_sha256: []const u8,
     provider_sha256: []const u8,
+    budget_authorization_sha256: []const u8,
     model: []const u8,
     model_sha256: []const u8,
     system_prompt_sha256: []const u8,
@@ -807,6 +835,7 @@ pub const LoadedReceipt = struct {
     project_sha256: [64]u8,
     author_sha256: [64]u8,
     provider_sha256: [64]u8,
+    budget_authorization_sha256: [64]u8,
     model_sha256: [64]u8,
     system_prompt_sha256: [64]u8,
     packet_sha256: [64]u8,
@@ -872,6 +901,7 @@ fn persistReceipt(
         .project_sha256 = prepared.project_sha256[0..],
         .author_sha256 = prepared.author_sha256[0..],
         .provider_sha256 = prepared.provider_sha256[0..],
+        .budget_authorization_sha256 = prepared.budget_authorization_sha256[0..],
         .model = prepared.model,
         .model_sha256 = prepared.model_sha256[0..],
         .system_prompt_sha256 = prepared.system_prompt_sha256[0..],
@@ -973,6 +1003,8 @@ pub fn loadReceipt(
     const project = parseHex(record.body.project_sha256) orelse return error.InvalidAuthorReceipt;
     const author_sha256 = parseHex(record.body.author_sha256) orelse return error.InvalidAuthorReceipt;
     const provider_sha256 = parseHex(record.body.provider_sha256) orelse return error.InvalidAuthorReceipt;
+    const budget_authorization_sha256 = parseHex(record.body.budget_authorization_sha256) orelse
+        return error.InvalidAuthorReceipt;
     const model_sha256 = parseHex(record.body.model_sha256) orelse return error.InvalidAuthorReceipt;
     const prompt_sha256 = parseHex(record.body.system_prompt_sha256) orelse return error.InvalidAuthorReceipt;
     const packet_sha256 = parseHex(record.body.packet_sha256) orelse return error.InvalidAuthorReceipt;
@@ -1005,6 +1037,7 @@ pub fn loadReceipt(
         .project_sha256 = record.body.project_sha256,
         .author_sha256 = record.body.author_sha256,
         .provider_sha256 = record.body.provider_sha256,
+        .budget_authorization_sha256 = record.body.budget_authorization_sha256,
         .model_sha256 = record.body.model_sha256,
         .system_prompt_sha256 = record.body.system_prompt_sha256,
         .packet_sha256 = record.body.packet_sha256,
@@ -1070,6 +1103,7 @@ pub fn loadReceipt(
         .project_sha256 = project,
         .author_sha256 = author_sha256,
         .provider_sha256 = provider_sha256,
+        .budget_authorization_sha256 = budget_authorization_sha256,
         .model_sha256 = model_sha256,
         .system_prompt_sha256 = prompt_sha256,
         .packet_sha256 = packet_sha256,
@@ -1248,6 +1282,7 @@ test "rule author gate is fail-closed and binds request identity" {
         .project_sha256 = .{'a'} ** 64,
         .author_sha256 = .{'b'} ** 64,
         .provider_sha256 = .{'c'} ** 64,
+        .budget_authorization_sha256 = .{'8'} ** 64,
         .model = "author-model",
         .model_sha256 = observation.sha256Hex("author-model"),
         .system_prompt_sha256 = systemPromptSha256(),

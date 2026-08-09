@@ -395,6 +395,28 @@ pub fn build(b: *std.Build) void {
     });
     addHl(b, core_mod);
 
+    // One-shot paid feasibility probe for the isolated rule-author adapter.
+    // It is intentionally absent from the default install graph; the Python
+    // budget runner builds it before acquiring durable request authorization.
+    const rule_author_trial_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/eval/rule_author_feasibility.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    rule_author_trial_mod.addImport("metacodes-core", core_mod);
+    addPlatform(b, rule_author_trial_mod);
+    const rule_author_trial_exe = b.addExecutable(.{
+        .name = "rule-author-feasibility",
+        .root_module = rule_author_trial_mod,
+    });
+    const install_rule_author_trial = b.addInstallArtifact(rule_author_trial_exe, .{});
+    const rule_author_trial_step = b.step(
+        "eval:rule-author-build",
+        "Build the isolated rule-author feasibility probe (no provider call)",
+    );
+    rule_author_trial_step.dependOn(&install_rule_author_trial.step);
+
     const agentcore_types_mod = b.createModule(.{
         .root_source_file = b.path("sdk/zig/types.zig"),
         .target = target,

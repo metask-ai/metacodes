@@ -74,6 +74,7 @@ pub const api_provider = @import("api/provider.zig"); // 多 provider vtable
 pub const api_provider_factory = @import("api/provider_factory.zig");
 pub const api_capability = @import("api/capability.zig");
 pub const api_cache = @import("api/cache.zig"); // 多 provider 缓存扩展点契约
+pub const auth = @import("core/auth.zig");
 pub const api_openai = @import("api/openai_client.zig");
 pub const api_gemini = @import("api/gemini_client.zig"); // 第三 provider:Gemini + 有状态缓存
 pub const json = @import("json.zig");
