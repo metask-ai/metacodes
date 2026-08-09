@@ -1,20 +1,23 @@
-//! Zero-provider E2 driver for governed project-Harness evolution.
+//! Zero-provider lifecycle driver for governed project-Harness rule templates.
 //!
-//! `prepare` persists a real transcript-backed user correction and typed
+//! `prepare` persists a transcript-backed project constraint and typed
 //! candidate, then captures one real safe dispatch for later shadow replay.
 //! `finalize` consumes an independently sandboxed Lean build, records the
 //! production lifecycle, promotes through the fixed kernel, and exercises the
-//! production RunControl on a blocked Write plus admitted Edit recovery.
+//! production RunControl.  The evolved flavor blocks an existing-file Write
+//! and recovers through Edit; the static flavor admits a bounded Write and
+//! requires a host-reobserved mutation.
 //! `audit` is a separate-process, read-only reopening of the complete chain.
 
 const std = @import("std");
 const cc = @import("cc");
 
-const PREPARE_SCHEMA = "metacodes-project-harness-lifecycle-prepare-v1";
-const FINAL_SCHEMA = "metacodes-project-harness-lifecycle-final-v1";
-const AUDIT_SCHEMA = "metacodes-project-harness-lifecycle-audit-v1";
-const CORRECTION = "In this project, never use Write to overwrite an existing regular file; use Edit for targeted changes.";
-const LEAN_SOURCE =
+const PREPARE_SCHEMA = "metacodes-project-harness-lifecycle-prepare-v2";
+const FINAL_SCHEMA = "metacodes-project-harness-lifecycle-final-v2";
+const AUDIT_SCHEMA = "metacodes-project-harness-lifecycle-audit-v2";
+const EVOLVED_CORRECTION = "In this project, never use Write to overwrite an existing regular file; use Edit for targeted changes.";
+const STATIC_CORRECTION = "In this project, every successful Write must remain bounded, authoritative, and carry a host-reobserved file mutation.";
+const EVOLVED_LEAN_SOURCE =
     \\def spec : RuleSpec := {
     \\  targetTool := "Write"
     \\  targetScope := .existingFile
@@ -26,10 +29,23 @@ const LEAN_SOURCE =
     \\}
     \\theorem spec_valid : valid spec = true := by rfl
 ;
+const STATIC_LEAN_SOURCE =
+    \\def spec : RuleSpec := {
+    \\  targetTool := "Write"
+    \\  targetScope := .all
+    \\  denyTarget := false
+    \\  maxInputBytes := 8192
+    \\  maxAgentDepth := 4
+    \\  authoritativeOnly := true
+    \\  effectRequirement := .fileMutationV1Reobserved
+    \\}
+    \\theorem spec_valid : valid spec = true := by rfl
+;
 const CORRECTION_SID = "0123456789abcdef01234567";
 const RUNTIME_SID = "fedcba9876543210fedcba98";
 
 const Phase = enum { prepare, finalize, audit };
+const RuleFlavor = enum { evolved, static };
 
 const Options = struct {
     phase: Phase,
@@ -39,6 +55,9 @@ const Options = struct {
     lake: ?[]const u8 = null,
     kernel_path: ?[]const u8 = null,
     kernel_sha256: ?[64]u8 = null,
+    project_root: ?[]const u8 = null,
+    home_root: ?[]const u8 = null,
+    rule_flavor: RuleFlavor = .evolved,
 };
 
 const WireBinding = struct {
@@ -55,6 +74,7 @@ const PrepareResult = struct {
     quality_evidence: bool = false,
     provider_requests: u64 = 0,
     paid_cost_usd: f64 = 0,
+    rule_flavor: []const u8,
     project_root: []const u8,
     home_root: []const u8,
     session_dir: []const u8,
@@ -81,6 +101,7 @@ const FinalResult = struct {
     source_kind: []const u8 = "user_correction",
     real_isolated_lean_build: bool = true,
     synthetic_active_identity: bool = false,
+    rule_flavor: []const u8,
     project_sha256: []const u8,
     source_receipt_id: []const u8,
     candidate_id: []const u8,
@@ -100,6 +121,7 @@ const FinalResult = struct {
     promotion_verdict_sha256: []const u8,
     active_pointer_sha256: []const u8,
     runtime_blocked_before_dispatch: bool,
+    runtime_task_succeeded: bool,
     runtime_recovery_succeeded: bool,
     runtime_journal_sha256: []const u8,
     runtime_run: WireBinding,
@@ -116,6 +138,7 @@ const AuditResult = struct {
     lifecycle_chain_reopened: bool = true,
     active_bundle_reattested: bool = true,
     runtime_journal_reopened: bool = true,
+    rule_flavor: []const u8,
     candidate_id: []const u8,
     promotion_receipt_id: []const u8,
     bundle_sha256: []const u8,
@@ -127,6 +150,9 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(allocator);
     const options = try parseOptions(args);
     if (!std.fs.path.isAbsolute(options.root)) return error.AbsolutePathRequired;
+    if ((options.project_root != null and !std.fs.path.isAbsolute(options.project_root.?)) or
+        (options.home_root != null and !std.fs.path.isAbsolute(options.home_root.?)))
+        return error.AbsolutePathRequired;
     switch (options.phase) {
         .prepare => try prepare(init, allocator, options),
         .finalize => try finalize(init, allocator, options),
@@ -137,19 +163,22 @@ pub fn main(init: std.process.Init) !void {
 fn prepare(init: std.process.Init, allocator: std.mem.Allocator, options: Options) !void {
     const result_path = try std.fmt.allocPrint(allocator, "{s}/lifecycle-prepare.json", .{options.root});
     if (try pathExists(init.io, result_path)) return error.ResultAlreadyExists;
-    const project_root = try std.fmt.allocPrint(allocator, "{s}/project", .{options.root});
-    const home_root = try std.fmt.allocPrint(allocator, "{s}/home", .{options.root});
+    const project_root = options.project_root orelse
+        try std.fmt.allocPrint(allocator, "{s}/project", .{options.root});
+    const home_root = options.home_root orelse
+        try std.fmt.allocPrint(allocator, "{s}/home", .{options.root});
+    const correction = correctionFor(options.rule_flavor);
     try cc.util_fs.mkdirParents(project_root);
     try cc.util_fs.mkdirParents(home_root);
     const sid = cc.session_id.SessionId.fromSlice(CORRECTION_SID).?;
     var conversation = cc.conversation.Conversation.init(allocator);
     defer conversation.deinit();
-    try conversation.appendText(.user, CORRECTION);
+    try conversation.appendText(.user, correction);
     var writer = try cc.transcript.Writer.init(
         allocator,
         project_root,
         home_root,
-        "e2-zero-provider",
+        if (options.rule_flavor == .evolved) "e2-zero-provider" else "e3-static-template",
         sid,
     );
     defer writer.deinit();
@@ -158,20 +187,20 @@ fn prepare(init: std.process.Init, allocator: std.mem.Allocator, options: Option
     const project = cc.project_rule_bundle.projectIdentity(project_root);
     const issuer = actor("metacodes-e2-user-authority-v1");
     const proposer = actor("metacodes-e2-candidate-proposer-v1");
-    const correction_sha = cc.tools.tool_observation.sha256Hex(CORRECTION);
+    const correction_sha = cc.tools.tool_observation.sha256Hex(correction);
     const source = try cc.rule_source_receipt.persistUserCorrection(writer.dir, .{
         .project_sha256 = project,
         .issuer_sha256 = issuer,
         .session_id = sid,
         .transcript_line_index = 0,
-        .correction = CORRECTION,
+        .correction = correction,
     });
     const candidate = try cc.rule_candidate.persist(writer.dir, .{
         .project_sha256 = project,
         .proposer_sha256 = proposer,
-        .invariant = "Existing regular files are changed through Edit, never overwritten through Write.",
-        .rule_spec = evolvedSpec(),
-        .lean_source = LEAN_SOURCE,
+        .invariant = invariantFor(options.rule_flavor),
+        .rule_spec = specFor(options.rule_flavor),
+        .lean_source = leanSourceFor(options.rule_flavor),
         .source = .{ .user_correction = .{
             .receipt_id = source.receipt_id,
             .correction_sha256 = correction_sha,
@@ -211,6 +240,7 @@ fn prepare(init: std.process.Init, allocator: std.mem.Allocator, options: Option
     const state_root = std.fs.path.dirname(writer.dir) orelse return error.InvalidSessionDirectory;
     const rules_dir = try std.fmt.allocPrint(allocator, "{s}/project-rules", .{state_root});
     const result = PrepareResult{
+        .rule_flavor = @tagName(options.rule_flavor),
         .project_root = project_root,
         .home_root = home_root,
         .session_dir = writer.dir,
@@ -234,7 +264,9 @@ fn finalize(init: std.process.Init, allocator: std.mem.Allocator, options: Optio
     const prepare_path = try std.fmt.allocPrint(allocator, "{s}/lifecycle-prepare.json", .{options.root});
     const final_path = try std.fmt.allocPrint(allocator, "{s}/lifecycle-final.json", .{options.root});
     if (try pathExists(init.io, final_path)) return error.ResultAlreadyExists;
-    const prepared = try loadPrepare(init.io, allocator, options.root, prepare_path);
+    const prepared = try loadPrepare(init.io, allocator, options, prepare_path);
+    const flavor = std.meta.stringToEnum(RuleFlavor, prepared.rule_flavor) orelse
+        return error.InvalidPrepareResult;
     const project = parseHex(prepared.project_sha256) orelse return error.InvalidPrepareIdentity;
     const candidate_id = parseHex(prepared.candidate_id) orelse return error.InvalidPrepareIdentity;
     const source_receipt_id = parseHex(prepared.source_receipt_id) orelse return error.InvalidPrepareIdentity;
@@ -270,41 +302,7 @@ fn finalize(init: std.process.Init, allocator: std.mem.Allocator, options: Optio
             .axiom_checker_sha256 = actor("metacodes-e2-axiom-checker-v1"),
         },
     );
-    const replay_cases = [_]cc.rule_evaluation.ReplayCase{
-        .{ .case_id = "read-admitted", .expected_admit = true, .signal = .{ .pre = .{
-            .tool = "Read",
-            .input_bytes = 2,
-            .agent_depth = 0,
-            .authoritative = true,
-        } } },
-        .{ .case_id = "edit-admitted", .expected_admit = true, .signal = .{ .pre = .{
-            .tool = "Edit",
-            .input_bytes = 2,
-            .agent_depth = 0,
-            .authoritative = true,
-        } } },
-        .{ .case_id = "missing-write-admitted", .expected_admit = true, .signal = .{ .pre = .{
-            .tool = "Write",
-            .input_bytes = 2,
-            .agent_depth = 0,
-            .authoritative = true,
-            .file_target_state = .missing,
-        } } },
-        .{ .case_id = "existing-write-blocked", .expected_admit = false, .signal = .{ .pre = .{
-            .tool = "Write",
-            .input_bytes = 2,
-            .agent_depth = 0,
-            .authoritative = true,
-            .file_target_state = .regular_existing,
-        } } },
-        .{ .case_id = "ambiguous-write-blocked", .expected_admit = false, .signal = .{ .pre = .{
-            .tool = "Write",
-            .input_bytes = 2,
-            .agent_depth = 0,
-            .authoritative = true,
-            .file_target_state = .unavailable,
-        } } },
-    };
+    const replay_cases = replayCases(flavor);
     const replay = try cc.rule_evaluation.evaluateAndRecordReplay(
         allocator,
         prepared.session_dir,
@@ -382,21 +380,29 @@ fn finalize(init: std.process.Init, allocator: std.mem.Allocator, options: Optio
         allocator,
         .{ .bytes = [_]u8{'e'} ** 12 },
     );
-    const blocked = try requireProjectRuleBlock(allocator, write_outcome);
-    const edit_input = try std.json.Stringify.valueAlloc(allocator, .{
-        .file_path = protected_path,
-        .old_string = "old",
-        .new_string = "new",
-    }, .{});
-    const edit_outcome = try cc.tool_exec.executeOne(
-        &ctx,
-        "Edit",
-        edit_input,
-        "runtime-edit",
-        allocator,
-        .{ .bytes = [_]u8{'e'} ** 12 },
-    );
-    try requireToolSuccess(allocator, edit_outcome);
+    const blocked = switch (flavor) {
+        .evolved => try requireProjectRuleBlock(allocator, write_outcome),
+        .static => blk: {
+            try requireToolSuccess(allocator, write_outcome);
+            break :blk false;
+        },
+    };
+    if (flavor == .evolved) {
+        const edit_input = try std.json.Stringify.valueAlloc(allocator, .{
+            .file_path = protected_path,
+            .old_string = "old",
+            .new_string = "new",
+        }, .{});
+        const edit_outcome = try cc.tool_exec.executeOne(
+            &ctx,
+            "Edit",
+            edit_input,
+            "runtime-edit",
+            allocator,
+            .{ .bytes = [_]u8{'e'} ** 12 },
+        );
+        try requireToolSuccess(allocator, edit_outcome);
+    }
     try control.finishRun("end_turn");
     const runtime_binding = try control.journal.runBinding();
     control.deinit();
@@ -408,9 +414,10 @@ fn finalize(init: std.process.Init, allocator: std.mem.Allocator, options: Optio
     if (!runtime_validated.summary.complete or
         !try fileEquals(init.io, allocator, protected_path, "new"))
         return error.RuntimeRecoveryFailed;
-    try verifyRuntimeRun(allocator, runtime_dir, runtime_binding, candidate_id);
+    try verifyRuntimeRun(allocator, runtime_dir, runtime_binding, candidate_id, flavor);
 
     const result = FinalResult{
+        .rule_flavor = @tagName(flavor),
         .project_sha256 = project[0..],
         .source_receipt_id = source_receipt_id[0..],
         .candidate_id = candidate_id[0..],
@@ -430,7 +437,8 @@ fn finalize(init: std.process.Init, allocator: std.mem.Allocator, options: Optio
         .promotion_verdict_sha256 = promoted.verdict_sha256[0..],
         .active_pointer_sha256 = promoted.active_pointer_sha256[0..],
         .runtime_blocked_before_dispatch = blocked,
-        .runtime_recovery_succeeded = true,
+        .runtime_task_succeeded = true,
+        .runtime_recovery_succeeded = flavor == .evolved,
         .runtime_journal_sha256 = runtime_validated.summary.artifact_sha256[0..],
         .runtime_run = wireBinding(&runtime_binding, &runtime_validated.interval_sha256),
     };
@@ -443,14 +451,17 @@ fn audit(init: std.process.Init, allocator: std.mem.Allocator, options: Options)
     const final_path = try std.fmt.allocPrint(allocator, "{s}/lifecycle-final.json", .{options.root});
     const audit_path = try std.fmt.allocPrint(allocator, "{s}/lifecycle-audit.json", .{options.root});
     if (try pathExists(init.io, audit_path)) return error.ResultAlreadyExists;
-    const prepared = try loadPrepare(init.io, allocator, options.root, prepare_path);
+    const prepared = try loadPrepare(init.io, allocator, options, prepare_path);
     const final = try loadFinal(init.io, allocator, final_path);
+    const flavor = std.meta.stringToEnum(RuleFlavor, prepared.rule_flavor) orelse
+        return error.InvalidPrepareResult;
     const project = parseHex(final.project_sha256) orelse return error.InvalidFinalIdentity;
     const source_id = parseHex(final.source_receipt_id) orelse return error.InvalidFinalIdentity;
     const candidate_id = parseHex(final.candidate_id) orelse return error.InvalidFinalIdentity;
     const manifest = parseHex(final.build_manifest_sha256) orelse return error.InvalidFinalIdentity;
     if (!std.mem.eql(u8, final.project_sha256, prepared.project_sha256) or
         !std.mem.eql(u8, final.source_receipt_id, prepared.source_receipt_id) or
+        !std.mem.eql(u8, final.rule_flavor, prepared.rule_flavor) or
         !std.mem.eql(u8, final.candidate_id, prepared.candidate_id))
         return error.FinalPrepareIdentityMismatch;
     const config = cc.project_harness_runtime.Config{
@@ -538,9 +549,10 @@ fn audit(init: std.process.Init, allocator: std.mem.Allocator, options: Options)
     if (!runtime_validated.summary.complete or
         !std.mem.eql(u8, &runtime_validated.summary.artifact_sha256, &expected_journal))
         return error.RuntimeJournalMismatch;
-    try verifyRuntimeRun(allocator, runtime_dir, runtime_binding, candidate_id);
+    try verifyRuntimeRun(allocator, runtime_dir, runtime_binding, candidate_id, flavor);
 
     const result = AuditResult{
+        .rule_flavor = @tagName(flavor),
         .candidate_id = candidate_id[0..],
         .promotion_receipt_id = expected_promotion[0..],
         .bundle_sha256 = expected_bundle[0..],
@@ -594,15 +606,119 @@ fn trustedFiles(
     };
 }
 
-fn evolvedSpec() cc.project_rule_spec.Spec {
-    return .{
-        .target_tool = "Write",
-        .target_scope = .existing_file,
-        .deny_target = true,
-        .max_input_bytes = 8192,
-        .max_agent_depth = 4,
-        .authoritative_only = true,
-        .effect_requirement = .none,
+fn correctionFor(flavor: RuleFlavor) []const u8 {
+    return switch (flavor) {
+        .evolved => EVOLVED_CORRECTION,
+        .static => STATIC_CORRECTION,
+    };
+}
+
+fn invariantFor(flavor: RuleFlavor) []const u8 {
+    return switch (flavor) {
+        .evolved => "Existing regular files are changed through Edit, never overwritten through Write.",
+        .static => "Successful authoritative Write calls are bounded and retain host-reobserved mutation evidence.",
+    };
+}
+
+fn leanSourceFor(flavor: RuleFlavor) []const u8 {
+    return switch (flavor) {
+        .evolved => EVOLVED_LEAN_SOURCE,
+        .static => STATIC_LEAN_SOURCE,
+    };
+}
+
+fn specFor(flavor: RuleFlavor) cc.project_rule_spec.Spec {
+    return switch (flavor) {
+        .evolved => .{
+            .target_tool = "Write",
+            .target_scope = .existing_file,
+            .deny_target = true,
+            .max_input_bytes = 8192,
+            .max_agent_depth = 4,
+            .authoritative_only = true,
+            .effect_requirement = .none,
+        },
+        .static => .{
+            .target_tool = "Write",
+            .target_scope = .all,
+            .deny_target = false,
+            .max_input_bytes = 8192,
+            .max_agent_depth = 4,
+            .authoritative_only = true,
+            .effect_requirement = .file_mutation_v1_reobserved,
+        },
+    };
+}
+
+fn replayCases(flavor: RuleFlavor) [5]cc.rule_evaluation.ReplayCase {
+    return switch (flavor) {
+        .evolved => .{
+            .{ .case_id = "read-admitted", .expected_admit = true, .signal = .{ .pre = .{
+                .tool = "Read",
+                .input_bytes = 2,
+                .agent_depth = 0,
+                .authoritative = true,
+            } } },
+            .{ .case_id = "edit-admitted", .expected_admit = true, .signal = .{ .pre = .{
+                .tool = "Edit",
+                .input_bytes = 2,
+                .agent_depth = 0,
+                .authoritative = true,
+            } } },
+            .{ .case_id = "missing-write-admitted", .expected_admit = true, .signal = .{ .pre = .{
+                .tool = "Write",
+                .input_bytes = 2,
+                .agent_depth = 0,
+                .authoritative = true,
+                .file_target_state = .missing,
+            } } },
+            .{ .case_id = "existing-write-blocked", .expected_admit = false, .signal = .{ .pre = .{
+                .tool = "Write",
+                .input_bytes = 2,
+                .agent_depth = 0,
+                .authoritative = true,
+                .file_target_state = .regular_existing,
+            } } },
+            .{ .case_id = "ambiguous-write-blocked", .expected_admit = false, .signal = .{ .pre = .{
+                .tool = "Write",
+                .input_bytes = 2,
+                .agent_depth = 0,
+                .authoritative = true,
+                .file_target_state = .unavailable,
+            } } },
+        },
+        .static => .{
+            .{ .case_id = "read-admitted", .expected_admit = true, .signal = .{ .pre = .{
+                .tool = "Read",
+                .input_bytes = 2,
+                .agent_depth = 0,
+                .authoritative = true,
+            } } },
+            .{ .case_id = "bounded-write-admitted", .expected_admit = true, .signal = .{ .pre = .{
+                .tool = "Write",
+                .input_bytes = 2,
+                .agent_depth = 0,
+                .authoritative = true,
+            } } },
+            .{ .case_id = "oversized-write-blocked", .expected_admit = false, .signal = .{ .pre = .{
+                .tool = "Write",
+                .input_bytes = 8193,
+                .agent_depth = 0,
+                .authoritative = true,
+            } } },
+            .{ .case_id = "deep-write-blocked", .expected_admit = false, .signal = .{ .pre = .{
+                .tool = "Write",
+                .input_bytes = 2,
+                .agent_depth = 5,
+                .authoritative = true,
+            } } },
+            .{ .case_id = "non-authoritative-write-blocked", .expected_admit = false, .signal = .{ .pre = .{
+                .tool = "Write",
+                .input_bytes = 2,
+                .agent_depth = 0,
+                .authoritative = false,
+            } } },
+        },
     };
 }
 
@@ -611,28 +727,43 @@ fn verifyRuntimeRun(
     runtime_dir: []const u8,
     binding: cc.tool_observation_journal.RunBinding,
     candidate_id: [64]u8,
+    flavor: RuleFlavor,
 ) !void {
     var run = try cc.tool_observation_journal.loadRunDispatches(allocator, runtime_dir, binding);
     defer run.deinit();
+    const expected_id = if (flavor == .evolved) "runtime-edit" else "runtime-write";
+    const expected_tool = if (flavor == .evolved) "Edit" else "Write";
+    const expected_decisions: usize = if (flavor == .evolved) 3 else 2;
     if (run.dispatches.len != 1 or
-        !std.mem.eql(u8, run.dispatches[0].id, "runtime-edit") or
-        !std.mem.eql(u8, run.dispatches[0].dispatched_name, "Edit") or
-        run.formal_decisions.len != 3)
+        !std.mem.eql(u8, run.dispatches[0].id, expected_id) or
+        !std.mem.eql(u8, run.dispatches[0].dispatched_name, expected_tool) or
+        run.dispatches[0].outcome != .succeeded or
+        run.formal_decisions.len != expected_decisions)
         return error.InvalidRuntimeEvidence;
-    var write_blocks: usize = 0;
-    var edit_admits: usize = 0;
+    var target_pre_blocks: usize = 0;
+    var dispatched_admits: usize = 0;
     for (run.formal_decisions) |decision| {
         if (decision.actuation != .enforced or
             !std.mem.eql(u8, &decision.candidate_id, &candidate_id))
             return error.InvalidRuntimeEvidence;
         if (std.mem.eql(u8, decision.dispatch_id, "runtime-write") and
             decision.phase == .pre and decision.result == .block)
-            write_blocks += 1;
-        if (std.mem.eql(u8, decision.dispatch_id, "runtime-edit") and
+            target_pre_blocks += 1;
+        if (std.mem.eql(u8, decision.dispatch_id, expected_id) and
             decision.result == .admit)
-            edit_admits += 1;
+            dispatched_admits += 1;
     }
-    if (write_blocks != 1 or edit_admits != 2) return error.InvalidRuntimeEvidence;
+    if ((flavor == .evolved and (target_pre_blocks != 1 or dispatched_admits != 2)) or
+        (flavor == .static and (target_pre_blocks != 0 or dispatched_admits != 2)))
+        return error.InvalidRuntimeEvidence;
+    if (flavor == .static) {
+        const effect = run.dispatches[0].effect orelse return error.InvalidRuntimeEvidence;
+        switch (effect) {
+            .file_mutation_v2 => |mutation| if (mutation.reobservation.state != .matched)
+                return error.InvalidRuntimeEvidence,
+            else => return error.InvalidRuntimeEvidence,
+        }
+    }
 }
 
 fn requireToolSuccess(
@@ -705,7 +836,7 @@ fn parseBinding(wire: WireBinding) !cc.tool_observation_journal.RunBinding {
 fn loadPrepare(
     io: std.Io,
     allocator: std.mem.Allocator,
-    root: []const u8,
+    options: Options,
     path: []const u8,
 ) !PrepareResult {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
@@ -718,8 +849,10 @@ fn loadPrepare(
         !std.mem.eql(u8, parsed.phase, "prepare") or parsed.quality_evidence or
         parsed.provider_requests != 0 or parsed.paid_cost_usd != 0)
         return error.InvalidPrepareResult;
-    const expected_project = try std.fmt.allocPrint(allocator, "{s}/project", .{root});
-    const expected_home = try std.fmt.allocPrint(allocator, "{s}/home", .{root});
+    const expected_project = options.project_root orelse
+        try std.fmt.allocPrint(allocator, "{s}/project", .{options.root});
+    const expected_home = options.home_root orelse
+        try std.fmt.allocPrint(allocator, "{s}/home", .{options.root});
     const expected_project_sha256 = cc.project_rule_bundle.projectIdentity(expected_project);
     const cwd_hash = cc.transcript.hashCwd(expected_project);
     const expected_state_root = try std.fmt.allocPrint(
@@ -747,6 +880,7 @@ fn loadPrepare(
         .{ expected_session, candidate_name },
     );
     if (!std.mem.eql(u8, parsed.project_root, expected_project) or
+        !std.mem.eql(u8, parsed.rule_flavor, @tagName(options.rule_flavor)) or
         !std.mem.eql(u8, parsed.home_root, expected_home) or
         !std.mem.eql(u8, parsed.session_dir, expected_session) or
         !std.mem.eql(u8, parsed.rules_dir, expected_rules) or
@@ -766,12 +900,16 @@ fn loadFinal(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !FinalR
         .allocate = .alloc_always,
         .duplicate_field_behavior = .@"error",
     });
+    const flavor = std.meta.stringToEnum(RuleFlavor, parsed.rule_flavor) orelse
+        return error.InvalidFinalResult;
     if (!std.mem.eql(u8, parsed.schema_version, FINAL_SCHEMA) or
         !std.mem.eql(u8, parsed.phase, "finalize") or parsed.quality_evidence or
         parsed.outcome_superiority_claimed or parsed.provider_requests != 0 or
         parsed.paid_cost_usd != 0 or !parsed.real_isolated_lean_build or
-        parsed.synthetic_active_identity or !parsed.runtime_blocked_before_dispatch or
-        !parsed.runtime_recovery_succeeded)
+        parsed.synthetic_active_identity or
+        parsed.runtime_blocked_before_dispatch != (flavor == .evolved) or
+        !parsed.runtime_task_succeeded or
+        parsed.runtime_recovery_succeeded != (flavor == .evolved))
         return error.InvalidFinalResult;
     return parsed;
 }
@@ -830,6 +968,9 @@ fn parseOptions(args: []const []const u8) !Options {
     var lake: ?[]const u8 = null;
     var kernel_path: ?[]const u8 = null;
     var kernel_sha256: ?[64]u8 = null;
+    var project_root: ?[]const u8 = null;
+    var home_root: ?[]const u8 = null;
+    var rule_flavor: ?RuleFlavor = null;
     var index: usize = 1;
     while (index + 1 < args.len) : (index += 2) {
         const key = args[index];
@@ -855,6 +996,16 @@ fn parseOptions(args: []const []const u8) !Options {
         } else if (std.mem.eql(u8, key, "--kernel-sha256")) {
             if (kernel_sha256 != null) return error.DuplicateArgument;
             kernel_sha256 = parseHex(value) orelse return error.InvalidKernelSha256;
+        } else if (std.mem.eql(u8, key, "--project-root")) {
+            if (project_root != null) return error.DuplicateArgument;
+            project_root = value;
+        } else if (std.mem.eql(u8, key, "--home-root")) {
+            if (home_root != null) return error.DuplicateArgument;
+            home_root = value;
+        } else if (std.mem.eql(u8, key, "--rule-flavor")) {
+            if (rule_flavor != null) return error.DuplicateArgument;
+            rule_flavor = std.meta.stringToEnum(RuleFlavor, value) orelse
+                return error.InvalidRuleFlavor;
         } else return error.UnknownArgument;
     }
     return .{
@@ -865,6 +1016,9 @@ fn parseOptions(args: []const []const u8) !Options {
         .lake = lake,
         .kernel_path = kernel_path,
         .kernel_sha256 = kernel_sha256,
+        .project_root = project_root,
+        .home_root = home_root,
+        .rule_flavor = rule_flavor orelse .evolved,
     };
 }
 

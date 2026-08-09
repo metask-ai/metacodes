@@ -55,6 +55,10 @@ class ProjectHarnessEvolutionTest(unittest.TestCase):
             self.assertTrue(report["gates"]["write_blocked_before_dispatch"])
             self.assertTrue(report["gates"]["edit_recovery_reobserved"])
             self.assertTrue(report["gates"]["provider_requests_zero"])
+            final = json.loads((root / "lifecycle-final.json").read_text(encoding="utf-8"))
+            self.assertEqual("evolved", final["rule_flavor"])
+            self.assertTrue(final["runtime_task_succeeded"])
+            self.assertTrue(final["runtime_recovery_succeeded"])
 
             journal_path = next(
                 (root / "home/.metacodes/projects").glob(

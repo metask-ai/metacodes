@@ -23,9 +23,9 @@ from typing import Any, Dict, List, Mapping, Sequence
 
 MANIFEST_SCHEMA = "metacodes-project-harness-evolution-manifest-v1"
 REPORT_SCHEMA = "metacodes-project-harness-evolution-report-v1"
-PREPARE_SCHEMA = "metacodes-project-harness-lifecycle-prepare-v1"
-FINAL_SCHEMA = "metacodes-project-harness-lifecycle-final-v1"
-AUDIT_SCHEMA = "metacodes-project-harness-lifecycle-audit-v1"
+PREPARE_SCHEMA = "metacodes-project-harness-lifecycle-prepare-v2"
+FINAL_SCHEMA = "metacodes-project-harness-lifecycle-final-v2"
+AUDIT_SCHEMA = "metacodes-project-harness-lifecycle-audit-v2"
 BUILD_SCHEMA = "metacodes-project-rule-build-v1"
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_JOURNAL_BYTES = 64 * 1024 * 1024
@@ -340,6 +340,7 @@ def analyze_lifecycle(manifest_path: Path) -> Dict[str, Any]:
         or final.get("real_isolated_lean_build") is not True
         or final.get("synthetic_active_identity") is not False
         or final.get("runtime_blocked_before_dispatch") is not True
+        or final.get("runtime_task_succeeded") is not True
         or final.get("runtime_recovery_succeeded") is not True
     ):
         raise EvolutionError("production lifecycle mechanism gate failed")
