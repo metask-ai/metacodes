@@ -16,7 +16,8 @@ pub const FORMAL_SCHEMA_VERSION_V1 = "metacodes-project-formal-decision-v1";
 pub const FORMAL_BATCH_SCHEMA_VERSION_V1 = "metacodes-project-formal-decision-batch-v1";
 pub const FORMAL_SCHEMA_VERSION = "metacodes-project-formal-decision-v2";
 pub const FORMAL_BATCH_SCHEMA_VERSION_V2 = "metacodes-project-formal-decision-batch-v2";
-pub const FORMAL_BATCH_SCHEMA_VERSION = "metacodes-project-formal-decision-batch-v3";
+pub const FORMAL_BATCH_SCHEMA_VERSION_V3 = "metacodes-project-formal-decision-batch-v3";
+pub const FORMAL_BATCH_SCHEMA_VERSION = "metacodes-project-formal-decision-batch-v4";
 
 pub const Origin = enum {
     authoritative,
@@ -34,6 +35,30 @@ pub const Outcome = enum {
 
 pub const FormalPhase = enum { pre, post };
 pub const FormalResult = enum { admit, block, fault };
+
+/// The exact fixed-kernel operation that produced a candidate verdict. Phase
+/// alone is insufficient once a recovery transition and an ordinary rule are
+/// evaluated in the same physical checker batch.
+pub const FormalOperation = enum {
+    pre_decision,
+    post_decision,
+    recovery_pre_decision,
+    recovery_post_decision,
+
+    pub fn phase(self: FormalOperation) FormalPhase {
+        return switch (self) {
+            .pre_decision, .recovery_pre_decision => .pre,
+            .post_decision, .recovery_post_decision => .post,
+        };
+    }
+
+    pub fn isRecovery(self: FormalOperation) bool {
+        return switch (self) {
+            .recovery_pre_decision, .recovery_post_decision => true,
+            .pre_decision, .post_decision => false,
+        };
+    }
+};
 
 /// A bounded next-action direction selected by the fixed formal kernel.  It is
 /// evidence about the verdict, not an authorization to bypass the ordinary
@@ -62,6 +87,7 @@ pub const FileTargetState = enum {
 };
 
 pub const FormalCandidateDecision = struct {
+    operation: FormalOperation = .pre_decision,
     result: FormalResult,
     recovery_action: FormalRecoveryAction = .none,
     candidate_id: [64]u8,

@@ -16,6 +16,29 @@ pub const RUNTIME_BATCH_VERDICT_PREFIX = "project-rule-runtime-batch-verdict-";
 const BatchDecision = struct {
     result: protocol.Result,
     recovery_action: protocol.RecoveryAction = .none,
+    recovery_rule_index: ?usize = null,
+    recovery_rule_result: ?protocol.Result = null,
+};
+
+const MAX_EXACT_EDIT_OBLIGATIONS: usize = 32;
+const MAX_INFLIGHT_EXACT_EDITS: usize = 32;
+
+const ExactEditObligation = struct {
+    rule_index: usize,
+    target_sha256: [64]u8,
+    source_content_sha256: [64]u8,
+    blocked_content_sha256: [64]u8,
+};
+
+const InflightExactEdit = struct {
+    dispatch_sha256: [64]u8,
+    target_sha256: [64]u8,
+    pre: spec_mod.RecoveryPreSignal,
+};
+
+const RecoveryMatch = struct {
+    obligation: ExactEditObligation,
+    pre: spec_mod.RecoveryPreSignal,
 };
 
 pub const RuntimeGate = struct {
@@ -31,25 +54,121 @@ pub const RuntimeGate = struct {
     actuation: observation.FormalActuation = .enforced,
     evidence_dir: ?[]const u8 = null,
     observation_sink: ?observation.Sink = null,
+    exact_edit_obligations: [MAX_EXACT_EDIT_OBLIGATIONS]ExactEditObligation = undefined,
+    exact_edit_obligations_len: usize = 0,
+    inflight_exact_edits: [MAX_INFLIGHT_EXACT_EDITS]InflightExactEdit = undefined,
+    inflight_exact_edits_len: usize = 0,
 
     pub fn protocolGate(self: *RuntimeGate) protocol.Gate {
-        return .{ .ctx = @ptrCast(self), .preFn = preThunk, .postFn = postThunk };
+        return .{
+            .ctx = @ptrCast(self),
+            .preFn = preThunk,
+            .postFn = postThunk,
+            .cancelPreFn = cancelPreThunk,
+        };
     }
 
     fn preThunk(raw: *anyopaque, signal: protocol.PreSignal) protocol.PreResult {
         const self: *RuntimeGate = @ptrCast(@alignCast(raw));
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (signal.exact_edit_material.writeNeedsEdit() and
+            self.exact_edit_obligations_len == self.exact_edit_obligations.len)
+        {
+            const target = signal.exact_edit_material.target_sha256.?;
+            if (self.findExactEditObligation(target) == null) return .fault;
+        }
+        if (self.recoveryPreFacts(signal)) |facts| {
+            const dispatch_sha256 = observation.sha256Hex(signal.dispatch_id);
+            if (self.findInflightDispatch(dispatch_sha256) != null or
+                self.findInflightTarget(facts.obligation.target_sha256) != null or
+                self.inflight_exact_edits_len == self.inflight_exact_edits.len)
+                return .fault;
+            const decision = self.decideExactRecoveryPre(signal, facts) catch
+                return .fault;
+            const actuated = self.actuatePre(decision);
+            if (self.actuation == .enforced and actuated == .admit) {
+                if (decision.recovery_rule_result != .admit) return .fault;
+                self.inflight_exact_edits[self.inflight_exact_edits_len] = .{
+                    .dispatch_sha256 = dispatch_sha256,
+                    .target_sha256 = facts.obligation.target_sha256,
+                    .pre = facts.pre,
+                };
+                self.inflight_exact_edits_len += 1;
+                return .admit_exact_edit;
+            }
+            return actuated;
+        }
         const decision = self.decidePre(signal) catch return .fault;
-        return self.actuatePre(decision);
+        const actuated = self.actuatePre(decision);
+        if (self.actuation == .enforced and decision.result == .block and
+            decision.recovery_action == .edit_existing_file_exact)
+        {
+            const material = signal.exact_edit_material;
+            const rule_index = decision.recovery_rule_index orelse return .fault;
+            if (!material.writeNeedsEdit()) return .fault;
+            const obligation = ExactEditObligation{
+                .rule_index = rule_index,
+                .target_sha256 = material.target_sha256.?,
+                .source_content_sha256 = material.current_sha256.?,
+                .blocked_content_sha256 = material.write_content_sha256.?,
+            };
+            if (self.findInflightTarget(obligation.target_sha256) != null or
+                !self.installExactEditObligation(obligation))
+                return .fault;
+        }
+        return actuated;
     }
 
     fn postThunk(raw: *anyopaque, signal: protocol.PostSignal) protocol.Result {
         const self: *RuntimeGate = @ptrCast(@alignCast(raw));
         self.mutex.lock();
         defer self.mutex.unlock();
+        const dispatch_sha256 = observation.sha256Hex(signal.pre.dispatch_id);
+        if (self.findInflightDispatch(dispatch_sha256)) |inflight_index| {
+            const inflight = self.inflight_exact_edits[inflight_index];
+            defer self.removeInflightExactEdit(inflight_index);
+            const obligation_index = self.findExactEditObligation(
+                inflight.target_sha256,
+            ) orelse return .fault;
+            const obligation = self.exact_edit_obligations[obligation_index];
+            const observed_matches = observedMatchesBlocked(
+                signal.effect,
+                obligation.target_sha256,
+                obligation.blocked_content_sha256,
+            );
+            const recovery_post = spec_mod.RecoveryPostSignal{
+                .pre = inflight.pre,
+                .succeeded = signal.outcome == .succeeded,
+                .effect_valid = signal.effect_valid,
+                .has_file_mutation_v1 = hasFileMutation(signal.effect),
+                .post_reobserved = postReobserved(signal.effect),
+                .observed_matches_blocked = observed_matches,
+            };
+            const decision = self.decideExactRecoveryPost(
+                signal,
+                obligation.rule_index,
+                recovery_post,
+            ) catch return .fault;
+            if (self.actuation == .enforced and
+                decision.recovery_rule_result == .admit and
+                observed_matches)
+                self.removeExactEditObligation(obligation_index);
+            return self.actuateResult(decision.result);
+        }
         const decision = self.decidePost(signal) catch return .fault;
         return self.actuateResult(decision.result);
+    }
+
+    fn cancelPreThunk(raw: *anyopaque, signal: protocol.PreSignal) bool {
+        const self: *RuntimeGate = @ptrCast(@alignCast(raw));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const dispatch_sha256 = observation.sha256Hex(signal.dispatch_id);
+        const inflight_index = self.findInflightDispatch(dispatch_sha256) orelse
+            return false;
+        self.removeInflightExactEdit(inflight_index);
+        return true;
     }
 
     fn actuateResult(self: *const RuntimeGate, decision: protocol.Result) protocol.Result {
@@ -72,6 +191,7 @@ pub const RuntimeGate = struct {
             .agent_depth = signal.agent_depth,
             .authoritative = signal.authoritative,
             .file_target_state = signal.file_target_state,
+            .exact_recovery_material_ready = signal.exact_edit_material.writeNeedsEdit(),
         };
         const signal_json = try std.json.Stringify.valueAlloc(self.allocator, formal_signal, .{});
         defer self.allocator.free(signal_json);
@@ -134,6 +254,7 @@ pub const RuntimeGate = struct {
             .agent_depth = signal.pre.agent_depth,
             .authoritative = signal.pre.authoritative,
             .file_target_state = signal.pre.file_target_state,
+            .exact_recovery_material_ready = signal.pre.exact_edit_material.writeNeedsEdit(),
         };
         const formal_signal = spec_mod.PostSignal{
             .pre = formal_pre,
@@ -196,6 +317,195 @@ pub const RuntimeGate = struct {
         );
     }
 
+    fn recoveryPreFacts(
+        self: *const RuntimeGate,
+        signal: protocol.PreSignal,
+    ) ?RecoveryMatch {
+        if (!std.mem.eql(u8, signal.tool, "Edit")) return null;
+        const material = signal.exact_edit_material;
+        const target = material.target_sha256 orelse return null;
+        const obligation_index = self.findExactEditObligation(target) orelse return null;
+        const obligation = self.exact_edit_obligations[obligation_index];
+        const current = material.current_sha256;
+        const old = material.edit_old_sha256;
+        const new = material.edit_new_sha256;
+        return .{ .obligation = obligation, .pre = .{
+            .tool = signal.tool,
+            .input_bytes = signal.input_bytes,
+            .agent_depth = signal.agent_depth,
+            .authoritative = signal.authoritative,
+            .target_matches = true,
+            .material_available = material.editReady(),
+            .current_matches_source = current != null and std.mem.eql(
+                u8,
+                &current.?,
+                &obligation.source_content_sha256,
+            ),
+            .old_matches_current = current != null and old != null and
+                std.mem.eql(u8, &current.?, &old.?),
+            .new_matches_blocked = new != null and
+                std.mem.eql(u8, &new.?, &obligation.blocked_content_sha256),
+        } };
+    }
+
+    /// Evaluate the recovery transition and every unrelated active rule in
+    /// one physical checker call. The obligation's source rule changes
+    /// operation; other candidates still see the ordinary Edit signal.
+    fn decideExactRecoveryPre(
+        self: *RuntimeGate,
+        signal: protocol.PreSignal,
+        recovery: RecoveryMatch,
+    ) !BatchDecision {
+        if (recovery.obligation.rule_index >= self.active.rules.len)
+            return error.InvalidRecoveryRule;
+        const ordinary = spec_mod.PreSignal{
+            .tool = signal.tool,
+            .input_bytes = signal.input_bytes,
+            .agent_depth = signal.agent_depth,
+            .authoritative = signal.authoritative,
+            .file_target_state = signal.file_target_state,
+            .exact_recovery_material_ready = false,
+        };
+        const ordinary_json = try std.json.Stringify.valueAlloc(
+            self.allocator,
+            ordinary,
+            .{},
+        );
+        defer self.allocator.free(ordinary_json);
+        const recovery_json = try std.json.Stringify.valueAlloc(
+            self.allocator,
+            recovery.pre,
+            .{},
+        );
+        defer self.allocator.free(recovery_json);
+        return self.decideMixed(
+            signal.dispatch_id,
+            signal.file_target_state,
+            .pre,
+            recovery.obligation.rule_index,
+            .pre_decision,
+            .{ .pre = ordinary },
+            ordinary_json,
+            .recovery_pre_decision,
+            .{ .recovery_pre = recovery.pre },
+            recovery_json,
+        );
+    }
+
+    fn decideExactRecoveryPost(
+        self: *RuntimeGate,
+        signal: protocol.PostSignal,
+        rule_index: usize,
+        recovery: spec_mod.RecoveryPostSignal,
+    ) !BatchDecision {
+        if (rule_index >= self.active.rules.len) return error.InvalidRecoveryRule;
+        const ordinary_pre = spec_mod.PreSignal{
+            .tool = signal.pre.tool,
+            .input_bytes = signal.pre.input_bytes,
+            .agent_depth = signal.pre.agent_depth,
+            .authoritative = signal.pre.authoritative,
+            .file_target_state = signal.pre.file_target_state,
+            .exact_recovery_material_ready = false,
+        };
+        const ordinary = spec_mod.PostSignal{
+            .pre = ordinary_pre,
+            .succeeded = signal.outcome == .succeeded,
+            .effect_valid = signal.effect_valid,
+            .has_file_mutation_v1 = hasFileMutation(signal.effect),
+            .post_reobserved = postReobserved(signal.effect),
+        };
+        const ordinary_json = try std.json.Stringify.valueAlloc(
+            self.allocator,
+            ordinary,
+            .{},
+        );
+        defer self.allocator.free(ordinary_json);
+        const recovery_json = try std.json.Stringify.valueAlloc(
+            self.allocator,
+            recovery,
+            .{},
+        );
+        defer self.allocator.free(recovery_json);
+        return self.decideMixed(
+            signal.pre.dispatch_id,
+            signal.pre.file_target_state,
+            .post,
+            rule_index,
+            .post_decision,
+            .{ .post = ordinary },
+            ordinary_json,
+            .recovery_post_decision,
+            .{ .recovery_post = recovery },
+            recovery_json,
+        );
+    }
+
+    fn decideMixed(
+        self: *RuntimeGate,
+        dispatch_id: []const u8,
+        file_target_state: observation.FileTargetState,
+        phase: observation.FormalPhase,
+        rule_index: usize,
+        ordinary_operation: kernel.Operation,
+        ordinary_payload: kernel.Payload,
+        ordinary_signal_json: []const u8,
+        recovery_operation: kernel.Operation,
+        recovery_payload: kernel.Payload,
+        recovery_signal_json: []const u8,
+    ) !BatchDecision {
+        if (rule_index >= self.active.rules.len) return error.InvalidRecoveryRule;
+        const requests = try self.allocator.alloc(kernel.Request, self.active.rules.len);
+        defer self.allocator.free(requests);
+        const bindings = try self.allocator.alloc(kernel.Bindings, self.active.rules.len);
+        defer self.allocator.free(bindings);
+        const request_ids = try self.allocator.alloc([64]u8, self.active.rules.len);
+        defer self.allocator.free(request_ids);
+        for (self.active.rules, 0..) |entry, index| {
+            const candidate_id = parseHex(entry.candidate_id) orelse
+                return error.InvalidCandidateId;
+            const is_recovery = index == rule_index;
+            const operation = if (is_recovery) recovery_operation else ordinary_operation;
+            const payload = if (is_recovery) recovery_payload else ordinary_payload;
+            const signal_json = if (is_recovery) recovery_signal_json else ordinary_signal_json;
+            request_ids[index] = kernel.requestId(
+                operation,
+                candidate_id,
+                self.active.bundle_sha256,
+                self.active.revision,
+                signal_json,
+            );
+            requests[index] = .{
+                .request_id = request_ids[index][0..],
+                .operation = operation,
+                .kernel_sha256 = self.active.kernel_sha256[0..],
+                .candidate_id = entry.candidate_id,
+                .project_sha256 = self.active.project_sha256[0..],
+                .bundle_sha256 = self.active.bundle_sha256[0..],
+                .bundle_revision = self.active.revision,
+                .rule_spec = entry.rule_spec,
+                .payload = payload,
+            };
+            bindings[index] = .{
+                .request_id = request_ids[index],
+                .operation = operation,
+                .kernel_sha256 = self.active.kernel_sha256,
+                .candidate_id = candidate_id,
+                .project_sha256 = self.active.project_sha256,
+                .bundle_sha256 = self.active.bundle_sha256,
+                .bundle_revision = self.active.revision,
+            };
+        }
+        var batch = try kernel.invokeBatch(
+            self.allocator,
+            self.config,
+            requests,
+            bindings,
+            self.abort,
+        );
+        defer batch.deinit(self.allocator);
+        return self.recordBatch(dispatch_id, phase, file_target_state, &batch);
+    }
+
     fn recordBatch(
         self: *RuntimeGate,
         dispatch_id: []const u8,
@@ -210,11 +520,25 @@ pub const RuntimeGate = struct {
         var decision_count: usize = 0;
         var result = protocol.Result.admit;
         var recovery_action = protocol.RecoveryAction.none;
+        var recovery_rule_index: ?usize = null;
+        var recovery_rule_result: ?protocol.Result = null;
         for (batch.invocations) |invocation| {
             decision_count += 1;
             if (invocation.failure != .none or invocation.verdict == null) {
                 result = .fault;
+                if (invocation.bindings) |bindings| {
+                    if (isRecoveryOperation(bindings.operation))
+                        recovery_rule_result = .fault;
+                }
                 break;
+            }
+            if (invocation.bindings) |bindings| {
+                if (isRecoveryOperation(bindings.operation)) {
+                    recovery_rule_result = if (invocation.verdict.?.admitted)
+                        .admit
+                    else
+                        .block;
+                }
             }
             if (!invocation.verdict.?.admitted) {
                 result = .block;
@@ -222,6 +546,8 @@ pub const RuntimeGate = struct {
                     .none => .none,
                     .edit_existing_file_exact => .edit_existing_file_exact,
                 };
+                if (recovery_action != .none and invocation.bindings != null)
+                    recovery_rule_index = self.ruleIndex(invocation.bindings.?.candidate_id);
                 break;
             }
         }
@@ -236,12 +562,15 @@ pub const RuntimeGate = struct {
         const sink = self.observation_sink orelse return .{
             .result = result,
             .recovery_action = recovery_action,
+            .recovery_rule_index = recovery_rule_index,
+            .recovery_rule_result = recovery_rule_result,
         };
         const decisions = self.allocator.alloc(observation.FormalCandidateDecision, decision_count) catch
             return .{ .result = .fault };
         defer self.allocator.free(decisions);
         for (batch.invocations[0..decision_count], decisions) |invocation, *decision| {
             decision.* = .{
+                .operation = formalOperation(invocation.bindings.?.operation),
                 .result = if (invocation.failure != .none)
                     .fault
                 else if (invocation.verdict != null and invocation.verdict.?.admitted)
@@ -278,9 +607,100 @@ pub const RuntimeGate = struct {
             .checker_bytes = first.checker_bytes,
             .decisions = decisions,
         } })) return .{ .result = .fault };
-        return .{ .result = result, .recovery_action = recovery_action };
+        return .{
+            .result = result,
+            .recovery_action = recovery_action,
+            .recovery_rule_index = recovery_rule_index,
+            .recovery_rule_result = recovery_rule_result,
+        };
+    }
+
+    fn ruleIndex(self: *const RuntimeGate, candidate_id: [64]u8) ?usize {
+        for (self.active.rules, 0..) |entry, index| {
+            const parsed = parseHex(entry.candidate_id) orelse continue;
+            if (std.mem.eql(u8, &parsed, &candidate_id)) return index;
+        }
+        return null;
+    }
+
+    fn findExactEditObligation(
+        self: *const RuntimeGate,
+        target_sha256: [64]u8,
+    ) ?usize {
+        for (self.exact_edit_obligations[0..self.exact_edit_obligations_len], 0..) |item, index| {
+            if (std.mem.eql(u8, &item.target_sha256, &target_sha256)) return index;
+        }
+        return null;
+    }
+
+    fn installExactEditObligation(
+        self: *RuntimeGate,
+        obligation: ExactEditObligation,
+    ) bool {
+        if (self.findExactEditObligation(obligation.target_sha256)) |index| {
+            self.exact_edit_obligations[index] = obligation;
+            return true;
+        }
+        if (self.exact_edit_obligations_len == self.exact_edit_obligations.len)
+            return false;
+        self.exact_edit_obligations[self.exact_edit_obligations_len] = obligation;
+        self.exact_edit_obligations_len += 1;
+        return true;
+    }
+
+    fn removeExactEditObligation(self: *RuntimeGate, index: usize) void {
+        std.debug.assert(index < self.exact_edit_obligations_len);
+        self.exact_edit_obligations_len -= 1;
+        if (index != self.exact_edit_obligations_len)
+            self.exact_edit_obligations[index] =
+                self.exact_edit_obligations[self.exact_edit_obligations_len];
+    }
+
+    fn findInflightDispatch(
+        self: *const RuntimeGate,
+        dispatch_sha256: [64]u8,
+    ) ?usize {
+        for (self.inflight_exact_edits[0..self.inflight_exact_edits_len], 0..) |item, index| {
+            if (std.mem.eql(u8, &item.dispatch_sha256, &dispatch_sha256)) return index;
+        }
+        return null;
+    }
+
+    fn findInflightTarget(
+        self: *const RuntimeGate,
+        target_sha256: [64]u8,
+    ) ?usize {
+        for (self.inflight_exact_edits[0..self.inflight_exact_edits_len], 0..) |item, index| {
+            if (std.mem.eql(u8, &item.target_sha256, &target_sha256)) return index;
+        }
+        return null;
+    }
+
+    fn removeInflightExactEdit(self: *RuntimeGate, index: usize) void {
+        std.debug.assert(index < self.inflight_exact_edits_len);
+        self.inflight_exact_edits_len -= 1;
+        if (index != self.inflight_exact_edits_len)
+            self.inflight_exact_edits[index] =
+                self.inflight_exact_edits[self.inflight_exact_edits_len];
     }
 };
+
+fn isRecoveryOperation(operation: kernel.Operation) bool {
+    return switch (operation) {
+        .recovery_pre_decision, .recovery_post_decision => true,
+        .promote, .pre_decision, .post_decision => false,
+    };
+}
+
+fn formalOperation(operation: kernel.Operation) observation.FormalOperation {
+    return switch (operation) {
+        .pre_decision => .pre_decision,
+        .post_decision => .post_decision,
+        .recovery_pre_decision => .recovery_pre_decision,
+        .recovery_post_decision => .recovery_post_decision,
+        .promote => unreachable,
+    };
+}
 
 fn persistRuntimeBatchVerdict(
     directory: []const u8,
@@ -435,6 +855,23 @@ fn postReobserved(effect: ?observation.Effect) bool {
     return switch (value) {
         .file_mutation_v1 => false,
         .file_mutation_v2 => |mutation| mutation.reobservation.state == .matched,
+    };
+}
+
+fn observedMatchesBlocked(
+    effect: ?observation.Effect,
+    target_sha256: [64]u8,
+    expected: [64]u8,
+) bool {
+    const value = effect orelse return false;
+    return switch (value) {
+        .file_mutation_v1 => false,
+        .file_mutation_v2 => |mutation| std.mem.eql(
+            u8,
+            &mutation.mutation.path_sha256,
+            &target_sha256,
+        ) and mutation.reobservation.state == .matched and
+            std.mem.eql(u8, &mutation.reobservation.observed_sha256, &expected),
     };
 }
 

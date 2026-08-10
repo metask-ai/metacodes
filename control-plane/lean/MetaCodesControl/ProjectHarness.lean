@@ -6,11 +6,11 @@ namespace MetaCodesControl.ProjectHarness
 open MetaCodesControl.FormalKernel
 open MetaCodesControl.ProjectRule
 
-def requestSchema : String := "metacodes-project-harness-request-v2"
-def verdictSchema : String := "metacodes-project-harness-verdict-v2"
-def batchRequestSchema : String := "metacodes-project-harness-batch-request-v2"
-def batchVerdictSchema : String := "metacodes-project-harness-batch-verdict-v2"
-def checkerVersion : String := "metacodes-project-harness-kernel-v2"
+def requestSchema : String := "metacodes-project-harness-request-v3"
+def verdictSchema : String := "metacodes-project-harness-verdict-v3"
+def batchRequestSchema : String := "metacodes-project-harness-batch-request-v3"
+def batchVerdictSchema : String := "metacodes-project-harness-batch-verdict-v3"
+def checkerVersion : String := "metacodes-project-harness-kernel-v3"
 def maxBatchRequests : Nat := 1024
 def zeroSha256 : String := "0000000000000000000000000000000000000000000000000000000000000000"
 
@@ -24,6 +24,8 @@ inductive Operation where
   | promote
   | preDecision
   | postDecision
+  | recoveryPreDecision
+  | recoveryPostDecision
   deriving Repr, BEq, DecidableEq
 
 structure PromotionFacts where
@@ -70,6 +72,8 @@ inductive Payload where
   | promotion : PromotionFacts → Payload
   | pre : PreSignal → Payload
   | post : PostSignal → Payload
+  | recoveryPre : RecoveryPreSignal → Payload
+  | recoveryPost : RecoveryPostSignal → Payload
   deriving Repr, BEq
 
 structure Request where
@@ -157,6 +161,12 @@ def decide (request : Request) : Bool :=
   | .post signal =>
       request.operation == .postDecision && requestBindingsValid request &&
         valid request.ruleSpec && postDecision request.ruleSpec signal
+  | .recoveryPre signal =>
+      request.operation == .recoveryPreDecision && requestBindingsValid request &&
+        valid request.ruleSpec && recoveryPreDecision request.ruleSpec signal
+  | .recoveryPost signal =>
+      request.operation == .recoveryPostDecision && requestBindingsValid request &&
+        valid request.ruleSpec && recoveryPostDecision request.ruleSpec signal
 
 theorem safePromotion_sound (request : Request) (facts : PromotionFacts)
     (admitted : SafePromotion request facts = true) :
@@ -208,6 +218,8 @@ def operationName : Operation → String
   | .promote => "promote"
   | .preDecision => "pre_decision"
   | .postDecision => "post_decision"
+  | .recoveryPreDecision => "recovery_pre_decision"
+  | .recoveryPostDecision => "recovery_post_decision"
 
 def effectOfString? : String → Option EffectRequirement
   | "none" => some .none
@@ -237,6 +249,8 @@ def operationOfString? : String → Option Operation
   | "promote" => some .promote
   | "pre_decision" => some .preDecision
   | "post_decision" => some .postDecision
+  | "recovery_pre_decision" => some .recoveryPreDecision
+  | "recovery_post_decision" => some .recoveryPostDecision
   | _ => none
 
 def parseEffectField (cursor : Cursor) (name : String) :
@@ -302,6 +316,9 @@ def parsePreSignal (cursor : Cursor) : Except String (PreSignal × Cursor) := do
   let cursor ← expectLiteral cursor ","
   let (fileTargetState, cursor) ←
     parseFileTargetStateField cursor "file_target_state"
+  let cursor ← expectLiteral cursor ","
+  let (exactRecoveryMaterialReady, cursor) ←
+    parseBoolField cursor "exact_recovery_material_ready"
   let cursor ← expectLiteral cursor "}"
   let signal : PreSignal := {
     tool := tool
@@ -309,6 +326,7 @@ def parsePreSignal (cursor : Cursor) : Except String (PreSignal × Cursor) := do
     agentDepth := agentDepth
     authoritative := authoritative
     fileTargetState := fileTargetState
+    exactRecoveryMaterialReady := exactRecoveryMaterialReady
   }
   pure (signal, cursor)
 
@@ -332,6 +350,65 @@ def parsePostSignal (cursor : Cursor) : Except String (PostSignal × Cursor) := 
     postReobserved := postReobserved
   }
   pure (signal, cursor)
+
+def parseRecoveryPreSignal (cursor : Cursor) :
+    Except String (RecoveryPreSignal × Cursor) := do
+  let cursor ← expectLiteral cursor "{"
+  let (tool, cursor) ← parseStringField cursor "tool"
+  let cursor ← expectLiteral cursor ","
+  let (inputBytes, cursor) ← parseNatField cursor "input_bytes"
+  let cursor ← expectLiteral cursor ","
+  let (agentDepth, cursor) ← parseNatField cursor "agent_depth"
+  let cursor ← expectLiteral cursor ","
+  let (authoritative, cursor) ← parseBoolField cursor "authoritative"
+  let cursor ← expectLiteral cursor ","
+  let (targetMatches, cursor) ← parseBoolField cursor "target_matches"
+  let cursor ← expectLiteral cursor ","
+  let (materialAvailable, cursor) ← parseBoolField cursor "material_available"
+  let cursor ← expectLiteral cursor ","
+  let (currentMatchesSource, cursor) ←
+    parseBoolField cursor "current_matches_source"
+  let cursor ← expectLiteral cursor ","
+  let (oldMatchesCurrent, cursor) ← parseBoolField cursor "old_matches_current"
+  let cursor ← expectLiteral cursor ","
+  let (newMatchesBlocked, cursor) ← parseBoolField cursor "new_matches_blocked"
+  let cursor ← expectLiteral cursor "}"
+  pure ({
+    tool := tool
+    inputBytes := inputBytes
+    agentDepth := agentDepth
+    authoritative := authoritative
+    targetMatches := targetMatches
+    materialAvailable := materialAvailable
+    currentMatchesSource := currentMatchesSource
+    oldMatchesCurrent := oldMatchesCurrent
+    newMatchesBlocked := newMatchesBlocked
+  }, cursor)
+
+def parseRecoveryPostSignal (cursor : Cursor) :
+    Except String (RecoveryPostSignal × Cursor) := do
+  let cursor ← expectLiteral cursor "{\"pre\":"
+  let (pre, cursor) ← parseRecoveryPreSignal cursor
+  let cursor ← expectLiteral cursor ","
+  let (succeeded, cursor) ← parseBoolField cursor "succeeded"
+  let cursor ← expectLiteral cursor ","
+  let (effectValid, cursor) ← parseBoolField cursor "effect_valid"
+  let cursor ← expectLiteral cursor ","
+  let (hasFileMutationV1, cursor) ← parseBoolField cursor "has_file_mutation_v1"
+  let cursor ← expectLiteral cursor ","
+  let (postReobserved, cursor) ← parseBoolField cursor "post_reobserved"
+  let cursor ← expectLiteral cursor ","
+  let (observedMatchesBlocked, cursor) ←
+    parseBoolField cursor "observed_matches_blocked"
+  let cursor ← expectLiteral cursor "}"
+  pure ({
+    pre := pre
+    succeeded := succeeded
+    effectValid := effectValid
+    hasFileMutationV1 := hasFileMutationV1
+    postReobserved := postReobserved
+    observedMatchesBlocked := observedMatchesBlocked
+  }, cursor)
 
 def parsePromotionFacts (cursor : Cursor) : Except String (PromotionFacts × Cursor) := do
   let cursor ← expectLiteral cursor "{"
@@ -494,6 +571,16 @@ def parseCanonicalRequest (cursor : Cursor) : Except String (Request × Cursor) 
         let (signal, cursor) ← parsePostSignal cursor
         let cursor ← expectLiteral cursor "}}"
         pure (Payload.post signal, cursor)
+    | .recoveryPreDecision => do
+        let cursor ← expectLiteral cursor "\"recovery_pre\":"
+        let (signal, cursor) ← parseRecoveryPreSignal cursor
+        let cursor ← expectLiteral cursor "}}"
+        pure (Payload.recoveryPre signal, cursor)
+    | .recoveryPostDecision => do
+        let cursor ← expectLiteral cursor "\"recovery_post\":"
+        let (signal, cursor) ← parseRecoveryPostSignal cursor
+        let cursor ← expectLiteral cursor "}}"
+        pure (Payload.recoveryPost signal, cursor)
   pure ({
     schemaVersion := schemaVersion
     requestId := requestId
@@ -541,7 +628,7 @@ def lifecycleValid (request : Request) : Bool :=
   | .promotion facts => sourceValid facts && actorsIndependent facts &&
       chainValid facts && buildValid facts && replayValid request facts &&
       shadowValid request facts && bundleTransitionValid request facts
-  | .pre _ | .post _ => true
+  | .pre _ | .post _ | .recoveryPre _ | .recoveryPost _ => true
 
 def failureCodes (request : Request) : List String :=
   let failures := if requestBindingsValid request then [] else ["invalid_request_binding"]
@@ -568,6 +655,19 @@ def failureCodes (request : Request) : List String :=
       | some code => failures ++ [code]
   | .post signal =>
       if postDecision request.ruleSpec signal then failures else failures ++ ["rule_postcondition_blocked"]
+  | .recoveryPre signal =>
+      let failures := if recoveryPreDecision request.ruleSpec signal then failures
+        else failures ++ ["rule_precondition_blocked"]
+      if request.operation == .recoveryPreDecision &&
+          requestBindingsValid request && valid request.ruleSpec &&
+          !recoveryPreDecision request.ruleSpec signal &&
+          recoveryPreRetryEligible request.ruleSpec signal then
+        failures ++ ["recover_edit_existing_file_exact"]
+      else
+        failures
+  | .recoveryPost signal =>
+      if recoveryPostDecision request.ruleSpec signal then failures
+      else failures ++ ["rule_postcondition_blocked"]
 
 def verdictJson (request : Request) : String :=
   let admitted := decide request

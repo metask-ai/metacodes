@@ -84,6 +84,7 @@ pub const RunFormalDecision = struct {
     sequence: u64,
     dispatch_id: []const u8,
     phase: observation.FormalPhase,
+    operation: observation.FormalOperation,
     actuation: observation.FormalActuation,
     file_target_state: observation.FileTargetState = .unobserved,
     result: observation.FormalResult,
@@ -401,6 +402,7 @@ pub fn loadRunDispatches(
                     .sequence = envelope.sequence,
                     .dispatch_id = formal.dispatch_id,
                     .phase = formal.phase,
+                    .operation = standardFormalOperation(formal.phase),
                     .actuation = formal.actuation,
                     .file_target_state = formal.file_target_state,
                     .result = formal.result,
@@ -424,6 +426,11 @@ pub fn loadRunDispatches(
                         .sequence = envelope.sequence,
                         .dispatch_id = batch.dispatch_id,
                         .phase = batch.phase,
+                        .operation = if (std.mem.eql(
+                            u8,
+                            batch.schema_version,
+                            observation.FORMAL_BATCH_SCHEMA_VERSION,
+                        )) decision.operation else standardFormalOperation(batch.phase),
                         .actuation = batch.actuation,
                         .file_target_state = batch.file_target_state,
                         .result = decision.result,
@@ -633,6 +640,7 @@ fn validateFd(
                         try acceptFormalDecision(&formal_validation, .{
                             .dispatch_id = formal.dispatch_id,
                             .phase = formal.phase,
+                            .operation = standardFormalOperation(formal.phase),
                             .actuation = formal.actuation,
                             .result = formal.result,
                             .candidate_id = formal.candidate_id,
@@ -661,11 +669,18 @@ fn validateFd(
                             batch.schema_version,
                             observation.FORMAL_BATCH_SCHEMA_VERSION_V2,
                         );
-                        if ((!legacy_v1 and !legacy_v2 and !std.mem.eql(
+                        const legacy_v3 = std.mem.eql(
+                            u8,
+                            batch.schema_version,
+                            observation.FORMAL_BATCH_SCHEMA_VERSION_V3,
+                        );
+                        const current_schema = std.mem.eql(
                             u8,
                             batch.schema_version,
                             observation.FORMAL_BATCH_SCHEMA_VERSION,
-                        )) or (legacy_v1 and batch.actuation != .enforced) or
+                        );
+                        if ((!legacy_v1 and !legacy_v2 and !legacy_v3 and !current_schema) or
+                            (legacy_v1 and batch.actuation != .enforced) or
                             batch.decisions.len == 0 or
                             batch.decisions.len > batch.checker_batch_size or
                             batch.checker_batch_size > @import("../formal/project_harness_runtime.zig").MAX_BATCH_REQUESTS or
@@ -673,6 +688,11 @@ fn validateFd(
                                 batch.decisions[batch.decisions.len - 1].result == .admit))
                             return error.InvalidRecord;
                         for (batch.decisions) |decision| {
+                            const operation = if (current_schema)
+                                decision.operation
+                            else
+                                standardFormalOperation(batch.phase);
+                            if (operation.phase() != batch.phase) return error.InvalidRecord;
                             if (decision.recovery_action != .none and
                                 (legacy_v1 or legacy_v2 or batch.phase != .pre or
                                     decision.result != .block or
@@ -681,6 +701,7 @@ fn validateFd(
                             try acceptFormalDecision(&formal_validation, .{
                                 .dispatch_id = batch.dispatch_id,
                                 .phase = batch.phase,
+                                .operation = operation,
                                 .actuation = batch.actuation,
                                 .result = decision.result,
                                 .candidate_id = decision.candidate_id,
@@ -853,6 +874,7 @@ const OpenDispatch = struct {
 const FormalRecord = struct {
     dispatch_id: []const u8,
     phase: observation.FormalPhase,
+    operation: observation.FormalOperation,
     actuation: observation.FormalActuation,
     result: observation.FormalResult,
     candidate_id: [64]u8,
@@ -880,6 +902,7 @@ const FormalValidationState = struct {
 
 fn acceptFormalDecision(state: *FormalValidationState, formal: FormalRecord) !void {
     if (formal.dispatch_id.len == 0 or formal.dispatch_id.len > 256 or
+        formal.operation.phase() != formal.phase or
         formal.bundle_revision == 0 or
         !validHex(formal.candidate_id) or
         !validHex(formal.project_sha256) or
@@ -904,7 +927,11 @@ fn acceptFormalDecision(state: *FormalValidationState, formal: FormalRecord) !vo
             return error.InvalidRecord,
     }
     const dispatch_key = dispatchKey(formal.dispatch_id);
-    const event_key = formalKey(formal.dispatch_id, formal.candidate_id, formal.phase);
+    const event_key = formalEventKey(
+        formal.dispatch_id,
+        formal.candidate_id,
+        formal.operation,
+    );
     if (state.formal_events.contains(event_key)) return error.InvalidRecord;
     try state.formal_events.put(event_key, 0);
     const identity = FormalControlIdentity{
@@ -938,7 +965,11 @@ fn acceptFormalDecision(state: *FormalValidationState, formal: FormalRecord) !vo
             if (formal.actuation == .enforced and formal.result != .admit)
                 state_entry.value_ptr.terminal_pre = true;
             try state.pre_decisions.put(
-                formalKey(formal.dispatch_id, formal.candidate_id, .pre),
+                formalPairKey(
+                    formal.dispatch_id,
+                    formal.candidate_id,
+                    formal.operation,
+                ),
                 .{ .identity = identity, .result = formal.result },
             );
         },
@@ -948,7 +979,11 @@ fn acceptFormalDecision(state: *FormalValidationState, formal: FormalRecord) !vo
             const dispatch_state = state.formal_dispatches.get(dispatch_key) orelse
                 return error.InvalidRecord;
             const prior = state.pre_decisions.get(
-                formalKey(formal.dispatch_id, formal.candidate_id, .pre),
+                formalPairKey(
+                    formal.dispatch_id,
+                    formal.candidate_id,
+                    formal.operation,
+                ),
             ) orelse return error.InvalidRecord;
             if (!opened.governed or opened.terminal_post or
                 (formal.actuation == .enforced and prior.result != .admit) or
@@ -973,17 +1008,42 @@ fn formalIdentity(formal: anytype) FormalControlIdentity {
     };
 }
 
-fn formalKey(
+fn standardFormalOperation(
+    phase: observation.FormalPhase,
+) observation.FormalOperation {
+    return switch (phase) {
+        .pre => .pre_decision,
+        .post => .post_decision,
+    };
+}
+
+fn formalEventKey(
     dispatch_id: []const u8,
     candidate_id: [64]u8,
-    phase: observation.FormalPhase,
+    operation: observation.FormalOperation,
 ) [32]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("metacodes-formal-event-key-v1\x00");
+    hasher.update("metacodes-formal-event-key-v2\x00");
     hasher.update(dispatch_id);
     hasher.update("\x00");
     hasher.update(&candidate_id);
-    hasher.update(&.{@intFromEnum(phase)});
+    hasher.update(&.{@intFromEnum(operation)});
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn formalPairKey(
+    dispatch_id: []const u8,
+    candidate_id: [64]u8,
+    operation: observation.FormalOperation,
+) [32]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("metacodes-formal-pair-key-v1\x00");
+    hasher.update(dispatch_id);
+    hasher.update("\x00");
+    hasher.update(&candidate_id);
+    hasher.update(&.{@intFromBool(operation.isRecovery())});
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     return digest;
@@ -1292,6 +1352,7 @@ test "formal journal enforces pre dispatch post finish wiring and permits pre bl
     };
     const batch_post_decisions = [_]observation.FormalCandidateDecision{
         .{
+            .operation = .post_decision,
             .result = .admit,
             .candidate_id = .{'1'} ** 64,
             .request_sha256 = .{'9'} ** 64,
@@ -1299,6 +1360,7 @@ test "formal journal enforces pre dispatch post finish wiring and permits pre bl
             .checker_failure = null,
         },
         .{
+            .operation = .post_decision,
             .result = .admit,
             .candidate_id = .{'2'} ** 64,
             .request_sha256 = .{'b'} ** 64,

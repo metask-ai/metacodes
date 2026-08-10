@@ -13,11 +13,11 @@ const observation = @import("../tools/observation.zig");
 const spec_mod = @import("../core/project_rule_spec.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
-pub const REQUEST_SCHEMA = "metacodes-project-harness-request-v2";
-pub const VERDICT_SCHEMA = "metacodes-project-harness-verdict-v2";
-pub const BATCH_REQUEST_SCHEMA = "metacodes-project-harness-batch-request-v2";
-pub const BATCH_VERDICT_SCHEMA = "metacodes-project-harness-batch-verdict-v2";
-pub const CHECKER_VERSION = "metacodes-project-harness-kernel-v2";
+pub const REQUEST_SCHEMA = "metacodes-project-harness-request-v3";
+pub const VERDICT_SCHEMA = "metacodes-project-harness-verdict-v3";
+pub const BATCH_REQUEST_SCHEMA = "metacodes-project-harness-batch-request-v3";
+pub const BATCH_VERDICT_SCHEMA = "metacodes-project-harness-batch-verdict-v3";
+pub const CHECKER_VERSION = "metacodes-project-harness-kernel-v3";
 pub const MAX_REQUEST_BYTES: usize = 128 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 pub const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
@@ -52,7 +52,13 @@ pub fn loadConfigFromEnv() ConfigLoad {
     } };
 }
 
-pub const Operation = enum { promote, pre_decision, post_decision };
+pub const Operation = enum {
+    promote,
+    pre_decision,
+    post_decision,
+    recovery_pre_decision,
+    recovery_post_decision,
+};
 pub const SourceKind = enum { user_correction, agent_reflection, runtime_counterexample };
 
 pub const PromotionFacts = struct {
@@ -99,6 +105,8 @@ pub const Payload = union(enum) {
     promotion: PromotionFacts,
     pre: spec_mod.PreSignal,
     post: spec_mod.PostSignal,
+    recovery_pre: spec_mod.RecoveryPreSignal,
+    recovery_post: spec_mod.RecoveryPostSignal,
 };
 
 pub const Request = struct {
@@ -142,8 +150,9 @@ pub const Checks = struct {
     }
 };
 
-/// Recovery is proof-carrying output from the hash-pinned Lean kernel.  It is
-/// advisory for the next model action, never an authorization bypass.
+/// Recovery is proof-carrying output from the hash-pinned Lean kernel. The
+/// native gate turns it into an exact-edit obligation; it is never an
+/// authorization bypass.
 pub const RecoveryAction = enum {
     none,
     edit_existing_file_exact,
@@ -610,7 +619,9 @@ fn validateRawVerdict(raw: RawVerdict, bindings: Bindings) ParseError!Verdict {
     if (recovery_count > 1 or
         (raw.admitted and raw.reason_codes.len != 0) or
         (recovery_count == 1 and
-            (raw.operation != .pre_decision or raw.admitted or blocked_count != 1 or
+            ((raw.operation != .pre_decision and
+                raw.operation != .recovery_pre_decision) or
+                raw.admitted or blocked_count != 1 or
                 raw.reason_codes.len != 2 or !raw.checks.all())))
         return error.Inconsistent;
     return .{

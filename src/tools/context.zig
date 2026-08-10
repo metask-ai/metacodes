@@ -119,6 +119,13 @@ pub const ToolObservationSink = @import("observation.zig").Sink;
 pub const ProjectRuleGate = @import("project_rule_gate.zig").Gate;
 pub const ToolObservationOrigin = @import("observation.zig").Origin;
 
+/// Host-only execution constraint installed after the formal recovery gate.
+/// It is not model input and cannot be selected through a tool argument.
+pub const ProjectEditMode = enum {
+    ordinary,
+    whole_file_exact,
+};
+
 /// Admission-fixed Run identity, passed by value down the execution chain.
 /// Immutable for the duration of one Run; never looked up from mutable state.
 pub const RunIdentity = struct {
@@ -427,6 +434,11 @@ pub const ToolContext = struct {
     /// target was observed missing.  Write then uses O_EXCL so a file created
     /// in the observation-to-open window is not silently truncated.
     project_write_exclusive_create: bool = false,
+    /// executeOne sets this only for a Lean-admitted recovery Edit.  The
+    /// native Edit implementation then requires old_string to equal the full
+    /// bytes read from one O_NOFOLLOW RDWR descriptor and disables every
+    /// fuzzy/substring fallback.
+    project_edit_mode: ProjectEditMode = .ordinary,
 
     /// **U6 A2:工具→父 backend 通知通路**。Task 生 subagent → emit agent_lifecycle;
     /// TaskUpdate 改 DAG → emit tasks_changed。agent_loop(depth==0)注入,转发到 backend.emitEvent

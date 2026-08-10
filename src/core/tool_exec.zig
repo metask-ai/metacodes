@@ -204,6 +204,7 @@ const DispatchObservation = struct {
     terminal_attempted: bool = false,
     input_bytes: usize = 0,
     file_target_state: @import("project_rule_spec.zig").FileTargetState = .unobserved,
+    project_pre_signal: ?project_gate_protocol.PreSignal = null,
 
     fn start(self: *DispatchObservation, input: []const u8) bool {
         if (!emitDispatchStarted(
@@ -233,14 +234,7 @@ const DispatchObservation = struct {
         reobserveFileEffect(self.effect_slot);
         const elapsed: u64 = @intCast(@max(util_time.nowMs() - self.started_at_ms, 0));
         const formal = if (self.ctx.project_rule_gate) |gate| gate.post(.{
-            .pre = .{
-                .dispatch_id = self.id,
-                .tool = self.dispatched_name,
-                .input_bytes = self.input_bytes,
-                .agent_depth = self.ctx.agent_depth,
-                .authoritative = self.ctx.tool_observation_origin == .authoritative,
-                .file_target_state = self.file_target_state,
-            },
+            .pre = self.project_pre_signal orelse return false,
             .outcome = outcome,
             .effect = self.effect_slot.effect,
             .effect_valid = self.effect_slot.valid,
@@ -484,6 +478,7 @@ pub fn executeOne(
             input,
         );
         dispatch_observation.file_target_state = project_pre_signal.?.file_target_state;
+        dispatch_observation.project_pre_signal = project_pre_signal.?;
     }
     if (job_ctx.project_rule_gate) |gate| {
         switch (gate.pre(project_pre_signal.?)) {
@@ -491,6 +486,17 @@ pub fn executeOne(
                 if (std.mem.eql(u8, dispatched_name, "Write") and
                     project_pre_signal.?.file_target_state == .missing)
                     job_ctx.project_write_exclusive_create = true;
+            },
+            .admit_exact_edit => {
+                // This tag is an authority-bearing native execution mode,
+                // not a generic "yes".  A buggy/malicious gate must not use
+                // it to reroute another tool through Edit.
+                if (!std.mem.eql(u8, dispatched_name, "Edit")) {
+                    _ = gate.cancelPre(project_pre_signal.?);
+                    log.warnId("agent", rid, "project formal gate returned exact-edit admission for non-Edit name={s} id={s}", .{ name, id });
+                    return .host_fatal;
+                }
+                job_ctx.project_edit_mode = .whole_file_exact;
             },
             .block => |recovery_action| {
                 const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
@@ -520,11 +526,19 @@ pub fn executeOne(
         }
     }
     if (!dispatch_observation.start(input)) {
+        if (job_ctx.project_edit_mode == .whole_file_exact) {
+            const gate = job_ctx.project_rule_gate orelse return .host_fatal;
+            if (!gate.cancelPre(project_pre_signal.?))
+                log.warnId("agent", rid, "project exact-edit pre-state cancellation failed after observation start rejection name={s} id={s}", .{ name, id });
+        }
         log.warnId("agent", rid, "tool observation rejected dispatch start name={s} id={s}", .{ name, id });
         return .host_fatal;
     }
     defer dispatch_observation.ensureTerminal();
-    const r = tools_mod.dispatch(&job_ctx, name, input) catch |err| {
+    const r = (if (job_ctx.project_edit_mode == .whole_file_exact)
+        tools_mod.dispatchProjectExactEdit(&job_ctx, input)
+    else
+        tools_mod.dispatch(&job_ctx, name, input)) catch |err| {
         const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
         if (err == error.OutOfMemory) {
             if (!dispatch_observation.finish(.host_fatal, @errorName(err), null))

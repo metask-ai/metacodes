@@ -60,6 +60,75 @@ const CreateRaceGate = struct {
     }
 };
 
+/// Wraps the real RuntimeGate and changes the file only after Lean has
+/// admitted the recovery transition.  This places the mutation in the exact
+/// sensor/checker-to-native-dispatch window that the L2 is meant to cover.
+const ExactEditRaceGate = struct {
+    inner: cc.project_rule_gate_protocol.Gate,
+    path: [:0]const u8,
+    raced: bool = false,
+
+    fn pre(raw: *anyopaque, signal: cc.project_rule_gate_protocol.PreSignal) cc.project_rule_gate_protocol.PreResult {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const result = self.inner.pre(signal);
+        if (result == .admit_exact_edit) {
+            const fd = pfs.open(
+                self.path.ptr,
+                .{ .ACCMODE = .WRONLY, .TRUNC = true, .NOFOLLOW = true },
+                0,
+            );
+            if (fd < 0) return .fault;
+            defer pfs.close(fd);
+            if (pfs.write(fd, "racer\n") != 6) return .fault;
+            self.raced = true;
+        }
+        return result;
+    }
+
+    fn post(raw: *anyopaque, signal: cc.project_rule_gate_protocol.PostSignal) cc.project_rule_gate_protocol.Result {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.inner.post(signal);
+    }
+
+    fn cancelPre(raw: *anyopaque, signal: cc.project_rule_gate_protocol.PreSignal) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.inner.cancelPre(signal);
+    }
+
+    fn gate(self: *@This()) cc.project_rule_gate_protocol.Gate {
+        return .{
+            .ctx = @ptrCast(self),
+            .preFn = pre,
+            .postFn = post,
+            .cancelPreFn = cancelPre,
+        };
+    }
+};
+
+const RejectDispatchStartSink = struct {
+    formal_events: usize = 0,
+    rejected_starts: usize = 0,
+
+    fn emit(raw: *anyopaque, event: cc.tools.tool_observation.Event) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return switch (event) {
+            .formal_decision, .formal_decision_batch => blk: {
+                self.formal_events += 1;
+                break :blk true;
+            },
+            .dispatch_started => blk: {
+                self.rejected_starts += 1;
+                break :blk false;
+            },
+            .dispatch_finished => true,
+        };
+    }
+
+    fn sink(self: *@This()) cc.tools.ToolObservationSink {
+        return .{ .ctx = @ptrCast(self), .emitFn = emit };
+    }
+};
+
 fn parseHex(value: []const u8) ?[64]u8 {
     if (value.len != 64) return null;
     var result: [64]u8 = undefined;
@@ -124,6 +193,412 @@ test "L2 admitted new-file Write cannot truncate a target created after observat
     try std.testing.expectEqual(@as(usize, 1), race.post_calls);
 }
 
+test "L2 Lean-admitted exact Edit refuses a source changed before native dispatch" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/exact-race.txt",
+        .{root_buffer[0..root_len]},
+        0,
+    );
+    defer allocator.free(path);
+    try overwriteArtifact(allocator, path, "before\n");
+
+    var active = try syntheticOrderedRecoveryActive(allocator, true, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+    };
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.project_rule_gate = runtime.protocolGate();
+
+    const write_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"after\"}}",
+        .{path},
+    );
+    defer allocator.free(write_args);
+    const blocked = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        write_args,
+        "race-source-write",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (blocked) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), runtime.exact_edit_obligations_len);
+
+    var race = ExactEditRaceGate{
+        .inner = runtime.protocolGate(),
+        .path = path,
+    };
+    ctx.project_rule_gate = race.gate();
+    const edit_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"old_string\":\"before\\n\",\"new_string\":\"after\"}}",
+        .{path},
+    );
+    defer allocator.free(edit_args);
+    const rejected = try cc.tool_exec.executeOne(
+        &ctx,
+        "Edit",
+        edit_args,
+        "race-exact-edit",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (rejected) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+            var parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                allocator,
+                done.content orelse return error.MissingToolError,
+                .{},
+            );
+            defer parsed.deinit();
+            const envelope = parsed.value.object.get("error") orelse
+                return error.MissingErrorEnvelope;
+            try std.testing.expectEqualStrings(
+                "stale_file",
+                (envelope.object.get("code") orelse return error.MissingErrorCode).string,
+            );
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                (envelope.object.get("detail") orelse return error.MissingErrorDetail).string,
+                "submit the intended Write proposal again",
+            ) != null);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    try std.testing.expect(race.raced);
+
+    const after = try readArtifact(allocator, path);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings("racer\n", after);
+    try std.testing.expectEqual(@as(usize, 1), runtime.exact_edit_obligations_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
+}
+
+test "L2 exact recovery preserves content CAS across the blocked Write and later Edit" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/between-turns-race.txt",
+        .{root_buffer[0..root_len]},
+    );
+    defer allocator.free(path);
+    try overwriteArtifact(allocator, path, "before\n");
+
+    var active = try syntheticOrderedRecoveryActive(allocator, true, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+    };
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.project_rule_gate = runtime.protocolGate();
+
+    const write_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"after\"}}",
+        .{path},
+    );
+    defer allocator.free(write_args);
+    const blocked = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        write_args,
+        "between-turns-source-write",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (blocked) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), runtime.exact_edit_obligations_len);
+
+    // Another actor changes the target after the denied Write. Even an Edit
+    // that exactly names this newer content must not consume the old
+    // obligation: recovery is a content-CAS, not merely a path-scoped write.
+    try overwriteArtifact(allocator, path, "intervening\n");
+    const edit_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"old_string\":\"intervening\\n\",\"new_string\":\"after\"}}",
+        .{path},
+    );
+    defer allocator.free(edit_args);
+    const rejected = try cc.tool_exec.executeOne(
+        &ctx,
+        "Edit",
+        edit_args,
+        "between-turns-exact-edit",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (rejected) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    const after = try readArtifact(allocator, path);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings("intervening\n", after);
+    try std.testing.expectEqual(@as(usize, 1), runtime.exact_edit_obligations_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
+}
+
+test "L2 exact recovery can fill an existing empty file without ordinary empty-needle semantics" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/empty.txt",
+        .{root_buffer[0..root_len]},
+    );
+    defer allocator.free(path);
+    try overwriteArtifact(allocator, path, "");
+
+    var active = try syntheticOrderedRecoveryActive(allocator, true, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+    };
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.project_rule_gate = runtime.protocolGate();
+    const write_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"filled\"}}",
+        .{path},
+    );
+    defer allocator.free(write_args);
+    const blocked = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        write_args,
+        "empty-source-write",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (blocked) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), runtime.exact_edit_obligations_len);
+
+    const edit_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"old_string\":\"\",\"new_string\":\"filled\"}}",
+        .{path},
+    );
+    defer allocator.free(edit_args);
+    const recovered = try cc.tool_exec.executeOne(
+        &ctx,
+        "Edit",
+        edit_args,
+        "empty-source-edit",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (recovered) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(!done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    const after = try readArtifact(allocator, path);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings("filled", after);
+    try std.testing.expectEqual(@as(usize, 0), runtime.exact_edit_obligations_len);
+}
+
+test "L2 malformed unrelated Edit remains a tool error while an exact obligation is pending" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/pending.txt",
+        .{root_buffer[0..root_len]},
+    );
+    defer allocator.free(path);
+    try overwriteArtifact(allocator, path, "before\n");
+
+    var active = try syntheticOrderedRecoveryActive(allocator, true, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+    };
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.project_rule_gate = runtime.protocolGate();
+    const write_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"after\"}}",
+        .{path},
+    );
+    defer allocator.free(write_args);
+    const blocked = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        write_args,
+        "malformed-source-write",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (blocked) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+
+    const malformed = try cc.tool_exec.executeOne(
+        &ctx,
+        "Edit",
+        "{}",
+        "malformed-unrelated-edit",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (malformed) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), runtime.exact_edit_obligations_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
+    const unchanged = try readArtifact(allocator, path);
+    defer allocator.free(unchanged);
+    try std.testing.expectEqualStrings("before\n", unchanged);
+}
+
+test "L2 rejected dispatch start cancels exact recovery inflight state" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/start-rejected.txt",
+        .{root_buffer[0..root_len]},
+    );
+    defer allocator.free(path);
+    try overwriteArtifact(allocator, path, "before\n");
+
+    var active = try syntheticOrderedRecoveryActive(allocator, true, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+    };
+    var sink_state = RejectDispatchStartSink{};
+    const sink = sink_state.sink();
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.project_rule_gate = runtime.protocolGate();
+
+    const write_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"after\"}}",
+        .{path},
+    );
+    defer allocator.free(write_args);
+    const blocked = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        write_args,
+        "start-rejected-source",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (blocked) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), runtime.exact_edit_obligations_len);
+    runtime.evidence_dir = root_buffer[0..root_len];
+    runtime.observation_sink = sink;
+    ctx.tool_observer = sink;
+
+    const edit_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"old_string\":\"before\\n\",\"new_string\":\"after\"}}",
+        .{path},
+    );
+    defer allocator.free(edit_args);
+    const rejected = try cc.tool_exec.executeOne(
+        &ctx,
+        "Edit",
+        edit_args,
+        "start-rejected-edit",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    try std.testing.expect(rejected == .host_fatal);
+    try std.testing.expectEqual(@as(usize, 1), sink_state.rejected_starts);
+    try std.testing.expectEqual(@as(usize, 1), sink_state.formal_events);
+    try std.testing.expectEqual(@as(usize, 1), runtime.exact_edit_obligations_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
+    const unchanged = try readArtifact(allocator, path);
+    defer allocator.free(unchanged);
+    try std.testing.expectEqualStrings("before\n", unchanged);
+}
+
 const Probe = struct {
     calls: usize = 0,
 
@@ -156,6 +631,56 @@ const Probe = struct {
         };
     }
 };
+
+test "L2 exact-edit admission never delegates to an embedding Session executor" {
+    const ExactAdmission = struct {
+        fn pre(_: *anyopaque, _: cc.project_rule_gate_protocol.PreSignal) cc.project_rule_gate_protocol.PreResult {
+            return .admit_exact_edit;
+        }
+        fn post(_: *anyopaque, signal: cc.project_rule_gate_protocol.PostSignal) cc.project_rule_gate_protocol.Result {
+            return if (signal.outcome == .tool_error) .admit else .fault;
+        }
+    };
+    const allocator = std.testing.allocator;
+    var probe = Probe{};
+    var marker: u8 = 0;
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.tool_dispatcher = probe.dispatcher();
+    ctx.project_rule_gate = .{
+        .ctx = @ptrCast(&marker),
+        .preFn = ExactAdmission.pre,
+        .postFn = ExactAdmission.post,
+    };
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Edit",
+        "{\"file_path\":\"/must/not/run\",\"old_string\":\"a\",\"new_string\":\"b\"}",
+        "embedding-exact-edit",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+            var parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                allocator,
+                done.content orelse return error.MissingToolError,
+                .{},
+            );
+            defer parsed.deinit();
+            const envelope = parsed.value.object.get("error") orelse
+                return error.MissingErrorEnvelope;
+            try std.testing.expectEqualStrings(
+                "project_rule_blocked",
+                (envelope.object.get("code") orelse return error.MissingErrorCode).string,
+            );
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+}
 
 fn readArtifact(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const path_z = try allocator.dupeZ(u8, path);
@@ -802,7 +1327,7 @@ fn promoteFixture(
     });
 }
 
-test "L2 evolved existing-file rule blocks overwrite, permits creation, and leaves Edit recovery" {
+test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edit" {
     const config = testKernel() orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -857,10 +1382,10 @@ test "L2 evolved existing-file rule blocks overwrite, permits creation, and leav
 
     const existing_path = try std.fmt.allocPrint(allocator, "{s}/existing.txt", .{root});
     defer allocator.free(existing_path);
-    try overwriteArtifact(allocator, existing_path, "old");
+    try overwriteArtifact(allocator, existing_path, "old\n");
     const overwrite_args = try std.fmt.allocPrint(
         allocator,
-        "{{\"file_path\":\"{s}\",\"content\":\"destroyed\"}}",
+        "{{\"file_path\":\"{s}\",\"content\":\"new\"}}",
         .{existing_path},
     );
     defer allocator.free(overwrite_args);
@@ -917,11 +1442,71 @@ test "L2 evolved existing-file rule blocks overwrite, permits creation, and leav
     }
     const preserved = try readArtifact(allocator, existing_path);
     defer allocator.free(preserved);
-    try std.testing.expectEqualStrings("old", preserved);
+    try std.testing.expectEqualStrings("old\n", preserved);
+
+    // An obligation is path-scoped. A normal Edit of another existing file
+    // still traverses the ordinary Lean rules and must not be falsely blocked.
+    const other_path = try std.fmt.allocPrint(allocator, "{s}/other.txt", .{root});
+    defer allocator.free(other_path);
+    try overwriteArtifact(allocator, other_path, "alpha");
+    const other_edit_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"old_string\":\"alpha\",\"new_string\":\"beta\"}}",
+        .{other_path},
+    );
+    defer allocator.free(other_edit_args);
+    const other_edit = try cc.tool_exec.executeOne(
+        &ctx,
+        "Edit",
+        other_edit_args,
+        "unrelated-edit-admitted",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (other_edit) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(!done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    const other_changed = try readArtifact(allocator, other_path);
+    defer allocator.free(other_changed);
+    try std.testing.expectEqualStrings("beta", other_changed);
+    try std.testing.expectEqual(@as(usize, 1), runtime.exact_edit_obligations_len);
+
+    // This is the real failure mode found by the first prospective GLM
+    // rollout: a local replacement omits the file's terminal newline from
+    // old_string and adds one to new_string. The recovery transition must
+    // block it before Edit can touch the file.
+    const partial_edit_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"old_string\":\"old\",\"new_string\":\"new\\n\"}}",
+        .{existing_path},
+    );
+    defer allocator.free(partial_edit_args);
+    const partial = try cc.tool_exec.executeOne(
+        &ctx,
+        "Edit",
+        partial_edit_args,
+        "partial-edit-rejected",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (partial) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    const still_preserved = try readArtifact(allocator, existing_path);
+    defer allocator.free(still_preserved);
+    try std.testing.expectEqualStrings("old\n", still_preserved);
 
     const edit_args = try std.fmt.allocPrint(
         allocator,
-        "{{\"file_path\":\"{s}\",\"old_string\":\"old\",\"new_string\":\"new\"}}",
+        "{{\"file_path\":\"{s}\",\"old_string\":\"old\\n\",\"new_string\":\"new\"}}",
         .{existing_path},
     );
     defer allocator.free(edit_args);
@@ -940,6 +1525,11 @@ test "L2 evolved existing-file rule blocks overwrite, permits creation, and leav
         },
         else => return error.UnexpectedToolResult,
     }
+    const exact = try readArtifact(allocator, existing_path);
+    defer allocator.free(exact);
+    try std.testing.expectEqualStrings("new", exact);
+    try std.testing.expectEqual(@as(usize, 0), runtime.exact_edit_obligations_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
 
     const new_path = try std.fmt.allocPrintSentinel(allocator, "{s}/created.txt", .{root}, 0);
     defer allocator.free(new_path);
@@ -1007,9 +1597,10 @@ test "L2 evolved existing-file rule blocks overwrite, permits creation, and leav
         binding,
     );
     defer observed.deinit();
-    // Only the Edit recovery and the new-file Write reached the dispatcher.
-    try std.testing.expectEqual(@as(usize, 2), observed.dispatches.len);
-    try std.testing.expectEqual(@as(usize, 6), observed.formal_decisions.len);
+    // The unrelated Edit, exact recovery and new-file Write reached dispatch;
+    // the prohibited Write, partial Edit and directory Write did not.
+    try std.testing.expectEqual(@as(usize, 3), observed.dispatches.len);
+    try std.testing.expectEqual(@as(usize, 9), observed.formal_decisions.len);
     var blocked_regular: usize = 0;
     var admitted_missing: usize = 0;
     var blocked_other: usize = 0;
@@ -1022,26 +1613,33 @@ test "L2 evolved existing-file rule blocks overwrite, permits creation, and leav
         if (decision.file_target_state == .other_existing and decision.result == .block)
             blocked_other += 1;
     }
-    try std.testing.expectEqual(@as(usize, 1), blocked_regular);
+    try std.testing.expectEqual(@as(usize, 2), blocked_regular);
     try std.testing.expectEqual(@as(usize, 1), admitted_missing);
     try std.testing.expectEqual(@as(usize, 1), blocked_other);
 
     var impact = try cc.rule_impact_stats.derive(allocator, &observed, .{});
     defer impact.deinit(allocator);
-    try std.testing.expectEqual(@as(u64, 6), impact.formal_decisions);
-    try std.testing.expectEqual(@as(u64, 6), impact.physical_checker_calls);
+    try std.testing.expectEqual(@as(u64, 9), impact.formal_decisions);
+    try std.testing.expectEqual(@as(u64, 9), impact.physical_checker_calls);
     try std.testing.expectEqual(@as(u64, 1), impact.exact_edit_recovery_directions);
-    try std.testing.expectEqual(@as(u64, 2), impact.enforced_pre_blocks_before_dispatch);
-    try std.testing.expectEqual(@as(u64, 2), impact.authoritative_dispatches);
-    try std.testing.expectEqual(@as(u64, 2), impact.authoritative_successes);
-    try std.testing.expectEqual(@as(u64, 2), impact.realized_file_changes);
-    try std.testing.expectEqual(@as(u64, 2), impact.subsequent_authoritative_successes);
+    try std.testing.expectEqual(@as(u64, 1), impact.exact_edit_recovery_pre_admits);
+    try std.testing.expectEqual(@as(u64, 1), impact.exact_edit_recovery_pre_blocks);
+    try std.testing.expectEqual(@as(u64, 1), impact.exact_edit_recovery_post_admits);
+    try std.testing.expectEqual(@as(u64, 0), impact.exact_edit_recovery_post_blocks);
+    try std.testing.expectEqual(@as(u64, 3), impact.enforced_pre_blocks_before_dispatch);
+    try std.testing.expectEqual(@as(u64, 3), impact.authoritative_dispatches);
+    try std.testing.expectEqual(@as(u64, 3), impact.authoritative_successes);
+    try std.testing.expectEqual(@as(u64, 3), impact.realized_file_changes);
+    try std.testing.expectEqual(@as(u64, 3), impact.subsequent_authoritative_successes);
     try std.testing.expectEqual(@as(usize, 1), impact.rules.len);
     try std.testing.expectEqual(
         @as(u64, 1),
         impact.rules[0].exact_edit_recovery_directions,
     );
-    try std.testing.expectEqual(@as(u64, 2), impact.rules[0].enforced_pre_blocks_before_dispatch);
+    try std.testing.expectEqual(@as(u64, 1), impact.rules[0].exact_edit_recovery_pre_admits);
+    try std.testing.expectEqual(@as(u64, 1), impact.rules[0].exact_edit_recovery_pre_blocks);
+    try std.testing.expectEqual(@as(u64, 1), impact.rules[0].exact_edit_recovery_post_admits);
+    try std.testing.expectEqual(@as(u64, 3), impact.rules[0].enforced_pre_blocks_before_dispatch);
     // A completed host Run is not automatically labeled as a successful task.
     try std.testing.expect(impact.labels.task_success == null);
 }
@@ -1127,6 +1725,8 @@ test "L2 shadow project rule records Lean blocks without changing real dispatch"
     const changed = try readArtifact(allocator, existing_path);
     defer allocator.free(changed);
     try std.testing.expectEqualStrings("shadow-wrote", changed);
+    try std.testing.expectEqual(@as(usize, 0), runtime.exact_edit_obligations_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
 
     try journal.finishRun("end_turn");
     const binding = try journal.runBinding();
@@ -1549,6 +2149,246 @@ fn syntheticOrderedRecoveryActive(
     };
 }
 
+test "L2 multi-target recovery keeps obligations independent and journals one mixed checker batch" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
+    defer allocator.free(evidence_dir);
+    try cc.util_fs.mkdirParents(evidence_dir);
+
+    var active = try syntheticOrderedRecoveryActive(allocator, true, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+    };
+    const sid = cc.session_id.SessionId.fromSlice("abcdef0123456789abcdef01").?;
+    var journal = try cc.tool_observation_journal.Journal.init(evidence_dir, sid);
+    errdefer journal.deinit();
+    const sink = journal.sink();
+    runtime.evidence_dir = evidence_dir;
+    runtime.observation_sink = sink;
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.project_rule_gate = runtime.protocolGate();
+    ctx.tool_observer = sink;
+
+    const path_a = try std.fmt.allocPrint(allocator, "{s}/target-a.txt", .{root});
+    defer allocator.free(path_a);
+    const path_b = try std.fmt.allocPrint(allocator, "{s}/target-b.txt", .{root});
+    defer allocator.free(path_b);
+    try overwriteArtifact(allocator, path_a, "a-old\n");
+    try overwriteArtifact(allocator, path_b, "b-old\n");
+
+    const write_a = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"a-new\"}}",
+        .{path_a},
+    );
+    defer allocator.free(write_a);
+    const write_b = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"b-new\\n\"}}",
+        .{path_b},
+    );
+    defer allocator.free(write_b);
+    for ([_]struct { args: []const u8, id: []const u8 }{
+        .{ .args = write_a, .id = "multi-target-a-write" },
+        .{ .args = write_b, .id = "multi-target-b-write" },
+    }) |attempt| {
+        const result = try cc.tool_exec.executeOne(
+            &ctx,
+            "Write",
+            attempt.args,
+            attempt.id,
+            allocator,
+            .{ .bytes = [_]u8{'0'} ** 12 },
+        );
+        switch (result) {
+            .done => |done| {
+                defer if (done.content) |bytes| allocator.free(bytes);
+                try std.testing.expect(done.is_error);
+            },
+            else => return error.UnexpectedToolResult,
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), runtime.exact_edit_obligations_len);
+
+    const edit_a = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"old_string\":\"a-old\\n\",\"new_string\":\"a-new\"}}",
+        .{path_a},
+    );
+    defer allocator.free(edit_a);
+    const recovered_a = try cc.tool_exec.executeOne(
+        &ctx,
+        "Edit",
+        edit_a,
+        "multi-target-a-edit",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (recovered_a) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(!done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), runtime.exact_edit_obligations_len);
+    const a_after = try readArtifact(allocator, path_a);
+    defer allocator.free(a_after);
+    try std.testing.expectEqualStrings("a-new", a_after);
+    const b_before = try readArtifact(allocator, path_b);
+    defer allocator.free(b_before);
+    try std.testing.expectEqualStrings("b-old\n", b_before);
+
+    const edit_b = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"old_string\":\"b-old\\n\",\"new_string\":\"b-new\\n\"}}",
+        .{path_b},
+    );
+    defer allocator.free(edit_b);
+    const recovered_b = try cc.tool_exec.executeOne(
+        &ctx,
+        "Edit",
+        edit_b,
+        "multi-target-b-edit",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (recovered_b) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(!done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    try std.testing.expectEqual(@as(usize, 0), runtime.exact_edit_obligations_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
+    const b_after = try readArtifact(allocator, path_b);
+    defer allocator.free(b_after);
+    try std.testing.expectEqualStrings("b-new\n", b_after);
+
+    try journal.finishRun("end_turn");
+    const binding = try journal.runBinding();
+    journal.deinit();
+    var observed = try cc.tool_observation_journal.loadRunDispatches(
+        allocator,
+        evidence_dir,
+        binding,
+    );
+    defer observed.deinit();
+
+    var recovery_pre: usize = 0;
+    var ordinary_pre: usize = 0;
+    var pre_sequence: ?u64 = null;
+    var pre_call: ?[64]u8 = null;
+    for (observed.formal_decisions) |decision| {
+        if (!std.mem.eql(u8, decision.dispatch_id, "multi-target-a-edit") or
+            decision.phase != .pre)
+            continue;
+        try std.testing.expectEqual(@as(u32, 2), decision.checker_batch_size);
+        if (pre_sequence) |sequence|
+            try std.testing.expectEqual(sequence, decision.sequence)
+        else
+            pre_sequence = decision.sequence;
+        if (pre_call) |call|
+            try std.testing.expectEqualSlices(
+                u8,
+                &call,
+                &(decision.checker_call_sha256 orelse return error.MissingCheckerCall),
+            )
+        else
+            pre_call = decision.checker_call_sha256 orelse return error.MissingCheckerCall;
+        switch (decision.operation) {
+            .recovery_pre_decision => recovery_pre += 1,
+            .pre_decision => ordinary_pre += 1,
+            else => return error.UnexpectedFormalOperation,
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), recovery_pre);
+    try std.testing.expectEqual(@as(usize, 1), ordinary_pre);
+
+    var impact = try cc.rule_impact_stats.derive(allocator, &observed, .{});
+    defer impact.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 10), impact.formal_decisions);
+    try std.testing.expectEqual(@as(u64, 6), impact.physical_checker_calls);
+    try std.testing.expectEqual(@as(u64, 2), impact.exact_edit_recovery_directions);
+    try std.testing.expectEqual(@as(u64, 2), impact.exact_edit_recovery_pre_admits);
+    try std.testing.expectEqual(@as(u64, 2), impact.exact_edit_recovery_post_admits);
+}
+
+test "L2 exact recovery obligation capacity fails closed before a new target" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    var active = try syntheticOrderedRecoveryActive(allocator, true, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+    };
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.project_rule_gate = runtime.protocolGate();
+
+    // RuntimeGate deliberately has a fixed, auditable bound. The first 32
+    // distinct targets install obligations; target 33 must fail before any
+    // tool dispatch rather than silently dropping a recovery commitment.
+    for (0..33) |index| {
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/bounded-{d}.txt",
+            .{ root, index },
+        );
+        defer allocator.free(path);
+        try overwriteArtifact(allocator, path, "old\n");
+        const args = try std.fmt.allocPrint(
+            allocator,
+            "{{\"file_path\":\"{s}\",\"content\":\"new-{d}\"}}",
+            .{ path, index },
+        );
+        defer allocator.free(args);
+        const result = try cc.tool_exec.executeOne(
+            &ctx,
+            "Write",
+            args,
+            "capacity-write",
+            allocator,
+            .{ .bytes = [_]u8{'0'} ** 12 },
+        );
+        if (index < 32) {
+            switch (result) {
+                .done => |done| {
+                    defer if (done.content) |bytes| allocator.free(bytes);
+                    try std.testing.expect(done.is_error);
+                },
+                else => return error.UnexpectedToolResult,
+            }
+        } else {
+            try std.testing.expect(result == .host_fatal);
+        }
+        const unchanged = try readArtifact(allocator, path);
+        defer allocator.free(unchanged);
+        try std.testing.expectEqualStrings("old\n", unchanged);
+    }
+    try std.testing.expectEqual(@as(usize, 32), runtime.exact_edit_obligations_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
+}
+
 test "L2 multi-rule recovery follows the first blocking Lean verdict only" {
     const config = testKernel() orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -1765,7 +2605,7 @@ test "L2 malformed Lean batch verdict fails before the real dispatcher" {
     defer allocator.free(checker_path);
     const checker_script =
         "#!/bin/sh\n" ++
-        "printf '%s\\n' '{\"schema_version\":\"metacodes-project-harness-batch-verdict-v2\",\"checker_version\":\"metacodes-project-harness-kernel-v2\",\"verdicts\":[]}'\n";
+        "printf '%s\\n' '{\"schema_version\":\"metacodes-project-harness-batch-verdict-v3\",\"checker_version\":\"metacodes-project-harness-kernel-v3\",\"verdicts\":[]}'\n";
     try overwriteArtifact(allocator, checker_path, checker_script);
     const checker_z = try allocator.dupeZ(u8, checker_path);
     defer allocator.free(checker_z);
@@ -1827,6 +2667,94 @@ test "L2 malformed Lean batch verdict fails before the real dispatcher" {
     try std.testing.expectEqual(@as(u64, 1), impact.enforced_pre_faults_before_dispatch);
     try std.testing.expectEqual(@as(u64, 1), impact.formal_faults);
     try std.testing.expectEqual(@as(u64, 0), impact.authoritative_dispatches);
+}
+
+test "L2 exact recovery checker fault fails closed before Edit side effects" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const real_kernel = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const checker_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/recovery-fault-checker",
+        .{root},
+    );
+    defer allocator.free(checker_path);
+    const checker_script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in\n" ++
+            "  *recovery_pre_decision*) printf '%s\\n' '{{\"schema_version\":\"metacodes-project-harness-batch-verdict-v3\",\"checker_version\":\"metacodes-project-harness-kernel-v3\",\"verdicts\":[]}}' ;;\n" ++
+            "  *) printf '%s' \"$input\" | \"{s}\" ;;\nesac\n",
+        .{real_kernel.checker_path},
+    );
+    defer allocator.free(checker_script);
+    try overwriteArtifact(allocator, checker_path, checker_script);
+    const checker_z = try allocator.dupeZ(u8, checker_path);
+    defer allocator.free(checker_z);
+    if (std.c.chmod(checker_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    const config = cc.project_harness_runtime.Config{
+        .checker_path = checker_path,
+        .expected_sha256 = cc.tools.tool_observation.sha256Hex(checker_script),
+    };
+    var active = try syntheticOrderedRecoveryActive(allocator, true, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+    };
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.project_rule_gate = runtime.protocolGate();
+    const path = try std.fmt.allocPrint(allocator, "{s}/target.txt", .{root});
+    defer allocator.free(path);
+    try overwriteArtifact(allocator, path, "before\n");
+    const write_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"after\"}}",
+        .{path},
+    );
+    defer allocator.free(write_args);
+    const blocked = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        write_args,
+        "fault-source-write",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (blocked) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), runtime.exact_edit_obligations_len);
+    const edit_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"old_string\":\"before\\n\",\"new_string\":\"after\"}}",
+        .{path},
+    );
+    defer allocator.free(edit_args);
+    const rejected = try cc.tool_exec.executeOne(
+        &ctx,
+        "Edit",
+        edit_args,
+        "faulted-exact-edit",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    try std.testing.expect(rejected == .host_fatal);
+    const unchanged = try readArtifact(allocator, path);
+    defer allocator.free(unchanged);
+    try std.testing.expectEqualStrings("before\n", unchanged);
+    try std.testing.expectEqual(@as(usize, 1), runtime.exact_edit_obligations_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
 }
 
 test "L2 same-cardinality batch binding drift has no durable verdict and no dispatch" {

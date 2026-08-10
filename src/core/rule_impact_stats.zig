@@ -11,7 +11,7 @@ const std = @import("std");
 const journal_mod = @import("tool_observation_journal.zig");
 const observation = @import("../tools/observation.zig");
 
-pub const SCHEMA_VERSION = "metacodes-rule-impact-observation-v2";
+pub const SCHEMA_VERSION = "metacodes-rule-impact-observation-v3";
 
 pub const OutcomeSource = enum {
     unknown,
@@ -57,6 +57,10 @@ pub const RuleStats = struct {
     blocks: u64 = 0,
     faults: u64 = 0,
     exact_edit_recovery_directions: u64 = 0,
+    exact_edit_recovery_pre_admits: u64 = 0,
+    exact_edit_recovery_pre_blocks: u64 = 0,
+    exact_edit_recovery_post_admits: u64 = 0,
+    exact_edit_recovery_post_blocks: u64 = 0,
     enforced_pre_blocks_before_dispatch: u64 = 0,
     enforced_pre_faults_before_dispatch: u64 = 0,
     shadow_pre_blocks_followed_by_dispatch: u64 = 0,
@@ -73,6 +77,10 @@ pub const Snapshot = struct {
     formal_decisions: u64 = 0,
     formal_faults: u64 = 0,
     exact_edit_recovery_directions: u64 = 0,
+    exact_edit_recovery_pre_admits: u64 = 0,
+    exact_edit_recovery_pre_blocks: u64 = 0,
+    exact_edit_recovery_post_admits: u64 = 0,
+    exact_edit_recovery_post_blocks: u64 = 0,
     physical_checker_calls: u64 = 0,
     checker_elapsed_ns: u64 = 0,
     authoritative_dispatches: u64 = 0,
@@ -241,8 +249,35 @@ pub fn derive(
         if (decision.recovery_action == .edit_existing_file_exact) {
             if (decision.phase != .pre or decision.result != .block)
                 return error.InvalidRecoveryDirection;
-            try increment(&rule.exact_edit_recovery_directions);
-            try increment(&snapshot.exact_edit_recovery_directions);
+            if (decision.operation == .pre_decision) {
+                try increment(&rule.exact_edit_recovery_directions);
+                try increment(&snapshot.exact_edit_recovery_directions);
+            }
+        }
+        switch (decision.operation) {
+            .recovery_pre_decision => switch (decision.result) {
+                .admit => {
+                    try increment(&rule.exact_edit_recovery_pre_admits);
+                    try increment(&snapshot.exact_edit_recovery_pre_admits);
+                },
+                .block => {
+                    try increment(&rule.exact_edit_recovery_pre_blocks);
+                    try increment(&snapshot.exact_edit_recovery_pre_blocks);
+                },
+                .fault => {},
+            },
+            .recovery_post_decision => switch (decision.result) {
+                .admit => {
+                    try increment(&rule.exact_edit_recovery_post_admits);
+                    try increment(&snapshot.exact_edit_recovery_post_admits);
+                },
+                .block => {
+                    try increment(&rule.exact_edit_recovery_post_blocks);
+                    try increment(&snapshot.exact_edit_recovery_post_blocks);
+                },
+                .fault => {},
+            },
+            .pre_decision, .post_decision => {},
         }
 
         if (decision.phase == .pre and decision.result != .admit) {

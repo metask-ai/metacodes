@@ -14,7 +14,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const new_raw = common.extractJsonArg(args, "new_string") orelse return error.MissingNewString;
 
     if (file_path_raw.len == 0) return error.EmptyFilePath;
-    if (old_raw.len == 0) return error.EmptyOldString;
+    // Empty existing files are a valid whole-file recovery source. Ordinary
+    // Edit still rejects an empty needle because substring replacement would
+    // be undefined/degenerate.
+    if (old_raw.len == 0 and ctx.project_edit_mode != .whole_file_exact)
+        return error.EmptyOldString;
     // 归一化(展开 ~、折叠、查 traversal)。openat 不认 ~,必须自己展开。
     const file_path = try path_mod.normalizeChecked(allocator, file_path_raw, .{
         .home = ctx.home_dir,
@@ -46,6 +50,19 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     if (std.mem.eql(u8, old_unesc, new_unesc)) {
         setDetail(ctx, allocator, "Edit is a no-op: old_string and new_string are identical. Provide a different new_string.", .{});
         return error.NoOpEdit;
+    }
+
+    if (ctx.project_edit_mode == .whole_file_exact) {
+        return executeWholeFileExact(
+            ctx,
+            allocator,
+            file_path,
+            old_unesc,
+            new_unesc,
+            old_raw,
+            new_raw,
+            args,
+        );
     }
 
     // 处理 Read 注入的 "%6d\t" 行号前缀：模型可能原样复制。strip 后作为 fallback 匹配。
@@ -138,6 +155,132 @@ fn finalizeWrite(
         pos += @intCast(written);
     }
 
+    return finalizeCommittedWrite(
+        ctx,
+        allocator,
+        file_path,
+        old_content,
+        content,
+        old_raw,
+        new_raw,
+        write_fd,
+    );
+}
+
+/// Lean-admitted recovery path.  It intentionally has none of ordinary
+/// Edit's substring, line-number, smart-quote, or replace-all behavior.  The
+/// full-file comparison and mutation use one O_NOFOLLOW RDWR descriptor so a
+/// replacement of the final pathname component after formal admission cannot
+/// redirect the write. Parent-directory integrity remains an environment and
+/// sandbox responsibility; O_NOFOLLOW alone does not freeze every component.
+fn executeWholeFileExact(
+    ctx: *const ToolContext,
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    old_content: []const u8,
+    new_content: []const u8,
+    old_raw: []const u8,
+    new_raw: []const u8,
+    args: []const u8,
+) ![]u8 {
+    if (!pfs.atomic_final_nofollow)
+        return error.ProjectExactEditNativeUnavailable;
+    const replace_all = common.extractJsonArg(args, "replace_all");
+    if (replace_all != null and std.mem.eql(u8, replace_all.?, "true"))
+        return error.ExactRecoveryReplaceAllForbidden;
+
+    const fd = pfs.openZ(
+        file_path,
+        .{ .ACCMODE = .RDWR, .NOFOLLOW = true },
+        0,
+    ) catch return error.ExactRecoveryTargetUnavailable;
+    defer _ = pfs.close(fd);
+    pfs.makeCloseOnExec(fd) catch return error.ExactRecoveryTargetUnavailable;
+
+    const before = pfs.fileInfo(fd) catch return error.ExactRecoveryTargetUnavailable;
+    if (!before.is_regular or before.link_count != 1)
+        return error.ExactRecoveryTargetUnavailable;
+    if (before.size > MAX_EDIT_FILE_SIZE) return error.FileTooLarge;
+
+    const observed = common.readAllFromFdCapped(
+        fd,
+        allocator,
+        @intCast(MAX_EDIT_FILE_SIZE),
+    ) catch |err| switch (err) {
+        error.FileTooLarge => return error.FileTooLarge,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.ReadError,
+    };
+    defer allocator.free(observed);
+    const after_read = pfs.fileInfo(fd) catch return error.ExactRecoveryTargetUnavailable;
+    if (!after_read.is_regular or after_read.link_count != 1 or
+        after_read.size != before.size or observed.len != @as(usize, @intCast(before.size)) or
+        !std.mem.eql(u8, observed, old_content))
+    {
+        setDetail(ctx, allocator, "Exact recovery source changed after formal admission, so the old recovery obligation is stale. Re-Read the file, submit the intended Write proposal again to obtain a fresh governed recovery contract, then follow that contract; do not retry this Edit against the old obligation.", .{});
+        return error.ExactRecoverySourceChanged;
+    }
+
+    replaceWholeFileFd(fd, observed, new_content) catch |err| {
+        // A short write may already have changed the inode. Publish the
+        // intended mutation so executeOne's mandatory re-observation records
+        // the mismatch instead of accepting an invisible partial effect. The
+        // helper first attempts to restore `observed`, but the post-check must
+        // not trust that best-effort rollback without reading the host again.
+        ctx.reportFileMutation(file_path, .{ .known = observed }, new_content);
+        return err;
+    };
+
+    return finalizeCommittedWrite(
+        ctx,
+        allocator,
+        file_path,
+        observed,
+        new_content,
+        old_raw,
+        new_raw,
+        fd,
+    );
+}
+
+fn writeWholeFileFd(fd: pfs.Fd, content: []const u8) error{WriteError}!void {
+    if (pfs.lseek(fd, 0, .set) != 0) return error.WriteError;
+    var pos: usize = 0;
+    while (pos < content.len) {
+        const written = pfs.write(fd, content[pos..]);
+        if (written <= 0) return error.WriteError;
+        pos += @intCast(written);
+    }
+    pfs.setSize(fd, @intCast(content.len)) catch return error.WriteError;
+}
+
+fn replaceWholeFileFd(
+    fd: pfs.Fd,
+    original: []const u8,
+    replacement: []const u8,
+) error{WriteError}!void {
+    writeWholeFileFd(fd, replacement) catch {
+        writeWholeFileFd(fd, original) catch {};
+        pfs.fsyncChecked(fd) catch {};
+        return error.WriteError;
+    };
+    pfs.fsyncChecked(fd) catch {
+        writeWholeFileFd(fd, original) catch {};
+        pfs.fsyncChecked(fd) catch {};
+        return error.WriteError;
+    };
+}
+
+fn finalizeCommittedWrite(
+    ctx: *const ToolContext,
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    old_content: []const u8,
+    content: []const u8,
+    old_raw: []const u8,
+    new_raw: []const u8,
+    write_fd: pfs.Fd,
+) ![]u8 {
     ctx.reportFileMutation(file_path, .{ .known = old_content }, content);
 
     // 写完后刷新 ReadState 的 mtime + content_hash，避免紧接着再次 Edit 报 stale
@@ -374,7 +517,10 @@ test "EditTool basic replace" {
     var b2: [320]u8 = undefined;
     const result = try execute(&ctx, try std.fmt.bufPrint(&b2, "{{\"file_path\":\"{s}\",\"old_string\":\"World\",\"new_string\":\"Zig\"}}", .{path}));
     defer std.testing.allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"success\":true") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expect((parsed.value.object.get("success") orelse
+        return error.MissingSuccess).bool);
 }
 
 test "EditTool replace_all" {

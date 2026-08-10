@@ -141,7 +141,7 @@ class BoundaryProvider:
                         response = _tool_sse(
                             [("boundary-write", "Write", {
                                 "file_path": str(outer.target),
-                                "content": "new-via-write\n",
+                                "content": "new-via-edit\n",
                             })],
                             request_id,
                         )

@@ -21,6 +21,12 @@ const builtin = @import("builtin");
 
 const is_windows = builtin.os.tag == .windows;
 
+/// Whether opening the final path component with `NOFOLLOW` is one atomic OS
+/// operation. MSVCRT has no O_NOFOLLOW; its defensive attribute precheck is
+/// useful for ordinary callers but cannot authorize a security-sensitive
+/// read/compare/write transaction across a path-swap race.
+pub const atomic_final_nofollow = !is_windows;
+
 /// 文件 fd 类型。两平台皆 c_int:POSIX 天然 fd;Windows 走 MSVCRT `_open`(返回 CRT 层
 /// int fd,非内核 HANDLE),故模型一致。**勿用 `std.c.fd_t`**——它在 Windows 是 HANDLE
 /// (*anyopaque),会与 pfs.open 返回的 c_int 冲突(-1 哨兵无法赋值)。
@@ -63,6 +69,7 @@ extern "c" fn _close(fd: c_int) c_int;
 extern "c" fn _lseek(fd: c_int, offset: c_long, origin: c_int) c_long;
 extern "c" fn _lseeki64(fd: c_int, offset: i64, origin: c_int) i64; // Win64:64 位 offset(_lseek 仅 32 位)
 extern "c" fn _commit(fd: c_int) c_int; // MSVCRT:等价 fsync(刷到磁盘)
+extern "c" fn _chsize_s(fd: c_int, size: i64) c_int;
 extern "c" fn _fullpath(absPath: ?[*]u8, relPath: [*:0]const u8, maxLength: usize) ?[*:0]u8; // MSVCRT:规范化路径
 
 fn windowsOflag(flags: WindowsO) c_int {
@@ -227,6 +234,18 @@ pub fn fsyncChecked(fd: c_int) error{SyncFailed}!void {
         if (_commit(fd) != 0) return error.SyncFailed;
     } else {
         if (std.c.fsync(fd) != 0) return error.SyncFailed;
+    }
+}
+
+/// Resize one already-open regular file descriptor.  Security-sensitive
+/// read/compare/write paths use this instead of reopening the pathname with
+/// O_TRUNC, which would reintroduce a path-swap race after validation.
+pub fn setSize(fd: Fd, size: u64) error{ResizeFailed}!void {
+    if (size > std.math.maxInt(i64)) return error.ResizeFailed;
+    if (is_windows) {
+        if (_chsize_s(fd, @intCast(size)) != 0) return error.ResizeFailed;
+    } else {
+        if (std.c.ftruncate(fd, @intCast(size)) != 0) return error.ResizeFailed;
     }
 }
 
@@ -472,6 +491,12 @@ test "open/write/lseek/read/close 文件往返" {
     const n = read(fd, buf[0..]);
     try std.testing.expectEqual(@as(isize, msg.len), n); // _O_BINARY：无 CRLF 膨胀，长度精确
     try std.testing.expectEqualStrings(msg, buf[0..@intCast(n)]);
+
+    try setSize(fd, 5);
+    try std.testing.expectEqual(@as(i64, 0), lseek(fd, 0, .set));
+    const shortened = read(fd, buf[0..]);
+    try std.testing.expectEqual(@as(isize, 5), shortened);
+    try std.testing.expectEqualStrings("hello", buf[0..@intCast(shortened)]);
     close(fd);
 }
 

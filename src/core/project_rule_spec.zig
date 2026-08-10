@@ -63,6 +63,33 @@ pub const PreSignal = struct {
     agent_depth: u8,
     authoritative: bool,
     file_target_state: FileTargetState = .unobserved,
+    exact_recovery_material_ready: bool = false,
+};
+
+/// Host comparisons for one pending exact-edit obligation. Plaintext paths
+/// and contents stay outside the checker; the native sensor binds those bytes
+/// and supplies only the equality facts needed by the fixed decision kernel.
+pub const RecoveryPreSignal = struct {
+    tool: []const u8,
+    input_bytes: usize,
+    agent_depth: u8,
+    authoritative: bool,
+    target_matches: bool,
+    material_available: bool,
+    /// The current file still has the content observed when the prohibited
+    /// Write was blocked. This supplies content-CAS semantics across turns.
+    current_matches_source: bool,
+    old_matches_current: bool,
+    new_matches_blocked: bool,
+};
+
+pub const RecoveryPostSignal = struct {
+    pre: RecoveryPreSignal,
+    succeeded: bool,
+    effect_valid: bool,
+    has_file_mutation_v1: bool,
+    post_reobserved: bool,
+    observed_matches_blocked: bool,
 };
 
 pub const PostSignal = struct {

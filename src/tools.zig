@@ -943,6 +943,27 @@ pub fn dispatch(ctx: *const ToolContext, name: []const u8, args: []const u8) any
     return error.UnknownTool;
 }
 
+/// Execute the only native operation allowed by an `admit_exact_edit` gate
+/// result.  An embedding Session may implement a tool named Edit with
+/// arbitrary semantics, so recovery cannot silently delegate to it.  Such a
+/// Session fails closed and retains the outstanding recovery obligation.
+pub fn dispatchProjectExactEdit(
+    ctx: *const ToolContext,
+    args: []const u8,
+) anyerror!ToolDispatchOutcome {
+    if (ctx.project_edit_mode != .whole_file_exact)
+        return error.ProjectExactEditNotAuthorized;
+    if (ctx.execution_policy) |policy| {
+        if (!policy.allowsInvocation("Edit", args))
+            return error.ToolPolicyDenied;
+    }
+    if (ctx.tool_dispatcher != null)
+        return error.ProjectExactEditNativeUnavailable;
+    try validateRequired("Edit", args);
+    try validateTypes("Edit", args);
+    return .{ .ok = try edit_tool.execute(ctx, args) };
+}
+
 /// 逗号分隔的所有真实工具名(静态 + dyn),供 UnknownTool 错误引导模型。caller free。
 pub fn availableToolNames(ctx: *const ToolContext, allocator: std.mem.Allocator) ![]u8 {
     var out = std.ArrayList(u8).empty;

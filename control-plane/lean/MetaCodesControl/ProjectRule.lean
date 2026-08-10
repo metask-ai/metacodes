@@ -47,6 +47,28 @@ structure PreSignal where
   agentDepth : Nat
   authoritative : Bool
   fileTargetState : FileTargetState := .unobserved
+  exactRecoveryMaterialReady : Bool := false
+  deriving Repr, BEq
+
+structure RecoveryPreSignal where
+  tool : String
+  inputBytes : Nat
+  agentDepth : Nat
+  authoritative : Bool
+  targetMatches : Bool
+  materialAvailable : Bool
+  currentMatchesSource : Bool
+  oldMatchesCurrent : Bool
+  newMatchesBlocked : Bool
+  deriving Repr, BEq
+
+structure RecoveryPostSignal where
+  pre : RecoveryPreSignal
+  succeeded : Bool
+  effectValid : Bool
+  hasFileMutationV1 : Bool
+  postReobserved : Bool
+  observedMatchesBlocked : Bool
   deriving Repr, BEq
 
 structure PostSignal where
@@ -92,15 +114,48 @@ def postDecision (spec : RuleSpec) (signal : PostSignal) : Bool :=
     | .fileMutationV1Reobserved =>
         signal.effectValid && signal.hasFileMutationV1 && signal.postReobserved
 
+def supportsExactEditRecovery (spec : RuleSpec) : Bool :=
+  valid spec && spec.targetTool == "Write" &&
+    spec.targetScope == .existingFile && spec.denyTarget
+
+def recoveryPreDecision (spec : RuleSpec) (signal : RecoveryPreSignal) : Bool :=
+  supportsExactEditRecovery spec && signal.tool == "Edit" &&
+    signal.inputBytes ≤ spec.maxInputBytes &&
+    signal.agentDepth ≤ spec.maxAgentDepth &&
+    (!spec.authoritativeOnly || signal.authoritative) &&
+    signal.targetMatches && signal.materialAvailable &&
+    signal.currentMatchesSource && signal.oldMatchesCurrent &&
+    signal.newMatchesBlocked
+
+/-- A malformed exact Edit may receive the same bounded retry direction only
+while the blocked Write's source snapshot is still current. Source drift
+invalidates the obligation and must not be presented as a retryable typo. -/
+def recoveryPreRetryEligible (spec : RuleSpec) (signal : RecoveryPreSignal) : Bool :=
+  supportsExactEditRecovery spec && signal.tool == "Edit" &&
+    signal.inputBytes ≤ spec.maxInputBytes &&
+    signal.agentDepth ≤ spec.maxAgentDepth &&
+    (!spec.authoritativeOnly || signal.authoritative) &&
+    signal.targetMatches && signal.materialAvailable &&
+    signal.currentMatchesSource
+
+def recoveryPostDecision (spec : RuleSpec) (signal : RecoveryPostSignal) : Bool :=
+  if !recoveryPreDecision spec signal.pre then false
+  else if !signal.effectValid then false
+  else if !signal.succeeded then
+    !signal.hasFileMutationV1 ||
+      (signal.postReobserved && signal.observedMatchesBlocked)
+  else signal.hasFileMutationV1 && signal.postReobserved &&
+    signal.observedMatchesBlocked
+
 /-- A denied overwrite of a host-observed regular file has one general safe
 recovery direction: edit the existing bytes exactly.  Ambiguous targets,
 invalid specifications and non-deny rules deliberately receive no hint. -/
 def recoveryAction (spec : RuleSpec) (signal : PreSignal) : RecoveryAction :=
   match spec.targetScope, signal.fileTargetState with
   | .existingFile, .regularExisting =>
-      if valid spec && spec.targetTool == "Write" && spec.denyTarget &&
+      if supportsExactEditRecovery spec &&
           signal.tool == spec.targetTool && !preDecision spec signal then
-        .editExistingFileExact
+        if signal.exactRecoveryMaterialReady then .editExistingFileExact else .none
       else
         .none
   | _, _ => .none
@@ -155,10 +210,12 @@ theorem denied_observed_overwrite_selects_exact_edit_recovery
     (scope : spec.targetScope = .existingFile)
     (denied : spec.denyTarget = true)
     (same : signal.tool = spec.targetTool)
-    (state : signal.fileTargetState = .regularExisting) :
+    (state : signal.fileTargetState = .regularExisting)
+    (material : signal.exactRecoveryMaterialReady = true) :
     recoveryAction spec signal = .editExistingFileExact := by
   simp [recoveryAction, validSpec, target, scope, denied, same, state,
-    preDecision, matchedDecision]
+    material, supportsExactEditRecovery, preDecision, matchedDecision]
+  rfl
 
 theorem nonregular_target_has_no_exact_edit_recovery
     (spec : RuleSpec) (signal : PreSignal)
@@ -169,6 +226,36 @@ theorem nonregular_target_has_no_exact_edit_recovery
     recoveryAction spec signal = .none := by
   rcases nonregular with state | state | state | state <;>
     simp [recoveryAction, state]
+
+theorem exact_edit_recovery_pre_sound (spec : RuleSpec)
+    (signal : RecoveryPreSignal)
+    (admitted : recoveryPreDecision spec signal = true) :
+    signal.targetMatches = true ∧ signal.materialAvailable = true ∧
+      signal.currentMatchesSource = true ∧ signal.oldMatchesCurrent = true ∧
+      signal.newMatchesBlocked = true := by
+  simp [recoveryPreDecision] at admitted
+  exact ⟨admitted.1.1.1.1.2, admitted.1.1.1.2,
+    admitted.1.1.2, admitted.1.2, admitted.2⟩
+
+theorem exact_edit_recovery_post_sound (spec : RuleSpec)
+    (signal : RecoveryPostSignal)
+    (succeeded : signal.succeeded = true)
+    (admitted : recoveryPostDecision spec signal = true) :
+    signal.effectValid = true ∧ signal.hasFileMutationV1 = true ∧
+      signal.postReobserved = true ∧ signal.observedMatchesBlocked = true := by
+  simp [recoveryPostDecision, succeeded] at admitted
+  exact ⟨admitted.2.1, admitted.2.2.1.1, admitted.2.2.1.2,
+    admitted.2.2.2⟩
+
+theorem exact_edit_recovery_failed_mutation_sound (spec : RuleSpec)
+    (signal : RecoveryPostSignal)
+    (failed : signal.succeeded = false)
+    (mutated : signal.hasFileMutationV1 = true)
+    (admitted : recoveryPostDecision spec signal = true) :
+    signal.effectValid = true ∧ signal.postReobserved = true ∧
+      signal.observedMatchesBlocked = true := by
+  simp [recoveryPostDecision, failed, mutated] at admitted
+  exact ⟨admitted.2.1, admitted.2.2.1, admitted.2.2.2⟩
 
 def recoveryReasonCode : RecoveryAction → Option String
   | .none => none
