@@ -556,7 +556,16 @@ def failureCodes (request : Request) : List String :=
       let failures := if shadowValid request facts then failures else failures ++ ["shadow_invalid"]
       if bundleTransitionValid request facts then failures else failures ++ ["bundle_transition_invalid"]
   | .pre signal =>
-      if preDecision request.ruleSpec signal then failures else failures ++ ["rule_precondition_blocked"]
+      let failures := if preDecision request.ruleSpec signal then failures
+        else failures ++ ["rule_precondition_blocked"]
+      let recovery := if request.operation == .preDecision &&
+          requestBindingsValid request then
+        recoveryAction request.ruleSpec signal
+      else
+        RecoveryAction.none
+      match recoveryReasonCode recovery with
+      | none => failures
+      | some code => failures ++ [code]
   | .post signal =>
       if postDecision request.ruleSpec signal then failures else failures ++ ["rule_postcondition_blocked"]
 

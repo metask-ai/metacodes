@@ -15,7 +15,8 @@ pub const SCHEMA_VERSION = "metacodes-tool-observation-v1";
 pub const FORMAL_SCHEMA_VERSION_V1 = "metacodes-project-formal-decision-v1";
 pub const FORMAL_BATCH_SCHEMA_VERSION_V1 = "metacodes-project-formal-decision-batch-v1";
 pub const FORMAL_SCHEMA_VERSION = "metacodes-project-formal-decision-v2";
-pub const FORMAL_BATCH_SCHEMA_VERSION = "metacodes-project-formal-decision-batch-v2";
+pub const FORMAL_BATCH_SCHEMA_VERSION_V2 = "metacodes-project-formal-decision-batch-v2";
+pub const FORMAL_BATCH_SCHEMA_VERSION = "metacodes-project-formal-decision-batch-v3";
 
 pub const Origin = enum {
     authoritative,
@@ -33,6 +34,14 @@ pub const Outcome = enum {
 
 pub const FormalPhase = enum { pre, post };
 pub const FormalResult = enum { admit, block, fault };
+
+/// A bounded next-action direction selected by the fixed formal kernel.  It is
+/// evidence about the verdict, not an authorization to bypass the ordinary
+/// gate on the next tool call.
+pub const FormalRecoveryAction = enum {
+    none,
+    edit_existing_file_exact,
+};
 
 /// Separates the fixed kernel's counterfactual decision from whether the host
 /// applies it to the real dispatch.  Production gates are always `enforced`;
@@ -54,6 +63,7 @@ pub const FileTargetState = enum {
 
 pub const FormalCandidateDecision = struct {
     result: FormalResult,
+    recovery_action: FormalRecoveryAction = .none,
     candidate_id: [64]u8,
     request_sha256: [64]u8,
     verdict_sha256: ?[64]u8,

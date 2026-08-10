@@ -13,6 +13,11 @@ const sync = @import("platform").sync;
 pub const RUNTIME_VERDICT_PREFIX = "project-rule-runtime-verdict-";
 pub const RUNTIME_BATCH_VERDICT_PREFIX = "project-rule-runtime-batch-verdict-";
 
+const BatchDecision = struct {
+    result: protocol.Result,
+    recovery_action: protocol.RecoveryAction = .none,
+};
+
 pub const RuntimeGate = struct {
     mutex: sync.Mutex = .{},
     allocator: std.mem.Allocator,
@@ -31,27 +36,36 @@ pub const RuntimeGate = struct {
         return .{ .ctx = @ptrCast(self), .preFn = preThunk, .postFn = postThunk };
     }
 
-    fn preThunk(raw: *anyopaque, signal: protocol.PreSignal) protocol.Result {
+    fn preThunk(raw: *anyopaque, signal: protocol.PreSignal) protocol.PreResult {
         const self: *RuntimeGate = @ptrCast(@alignCast(raw));
         self.mutex.lock();
         defer self.mutex.unlock();
-        const decision = self.decidePre(signal) catch .fault;
-        return self.actuate(decision);
+        const decision = self.decidePre(signal) catch return .fault;
+        return self.actuatePre(decision);
     }
 
     fn postThunk(raw: *anyopaque, signal: protocol.PostSignal) protocol.Result {
         const self: *RuntimeGate = @ptrCast(@alignCast(raw));
         self.mutex.lock();
         defer self.mutex.unlock();
-        const decision = self.decidePost(signal) catch .fault;
-        return self.actuate(decision);
+        const decision = self.decidePost(signal) catch return .fault;
+        return self.actuateResult(decision.result);
     }
 
-    fn actuate(self: *const RuntimeGate, decision: protocol.Result) protocol.Result {
+    fn actuateResult(self: *const RuntimeGate, decision: protocol.Result) protocol.Result {
         return if (self.actuation == .shadow) .admit else decision;
     }
 
-    fn decidePre(self: *RuntimeGate, signal: protocol.PreSignal) !protocol.Result {
+    fn actuatePre(self: *const RuntimeGate, decision: BatchDecision) protocol.PreResult {
+        if (self.actuation == .shadow) return .admit;
+        return switch (decision.result) {
+            .admit => .admit,
+            .block => .{ .block = decision.recovery_action },
+            .fault => .fault,
+        };
+    }
+
+    fn decidePre(self: *RuntimeGate, signal: protocol.PreSignal) !BatchDecision {
         const formal_signal = spec_mod.PreSignal{
             .tool = signal.tool,
             .input_bytes = signal.input_bytes,
@@ -113,7 +127,7 @@ pub const RuntimeGate = struct {
         );
     }
 
-    fn decidePost(self: *RuntimeGate, signal: protocol.PostSignal) !protocol.Result {
+    fn decidePost(self: *RuntimeGate, signal: protocol.PostSignal) !BatchDecision {
         const formal_pre = spec_mod.PreSignal{
             .tool = signal.pre.tool,
             .input_bytes = signal.pre.input_bytes,
@@ -188,12 +202,14 @@ pub const RuntimeGate = struct {
         phase: observation.FormalPhase,
         file_target_state: observation.FileTargetState,
         batch: *const kernel.BatchInvocation,
-    ) protocol.Result {
+    ) BatchDecision {
         // A production gate must publish both the payload and its journal
         // binding.  Test-only direct gates may deliberately configure neither.
-        if ((self.evidence_dir != null) != (self.observation_sink != null)) return .fault;
+        if ((self.evidence_dir != null) != (self.observation_sink != null))
+            return .{ .result = .fault };
         var decision_count: usize = 0;
         var result = protocol.Result.admit;
+        var recovery_action = protocol.RecoveryAction.none;
         for (batch.invocations) |invocation| {
             decision_count += 1;
             if (invocation.failure != .none or invocation.verdict == null) {
@@ -202,19 +218,27 @@ pub const RuntimeGate = struct {
             }
             if (!invocation.verdict.?.admitted) {
                 result = .block;
+                recovery_action = switch (invocation.verdict.?.recovery_action) {
+                    .none => .none,
+                    .edit_existing_file_exact => .edit_existing_file_exact,
+                };
                 break;
             }
         }
-        if (decision_count == 0) return .fault;
+        if (decision_count == 0) return .{ .result = .fault };
         if (self.evidence_dir) |directory| {
             if (batch.verdict_payload) |payload| {
-                const verdict_sha = batch.verdict_sha256 orelse return .fault;
-                persistRuntimeBatchVerdict(directory, verdict_sha, payload) catch return .fault;
+                const verdict_sha = batch.verdict_sha256 orelse return .{ .result = .fault };
+                persistRuntimeBatchVerdict(directory, verdict_sha, payload) catch
+                    return .{ .result = .fault };
             }
         }
-        const sink = self.observation_sink orelse return result;
+        const sink = self.observation_sink orelse return .{
+            .result = result,
+            .recovery_action = recovery_action,
+        };
         const decisions = self.allocator.alloc(observation.FormalCandidateDecision, decision_count) catch
-            return .fault;
+            return .{ .result = .fault };
         defer self.allocator.free(decisions);
         for (batch.invocations[0..decision_count], decisions) |invocation, *decision| {
             decision.* = .{
@@ -224,6 +248,10 @@ pub const RuntimeGate = struct {
                     .admit
                 else
                     .block,
+                .recovery_action = if (invocation.verdict) |verdict| switch (verdict.recovery_action) {
+                    .none => .none,
+                    .edit_existing_file_exact => .edit_existing_file_exact,
+                } else .none,
                 .candidate_id = invocation.bindings.?.candidate_id,
                 .request_sha256 = invocation.request_sha256,
                 .verdict_sha256 = invocation.verdict_sha256,
@@ -243,14 +271,14 @@ pub const RuntimeGate = struct {
             .bundle_sha256 = self.active.bundle_sha256,
             .bundle_revision = self.active.revision,
             .kernel_sha256 = self.active.kernel_sha256,
-            .checker_call_sha256 = first.checker_call_sha256 orelse return .fault,
+            .checker_call_sha256 = first.checker_call_sha256 orelse return .{ .result = .fault },
             .checker_verdict_sha256 = batch.verdict_sha256,
             .checker_batch_size = first.checker_batch_size,
             .checker_elapsed_ns = first.checker_elapsed_ns,
             .checker_bytes = first.checker_bytes,
             .decisions = decisions,
-        } })) return .fault;
-        return result;
+        } })) return .{ .result = .fault };
+        return .{ .result = result, .recovery_action = recovery_action };
     }
 };
 

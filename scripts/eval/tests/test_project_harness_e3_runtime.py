@@ -47,6 +47,7 @@ class _Provider:
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
         self.requests: list[dict] = []
+        self.recovery_contracts: list[dict] = []
         self.server: socketserver.TCPServer | None = None
         self.thread: threading.Thread | None = None
 
@@ -142,14 +143,32 @@ class _HazardProvider(_Provider):
                         index,
                     )
                 elif "project_rule_blocked" in results.get("write-deploy", ""):
-                    response = _tool_sse(
-                        [("edit-deploy", "Edit", {
-                            "file_path": str(outer.workspace / "deploy.yaml"),
-                            "old_string": old,
-                            "new_string": new,
-                        })],
-                        index,
-                    )
+                    try:
+                        error = json.loads(results["write-deploy"])["error"]
+                        recovery = error["recovery"]
+                        valid_recovery = (
+                            error["recoverable"] is False
+                            and recovery["task_recoverable"] is True
+                            and recovery["action"] == "edit_existing_file_exact"
+                            and any(
+                                "ends with a newline" in requirement
+                                for requirement in recovery["requirements"]
+                            )
+                        )
+                    except (KeyError, TypeError, json.JSONDecodeError):
+                        valid_recovery = False
+                    if valid_recovery:
+                        outer.recovery_contracts.append(recovery)
+                        response = _tool_sse(
+                            [("edit-deploy", "Edit", {
+                                "file_path": str(outer.workspace / "deploy.yaml"),
+                                "old_string": old,
+                                "new_string": new,
+                            })],
+                            index,
+                        )
+                    else:
+                        response = _text_sse("missing governed recovery contract", index)
                 else:
                     response = _text_sse("completed", index)
                 self.send_response(200)
@@ -428,6 +447,10 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
                         test_base_url=provider.url,
                     )
             self.assertEqual(signal_provider.requests[0], provider.requests[0])
+            self.assertEqual(
+                ["edit_existing_file_exact"],
+                [item["action"] for item in provider.recovery_contracts],
+            )
             receipt = json.loads(Path(item["receipt_path"]).read_text(encoding="utf-8"))
             governance = receipt["governance"]
             self.assertTrue(receipt["grader"]["passed"])
@@ -435,6 +458,7 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
             self.assertTrue(governance["existing_file_write_recurrence"])
             self.assertFalse(governance["existing_file_write_dispatch"])
             self.assertFalse(governance["realized_existing_file_write_effect"])
+            self.assertEqual(1, governance["exact_edit_recovery_directions"])
             self.assertTrue(governance["recovery_after_block"])
             self.assertTrue(governance["trustworthy_task_success"])
 

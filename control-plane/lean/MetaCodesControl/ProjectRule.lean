@@ -22,6 +22,15 @@ inductive FileTargetState where
   | unavailable
   deriving Repr, BEq, DecidableEq
 
+/-- A bounded recovery direction emitted only after the fixed kernel has
+blocked a concrete pre-dispatch signal.  This is not an authorization: the
+replacement tool still traverses the ordinary sensor, kernel and reobservation
+path. -/
+inductive RecoveryAction where
+  | none
+  | editExistingFileExact
+  deriving Repr, BEq, DecidableEq
+
 structure RuleSpec where
   targetTool : String
   targetScope : TargetScope := .all
@@ -83,6 +92,19 @@ def postDecision (spec : RuleSpec) (signal : PostSignal) : Bool :=
     | .fileMutationV1Reobserved =>
         signal.effectValid && signal.hasFileMutationV1 && signal.postReobserved
 
+/-- A denied overwrite of a host-observed regular file has one general safe
+recovery direction: edit the existing bytes exactly.  Ambiguous targets,
+invalid specifications and non-deny rules deliberately receive no hint. -/
+def recoveryAction (spec : RuleSpec) (signal : PreSignal) : RecoveryAction :=
+  match spec.targetScope, signal.fileTargetState with
+  | .existingFile, .regularExisting =>
+      if valid spec && spec.targetTool == "Write" && spec.denyTarget &&
+          signal.tool == spec.targetTool && !preDecision spec signal then
+        .editExistingFileExact
+      else
+        .none
+  | _, _ => .none
+
 theorem denied_all_target_blocks (spec : RuleSpec) (signal : PreSignal)
     (same : signal.tool = spec.targetTool) (scope : spec.targetScope = .all)
     (denied : spec.denyTarget = true) :
@@ -125,6 +147,32 @@ theorem reobservation_required (spec : RuleSpec) (signal : PostSignal)
       signal.postReobserved = true := by
   simp [postDecision, same, pre, succeeded, required] at admitted
   simpa only [and_assoc] using admitted
+
+theorem denied_observed_overwrite_selects_exact_edit_recovery
+    (spec : RuleSpec) (signal : PreSignal)
+    (validSpec : valid spec = true)
+    (target : spec.targetTool = "Write")
+    (scope : spec.targetScope = .existingFile)
+    (denied : spec.denyTarget = true)
+    (same : signal.tool = spec.targetTool)
+    (state : signal.fileTargetState = .regularExisting) :
+    recoveryAction spec signal = .editExistingFileExact := by
+  simp [recoveryAction, validSpec, target, scope, denied, same, state,
+    preDecision, matchedDecision]
+
+theorem nonregular_target_has_no_exact_edit_recovery
+    (spec : RuleSpec) (signal : PreSignal)
+    (nonregular : signal.fileTargetState = .unobserved ∨
+      signal.fileTargetState = .missing ∨
+      signal.fileTargetState = .otherExisting ∨
+      signal.fileTargetState = .unavailable) :
+    recoveryAction spec signal = .none := by
+  rcases nonregular with state | state | state | state <;>
+    simp [recoveryAction, state]
+
+def recoveryReasonCode : RecoveryAction → Option String
+  | .none => none
+  | .editExistingFileExact => some "recover_edit_existing_file_exact"
 
 def effectName : EffectRequirement → String
   | .none => "none"

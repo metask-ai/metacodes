@@ -11,7 +11,7 @@ const GovernedGateProbe = struct {
     post_calls: usize = 0,
     last_outcome: ?cc.tools.tool_observation.Outcome = null,
 
-    fn pre(raw: *anyopaque, _: cc.project_rule_gate_protocol.PreSignal) cc.project_rule_gate_protocol.Result {
+    fn pre(raw: *anyopaque, _: cc.project_rule_gate_protocol.PreSignal) cc.project_rule_gate_protocol.PreResult {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.pre_calls += 1;
         return .admit;
@@ -34,7 +34,7 @@ const CreateRaceGate = struct {
     pre_calls: usize = 0,
     post_calls: usize = 0,
 
-    fn pre(raw: *anyopaque, signal: cc.project_rule_gate_protocol.PreSignal) cc.project_rule_gate_protocol.Result {
+    fn pre(raw: *anyopaque, signal: cc.project_rule_gate_protocol.PreSignal) cc.project_rule_gate_protocol.PreResult {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.pre_calls += 1;
         if (signal.file_target_state != .missing) return .fault;
@@ -876,10 +876,41 @@ test "L2 evolved existing-file rule blocks overwrite, permits creation, and leav
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
             try std.testing.expect(done.is_error);
+            var parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                allocator,
+                done.content orelse return error.MissingToolError,
+                .{},
+            );
+            defer parsed.deinit();
+            const envelope = parsed.value.object.get("error") orelse
+                return error.MissingErrorEnvelope;
+            try std.testing.expectEqualStrings(
+                "project_rule_blocked",
+                (envelope.object.get("code") orelse return error.MissingErrorCode).string,
+            );
+            try std.testing.expect(
+                !(envelope.object.get("recoverable") orelse
+                    return error.MissingRecoverable).bool,
+            );
+            const recovery = envelope.object.get("recovery") orelse
+                return error.MissingRecoveryContract;
+            try std.testing.expect(
+                (recovery.object.get("task_recoverable") orelse
+                    return error.MissingTaskRecoverable).bool,
+            );
+            try std.testing.expectEqualStrings(
+                "edit_existing_file_exact",
+                (recovery.object.get("action") orelse
+                    return error.MissingRecoveryAction).string,
+            );
+            const requirements = (recovery.object.get("requirements") orelse
+                return error.MissingRecoveryRequirements).array.items;
+            try std.testing.expectEqual(@as(usize, 4), requirements.len);
             try std.testing.expect(std.mem.indexOf(
                 u8,
-                done.content orelse return error.MissingToolError,
-                "project_rule_blocked",
+                requirements[1].string,
+                "ends with a newline",
             ) != null);
         },
         else => return error.UnexpectedToolResult,
@@ -953,6 +984,16 @@ test "L2 evolved existing-file rule blocks overwrite, permits creation, and leav
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
             try std.testing.expect(done.is_error);
+            var parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                allocator,
+                done.content orelse return error.MissingToolError,
+                .{},
+            );
+            defer parsed.deinit();
+            const envelope = parsed.value.object.get("error") orelse
+                return error.MissingErrorEnvelope;
+            try std.testing.expect(envelope.object.get("recovery") == null);
         },
         else => return error.UnexpectedToolResult,
     }
@@ -989,12 +1030,17 @@ test "L2 evolved existing-file rule blocks overwrite, permits creation, and leav
     defer impact.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 6), impact.formal_decisions);
     try std.testing.expectEqual(@as(u64, 6), impact.physical_checker_calls);
+    try std.testing.expectEqual(@as(u64, 1), impact.exact_edit_recovery_directions);
     try std.testing.expectEqual(@as(u64, 2), impact.enforced_pre_blocks_before_dispatch);
     try std.testing.expectEqual(@as(u64, 2), impact.authoritative_dispatches);
     try std.testing.expectEqual(@as(u64, 2), impact.authoritative_successes);
     try std.testing.expectEqual(@as(u64, 2), impact.realized_file_changes);
     try std.testing.expectEqual(@as(u64, 2), impact.subsequent_authoritative_successes);
     try std.testing.expectEqual(@as(usize, 1), impact.rules.len);
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        impact.rules[0].exact_edit_recovery_directions,
+    );
     try std.testing.expectEqual(@as(u64, 2), impact.rules[0].enforced_pre_blocks_before_dispatch);
     // A completed host Run is not automatically labeled as a successful task.
     try std.testing.expect(impact.labels.task_success == null);
@@ -1450,6 +1496,123 @@ fn syntheticActive(
         .active_pointer_sha256 = .{'f'} ** 64,
         .rules = rules,
     };
+}
+
+fn syntheticOrderedRecoveryActive(
+    allocator: std.mem.Allocator,
+    recovery_first: bool,
+    config: cc.project_harness_runtime.Config,
+) !cc.project_rule_bundle.LoadedActive {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const rules = try a.alloc(cc.project_rule_bundle.RuleEntry, 2);
+    const generic_id = cc.tools.tool_observation.sha256Hex("generic-write-deny");
+    const recovery_id = cc.tools.tool_observation.sha256Hex("existing-write-deny");
+    const generic = cc.project_rule_bundle.RuleEntry{
+        .candidate_id = try a.dupe(u8, &generic_id),
+        .rule_spec = cc.project_rule_spec.toWire(.{
+            .target_tool = "Write",
+            .target_scope = .all,
+            .deny_target = true,
+            .max_input_bytes = 8192,
+            .max_agent_depth = 4,
+            .authoritative_only = true,
+            .effect_requirement = .none,
+        }),
+    };
+    const recovery = cc.project_rule_bundle.RuleEntry{
+        .candidate_id = try a.dupe(u8, &recovery_id),
+        .rule_spec = cc.project_rule_spec.toWire(.{
+            .target_tool = "Write",
+            .target_scope = .existing_file,
+            .deny_target = true,
+            .max_input_bytes = 8192,
+            .max_agent_depth = 4,
+            .authoritative_only = true,
+            .effect_requirement = .none,
+        }),
+    };
+    rules[0] = if (recovery_first) recovery else generic;
+    rules[1] = if (recovery_first) generic else recovery;
+    return .{
+        .arena = arena,
+        .project_sha256 = .{'a'} ** 64,
+        .bundle_sha256 = .{'b'} ** 64,
+        .revision = 7,
+        .kernel_sha256 = config.expected_sha256,
+        .promotion_receipt_id = .{'c'} ** 64,
+        .promotion_request_sha256 = .{'d'} ** 64,
+        .promotion_verdict_sha256 = .{'e'} ** 64,
+        .active_pointer_sha256 = .{'f'} ** 64,
+        .rules = rules,
+    };
+}
+
+test "L2 multi-rule recovery follows the first blocking Lean verdict only" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/existing.txt",
+        .{root_buffer[0..root_len]},
+    );
+    defer allocator.free(path);
+    try overwriteArtifact(allocator, path, "preserved\n");
+    const args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"replacement\\n\"}}",
+        .{path},
+    );
+    defer allocator.free(args);
+
+    for ([_]bool{ false, true }) |recovery_first| {
+        var active = try syntheticOrderedRecoveryActive(allocator, recovery_first, config);
+        defer active.deinit();
+        var runtime = cc.project_rule_gate.RuntimeGate{
+            .allocator = allocator,
+            .active = &active,
+            .config = config,
+            .abort = null,
+        };
+        var ctx = cc.tool_context.ToolContext.simple(allocator);
+        ctx.project_rule_gate = runtime.protocolGate();
+        const result = try cc.tool_exec.executeOne(
+            &ctx,
+            "Write",
+            args,
+            if (recovery_first) "recovery-first" else "generic-first",
+            allocator,
+            .{ .bytes = [_]u8{'0'} ** 12 },
+        );
+        switch (result) {
+            .done => |done| {
+                defer if (done.content) |bytes| allocator.free(bytes);
+                try std.testing.expect(done.is_error);
+                var parsed = try std.json.parseFromSlice(
+                    std.json.Value,
+                    allocator,
+                    done.content orelse return error.MissingToolError,
+                    .{},
+                );
+                defer parsed.deinit();
+                const envelope = parsed.value.object.get("error") orelse
+                    return error.MissingErrorEnvelope;
+                try std.testing.expectEqual(
+                    recovery_first,
+                    envelope.object.get("recovery") != null,
+                );
+            },
+            else => return error.UnexpectedToolResult,
+        }
+        const preserved = try readArtifact(allocator, path);
+        defer allocator.free(preserved);
+        try std.testing.expectEqualStrings("preserved\n", preserved);
+    }
 }
 
 const BatchRuntimeStats = struct {

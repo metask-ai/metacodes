@@ -142,6 +142,13 @@ pub const Checks = struct {
     }
 };
 
+/// Recovery is proof-carrying output from the hash-pinned Lean kernel.  It is
+/// advisory for the next model action, never an authorization bypass.
+pub const RecoveryAction = enum {
+    none,
+    edit_existing_file_exact,
+};
+
 pub const FailureKind = enum {
     none,
     request_oversize,
@@ -171,6 +178,7 @@ pub const FailureKind = enum {
 pub const Verdict = struct {
     admitted: bool,
     checks: Checks,
+    recovery_action: RecoveryAction = .none,
 };
 
 pub const Invocation = struct {
@@ -597,7 +605,30 @@ fn validateRawVerdict(raw: RawVerdict, bindings: Bindings) ParseError!Verdict {
         raw.admitted != std.mem.eql(u8, raw.decision, "admit") or
         !raw.checks.decision_valid or (raw.admitted and !raw.checks.all()))
         return error.Inconsistent;
-    return .{ .admitted = raw.admitted, .checks = raw.checks };
+    const recovery_count = countReason(raw.reason_codes, "recover_edit_existing_file_exact");
+    const blocked_count = countReason(raw.reason_codes, "rule_precondition_blocked");
+    if (recovery_count > 1 or
+        (raw.admitted and raw.reason_codes.len != 0) or
+        (recovery_count == 1 and
+            (raw.operation != .pre_decision or raw.admitted or blocked_count != 1 or
+                raw.reason_codes.len != 2 or !raw.checks.all())))
+        return error.Inconsistent;
+    return .{
+        .admitted = raw.admitted,
+        .checks = raw.checks,
+        .recovery_action = if (recovery_count == 1)
+            .edit_existing_file_exact
+        else
+            .none,
+    };
+}
+
+fn countReason(reasons: []const []const u8, expected: []const u8) usize {
+    var count: usize = 0;
+    for (reasons) |reason| {
+        if (std.mem.eql(u8, reason, expected)) count += 1;
+    }
+    return count;
 }
 
 fn parseFailure(err: ParseError) FailureKind {
@@ -748,4 +779,71 @@ test "project harness request rendering is byte-stable and identity-bound" {
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualSlices(u8, first, second);
     try std.testing.expect(std.mem.indexOf(u8, first, "\"operation\":\"pre_decision\"") != null);
+}
+
+test "project harness verdict accepts only coherent Lean recovery reasons" {
+    const request_id = [_]u8{'a'} ** 64;
+    const kernel_sha256 = [_]u8{'b'} ** 64;
+    const candidate_id = [_]u8{'c'} ** 64;
+    const project_sha256 = [_]u8{'d'} ** 64;
+    const bundle_sha256 = [_]u8{'e'} ** 64;
+    const bindings = Bindings{
+        .request_id = request_id,
+        .operation = .pre_decision,
+        .kernel_sha256 = kernel_sha256,
+        .candidate_id = candidate_id,
+        .project_sha256 = project_sha256,
+        .bundle_sha256 = bundle_sha256,
+        .bundle_revision = 1,
+    };
+    var reasons = [_][]const u8{
+        "rule_precondition_blocked",
+        "recover_edit_existing_file_exact",
+    };
+    var raw = RawVerdict{
+        .schema_version = VERDICT_SCHEMA,
+        .checker_version = CHECKER_VERSION,
+        .request_id = &request_id,
+        .operation = .pre_decision,
+        .kernel_sha256 = &kernel_sha256,
+        .candidate_id = &candidate_id,
+        .project_sha256 = &project_sha256,
+        .bundle_sha256 = &bundle_sha256,
+        .bundle_revision = 1,
+        .decision = "block",
+        .admitted = false,
+        .reason_codes = &reasons,
+        .checks = .{
+            .request_valid = true,
+            .rule_valid = true,
+            .lifecycle_valid = true,
+            .decision_valid = true,
+        },
+    };
+    const verdict = try validateRawVerdict(raw, bindings);
+    try std.testing.expect(!verdict.admitted);
+    try std.testing.expect(verdict.recovery_action == .edit_existing_file_exact);
+
+    raw.operation = .post_decision;
+    try std.testing.expectError(error.BindingMismatch, validateRawVerdict(raw, bindings));
+    raw.operation = .pre_decision;
+    raw.decision = "admit";
+    raw.admitted = true;
+    try std.testing.expectError(error.Inconsistent, validateRawVerdict(raw, bindings));
+    raw.decision = "block";
+    raw.admitted = false;
+    reasons[0] = "unrelated_failure";
+    try std.testing.expectError(error.Inconsistent, validateRawVerdict(raw, bindings));
+
+    var extra_reasons = [_][]const u8{
+        "rule_precondition_blocked",
+        "recover_edit_existing_file_exact",
+        "unexpected_extra_reason",
+    };
+    raw.reason_codes = &extra_reasons;
+    try std.testing.expectError(error.Inconsistent, validateRawVerdict(raw, bindings));
+    raw.reason_codes = &reasons;
+    reasons[0] = "rule_precondition_blocked";
+    raw.checks.request_valid = false;
+    try std.testing.expectError(error.Inconsistent, validateRawVerdict(raw, bindings));
 }

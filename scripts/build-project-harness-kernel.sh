@@ -29,6 +29,8 @@ expected_axioms="'MetaCodesControl.ProjectHarness.safePromotion_sound' depends o
 'MetaCodesControl.ProjectHarness.correction_promotion_requires_receipt' depends on axioms: [propext]
 'MetaCodesControl.ProjectHarness.denied_all_predecision_blocks' depends on axioms: [propext]
 'MetaCodesControl.ProjectHarness.denied_existing_file_predecision_blocks' depends on axioms: [propext]
+'MetaCodesControl.ProjectRule.denied_observed_overwrite_selects_exact_edit_recovery' depends on axioms: [propext]
+'MetaCodesControl.ProjectRule.nonregular_target_has_no_exact_edit_recovery' depends on axioms: [propext]
 'MetaCodesControl.ProjectHarness.decideBatch_sound' does not depend on any axioms"
 if [[ "$axiom_audit" != "$expected_axioms" ]]; then
   echo "build-project-harness-kernel: unexpected axiom set" >&2
@@ -74,7 +76,9 @@ deny_request="${prefix}\"tool\":\"Write\",\"input_bytes\":10,\"agent_depth\":0,\
 admit_request=${deny_request/\"regular_existing\"/\"missing\"}
 deny_verdict=$(printf '%s' "$deny_request" | "$output")
 admit_verdict=$(printf '%s' "$admit_request" | "$output")
-[[ "$deny_verdict" == *'"decision":"block"'* && "$deny_verdict" == *'"rule_precondition_blocked"'* ]] || {
+[[ "$deny_verdict" == *'"decision":"block"'* &&
+  "$deny_verdict" == *'"rule_precondition_blocked"'* &&
+  "$deny_verdict" == *'"recover_edit_existing_file_exact"'* ]] || {
   echo "build-project-harness-kernel: deny smoke failed" >&2
   exit 1
 }

@@ -492,14 +492,21 @@ pub fn executeOne(
                     project_pre_signal.?.file_target_state == .missing)
                     job_ctx.project_write_exclusive_create = true;
             },
-            .block => {
+            .block => |recovery_action| {
                 const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
-                const denied = @import("tool_error.zig").errorToJson(
-                    "ProjectRuleBlocked",
-                    "Project formal rule blocked tool '{s}' before dispatch",
-                    .{dispatched_name},
-                    parent_allocator,
-                ) catch return error.OutOfMemory;
+                const tool_error = @import("tool_error.zig");
+                const denied = switch (recovery_action) {
+                    .none => tool_error.errorToJson(
+                        "ProjectRuleBlocked",
+                        "Project formal rule blocked tool '{s}' before dispatch",
+                        .{dispatched_name},
+                        parent_allocator,
+                    ),
+                    .edit_existing_file_exact => tool_error.projectRuleExactEditBlockedJson(
+                        dispatched_name,
+                        parent_allocator,
+                    ),
+                } catch return error.OutOfMemory;
                 return .{ .done = .{
                     .content = denied,
                     .is_error = true,
@@ -1497,7 +1504,7 @@ test "project post gate runs before terminal observation and block preserves act
         post_called: bool = false,
         saw_matched_reobservation: bool = false,
 
-        fn pre(_: *anyopaque, _: project_gate_protocol.PreSignal) project_gate_protocol.Result {
+        fn pre(_: *anyopaque, _: project_gate_protocol.PreSignal) project_gate_protocol.PreResult {
             return .admit;
         }
 

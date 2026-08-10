@@ -714,6 +714,48 @@ versus 0.148837), although its cost, requests and wall time per trustworthy
 success were lower because it produced twice as many trustworthy successes.
 The stability gate therefore rejects a production preference.
 
+The byte-level diagnosis was identical in all four failures. The observed
+`deploy.yaml`, `policy.json`, `OPERATIONS.md`, and `migration.sql` were exactly
+the oracle bytes plus one final `0x0a`; their observed sizes were respectively
+67/61/129/101 bytes versus expected 66/60/128/100. The cassette shows that the
+blocked `Write` content already matched the oracle. In every failure GLM then
+sent an `Edit.old_string` without the existing terminal newline, whereas every
+successful recovery included that newline. This is therefore a single
+recovery-protocol defect rather than four independent semantic failures.
+
+The next bounded mechanism revision makes that recovery direction a formal
+kernel output instead of a hand-written generic error. For a valid deny rule,
+the fixed Lean kernel emits `recover_edit_existing_file_exact` only when the
+target tool is `Write`, the rule scope is `existing_file`, and the host's
+pre-signal says `regular_existing`. Missing, directory/symlink and unavailable
+targets receive no direction. The hash-pinned native parser rejects recovery
+codes on an admitted/post/invalid verdict, extra reason combinations, or
+failed request/rule/lifecycle checks. In a multi-rule batch only the first
+blocking verdict controls the model-facing recovery action; a checker fault,
+journal failure or shadow actuation cannot expose it.
+
+The enforced tool result carries the versioned
+`metacodes-project-rule-recovery-v1` contract. It says that the denied `Write`
+itself is not retryable, but the task may continue through ordinary `Edit`;
+whole-file `old_string` must match the latest observed file including terminal
+newline state, `new_string` must preserve the blocked content exactly, and the
+final file must be re-observed. The follow-up `Edit` receives no authorization
+bypass and traverses the same sensor, Lean gate, dispatcher and post-action
+re-observation path. The selected direction is also written into formal
+decision-batch v3 journal evidence and counted by the internal rule-impact
+observer, so later analysis can distinguish a kernel-directed recovery from a
+model's unaided strategy change.
+
+This contract appears only in the blocked tool result after treatment. It does
+not change the system prompt, tool schema/order, task message or first provider
+request, so the causal cacheable prefix remains identical across arms. The
+real loopback runner now proves
+`production binary -> fixed Lean block -> structured tool_result -> exact Edit
+-> final Read -> exact grader`, while checking byte-identical first requests.
+This is new E0/E1/L2 mechanism evidence only; it does not retroactively change
+the non-significant E3 result. A new frozen paid replication is required before
+claiming outcome benefit.
+
 The retained local report has manifest id
 `dbf52121cbef1a0f11f4f99c27f6d8f0b18529047ca38dada0bba75e54288485`
 and SHA-256

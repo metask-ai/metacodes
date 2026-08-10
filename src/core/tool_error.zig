@@ -193,6 +193,56 @@ pub fn errorToJson(err_name: []const u8, comptime detail_fmt: []const u8, detail
     return try e.toJson(allocator);
 }
 
+pub const PROJECT_RULE_RECOVERY_SCHEMA = "metacodes-project-rule-recovery-v1";
+
+/// Render the task-level recovery contract selected by the fixed Lean kernel.
+/// `recoverable` remains false for the denied Write itself: only the distinct
+/// Edit path is recoverable, and it must pass the normal gate again.
+pub fn projectRuleExactEditBlockedJson(
+    tool: []const u8,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    const detail = try std.fmt.allocPrint(
+        allocator,
+        "Project formal rule blocked tool '{s}' before dispatch. Do not retry the blocked tool; follow the recovery contract.",
+        .{tool},
+    );
+    defer allocator.free(detail);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try aw.writer.writeAll("{\"error\":{\"code\":\"project_rule_blocked\",\"category\":\"safety\",\"detail\":");
+    try std.json.Stringify.encodeJsonString(detail, .{}, &aw.writer);
+    try aw.writer.print(
+        ",\"recoverable\":false,\"recovery\":{{\"schema_version\":\"{s}\",\"task_recoverable\":true,\"action\":\"edit_existing_file_exact\",\"requirements\":[",
+        .{PROJECT_RULE_RECOVERY_SCHEMA},
+    );
+    try std.json.Stringify.encodeJsonString(
+        "Use Edit on the existing regular file; this is not permission to retry Write.",
+        .{},
+        &aw.writer,
+    );
+    try aw.writer.writeByte(',');
+    try std.json.Stringify.encodeJsonString(
+        "For whole-file replacement, old_string must match the current file exactly, including whether it ends with a newline.",
+        .{},
+        &aw.writer,
+    );
+    try aw.writer.writeByte(',');
+    try std.json.Stringify.encodeJsonString(
+        "Reuse the blocked Write content as new_string exactly; do not add or remove a terminal newline.",
+        .{},
+        &aw.writer,
+    );
+    try aw.writer.writeByte(',');
+    try std.json.Stringify.encodeJsonString(
+        "Read or otherwise reobserve the final file before reporting completion.",
+        .{},
+        &aw.writer,
+    );
+    try aw.writer.writeAll("]}}}");
+    return try aw.toOwnedSlice();
+}
+
 /// Serialize a borrowed external detail only if the complete encoded JSON fits
 /// `max_bytes`. The first pass writes into a fixed-buffer discarding writer, so
 /// hostile escaping expansion is measured without allocating. The second pass
@@ -314,4 +364,39 @@ test "errorToJson oneliner" {
     defer a.free(j);
     try std.testing.expect(std.mem.indexOf(u8, j, "\"code\":\"not_read\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, j, "src/foo.zig") != null);
+}
+
+test "project rule exact edit recovery distinguishes denied action from task recovery" {
+    const a = std.testing.allocator;
+    const encoded = try projectRuleExactEditBlockedJson("Write", a);
+    defer a.free(encoded);
+    const Parsed = struct {
+        @"error": struct {
+            code: []const u8,
+            category: []const u8,
+            detail: []const u8,
+            recoverable: bool,
+            recovery: struct {
+                schema_version: []const u8,
+                task_recoverable: bool,
+                action: []const u8,
+                requirements: []const []const u8,
+            },
+        },
+    };
+    var parsed = try std.json.parseFromSlice(Parsed, a, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("project_rule_blocked", parsed.value.@"error".code);
+    try std.testing.expect(!parsed.value.@"error".recoverable);
+    try std.testing.expect(parsed.value.@"error".recovery.task_recoverable);
+    try std.testing.expectEqualStrings(
+        "edit_existing_file_exact",
+        parsed.value.@"error".recovery.action,
+    );
+    try std.testing.expectEqual(@as(usize, 4), parsed.value.@"error".recovery.requirements.len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        parsed.value.@"error".recovery.requirements[1],
+        "ends with a newline",
+    ) != null);
 }

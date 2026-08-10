@@ -7,6 +7,17 @@ const project_rule_spec = @import("../core/project_rule_spec.zig");
 
 pub const Result = enum { admit, block, fault };
 
+pub const RecoveryAction = enum {
+    none,
+    edit_existing_file_exact,
+};
+
+pub const PreResult = union(enum) {
+    admit,
+    block: RecoveryAction,
+    fault,
+};
+
 pub const PreSignal = struct {
     dispatch_id: []const u8,
     tool: []const u8,
@@ -25,10 +36,10 @@ pub const PostSignal = struct {
 
 pub const Gate = struct {
     ctx: *anyopaque,
-    preFn: *const fn (ctx: *anyopaque, signal: PreSignal) Result,
+    preFn: *const fn (ctx: *anyopaque, signal: PreSignal) PreResult,
     postFn: *const fn (ctx: *anyopaque, signal: PostSignal) Result,
 
-    pub fn pre(self: Gate, signal: PreSignal) Result {
+    pub fn pre(self: Gate, signal: PreSignal) PreResult {
         return self.preFn(self.ctx, signal);
     }
 

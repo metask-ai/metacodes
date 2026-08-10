@@ -609,7 +609,7 @@ test "Task depth guard rejects at MAX" {
 
 test "active project rules reject detached Agent before provider or worker side effects" {
     const GateProbe = struct {
-        fn pre(_: *anyopaque, _: @import("project_rule_gate.zig").PreSignal) @import("project_rule_gate.zig").Result {
+        fn pre(_: *anyopaque, _: @import("project_rule_gate.zig").PreSignal) @import("project_rule_gate.zig").PreResult {
             return .admit;
         }
         fn post(_: *anyopaque, _: @import("project_rule_gate.zig").PostSignal) @import("project_rule_gate.zig").Result {

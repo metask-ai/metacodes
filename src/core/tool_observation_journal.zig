@@ -87,6 +87,7 @@ pub const RunFormalDecision = struct {
     actuation: observation.FormalActuation,
     file_target_state: observation.FileTargetState = .unobserved,
     result: observation.FormalResult,
+    recovery_action: observation.FormalRecoveryAction = .none,
     candidate_id: [64]u8,
     project_sha256: [64]u8,
     bundle_sha256: [64]u8,
@@ -403,6 +404,7 @@ pub fn loadRunDispatches(
                     .actuation = formal.actuation,
                     .file_target_state = formal.file_target_state,
                     .result = formal.result,
+                    .recovery_action = .none,
                     .candidate_id = formal.candidate_id,
                     .project_sha256 = formal.project_sha256,
                     .bundle_sha256 = formal.bundle_sha256,
@@ -425,6 +427,7 @@ pub fn loadRunDispatches(
                         .actuation = batch.actuation,
                         .file_target_state = batch.file_target_state,
                         .result = decision.result,
+                        .recovery_action = decision.recovery_action,
                         .candidate_id = decision.candidate_id,
                         .project_sha256 = batch.project_sha256,
                         .bundle_sha256 = batch.bundle_sha256,
@@ -648,16 +651,21 @@ fn validateFd(
                         });
                     },
                     .formal_decision_batch => |batch| {
-                        const legacy = std.mem.eql(
+                        const legacy_v1 = std.mem.eql(
                             u8,
                             batch.schema_version,
                             observation.FORMAL_BATCH_SCHEMA_VERSION_V1,
                         );
-                        if ((!legacy and !std.mem.eql(
+                        const legacy_v2 = std.mem.eql(
+                            u8,
+                            batch.schema_version,
+                            observation.FORMAL_BATCH_SCHEMA_VERSION_V2,
+                        );
+                        if ((!legacy_v1 and !legacy_v2 and !std.mem.eql(
                             u8,
                             batch.schema_version,
                             observation.FORMAL_BATCH_SCHEMA_VERSION,
-                        )) or (legacy and batch.actuation != .enforced) or
+                        )) or (legacy_v1 and batch.actuation != .enforced) or
                             batch.decisions.len == 0 or
                             batch.decisions.len > batch.checker_batch_size or
                             batch.checker_batch_size > @import("../formal/project_harness_runtime.zig").MAX_BATCH_REQUESTS or
@@ -665,6 +673,11 @@ fn validateFd(
                                 batch.decisions[batch.decisions.len - 1].result == .admit))
                             return error.InvalidRecord;
                         for (batch.decisions) |decision| {
+                            if (decision.recovery_action != .none and
+                                (legacy_v1 or legacy_v2 or batch.phase != .pre or
+                                    decision.result != .block or
+                                    batch.file_target_state != .regular_existing))
+                                return error.InvalidRecord;
                             try acceptFormalDecision(&formal_validation, .{
                                 .dispatch_id = batch.dispatch_id,
                                 .phase = batch.phase,
@@ -1315,6 +1328,44 @@ test "formal journal enforces pre dispatch post finish wiring and permits pre bl
     };
     try writeTestRun(truncated_batch_dir, sid, &truncated_batch);
     try std.testing.expectError(error.InvalidRecord, validate(truncated_batch_dir, sid));
+
+    const recovery_decisions = [_]observation.FormalCandidateDecision{.{
+        .result = .block,
+        .recovery_action = .edit_existing_file_exact,
+        .candidate_id = .{'1'} ** 64,
+        .request_sha256 = .{'5'} ** 64,
+        .verdict_sha256 = .{'6'} ** 64,
+        .checker_failure = null,
+    }};
+    var recovery_event = testFormalBatchEvent(
+        "batch-recovery",
+        .pre,
+        1,
+        &recovery_decisions,
+    );
+    recovery_event.formal_decision_batch.file_target_state = .regular_existing;
+    const recovery_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/batch-recovery",
+        .{root},
+    );
+    defer std.testing.allocator.free(recovery_dir);
+    const recovery_events = [_]observation.Event{recovery_event};
+    try writeTestRun(recovery_dir, sid, &recovery_events);
+    _ = try validate(recovery_dir, sid);
+
+    var forged_legacy_recovery = recovery_event;
+    forged_legacy_recovery.formal_decision_batch.schema_version =
+        observation.FORMAL_BATCH_SCHEMA_VERSION_V2;
+    const legacy_recovery_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/batch-recovery-forged-v2",
+        .{root},
+    );
+    defer std.testing.allocator.free(legacy_recovery_dir);
+    const legacy_recovery_events = [_]observation.Event{forged_legacy_recovery};
+    try writeTestRun(legacy_recovery_dir, sid, &legacy_recovery_events);
+    try std.testing.expectError(error.InvalidRecord, validate(legacy_recovery_dir, sid));
 
     const multi_missing_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/multi-missing", .{root});
     defer std.testing.allocator.free(multi_missing_dir);

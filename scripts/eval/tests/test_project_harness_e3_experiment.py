@@ -276,7 +276,7 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
         kernel = "2" * 64
         candidate = "3" * 64
         batch = {
-            "schema_version": "metacodes-project-formal-decision-batch-v2",
+            "schema_version": "metacodes-project-formal-decision-batch-v3",
             "dispatch_id": "write-1",
             "phase": "pre",
             "actuation": "enforced",
@@ -293,6 +293,7 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
             "decisions": [{
                 "candidate_id": candidate,
                 "result": "block",
+                "recovery_action": "edit_existing_file_exact",
                 "request_sha256": "7" * 64,
                 "verdict_sha256": "8" * 64,
                 "checker_failure": None,
@@ -306,6 +307,7 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
             "decisions": [{
                 **batch["decisions"][0],
                 "result": "admit",
+                "recovery_action": "none",
                 "request_sha256": "9" * 64,
                 "verdict_sha256": "a" * 64,
             }],
@@ -356,6 +358,7 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
         self.assertFalse(result["existing_file_write_dispatch"])
         self.assertFalse(result["realized_existing_file_write_effect"])
         self.assertTrue(result["recovery_after_block"])
+        self.assertEqual(1, result["exact_edit_recovery_directions"])
         self.assertTrue(result["trustworthy_task_success"])
 
 
