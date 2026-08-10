@@ -6,6 +6,7 @@
 //! against a malicious same-user replacing both binary and configuration.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const pfs = @import("platform").fs;
 const runtime = @import("runtime.zig");
 
@@ -111,6 +112,11 @@ pub fn loadAdjacent(
     if (!validLabel(parsed.host_os, 64) or !validLabel(parsed.host_arch, 64) or
         !validLabel(parsed.linker, 64) or !validLabel(parsed.lean_version, 512))
         return error.InvalidProvenanceText;
+    const host_os = expectedHostOs() orelse return error.UnsupportedProvenanceHost;
+    const host_arch = expectedHostArch() orelse return error.UnsupportedProvenanceHost;
+    if (!std.mem.eql(u8, parsed.host_os, host_os) or
+        !std.mem.eql(u8, parsed.host_arch, host_arch))
+        return error.ProvenanceHostMismatch;
 
     // Per-build wall-clock facts deliberately live outside the stable
     // artifact identity. Both files are mandatory and hash-bound: accepting
@@ -199,6 +205,23 @@ fn validLabel(raw: []const u8, max: usize) bool {
     return true;
 }
 
+fn expectedHostOs() ?[]const u8 {
+    return switch (builtin.os.tag) {
+        .macos => "Darwin",
+        .linux => "Linux",
+        .windows => "Windows",
+        else => null,
+    };
+}
+
+fn expectedHostArch() ?[]const u8 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => "x86_64",
+        .aarch64 => if (builtin.os.tag == .macos) "arm64" else "aarch64",
+        else => null,
+    };
+}
+
 fn validUtcTimestamp(raw: []const u8) bool {
     if (raw.len != 20 or raw[4] != '-' or raw[7] != '-' or raw[10] != 'T' or
         raw[13] != ':' or raw[16] != ':' or raw[19] != 'Z') return false;
@@ -260,8 +283,14 @@ test "formal v3 provenance requires a hash-bound build receipt" {
     defer std.testing.allocator.free(checker_path);
     const expected_binary_sha256 =
         ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").*;
-    const manifest =
-        "{\"schema_version\":\"metacodes-formal-artifact-v3\",\"checker_version\":\"metacodes-formal-kernel-v2\",\"request_schema\":\"metacodes-formal-request-v1\",\"memory_request_schema\":\"metacodes-memory-migration-request-v1\",\"verdict_schema\":\"metacodes-formal-verdict-v2\",\"binary_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"binary_bytes\":7,\"kernel_source_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"memory_kernel_source_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"main_source_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"axiom_audit_source_sha256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"host_os\":\"test\",\"host_arch\":\"test\",\"linker\":\"test\",\"lean_version\":\"Lean test\",\"native_smoke\":\"passed\"}\n";
+    const host_os = expectedHostOs() orelse return error.SkipZigTest;
+    const host_arch = expectedHostArch() orelse return error.SkipZigTest;
+    const manifest = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema_version\":\"metacodes-formal-artifact-v3\",\"checker_version\":\"metacodes-formal-kernel-v2\",\"request_schema\":\"metacodes-formal-request-v1\",\"memory_request_schema\":\"metacodes-memory-migration-request-v1\",\"verdict_schema\":\"metacodes-formal-verdict-v2\",\"binary_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"binary_bytes\":7,\"kernel_source_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"memory_kernel_source_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"main_source_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"axiom_audit_source_sha256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"host_os\":\"{s}\",\"host_arch\":\"{s}\",\"linker\":\"test\",\"lean_version\":\"Lean test\",\"native_smoke\":\"passed\"}}\n",
+        .{ host_os, host_arch },
+    );
+    defer std.testing.allocator.free(manifest);
     const manifest_hash = sha256Hex(manifest);
     const manifest_path = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -291,6 +320,21 @@ test "formal v3 provenance requires a hash-bound build receipt" {
     try std.testing.expectEqualSlices(u8, &receipt_hash, &loaded.build_receipt_sha256);
     try std.testing.expectEqualStrings("2026-08-08T00:00:00Z", loaded.built_at_utc);
     try std.testing.expectEqualStrings(receipt, loaded.build_receipt_raw);
+
+    const wrong_host_manifest = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        manifest,
+        host_os,
+        "definitely-wrong-host",
+    );
+    defer std.testing.allocator.free(wrong_host_manifest);
+    try writeFixture(manifest_path, wrong_host_manifest);
+    try std.testing.expectError(
+        error.ProvenanceHostMismatch,
+        loadAdjacent(std.testing.allocator, checker_path, expected_binary_sha256, 7),
+    );
+    try writeFixture(manifest_path, manifest);
 
     const wrong_receipt =
         "{\"schema_version\":\"metacodes-formal-build-receipt-v1\",\"artifact_manifest_sha256\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"binary_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"built_at_utc\":\"2026-08-08T00:00:00Z\"}\n";

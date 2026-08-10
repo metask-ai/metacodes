@@ -10,10 +10,51 @@ set -euo pipefail
 
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 lean_dir="$repo_dir/control-plane/lean"
-output=${1:-"$repo_dir/zig-out/libexec/metacodes/metacodes-formal-kernel"}
+
+# This script is intentionally a native builder: the produced checker is
+# executed below before its provenance may say `native_smoke=passed`.  GitHub's
+# Windows runners invoke it through Git Bash, where `uname` reports a MINGW/
+# MSYS name and Lake emits an `.exe`; normalize both facts rather than treating
+# every non-Darwin host as a Unix filesystem.
+raw_host_os=$(uname -s)
+case "$raw_host_os" in
+  Darwin)
+    host_os="Darwin"
+    executable_suffix=""
+    ;;
+  Linux)
+    host_os="Linux"
+    executable_suffix=""
+    ;;
+  MINGW*|MSYS*|CYGWIN*)
+    host_os="Windows"
+    executable_suffix=".exe"
+    ;;
+  *)
+    echo "build-formal-kernel: unsupported native host: $raw_host_os" >&2
+    exit 1
+    ;;
+esac
+
+host_arch=$(uname -m)
+case "$host_arch" in
+  x86_64|aarch64|arm64) ;;
+  *)
+    echo "build-formal-kernel: unsupported native architecture: $host_arch" >&2
+    exit 1
+    ;;
+esac
+
+output=${1:-"$repo_dir/zig-out/libexec/metacodes/metacodes-formal-kernel$executable_suffix"}
 manifest=${2:-"$output.provenance.json"}
 receipt=${3:-"$output.build-receipt.json"}
-lake=${LAKE:-"$HOME/.elan/bin/lake"}
+if [[ -n "${LAKE:-}" ]]; then
+  lake=$LAKE
+elif command -v lake >/dev/null 2>&1; then
+  lake=$(command -v lake)
+else
+  lake="$HOME/.elan/bin/lake$executable_suffix"
+fi
 
 if [[ ! -x "$lake" ]]; then
   echo "build-formal-kernel: lake not found: $lake" >&2
@@ -22,7 +63,6 @@ fi
 
 mkdir -p "$(dirname "$output")" "$(dirname "$manifest")" "$(dirname "$receipt")"
 
-host_os=$(uname -s)
 (
   cd "$lean_dir"
   if [[ "$host_os" == "Darwin" ]]; then
@@ -103,7 +143,7 @@ if [[ "$host_os" == "Darwin" ]]; then
   install -m 0755 "$tmp_binary" "$output"
   linker="apple-clang"
 else
-  install -m 0755 "$lean_dir/.lake/build/bin/metacodes-formal-kernel" "$output"
+  install -m 0755 "$lean_dir/.lake/build/bin/metacodes-formal-kernel$executable_suffix" "$output"
 fi
 
 hex_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -164,8 +204,7 @@ if [[ "$host_os" == "Darwin" ]]; then
 else
   binary_bytes=$(stat -c '%s' "$output")
 fi
-lean_version=$(cd "$lean_dir" && "$lake" env lean --version | tr -d '\n')
-host_arch=$(uname -m)
+lean_version=$(cd "$lean_dir" && "$lake" env lean --version | tr -d '\r\n')
 built_at_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
 # The artifact manifest is intentionally time-independent.  It is the stable
