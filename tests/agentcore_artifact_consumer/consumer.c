@@ -6,7 +6,18 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 6 must not retain historical callback aliases"
+#error "revision 7 must not retain historical callback aliases"
+#endif
+
+#if METASK_AGENTCORE_ABI_REVISION != 7u || \
+    METASK_AGENTCORE_MCP_NEGOTIATION_AUTO != 1u || \
+    METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY != 2u || \
+    METASK_AGENTCORE_MCP_NEGOTIATION_LEGACY_ONLY != 3u || \
+    METASK_AGENTCORE_MCP_NEGOTIATION_LEGACY_2025_06_ONLY != 4u || \
+    METASK_AGENTCORE_MCP_ERA_2026_07_28 != 1u || \
+    METASK_AGENTCORE_MCP_ERA_2025_11_25 != 2u || \
+    METASK_AGENTCORE_MCP_ERA_2025_06_18 != 3u
+#error "source-free Revision 7 MCP codes must match the public contract"
 #endif
 
 #ifdef _WIN32
@@ -298,9 +309,9 @@ int main(void) {
     if (api == NULL) {
         return 10;
     }
-    metask_agentcore_api_v1 revision_5 = *api;
-    revision_5.abi_revision = 5;
-    if (metask_agentcore_api_v1_is_compatible(&revision_5)) {
+    metask_agentcore_api_v1 prior_revision = *api;
+    prior_revision.abi_revision = METASK_AGENTCORE_ABI_REVISION - 1u;
+    if (metask_agentcore_api_v1_is_compatible(&prior_revision)) {
         return 10;
     }
     if (metask_agentcore_get_api(0) != NULL ||

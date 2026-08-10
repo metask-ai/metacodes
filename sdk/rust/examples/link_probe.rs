@@ -1,6 +1,6 @@
 fn main() {
     let api =
-        metask_agentcore_sys::Api::discover().expect("AgentCore Revision 6 exact discovery failed");
+        metask_agentcore_sys::Api::discover().expect("AgentCore Revision 7 exact discovery failed");
     let output = api.owned_buffer();
     assert!(output
         .as_bytes()
@@ -16,10 +16,10 @@ fn main() {
         )
     }
     .is_null());
-    let mut revision_5 = unsafe { *api.as_raw() };
-    revision_5.abi_revision = 5;
+    let mut prior_revision = unsafe { *api.as_raw() };
+    prior_revision.abi_revision = metask_agentcore_sys::METASK_AGENTCORE_ABI_REVISION - 1;
     assert!(matches!(
-        unsafe { metask_agentcore_sys::Api::from_raw(&revision_5) },
+        unsafe { metask_agentcore_sys::Api::from_raw(&prior_revision) },
         Err(metask_agentcore_sys::AbiError::UnsupportedAbi)
     ));
 }

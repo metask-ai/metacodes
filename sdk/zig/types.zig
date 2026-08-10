@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 6;
+pub const ABI_REVISION: u32 = 7;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 6 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 7 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -219,8 +219,10 @@ pub const MCP_TRANSPORT_STREAMABLE_HTTP: u32 = 2;
 pub const MCP_NEGOTIATION_AUTO: u32 = 1;
 pub const MCP_NEGOTIATION_MODERN_ONLY: u32 = 2;
 pub const MCP_NEGOTIATION_LEGACY_ONLY: u32 = 3;
+pub const MCP_NEGOTIATION_LEGACY_2025_06_ONLY: u32 = 4;
 pub const MCP_ERA_2026_07_28: u32 = 1;
 pub const MCP_ERA_2025_11_25: u32 = 2;
+pub const MCP_ERA_2025_06_18: u32 = 3;
 pub const MCP_CONNECTION_DISPOSABLE_PROBE: u32 = 1;
 pub const MCP_CONNECTION_ACTUAL: u32 = 2;
 pub const MCP_OPEN_OK: u32 = 0;
@@ -346,9 +348,14 @@ pub const HostToolV1 = extern struct {
 
 /// MCP transport callbacks are Host-owned. AgentCore passes only borrowed
 /// request bytes and copies every successful response before the callback
-/// returns. A successful open produces one opaque connection context; its
-/// close callback is invoked exactly once. Credentials and transport handles
-/// never enter AgentCore checkpoints.
+/// returns. A successful open produces one opaque connection context that is
+/// permanently bound to its purpose and requested exact era; its close
+/// callback is invoked exactly once. For Streamable HTTP, the Host must attach
+/// that era as `MCP-Protocol-Version` after initialization and retain any
+/// `MCP-Session-Id` in this connection context. Probe, actual, and reopened
+/// exact-era connections must not share session identifiers or mutable
+/// protocol state. Credentials and transport handles never enter AgentCore
+/// checkpoints.
 pub const McpIsCancelledFnV1 = *const fn (
     cancellation_ctx: ?*const anyopaque,
 ) callconv(.c) u32;
@@ -797,7 +804,7 @@ pub const SessionAbortFnV1 = *const fn (
     reason_code: u32,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
-/// Runs the canonical default best-effort compact policy. Revision 6 accepts
+/// Runs the canonical default best-effort compact policy. Revision 7 accepts
 /// no target token budget and does not guarantee fit for a model context.
 pub const SessionCompactFnV1 = *const fn (
     session: ?*SessionHandle,
@@ -950,4 +957,16 @@ test "typed status and stop reason validate every public code" {
     try std.testing.expectEqual(StopReason.checkpoint_resource_limit, try StopReason.fromCode(8));
     try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(9));
     try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(std.math.maxInt(u32)));
+}
+
+test "Revision 7 MCP codes append without changing Revision 6 meanings" {
+    const std = @import("std");
+    try std.testing.expectEqual(@as(u32, 7), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
+    try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
+    try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);
+    try std.testing.expectEqual(@as(u32, 4), MCP_NEGOTIATION_LEGACY_2025_06_ONLY);
+    try std.testing.expectEqual(@as(u32, 1), MCP_ERA_2026_07_28);
+    try std.testing.expectEqual(@as(u32, 2), MCP_ERA_2025_11_25);
+    try std.testing.expectEqual(@as(u32, 3), MCP_ERA_2025_06_18);
 }

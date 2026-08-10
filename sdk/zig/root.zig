@@ -278,7 +278,7 @@ test "RunContext validator bounds length before pointer slicing" {
     try std.testing.expectEqualStrings(id, valid.session_id);
 }
 
-test "Revision 6 SDK rejects the Revision 5 table from the stable prefix" {
+test "Revision 7 SDK rejects the Revision 6 table from the stable prefix" {
     const Revision5Api = extern struct {
         struct_size: u32,
         abi_version: u32,
@@ -291,7 +291,7 @@ test "Revision 6 SDK rejects the Revision 5 table from the stable prefix" {
         std.mem.zeroes(Revision5Api);
     legacy.struct_size = @sizeOf(Revision5Api);
     legacy.abi_version = types.ABI_VERSION_V1;
-    legacy.abi_revision = 5;
+    legacy.abi_revision = 6;
     const raw: *const types.ApiV1 = @ptrCast(&legacy);
     try std.testing.expectError(error.UnsupportedAbi, Api.validate(raw));
 }

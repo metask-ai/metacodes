@@ -173,7 +173,8 @@ const AbiMcpConnector = struct {
             },
             switch (era) {
                 .modern_2026_07_28 => wire.MCP_ERA_2026_07_28,
-                .legacy_2025_11_25 => wire.MCP_ERA_2025_11_25,
+                .classic_2025_11_25 => wire.MCP_ERA_2025_11_25,
+                .classic_2025_06_18 => wire.MCP_ERA_2025_06_18,
             },
             self.timeout_ms,
             &connection_ctx,
@@ -3674,6 +3675,7 @@ fn mcpNegotiationPolicy(code: u32) ?mcp_negotiation.Policy {
         wire.MCP_NEGOTIATION_AUTO => .auto,
         wire.MCP_NEGOTIATION_MODERN_ONLY => .modern_only,
         wire.MCP_NEGOTIATION_LEGACY_ONLY => .legacy_only,
+        wire.MCP_NEGOTIATION_LEGACY_2025_06_ONLY => .legacy_2025_06_only,
         else => null,
     };
 }

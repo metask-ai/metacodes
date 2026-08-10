@@ -16,7 +16,7 @@ pub enum AbiError {
     LengthOverflow,
 }
 
-/// Validated Revision 6 function table. Discovery rejects every earlier
+/// Validated Revision 7 function table. Discovery rejects every earlier
 /// revision; there is no legacy probe or alternate layout.
 #[derive(Clone, Copy)]
 pub struct Api {
@@ -361,8 +361,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn revision_six_layout_and_host_buffer_helpers_are_exact() {
-        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 6);
+    fn revision_seven_layout_codes_and_host_buffer_helpers_are_exact() {
+        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 7);
+        assert_eq!(raw::METASK_AGENTCORE_MCP_NEGOTIATION_AUTO, 1);
+        assert_eq!(raw::METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY, 2);
+        assert_eq!(raw::METASK_AGENTCORE_MCP_NEGOTIATION_LEGACY_ONLY, 3);
+        assert_eq!(
+            raw::METASK_AGENTCORE_MCP_NEGOTIATION_LEGACY_2025_06_ONLY,
+            4
+        );
+        assert_eq!(raw::METASK_AGENTCORE_MCP_ERA_2026_07_28, 1);
+        assert_eq!(raw::METASK_AGENTCORE_MCP_ERA_2025_11_25, 2);
+        assert_eq!(raw::METASK_AGENTCORE_MCP_ERA_2025_06_18, 3);
         assert_eq!(size_of::<raw::metask_agentcore_api_v1>(), 216);
         assert_eq!(
             size_of::<raw::metask_agentcore_session_host_config_v1>(),

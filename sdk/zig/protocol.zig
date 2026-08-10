@@ -61,7 +61,7 @@ pub const PermissionCandidate = struct {
     scope: PermissionCandidateScope,
 };
 
-/// Exact Revision 6 Permission callback request. Unlike AskUserQuestion this
+/// Exact Revision 7 Permission callback request. Unlike AskUserQuestion this
 /// is a flat typed object, identified by `type == "permission"`.
 pub const PermissionRequest = struct {
     type: []const u8,
@@ -1018,7 +1018,8 @@ fn validSessionId(value: []const u8) bool {
 
 fn validMcpProtocol(value: []const u8) bool {
     return std.mem.eql(u8, value, "2026-07-28") or
-        std.mem.eql(u8, value, "2025-11-25");
+        std.mem.eql(u8, value, "2025-11-25") or
+        std.mem.eql(u8, value, "2025-06-18");
 }
 
 fn validBoundedText(value: []const u8, max: usize) bool {

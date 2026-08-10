@@ -10,7 +10,7 @@ stateful AgentSession execution. It does not expose or define a host product
 model.
 
 **Status: experimental.** The premature 2026-07-17 freeze was retracted after
-consumer feedback exposed a dangling callback-identity contract. Revision 6
+consumer feedback exposed a dangling callback-identity contract. Revision 7
 now defines one exact hard-cut wire shape after Permission authority,
 checkpoint/restore, durable budget, and MCP Runtime/Session seams were
 implemented and tested; this is not a general v1 stability promise.
@@ -20,22 +20,21 @@ and treat a different revision as incompatible. Layouts, numeric values,
 function-table order, and semantics may change only through another explicit
 revision cut while v1 remains experimental.
 
-The current experimental bundle is **ABI v1 revision 6**. Revision 6 is a
+The current experimental bundle is **ABI v1 revision 7**. Revision 7 is a
 hard-cut replacement for every earlier revision. In addition to the Revision
-5 Session surface, it adds Session checkpoint/restore/describe, durable
-admission budgets, Session Permission authority, and Runtime/Session MCP:
+6 Session surface, it completes the Runtime/Session MCP protocol boundary:
 
-- `metask_agentcore_api_v1` is 216 bytes and requires `abi_revision == 6`;
+- `metask_agentcore_api_v1` is 216 bytes and requires `abi_revision == 7`;
 - `RuntimeConfigV1`, `SessionHostConfigV1`, `SessionCreateConfigV1`,
   `SessionRestoreConfigV1`, `RunInputV1`, and `RunResultV1` are respectively
   96, 168, 64, 64, 104, and 72 bytes on the required 64-bit ABI;
 - checkpoint, restore, describe, MCP refresh/describe/selection, Permission
   rule update, compact, and abort entries are mandatory;
 - the exact required capability set is `0x7ffff`;
-- `manifest.json` records revision 6, table size 216, and that exact capability
+- `manifest.json` records revision 7, table size 216, and that exact capability
   set.
 
-Revision 6 provides no earlier-revision compatibility, shim, dual dispatch, or old
+Revision 7 provides no earlier AgentCore revision compatibility, shim, dual dispatch, or old
 table layout. Consumers update the header, SDK, manifest, and library
 atomically, validate the stable
 `struct_size`/`abi_version` prefix before reading later fields, then require
@@ -260,7 +259,7 @@ Events describe observations, not commands. A Host may render, aggregate,
 persist, or ignore them; consuming an event never drives the core execution
 loop.
 
-`on_event` is mandatory in Revision 6. To reconstruct final visible assistant
+`on_event` is mandatory in Revision 7. To reconstruct final visible assistant
 output, a Host accumulates only closed segments: `text_chunk` appends to the
 current segment and `stream_done` closes it. `tool_start` and `tool_result` are
 semantic boundaries that discard any unclosed segment and all previously
@@ -368,7 +367,7 @@ not define status precedence when multiple other input or admission errors are
 present in the same call.
 
 ABI v1 provides no in-place recovery or mutation of a poisoned Session. The
-Host must destroy that physical handle. Revision 6 checkpoint/restore creates
+Host must destroy that physical handle. Revision 7 checkpoint/restore creates
 a new handle from a previously exported committed checkpoint; it does not
 reconstruct state that was never successfully exported or resume an active
 Run.
@@ -376,7 +375,7 @@ Run.
 When facade poison occurs after Core has returned to an inspectable idle state,
 `session_describe` succeeds and reports lifecycle `poisoned`; it must not report
 `idle`. An active ordinary Session activity makes `session_describe` return
-`METASK_AGENTCORE_STATUS_BUSY`, so a successful Revision 6 description does not
+`METASK_AGENTCORE_STATUS_BUSY`, so a successful Revision 7 description does not
 emit lifecycle `busy`.
 
 A checkpoint is resumable model state, not a raw transcript archive. Before
@@ -401,7 +400,7 @@ requests cooperative abort and any other value returns
 ### Manual compact
 
 `session_compact` runs the canonical default compact policy as a best-effort
-Conversation maintenance operation. Revision 6 has no Host-supplied target
+Conversation maintenance operation. Revision 7 has no Host-supplied target
 token budget and does not guarantee that the result fits the context window of
 the current or a future model. `session_set_model` and `session_compact` are
 independent primitives, not a compound model-migration transaction.
@@ -410,7 +409,7 @@ On `METASK_AGENTCORE_STATUS_OK`, `CompactResultV1.before_context_tokens` and
 `after_context_tokens` are context-size estimates for UI and policy decisions;
 they are not provider billing values. The four provider usage-delta fields are
 semantically separate. `METASK_AGENTCORE_COMPACT_DEGRADED` exposes no structured
-reason in Revision 6, and a Host must not infer one by parsing diagnostics.
+reason in Revision 7, and a Host must not infer one by parsing diagnostics.
 
 Assistant text and other execution output are delivered through `on_event`.
 `RunResultV1` is a terminal summary containing stop reason, turns, and tool
@@ -577,7 +576,7 @@ synchronous within the same Host Run and projects its public text and usage
 through the ordinary event stream. The provider tool name `Skill` is reserved:
 Runtime creation rejects a Host tool with that name.
 
-Fork children cannot suspend for Host UI interaction in Revision 6. Their UI
+Fork children cannot suspend for Host UI interaction in Revision 7. Their UI
 requester is unavailable, so a child question or permission request fails
 closed as an ordinary fork/tool failure attributed to the outer Run. Inline
 execution may use the outer Run's synchronous UI callback.
@@ -589,17 +588,48 @@ product decision.
 
 ### MCP Runtime catalog and Session view
 
-Revision 6 accepts only MCP `2026-07-28` as the primary era and
-`2025-11-25` as the single compatibility era. Runtime owns negotiation,
+Revision 7 supports exact MCP `2026-07-28`, `2025-11-25`, and `2025-06-18`
+connections. Public negotiation codes preserve Revision 6 meanings:
+`auto=1`, `modern_only=2`, and exact `legacy_only=3`; exact
+`legacy_2025_06_only=4` is appended. Runtime owns negotiation,
 transport, canonical catalogs, cache expiry, and immutable generations;
 Session owns only a filtered selection, while each Run pins an admitted Tool
 environment. Credentials, live connections, and request state never enter a
 Session checkpoint.
 
+`auto` probes Modern first. A validated `MethodNotFound` may enter Classic;
+stdio probe timeout or child exit may also enter Classic, while HTTP timeout,
+network, authentication, and server failures fail closed. Classic starts with
+an exact 2025-11 request. If that response selects 2025-06, Runtime closes the
+connection and reopens exact 2025-06 once. Only the final exact-era handshake
+may publish capabilities or create the operational client.
+
+The Host-owned Connector is also the MCP transport compliance boundary. Every
+successful `open` must create a connection context permanently bound to the
+provided purpose and exact `requested_era_code`. For Streamable HTTP, the Host
+must retain response headers and attach the exact era as
+`MCP-Protocol-Version` to every request after successful initialization; when
+the server returns `MCP-Session-Id`, the Host must retain it in that connection
+context and send it on subsequent HTTP requests. Disposable probes, actual
+connections, and connections reopened for another era must not share
+`MCP-Session-Id` values or other connection-scoped mutable protocol state.
+Host-configured credentials, including authentication cookies, may be reused
+only within the same authentication context. The Host must never change an
+existing connection's era after inspecting an initialize response: AgentCore
+closes a mismatch and performs the exact-era reopen itself.
+
+| Responsibility | Owner |
+|---|---|
+| Candidate selection and validation of the server-selected protocol | AgentCore |
+| Closing a mismatch and performing an exact-era reopen | AgentCore |
+| JSON-RPC request bodies and Classic lifecycle ordering | AgentCore |
+| HTTP headers, authentication, cookies, session IDs, and connection pooling | Host Connector |
+| Binding one connection context to `purpose_code` and `requested_era_code` | Host Connector |
+
 `runtime_describe_mcp` returns `agentcore.mcp-catalog/v1`. Every server entry
 contains `server_binding_identity`, namespace, negotiated protocol,
 fingerprint, `cache_scope`, `fresh`, `ttl_remaining_ms`, and its Tool range.
-Modern TTL is capped by Runtime policy; the legacy adapter receives a
+Modern TTL is capped by Runtime policy; Classic adapters receive a
 conservative default TTL. A fresh Session selection fails when its server is
 expired, restore degrades and invalidates that authority, and a newly admitted
 Run never receives stale MCP Tools. An already admitted Run keeps its immutable
@@ -612,7 +642,7 @@ Modern `tools/list` cache metadata is required; `server/discover` may omit both
 cache fields. Each server TTL starts when that server's discovery completes,
 not when the multi-server refresh began.
 
-Canonical MCP schemas are retained losslessly, but Revision 6 advertises only
+Canonical MCP schemas are retained losslessly, but Revision 7 advertises only
 a bounded local validation profile. References, header projection,
 `uniqueItems: true`, numeric constraints, and numeric or structural
 `enum`/`const` are unavailable rather than approximately validated. Container,
@@ -623,11 +653,28 @@ validation and `tools/call` encoding, and `outputSchema` is applied only to a
 successful result. An `isError=true` Tool business error may omit
 `structuredContent` without losing its typed content.
 
+Catalog is the sole executable admission authority. A Snapshot stores only a
+canonical Tool pointer, stable model alias, and compact copied diagnostics for
+each admitted Tool. Rejected schemas and tools requiring MCP Tasks are visible
+only as catalog issues and cannot be found or selected. Session materializes a
+provider `PreparedTool` only for selected admitted entries; a non-allocation
+disagreement with the recorded admission is an invariant violation. View
+destruction releases materialized tools before releasing the retained
+Snapshot. MCP Tasks, notification pumping, and automatic request replay remain
+outside Revision 7.
+
+The value-only MCP checkpoint section writes `R7MCP` state revision 2. Its
+decoder accepts only the exact `R6MCP`/revision 1 and `R7MCP`/revision 2 pairs;
+the new 2025-06 era value is appended and era remains provenance rather than a
+selection fingerprint input. This does not make AgentCore ABI Revision 6
+checkpoints loadable through Revision 7 discovery—the outer ABI remains a hard
+cut.
+
 ### Model-visible MCP diagnostics
 
 MCP Tool failures currently reach the model as compact JSON with `code`,
 `phase`, and nullable `rpc_code`. These strings are diagnostic output, not C ABI
-`Status` values or a stable Revision 6 control vocabulary; Hosts must not branch
+`Status` values or a stable ABI control vocabulary; Hosts must not branch
 on their spelling or use them to broaden Tool authority. The current uncertain
 delivery code is `indeterminate`. Stabilizing this vocabulary requires a later
 explicit contract decision rather than treating leaked enum names as wire API.
@@ -824,21 +871,21 @@ reliable automatic classification.
 ### ABI evolution
 
 All v1 POD descriptors and the API table require their exact documented
-`struct_size`; every reserved field must be zero. Revision 6 freezes one exact
+`struct_size`; every reserved field must be zero. Revision 7 freezes one exact
 experimental cut. A later breaking v1 bundle must increment `abi_revision`,
 and consumers accept only the exact revision they were built against.
 Reserved storage is not permission to infer compatibility. After v1 is
 genuinely stabilized, later layout, function-table, or control-message
 extensions require `metask_agentcore_get_api(2)` and v2 types.
-In particular, assigning a meaning or non-zero value to a Revision 6 reserved
+In particular, assigning a meaning or non-zero value to a Revision 7 reserved
 field is a new wire contract and requires another explicit revision cut.
 
-Revision 6's published POD offsets and sizes require a 64-bit pointer ABI.
+Revision 7's published POD offsets and sizes require a 64-bit pointer ABI.
 The header rejects 32-bit consumers at compile time; a future 32-bit contract
 would need separately specified layouts and consumer gates.
 
 `capabilities` reports the API surface implemented by the returned library
-table. Revision 6 consumers require exact equality with
+table. Revision 7 consumers require exact equality with
 `METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1`; it is not an extensible superset
 check. It is not per-Runtime or per-Session negotiation; concrete Runtime and
 Session configuration still determines which tools and callbacks are active.

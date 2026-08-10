@@ -6,7 +6,7 @@ int main(void) {
         metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1 + 1) != NULL) {
         return 1;
     }
-    metask_agentcore_api_v1 revision_5 = *api;
-    revision_5.abi_revision = 5;
-    return metask_agentcore_api_v1_is_compatible(&revision_5) ? 1 : 0;
+    metask_agentcore_api_v1 prior_revision = *api;
+    prior_revision.abi_revision = METASK_AGENTCORE_ABI_REVISION - 1u;
+    return metask_agentcore_api_v1_is_compatible(&prior_revision) ? 1 : 0;
 }
