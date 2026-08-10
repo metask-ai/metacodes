@@ -1,4 +1,4 @@
-//! Immutable Runtime MCP catalog generations for AgentCore Revision 6.
+//! Immutable Runtime MCP catalog generations for AgentCore Revision 7.
 //!
 //! A refresh builds a complete candidate snapshot off to the side and only
 //! then publishes one new generation. Sessions and Runs retain old snapshots,
@@ -24,9 +24,11 @@ pub const Clock = struct {
     }
 };
 
+pub const MAX_NAMESPACE_BYTES: usize = 24;
+
 pub const Limits = struct {
     max_servers: usize = 64,
-    max_namespace_bytes: usize = 24,
+    max_namespace_bytes: usize = MAX_NAMESPACE_BYTES,
     max_issues: usize = 4096,
     legacy_ttl_ms: u64 = 30_000,
     max_ttl_ms: u64 = 300_000,
@@ -50,9 +52,19 @@ pub const Error = error{
     NotRefreshed,
 };
 
+pub const MaterializeError = error{
+    OutOfMemory,
+    AdmissionInvariantViolation,
+};
+
+pub const ToolIssue = union(enum) {
+    schema: schema.Issue,
+    task_required_unsupported,
+};
+
 pub const IssueKind = union(enum) {
     connection: runtime.ConnectFailure,
-    schema: schema.Issue,
+    tool: ToolIssue,
 };
 
 pub const CatalogIssue = struct {
@@ -67,10 +79,22 @@ pub const ServerRecord = struct {
     fingerprint: [32]u8,
     expires_at_ns: util_time.Nanos,
     cache_scope: canonical.CacheScope,
+    admitted_tools: []AdmittedTool,
 
     pub fn isFreshAt(self: ServerRecord, now_ns: util_time.Nanos) bool {
         return now_ns < self.expires_at_ns;
     }
+};
+
+pub const MAX_MODEL_TOOL_NAME_BYTES: usize = 64;
+
+/// A Snapshot stores only immutable admission evidence and a pointer to the
+/// canonical Tool owned by its retained Runtime Client. Provider projection
+/// trees are materialized only for tools selected into a Session View.
+pub const AdmittedTool = struct {
+    canonical: *const canonical.Tool,
+    model_name: []const u8,
+    diagnostics: []const schema.ProjectionDiagnostic,
 };
 
 pub const ServerDescription = struct {
@@ -161,11 +185,11 @@ pub const Snapshot = struct {
         self: *const Snapshot,
         binding: *const [32]u8,
         name: []const u8,
-    ) ?struct { server: *const ServerRecord, tool: *const canonical.Tool } {
+    ) ?struct { server: *const ServerRecord, admitted: *const AdmittedTool } {
         const server = self.findServer(binding) orelse return null;
-        for (server.client.catalog.tools) |*tool|
-            if (std.mem.eql(u8, tool.identity.name, name))
-                return .{ .server = server, .tool = tool };
+        for (server.admitted_tools) |*admitted|
+            if (std.mem.eql(u8, admitted.canonical.identity.name, name))
+                return .{ .server = server, .admitted = admitted };
         return null;
     }
 
@@ -180,7 +204,7 @@ pub const Snapshot = struct {
         for (self.servers) |server| tool_count = std.math.add(
             usize,
             tool_count,
-            server.client.catalog.tools.len,
+            server.admitted_tools.len,
         ) catch return error.ResourceLimit;
         const servers = a.alloc(ServerDescription, self.servers.len) catch
             return error.OutOfMemory;
@@ -202,9 +226,12 @@ pub const Snapshot = struct {
                 .fresh = server.isFreshAt(now_ns),
                 .ttl_remaining_ms = @intCast(@divTrunc(remaining_ns, std.time.ns_per_ms)),
                 .tool_offset = @intCast(tool_offset),
-                .tool_count = @intCast(server.client.catalog.tools.len),
+                .tool_count = @intCast(server.admitted_tools.len),
             };
-            for (server.client.catalog.tools, tools[tool_offset..]) |tool, *target| {
+            const admitted_count = server.admitted_tools.len;
+            const destinations = tools[tool_offset..][0..admitted_count];
+            for (server.admitted_tools, destinations) |admitted, *target| {
+                const tool = admitted.canonical;
                 target.* = .{
                     .server_binding_identity = tool.identity.server_binding_identity,
                     .canonical_name = a.dupe(u8, tool.identity.name) catch
@@ -212,17 +239,11 @@ pub const Snapshot = struct {
                     .schema_fingerprint = tool.identity.schema_fingerprint,
                     .permission_binding = tool.identity.permissionBinding(),
                 };
-                tool_offset += 1;
             }
+            tool_offset += admitted_count;
         }
         for (self.issues, issues) |issue, *description| {
-            const parts = switch (issue.kind) {
-                .connection => |failure| .{ @tagName(failure), "" },
-                .schema => |schema_issue| .{
-                    @tagName(schema_issue.code),
-                    schema_issue.keyword orelse "",
-                },
-            };
+            const parts = issueParts(issue.kind);
             const kind: []const u8 = parts[0];
             const detail: []const u8 = parts[1];
             const owned_tool = if (issue.tool_name) |name|
@@ -255,6 +276,23 @@ pub const Snapshot = struct {
         };
     }
 };
+
+fn issueParts(kind: IssueKind) struct { []const u8, []const u8 } {
+    return switch (kind) {
+        .connection => |failure| switch (failure) {
+            .diagnostic => |diagnostic| .{ @tagName(diagnostic.code), @tagName(diagnostic.phase) },
+            .resource_limit => .{ "server_resource_limit", "" },
+            .out_of_memory => .{ "runtime_out_of_memory", "" },
+        },
+        .tool => |tool_issue| switch (tool_issue) {
+            .schema => |schema_issue| .{
+                @tagName(schema_issue.code),
+                schema_issue.keyword orelse "",
+            },
+            .task_required_unsupported => .{ "task_required_unsupported", "execution.taskSupport" },
+        },
+    };
+}
 
 const OwnedSpec = struct {
     binding: [32]u8,
@@ -312,9 +350,13 @@ pub const Manager = struct {
         errdefer arena.deinit();
         const owned = arena.allocator().alloc(OwnedSpec, specs.len) catch
             return error.OutOfMemory;
+        const effective_namespace_limit = @min(
+            limits.max_namespace_bytes,
+            MAX_NAMESPACE_BYTES,
+        );
         for (specs, owned, 0..) |spec, *destination, index| {
             if (allZero(&spec.binding) or
-                !validNamespace(spec.namespace, limits.max_namespace_bytes) or
+                !validNamespace(spec.namespace, effective_namespace_limit) or
                 spec.timeout_ms == 0 or
                 spec.protocol_limits.max_tools > (canonical.Limits{}).max_tools)
                 return error.InvalidConfig;
@@ -427,22 +469,36 @@ pub const Manager = struct {
             };
             errdefer client.deinit();
             const namespace = a.dupe(u8, spec.namespace) catch return error.OutOfMemory;
+            var admitted_tools: std.ArrayList(AdmittedTool) = .empty;
+            defer admitted_tools.deinit(a);
             for (client.catalog.tools) |*tool| {
-                var admission = schema.prepareTool(a, "mcp__catalog_probe", tool, .{}) catch
-                    return error.OutOfMemory;
-                switch (admission) {
-                    .available => |*prepared| prepared.deinit(),
+                const model_name = deriveModelName(
+                    a,
+                    namespace,
+                    &spec.binding,
+                    tool.identity.name,
+                ) catch |err| return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.InvalidSelection => error.InvalidConfig,
+                    error.ResourceLimit => error.ResourceLimit,
+                };
+                const inspected = try inspectTool(a, self.allocator, model_name, tool);
+                switch (inspected) {
+                    .admitted => |admitted| admitted_tools.append(a, admitted) catch
+                        return error.OutOfMemory,
                     .unavailable => |issue| try appendIssue(&issues, a, self.limits, .{
                         .server_binding_identity = spec.binding,
                         .tool_name = tool.identity.name,
-                        .kind = .{ .schema = issue },
+                        .kind = .{ .tool = issue },
                     }),
                 }
             }
+            const owned_admitted = admitted_tools.toOwnedSlice(a) catch
+                return error.OutOfMemory;
             servers.append(a, .{
                 .namespace = namespace,
                 .client = client,
-                .fingerprint = serverFingerprint(self.allocator, client) catch
+                .fingerprint = serverFingerprint(self.allocator, client, owned_admitted) catch
                     return error.OutOfMemory,
                 .expires_at_ns = try expiresAt(
                     // Protocol TTL starts when this server's complete
@@ -453,6 +509,7 @@ pub const Manager = struct {
                     self.limits,
                 ),
                 .cache_scope = client.catalog.cache.scope,
+                .admitted_tools = owned_admitted,
             }) catch return error.OutOfMemory;
         }
         sortServers(servers.items);
@@ -471,6 +528,102 @@ pub const Manager = struct {
         return snapshot;
     }
 };
+
+const Inspection = union(enum) {
+    admitted: AdmittedTool,
+    unavailable: ToolIssue,
+};
+
+/// Perform the one authoritative executable admission pass. The temporary
+/// PreparedTool proves the complete schema can be parsed and projected under
+/// the declared profile; only compact diagnostics survive in the Snapshot.
+fn inspectTool(
+    snapshot_allocator: std.mem.Allocator,
+    scratch_backing: std.mem.Allocator,
+    model_name: []const u8,
+    tool: *const canonical.Tool,
+) error{OutOfMemory}!Inspection {
+    if (tool.execution_mode == .task_required)
+        return .{ .unavailable = .task_required_unsupported };
+    var admission = try schema.prepareTool(scratch_backing, model_name, tool, .{});
+    return switch (admission) {
+        .unavailable => |issue| .{ .unavailable = .{ .schema = issue } },
+        .available => |*prepared| blk: {
+            defer prepared.deinit();
+            const diagnostics = snapshot_allocator.dupe(
+                schema.ProjectionDiagnostic,
+                prepared.diagnostics,
+            ) catch return error.OutOfMemory;
+            break :blk .{ .admitted = .{
+                .canonical = tool,
+                .model_name = model_name,
+                .diagnostics = diagnostics,
+            } };
+        },
+    };
+}
+
+/// Rebuild the provider projection only for a Session-selected admitted tool.
+/// A non-OOM disagreement means code or immutable data violated Catalog's
+/// admission invariant; it is never downgraded into a second admission pass.
+pub fn materializeAdmittedTool(
+    backing: std.mem.Allocator,
+    admitted: *const AdmittedTool,
+) MaterializeError!schema.PreparedTool {
+    const admission = schema.prepareTool(
+        backing,
+        admitted.model_name,
+        admitted.canonical,
+        .{},
+    ) catch return error.OutOfMemory;
+    return switch (admission) {
+        .unavailable => error.AdmissionInvariantViolation,
+        .available => |prepared| blk: {
+            if (!std.mem.eql(
+                schema.ProjectionDiagnostic,
+                prepared.diagnostics,
+                admitted.diagnostics,
+            )) {
+                var cleanup = prepared;
+                cleanup.deinit();
+                return error.AdmissionInvariantViolation;
+            }
+            break :blk prepared;
+        },
+    };
+}
+
+pub fn deriveModelName(
+    allocator: std.mem.Allocator,
+    namespace: []const u8,
+    binding: *const [32]u8,
+    tool_name: []const u8,
+) error{ OutOfMemory, InvalidSelection, ResourceLimit }![]u8 {
+    if (namespace.len == 0 or namespace.len > MAX_NAMESPACE_BYTES)
+        return error.InvalidSelection;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    // Public model names remain stable across the Revision 7 era addition.
+    hasher.update("agentcore-r6-mcp-model-tool\x00");
+    hasher.update(binding);
+    hasher.update(tool_name);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    const prefix = "mcp__";
+    const middle = "__";
+    const size = prefix.len + namespace.len + middle.len + 32;
+    if (size > MAX_MODEL_TOOL_NAME_BYTES) return error.ResourceLimit;
+    const result = allocator.alloc(u8, size) catch return error.OutOfMemory;
+    @memcpy(result[0..prefix.len], prefix);
+    @memcpy(result[prefix.len .. prefix.len + namespace.len], namespace);
+    const middle_start = prefix.len + namespace.len;
+    @memcpy(result[middle_start .. middle_start + middle.len], middle);
+    const hex = "0123456789abcdef";
+    for (digest[0..16], 0..) |byte, index| {
+        result[middle_start + middle.len + index * 2] = hex[byte >> 4];
+        result[middle_start + middle.len + index * 2 + 1] = hex[byte & 0x0f];
+    }
+    return result;
+}
 
 fn expiresAt(
     refreshed_at_ns: util_time.Nanos,
@@ -505,6 +658,7 @@ fn deriveIssueId(
     detail: []const u8,
 ) [32]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    // Stable identity domain; changing the ABI revision is not an issue key.
     hasher.update("agentcore-r6-mcp-catalog-issue\x00");
     hasher.update(binding);
     hashBytes(&hasher, tool_name orelse "");
@@ -526,15 +680,18 @@ fn validNamespace(value: []const u8, max_bytes: usize) bool {
 fn serverFingerprint(
     allocator: std.mem.Allocator,
     client: *const runtime.Client,
+    admitted_tools: []const AdmittedTool,
 ) error{OutOfMemory}![32]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    // Stable domain; admitted contents, not the ABI revision, define change.
     hasher.update("agentcore-r6-mcp-server-catalog\x00");
     hasher.update(&client.binding);
     hasher.update(client.era.version());
-    const digests = allocator.alloc([32]u8, client.catalog.tools.len) catch
+    const digests = allocator.alloc([32]u8, admitted_tools.len) catch
         return error.OutOfMemory;
     defer allocator.free(digests);
-    for (client.catalog.tools, digests) |tool, *digest| {
+    for (admitted_tools, digests) |admitted, *digest| {
+        const tool = admitted.canonical;
         var tool_hasher = std.crypto.hash.sha2.Sha256.init(.{});
         hashBytes(&tool_hasher, tool.identity.name);
         tool_hasher.update(&tool.identity.schema_fingerprint);
@@ -549,6 +706,7 @@ fn serverFingerprint(
 
 fn snapshotFingerprint(servers: []const ServerRecord) [32]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    // Stable domain retained for unchanged Runtime catalog generations.
     hasher.update("agentcore-r6-mcp-runtime-catalog\x00");
     for (servers) |server| {
         hasher.update(&server.client.binding);
@@ -589,6 +747,8 @@ const Fake = struct {
     ttl_ms: u64 = 1000,
     tool_count: u8 = 1,
     paginate: bool = false,
+    required_task: bool = false,
+    fail_open_oom: bool = false,
 
     const Conn = struct { owner: *Fake };
 
@@ -598,6 +758,7 @@ const Fake = struct {
 
     fn open(raw: *anyopaque, _: runtime.ConnectionPurpose, _: canonical.Era) anyerror!runtime.OpenOutcome {
         const self: *Fake = @ptrCast(@alignCast(raw));
+        if (self.fail_open_oom) return error.OutOfMemory;
         const connection = try std.heap.c_allocator.create(Conn);
         connection.* = .{ .owner = self };
         self.opens += 1;
@@ -629,6 +790,12 @@ const Fake = struct {
                 try std.fmt.allocPrint(
                     allocator,
                     "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\"}}}}],\"nextCursor\":\"again\",\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
+                    .{ id, connection.owner.ttl_ms },
+                )
+            else if (connection.owner.required_task)
+                try std.fmt.allocPrint(
+                    allocator,
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"tasked\",\"inputSchema\":{{\"type\":\"object\"}},\"execution\":{{\"taskSupport\":\"required\"}}}}],\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
                     .{ id, connection.owner.ttl_ms },
                 )
             else if (connection.owner.tool_count == 1)
@@ -722,6 +889,44 @@ test "catalog refresh publishes generations while retained Run snapshot remains 
     try std.testing.expectEqual(@as(u8, 2), fake.closes);
 }
 
+test "catalog description uses an exact destination window for every server" {
+    var first = Fake{};
+    var second = Fake{};
+    const specs = [_]ServerSpec{
+        .{
+            .binding = [_]u8{0x17} ** 32,
+            .namespace = "first",
+            .connector = first.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+        .{
+            .binding = [_]u8{0x18} ** 32,
+            .namespace = "second",
+            .connector = second.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+    };
+    var manager = try Manager.init(std.testing.allocator, &specs, .{});
+    defer manager.deinit();
+    _ = try manager.refresh();
+
+    var description = try manager.describeCurrent(std.testing.allocator);
+    defer description.deinit();
+    try std.testing.expectEqual(@as(usize, 2), description.servers.len);
+    try std.testing.expectEqual(@as(usize, 2), description.tools.len);
+    for (description.servers, 0..) |server, index| {
+        try std.testing.expectEqual(@as(u64, 1), server.tool_count);
+        try std.testing.expectEqual(@as(u64, @intCast(index)), server.tool_offset);
+        try std.testing.expectEqualSlices(
+            u8,
+            &server.server_binding_identity,
+            &description.tools[index].server_binding_identity,
+        );
+    }
+}
+
 test "catalog freshness is clocked bounded and visible through description" {
     var fake = Fake{ .ttl_ms = 1000 };
     var clock = TestClock{ .now_ns = 10 * std.time.ns_per_s };
@@ -783,7 +988,28 @@ test "one server resource limit does not suppress unrelated catalog entries" {
     try std.testing.expectEqualStrings("healthy", description.servers[0].namespace);
     try std.testing.expectEqual(@as(usize, 1), description.tools.len);
     try std.testing.expectEqual(@as(usize, 1), description.issues.len);
-    try std.testing.expectEqualStrings("resource_limit", description.issues[0].kind);
+    try std.testing.expectEqualStrings("server_resource_limit", description.issues[0].kind);
+}
+
+test "Runtime-local allocation failure preserves the previous Snapshot" {
+    var fake = Fake{};
+    const binding = [_]u8{0x43} ** 32;
+    const specs = [_]ServerSpec{.{
+        .binding = binding,
+        .namespace = "stable",
+        .connector = fake.connector(),
+        .transport = .stdio,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    }};
+    var manager = try Manager.init(std.testing.allocator, &specs, .{});
+    defer manager.deinit();
+    try std.testing.expectEqual(@as(u64, 1), try manager.refresh());
+    fake.fail_open_oom = true;
+    try std.testing.expectError(error.OutOfMemory, manager.refresh());
+    const retained = try manager.retainCurrent();
+    defer retained.release();
+    try std.testing.expectEqual(@as(u64, 1), retained.generation);
+    try std.testing.expect(retained.findTool(&binding, "weather") != null);
 }
 
 test "catalog TTL policy supplies legacy default and caps modern duration" {
@@ -845,6 +1071,58 @@ test "catalog description resolves stable issue identity without live handles" {
     );
 }
 
+test "Catalog is the sole admission authority for schema and required-task tools" {
+    const fixture = @import("mcp_test_support.zig");
+    var invalid_schema = fixture.Server{
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"x\":{\"$ref\":\"#/$defs/x\"}}}",
+    };
+    var required_task = Fake{ .required_task = true };
+    const invalid_binding = [_]u8{0x51} ** 32;
+    const required_binding = [_]u8{0x52} ** 32;
+    const specs = [_]ServerSpec{
+        .{
+            .binding = invalid_binding,
+            .namespace = "invalid",
+            .connector = invalid_schema.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+        .{
+            .binding = required_binding,
+            .namespace = "tasked",
+            .connector = required_task.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+    };
+    var manager = try Manager.init(std.testing.allocator, &specs, .{});
+    defer manager.deinit();
+    _ = try manager.refresh();
+    const snapshot = try manager.retainCurrent();
+    defer snapshot.release();
+    try std.testing.expect(snapshot.findTool(&invalid_binding, "weather") == null);
+    const required_server = snapshot.findServer(&required_binding) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        canonical.ExecutionMode.task_required,
+        required_server.client.catalog.tools[0].execution_mode,
+    );
+    try std.testing.expect(snapshot.findTool(&required_binding, "tasked") == null);
+
+    var description = try snapshot.describe(std.testing.allocator);
+    defer description.deinit();
+    try std.testing.expectEqual(@as(usize, 0), description.tools.len);
+    try std.testing.expectEqual(@as(usize, 2), description.issues.len);
+    var saw_schema = false;
+    var saw_task = false;
+    for (description.issues) |issue| {
+        if (std.mem.eql(u8, issue.kind, "unsupported_reference")) saw_schema = true;
+        if (std.mem.eql(u8, issue.kind, "task_required_unsupported")) saw_task = true;
+    }
+    try std.testing.expect(saw_schema);
+    try std.testing.expect(saw_task);
+}
+
 test "catalog configuration rejects duplicate identity and unsafe namespace" {
     var fake = Fake{};
     const duplicate = [_]ServerSpec{
@@ -860,4 +1138,41 @@ test "catalog configuration rejects duplicate identity and unsafe namespace" {
         .client = .{ .name = "x", .version = "1" },
     }};
     try std.testing.expectError(error.InvalidConfig, Manager.init(std.testing.allocator, &unsafe, .{}));
+
+    var boundary_fake = Fake{};
+    const boundary_namespace = "abcdefghijklmnopqrstuvwx";
+    try std.testing.expectEqual(MAX_NAMESPACE_BYTES, boundary_namespace.len);
+    const boundary = [_]ServerSpec{.{
+        .binding = [_]u8{4} ** 32,
+        .namespace = boundary_namespace,
+        .connector = boundary_fake.connector(),
+        .transport = .stdio,
+        .client = .{ .name = "x", .version = "1" },
+    }};
+    var boundary_manager = try Manager.init(
+        std.testing.allocator,
+        &boundary,
+        .{ .max_namespace_bytes = MAX_NAMESPACE_BYTES + 8 },
+    );
+    defer boundary_manager.deinit();
+    try std.testing.expectEqual(@as(u64, 1), try boundary_manager.refresh());
+
+    const oversized_namespace = "abcdefghijklmnopqrstuvwxy";
+    try std.testing.expectEqual(MAX_NAMESPACE_BYTES + 1, oversized_namespace.len);
+    const oversized = [_]ServerSpec{.{
+        .binding = [_]u8{3} ** 32,
+        .namespace = oversized_namespace,
+        .connector = fake.connector(),
+        .transport = .stdio,
+        .client = .{ .name = "x", .version = "1" },
+    }};
+    try std.testing.expectError(
+        error.InvalidConfig,
+        Manager.init(
+            std.testing.allocator,
+            &oversized,
+            .{ .max_namespace_bytes = MAX_NAMESPACE_BYTES + 8 },
+        ),
+    );
+    try std.testing.expectEqual(@as(u8, 0), fake.opens);
 }

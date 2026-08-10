@@ -8,7 +8,7 @@ const runtime = @import("mcp_runtime.zig");
 const schema = @import("mcp_schema.zig");
 const session_permission = @import("session_permission.zig");
 
-pub const MAX_MODEL_TOOL_NAME_BYTES: usize = 64;
+pub const MAX_MODEL_TOOL_NAME_BYTES: usize = catalog.MAX_MODEL_TOOL_NAME_BYTES;
 
 pub const Selector = struct {
     server_binding_identity: [32]u8,
@@ -25,10 +25,12 @@ pub const Error = error{
     InvalidSelection,
     NotRefreshed,
     ResourceLimit,
+    AdmissionInvariantViolation,
 };
 
 pub const Entry = struct {
     server: *const catalog.ServerRecord,
+    admitted: *const catalog.AdmittedTool,
     tool: *const canonical.Tool,
     model_name: []const u8,
     prepared: schema.PreparedTool,
@@ -112,37 +114,30 @@ pub const View = struct {
                 continue;
             }
             if (selector.expected_schema_fingerprint) |expected| {
-                if (!std.mem.eql(u8, &expected, &resolved.tool.identity.schema_fingerprint)) {
+                if (!std.mem.eql(u8, &expected, &resolved.admitted.canonical.identity.schema_fingerprint)) {
                     if (mode == .fresh) return error.InvalidSelection;
                     invalidated += 1;
                     continue;
                 }
             }
-            const model_name = try deriveModelName(
-                a,
-                resolved.server.namespace,
-                &selector.server_binding_identity,
-                selector.tool_name,
-            );
+            const model_name = resolved.admitted.model_name;
             for (entries.items) |entry| if (std.mem.eql(u8, entry.model_name, model_name))
                 return error.InvalidSelection;
             // `arena` is moved by value into the returned View. A child arena
             // must therefore use the stable caller-provided backing allocator,
             // not `a`, whose allocator pointer refers to this stack-local arena
             // value before that move.
-            const admission = schema.prepareTool(backing, model_name, resolved.tool, .{}) catch
-                return error.OutOfMemory;
-            const prepared = switch (admission) {
-                .available => |value| value,
-                .unavailable => {
-                    if (mode == .fresh) return error.InvalidSelection;
-                    invalidated += 1;
-                    continue;
-                },
+            const prepared = catalog.materializeAdmittedTool(
+                backing,
+                resolved.admitted,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.AdmissionInvariantViolation => return error.AdmissionInvariantViolation,
             };
             entries.append(a, .{
                 .server = resolved.server,
-                .tool = resolved.tool,
+                .admitted = resolved.admitted,
+                .tool = resolved.admitted.canonical,
                 .model_name = model_name,
                 .prepared = prepared,
             }) catch {
@@ -464,28 +459,7 @@ pub fn deriveModelName(
     binding: *const [32]u8,
     tool_name: []const u8,
 ) Error![]u8 {
-    if (namespace.len == 0 or namespace.len > 24) return error.InvalidSelection;
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("agentcore-r6-mcp-model-tool\x00");
-    hasher.update(binding);
-    hasher.update(tool_name);
-    var digest: [32]u8 = undefined;
-    hasher.final(&digest);
-    const prefix = "mcp__";
-    const middle = "__";
-    const size = prefix.len + namespace.len + middle.len + 32;
-    if (size > MAX_MODEL_TOOL_NAME_BYTES) return error.ResourceLimit;
-    const result = allocator.alloc(u8, size) catch return error.OutOfMemory;
-    @memcpy(result[0..prefix.len], prefix);
-    @memcpy(result[prefix.len .. prefix.len + namespace.len], namespace);
-    const middle_start = prefix.len + namespace.len;
-    @memcpy(result[middle_start .. middle_start + middle.len], middle);
-    const hex = "0123456789abcdef";
-    for (digest[0..16], 0..) |byte, index| {
-        result[middle_start + middle.len + index * 2] = hex[byte >> 4];
-        result[middle_start + middle.len + index * 2 + 1] = hex[byte & 0x0f];
-    }
-    return result;
+    return catalog.deriveModelName(allocator, namespace, binding, tool_name);
 }
 
 fn selectionFingerprint(
@@ -508,6 +482,7 @@ fn selectionFingerprint(
         }
     }.lessThan);
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    // Must match mcp_checkpoint.zig and remain stable for R6MCP migration.
     hasher.update("agentcore-r6-mcp-session-selection\x00");
     for (digests) |digest| hasher.update(&digest);
     var result: [32]u8 = undefined;
@@ -661,6 +636,34 @@ test "Session MCP view never auto-selects wider Runtime authority" {
     try std.testing.expect(view.findCanonicalTool(&weather_binding, "weather") != null);
     try std.testing.expect(view.findCanonicalTool(&calendar_binding, "events") == null);
     try std.testing.expectEqual(@as(u32, 0), view.invalidated);
+}
+
+test "Session cannot select a Catalog-rejected tool and performs no call" {
+    const fixture = @import("mcp_test_support.zig");
+    var server = fixture.Server{
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"x\":{\"$ref\":\"#/$defs/x\"}}}",
+    };
+    const binding = [_]u8{0x67} ** 32;
+    const specs = [_]catalog.ServerSpec{.{
+        .binding = binding,
+        .namespace = "invalid",
+        .connector = server.connector(),
+        .transport = .stdio,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    }};
+    var manager = try catalog.Manager.init(std.testing.allocator, &specs, .{});
+    defer manager.deinit();
+    _ = try manager.refresh();
+    const snapshot = try manager.retainCurrent();
+    defer snapshot.release();
+    try std.testing.expectError(
+        error.InvalidSelection,
+        View.init(std.testing.allocator, snapshot, &.{.{
+            .server_binding_identity = binding,
+            .tool_name = "weather",
+        }}, .fresh),
+    );
+    try std.testing.expectEqual(@as(u32, 0), server.calls);
 }
 
 test "Session MCP view binds canonical identity validates before dispatch and retains its generation" {
@@ -902,7 +905,7 @@ test "MCP expiry excludes new Runs without mutating an admitted Run environment"
     try std.testing.expectEqual(@as(u32, 1), degraded.invalidated);
 }
 
-test "modern and legacy peers enter the same Session identity and dispatch seam" {
+test "all three protocol eras enter the same Session identity and dispatch seam" {
     const fixture = @import("mcp_test_support.zig");
     const negotiation = @import("mcp_negotiation.zig");
     const Exercise = struct {
@@ -992,16 +995,30 @@ test "modern and legacy peers enter the same Session identity and dispatch seam"
     };
 
     const modern_result = try Exercise.run(.modern_2026_07_28, .modern_only);
-    const legacy_result = try Exercise.run(.legacy_2025_11_25, .legacy_only);
+    const legacy_result = try Exercise.run(.classic_2025_11_25, .legacy_only);
+    const classic_06_result = try Exercise.run(
+        .classic_2025_06_18,
+        .legacy_2025_06_only,
+    );
     try std.testing.expectEqualStrings(
         modern_result.model_name[0..modern_result.model_name_len],
         legacy_result.model_name[0..legacy_result.model_name_len],
+    );
+    try std.testing.expectEqualStrings(
+        modern_result.model_name[0..modern_result.model_name_len],
+        classic_06_result.model_name[0..classic_06_result.model_name_len],
     );
     try std.testing.expectEqualSlices(
         u8,
         &modern_result.permission_binding,
         &legacy_result.permission_binding,
     );
+    try std.testing.expectEqualSlices(
+        u8,
+        &modern_result.permission_binding,
+        &classic_06_result.permission_binding,
+    );
     try std.testing.expectEqual(@as(u32, 1), modern_result.calls);
     try std.testing.expectEqual(@as(u32, 1), legacy_result.calls);
+    try std.testing.expectEqual(@as(u32, 1), classic_06_result.calls);
 }
