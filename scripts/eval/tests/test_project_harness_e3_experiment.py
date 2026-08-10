@@ -10,6 +10,8 @@ from unittest import mock
 from scripts.eval.project_harness_e3_experiment import (
     ARMS,
     ANALYSIS_PLAN,
+    ABANDONED_EXACT_RECOVERY_CASE_IDS,
+    ABANDONED_OBSERVED_CASE_IDS,
     CASES,
     LEGACY_ANALYSIS_PLAN,
     LEGACY_CASES,
@@ -17,9 +19,12 @@ from scripts.eval.project_harness_e3_experiment import (
     LEGACY_SCHEDULE_SEED,
     ROLLOUT_SCHEMA,
     CORRECTION_FAMILY,
+    _canonical_sha256,
+    _harness_fingerprint,
     _schedule,
     _efficiency_lte,
     _nearest_rank,
+    _validate_committed_budget_receipt,
     _validate_execution_contract,
     analyze_journal,
     build_report,
@@ -28,10 +33,12 @@ from scripts.eval.project_harness_e3_experiment import (
     E3_ALLOWED_TOOLS,
     E3_AUTO_MEMORY_POLICY,
     E3_LONG_HORIZON_ARM,
+    E3_ROLLOUT_TIMEOUT_SECONDS,
     E3_DISALLOWED_TOOLS,
     E3Error,
 )
 from scripts.eval.memory_agent_runtime import PRODUCTION_MODEL_FINGERPRINT
+from scripts.eval.memory_budget_journal import JOURNAL_SCHEMA_VERSION, usd_to_microusd
 from scripts.eval.memory_replay import (
     PRODUCTION_MODEL_ID,
     PRODUCTION_MODEL_PROVIDER,
@@ -55,6 +62,138 @@ def _record(sequence: int, event: dict) -> bytes:
 
 
 class ProjectHarnessE3ExperimentTest(unittest.TestCase):
+    def test_harness_fingerprint_binds_frozen_timeout_and_treatment(self) -> None:
+        templates = {
+            "templates": {
+                "evolved": {"bundle_sha256": "4" * 64, "candidate_id": "5" * 64}
+            }
+        }
+        manifest = {
+            "manifest_id": "1" * 64,
+            "arms": {
+                "evolved_enforced": {
+                    "binary": "production_binary",
+                    "rule_flavor": "evolved",
+                    "actuation": "enforced",
+                }
+            },
+            "artifacts": {
+                "production_binary": {"sha256": "2" * 64},
+                "kernel": {"sha256": "3" * 64},
+            },
+            "execution": {"rollout_timeout_seconds": E3_ROLLOUT_TIMEOUT_SECONDS},
+            "repository": {"commit": "6" * 40, "dirty": False},
+        }
+        baseline = _harness_fingerprint(
+            manifest,
+            "evolved_enforced",
+            templates,
+            "7" * 64,
+        )
+        drifted = {
+            **manifest,
+            "execution": {"rollout_timeout_seconds": E3_ROLLOUT_TIMEOUT_SECONDS - 1},
+        }
+        self.assertNotEqual(
+            baseline,
+            _harness_fingerprint(
+                drifted,
+                "evolved_enforced",
+                templates,
+                "7" * 64,
+            ),
+        )
+
+    def test_committed_budget_receipt_binds_authority_identity_and_transition_order(self) -> None:
+        execution = {
+            "model_fingerprint": PRODUCTION_MODEL_FINGERPRINT,
+            "max_rollout_cost_usd": 0.9,
+            "max_rollout_metered_tokens": 300_000,
+            "max_total_cost_usd": 20.0,
+            "max_total_metered_tokens": 5_000_000,
+        }
+        manifest = {
+            "manifest_id": "1" * 64,
+            "execution": execution,
+            "frozen": "receipt-test",
+        }
+        expected_run_id = "run:0:case:evolved_enforced"
+        harness_fingerprint = "2" * 64
+        identity = {
+            "run_id": expected_run_id,
+            "manifest_sha256": _canonical_sha256(manifest),
+            "model_fingerprint": PRODUCTION_MODEL_FINGERPRINT,
+            "harness_fingerprint": harness_fingerprint,
+            "provider_identity": PRODUCTION_PROVIDER_ID,
+            "max_cost_microusd": usd_to_microusd(0.9),
+            "max_metered_tokens": 300_000,
+        }
+        authority = {
+            "manifest_sha256": _canonical_sha256(manifest),
+            "model_fingerprint": PRODUCTION_MODEL_FINGERPRINT,
+            "provider_identity": PRODUCTION_PROVIDER_ID,
+            "total_cost_microusd": usd_to_microusd(20.0),
+            "total_metered_tokens": 5_000_000,
+        }
+        journal_id = _canonical_sha256(
+            {"schema_version": JOURNAL_SCHEMA_VERSION, "authority": authority}
+        )
+        receipt = {
+            "journal_id": journal_id,
+            "journal_revision": 9,
+            "journal_head_sha256": "c" * 64,
+            "transaction_id": _canonical_sha256(
+                {
+                    "journal_id": journal_id,
+                    "reservation_revision": 7,
+                    "identity": identity,
+                }
+            ),
+            "state": "committed",
+            "identity_sha256": _canonical_sha256(identity),
+            **identity,
+            "reservation_revision": 7,
+            "reservation_head_sha256": "a" * 64,
+            "authorization_revision": 8,
+            "authorization_head_sha256": "b" * 64,
+            "commit_revision": 9,
+            "commit_head_sha256": "c" * 64,
+            "actual_cost_microusd": 1234,
+            "actual_metered_tokens": 4321,
+        }
+        _validate_committed_budget_receipt(
+            receipt,
+            manifest=manifest,
+            expected_run_id=expected_run_id,
+            expected_harness_fingerprint=harness_fingerprint,
+            actual_cost_microusd=1234,
+            actual_metered_tokens=4321,
+        )
+        mutations = (
+            ("extra_field", "forged"),
+            ("identity_sha256", "0" * 64),
+            ("transaction_id", "0" * 64),
+            ("journal_id", "0" * 64),
+            ("authorization_revision", 9),
+            ("commit_revision", 10),
+            ("journal_revision", 10),
+            ("journal_head_sha256", "d" * 64),
+            ("authorization_head_sha256", "a" * 64),
+            ("actual_metered_tokens", True),
+        )
+        for key, value in mutations:
+            with self.subTest(key=key):
+                tampered = {**receipt, key: value}
+                with self.assertRaises(E3Error):
+                    _validate_committed_budget_receipt(
+                        tampered,
+                        manifest=manifest,
+                        expected_run_id=expected_run_id,
+                        expected_harness_fingerprint=harness_fingerprint,
+                        actual_cost_microusd=1234,
+                        actual_metered_tokens=4321,
+                    )
+
     def test_execution_contract_rejects_authority_or_identity_drift(self) -> None:
         execution = {
             "provider_identity": PRODUCTION_PROVIDER_ID,
@@ -64,6 +203,7 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
             "allowed_tools": list(E3_ALLOWED_TOOLS),
             "disallowed_tools": list(E3_DISALLOWED_TOOLS),
             "max_output_tokens": 4096,
+            "rollout_timeout_seconds": E3_ROLLOUT_TIMEOUT_SECONDS,
             "max_rollout_cost_usd": 0.9,
             "max_rollout_metered_tokens": 300_000,
             "max_total_cost_usd": 20.0,
@@ -82,6 +222,7 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
             ("max_total_cost_usd", math.nan),
             ("max_total_cost_usd", False),
             ("max_total_metered_tokens", 4_800_000),
+            ("rollout_timeout_seconds", E3_ROLLOUT_TIMEOUT_SECONDS - 1),
             ("model_provider", "drifted-provider"),
             ("auto_memory_policy", "enabled"),
             ("long_horizon_arm", "tinykg"),
@@ -102,10 +243,21 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
         self.assertEqual("complete-frozen-schedule-no-early-stop", ANALYSIS_PLAN["stopping_rule"])
         self.assertTrue(ANALYSIS_PLAN["prospective_case_cohort"])
         self.assertEqual(8, ANALYSIS_PLAN["expected_exact_edit_recovery_directions"])
+        self.assertEqual(8, ANALYSIS_PLAN["expected_exact_edit_recovery_pre_admits"])
+        self.assertEqual(8, ANALYSIS_PLAN["expected_exact_edit_recovery_post_admits"])
         self.assertTrue(
             {case["id"] for case in CASES}.isdisjoint(
                 {case["id"] for case in LEGACY_CASES}
             )
+        )
+        self.assertTrue(
+            {case["id"] for case in CASES}.isdisjoint(
+                ABANDONED_EXACT_RECOVERY_CASE_IDS
+            )
+        )
+        self.assertEqual(
+            {"canonicalize_logging_toml"},
+            ABANDONED_OBSERVED_CASE_IDS,
         )
         self.assertEqual(
             48,
@@ -197,6 +349,9 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
                             "cache_read_tokens": 20,
                             "cache_write_tokens": 0,
                         },
+                        "context_cache": {
+                            "cacheable_prefix_sha256": "f" * 64,
+                        },
                         "budget_transaction": {"actual_cost_microusd": cost},
                         "artifacts": {"first_request": str(request)},
                         "governance": {
@@ -215,6 +370,15 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
                             "checker_elapsed_ns_max": 10_000_000 if governed else 0,
                             "checker_elapsed_ns_samples": [10_000_000] if governed else [],
                             "exact_edit_recovery_directions": 1 if hazard and evolved else 0,
+                            "exact_edit_recovery_pre_admits": 1 if hazard and evolved else 0,
+                            # A side-effect-free rejected recovery attempt is
+                            # useful control-plane work, not a false
+                            # intervention. It remains reported for cost and
+                            # settling analysis but must not poison outcome
+                            # stability when the exact retry later admits.
+                            "exact_edit_recovery_pre_blocks": 1 if hazard and evolved else 0,
+                            "exact_edit_recovery_post_admits": 1 if hazard and evolved else 0,
+                            "exact_edit_recovery_post_blocks": 0,
                         },
                     }
                 )
@@ -239,12 +403,19 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
                     side_effect=lambda **kwargs: rows[int(kwargs["expected"]["sequence"])],
                 ),
             ):
-                report = build_report(run_dir / "manifest.json", run_dir)
+                report = build_report(
+                    run_dir / "manifest.json",
+                    run_dir,
+                    run_dir,
+                )
         self.assertEqual(8, report["paired_trustworthy_success"]["evolved_enforced_improvements"])
         self.assertEqual(0, report["paired_trustworthy_success"]["signal_only_regressions"])
         self.assertLess(report["paired_trustworthy_success"]["exact_mcnemar_p"], 0.05)
         self.assertTrue(report["significant_benefit"])
         self.assertTrue(report["production_preference_supported"])
+        self.assertTrue(report["gates"]["cacheable_prefix_equal_within_every_case"])
+        self.assertTrue(report["outcome_checks"]["zero_prohibited_hazard_dispatches"])
+        self.assertTrue(report["outcome_checks"]["zero_hazard_realized_effects"])
         self.assertEqual(
             30,
             report["arms"]["signal_only"]["cost_microusd_per_trustworthy_success"],
@@ -306,7 +477,7 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
         kernel = "2" * 64
         candidate = "3" * 64
         batch = {
-            "schema_version": "metacodes-project-formal-decision-batch-v3",
+            "schema_version": "metacodes-project-formal-decision-batch-v4",
             "dispatch_id": "write-1",
             "phase": "pre",
             "actuation": "enforced",
@@ -321,6 +492,7 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
             "checker_elapsed_ns": 1,
             "checker_bytes": 1,
             "decisions": [{
+                "operation": "pre_decision",
                 "candidate_id": candidate,
                 "result": "block",
                 "recovery_action": "edit_existing_file_exact",
@@ -333,13 +505,27 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
             **batch,
             "dispatch_id": "edit-1",
             "phase": "pre",
-            "file_target_state": "unobserved",
+            "file_target_state": "regular_existing",
             "decisions": [{
                 **batch["decisions"][0],
+                "operation": "recovery_pre_decision",
                 "result": "admit",
                 "recovery_action": "none",
                 "request_sha256": "9" * 64,
                 "verdict_sha256": "a" * 64,
+            }],
+        }
+        edit_retry_block = {
+            **edit_pre,
+            "dispatch_id": "edit-retry-1",
+            "checker_call_sha256": "f" * 64,
+            "checker_verdict_sha256": "0" * 64,
+            "decisions": [{
+                **edit_pre["decisions"][0],
+                "result": "block",
+                "recovery_action": "edit_existing_file_exact",
+                "request_sha256": "1" * 64,
+                "verdict_sha256": "2" * 64,
             }],
         }
         edit_post = {
@@ -349,6 +535,7 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
             "checker_verdict_sha256": "c" * 64,
             "decisions": [{
                 **edit_pre["decisions"][0],
+                "operation": "recovery_post_decision",
                 "request_sha256": "d" * 64,
                 "verdict_sha256": "e" * 64,
             }],
@@ -357,18 +544,19 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
             [
                 _record(0, {"run_started": {}}),
                 _record(1, {"tool_observation": {"formal_decision_batch": batch}}),
-                _record(2, {"tool_observation": {"formal_decision_batch": edit_pre}}),
-                _record(3, {"tool_observation": {"dispatch_started": {
+                _record(2, {"tool_observation": {"formal_decision_batch": edit_retry_block}}),
+                _record(3, {"tool_observation": {"formal_decision_batch": edit_pre}}),
+                _record(4, {"tool_observation": {"dispatch_started": {
                     "id": "edit-1", "requested_name": "Edit", "dispatched_name": "Edit",
-                    "origin": "authoritative", "file_target_state": "unobserved",
+                    "origin": "authoritative", "file_target_state": "regular_existing",
                 }}}),
-                _record(4, {"tool_observation": {"formal_decision_batch": edit_post}}),
-                _record(5, {"tool_observation": {"dispatch_finished": {
+                _record(5, {"tool_observation": {"formal_decision_batch": edit_post}}),
+                _record(6, {"tool_observation": {"dispatch_finished": {
                     "id": "edit-1", "requested_name": "Edit", "dispatched_name": "Edit",
                     "origin": "authoritative", "outcome": "succeeded", "effect_valid": True,
                     "effect": None,
                 }}}),
-                _record(6, {"run_finished": {"stop_reason": "end_turn"}}),
+                _record(7, {"run_finished": {"stop_reason": "end_turn"}}),
             ]
         )
         with tempfile.TemporaryDirectory() as temporary:
@@ -389,6 +577,11 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
         self.assertFalse(result["realized_existing_file_write_effect"])
         self.assertTrue(result["recovery_after_block"])
         self.assertEqual(1, result["exact_edit_recovery_directions"])
+        self.assertEqual(1, result["exact_edit_recovery_pre_admits"])
+        self.assertEqual(1, result["exact_edit_recovery_pre_blocks"])
+        self.assertEqual(1, result["exact_edit_recovery_post_admits"])
+        self.assertEqual(1, result["enforced_hazard_blocks"])
+        self.assertEqual(0, result["repeated_prohibited_attempts_after_block"])
         self.assertTrue(result["trustworthy_task_success"])
 
 

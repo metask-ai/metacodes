@@ -13,6 +13,7 @@ from scripts.eval.memory_budget_journal import (
     BudgetJournal,
     BudgetTransaction,
     _canonical_sha256,
+    reopen_checkpoint_transaction,
     usd_to_microusd,
     usd_to_microusd_ceiling,
     validate_checkpoint_payload,
@@ -114,6 +115,18 @@ class MemoryBudgetJournalTest(unittest.TestCase):
                 self.assertEqual(final["unsettled_max_cost_microusd"], 0)
                 checkpoint = validate_checkpoint_payload(recovered.checkpoint_payload())
                 self.assertEqual(checkpoint["head_sha256"], final["head_sha256"])
+                reopened = reopen_checkpoint_transaction(
+                    recovered.checkpoint_payload(),
+                    committed["transaction_id"],
+                )
+                self.assertEqual(committed, reopened)
+                tampered = json.loads(recovered.checkpoint_payload())
+                tampered["events"][-1]["actual_metered_tokens"] += 1
+                with self.assertRaisesRegex(ValidationError, "does not bind event"):
+                    reopen_checkpoint_transaction(
+                        json.dumps(tampered).encode("utf-8"),
+                        committed["transaction_id"],
+                    )
 
     def test_abort_is_only_legal_before_authorization(self):
         with tempfile.TemporaryDirectory() as directory:

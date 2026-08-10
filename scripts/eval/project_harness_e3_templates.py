@@ -54,6 +54,34 @@ else:
 SCHEMA = "metacodes-project-harness-e3-templates-v1"
 FLAVORS = ("static", "evolved")
 MAX_TEMPLATE_BYTES = 64 * 1024 * 1024
+KERNEL_PROVENANCE_SCHEMA = "metacodes-project-kernel-artifact-v4"
+KERNEL_PROVENANCE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "checker_version",
+        "request_schema",
+        "verdict_schema",
+        "batch_request_schema",
+        "batch_verdict_schema",
+        "max_batch_requests",
+        "binary_sha256",
+        "binary_bytes",
+        "kernel_source_sha256",
+        "rule_source_sha256",
+        "formal_kernel_source_sha256",
+        "main_source_sha256",
+        "axiom_audit_source_sha256",
+        "axiom_policy",
+        "axiom_audit",
+        "host_os",
+        "host_arch",
+        "linker",
+        "lean_version",
+        "native_smoke",
+        "native_batch_smoke",
+        "native_recovery_smoke",
+    }
+)
 EXPECTED_SPECS: Mapping[str, Mapping[str, Any]] = {
     "static": {
         "schema_version": "metacodes-project-rule-spec-v2",
@@ -80,6 +108,59 @@ EXPECTED_SPECS: Mapping[str, Mapping[str, Any]] = {
 
 class TemplateError(RuntimeError):
     """Fail-closed template setup error."""
+
+
+def _verified_kernel_artifact(repo: Path, kernel: Path) -> Dict[str, Any]:
+    """Bind the shipped checker to the exact Lean sources under study."""
+
+    repo = repo.resolve(strict=True)
+    kernel = kernel.resolve(strict=True)
+    provenance_path = Path(f"{kernel}.provenance.json")
+    provenance = _read_json(provenance_path)
+    binary_raw = _read_regular(kernel, MAX_TEMPLATE_BYTES)
+    expected_sources = {
+        "kernel_source_sha256": repo
+        / "control-plane/lean/MetaCodesControl/ProjectHarness.lean",
+        "rule_source_sha256": repo
+        / "control-plane/lean/MetaCodesControl/ProjectRule.lean",
+        "formal_kernel_source_sha256": repo
+        / "control-plane/lean/MetaCodesControl/FormalKernel.lean",
+        "main_source_sha256": repo / "control-plane/lean/ProjectHarnessMain.lean",
+        "axiom_audit_source_sha256": repo
+        / "control-plane/lean/ProjectHarnessAxiomAudit.lean",
+    }
+    if (
+        set(provenance) != KERNEL_PROVENANCE_FIELDS
+        or provenance.get("schema_version") != KERNEL_PROVENANCE_SCHEMA
+        or provenance.get("checker_version") != "metacodes-project-harness-kernel-v3"
+        or provenance.get("request_schema") != "metacodes-project-harness-request-v3"
+        or provenance.get("verdict_schema") != "metacodes-project-harness-verdict-v3"
+        or provenance.get("batch_request_schema")
+        != "metacodes-project-harness-batch-request-v3"
+        or provenance.get("batch_verdict_schema")
+        != "metacodes-project-harness-batch-verdict-v3"
+        or provenance.get("max_batch_requests") != 1024
+        or provenance.get("binary_sha256") != _sha256_bytes(binary_raw)
+        or provenance.get("binary_bytes") != len(binary_raw)
+        or provenance.get("axiom_policy") != "propext"
+        or provenance.get("axiom_audit") != "passed"
+        or provenance.get("native_smoke") != "passed"
+        or provenance.get("native_batch_smoke") != "passed"
+        or provenance.get("native_recovery_smoke") != "passed"
+        or not isinstance(provenance.get("lean_version"), str)
+        or not provenance["lean_version"]
+        or any(
+            provenance.get(field) != _sha256_file(source)
+            for field, source in expected_sources.items()
+        )
+    ):
+        raise TemplateError("project kernel provenance/source binding drift")
+    return {
+        "path": str(kernel),
+        "sha256": provenance["binary_sha256"],
+        "provenance_path": str(provenance_path),
+        "provenance_sha256": _sha256_file(provenance_path),
+    }
 
 
 def _run(
@@ -162,12 +243,14 @@ def _template_rules_relative(home: Path, rules_dir: Path) -> bool:
 
 def verify_templates(
     manifest_path: Path,
-    repo: Path | None = None,
+    repo: Path,
     *,
     require_clean: bool = True,
+    require_kernel_provenance: bool = True,
 ) -> Dict[str, Any]:
     """Reopen every E3 template identity before it can authorize a rollout."""
 
+    repo = repo.resolve(strict=True)
     manifest = _read_json(manifest_path)
     manifest_path = manifest_path.resolve(strict=True)
     if (
@@ -205,7 +288,7 @@ def verify_templates(
         raise TemplateError("template paid-rollout eligibility drift")
     if require_clean and repository["dirty"]:
         raise TemplateError("dirty repository cannot authorize a paid rollout")
-    if repo is not None and dict(_git_identity(repo.resolve(strict=True))) != dict(repository):
+    if dict(_git_identity(repo)) != dict(repository):
         raise TemplateError("template repository identity drift")
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, Mapping) or set(artifacts) != {"driver", "kernel", "lake", "builder"}:
@@ -216,6 +299,18 @@ def verify_templates(
         path = Path(str(item.get("path", "")))
         if not path.is_absolute() or _sha256_file(path) != _identity(item.get("sha256"), f"artifact.{name}"):
             raise TemplateError(f"template artifact identity drift: {name}")
+    if require_kernel_provenance:
+        kernel_artifact = _verified_kernel_artifact(
+            repo,
+            Path(str(artifacts["kernel"]["path"])),
+        )
+        if artifacts["kernel"] != kernel_artifact:
+            raise TemplateError("template kernel provenance identity drift")
+    elif set(artifacts["kernel"]) != {"path", "sha256"}:
+        # Historical manifests can be reopened only under their exact source
+        # commit.  They retain their original binary binding, but never gain a
+        # retroactive claim to the source-complete v4 provenance contract.
+        raise TemplateError("legacy template kernel artifact contract drift")
 
     templates = manifest.get("templates")
     if not isinstance(templates, Mapping) or set(templates) != set(FLAVORS):
@@ -459,7 +554,8 @@ def build_templates(
     os.chmod(root, 0o700)
     project = root / "workspace"
     project.mkdir(mode=0o700)
-    kernel_sha256 = _sha256_file(kernel)
+    kernel_artifact = _verified_kernel_artifact(repo, kernel)
+    kernel_sha256 = str(kernel_artifact["sha256"])
     templates = {
         flavor: _run_flavor(
             repo=repo,
@@ -492,7 +588,7 @@ def build_templates(
         "project_sha256": next(iter(project_ids)),
         "artifacts": {
             "driver": {"path": str(driver), "sha256": _sha256_file(driver)},
-            "kernel": {"path": str(kernel), "sha256": kernel_sha256},
+            "kernel": kernel_artifact,
             "lake": {"path": str(lake), "sha256": _sha256_file(lake)},
             "builder": {"path": str(builder), "sha256": _sha256_file(builder)},
         },

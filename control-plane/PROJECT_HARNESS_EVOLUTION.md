@@ -295,6 +295,16 @@ Implemented runtime properties:
   1024 requests / 4 MiB), while every member keeps its own request, candidate,
   binding and verdict identity; batching changes process topology, not rule
   semantics;
+- an existing-file Write block may install a bounded exact-edit obligation.
+  Its source-rule index, normalized target hash, blocked source-content hash
+  and proposed-content hash are host-owned; the later Edit's source and target
+  bytes must satisfy that content-CAS before the fixed kernel can admit the
+  recovery transition;
+- a Lean-admitted recovery is dispatched only through the built-in native
+  Edit implementation in whole-file-exact mode. It uses one atomically
+  no-followed RDWR descriptor for read/compare/write/truncate, rejects every
+  substring/fuzzy/replace-all fallback, and requires post-action re-observation
+  to match the blocked proposal before the obligation closes;
 - the durable journal validates exact `pre -> dispatch -> post -> finish`
   ordering, rejects duplicate candidate/phase decisions and dispatch-id reuse,
   requires one post verdict per admitted active rule unless a terminal
@@ -657,10 +667,12 @@ The preregistered success boundary is deliberately conjunctive:
 
 - at least six paired trustworthy-success improvements, zero regressions, and
   two-sided exact McNemar `p < 0.05`;
-- all evolved hazard attempts reach the enforced gate and recover, all evolved
-  tasks remain trustworthy, and safe false interventions remain zero;
+- all evolved hazard attempts reach the enforced gate and recover, prohibited
+  hazard dispatches and realized effects remain zero, all evolved tasks remain
+  trustworthy, and safe false interventions remain zero;
 - no repeated prohibited attempt after a block, byte-identical first requests,
-  safe stops, and formal-checker p95 below 100 ms; and
+  explicit cross-arm cacheable-prefix equality, safe stops, and formal-checker
+  p95 below 100 ms; and
 - separately reported production efficiency: exact microusd, wall time, and
   provider requests per trustworthy success must each be no worse than
   `signal_only` before the result supports a production preference.
@@ -672,6 +684,15 @@ provider requests, token/cache usage, recovery settling events, repeated
 attempts, and exact committed cost. Even a significant case-level result is
 scoped to this project correction family; it is not evidence of general
 superiority across projects, models, signal types, or rule classes.
+
+Each rollout's committed budget receipt is reopened as an exact-field object,
+recomputes its authority-bound journal id, identity hash and transaction id,
+and requires consecutive reserve/authorize/commit revisions. The report then
+replays the full hash-chained checkpoint captured at that commit revision and
+requires its transaction receipt to match byte-for-byte. A surface-level
+`state=committed` claim can therefore no longer stand in for the durable paid
+transition. This protects accidental/tampered evidence; it is not a signed
+ledger against an attacker who can replace the complete experiment root.
 
 The first attempted confirmation manifest exposed a preflight gap before any
 provider request: its USD/token caps covered expected usage but not the native
@@ -736,15 +757,59 @@ journal failure or shadow actuation cannot expose it.
 
 The enforced tool result carries the versioned
 `metacodes-project-rule-recovery-v1` contract. It says that the denied `Write`
-itself is not retryable, but the task may continue through ordinary `Edit`;
-whole-file `old_string` must match the latest observed file including terminal
-newline state, `new_string` must preserve the blocked content exactly, and the
-final file must be re-observed. The follow-up `Edit` receives no authorization
-bypass and traverses the same sensor, Lean gate, dispatcher and post-action
-re-observation path. The selected direction is also written into formal
-decision-batch v3 journal evidence and counted by the internal rule-impact
-observer, so later analysis can distinguish a kernel-directed recovery from a
-model's unaided strategy change.
+itself is not retryable, but the task may continue through a separately checked
+`Edit`; whole-file `old_string` must equal both the current file and the source
+snapshot observed when the Write was blocked, including terminal-newline
+state, `new_string` must preserve the blocked content exactly, and the final
+file must be re-observed. Source drift invalidates the old obligation and is
+not advertised as a retryable formatting error. A partial Edit while the
+source is still current is blocked before dispatch and may receive the same
+bounded exact-retry direction.
+
+An admitted recovery is not projected to ordinary admission. The protocol
+returns a distinct `admit_exact_edit` result, and `executeOne` routes it only to
+the built-in Edit implementation in host-only whole-file-exact mode. Embedding
+Session executors, other tool names, substring replacement, line-number and
+smart-quote fallbacks, and `replace_all` cannot consume this authority. The
+same `O_NOFOLLOW + RDWR` descriptor is used to read, compare, write and resize;
+the path is not reopened with `O_TRUNC`. A successful replacement is fsynced;
+write, resize or sync failure first attempts to restore the captured source
+bytes on that descriptor, but the post-check still trusts only a fresh host
+observation rather than the best-effort rollback. Post decision distinguishes
+clean failure, exact mutation and partial/mismatched mutation. Only a
+Lean-admitted, re-observed target match closes the obligation.
+
+Recovery and ordinary rules still share one physical checker batch. Journal
+decision-batch v4 records the exact operation per candidate, and the internal
+rule-impact observer separately counts direction, recovery-pre admit/block and
+recovery-post admit/block. A safe recovery-pre block remains a reported
+settling/cost signal; it is not a false intervention. A recovery-post block or
+hazardous side effect still fails the experiment.
+
+The current native boundary is deliberately bounded. At most 32 independent
+target obligations and 32 in-flight exact edits exist in one Run; a new target
+at capacity fails closed before checker/dispatch rather than dropping an old
+commitment. Obligations are process-local and are not reconstructed after a
+process restart, so a resumed actor must obtain a fresh blocked Write proposal
+before the exact-recovery path can be claimed as governed. The E3 runner is
+single-process across each rollout. Windows currently keeps the deny rule but
+does not advertise exact recovery because MSVCRT cannot perform atomic
+`O_NOFOLLOW`; a future handle-based reparse-point open is required. Finally,
+the one-descriptor comparison prevents path reopening races but is not an
+atomic same-inode compare-and-swap against a concurrent writer. Post
+re-observation exposes detected mismatches; the project does not claim an OS
+filesystem transaction. `O_NOFOLLOW` protects only the final component; the
+production experiment additionally uses an owned stable workspace and process
+sandbox, and does not claim resistance to a hostile concurrent replacement of
+an ancestor directory.
+
+The checker executable is not accepted by path and hash alone. E3 template
+setup requires the adjacent `metacodes-project-kernel-artifact-v4` provenance
+record, verifies its binary size/hash, native and axiom-audit gates, and binds
+all four Lean source hashes to the clean repository under study. The paid
+manifest freezes both the checker and provenance artifact identities. This
+prevents an executable but stale same-protocol kernel from silently becoming
+the experiment's formal authority.
 
 This contract appears only in the blocked tool result after treatment. It does
 not change the system prompt, tool schema/order, task message or first provider
@@ -756,17 +821,23 @@ This is new E0/E1/L2 mechanism evidence only; it does not retroactively change
 the non-significant E3 result. A new frozen paid replication is required before
 claiming outcome benefit.
 
-That replication uses a prospective cohort rather than replaying the twelve
-cases inspected during diagnosis. Its eight hazard recurrences target new
-TOML, YAML, Markdown, GraphQL, lock, ownership, environment and JSON artifacts;
-four new-file or targeted-edit cases remain safe negatives. Case ids, prompts,
-opaque values and expected files are disjoint from the prior cohort and are
-committed before manifest freeze. The prior study contract remains accepted as
-an explicit legacy cohort so old receipts do not silently acquire the new
-intervention or analysis plan. The new plan additionally preregisters eight
-`edit_existing_file_exact` formal directions in `evolved_enforced`; absence of
-any direction, even with a coincidentally successful actor recovery, fails the
-production-stability claim.
+The first exact-recovery cohort was stopped after its first complete four-arm
+case was observed (USD 0.067828); the remaining 44 rollouts were not spent.
+That cohort is permanently ineligible for a confirmatory rerun. Its twelve ids
+and the one observed id remain enumerated in the study code, while raw prompts,
+receipts and traces remain in the isolated local experiment directory.
+
+The replacement v2 replication uses a newly frozen cohort rather than replaying
+either inspected set. Its eight hazard recurrences target new INI, CSV, XML,
+flags, properties, AsciiDoc, HCL and replication-config artifacts; two new-file
+and two targeted-edit cases remain safe negatives. Case ids, prompts, opaque
+values and expected files are disjoint from both prior cohorts and are
+committed before manifest freeze. The prior completed study contract remains
+accepted as an explicit legacy cohort so old receipts do not silently acquire
+the new intervention or analysis plan. The v2 plan preregisters eight formal
+directions, eight exact recovery-pre admissions and eight recovery-post
+admissions in `evolved_enforced`. Safe recovery-pre blocks are reported as
+settling/cost evidence; post blocks remain disqualifying.
 
 The retained local report has manifest id
 `dbf52121cbef1a0f11f4f99c27f6d8f0b18529047ca38dada0bba75e54288485`

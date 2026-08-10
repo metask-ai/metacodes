@@ -59,6 +59,7 @@ if __package__ in {None, ""}:
     )
     from scripts.eval.model import stable_json  # type: ignore
     from scripts.eval.project_harness_e3_experiment import (  # type: ignore
+        ANALYSIS_PLAN,
         ARMS,
         E3_AUTO_MEMORY_POLICY,
         E3_LONG_HORIZON_ARM,
@@ -66,6 +67,7 @@ if __package__ in {None, ""}:
         E3_DISALLOWED_TOOLS,
         E3Error,
         _canonical_sha256,
+        _harness_fingerprint,
         _kernel_runtime_dependencies,
         _reopen_rollout_receipt,
         analyze_journal,
@@ -118,6 +120,7 @@ else:
     )
     from .model import stable_json
     from .project_harness_e3_experiment import (
+        ANALYSIS_PLAN,
         ARMS,
         E3_AUTO_MEMORY_POLICY,
         E3_LONG_HORIZON_ARM,
@@ -125,6 +128,7 @@ else:
         E3_DISALLOWED_TOOLS,
         E3Error,
         _canonical_sha256,
+        _harness_fingerprint,
         _kernel_runtime_dependencies,
         _reopen_rollout_receipt,
         analyze_journal,
@@ -262,36 +266,6 @@ def _environment_fingerprint(
             "auto_compact_policy": PRODUCTION_AUTO_COMPACT_POLICY,
             "auto_memory_policy": E3_AUTO_MEMORY_POLICY,
             "long_horizon_arm": E3_LONG_HORIZON_ARM,
-        }
-    )
-
-
-def _harness_fingerprint(
-    manifest: Mapping[str, Any],
-    arm: str,
-    templates: Mapping[str, Any],
-    ripgrep_sha256: str,
-) -> str:
-    config = manifest["arms"][arm]
-    flavor = config["rule_flavor"]
-    template = templates["templates"].get(flavor) if flavor is not None else None
-    binary = manifest["artifacts"][config["binary"]]
-    return _canonical_sha256(
-        {
-            "manifest_id": manifest["manifest_id"],
-            "arm": arm,
-            "binary_sha256": binary["sha256"],
-            "actuation": config["actuation"],
-            "rule_flavor": flavor,
-            "bundle_sha256": template["bundle_sha256"] if template else None,
-            "candidate_id": template["candidate_id"] if template else None,
-            "kernel_sha256": manifest["artifacts"]["kernel"]["sha256"],
-            "allowed_tools": list(E3_ALLOWED_TOOLS),
-            "disallowed_tools": list(E3_DISALLOWED_TOOLS),
-            "ripgrep_sha256": ripgrep_sha256,
-            "auto_memory_policy": E3_AUTO_MEMORY_POLICY,
-            "long_horizon_arm": E3_LONG_HORIZON_ARM,
-            "repository": manifest["repository"],
         }
     )
 
@@ -863,12 +837,13 @@ def run_paid(
     run_dir: Path,
     budget_path: Path,
     auth_file: Path,
-    timeout_seconds: int,
     resume: bool,
     max_rollouts: int | None = None,
 ) -> Mapping[str, Any]:
     repo = repo.resolve(strict=True)
     manifest = validate_manifest(manifest_path.resolve(strict=True), repo)
+    if manifest["analysis_plan"] != ANALYSIS_PLAN:
+        raise E3Error("historical E3 manifests are report-only")
     # Reject a malformed host-only pause control before creating a run
     # directory, opening the budget journal, or loading the credential.
     _rollout_window(manifest["schedule"], 0, max_rollouts)
@@ -923,7 +898,9 @@ def run_paid(
                     ripgrep_sha256=ripgrep_sha256,
                     api_key=api_key,
                     budget=budget,
-                    timeout_seconds=timeout_seconds,
+                    timeout_seconds=int(
+                        manifest["execution"]["rollout_timeout_seconds"]
+                    ),
                 )
                 completed.append(item)
                 budget_checkpoint = run_dir / f"budget-checkpoint-r{budget.snapshot()['revision']}.json"
@@ -945,7 +922,7 @@ def run_paid(
                 "checkpoint_sha256": _sha256_file(checkpoint),
                 "budget": budget.snapshot(),
             }
-        report = build_report(manifest_path, run_dir)
+        report = build_report(manifest_path, run_dir, repo)
         report_path = run_dir / "report.json"
         _write_new(report_path, (stable_json(report) + "\n").encode("utf-8"))
         return {
@@ -954,6 +931,9 @@ def run_paid(
             "rollouts": report["rollouts"],
             "quality_evidence": report["quality_evidence"],
             "significant_benefit": report["significant_benefit"],
+            "production_preference_supported": report[
+                "production_preference_supported"
+            ],
             "estimated_cost_usd": sum(
                 float(arm["estimated_cost_usd"]) for arm in report["arms"].values()
             ),
@@ -989,7 +969,6 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--run-dir", type=Path, required=True)
     run.add_argument("--budget-journal", type=Path, required=True)
     run.add_argument("--auth-file", type=Path, default=Path.home() / ".metacodes/auth.json")
-    run.add_argument("--timeout-seconds", type=int, default=300)
     run.add_argument(
         "--max-rollouts-this-invocation",
         type=int,
@@ -998,6 +977,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--allow-paid-rollouts", action="store_true")
     run.add_argument("--resume", action="store_true")
     report = sub.add_parser("report")
+    report.add_argument("--repo", type=Path, required=True)
     report.add_argument("--manifest", type=Path, required=True)
     report.add_argument("--run-dir", type=Path, required=True)
     return parser
@@ -1048,7 +1028,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
     if args.command == "report":
-        print(stable_json(build_report(args.manifest.resolve(strict=True), args.run_dir.resolve(strict=True))))
+        print(stable_json(build_report(
+            args.manifest.resolve(strict=True),
+            args.run_dir.resolve(strict=True),
+            args.repo.resolve(strict=True),
+        )))
         return 0
     if not args.allow_paid_rollouts:
         raise E3Error("paid E3 run requires --allow-paid-rollouts")
@@ -1059,7 +1043,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_dir=args.run_dir,
         budget_path=args.budget_journal,
         auth_file=args.auth_file,
-        timeout_seconds=args.timeout_seconds,
         resume=args.resume,
         max_rollouts=args.max_rollouts_this_invocation,
     )

@@ -463,6 +463,53 @@ def _replay_document(document: Mapping[str, Any]) -> Mapping[str, Any]:
     }
 
 
+def _transaction_receipt_from_state(
+    state: Mapping[str, Any],
+    transaction_id: str,
+) -> Mapping[str, Any]:
+    _require_hash(transaction_id, "budget transaction id")
+    current = state["transactions"].get(transaction_id)
+    if current is None:
+        _fail("budget transaction", "is unknown")
+    identity = current["identity"]
+    return {
+        "journal_id": state["journal_id"],
+        "journal_revision": state["revision"],
+        "journal_head_sha256": state["head_sha256"],
+        "transaction_id": transaction_id,
+        "state": current["state"],
+        "identity_sha256": current["identity_sha256"],
+        "run_id": identity["run_id"],
+        "manifest_sha256": identity["manifest_sha256"],
+        "model_fingerprint": identity["model_fingerprint"],
+        "harness_fingerprint": identity["harness_fingerprint"],
+        "provider_identity": identity["provider_identity"],
+        "max_cost_microusd": identity["max_cost_microusd"],
+        "max_metered_tokens": identity["max_metered_tokens"],
+        "reservation_revision": current["reservation_revision"],
+        "reservation_head_sha256": current["reservation_head_sha256"],
+        "authorization_revision": current["authorization_revision"],
+        "authorization_head_sha256": current["authorization_head_sha256"],
+        "commit_revision": current["commit_revision"],
+        "commit_head_sha256": current["commit_head_sha256"],
+        "actual_cost_microusd": current["actual_cost_microusd"],
+        "actual_metered_tokens": current["actual_metered_tokens"],
+    }
+
+
+def reopen_checkpoint_transaction(
+    payload: bytes,
+    transaction_id: str,
+) -> Mapping[str, Any]:
+    """Validate a durable journal checkpoint and reopen one exact receipt."""
+
+    if not payload or len(payload) > MAX_JOURNAL_BYTES:
+        _fail("budget checkpoint", "size is empty or exceeds the safety limit")
+    document = _unique_json(payload, "budget checkpoint")
+    state = _replay_document(document)
+    return _transaction_receipt_from_state(state, transaction_id)
+
+
 def validate_checkpoint_payload(payload: bytes) -> Mapping[str, Any]:
     """Validate an exported checkpoint and return its replayed public state."""
 
@@ -846,32 +893,9 @@ class BudgetJournal:
             _fail("budget journal CAS", "revision or head mismatch")
 
     def transaction_receipt(self, transaction_id: str) -> Mapping[str, Any]:
-        current = self._transaction(transaction_id)
+        self._transaction(transaction_id)
         assert self._state is not None
-        identity = current["identity"]
-        return {
-            "journal_id": self._state["journal_id"],
-            "journal_revision": self._state["revision"],
-            "journal_head_sha256": self._state["head_sha256"],
-            "transaction_id": transaction_id,
-            "state": current["state"],
-            "identity_sha256": current["identity_sha256"],
-            "run_id": identity["run_id"],
-            "manifest_sha256": identity["manifest_sha256"],
-            "model_fingerprint": identity["model_fingerprint"],
-            "harness_fingerprint": identity["harness_fingerprint"],
-            "provider_identity": identity["provider_identity"],
-            "max_cost_microusd": identity["max_cost_microusd"],
-            "max_metered_tokens": identity["max_metered_tokens"],
-            "reservation_revision": current["reservation_revision"],
-            "reservation_head_sha256": current["reservation_head_sha256"],
-            "authorization_revision": current["authorization_revision"],
-            "authorization_head_sha256": current["authorization_head_sha256"],
-            "commit_revision": current["commit_revision"],
-            "commit_head_sha256": current["commit_head_sha256"],
-            "actual_cost_microusd": current["actual_cost_microusd"],
-            "actual_metered_tokens": current["actual_metered_tokens"],
-        }
+        return _transaction_receipt_from_state(self._state, transaction_id)
 
     def transaction_receipts(self) -> Tuple[Mapping[str, Any], ...]:
         """Return every transaction in durable reservation order.

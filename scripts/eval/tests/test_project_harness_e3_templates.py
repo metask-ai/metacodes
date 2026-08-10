@@ -75,6 +75,10 @@ class ProjectHarnessE3TemplatesTest(unittest.TestCase):
                 result["templates"]["static"]["bundle_sha256"],
                 result["templates"]["evolved"]["bundle_sha256"],
             )
+            self.assertEqual(
+                Path(f"{kernel.resolve()}.provenance.json"),
+                Path(result["artifacts"]["kernel"]["provenance_path"]),
+            )
             verify_templates(manifest_path, repo, require_clean=False)
 
             static_rules = Path(result["templates"]["static"]["rules_dir"])
@@ -99,6 +103,27 @@ class ProjectHarnessE3TemplatesTest(unittest.TestCase):
             with self.assertRaises(TemplateError):
                 verify_templates(manifest_path, repo, require_clean=False)
             manifest_path.write_bytes(manifest_raw)
+
+            manifest = json.loads(manifest_raw)
+            manifest["artifacts"]["kernel"]["provenance_sha256"] = "0" * 64
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaises(TemplateError):
+                verify_templates(manifest_path, repo, require_clean=False)
+            manifest_path.write_bytes(manifest_raw)
+
+            legacy_manifest = json.loads(manifest_raw)
+            legacy_manifest["artifacts"]["kernel"] = {
+                "path": legacy_manifest["artifacts"]["kernel"]["path"],
+                "sha256": legacy_manifest["artifacts"]["kernel"]["sha256"],
+            }
+            legacy_path = root / "legacy-templates-manifest.json"
+            legacy_path.write_text(json.dumps(legacy_manifest), encoding="utf-8")
+            verify_templates(
+                legacy_path,
+                repo,
+                require_clean=False,
+                require_kernel_provenance=False,
+            )
 
             manifest_link = root / "templates-manifest-link.json"
             manifest_link.symlink_to(manifest_path)
