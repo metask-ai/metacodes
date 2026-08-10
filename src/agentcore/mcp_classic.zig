@@ -1,4 +1,4 @@
-//! MCP 2025-11-25 single-era compatibility adapter for Revision 6.
+//! MCP Classic adapter for 2025-11-25 and 2025-06-18 in Revision 7.
 //!
 //! This is external protocol interoperability only. It does not expose or
 //! restore any older AgentCore ABI revision.
@@ -25,9 +25,32 @@ const CallParamsDto = struct {
     arguments: std.json.Value,
 };
 
+pub const ClassicProfile = struct {
+    era: canonical.Era,
+    protocol_version: []const u8,
+    supports_task_metadata: bool,
+
+    pub fn forEra(era: canonical.Era) ?ClassicProfile {
+        return switch (era) {
+            .modern_2026_07_28 => null,
+            .classic_2025_11_25 => .{
+                .era = era,
+                .protocol_version = canonical.CLASSIC_2025_11_VERSION,
+                .supports_task_metadata = true,
+            },
+            .classic_2025_06_18 => .{
+                .era = era,
+                .protocol_version = canonical.CLASSIC_2025_06_VERSION,
+                .supports_task_metadata = false,
+            },
+        };
+    }
+};
+
 pub fn encodeInitializeRequest(
     allocator: std.mem.Allocator,
     id: u64,
+    profile: ClassicProfile,
     client: wire.ClientInfo,
     limits: canonical.Limits,
 ) canonical.Error![]u8 {
@@ -37,18 +60,18 @@ pub fn encodeInitializeRequest(
         .id = id,
         .method = "initialize",
         .params = InitializeParamsDto{
-            .protocolVersion = canonical.LEGACY_VERSION,
+            .protocolVersion = profile.protocol_version,
             .clientInfo = .{ .name = client.name, .version = client.version },
         },
     });
 }
 
-pub fn encodeInitializedNotification(allocator: std.mem.Allocator) canonical.Error![]u8 {
-    return stringify(allocator, .{
+pub fn encodeInitializedNotification(allocator: std.mem.Allocator) error{OutOfMemory}![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, .{
         .jsonrpc = wire.JSON_RPC_VERSION,
         .method = "notifications/initialized",
         .params = .{},
-    });
+    }, .{}) catch return error.OutOfMemory;
 }
 
 pub fn encodeListToolsRequest(
@@ -97,9 +120,10 @@ pub fn parseInitializeResponse(
     backing: std.mem.Allocator,
     encoded: []const u8,
     expected_id: u64,
+    requested_profile: ClassicProfile,
     limits: canonical.Limits,
 ) error{OutOfMemory}!canonical.Outcome(canonical.OwnedHandshake) {
-    var owned = canonical.OwnedHandshake.init(backing, .legacy_2025_11_25);
+    var owned = canonical.OwnedHandshake.init(backing, requested_profile.era);
     const allocator = owned.allocator();
     const envelope = try wire.parseEnvelope(allocator, encoded, expected_id, .initialize, limits);
     const result = switch (envelope) {
@@ -109,7 +133,7 @@ pub fn parseInitializeResponse(
         },
         .value => |value| value,
     };
-    if (wire.validateCompleteResult(result, .legacy_2025_11_25, .initialize, limits)) |diagnostic| {
+    if (wire.validateCompleteResult(result, requested_profile.era, .initialize, limits)) |diagnostic| {
         owned.deinit();
         return .{ .diagnostic = diagnostic };
     }
@@ -126,17 +150,20 @@ pub fn parseInitializeResponse(
         return .{ .diagnostic = canonical.Diagnostic.init(.missing_required_field, .initialize) };
     };
     if (version != .string or capabilities != .object or server_info != .object or
-        !std.mem.eql(u8, version.string, canonical.LEGACY_VERSION) or
         !validImplementation(server_info, limits))
     {
-        const code: canonical.DiagnosticCode = if (version == .string and
-            !std.mem.eql(u8, version.string, canonical.LEGACY_VERSION))
-            .unsupported_protocol_version
-        else
-            .invalid_field;
         owned.deinit();
-        return .{ .diagnostic = canonical.Diagnostic.init(code, .initialize) };
+        return .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .initialize) };
     }
+    const selected_era = canonical.Era.parseExact(version.string) orelse {
+        owned.deinit();
+        return .{ .diagnostic = canonical.Diagnostic.init(.unsupported_protocol_version, .initialize) };
+    };
+    if (selected_era == .modern_2026_07_28) {
+        owned.deinit();
+        return .{ .diagnostic = canonical.Diagnostic.init(.unsupported_protocol_version, .initialize) };
+    }
+    owned.era = selected_era;
     const versions = allocator.alloc([]const u8, 1) catch {
         owned.deinit();
         return error.OutOfMemory;
@@ -148,6 +175,13 @@ pub fn parseInitializeResponse(
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .diagnostic = mapCanonical(err, .initialize) };
     };
+    if (capabilities.object.get("tools")) |tools| {
+        if (tools != .object) {
+            owned.deinit();
+            return .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .initialize) };
+        }
+        owned.capabilities.tool_catalog_available = true;
+    }
     owned.server_info_json = canonical.encodeValue(allocator, server_info, limits.max_text_bytes) catch |err| {
         owned.deinit();
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -165,10 +199,11 @@ pub fn parseListToolsResponse(
     backing: std.mem.Allocator,
     encoded: []const u8,
     expected_id: u64,
+    profile: ClassicProfile,
     server_binding_identity: [32]u8,
     limits: canonical.Limits,
 ) error{OutOfMemory}!canonical.Outcome(canonical.OwnedCatalog) {
-    var owned = canonical.OwnedCatalog.init(backing, .legacy_2025_11_25);
+    var owned = canonical.OwnedCatalog.init(backing, profile.era);
     const allocator = owned.allocator();
     const envelope = try wire.parseEnvelope(allocator, encoded, expected_id, .tools_list, limits);
     const result = switch (envelope) {
@@ -178,7 +213,7 @@ pub fn parseListToolsResponse(
         },
         .value => |value| value,
     };
-    if (wire.validateCompleteResult(result, .legacy_2025_11_25, .tools_list, limits)) |diagnostic| {
+    if (wire.validateCompleteResult(result, profile.era, .tools_list, limits)) |diagnostic| {
         owned.deinit();
         return .{ .diagnostic = diagnostic };
     }
@@ -198,13 +233,17 @@ pub fn parseListToolsResponse(
         tools[index] = canonical.projectTool(
             allocator,
             tool_value,
-            .legacy_2025_11_25,
+            profile.era,
             server_binding_identity,
             limits,
         ) catch |err| {
             owned.deinit();
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return .{ .diagnostic = mapCanonical(err, .tools_list) };
+        };
+        tools[index].execution_mode = parseExecutionMode(tool_value, profile) catch {
+            owned.deinit();
+            return .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_list) };
         };
         for (tools[0..index]) |existing| {
             if (std.mem.eql(u8, existing.identity.name, tools[index].identity.name)) {
@@ -231,9 +270,10 @@ pub fn parseCallToolResponse(
     backing: std.mem.Allocator,
     encoded: []const u8,
     expected_id: u64,
+    profile: ClassicProfile,
     limits: canonical.Limits,
 ) error{OutOfMemory}!canonical.Outcome(canonical.OwnedCallResult) {
-    var owned = canonical.OwnedCallResult.init(backing, .legacy_2025_11_25);
+    var owned = canonical.OwnedCallResult.init(backing, profile.era);
     const allocator = owned.allocator();
     const envelope = try wire.parseEnvelope(allocator, encoded, expected_id, .tools_call, limits);
     const result = switch (envelope) {
@@ -243,7 +283,7 @@ pub fn parseCallToolResponse(
         },
         .value => |value| value,
     };
-    if (wire.validateCompleteResult(result, .legacy_2025_11_25, .tools_call, limits)) |diagnostic| {
+    if (wire.validateCompleteResult(result, profile.era, .tools_call, limits)) |diagnostic| {
         owned.deinit();
         return .{ .diagnostic = diagnostic };
     }
@@ -301,6 +341,21 @@ fn validImplementation(value: std.json.Value, limits: canonical.Limits) bool {
     return true;
 }
 
+fn parseExecutionMode(
+    tool: std.json.Value,
+    profile: ClassicProfile,
+) canonical.Error!canonical.ExecutionMode {
+    if (!profile.supports_task_metadata) return .ordinary;
+    const execution = tool.object.get("execution") orelse return .ordinary;
+    if (execution != .object) return error.InvalidValue;
+    const support = execution.object.get("taskSupport") orelse return .ordinary;
+    if (support != .string) return error.InvalidValue;
+    if (std.mem.eql(u8, support.string, "forbidden")) return .ordinary;
+    if (std.mem.eql(u8, support.string, "optional")) return .task_optional;
+    if (std.mem.eql(u8, support.string, "required")) return .task_required;
+    return error.InvalidValue;
+}
+
 fn stringify(allocator: std.mem.Allocator, value: anytype) canonical.Error![]u8 {
     return std.json.Stringify.valueAlloc(allocator, value, .{}) catch
         return error.OutOfMemory;
@@ -313,11 +368,12 @@ fn mapCanonical(err: canonical.Error, phase: canonical.Phase) canonical.Diagnost
     );
 }
 
-test "legacy lifecycle encodes exact 2025-11-25 initialize then initialized" {
+test "Classic lifecycle encodes the selected exact initialize then initialized" {
     const allocator = std.testing.allocator;
     const request = try encodeInitializeRequest(
         allocator,
         1,
+        ClassicProfile.forEra(.classic_2025_11_25).?,
         .{ .name = "agentcore", .version = "6" },
         .{},
     );
@@ -325,7 +381,7 @@ test "legacy lifecycle encodes exact 2025-11-25 initialize then initialized" {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, request, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings(
-        canonical.LEGACY_VERSION,
+        canonical.CLASSIC_2025_11_VERSION,
         parsed.value.object.get("params").?.object.get("protocolVersion").?.string,
     );
     try std.testing.expect(parsed.value.object.get("params").?.object.get("_meta") == null);
@@ -335,19 +391,49 @@ test "legacy lifecycle encodes exact 2025-11-25 initialize then initialized" {
     try std.testing.expect(std.mem.indexOf(u8, notification, "\"id\"") == null);
 }
 
-test "legacy initialize rejects every earlier protocol revision" {
+test "Classic initialize parser reports the selected known era without enforcing the request" {
     const response =
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{" ++
         "\"protocolVersion\":\"2025-06-18\",\"capabilities\":{}," ++
         "\"serverInfo\":{\"name\":\"old\",\"version\":\"1\"}}}";
-    const parsed = try parseInitializeResponse(std.testing.allocator, response, 1, .{});
-    try std.testing.expectEqual(
-        canonical.DiagnosticCode.unsupported_protocol_version,
-        parsed.diagnostic.code,
+    const parsed = try parseInitializeResponse(
+        std.testing.allocator,
+        response,
+        1,
+        ClassicProfile.forEra(.classic_2025_11_25).?,
+        .{},
     );
+    var handshake = switch (parsed) {
+        .value => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer handshake.deinit();
+    try std.testing.expectEqual(canonical.Era.classic_2025_06_18, handshake.era);
 }
 
-test "legacy tools list normalizes absent result type into canonical catalog" {
+test "Classic initialize rejects unknown and Modern selections" {
+    inline for (.{ "2024-11-05", canonical.MODERN_VERSION }) |version| {
+        const response = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"serverInfo\":{{\"name\":\"peer\",\"version\":\"1\"}}}}}}",
+            .{version},
+        );
+        defer std.testing.allocator.free(response);
+        const parsed = try parseInitializeResponse(
+            std.testing.allocator,
+            response,
+            1,
+            ClassicProfile.forEra(.classic_2025_11_25).?,
+            .{},
+        );
+        try std.testing.expectEqual(
+            canonical.DiagnosticCode.unsupported_protocol_version,
+            parsed.diagnostic.code,
+        );
+    }
+}
+
+test "Classic 2025-11 tools list classifies optional task execution" {
     const response =
         "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{" ++
         "\"tools\":[{\"name\":\"weather\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}}," ++
@@ -357,6 +443,7 @@ test "legacy tools list normalizes absent result type into canonical catalog" {
         std.testing.allocator,
         response,
         3,
+        ClassicProfile.forEra(.classic_2025_11_25).?,
         [_]u8{8} ** 32,
         .{},
     );
@@ -368,6 +455,43 @@ test "legacy tools list normalizes absent result type into canonical catalog" {
     try std.testing.expectEqual(@as(usize, 1), catalog.tools.len);
     try std.testing.expect(catalog.cache.ttl_ms == null);
     try std.testing.expect(catalog.tools[0].execution_json != null);
+    try std.testing.expectEqual(canonical.ExecutionMode.task_optional, catalog.tools[0].execution_mode);
+}
+
+test "Classic execution metadata is era-local and required tasks stay classified" {
+    const response =
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{" ++
+        "\"tools\":[{\"name\":\"tasked\",\"inputSchema\":{\"type\":\"object\"}," ++
+        "\"execution\":{\"taskSupport\":\"required\"}}]}}";
+    const parsed_11 = try parseListToolsResponse(
+        std.testing.allocator,
+        response,
+        7,
+        ClassicProfile.forEra(.classic_2025_11_25).?,
+        [_]u8{7} ** 32,
+        .{},
+    );
+    var catalog_11 = switch (parsed_11) {
+        .value => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer catalog_11.deinit();
+    try std.testing.expectEqual(.task_required, catalog_11.tools[0].execution_mode);
+
+    const parsed_06 = try parseListToolsResponse(
+        std.testing.allocator,
+        response,
+        7,
+        ClassicProfile.forEra(.classic_2025_06_18).?,
+        [_]u8{7} ** 32,
+        .{},
+    );
+    var catalog_06 = switch (parsed_06) {
+        .value => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer catalog_06.deinit();
+    try std.testing.expectEqual(.ordinary, catalog_06.tools[0].execution_mode);
 }
 
 test "legacy structured content remains object-only" {
@@ -375,6 +499,7 @@ test "legacy structured content remains object-only" {
         std.testing.allocator,
         "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"content\":[],\"structuredContent\":{\"ok\":true}}}",
         4,
+        ClassicProfile.forEra(.classic_2025_06_18).?,
         .{},
     );
     var result = switch (valid) {
@@ -386,6 +511,7 @@ test "legacy structured content remains object-only" {
         std.testing.allocator,
         "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"content\":[],\"structuredContent\":\"scalar\"}}",
         5,
+        ClassicProfile.forEra(.classic_2025_06_18).?,
         .{},
     );
     try std.testing.expectEqual(canonical.DiagnosticCode.invalid_field, invalid.diagnostic.code);

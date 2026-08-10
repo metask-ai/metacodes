@@ -1,4 +1,4 @@
-//! Revision 6 MCP protocol-era negotiation and disposable-probe ownership.
+//! Revision 7 MCP protocol-era negotiation and disposable-probe ownership.
 //!
 //! Transport implementations live in the later Runtime integration task.
 //! This module freezes the policy and lifecycle contract without importing the
@@ -11,6 +11,7 @@ pub const Policy = enum(u8) {
     auto,
     modern_only,
     legacy_only,
+    legacy_2025_06_only,
 };
 
 pub const Transport = enum(u8) {
@@ -30,6 +31,7 @@ pub const ProbeObservation = union(enum) {
     auth_error,
     server_error,
     malformed_response,
+    cancelled,
 };
 
 pub const RevalidatedProtocol = union(enum) {
@@ -62,23 +64,25 @@ pub fn selectFromProbe(
     observation: ProbeObservation,
 ) canonical.Outcome(canonical.Era) {
     if (policy == .legacy_only)
-        return .{ .value = .legacy_2025_11_25 };
+        return .{ .value = .classic_2025_11_25 };
+    if (policy == .legacy_2025_06_only)
+        return .{ .value = .classic_2025_06_18 };
 
     return switch (observation) {
         .discovered_versions => |versions| selectFromVersions(policy, versions),
         .method_not_found => if (policy == .auto)
-            .{ .value = .legacy_2025_11_25 }
+            .{ .value = .classic_2025_11_25 }
         else
             .{ .diagnostic = canonical.Diagnostic.init(.unsupported_protocol_version, .negotiation) },
         .timeout => if (policy == .auto and transport == .stdio)
-            .{ .value = .legacy_2025_11_25 }
+            .{ .value = .classic_2025_11_25 }
         else
             .{ .diagnostic = canonical.Diagnostic.init(
                 if (transport == .streamable_http) .downgrade_refused else .probe_failed,
                 .negotiation,
             ) },
         .child_exit => if (policy == .auto and transport == .stdio)
-            .{ .value = .legacy_2025_11_25 }
+            .{ .value = .classic_2025_11_25 }
         else
             .{ .diagnostic = canonical.Diagnostic.init(.probe_failed, .negotiation) },
         .network_error, .auth_error, .server_error => .{
@@ -87,7 +91,7 @@ pub fn selectFromProbe(
                 .negotiation,
             ),
         },
-        .malformed_response => .{
+        .malformed_response, .cancelled => .{
             .diagnostic = canonical.Diagnostic.init(.probe_failed, .negotiation),
         },
     };
@@ -98,11 +102,13 @@ pub fn selectFromVersions(
     versions: []const []const u8,
 ) canonical.Outcome(canonical.Era) {
     var has_modern = false;
-    var has_legacy = false;
+    var has_classic_11 = false;
+    var has_classic_06 = false;
     for (versions) |version| {
         switch (canonical.Era.parseExact(version) orelse continue) {
             .modern_2026_07_28 => has_modern = true,
-            .legacy_2025_11_25 => has_legacy = true,
+            .classic_2025_11_25 => has_classic_11 = true,
+            .classic_2025_06_18 => has_classic_06 = true,
         }
     }
     return switch (policy) {
@@ -110,14 +116,20 @@ pub fn selectFromVersions(
             .{ .value = .modern_2026_07_28 }
         else
             .{ .diagnostic = canonical.Diagnostic.init(.unsupported_protocol_version, .negotiation) },
-        .legacy_only => if (has_legacy)
-            .{ .value = .legacy_2025_11_25 }
+        .legacy_only => if (has_classic_11)
+            .{ .value = .classic_2025_11_25 }
+        else
+            .{ .diagnostic = canonical.Diagnostic.init(.unsupported_protocol_version, .negotiation) },
+        .legacy_2025_06_only => if (has_classic_06)
+            .{ .value = .classic_2025_06_18 }
         else
             .{ .diagnostic = canonical.Diagnostic.init(.unsupported_protocol_version, .negotiation) },
         .auto => if (has_modern)
             .{ .value = .modern_2026_07_28 }
-        else if (has_legacy)
-            .{ .value = .legacy_2025_11_25 }
+        else if (has_classic_11)
+            .{ .value = .classic_2025_11_25 }
+        else if (has_classic_06)
+            .{ .value = .classic_2025_06_18 }
         else
             .{ .diagnostic = canonical.Diagnostic.init(.unsupported_protocol_version, .negotiation) },
     };
@@ -130,7 +142,8 @@ pub fn negotiate(
 ) error{OutOfMemory}!canonical.Outcome(canonical.Era) {
     const selected: canonical.Era = switch (policy) {
         .modern_only => .modern_2026_07_28,
-        .legacy_only => .legacy_2025_11_25,
+        .legacy_only => .classic_2025_11_25,
+        .legacy_2025_06_only => .classic_2025_06_18,
         .auto => blk: {
             driver.start_probe_fn(driver.ctx, transport) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -165,22 +178,49 @@ pub fn negotiate(
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .diagnostic = canonical.Diagnostic.init(.connection_failed, .revalidation) };
     };
-    switch (actual) {
-        .known => |era| if (era != selected) {
-            driver.disconnect_fn(driver.ctx);
-            return .{ .diagnostic = canonical.Diagnostic.init(.era_revalidation_mismatch, .revalidation) };
-        },
+    const actual_era = switch (actual) {
+        .known => |era| era,
         .unsupported_revision => {
             driver.disconnect_fn(driver.ctx);
             return .{ .diagnostic = canonical.Diagnostic.init(.unsupported_protocol_version, .revalidation) };
         },
+    };
+    if (actual_era == selected) return .{ .value = selected };
+
+    // AUTO's Classic probe starts with the newest Classic era. A server may
+    // legally select 2025-06-18 from that initialize request. The first
+    // connection is never promoted: close it, reopen exact 2025-06-18 once,
+    // and accept only the second exact handshake.
+    if (policy == .auto and selected == .classic_2025_11_25 and
+        actual_era == .classic_2025_06_18)
+    {
+        driver.disconnect_fn(driver.ctx);
+        driver.connect_fn(driver.ctx, .classic_2025_06_18) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .diagnostic = canonical.Diagnostic.init(.connection_failed, .negotiation) };
+        };
+        const reopened = driver.revalidate_fn(driver.ctx, .classic_2025_06_18) catch |err| {
+            driver.disconnect_fn(driver.ctx);
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .diagnostic = canonical.Diagnostic.init(.connection_failed, .revalidation) };
+        };
+        switch (reopened) {
+            .known => |era| if (era == .classic_2025_06_18)
+                return .{ .value = .classic_2025_06_18 },
+            .unsupported_revision => {},
+        }
+        driver.disconnect_fn(driver.ctx);
+        return .{ .diagnostic = canonical.Diagnostic.init(.era_revalidation_mismatch, .revalidation) };
     }
-    return .{ .value = selected };
+    driver.disconnect_fn(driver.ctx);
+    return .{ .diagnostic = canonical.Diagnostic.init(.era_revalidation_mismatch, .revalidation) };
 }
 
 const FakeDriver = struct {
     observation: ProbeObservation,
     actual: RevalidatedProtocol,
+    revalidate_sequence: []const RevalidatedProtocol = &.{},
+    revalidate_index: usize = 0,
     fail_start: bool = false,
     fail_observe: bool = false,
     fail_connect: bool = false,
@@ -242,6 +282,11 @@ const FakeDriver = struct {
     fn revalidate(raw: ?*anyopaque, _: canonical.Era) DriverError!RevalidatedProtocol {
         const self = cast(raw);
         if (self.fail_revalidate or !self.actual_open) return error.TransportFailure;
+        if (self.revalidate_index < self.revalidate_sequence.len) {
+            const result = self.revalidate_sequence[self.revalidate_index];
+            self.revalidate_index += 1;
+            return result;
+        }
         return self.actual;
     }
 
@@ -256,10 +301,10 @@ const FakeDriver = struct {
 test "auto stdio uses disposable probe before opening a legacy connection" {
     var fake = FakeDriver{
         .observation = .timeout,
-        .actual = .{ .known = .legacy_2025_11_25 },
+        .actual = .{ .known = .classic_2025_11_25 },
     };
     const result = try negotiate(fake.interface(), .auto, .stdio);
-    try std.testing.expectEqual(canonical.Era.legacy_2025_11_25, result.value);
+    try std.testing.expectEqual(canonical.Era.classic_2025_11_25, result.value);
     try std.testing.expectEqual(@as(u8, 1), fake.probe_starts);
     try std.testing.expectEqual(@as(u8, 1), fake.probe_finishes);
     try std.testing.expectEqual(@as(u8, 1), fake.connects);
@@ -270,7 +315,7 @@ test "auto stdio uses disposable probe before opening a legacy connection" {
 test "HTTP timeout cannot trigger legacy downgrade" {
     var fake = FakeDriver{
         .observation = .timeout,
-        .actual = .{ .known = .legacy_2025_11_25 },
+        .actual = .{ .known = .classic_2025_11_25 },
     };
     const result = try negotiate(fake.interface(), .auto, .streamable_http);
     try std.testing.expectEqual(canonical.DiagnosticCode.downgrade_refused, result.diagnostic.code);
@@ -282,18 +327,97 @@ test "HTTP timeout cannot trigger legacy downgrade" {
 test "well formed MethodNotFound may select the one legacy era" {
     var fake = FakeDriver{
         .observation = .method_not_found,
-        .actual = .{ .known = .legacy_2025_11_25 },
+        .actual = .{ .known = .classic_2025_11_25 },
     };
     const result = try negotiate(fake.interface(), .auto, .streamable_http);
-    try std.testing.expectEqual(canonical.Era.legacy_2025_11_25, result.value);
-    try std.testing.expectEqual(canonical.Era.legacy_2025_11_25, fake.target.?);
+    try std.testing.expectEqual(canonical.Era.classic_2025_11_25, result.value);
+    try std.testing.expectEqual(canonical.Era.classic_2025_11_25, fake.target.?);
+}
+
+test "AUTO closes 2025-11 selection and reopens exact 2025-06 once" {
+    var fake = FakeDriver{
+        .observation = .method_not_found,
+        .actual = .{ .known = .classic_2025_06_18 },
+    };
+    const result = try negotiate(fake.interface(), .auto, .stdio);
+    try std.testing.expectEqual(canonical.Era.classic_2025_06_18, result.value);
+    try std.testing.expectEqual(@as(u8, 2), fake.connects);
+    try std.testing.expectEqual(@as(u8, 1), fake.disconnects);
+    try std.testing.expectEqual(canonical.Era.classic_2025_06_18, fake.target.?);
+    try std.testing.expect(fake.actual_open);
+}
+
+test "AUTO rejects a reopened connection that does not revalidate as exact 2025-06" {
+    const revalidations = [_]RevalidatedProtocol{
+        .{ .known = .classic_2025_06_18 },
+        .{ .known = .classic_2025_11_25 },
+    };
+    var fake = FakeDriver{
+        .observation = .method_not_found,
+        .actual = .unsupported_revision,
+        .revalidate_sequence = &revalidations,
+    };
+    const result = try negotiate(fake.interface(), .auto, .stdio);
+    try std.testing.expectEqual(
+        canonical.DiagnosticCode.era_revalidation_mismatch,
+        result.diagnostic.code,
+    );
+    try std.testing.expectEqual(@as(usize, 2), fake.revalidate_index);
+    try std.testing.expectEqual(@as(u8, 2), fake.connects);
+    try std.testing.expectEqual(@as(u8, 2), fake.disconnects);
+    try std.testing.expect(!fake.actual_open);
+}
+
+test "AUTO rejects an unsupported revision from the reopened 2025-06 connection" {
+    const revalidations = [_]RevalidatedProtocol{
+        .{ .known = .classic_2025_06_18 },
+        .unsupported_revision,
+    };
+    var fake = FakeDriver{
+        .observation = .method_not_found,
+        .actual = .{ .known = .classic_2025_06_18 },
+        .revalidate_sequence = &revalidations,
+    };
+    const result = try negotiate(fake.interface(), .auto, .stdio);
+    try std.testing.expectEqual(
+        canonical.DiagnosticCode.era_revalidation_mismatch,
+        result.diagnostic.code,
+    );
+    try std.testing.expectEqual(@as(usize, 2), fake.revalidate_index);
+    try std.testing.expectEqual(@as(u8, 2), fake.disconnects);
+    try std.testing.expect(!fake.actual_open);
+}
+
+test "exact 2025-06 policy skips probe and rejects a different selected era" {
+    var exact = FakeDriver{
+        .observation = .malformed_response,
+        .actual = .{ .known = .classic_2025_06_18 },
+    };
+    try std.testing.expectEqual(
+        canonical.Era.classic_2025_06_18,
+        (try negotiate(exact.interface(), .legacy_2025_06_only, .stdio)).value,
+    );
+    try std.testing.expectEqual(@as(u8, 0), exact.probe_starts);
+
+    var mismatch = FakeDriver{
+        .observation = .malformed_response,
+        .actual = .{ .known = .classic_2025_11_25 },
+    };
+    const failed = try negotiate(mismatch.interface(), .legacy_2025_06_only, .stdio);
+    try std.testing.expectEqual(
+        canonical.DiagnosticCode.era_revalidation_mismatch,
+        failed.diagnostic.code,
+    );
+    try std.testing.expectEqual(@as(u8, 0), mismatch.probe_starts);
+    try std.testing.expectEqual(@as(u8, 1), mismatch.connects);
+    try std.testing.expectEqual(@as(u8, 1), mismatch.disconnects);
 }
 
 test "real connection era mismatch fails without silent renegotiation" {
     const versions = [_][]const u8{canonical.MODERN_VERSION};
     var fake = FakeDriver{
         .observation = .{ .discovered_versions = &versions },
-        .actual = .{ .known = .legacy_2025_11_25 },
+        .actual = .{ .known = .classic_2025_11_25 },
     };
     const result = try negotiate(fake.interface(), .auto, .stdio);
     try std.testing.expectEqual(
@@ -307,19 +431,19 @@ test "real connection era mismatch fails without silent renegotiation" {
 }
 
 test "version selection prefers modern and rejects all older revisions" {
-    const both = [_][]const u8{ canonical.LEGACY_VERSION, canonical.MODERN_VERSION };
+    const both = [_][]const u8{ canonical.CLASSIC_2025_06_VERSION, canonical.CLASSIC_2025_11_VERSION, canonical.MODERN_VERSION };
     try std.testing.expectEqual(
         canonical.Era.modern_2026_07_28,
         selectFromVersions(.auto, &both).value,
     );
-    const old = [_][]const u8{ "2025-06-18", "2024-11-05" };
+    const old = [_][]const u8{"2024-11-05"};
     try std.testing.expectEqual(
         canonical.DiagnosticCode.unsupported_protocol_version,
         selectFromVersions(.auto, &old).diagnostic.code,
     );
     try std.testing.expectEqual(
         canonical.DiagnosticCode.unsupported_protocol_version,
-        selectFromVersions(.modern_only, &[_][]const u8{canonical.LEGACY_VERSION}).diagnostic.code,
+        selectFromVersions(.modern_only, &[_][]const u8{canonical.CLASSIC_2025_11_VERSION}).diagnostic.code,
     );
 }
 
@@ -335,10 +459,10 @@ test "explicit policies skip probing and still revalidate actual era" {
     try std.testing.expectEqual(@as(u8, 0), modern.probe_starts);
     var legacy = FakeDriver{
         .observation = .malformed_response,
-        .actual = .{ .known = .legacy_2025_11_25 },
+        .actual = .{ .known = .classic_2025_11_25 },
     };
     try std.testing.expectEqual(
-        canonical.Era.legacy_2025_11_25,
+        canonical.Era.classic_2025_11_25,
         (try negotiate(legacy.interface(), .legacy_only, .streamable_http)).value,
     );
     try std.testing.expectEqual(@as(u8, 0), legacy.probe_starts);
@@ -347,10 +471,10 @@ test "explicit policies skip probing and still revalidate actual era" {
 test "stdio child exit may select legacy and always closes the disposable probe" {
     var fake = FakeDriver{
         .observation = .child_exit,
-        .actual = .{ .known = .legacy_2025_11_25 },
+        .actual = .{ .known = .classic_2025_11_25 },
     };
     const result = try negotiate(fake.interface(), .auto, .stdio);
-    try std.testing.expectEqual(canonical.Era.legacy_2025_11_25, result.value);
+    try std.testing.expectEqual(canonical.Era.classic_2025_11_25, result.value);
     try std.testing.expectEqual(@as(u8, 1), fake.probe_starts);
     try std.testing.expectEqual(@as(u8, 1), fake.probe_finishes);
     try std.testing.expectEqual(@as(u8, 1), fake.connects);

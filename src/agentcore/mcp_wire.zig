@@ -1,4 +1,4 @@
-//! Shared strict JSON-RPC mechanics for the two Revision 6 MCP adapters.
+//! Shared strict JSON-RPC mechanics for Revision 7 MCP era adapters.
 
 const std = @import("std");
 const canonical = @import("mcp_canonical.zig");
@@ -217,5 +217,6 @@ test "modern complete result requires resultType after validating input required
         canonical.DiagnosticCode.missing_result_type,
         validateCompleteResult(missing.value, .modern_2026_07_28, .tools_call, .{}).?.code,
     );
-    try std.testing.expect(validateCompleteResult(missing.value, .legacy_2025_11_25, .tools_call, .{}) == null);
+    try std.testing.expect(validateCompleteResult(missing.value, .classic_2025_11_25, .tools_call, .{}) == null);
+    try std.testing.expect(validateCompleteResult(missing.value, .classic_2025_06_18, .tools_call, .{}) == null);
 }

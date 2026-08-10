@@ -1,4 +1,4 @@
-//! MCP 2026-07-28 adapter for AgentCore Revision 6.
+//! MCP 2026-07-28 adapter for AgentCore Revision 7.
 
 const std = @import("std");
 const canonical = @import("mcp_canonical.zig");
@@ -161,6 +161,9 @@ pub fn parseDiscoverResponse(
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .diagnostic = diagnostic };
     };
+    // Modern discovery itself authorizes the standard tools/list operation;
+    // its capability object is not the Classic initialize capability map.
+    owned.capabilities.tool_catalog_available = true;
     owned.instructions = canonical.optionalText(result.object, "instructions", limits.max_text_bytes) catch {
         owned.deinit();
         return .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .discovery) };
@@ -233,6 +236,10 @@ pub fn parseListToolsResponse(
             owned.deinit();
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return .{ .diagnostic = mapCanonical(err, .tools_list) };
+        };
+        tools[index].execution_mode = parseExecutionMode(tool_value) catch {
+            owned.deinit();
+            return .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_list) };
         };
         for (tools[0..index]) |existing| {
             if (std.mem.eql(u8, existing.identity.name, tools[index].identity.name)) {
@@ -326,6 +333,17 @@ fn requestMeta(client: wire.ClientInfo) RequestMetaDto {
             .version = client.version,
         },
     };
+}
+
+fn parseExecutionMode(tool: std.json.Value) canonical.Error!canonical.ExecutionMode {
+    const execution = tool.object.get("execution") orelse return .ordinary;
+    if (execution != .object) return error.InvalidValue;
+    const support = execution.object.get("taskSupport") orelse return .ordinary;
+    if (support != .string) return error.InvalidValue;
+    if (std.mem.eql(u8, support.string, "forbidden")) return .ordinary;
+    if (std.mem.eql(u8, support.string, "optional")) return .task_optional;
+    if (std.mem.eql(u8, support.string, "required")) return .task_required;
+    return error.InvalidValue;
 }
 
 fn stringify(allocator: std.mem.Allocator, value: anytype) canonical.Error![]u8 {

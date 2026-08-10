@@ -1,4 +1,4 @@
-//! Revision 6 MCP schema admission and provider projection.
+//! MCP schema admission and provider projection, introduced in Revision 6.
 //!
 //! Canonical MCP catalogs retain the complete wire schema in
 //! `mcp_canonical.Tool`. This module deliberately exposes a narrower,
@@ -559,7 +559,7 @@ fn spendScan(scan: *Scan, amount: usize, limits: Limits) bool {
     return true;
 }
 
-/// Revision 6 admits exact scalar literals only. Structural and numeric
+/// Admission accepts exact scalar literals only. Structural and numeric
 /// enum/const equality needs a larger canonical-number and budget contract;
 /// accepting it here would advertise validation semantics the Core lacks.
 fn supportedLiteral(value: std.json.Value) bool {

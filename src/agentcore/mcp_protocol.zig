@@ -1,11 +1,11 @@
-//! Single AgentCore-owned MCP canonical protocol seam for Revision 6.
+//! Single AgentCore-owned MCP canonical protocol seam for Revision 7.
 
 const std = @import("std");
 
 pub const canonical = @import("mcp_canonical.zig");
 pub const wire = @import("mcp_wire.zig");
 pub const modern = @import("mcp_modern.zig");
-pub const legacy = @import("mcp_legacy.zig");
+pub const classic = @import("mcp_classic.zig");
 pub const negotiation = @import("mcp_negotiation.zig");
 pub const schema = @import("mcp_schema.zig");
 pub const runtime = @import("mcp_runtime.zig");
@@ -38,10 +38,11 @@ test "dual era tool catalogs project the same executable identity" {
         .diagnostic => return error.TestUnexpectedResult,
     };
     defer modern_catalog.deinit();
-    const legacy_parsed = try legacy.parseListToolsResponse(
+    const legacy_parsed = try classic.parseListToolsResponse(
         std.testing.allocator,
         legacy_response,
         22,
+        classic.ClassicProfile.forEra(.classic_2025_11_25).?,
         binding,
         .{},
     );
@@ -86,10 +87,11 @@ test "dual era complete call results expose identical canonical content" {
         .diagnostic => return error.TestUnexpectedResult,
     };
     defer modern_result.deinit();
-    const legacy_parsed = try legacy.parseCallToolResponse(
+    const legacy_parsed = try classic.parseCallToolResponse(
         std.testing.allocator,
         legacy_response,
         32,
+        classic.ClassicProfile.forEra(.classic_2025_11_25).?,
         .{},
     );
     var legacy_result = switch (legacy_parsed) {
@@ -165,4 +167,21 @@ test "duplicate tool names are rejected in both eras" {
         .{},
     );
     try std.testing.expectEqual(canonical.DiagnosticCode.duplicate_tool, parsed.diagnostic.code);
+
+    const classic_response =
+        "{\"jsonrpc\":\"2.0\",\"id\":52,\"result\":{" ++
+        "\"tools\":[{\"name\":\"dup\",\"inputSchema\":{\"type\":\"object\"}}," ++
+        "{\"name\":\"dup\",\"inputSchema\":{\"type\":\"object\"}}]}}";
+    const classic_parsed = try classic.parseListToolsResponse(
+        std.testing.allocator,
+        classic_response,
+        52,
+        classic.ClassicProfile.forEra(.classic_2025_06_18).?,
+        [_]u8{2} ** 32,
+        .{},
+    );
+    try std.testing.expectEqual(
+        canonical.DiagnosticCode.duplicate_tool,
+        classic_parsed.diagnostic.code,
+    );
 }

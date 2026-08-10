@@ -60,8 +60,8 @@ pub const Server = struct {
         else if (std.mem.indexOf(u8, encoded, "initialize") != null)
             try std.fmt.allocPrint(
                 allocator,
-                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"agentcore-test\",\"version\":\"1\"}}}}}}",
-                .{id},
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"protocolVersion\":\"{s}\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"agentcore-test\",\"version\":\"1\"}}}}}}",
+                .{ id, self.era.version() },
             )
         else if (std.mem.indexOf(u8, encoded, "tools/list") != null)
             switch (self.era) {
@@ -70,7 +70,7 @@ pub const Server = struct {
                     "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"{s}\",\"inputSchema\":{s},\"outputSchema\":{s}}}],\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
                     .{ id, self.tool_name, self.input_schema_json, self.output_schema_json },
                 ),
-                .legacy_2025_11_25 => try std.fmt.allocPrint(
+                .classic_2025_11_25, .classic_2025_06_18 => try std.fmt.allocPrint(
                     allocator,
                     "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"tools\":[{{\"name\":\"{s}\",\"inputSchema\":{s},\"outputSchema\":{s}}}]}}}}",
                     .{ id, self.tool_name, self.input_schema_json, self.output_schema_json },
@@ -84,7 +84,7 @@ pub const Server = struct {
                     "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"content\":[],\"structuredContent\":{{\"ok\":true}}}}}}",
                     .{id},
                 ),
-                .legacy_2025_11_25 => try std.fmt.allocPrint(
+                .classic_2025_11_25, .classic_2025_06_18 => try std.fmt.allocPrint(
                     allocator,
                     "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"content\":[],\"structuredContent\":{{\"ok\":true}}}}}}",
                     .{id},

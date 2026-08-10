@@ -1,4 +1,4 @@
-//! AgentCore-owned canonical MCP protocol model for Revision 6.
+//! AgentCore-owned canonical MCP protocol model for Revision 7.
 //!
 //! The model is deliberately independent from the product `src/mcp` stack.
 //! Protocol-era adapters own wire differences; Runtime, Session, Permission
@@ -7,7 +7,8 @@
 const std = @import("std");
 
 pub const MODERN_VERSION = "2026-07-28";
-pub const LEGACY_VERSION = "2025-11-25";
+pub const CLASSIC_2025_11_VERSION = "2025-11-25";
+pub const CLASSIC_2025_06_VERSION = "2025-06-18";
 
 pub const Limits = struct {
     max_frame_bytes: usize = 8 * 1024 * 1024,
@@ -36,21 +37,25 @@ pub const Limits = struct {
 };
 
 pub const Era = enum(u8) {
-    modern_2026_07_28,
-    legacy_2025_11_25,
+    modern_2026_07_28 = 0,
+    classic_2025_11_25 = 1,
+    classic_2025_06_18 = 2,
 
     pub fn version(self: Era) []const u8 {
         return switch (self) {
             .modern_2026_07_28 => MODERN_VERSION,
-            .legacy_2025_11_25 => LEGACY_VERSION,
+            .classic_2025_11_25 => CLASSIC_2025_11_VERSION,
+            .classic_2025_06_18 => CLASSIC_2025_06_VERSION,
         };
     }
 
     pub fn parseExact(version_value: []const u8) ?Era {
         if (std.mem.eql(u8, version_value, MODERN_VERSION))
             return .modern_2026_07_28;
-        if (std.mem.eql(u8, version_value, LEGACY_VERSION))
-            return .legacy_2025_11_25;
+        if (std.mem.eql(u8, version_value, CLASSIC_2025_11_VERSION))
+            return .classic_2025_11_25;
+        if (std.mem.eql(u8, version_value, CLASSIC_2025_06_VERSION))
+            return .classic_2025_06_18;
         return null;
     }
 };
@@ -123,6 +128,21 @@ pub const CachePolicy = struct {
     scope: CacheScope,
 };
 
+/// Era adapters reduce wire capability shapes to state that AgentCore
+/// actually uses. Raw capability JSON is retained only for diagnostics.
+pub const CanonicalCapabilities = struct {
+    tool_catalog_available: bool,
+};
+
+/// AgentCore does not implement MCP Tasks in Revision 7. Optional task
+/// support remains callable as an ordinary request; required task execution
+/// is admitted into diagnostics but never into an executable catalog.
+pub const ExecutionMode = enum(u8) {
+    ordinary,
+    task_optional,
+    task_required,
+};
+
 pub const ToolIdentity = struct {
     server_binding_identity: [32]u8,
     name: []const u8,
@@ -133,6 +153,8 @@ pub const ToolIdentity = struct {
     /// intentionally absent.
     pub fn permissionBinding(self: ToolIdentity) [32]u8 {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        // Stable Revision 6 domain: era is provenance and must not churn the
+        // permission identity of an otherwise identical external Tool.
         hasher.update("agentcore-r6-mcp-tool-binding\x00");
         hasher.update(&self.server_binding_identity);
         hashBytes(&hasher, self.name);
@@ -157,6 +179,7 @@ pub const Tool = struct {
     icons_json: ?[]const u8,
     meta_json: ?[]const u8,
     execution_json: ?[]const u8,
+    execution_mode: ExecutionMode = .ordinary,
     raw_json: []const u8,
 };
 
@@ -165,6 +188,7 @@ pub const OwnedHandshake = struct {
     era: Era,
     supported_versions: []const []const u8,
     capabilities_json: []const u8,
+    capabilities: CanonicalCapabilities,
     server_info_json: ?[]const u8,
     instructions: ?[]const u8,
     cache: CachePolicy,
@@ -175,6 +199,7 @@ pub const OwnedHandshake = struct {
             .era = era,
             .supported_versions = &.{},
             .capabilities_json = "{}",
+            .capabilities = .{ .tool_catalog_available = false },
             .server_info_json = null,
             .instructions = null,
             .cache = .{ .ttl_ms = null, .scope = .private },
@@ -316,8 +341,8 @@ fn validateJsonValueAt(
 pub const SchemaMode = enum {
     modern_input,
     modern_output,
-    legacy_input,
-    legacy_output,
+    classic_input,
+    classic_output,
 };
 
 pub fn validateSchema(value: std.json.Value, mode: SchemaMode, limits: Limits) Error!void {
@@ -325,7 +350,7 @@ pub fn validateSchema(value: std.json.Value, mode: SchemaMode, limits: Limits) E
     try validateJsonValue(value, limits);
     const root_type = value.object.get("type");
     switch (mode) {
-        .modern_input, .legacy_input, .legacy_output => {
+        .modern_input, .classic_input, .classic_output => {
             const type_value = root_type orelse return error.InvalidValue;
             if (type_value != .string or !std.mem.eql(u8, type_value.string, "object"))
                 return error.InvalidValue;
@@ -350,6 +375,8 @@ pub fn schemaFingerprint(
     limits: Limits,
 ) Error![32]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    // Retained across Revision 7 so restored authority cannot drift merely
+    // because the ABI learned another exact protocol era.
     hasher.update("agentcore-r6-mcp-schema\x00");
     var nodes: u32 = 0;
     try hashJsonValue(allocator, &hasher, input_schema, 1, &nodes, limits);
@@ -381,14 +408,14 @@ pub fn projectTool(
         return error.InvalidValue;
     try validateSchema(
         input_schema,
-        if (era == .modern_2026_07_28) .modern_input else .legacy_input,
+        if (era == .modern_2026_07_28) .modern_input else .classic_input,
         limits,
     );
     const output_schema = value.object.get("outputSchema");
     if (output_schema) |schema| {
         try validateSchema(
             schema,
-            if (era == .modern_2026_07_28) .modern_output else .legacy_output,
+            if (era == .modern_2026_07_28) .modern_output else .classic_output,
             limits,
         );
     }
@@ -541,10 +568,10 @@ fn allZero(value: []const u8) bool {
     return true;
 }
 
-test "canonical era accepts only the two Revision 6 protocol versions" {
+test "canonical era accepts the three Revision 7 protocol versions" {
     try std.testing.expectEqual(Era.modern_2026_07_28, Era.parseExact(MODERN_VERSION).?);
-    try std.testing.expectEqual(Era.legacy_2025_11_25, Era.parseExact(LEGACY_VERSION).?);
-    try std.testing.expect(Era.parseExact("2025-06-18") == null);
+    try std.testing.expectEqual(Era.classic_2025_11_25, Era.parseExact(CLASSIC_2025_11_VERSION).?);
+    try std.testing.expectEqual(Era.classic_2025_06_18, Era.parseExact(CLASSIC_2025_06_VERSION).?);
     try std.testing.expect(Era.parseExact("2024-11-05") == null);
 }
 

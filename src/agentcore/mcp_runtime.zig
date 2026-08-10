@@ -1,4 +1,4 @@
-//! AgentCore-owned MCP transport lifecycle and dual-era client.
+//! AgentCore-owned MCP transport lifecycle and exact-era client.
 //!
 //! Host code supplies an opaque connector (and therefore owns credentials).
 //! AgentCore owns disposable negotiation probes, the real connection,
@@ -9,7 +9,7 @@ const std = @import("std");
 const sync = @import("platform").sync;
 const canonical = @import("mcp_canonical.zig");
 const modern = @import("mcp_modern.zig");
-const legacy = @import("mcp_legacy.zig");
+const classic = @import("mcp_classic.zig");
 const negotiation = @import("mcp_negotiation.zig");
 const wire = @import("mcp_wire.zig");
 const schema = @import("mcp_schema.zig");
@@ -154,6 +154,7 @@ pub const Client = struct {
     connection: Connection,
     mutex: sync.Mutex = .{},
     era: canonical.Era,
+    capabilities: canonical.CanonicalCapabilities,
     binding: [32]u8,
     client_info: wire.ClientInfo,
     timeout_ms: u32,
@@ -196,7 +197,7 @@ pub const Client = struct {
                 arguments_json,
                 self.limits,
             ),
-            .legacy_2025_11_25 => legacy.encodeCallToolRequest(
+            .classic_2025_11_25, .classic_2025_06_18 => classic.encodeCallToolRequest(
                 exchange_arena.allocator(),
                 request_id,
                 tool.identity.name,
@@ -230,10 +231,11 @@ pub const Client = struct {
                 request_id,
                 self.limits,
             ),
-            .legacy_2025_11_25 => legacy.parseCallToolResponse(
+            .classic_2025_11_25, .classic_2025_06_18 => classic.parseCallToolResponse(
                 result_allocator,
                 response,
                 request_id,
+                classic.ClassicProfile.forEra(self.era).?,
                 self.limits,
             ),
         } catch return .{ .failed = .out_of_memory };
@@ -276,6 +278,7 @@ const DriverState = struct {
     actual_connection: ?Connection = null,
     probe_observation: ?negotiation.ProbeObservation = null,
     probe_handshake: ?canonical.OwnedHandshake = null,
+    final_capabilities: ?canonical.CanonicalCapabilities = null,
     next_request_id: u64 = 1,
 
     fn driver(self: *DriverState) negotiation.Driver {
@@ -341,7 +344,8 @@ const DriverState = struct {
             .auth_error => return .auth_error,
             .server_error => return .server_error,
             .child_exit => return .child_exit,
-            .cancelled, .indeterminate => return .malformed_response,
+            .cancelled => return .cancelled,
+            .indeterminate => return .malformed_response,
         };
         const parsed = modern.parseDiscoverResponse(
             self.backing,
@@ -390,6 +394,7 @@ const DriverState = struct {
         var arena = std.heap.ArenaAllocator.init(self.backing);
         defer arena.deinit();
         const id = self.next_request_id;
+        if (id == std.math.maxInt(u64)) return error.ResourceLimit;
         self.next_request_id += 1;
         const request = switch (era) {
             .modern_2026_07_28 => modern.encodeDiscoverRequest(
@@ -398,9 +403,10 @@ const DriverState = struct {
                 self.config.client,
                 self.config.limits,
             ),
-            .legacy_2025_11_25 => legacy.encodeInitializeRequest(
+            .classic_2025_11_25, .classic_2025_06_18 => classic.encodeInitializeRequest(
                 arena.allocator(),
                 id,
+                classic.ClassicProfile.forEra(era).?,
                 self.config.client,
                 self.config.limits,
             ),
@@ -429,46 +435,58 @@ const DriverState = struct {
                 self.config.limits,
             ) catch return error.OutOfMemory) {
                 .value => |value| value,
-                .diagnostic => |diagnostic| return if (diagnostic.code == .unsupported_protocol_version)
+                .diagnostic => |diagnostic| return if (isUnsupportedRevision(diagnostic))
                     .unsupported_revision
                 else
                     error.TransportFailure,
             },
-            .legacy_2025_11_25 => switch (legacy.parseInitializeResponse(
+            .classic_2025_11_25, .classic_2025_06_18 => switch (classic.parseInitializeResponse(
                 self.backing,
                 response,
                 id,
+                classic.ClassicProfile.forEra(era).?,
                 self.config.limits,
             ) catch return error.OutOfMemory) {
                 .value => |value| value,
-                .diagnostic => |diagnostic| return if (diagnostic.code == .unsupported_protocol_version)
+                .diagnostic => |diagnostic| return if (isUnsupportedRevision(diagnostic))
                     .unsupported_revision
                 else
                     error.TransportFailure,
             },
         };
         defer handshake.deinit();
-        var selected: ?canonical.Era = null;
-        for (handshake.supported_versions) |version| {
-            const candidate = canonical.Era.parseExact(version) orelse continue;
-            if (candidate == era) selected = candidate;
-        }
-        if (selected == null) return .unsupported_revision;
-        if (era == .legacy_2025_11_25) {
-            const notification = legacy.encodeInitializedNotification(arena.allocator()) catch
-                return error.ResourceLimit;
+        const selected: canonical.Era = if (era == .modern_2026_07_28) blk: {
+            var matched = false;
+            for (handshake.supported_versions) |version| {
+                if (canonical.Era.parseExact(version)) |candidate| {
+                    if (candidate == era) matched = true;
+                }
+            }
+            if (!matched) return .unsupported_revision;
+            break :blk era;
+        } else handshake.era;
+        if (selected != era) return .{ .known = selected };
+        if (era != .modern_2026_07_28) {
+            const notification = try classic.encodeInitializedNotification(arena.allocator());
             connection.notify(notification, self.config.timeout_ms, .{}) catch
                 return error.TransportFailure;
         }
-        return .{ .known = selected.? };
+        self.final_capabilities = handshake.capabilities;
+        return .{ .known = selected };
     }
 
     fn disconnectActual(raw: ?*anyopaque) void {
         const self = cast(raw);
         if (self.actual_connection) |connection| connection.close();
         self.actual_connection = null;
+        self.final_capabilities = null;
     }
 };
+
+fn isUnsupportedRevision(diagnostic: canonical.Diagnostic) bool {
+    return diagnostic.code == .unsupported_protocol_version or
+        diagnostic.code == .method_not_found;
+}
 
 pub fn connectServer(backing: std.mem.Allocator, config: Config) ConnectOutcome {
     config.limits.validate() catch return .{ .failed = .resource_limit };
@@ -487,15 +505,22 @@ pub fn connectServer(backing: std.mem.Allocator, config: Config) ConnectOutcome 
     const connection = state.actual_connection orelse
         return .{ .failed = .{ .diagnostic = canonical.Diagnostic.init(.connection_failed, .negotiation) } };
     state.actual_connection = null;
-    var catalog = listAllTools(backing, connection, &state, era) catch |err| {
+    const capabilities = state.final_capabilities orelse {
         connection.close();
-        return .{ .failed = switch (err) {
-            error.OutOfMemory => .out_of_memory,
-            error.ResourceLimit => .resource_limit,
-            error.ProtocolFailure => .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_list) },
-            error.TransportFailure => .{ .diagnostic = canonical.Diagnostic.init(.connection_failed, .tools_list) },
-        } };
+        return .{ .failed = .{ .diagnostic = canonical.Diagnostic.init(.era_revalidation_mismatch, .revalidation) } };
     };
+    var catalog = if (capabilities.tool_catalog_available)
+        listAllTools(backing, connection, &state, era) catch |err| {
+            connection.close();
+            return .{ .failed = switch (err) {
+                error.OutOfMemory => .out_of_memory,
+                error.ResourceLimit => .resource_limit,
+                error.ProtocolFailure => .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_list) },
+                error.TransportFailure => .{ .diagnostic = canonical.Diagnostic.init(.connection_failed, .tools_list) },
+            } };
+        }
+    else
+        canonical.OwnedCatalog.init(backing, era);
     const client = backing.create(Client) catch {
         catalog.deinit();
         connection.close();
@@ -521,6 +546,7 @@ pub fn connectServer(backing: std.mem.Allocator, config: Config) ConnectOutcome 
         .arena = arena,
         .connection = connection,
         .era = era,
+        .capabilities = capabilities,
         .binding = config.server_binding_identity,
         .client_info = .{ .name = name, .version = version },
         .timeout_ms = config.timeout_ms,
@@ -560,7 +586,7 @@ fn listAllTools(
                 cursor,
                 state.config.limits,
             ),
-            .legacy_2025_11_25 => legacy.encodeListToolsRequest(
+            .classic_2025_11_25, .classic_2025_06_18 => classic.encodeListToolsRequest(
                 exchange_arena.allocator(),
                 id,
                 cursor,
@@ -588,10 +614,11 @@ fn listAllTools(
                 .value => |value| value,
                 .diagnostic => return error.ProtocolFailure,
             },
-            .legacy_2025_11_25 => switch (legacy.parseListToolsResponse(
+            .classic_2025_11_25, .classic_2025_06_18 => switch (classic.parseListToolsResponse(
                 backing,
                 response,
                 id,
+                classic.ClassicProfile.forEra(era).?,
                 state.config.server_binding_identity,
                 state.config.limits,
             ) catch return error.OutOfMemory) {
@@ -609,7 +636,7 @@ fn listAllTools(
                 .allocate = .alloc_always,
                 .duplicate_field_behavior = .@"error",
             }) catch return error.ProtocolFailure;
-            const copied = canonical.projectTool(
+            var copied = canonical.projectTool(
                 a,
                 value,
                 era,
@@ -620,6 +647,7 @@ fn listAllTools(
                 error.ResourceLimit => error.ResourceLimit,
                 error.InvalidValue => error.ProtocolFailure,
             };
+            copied.execution_mode = tool.execution_mode;
             tools.append(a, copied) catch return error.OutOfMemory;
         }
         combined.cache = conservativeCache(combined.cache, page.cache, pages == 1);
@@ -656,10 +684,14 @@ fn allZero(value: []const u8) bool {
 
 const FakeConnector = struct {
     era: canonical.Era,
+    advertise_tools: bool = true,
+    advertise_tools_2025_11: ?bool = null,
+    advertise_tools_2025_06: ?bool = null,
     indeterminate_call: bool = false,
     business_error: bool = false,
     input_required_once: bool = false,
     typed_content: bool = false,
+    optional_task: bool = false,
     paginate_tools: bool = false,
     list_requests: u8 = 0,
     saw_second_page_cursor: bool = false,
@@ -671,6 +703,7 @@ const FakeConnector = struct {
     const FakeConnection = struct {
         owner: *FakeConnector,
         purpose: ConnectionPurpose,
+        requested_era: canonical.Era,
         closed: bool = false,
     };
 
@@ -678,10 +711,14 @@ const FakeConnector = struct {
         return .{ .ctx = self, .open_fn = open };
     }
 
-    fn open(raw: *anyopaque, purpose: ConnectionPurpose, _: canonical.Era) anyerror!OpenOutcome {
+    fn open(raw: *anyopaque, purpose: ConnectionPurpose, requested_era: canonical.Era) anyerror!OpenOutcome {
         const self: *FakeConnector = @ptrCast(@alignCast(raw));
         const connection = try std.heap.c_allocator.create(FakeConnection);
-        connection.* = .{ .owner = self, .purpose = purpose };
+        connection.* = .{
+            .owner = self,
+            .purpose = purpose,
+            .requested_era = requested_era,
+        };
         self.opens += 1;
         return .{ .connection = .{
             .ctx = connection,
@@ -705,16 +742,24 @@ const FakeConnector = struct {
             return .indeterminate;
         const id = requestId(encoded) orelse return .server_error;
         const response = if (std.mem.indexOf(u8, encoded, "server/discover") != null)
-            try std.fmt.allocPrint(
+            if (self.era == .modern_2026_07_28) try std.fmt.allocPrint(
                 allocator,
                 "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{{}},\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
+                .{id},
+            ) else try std.fmt.allocPrint(
+                allocator,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"error\":{{\"code\":-32601,\"message\":\"Method not found\"}}}}",
                 .{id},
             )
         else if (std.mem.indexOf(u8, encoded, "initialize") != null)
             try std.fmt.allocPrint(
                 allocator,
-                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{}},\"serverInfo\":{{\"name\":\"fake\",\"version\":\"1\"}}}}}}",
-                .{id},
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"protocolVersion\":\"{s}\",\"capabilities\":{s},\"serverInfo\":{{\"name\":\"fake\",\"version\":\"1\"}}}}}}",
+                .{
+                    id,
+                    self.era.version(),
+                    if (self.advertisesTools(connection.requested_era)) "{\"tools\":{}}" else "{}",
+                },
             )
         else if (std.mem.indexOf(u8, encoded, "tools/list") != null)
             if (self.era == .modern_2026_07_28 and self.paginate_tools) blk: {
@@ -734,18 +779,25 @@ const FakeConnector = struct {
                     "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"alerts\",\"inputSchema\":{{\"type\":\"object\"}}}}],\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
                     .{id},
                 );
-            } else if (self.era == .modern_2026_07_28)
-                try std.fmt.allocPrint(
+            } else if (self.era == .modern_2026_07_28) blk: {
+                self.list_requests += 1;
+                break :blk try std.fmt.allocPrint(
                     allocator,
                     "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"city\":{{\"type\":\"string\"}}}},\"required\":[\"city\"]}},\"outputSchema\":{{\"type\":\"object\"}}}}],\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
                     .{id},
-                )
-            else
-                try std.fmt.allocPrint(
+                );
+            } else blk: {
+                self.list_requests += 1;
+                const execution = if (self.optional_task and self.era == .classic_2025_11_25)
+                    ",\"execution\":{\"taskSupport\":\"optional\"}"
+                else
+                    "";
+                break :blk try std.fmt.allocPrint(
                     allocator,
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"city\":{{\"type\":\"string\"}}}},\"required\":[\"city\"]}},\"outputSchema\":{{\"type\":\"object\"}}}}]}}}}",
-                    .{id},
-                )
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"city\":{{\"type\":\"string\"}}}},\"required\":[\"city\"]}},\"outputSchema\":{{\"type\":\"object\"}}{s}}}]}}}}",
+                    .{ id, execution },
+                );
+            }
         else if (std.mem.indexOf(u8, encoded, "tools/call") != null)
             if (self.input_required_once and self.era == .modern_2026_07_28) blk: {
                 self.input_required_once = false;
@@ -794,6 +846,14 @@ const FakeConnector = struct {
         connection.closed = true;
         connection.owner.closes += 1;
         std.heap.c_allocator.destroy(connection);
+    }
+
+    fn advertisesTools(self: *const FakeConnector, requested_era: canonical.Era) bool {
+        return switch (requested_era) {
+            .modern_2026_07_28 => self.advertise_tools,
+            .classic_2025_11_25 => self.advertise_tools_2025_11 orelse self.advertise_tools,
+            .classic_2025_06_18 => self.advertise_tools_2025_06 orelse self.advertise_tools,
+        };
     }
 
     fn requestId(encoded: []const u8) ?u64 {
@@ -859,8 +919,8 @@ test "modern tools list merges successful pages and conservative cache policy" {
     try std.testing.expectEqual(canonical.CacheScope.private, client.catalog.cache.scope);
 }
 
-test "legacy client performs initialized notification and indeterminate call is never replayed" {
-    var fake = FakeConnector{ .era = .legacy_2025_11_25, .indeterminate_call = true };
+test "Classic client performs initialized notification and indeterminate call is never replayed" {
+    var fake = FakeConnector{ .era = .classic_2025_11_25, .indeterminate_call = true };
     const connected = connectServer(std.testing.allocator, .{
         .connector = fake.connector(),
         .transport = .stdio,
@@ -883,6 +943,147 @@ test "legacy client performs initialized notification and indeterminate call is 
     );
     try std.testing.expect(called == .failed and called.failed == .indeterminate);
     try std.testing.expectEqual(before + 1, fake.requests);
+}
+
+test "Classic optional task metadata keeps ordinary tools call semantics" {
+    var fake = FakeConnector{
+        .era = .classic_2025_11_25,
+        .optional_task = true,
+    };
+    const connected = connectServer(std.testing.allocator, .{
+        .connector = fake.connector(),
+        .transport = .stdio,
+        .policy = .legacy_only,
+        .server_binding_identity = [_]u8{0x29} ** 32,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    });
+    const client = switch (connected) {
+        .client => |value| value,
+        .failed => return error.TestUnexpectedResult,
+    };
+    defer client.deinit();
+    try std.testing.expectEqual(
+        canonical.ExecutionMode.task_optional,
+        client.catalog.tools[0].execution_mode,
+    );
+
+    const before = fake.requests;
+    var called = client.callTool(
+        std.testing.allocator,
+        &client.catalog.tools[0],
+        "{\"city\":\"Paris\"}",
+        .{},
+    );
+    defer if (called == .result) called.result.deinit();
+    try std.testing.expect(called == .result);
+    try std.testing.expectEqual(before + 1, fake.requests);
+}
+
+test "AUTO promotes only the final exact 2025-06 connection" {
+    var fake = FakeConnector{ .era = .classic_2025_06_18 };
+    const connected = connectServer(std.testing.allocator, .{
+        .connector = fake.connector(),
+        .transport = .stdio,
+        .policy = .auto,
+        .server_binding_identity = [_]u8{0x26} ** 32,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    });
+    const client = switch (connected) {
+        .client => |value| value,
+        .failed => return error.TestUnexpectedResult,
+    };
+    defer client.deinit();
+    try std.testing.expectEqual(canonical.Era.classic_2025_06_18, client.era);
+    try std.testing.expect(client.capabilities.tool_catalog_available);
+    try std.testing.expectEqual(@as(u8, 3), fake.opens);
+    try std.testing.expectEqual(@as(u8, 2), fake.closes);
+    try std.testing.expectEqual(@as(u8, 1), fake.notifications);
+    try std.testing.expectEqual(@as(u8, 1), fake.list_requests);
+}
+
+test "AUTO publishes only capabilities from the final exact 2025-06 handshake" {
+    var fake = FakeConnector{
+        .era = .classic_2025_06_18,
+        .advertise_tools_2025_11 = true,
+        .advertise_tools_2025_06 = false,
+    };
+    const connected = connectServer(std.testing.allocator, .{
+        .connector = fake.connector(),
+        .transport = .stdio,
+        .policy = .auto,
+        .server_binding_identity = [_]u8{0x25} ** 32,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    });
+    const client = switch (connected) {
+        .client => |value| value,
+        .failed => return error.TestUnexpectedResult,
+    };
+    defer client.deinit();
+    try std.testing.expectEqual(canonical.Era.classic_2025_06_18, client.era);
+    try std.testing.expect(!client.capabilities.tool_catalog_available);
+    try std.testing.expectEqual(@as(usize, 0), client.catalog.tools.len);
+    try std.testing.expectEqual(@as(u8, 0), fake.list_requests);
+    try std.testing.expectEqual(@as(u8, 1), fake.notifications);
+}
+
+test "exact Modern policy classifies MethodNotFound as unsupported revision" {
+    var fake = FakeConnector{ .era = .classic_2025_11_25 };
+    const connected = connectServer(std.testing.allocator, .{
+        .connector = fake.connector(),
+        .transport = .stdio,
+        .policy = .modern_only,
+        .server_binding_identity = [_]u8{0x24} ** 32,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    });
+    try std.testing.expect(connected == .failed);
+    try std.testing.expectEqual(
+        canonical.DiagnosticCode.unsupported_protocol_version,
+        connected.failed.diagnostic.code,
+    );
+    try std.testing.expectEqual(@as(u8, 1), fake.opens);
+    try std.testing.expectEqual(@as(u8, 1), fake.closes);
+    try std.testing.expectEqual(@as(u8, 0), fake.list_requests);
+}
+
+test "exact 2025-11 policy does not accept a 2025-06 selection" {
+    var fake = FakeConnector{ .era = .classic_2025_06_18 };
+    const connected = connectServer(std.testing.allocator, .{
+        .connector = fake.connector(),
+        .transport = .stdio,
+        .policy = .legacy_only,
+        .server_binding_identity = [_]u8{0x27} ** 32,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    });
+    try std.testing.expect(connected == .failed);
+    try std.testing.expectEqual(
+        canonical.DiagnosticCode.era_revalidation_mismatch,
+        connected.failed.diagnostic.code,
+    );
+    try std.testing.expectEqual(@as(u8, 1), fake.opens);
+    try std.testing.expectEqual(@as(u8, 1), fake.closes);
+    try std.testing.expectEqual(@as(u8, 0), fake.list_requests);
+}
+
+test "Classic server without tools capability never receives tools list" {
+    var fake = FakeConnector{
+        .era = .classic_2025_11_25,
+        .advertise_tools = false,
+    };
+    const connected = connectServer(std.testing.allocator, .{
+        .connector = fake.connector(),
+        .transport = .stdio,
+        .policy = .legacy_only,
+        .server_binding_identity = [_]u8{0x28} ** 32,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    });
+    const client = switch (connected) {
+        .client => |value| value,
+        .failed => return error.TestUnexpectedResult,
+    };
+    defer client.deinit();
+    try std.testing.expect(!client.capabilities.tool_catalog_available);
+    try std.testing.expectEqual(@as(usize, 0), client.catalog.tools.len);
+    try std.testing.expectEqual(@as(u8, 0), fake.list_requests);
 }
 
 test "tool business error is preserved without success structuredContent" {
