@@ -306,7 +306,9 @@ Implemented runtime properties:
   substring/fuzzy/replace-all fallback, and requires post-action re-observation
   to match the blocked proposal before the obligation closes;
 - the durable journal validates exact `pre -> dispatch -> post -> finish`
-  ordering, rejects duplicate candidate/phase decisions and dispatch-id reuse,
+  ordering plus the explicit `denied Write generation -> recovery-pre
+  generation -> dispatched Edit` transition, rejects duplicate candidate/
+  operation/generation decisions and dispatch-id reuse,
   requires one post verdict per admitted active rule unless a terminal
   post block/fault short-circuits the conjunction, and permits the explicit
   `pre block/fault -> no dispatch` terminal path;
@@ -776,8 +778,14 @@ the path is not reopened with `O_TRUNC`. A successful replacement is fsynced;
 write, resize or sync failure first attempts to restore the captured source
 bytes on that descriptor, but the post-check still trusts only a fresh host
 observation rather than the best-effort rollback. Post decision distinguishes
-clean failure, exact mutation and partial/mismatched mutation. Only a
-Lean-admitted, re-observed target match closes the obligation.
+clean failure, exact mutation and partial/mismatched mutation. The
+`admit_exact_edit` capability is linear: once its real dispatch starts, both
+the in-flight entry and source-bound obligation are consumed on every outcome,
+including a clean failure, source race, post-checker fault or rejected final
+state. Only a Lean-admitted, re-observed target match reports success; any retry
+must begin with a fresh Write proposal, fresh source observation and fresh Lean
+pre-admission. A dispatch-start evidence rejection consumes the capability too
+and poisons the Run before filesystem execution.
 
 Recovery and ordinary rules still share one physical checker batch. Journal
 decision-batch v4 records the exact operation per candidate, and the internal
@@ -811,14 +819,17 @@ manifest freezes both the checker and provenance artifact identities. This
 prevents an executable but stale same-protocol kernel from silently becoming
 the experiment's formal authority.
 
-This contract appears only in the blocked tool result after treatment. It does
-not change the system prompt, tool schema/order, task message or first provider
-request, so the causal cacheable prefix remains identical across arms. The
-real loopback runner now proves
-`production binary -> fixed Lean block -> structured tool_result -> exact Edit
--> final Read -> exact grader`, while checking byte-identical first requests.
-This is new E0/E1/L2 mechanism evidence only; it does not retroactively change
-the non-significant E3 result. A new frozen paid replication is required before
+In v2 this contract appeared only in the blocked tool result after treatment.
+It did not change the system prompt, tool schema/order, task message or first
+provider request, so the causal cacheable prefix remained identical across
+arms. The v2 real loopback runner proved
+`production binary -> fixed Lean block -> structured tool_result -> model exact
+Edit -> final Read -> exact grader`, while checking byte-identical first
+requests. The v3 runner replaces the model exact-Edit step with
+`host synthesis -> second Lean pre -> native exact Edit` and asserts that no
+repair contract or reconstructed parameters return to the provider. This is
+E0/E1/L2 mechanism evidence only; it does not retroactively change either
+non-significant E3 result. A new frozen paid replication is required before
 claiming outcome benefit.
 
 The first exact-recovery cohort was stopped after its first complete four-arm
@@ -839,14 +850,68 @@ directions, eight exact recovery-pre admissions and eight recovery-post
 admissions in `evolved_enforced`. Safe recovery-pre blocks are reported as
 settling/cost evidence; post blocks remain disqualifying.
 
-The retained local report has manifest id
-`dbf52121cbef1a0f11f4f99c27f6d8f0b18529047ca38dada0bba75e54288485`
-and SHA-256
-`362697aab9b353f4c35e6c90913d045d2f64e83c394fbf96a14bb23cb9490d0a`.
-Raw prompts, cassettes, journals and rollout artifacts remain outside the
-repository in the isolated local experiment tree. This E3 run evaluates a
-frozen evolved rule against a GLM actor; it does not evaluate provider-backed
-rule authoring. That authoring path is the next independent vertical slice.
+The completed v2 replication used manifest id
+`12d7ab03829707640e32046ed1c6ac71bff4805293cd4133634fb46a66ff2f1e`.
+All 48 transactions committed for USD 0.746869 and 1,204,090 metered tokens.
+`evolved_enforced` obtained 9/12 trustworthy successes versus 4/12 for
+`signal_only`: five paired improvements, zero regressions and exact McNemar
+`p=0.0625`. The result is directionally strong but not significant under the
+frozen `p<0.05` boundary, so neither outcome superiority nor production
+preference is claimed. Prohibited Write dispatches/effects and safe false
+interventions were zero, every first request and cacheable prefix matched, and
+cost, time and provider requests per trustworthy success all improved. The
+report SHA-256 is
+`d9179a0e5eb3bede4075ffa3c968822dd93964381d61c7fcf188e12b2f5907e1`.
+
+All three remaining enforced failures had the same evidence-backed cause. The
+source files ended in `0x0a`, while Read's line-number rendering did not expose
+terminal-newline state. GLM reconstructed `Edit.old_string` without that byte;
+one case also removed the intended target newline. Lean correctly rejected the
+stale/mismatched recovery parameters. The defect was therefore asking the
+neural actor to re-encode exact host bytes after the formal controller had
+already selected a deterministic recovery—not missing semantic context, weak
+formal policy, or cache loss.
+
+The v3 intervention removes that reconstruction round trip. An enforced
+existing-file Write block may return a non-authorizing
+`synthesize_exact_edit` host direction. The host reopens the real regular file
+without following the final symlink, combines those exact source bytes with
+the original Write proposal, and constructs a whole-file Edit. That synthetic
+Edit traverses the fixed Lean kernel again; only the distinct
+`admit_exact_edit` result can enter the native one-descriptor source-CAS path.
+The journal records `requested_name=Write` and `dispatched_name=Edit`, so it
+never launders the actual primitive or counts the safe rewrite as a prohibited
+Write dispatch. Final-path replacement and source drift observed before the
+second pre-check or native same-descriptor comparison fail closed without
+overwriting the competing content. This is a source-bound/source-checked
+rewrite, not a globally linearizable filesystem CAS: in the current single-
+runner pilot, an uncooperative process can still mutate the same inode in the
+narrow interval between the final comparison and write. Post re-observation
+detects a mismatching final state but cannot prove that no competing update was
+temporarily lost; broader deployment therefore requires a cooperative project
+mutation lock or a stronger filesystem primitive.
+
+The synthesized Edit is an internal actuator lowering of the already
+permissioned and hook-observed Write, not a second actor proposal. It therefore
+does not expose or ask the model to approve an Edit and does not rerun the
+actor-level Edit hook with host-only source bytes. It still passes the child
+execution policy, a fresh native sensor, a distinct Lean recovery-pre decision,
+the built-in exact Edit implementation and Lean recovery-post. Its
+provider-facing success result is a bounded receipt containing the target path
+and `lean_authorized_source_cas`; it never renders the captured old bytes or an
+Edit diff. Local effect evidence and post re-observation retain the bytes and
+hashes needed for audit without turning Write permission into an implicit read
+channel.
+
+This changes neither the system prompt, tool schema/order, task message nor
+first provider request. It also avoids an additional provider turn and removes
+the precise-byte burden from the model. A new v3 cohort contains twelve new
+case ids, prompts, filenames and opaque values, remains balanced across the
+same four arms, and preregisters eight formal directions, eight recovery-pre
+admissions, eight host Write-to-Edit rewrites and eight recovery-post
+admissions. All prior cohorts remain read-only compatibility evidence; none is
+rerun, extended or reclassified. Raw prompts, cassettes, journals and rollout
+artifacts remain outside the repository in the isolated local experiment tree.
 
 ### Compile-time actuation and native provider-boundary L2
 
@@ -865,20 +930,24 @@ real headless agent/tool path. The test requires:
 
 - byte-identical first provider request bodies across both artifacts;
 - a shadow block verdict followed by a real `Write` dispatcher entry;
-- an enforced block verdict with no `Write` dispatcher entry;
-- a real `Read -> Edit` recovery and matching final file re-observation;
+- an enforced block verdict with no actual `Write` dispatcher entry;
+- one Lean-authorized host `requested Write -> dispatched Edit` rewrite and
+  matching final file re-observation;
 - production remaining enforced even when a hostile-looking shadow environment
   variable is present; and
 - durable journals whose actuation mode matches the compiled artifact.
 
 The retained local report is
 `zig-out/reports/project-harness-binary-boundary.json`. The first verified run
-used a 55,312-byte byte-identical causal prefix, two loopback requests in shadow
-and four in enforced recovery, with zero external provider requests and zero
-paid cost. `Write` reached the shadow dispatcher but was then rejected by the
-independent must-read-first policy; that is correctly recorded as a shadow
-dispatch without a realized file mutation, not misclassified as formal
-actuation. This remains E2 mechanism/boundary evidence, not E3 outcome evidence.
+used a 55,312-byte byte-identical causal prefix and two loopback requests in
+each artifact, with zero external provider requests and zero paid cost. `Write`
+reached the shadow dispatcher but was rejected by the independent
+must-read-first policy as `NotRead`; the journal and provider result both record
+that tool error and the target remains unchanged. Production records the same
+requested tool id as `requested_name=Write, dispatched_name=Edit`, a successful
+terminal outcome, a valid re-observed effect, the exact final bytes, and only a
+bounded recovery receipt to the provider. This remains E2 mechanism/boundary
+evidence, not E3 outcome evidence.
 
 Report rule growth and maintenance cost as well as task success; a safer
 Harness that destroys context/cache reuse or consumes more maintenance budget

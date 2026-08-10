@@ -148,6 +148,7 @@ pub const RunGate = struct {
             .actuation = artifact_actuation,
             .evidence_dir = session_dir,
             .observation_sink = observation_sink,
+            .auto_exact_edit_recovery = true,
         };
         return self;
     }

@@ -531,8 +531,16 @@ def analyze_lifecycle(manifest_path: Path) -> Dict[str, Any]:
         single = observation.get("formal_decision")
         if isinstance(single, Mapping):
             formal.append({**single, "_sequence": record["sequence"]})
-    if [item.get("id") for item in dispatch_starts] != ["runtime-edit"] or [item.get("id") for item in dispatch_finishes] != ["runtime-edit"]:
-        raise EvolutionError("blocked Write reached dispatch or Edit evidence is missing")
+    # The model/provider requested one Write. Lean blocks that operation, then
+    # the host deterministically rewrites it to one exact Edit under a second
+    # Lean generation while retaining the original tool id. A dispatched Write
+    # is always a failure; requested Write + dispatched Edit is the expected
+    # source-bound recovery identity.
+    if (
+        [item.get("id") for item in dispatch_starts] != ["runtime-write"]
+        or [item.get("id") for item in dispatch_finishes] != ["runtime-write"]
+    ):
+        raise EvolutionError("host rewrite dispatch identity drift")
     if len(formal) != 3:
         raise EvolutionError("runtime did not emit the expected three formal decisions")
     kernel_sha = _identity(artifacts["kernel"].get("sha256"), "kernel.sha256")
@@ -556,35 +564,51 @@ def analyze_lifecycle(manifest_path: Path) -> Dict[str, Any]:
             _identity(item.get(key), f"formal.{key}")
     write_blocks = sum(
         item.get("dispatch_id") == "runtime-write"
+        and item.get("operation") == "pre_decision"
         and item.get("phase") == "pre"
         and item.get("result") == "block"
+        and item.get("recovery_action") == "edit_existing_file_exact"
         and item.get("actuation") == "enforced"
         and item.get("candidate_id") == candidate
         for item in formal
     )
-    edit_admits = sum(
-        item.get("dispatch_id") == "runtime-edit"
+    recovery_pre_admits = sum(
+        item.get("dispatch_id") == "runtime-write"
+        and item.get("operation") == "recovery_pre_decision"
+        and item.get("phase") == "pre"
         and item.get("result") == "admit"
         and item.get("actuation") == "enforced"
         and item.get("candidate_id") == candidate
         for item in formal
     )
-    if write_blocks != 1 or edit_admits != 2:
+    recovery_post_admits = sum(
+        item.get("dispatch_id") == "runtime-write"
+        and item.get("operation") == "recovery_post_decision"
+        and item.get("phase") == "post"
+        and item.get("result") == "admit"
+        and item.get("actuation") == "enforced"
+        and item.get("candidate_id") == candidate
+        for item in formal
+    )
+    if write_blocks != 1 or recovery_pre_admits != 1 or recovery_post_admits != 1:
         raise EvolutionError("runtime formal-decision order/result drift")
     write_pre = next(
         item for item in formal
-        if item.get("dispatch_id") == "runtime-write" and item.get("phase") == "pre"
+        if item.get("dispatch_id") == "runtime-write"
+        and item.get("operation") == "pre_decision"
     )
-    edit_pre = next(
+    recovery_pre = next(
         item for item in formal
-        if item.get("dispatch_id") == "runtime-edit" and item.get("phase") == "pre"
+        if item.get("dispatch_id") == "runtime-write"
+        and item.get("operation") == "recovery_pre_decision"
     )
-    edit_post = next(
+    recovery_post = next(
         item for item in formal
-        if item.get("dispatch_id") == "runtime-edit" and item.get("phase") == "post"
+        if item.get("dispatch_id") == "runtime-write"
+        and item.get("operation") == "recovery_post_decision"
     )
-    edit_started = dispatch_starts[0]
-    edit_finished = dispatch_finishes[0]
+    rewrite_started = dispatch_starts[0]
+    rewrite_finished = dispatch_finishes[0]
     start_sequence = next(
         record["sequence"] for record in events
         if (_formal_or_dispatch(record) or (None, None))[0] == "dispatch_started"
@@ -594,29 +618,29 @@ def analyze_lifecycle(manifest_path: Path) -> Dict[str, Any]:
         if (_formal_or_dispatch(record) or (None, None))[0] == "dispatch_finished"
     )
     if not (
-        write_pre["_sequence"] < edit_pre["_sequence"] < start_sequence
-        < edit_post["_sequence"] < finish_sequence
+        write_pre["_sequence"] < recovery_pre["_sequence"] < start_sequence
+        < recovery_post["_sequence"] < finish_sequence
     ):
         raise EvolutionError("formal gate/dispatch causal ordering drift")
-    effect = edit_finished.get("effect")
+    effect = rewrite_finished.get("effect")
     mutation_v2 = effect.get("file_mutation_v2") if isinstance(effect, Mapping) else None
     mutation = mutation_v2.get("mutation") if isinstance(mutation_v2, Mapping) else None
     reobservation = mutation_v2.get("reobservation") if isinstance(mutation_v2, Mapping) else None
     if (
-        edit_started.get("requested_name") != "Edit"
-        or edit_started.get("dispatched_name") != "Edit"
-        or edit_finished.get("requested_name") != "Edit"
-        or edit_finished.get("dispatched_name") != "Edit"
-        or edit_finished.get("outcome") != "succeeded"
-        or edit_finished.get("effect_valid") is not True
+        rewrite_started.get("requested_name") != "Write"
+        or rewrite_started.get("dispatched_name") != "Edit"
+        or rewrite_finished.get("requested_name") != "Write"
+        or rewrite_finished.get("dispatched_name") != "Edit"
+        or rewrite_finished.get("outcome") != "succeeded"
+        or rewrite_finished.get("effect_valid") is not True
         or not isinstance(mutation, Mapping)
         or mutation.get("change") != "changed"
         or not isinstance(reobservation, Mapping)
         or reobservation.get("state") != "matched"
     ):
-        raise EvolutionError("Edit recovery lacks a successful reobserved effect")
+        raise EvolutionError("Lean-authorized host rewrite lacks a successful reobserved effect")
     if _read_regular(project_root / "protected.txt", 1024) != b"new":
-        raise EvolutionError("admitted Edit did not recover the real file")
+        raise EvolutionError("admitted host rewrite did not recover the real file")
 
     gates = {
         "real_transcript_backed_user_correction": True,
@@ -625,7 +649,7 @@ def analyze_lifecycle(manifest_path: Path) -> Dict[str, Any]:
         "replay_shadow_promotion_chain_reopened": True,
         "hash_pinned_active_bundle_reattested": True,
         "write_blocked_before_dispatch": True,
-        "edit_recovery_reobserved": True,
+        "lean_authorized_host_rewrite_reobserved": True,
         "independent_process_audit_passed": True,
         "provider_requests_zero": True,
     }

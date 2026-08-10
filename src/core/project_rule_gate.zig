@@ -54,6 +54,12 @@ pub const RuntimeGate = struct {
     actuation: observation.FormalActuation = .enforced,
     evidence_dir: ?[]const u8 = null,
     observation_sink: ?observation.Sink = null,
+    /// Product construction enables deterministic host synthesis of the
+    /// Lean-selected exact Edit.  Direct/embedding construction defaults off
+    /// so adopting a RuntimeGate does not silently change tool-call shape.
+    /// The synthesized call still re-enters this gate and cannot dispatch
+    /// without a separate recovery-pre admission.
+    auto_exact_edit_recovery: bool = false,
     exact_edit_obligations: [MAX_EXACT_EDIT_OBLIGATIONS]ExactEditObligation = undefined,
     exact_edit_obligations_len: usize = 0,
     inflight_exact_edits: [MAX_INFLIGHT_EXACT_EDITS]InflightExactEdit = undefined,
@@ -97,6 +103,21 @@ pub const RuntimeGate = struct {
                 self.inflight_exact_edits_len += 1;
                 return .admit_exact_edit;
             }
+            // A recovery-pre block without the same bounded recovery direction
+            // means the source-bound obligation is no longer retryable (most
+            // importantly, the source snapshot drifted).  Do not leave stale
+            // authority in memory that could become usable again if bytes later
+            // happen to cycle back to the old digest.  A retry-eligible typo is
+            // the only blocking result that preserves the obligation.
+            if (self.actuation == .enforced and
+                decision.result == .block and
+                decision.recovery_action != .edit_existing_file_exact)
+            {
+                const obligation_index = self.findExactEditObligation(
+                    facts.obligation.target_sha256,
+                ) orelse return .fault;
+                self.removeExactEditObligation(obligation_index);
+            }
             return actuated;
         }
         const decision = self.decidePre(signal) catch return .fault;
@@ -116,6 +137,8 @@ pub const RuntimeGate = struct {
             if (self.findInflightTarget(obligation.target_sha256) != null or
                 !self.installExactEditObligation(obligation))
                 return .fault;
+            if (self.auto_exact_edit_recovery)
+                return .synthesize_exact_edit;
         }
         return actuated;
     }
@@ -132,6 +155,14 @@ pub const RuntimeGate = struct {
                 inflight.target_sha256,
             ) orelse return .fault;
             const obligation = self.exact_edit_obligations[obligation_index];
+            // `admit_exact_edit` is a linear, single-dispatch capability. Once
+            // the real dispatcher has started, consume the source-bound
+            // obligation regardless of tool outcome, post-checker failure, or
+            // re-observation result. Retaining it after a failed/raced dispatch
+            // would permit an old authorization to become usable again after
+            // an ABA content cycle. A retry must begin with a fresh Write,
+            // fresh host observation, and fresh Lean pre-admission.
+            defer self.removeExactEditObligation(obligation_index);
             const observed_matches = observedMatchesBlocked(
                 signal.effect,
                 obligation.target_sha256,
@@ -150,10 +181,6 @@ pub const RuntimeGate = struct {
                 obligation.rule_index,
                 recovery_post,
             ) catch return .fault;
-            if (self.actuation == .enforced and
-                decision.recovery_rule_result == .admit and
-                observed_matches)
-                self.removeExactEditObligation(obligation_index);
             return self.actuateResult(decision.result);
         }
         const decision = self.decidePost(signal) catch return .fault;
@@ -167,7 +194,16 @@ pub const RuntimeGate = struct {
         const dispatch_sha256 = observation.sha256Hex(signal.dispatch_id);
         const inflight_index = self.findInflightDispatch(dispatch_sha256) orelse
             return false;
+        const target_sha256 = self.inflight_exact_edits[inflight_index].target_sha256;
+        const obligation_index = self.findExactEditObligation(target_sha256) orelse {
+            self.removeInflightExactEdit(inflight_index);
+            return false;
+        };
         self.removeInflightExactEdit(inflight_index);
+        // A rejected evidence start poisons the governed Run. Do not leave the
+        // already-issued recovery capability available to a caller that
+        // incorrectly continues after the host-fatal result.
+        self.removeExactEditObligation(obligation_index);
         return true;
     }
 

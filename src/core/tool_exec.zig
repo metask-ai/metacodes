@@ -429,10 +429,11 @@ pub fn executeOne(
     // Built-in/dynamic dispatch performs deterministic name normalization;
     // host Session dispatch deliberately receives the exact advertised name.
     // Preserve both so evidence never attributes a repaired call to the model.
-    const dispatched_name = if (job_ctx.tool_dispatcher != null)
+    var dispatched_name = if (job_ctx.tool_dispatcher != null)
         name
     else
         tools_mod.resolveToolNameExact(&job_ctx, name) orelse name;
+    var dispatch_input = input;
     var dispatch_observation = DispatchObservation{
         .ctx = &job_ctx,
         .id = id,
@@ -464,6 +465,33 @@ pub fn executeOne(
                 .elapsed_ms = elapsed,
             } };
         }
+    }
+    // Auto source-CAS lowering must not turn a malformed model-authored Write
+    // into a well-typed host-authored Edit.  The ordinary dispatcher performs
+    // these same checks, but lowering happens before it.  Validate every
+    // native built-in Write at this boundary so signal-only and governed Runs
+    // retain identical schema-first semantics. An embedding Session owns its
+    // advertised schema. No formal obligation or dispatch-start evidence is
+    // emitted for an input that never reached a valid dispatcher invocation.
+    if (job_ctx.tool_dispatcher == null and
+        std.mem.eql(u8, dispatched_name, "Write"))
+    {
+        tools_mod.validateRequired("Write", input) catch |err|
+            return invalidNativeWriteArgsResult(
+                name,
+                err,
+                parent_allocator,
+                t_start,
+                rid,
+            );
+        tools_mod.validateTypes("Write", input) catch |err|
+            return invalidNativeWriteArgsResult(
+                name,
+                err,
+                parent_allocator,
+                t_start,
+                rid,
+            );
     }
     // Observe once for both signal-only and formally governed Runs.  If this
     // were conditional on an active rule, the treatment arm would receive a
@@ -498,6 +526,73 @@ pub fn executeOne(
                 }
                 job_ctx.project_edit_mode = .whole_file_exact;
             },
+            .synthesize_exact_edit => {
+                // The first Lean decision selected a bounded repair for this
+                // exact Write.  Construct the corresponding Edit from real
+                // source bytes plus the original proposal, then require a
+                // second Lean admission before exposing any dispatch event.
+                if (!std.mem.eql(u8, dispatched_name, "Write")) {
+                    log.warnId("agent", rid, "project formal gate requested exact-Edit synthesis for non-Write name={s} id={s}", .{ name, id });
+                    return .host_fatal;
+                }
+                const exact_input = project_rule_signal.synthesizeExactEditInput(
+                    &job_ctx,
+                    input,
+                ) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
+                    log.warnId("agent", rid, "project exact-Edit synthesis failed closed name={s} id={s} err={s}", .{ name, id, @errorName(err) });
+                    const denied = @import("tool_error.zig").projectRuleExactEditBlockedJson(
+                        dispatched_name,
+                        parent_allocator,
+                    ) catch return error.OutOfMemory;
+                    return .{ .done = .{
+                        .content = denied,
+                        .is_error = true,
+                        .elapsed_ms = elapsed,
+                    } };
+                };
+                dispatch_input = exact_input;
+                dispatched_name = "Edit";
+                const exact_signal = project_rule_signal.observePre(
+                    &job_ctx,
+                    id,
+                    dispatched_name,
+                    dispatch_input,
+                );
+                switch (gate.pre(exact_signal)) {
+                    .admit_exact_edit => job_ctx.project_edit_mode = .whole_file_exact,
+                    .block => |recovery_action| {
+                        const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
+                        const tool_error = @import("tool_error.zig");
+                        const denied = switch (recovery_action) {
+                            .none => tool_error.errorToJson(
+                                "ProjectRuleBlocked",
+                                "Project formal rule blocked synthesized tool '{s}' before dispatch",
+                                .{dispatched_name},
+                                parent_allocator,
+                            ),
+                            .edit_existing_file_exact => tool_error.projectRuleExactEditBlockedJson(
+                                dispatched_name,
+                                parent_allocator,
+                            ),
+                        } catch return error.OutOfMemory;
+                        return .{ .done = .{
+                            .content = denied,
+                            .is_error = true,
+                            .elapsed_ms = elapsed,
+                        } };
+                    },
+                    .admit, .synthesize_exact_edit, .fault => {
+                        log.warnId("agent", rid, "project synthesized exact Edit lacked recovery admission name={s} id={s}", .{ name, id });
+                        return .host_fatal;
+                    },
+                }
+                project_pre_signal = exact_signal;
+                dispatch_observation.dispatched_name = dispatched_name;
+                dispatch_observation.file_target_state = exact_signal.file_target_state;
+                dispatch_observation.project_pre_signal = exact_signal;
+            },
             .block => |recovery_action| {
                 const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
                 const tool_error = @import("tool_error.zig");
@@ -525,7 +620,7 @@ pub fn executeOne(
             },
         }
     }
-    if (!dispatch_observation.start(input)) {
+    if (!dispatch_observation.start(dispatch_input)) {
         if (job_ctx.project_edit_mode == .whole_file_exact) {
             const gate = job_ctx.project_rule_gate orelse return .host_fatal;
             if (!gate.cancelPre(project_pre_signal.?))
@@ -536,7 +631,7 @@ pub fn executeOne(
     }
     defer dispatch_observation.ensureTerminal();
     const r = (if (job_ctx.project_edit_mode == .whole_file_exact)
-        tools_mod.dispatchProjectExactEdit(&job_ctx, input)
+        tools_mod.dispatchProjectExactEdit(&job_ctx, dispatch_input)
     else
         tools_mod.dispatch(&job_ctx, name, input)) catch |err| {
         const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
@@ -577,6 +672,9 @@ pub fn executeOne(
             else
                 tool_error.errorToJson(code, "Tool '{s}' does not exist. Available tools: {s}", .{ name, if (names) |nm| nm else "(unavailable)" }, parent_allocator) catch return error.OutOfMemory;
         } else tool_error.errorToJson(code, "{s} failed with {s}", .{ name, @errorName(err) }, parent_allocator) catch return error.OutOfMemory;
+        // `dispatch_input` may be a host-synthesized exact Edit containing
+        // source bytes that were never model-visible. Preserve the historical
+        // model-input diagnostic without leaking that host-only snapshot.
         log.warnId("agent", rid, "tool.exec FAILED(par) name={s} err={s} duration_ms={d} input={s}", .{ name, @errorName(err), elapsed, input[0..@min(input.len, 200)] });
         return .{ .done = .{ .content = ej, .is_error = true, .elapsed_ms = elapsed } };
     };
@@ -633,6 +731,34 @@ pub fn executeOne(
     const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
     log.infoId("agent", rid, "tool.exec done(par) name={s} output_bytes={d} duration_ms={d}", .{ name, result_bytes.len, elapsed });
     return .{ .done = .{ .content = content, .is_error = false, .elapsed_ms = elapsed } };
+}
+
+fn invalidNativeWriteArgsResult(
+    name: []const u8,
+    err: anyerror,
+    allocator: std.mem.Allocator,
+    started_at_ms: i64,
+    rid: log.RequestId,
+) error{OutOfMemory}!OneResult {
+    const elapsed: u64 = @intCast(@max(util_time.nowMs() - started_at_ms, 0));
+    const code = @errorName(err);
+    const encoded = @import("tool_error.zig").errorToJson(
+        code,
+        "{s} failed with {s}",
+        .{ name, code },
+        allocator,
+    ) catch return error.OutOfMemory;
+    log.warnId(
+        "agent",
+        rid,
+        "tool.exec INVALID-ARGS name={s} code={s} duration_ms={d}",
+        .{ name, code, elapsed },
+    );
+    return .{ .done = .{
+        .content = encoded,
+        .is_error = true,
+        .elapsed_ms = elapsed,
+    } };
 }
 
 fn hostToolErrorJson(

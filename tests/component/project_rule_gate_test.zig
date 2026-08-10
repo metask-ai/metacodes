@@ -105,6 +105,147 @@ const ExactEditRaceGate = struct {
     }
 };
 
+/// Changes the file after Lean selected synthesis but before the host reads
+/// source bytes for the generated Edit.  The second Lean pre-check must reject
+/// the stale obligation and no dispatch may start.
+const ExactEditSynthesisRaceGate = struct {
+    inner: cc.project_rule_gate_protocol.Gate,
+    path: [:0]const u8,
+    raced: bool = false,
+
+    fn pre(raw: *anyopaque, signal: cc.project_rule_gate_protocol.PreSignal) cc.project_rule_gate_protocol.PreResult {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const result = self.inner.pre(signal);
+        if (result == .synthesize_exact_edit) {
+            const fd = pfs.open(
+                self.path.ptr,
+                .{ .ACCMODE = .WRONLY, .TRUNC = true, .NOFOLLOW = true },
+                0,
+            );
+            if (fd < 0) return .fault;
+            defer pfs.close(fd);
+            if (pfs.write(fd, "racer\n") != 6) return .fault;
+            self.raced = true;
+        }
+        return result;
+    }
+
+    fn post(raw: *anyopaque, signal: cc.project_rule_gate_protocol.PostSignal) cc.project_rule_gate_protocol.Result {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.inner.post(signal);
+    }
+
+    fn cancelPre(raw: *anyopaque, signal: cc.project_rule_gate_protocol.PreSignal) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.inner.cancelPre(signal);
+    }
+
+    fn gate(self: *@This()) cc.project_rule_gate_protocol.Gate {
+        return .{
+            .ctx = @ptrCast(self),
+            .preFn = pre,
+            .postFn = post,
+            .cancelPreFn = cancelPre,
+        };
+    }
+};
+
+const AutoRecoveryGateProbe = struct {
+    inner: cc.project_rule_gate_protocol.Gate,
+    pre_calls: usize = 0,
+    synthesize_results: usize = 0,
+    exact_admissions: usize = 0,
+    post_calls: usize = 0,
+
+    fn pre(raw: *anyopaque, signal: cc.project_rule_gate_protocol.PreSignal) cc.project_rule_gate_protocol.PreResult {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.pre_calls += 1;
+        const result = self.inner.pre(signal);
+        switch (result) {
+            .synthesize_exact_edit => self.synthesize_results += 1,
+            .admit_exact_edit => self.exact_admissions += 1,
+            else => {},
+        }
+        return result;
+    }
+
+    fn post(raw: *anyopaque, signal: cc.project_rule_gate_protocol.PostSignal) cc.project_rule_gate_protocol.Result {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.post_calls += 1;
+        return self.inner.post(signal);
+    }
+
+    fn cancelPre(raw: *anyopaque, signal: cc.project_rule_gate_protocol.PreSignal) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.inner.cancelPre(signal);
+    }
+
+    fn gate(self: *@This()) cc.project_rule_gate_protocol.Gate {
+        return .{
+            .ctx = @ptrCast(self),
+            .preFn = pre,
+            .postFn = post,
+            .cancelPreFn = cancelPre,
+        };
+    }
+};
+
+const AutoRecoveryDispatchProbe = struct {
+    starts: usize = 0,
+    finishes: usize = 0,
+    requested_write: bool = false,
+    dispatched_edit: bool = false,
+    matched_reobservation: bool = false,
+
+    fn emit(raw: *anyopaque, event: cc.tools.tool_observation.Event) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        switch (event) {
+            .formal_decision, .formal_decision_batch => {},
+            .dispatch_started => |started| {
+                self.starts += 1;
+                self.requested_write = std.mem.eql(u8, started.requested_name, "Write");
+                self.dispatched_edit = std.mem.eql(u8, started.dispatched_name, "Edit");
+            },
+            .dispatch_finished => |finished| {
+                self.finishes += 1;
+                if (finished.effect) |effect| switch (effect) {
+                    .file_mutation_v2 => |mutation| {
+                        self.matched_reobservation = mutation.reobservation.state == .matched;
+                    },
+                    .file_mutation_v1 => {},
+                };
+            },
+        }
+        return true;
+    }
+
+    fn sink(self: *@This()) cc.tools.ToolObservationSink {
+        return .{ .ctx = @ptrCast(self), .emitFn = emit };
+    }
+};
+
+const DenyExactEditExecutionPolicy = struct {
+    fn allowsTool(_: *const anyopaque, _: []const u8) bool {
+        return true;
+    }
+
+    fn allowsInvocation(
+        _: *const anyopaque,
+        name: []const u8,
+        _: []const u8,
+    ) bool {
+        return !std.mem.eql(u8, name, "Edit");
+    }
+
+    fn policy(self: *const @This()) cc.tool_context.ToolExecutionPolicy {
+        return .{
+            .ctx = @ptrCast(self),
+            .allowsToolFn = allowsTool,
+            .allowsInvocationFn = allowsInvocation,
+        };
+    }
+};
+
 const RejectDispatchStartSink = struct {
     formal_events: usize = 0,
     rejected_starts: usize = 0,
@@ -147,6 +288,489 @@ fn testKernel() ?cc.project_harness_runtime.Config {
     const hash = parseHex(std.mem.span(hash_raw)) orelse return null;
     if (!std.fs.path.isAbsolute(path)) return null;
     return .{ .checker_path = path, .expected_sha256 = hash };
+}
+
+test "L2 Lean-selected source-CAS rewrites existing Write through one host-synthesized exact Edit" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/auto-source-\"cas\".txt",
+        .{root_buffer[0..root_len]},
+    );
+    defer allocator.free(path);
+    try overwriteArtifact(allocator, path, "HOST_ONLY_SOURCE_BYTES\n");
+
+    var active = try syntheticOrderedRecoveryActive(allocator, true, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+        .auto_exact_edit_recovery = true,
+    };
+    var gate_probe = AutoRecoveryGateProbe{ .inner = runtime.protocolGate() };
+    var dispatch_probe = AutoRecoveryDispatchProbe{};
+    var read_state = cc.core_read_state.ReadState.init(allocator);
+    defer read_state.deinit();
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    // Production always installs ReadState. This file has deliberately not
+    // been exposed through Read: the host-captured source and exact native
+    // compare must be sufficient for the governed rewrite.
+    ctx.read_state = &read_state;
+    ctx.project_rule_gate = gate_probe.gate();
+    ctx.tool_observer = dispatch_probe.sink();
+    try std.testing.expect(read_state.get(path) == null);
+
+    const write_args = try std.json.Stringify.valueAlloc(allocator, .{
+        .file_path = path,
+        .content = "after\n",
+    }, .{});
+    defer allocator.free(write_args);
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        write_args,
+        "auto-source-cas-write",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(!done.is_error);
+            const content = done.content orelse return error.MissingToolResult;
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                content,
+                "HOST_ONLY_SOURCE_BYTES",
+            ) == null);
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                content,
+                "lean_authorized_source_cas",
+            ) != null);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+
+    const after = try readArtifact(allocator, path);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings("after\n", after);
+    try std.testing.expectEqual(@as(usize, 2), gate_probe.pre_calls);
+    try std.testing.expectEqual(@as(usize, 1), gate_probe.synthesize_results);
+    try std.testing.expectEqual(@as(usize, 1), gate_probe.exact_admissions);
+    try std.testing.expectEqual(@as(usize, 1), gate_probe.post_calls);
+    try std.testing.expectEqual(@as(usize, 1), dispatch_probe.starts);
+    try std.testing.expectEqual(@as(usize, 1), dispatch_probe.finishes);
+    try std.testing.expect(dispatch_probe.requested_write);
+    try std.testing.expect(dispatch_probe.dispatched_edit);
+    try std.testing.expect(dispatch_probe.matched_reobservation);
+    try std.testing.expect(read_state.get(path) != null);
+    try std.testing.expectEqual(@as(usize, 0), runtime.exact_edit_obligations_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
+}
+
+test "L2 malformed Write cannot be normalized by source-CAS lowering" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/malformed-source-cas.txt",
+        .{root_buffer[0..root_len]},
+    );
+    defer allocator.free(path);
+    try overwriteArtifact(allocator, path, "before\n");
+
+    var active = try syntheticOrderedRecoveryActive(allocator, true, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+        .auto_exact_edit_recovery = true,
+    };
+    var gate_probe = AutoRecoveryGateProbe{ .inner = runtime.protocolGate() };
+    var dispatch_probe = AutoRecoveryDispatchProbe{};
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.project_rule_gate = gate_probe.gate();
+    ctx.tool_observer = dispatch_probe.sink();
+    const malformed = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":123}}",
+        .{path},
+    );
+    defer allocator.free(malformed);
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        malformed,
+        "malformed-source-cas-write",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+            const content = done.content orelse return error.MissingToolResult;
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                content,
+                "InvalidFieldType",
+            ) != null);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    const after = try readArtifact(allocator, path);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings("before\n", after);
+    try std.testing.expectEqual(@as(usize, 0), gate_probe.pre_calls);
+    try std.testing.expectEqual(@as(usize, 0), gate_probe.post_calls);
+    try std.testing.expectEqual(@as(usize, 0), dispatch_probe.starts);
+    try std.testing.expectEqual(@as(usize, 0), dispatch_probe.finishes);
+    try std.testing.expectEqual(@as(usize, 0), runtime.exact_edit_obligations_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
+
+    // The same native schema-first boundary applies without a formal gate;
+    // otherwise malformed calls would create an arm-specific journal shape.
+    var signal_probe = AutoRecoveryDispatchProbe{};
+    var signal_ctx = cc.tool_context.ToolContext.simple(allocator);
+    signal_ctx.tool_observer = signal_probe.sink();
+    const signal_result = try cc.tool_exec.executeOne(
+        &signal_ctx,
+        "Write",
+        malformed,
+        "malformed-signal-only-write",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (signal_result) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    try std.testing.expectEqual(@as(usize, 0), signal_probe.starts);
+    try std.testing.expectEqual(@as(usize, 0), signal_probe.finishes);
+    const after_signal = try readArtifact(allocator, path);
+    defer allocator.free(after_signal);
+    try std.testing.expectEqualStrings("before\n", after_signal);
+}
+
+test "L2 host synthesis rejects non-UTF8 source without starting a dispatch" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/binary-source.bin",
+        .{root_buffer[0..root_len]},
+    );
+    defer allocator.free(path);
+    const original = [_]u8{ 0xff, 0x00, '\n' };
+    try overwriteArtifact(allocator, path, &original);
+
+    var active = try syntheticOrderedRecoveryActive(allocator, true, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+        .auto_exact_edit_recovery = true,
+    };
+    var gate_probe = AutoRecoveryGateProbe{ .inner = runtime.protocolGate() };
+    var dispatch_probe = AutoRecoveryDispatchProbe{};
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.project_rule_gate = gate_probe.gate();
+    ctx.tool_observer = dispatch_probe.sink();
+    const write_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"text\\n\"}}",
+        .{path},
+    );
+    defer allocator.free(write_args);
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        write_args,
+        "auto-source-cas-non-utf8",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    const after = try readArtifact(allocator, path);
+    defer allocator.free(after);
+    try std.testing.expectEqualSlices(u8, &original, after);
+    try std.testing.expectEqual(@as(usize, 1), gate_probe.pre_calls);
+    try std.testing.expectEqual(@as(usize, 1), gate_probe.synthesize_results);
+    try std.testing.expectEqual(@as(usize, 0), gate_probe.exact_admissions);
+    try std.testing.expectEqual(@as(usize, 0), dispatch_probe.starts);
+    try std.testing.expectEqual(@as(usize, 0), dispatch_probe.finishes);
+    try std.testing.expectEqual(@as(usize, 1), runtime.exact_edit_obligations_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
+}
+
+test "L2 execution policy can reject synthesized Edit with zero file effect" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/policy-denied.txt",
+        .{root_buffer[0..root_len]},
+    );
+    defer allocator.free(path);
+    try overwriteArtifact(allocator, path, "before\n");
+
+    var active = try syntheticOrderedRecoveryActive(allocator, true, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+        .auto_exact_edit_recovery = true,
+    };
+    var dispatch_probe = AutoRecoveryDispatchProbe{};
+    var policy_state = DenyExactEditExecutionPolicy{};
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.project_rule_gate = runtime.protocolGate();
+    ctx.tool_observer = dispatch_probe.sink();
+    ctx.execution_policy = policy_state.policy();
+    const write_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"after\\n\"}}",
+        .{path},
+    );
+    defer allocator.free(write_args);
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        write_args,
+        "auto-source-cas-policy-denied",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    const after = try readArtifact(allocator, path);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings("before\n", after);
+    try std.testing.expectEqual(@as(usize, 1), dispatch_probe.starts);
+    try std.testing.expectEqual(@as(usize, 1), dispatch_probe.finishes);
+    try std.testing.expectEqual(@as(usize, 0), runtime.exact_edit_obligations_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
+}
+
+test "L2 rejected auto-recovery dispatch start cancels inflight authorization" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const path = try std.fmt.allocPrint(allocator, "{s}/auto-start-rejected.txt", .{root});
+    defer allocator.free(path);
+    try overwriteArtifact(allocator, path, "before\n");
+
+    var active = try syntheticOrderedRecoveryActive(allocator, true, config);
+    defer active.deinit();
+    var sink_state = RejectDispatchStartSink{};
+    const sink = sink_state.sink();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+        .actuation = .enforced,
+        .evidence_dir = root,
+        .observation_sink = sink,
+        .auto_exact_edit_recovery = true,
+    };
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.project_rule_gate = runtime.protocolGate();
+    ctx.tool_observer = sink;
+    const write_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"after\\n\"}}",
+        .{path},
+    );
+    defer allocator.free(write_args);
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        write_args,
+        "auto-source-cas-start-rejected",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    try std.testing.expect(result == .host_fatal);
+    const after = try readArtifact(allocator, path);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings("before\n", after);
+    try std.testing.expectEqual(@as(usize, 2), sink_state.formal_events);
+    try std.testing.expectEqual(@as(usize, 1), sink_state.rejected_starts);
+    try std.testing.expectEqual(@as(usize, 0), runtime.exact_edit_obligations_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
+}
+
+test "L2 source drift between synthesis selection and recovery pre starts no dispatch" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/auto-pre-race.txt",
+        .{root_buffer[0..root_len]},
+        0,
+    );
+    defer allocator.free(path);
+    try overwriteArtifact(allocator, path, "before\n");
+
+    var active = try syntheticOrderedRecoveryActive(allocator, true, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+        .auto_exact_edit_recovery = true,
+    };
+    var race = ExactEditSynthesisRaceGate{
+        .inner = runtime.protocolGate(),
+        .path = path,
+    };
+    var dispatch_probe = AutoRecoveryDispatchProbe{};
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.project_rule_gate = race.gate();
+    ctx.tool_observer = dispatch_probe.sink();
+    const write_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"after\\n\"}}",
+        .{path},
+    );
+    defer allocator.free(write_args);
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        write_args,
+        "auto-source-cas-pre-race",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    const after = try readArtifact(allocator, path);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings("racer\n", after);
+    try std.testing.expect(race.raced);
+    try std.testing.expectEqual(@as(usize, 0), dispatch_probe.starts);
+    try std.testing.expectEqual(@as(usize, 0), dispatch_probe.finishes);
+    try std.testing.expectEqual(@as(usize, 0), runtime.exact_edit_obligations_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
+}
+
+test "L2 source drift after recovery admission is reobserved without overwrite" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/auto-dispatch-race.txt",
+        .{root_buffer[0..root_len]},
+        0,
+    );
+    defer allocator.free(path);
+    try overwriteArtifact(allocator, path, "before\n");
+
+    var active = try syntheticOrderedRecoveryActive(allocator, true, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+        .auto_exact_edit_recovery = true,
+    };
+    var race = ExactEditRaceGate{
+        .inner = runtime.protocolGate(),
+        .path = path,
+    };
+    var dispatch_probe = AutoRecoveryDispatchProbe{};
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.project_rule_gate = race.gate();
+    ctx.tool_observer = dispatch_probe.sink();
+    const write_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"after\\n\"}}",
+        .{path},
+    );
+    defer allocator.free(write_args);
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        write_args,
+        "auto-source-cas-dispatch-race",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    const after = try readArtifact(allocator, path);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings("racer\n", after);
+    try std.testing.expect(race.raced);
+    try std.testing.expectEqual(@as(usize, 1), dispatch_probe.starts);
+    try std.testing.expectEqual(@as(usize, 1), dispatch_probe.finishes);
+    try std.testing.expectEqual(@as(usize, 0), runtime.exact_edit_obligations_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
 }
 
 test "L2 admitted new-file Write cannot truncate a target created after observation" {
@@ -292,7 +916,7 @@ test "L2 Lean-admitted exact Edit refuses a source changed before native dispatc
     const after = try readArtifact(allocator, path);
     defer allocator.free(after);
     try std.testing.expectEqualStrings("racer\n", after);
-    try std.testing.expectEqual(@as(usize, 1), runtime.exact_edit_obligations_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.exact_edit_obligations_len);
     try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
 }
 
@@ -346,8 +970,9 @@ test "L2 exact recovery preserves content CAS across the blocked Write and later
     try std.testing.expectEqual(@as(usize, 1), runtime.exact_edit_obligations_len);
 
     // Another actor changes the target after the denied Write. Even an Edit
-    // that exactly names this newer content must not consume the old
-    // obligation: recovery is a content-CAS, not merely a path-scoped write.
+    // that exactly names this newer content invalidates the old obligation:
+    // recovery is a content-CAS, not merely a path-scoped write. A later retry
+    // must start from a fresh Write proposal and fresh source observation.
     try overwriteArtifact(allocator, path, "intervening\n");
     const edit_args = try std.fmt.allocPrint(
         allocator,
@@ -373,7 +998,7 @@ test "L2 exact recovery preserves content CAS across the blocked Write and later
     const after = try readArtifact(allocator, path);
     defer allocator.free(after);
     try std.testing.expectEqualStrings("intervening\n", after);
-    try std.testing.expectEqual(@as(usize, 1), runtime.exact_edit_obligations_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.exact_edit_obligations_len);
     try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
 }
 
@@ -592,7 +1217,7 @@ test "L2 rejected dispatch start cancels exact recovery inflight state" {
     try std.testing.expect(rejected == .host_fatal);
     try std.testing.expectEqual(@as(usize, 1), sink_state.rejected_starts);
     try std.testing.expectEqual(@as(usize, 1), sink_state.formal_events);
-    try std.testing.expectEqual(@as(usize, 1), runtime.exact_edit_obligations_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.exact_edit_obligations_len);
     try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
     const unchanged = try readArtifact(allocator, path);
     defer allocator.free(unchanged);

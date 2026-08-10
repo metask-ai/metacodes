@@ -15,6 +15,12 @@ pub const RecoveryAction = enum {
 
 pub const PreResult = union(enum) {
     admit,
+    /// The fixed kernel blocked an existing-file Write and selected the
+    /// bounded exact-Edit recovery.  Production may synthesize that Edit from
+    /// host-observed source bytes plus the original Write proposal, but it
+    /// must traverse `pre` again and receive `admit_exact_edit` before any
+    /// dispatch.  This tag alone is not mutation authority.
+    synthesize_exact_edit,
     /// The fixed kernel admitted an outstanding whole-file recovery.  This is
     /// deliberately distinct from ordinary admission: executeOne must route
     /// the call through the native exact-edit implementation, not the normal

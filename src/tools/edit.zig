@@ -14,28 +14,43 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const new_raw = common.extractJsonArg(args, "new_string") orelse return error.MissingNewString;
 
     if (file_path_raw.len == 0) return error.EmptyFilePath;
+    // Tool arguments are still JSON-escaped slices.  Write already decodes
+    // its path before normalization; Edit must do the same, especially for a
+    // host-synthesized exact Edit whose normalized path was encoded back into
+    // JSON.  Otherwise a legal quote or backslash in the filename passes the
+    // formal sensor but reaches a different native path.
+    const file_path_unescaped = try util_json.unescapeString(file_path_raw, allocator);
+    defer allocator.free(file_path_unescaped);
+    if (file_path_unescaped.len == 0) return error.EmptyFilePath;
     // Empty existing files are a valid whole-file recovery source. Ordinary
     // Edit still rejects an empty needle because substring replacement would
     // be undefined/degenerate.
     if (old_raw.len == 0 and ctx.project_edit_mode != .whole_file_exact)
         return error.EmptyOldString;
     // 归一化(展开 ~、折叠、查 traversal)。openat 不认 ~,必须自己展开。
-    const file_path = try path_mod.normalizeChecked(allocator, file_path_raw, .{
+    const file_path = try path_mod.normalizeChecked(allocator, file_path_unescaped, .{
         .home = ctx.home_dir,
         .base_dir = ctx.cwd_abs,
         .resolve_relative = ctx.resolve_relative_paths,
     });
     defer allocator.free(file_path);
 
-    // must-read-first：Edit 必须先 Read 过；挂了 ReadState 才校验。
-    // Edit 和 Write 不同：Edit 必然需要文件存在且内容可匹配，所以文件必须存在 → 必须被读过。
-    if (ctx.read_state) |rs| {
-        const st = read_state.statPath(file_path) catch return error.FileNotFound;
-        const rec = rs.get(file_path) orelse return error.NotRead;
-        // staleness 双判:mtime 变但内容哈希没变 → 不算 stale(对齐 cc FileEdit)。
-        if (rec.mtime_ns != st.mtime_ns) {
-            const cur_hash = read_state.hashFileContent(file_path);
-            if (rec.content_hash == 0 or cur_hash != rec.content_hash) return error.StaleFile;
+    // Ordinary Edit requires a prior model-visible Read. A Lean-admitted
+    // whole-file recovery is different: the host already captured the exact
+    // source bytes, recovery-pre proved the source commitment current, and
+    // executeWholeFileExact reopens one no-follow fd and compares every byte
+    // again before writing. Requiring ReadState here would reintroduce a model
+    // round trip after the deterministic host rewrite and can reject a valid
+    // recovery even though its stronger source check is already authoritative.
+    if (ctx.project_edit_mode != .whole_file_exact) {
+        if (ctx.read_state) |rs| {
+            const st = read_state.statPath(file_path) catch return error.FileNotFound;
+            const rec = rs.get(file_path) orelse return error.NotRead;
+            // staleness 双判:mtime 变但内容哈希没变 → 不算 stale(对齐 cc FileEdit)。
+            if (rec.mtime_ns != st.mtime_ns) {
+                const cur_hash = read_state.hashFileContent(file_path);
+                if (rec.content_hash == 0 or cur_hash != rec.content_hash) return error.StaleFile;
+            }
         }
     }
 
@@ -164,6 +179,7 @@ fn finalizeWrite(
         old_raw,
         new_raw,
         write_fd,
+        true,
     );
 }
 
@@ -240,6 +256,7 @@ fn executeWholeFileExact(
         old_raw,
         new_raw,
         fd,
+        false,
     );
 }
 
@@ -280,6 +297,7 @@ fn finalizeCommittedWrite(
     old_raw: []const u8,
     new_raw: []const u8,
     write_fd: pfs.Fd,
+    expose_diff_to_model: bool,
 ) ![]u8 {
     ctx.reportFileMutation(file_path, .{ .known = old_content }, content);
 
@@ -300,6 +318,30 @@ fn finalizeCommittedWrite(
 
     // B/C 合并:memdir 记忆 markdown 自动入图(best-effort;content=编辑后全文)。
     @import("../kg/autosync.zig").maybeImportMemoryFile(ctx, file_path, content);
+
+    // The exact recovery source was captured by the host and was never made
+    // model-visible through Read.  Ordinary Edit/Write results include removed
+    // lines, but doing so here would turn Write permission into an implicit
+    // read/exfiltration channel.  Keep the old/new bytes in the local effect and
+    // highlight cache for host audit/UI, while returning only a bounded success
+    // receipt to the provider.  The replacement content is already present in
+    // the model's original Write proposal.
+    if (!expose_diff_to_model) {
+        var receipt: std.Io.Writer.Allocating = .init(allocator);
+        defer receipt.deinit();
+        try receipt.writer.writeAll("{\"file_path\":");
+        try std.json.Stringify.encodeJsonString(file_path, .{}, &receipt.writer);
+        try receipt.writer.writeAll(",\"success\":true,\"recovery\":\"lean_authorized_source_cas\"");
+        try @import("lsp_diag.zig").appendToResult(
+            ctx,
+            allocator,
+            &receipt.writer,
+            file_path,
+            content,
+        );
+        try receipt.writer.writeByte('}');
+        return try receipt.toOwnedSlice();
+    }
 
     // structuredPatch + gitDiff
     const patch_mod = @import("../core/patch.zig");

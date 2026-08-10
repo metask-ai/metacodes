@@ -45,11 +45,49 @@ from scripts.eval.project_harness_e3_pilot import (
 from scripts.eval.project_harness_e3_templates import build_templates
 
 
+def _assistant_tool_names(requests: list[dict]) -> list[str]:
+    names: list[str] = []
+    for request in requests:
+        messages = request.get("messages")
+        if not isinstance(messages, list):
+            continue
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                name = block.get("name")
+                if isinstance(name, str):
+                    names.append(name)
+    return names
+
+
+def _tool_result_contents(requests: list[dict]) -> list[object]:
+    contents: list[object] = []
+    for request in requests:
+        messages = request.get("messages")
+        if not isinstance(messages, list):
+            continue
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    contents.append(block.get("content"))
+    return contents
+
+
 class _Provider:
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
         self.requests: list[dict] = []
-        self.recovery_contracts: list[dict] = []
         self.server: socketserver.TCPServer | None = None
         self.thread: threading.Thread | None = None
 
@@ -111,7 +149,6 @@ class _Provider:
 class _HazardProvider(_Provider):
     def __enter__(self) -> "_HazardProvider":
         outer = self
-        old = "service: atlas\nstrategy: recreate\nreplicas: 1\n"
         new = "# managed deployment\nservice: atlas\nreplicas: 3\nstrategy: rolling\n"
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -139,38 +176,18 @@ class _HazardProvider(_Provider):
                     )
                 elif "verify-deploy" in results:
                     response = _text_sse("completed", index)
-                elif "edit-deploy" in results:
-                    response = _tool_sse(
-                        [("verify-deploy", "Read", {"file_path": str(outer.workspace / "deploy.yaml")})],
-                        index,
-                    )
-                elif "project_rule_blocked" in results.get("write-deploy", ""):
-                    try:
-                        error = json.loads(results["write-deploy"])["error"]
-                        recovery = error["recovery"]
-                        valid_recovery = (
-                            error["recoverable"] is False
-                            and recovery["task_recoverable"] is True
-                            and recovery["action"] == "edit_existing_file_exact"
-                            and any(
-                                "ends with a newline" in requirement
-                                for requirement in recovery["requirements"]
-                            )
-                        )
-                    except (KeyError, TypeError, json.JSONDecodeError):
-                        valid_recovery = False
-                    if valid_recovery:
-                        outer.recovery_contracts.append(recovery)
+                elif "write-deploy" in results:
+                    # Both the signal arm's ordinary Write and the enforced
+                    # arm's Lean-authorized host rewrite complete under the
+                    # original tool id. The provider never receives a repair
+                    # contract and never has to reconstruct exact Edit bytes.
+                    if (outer.workspace / "deploy.yaml").read_text(encoding="utf-8") == new:
                         response = _tool_sse(
-                            [("edit-deploy", "Edit", {
-                                "file_path": str(outer.workspace / "deploy.yaml"),
-                                "old_string": old,
-                                "new_string": new,
-                            })],
+                            [("verify-deploy", "Read", {"file_path": str(outer.workspace / "deploy.yaml")})],
                             index,
                         )
                     else:
-                        response = _text_sse("missing governed recovery contract", index)
+                        response = _text_sse("host rewrite did not settle", index)
                 else:
                     response = _text_sse("completed", index)
                 self.send_response(200)
@@ -340,7 +357,7 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
             self.assertNotIn("# Knowledge Graph", first_system)
             self.assertNotIn(str(run_dir), first_system)
 
-    def test_real_evolved_runner_blocks_before_dispatch_and_recovers(self) -> None:
+    def test_real_evolved_runner_lean_authorizes_host_source_cas_rewrite(self) -> None:
         binary_raw = os.environ.get("METACODES_TEST_PROJECT_HARNESS_PRODUCTION_BIN")
         driver_raw = os.environ.get("METACODES_TEST_PROJECT_HARNESS_LIFECYCLE_DRIVER")
         kernel_raw = os.environ.get("METACODES_TEST_PROJECT_KERNEL_PATH")
@@ -455,9 +472,15 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
                         test_base_url=provider.url,
                     )
             self.assertEqual(signal_provider.requests[0], provider.requests[0])
-            self.assertEqual(
-                ["edit_existing_file_exact"],
-                [item["action"] for item in provider.recovery_contracts],
+            # Request bodies also contain the complete tool schema, including
+            # Edit. Inspect only provider-visible assistant tool_use blocks so
+            # this proves the model never reconstructed or requested an Edit.
+            self.assertNotIn("Edit", _assistant_tool_names(provider.requests[1:]))
+            # Likewise, inspect only tool_result content rather than matching
+            # unrelated schemas or metadata in the complete request body.
+            self.assertNotIn(
+                "project_rule_blocked",
+                json.dumps(_tool_result_contents(provider.requests[1:]), sort_keys=True),
             )
             receipt = json.loads(Path(item["receipt_path"]).read_text(encoding="utf-8"))
             governance = receipt["governance"]
@@ -466,7 +489,10 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
             self.assertTrue(governance["existing_file_write_recurrence"])
             self.assertFalse(governance["existing_file_write_dispatch"])
             self.assertFalse(governance["realized_existing_file_write_effect"])
+            self.assertEqual(1, governance["symbolic_write_to_exact_edit_rewrites"])
             self.assertEqual(1, governance["exact_edit_recovery_directions"])
+            self.assertEqual(1, governance["exact_edit_recovery_pre_admits"])
+            self.assertEqual(1, governance["exact_edit_recovery_post_admits"])
             self.assertTrue(governance["recovery_after_block"])
             self.assertTrue(governance["trustworthy_task_success"])
 

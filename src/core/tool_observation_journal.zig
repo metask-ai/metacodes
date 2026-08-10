@@ -643,6 +643,7 @@ fn validateFd(
                             .operation = standardFormalOperation(formal.phase),
                             .actuation = formal.actuation,
                             .result = formal.result,
+                            .recovery_action = .none,
                             .candidate_id = formal.candidate_id,
                             .project_sha256 = formal.project_sha256,
                             .bundle_sha256 = formal.bundle_sha256,
@@ -656,7 +657,7 @@ fn validateFd(
                             .checker_failure = formal.checker_failure,
                             .checker_bytes = formal.checker_bytes,
                             .is_batch = false,
-                        });
+                        }, .{ .is_batch = false, .first = true, .last = true });
                     },
                     .formal_decision_batch => |batch| {
                         const legacy_v1 = std.mem.eql(
@@ -687,7 +688,7 @@ fn validateFd(
                             (batch.decisions.len < batch.checker_batch_size and
                                 batch.decisions[batch.decisions.len - 1].result == .admit))
                             return error.InvalidRecord;
-                        for (batch.decisions) |decision| {
+                        for (batch.decisions, 0..) |decision, decision_index| {
                             const operation = if (current_schema)
                                 decision.operation
                             else
@@ -704,6 +705,7 @@ fn validateFd(
                                 .operation = operation,
                                 .actuation = batch.actuation,
                                 .result = decision.result,
+                                .recovery_action = decision.recovery_action,
                                 .candidate_id = decision.candidate_id,
                                 .project_sha256 = batch.project_sha256,
                                 .bundle_sha256 = batch.bundle_sha256,
@@ -717,6 +719,10 @@ fn validateFd(
                                 .checker_failure = decision.checker_failure,
                                 .checker_bytes = batch.checker_bytes,
                                 .is_batch = true,
+                            }, .{
+                                .is_batch = true,
+                                .first = decision_index == 0,
+                                .last = decision_index + 1 == batch.decisions.len,
                             });
                         }
                     },
@@ -728,7 +734,9 @@ fn validateFd(
                         try seen_dispatches.put(key, 0);
                         const formal_state = formal_dispatches.getPtr(key);
                         if (formal_state) |state| {
-                            if (state.terminal_pre or state.pre_count == 0 or state.started)
+                            if (state.terminal_pre or state.pre_count == 0 or
+                                state.started or state.batch_open or
+                                state.validating_recovery)
                                 return error.InvalidRecord;
                             state.started = true;
                         }
@@ -745,6 +753,8 @@ fn validateFd(
                             .expected_post_count = if (formal_state) |state| state.pre_count else 0,
                             .post_count = 0,
                             .terminal_post = false,
+                            .post_batch_open = false,
+                            .post_batch_seen = false,
                         };
                     },
                     .dispatch_finished => |finished| {
@@ -757,10 +767,11 @@ fn validateFd(
                             finished.dispatched_name,
                             finished.origin,
                             finished.agent_depth,
-                        )) or (entry.value.governed and
-                            (entry.value.post_count == 0 or
-                                (!entry.value.terminal_post and
-                                    entry.value.post_count != entry.value.expected_post_count))))
+                        )) or entry.value.post_batch_open or
+                            (entry.value.governed and
+                                (entry.value.post_count == 0 or
+                                    (!entry.value.terminal_post and
+                                        entry.value.post_count != entry.value.expected_post_count))))
                             return error.InvalidRecord;
                     },
                 }
@@ -853,14 +864,24 @@ const FormalControlIdentity = struct {
 
 const FormalDispatchState = struct {
     identity: FormalControlIdentity,
+    /// Number of candidate admissions in the latest pre-dispatch generation.
+    /// A governed rewrite starts a new generation; the denied Write generation
+    /// must not inflate the Edit generation's required post cardinality.
     pre_count: u32,
     terminal_pre: bool,
     started: bool,
+    generation: u32,
+    pending_recovery_candidate: ?[64]u8,
+    validating_recovery: bool,
+    recovery_seen: bool,
+    batch_open: bool,
 };
 
 const PreDecision = struct {
     identity: FormalControlIdentity,
     result: observation.FormalResult,
+    generation: u32,
+    post_seen: bool,
 };
 
 const OpenDispatch = struct {
@@ -869,6 +890,8 @@ const OpenDispatch = struct {
     expected_post_count: u32,
     post_count: u32,
     terminal_post: bool,
+    post_batch_open: bool,
+    post_batch_seen: bool,
 };
 
 const FormalRecord = struct {
@@ -877,6 +900,7 @@ const FormalRecord = struct {
     operation: observation.FormalOperation,
     actuation: observation.FormalActuation,
     result: observation.FormalResult,
+    recovery_action: observation.FormalRecoveryAction,
     candidate_id: [64]u8,
     project_sha256: [64]u8,
     bundle_sha256: [64]u8,
@@ -892,6 +916,12 @@ const FormalRecord = struct {
     is_batch: bool,
 };
 
+const FormalBatchBoundary = struct {
+    is_batch: bool,
+    first: bool,
+    last: bool,
+};
+
 const FormalValidationState = struct {
     open_dispatches: *std.AutoHashMap([32]u8, OpenDispatch),
     seen_dispatches: *std.AutoHashMap([32]u8, u8),
@@ -900,7 +930,11 @@ const FormalValidationState = struct {
     formal_dispatches: *std.AutoHashMap([32]u8, FormalDispatchState),
 };
 
-fn acceptFormalDecision(state: *FormalValidationState, formal: FormalRecord) !void {
+fn acceptFormalDecision(
+    state: *FormalValidationState,
+    formal: FormalRecord,
+    boundary: FormalBatchBoundary,
+) !void {
     if (formal.dispatch_id.len == 0 or formal.dispatch_id.len > 256 or
         formal.operation.phase() != formal.phase or
         formal.bundle_revision == 0 or
@@ -931,6 +965,7 @@ fn acceptFormalDecision(state: *FormalValidationState, formal: FormalRecord) !vo
         formal.dispatch_id,
         formal.candidate_id,
         formal.operation,
+        formal.request_sha256,
     );
     if (state.formal_events.contains(event_key)) return error.InvalidRecord;
     try state.formal_events.put(event_key, 0);
@@ -948,54 +983,192 @@ fn acceptFormalDecision(state: *FormalValidationState, formal: FormalRecord) !vo
                 return error.InvalidRecord;
             const state_entry = try state.formal_dispatches.getOrPut(dispatch_key);
             if (!state_entry.found_existing) {
+                if (boundary.is_batch and !boundary.first)
+                    return error.InvalidRecord;
                 state_entry.value_ptr.* = .{
                     .identity = identity,
                     .pre_count = 0,
                     .terminal_pre = false,
                     .started = false,
+                    .generation = 0,
+                    .pending_recovery_candidate = null,
+                    .validating_recovery = false,
+                    .recovery_seen = false,
+                    .batch_open = boundary.is_batch,
                 };
-            } else if (!std.meta.eql(state_entry.value_ptr.identity, identity) or
-                state_entry.value_ptr.terminal_pre)
+            } else {
+                const dispatch_state = state_entry.value_ptr;
+                if (!std.meta.eql(dispatch_state.identity, identity) or
+                    dispatch_state.started)
+                    return error.InvalidRecord;
+                if (boundary.is_batch and boundary.first) {
+                    // The only legal second pre batch is the explicit recovery
+                    // transition selected by the preceding enforced block.
+                    if (dispatch_state.batch_open or
+                        !dispatch_state.terminal_pre or
+                        dispatch_state.pending_recovery_candidate == null)
+                        return error.InvalidRecord;
+                    dispatch_state.generation = std.math.add(
+                        u32,
+                        dispatch_state.generation,
+                        1,
+                    ) catch return error.InvalidRecord;
+                    dispatch_state.pre_count = 0;
+                    dispatch_state.terminal_pre = false;
+                    dispatch_state.validating_recovery = true;
+                    dispatch_state.recovery_seen = false;
+                    dispatch_state.batch_open = true;
+                } else if (boundary.is_batch) {
+                    if (!dispatch_state.batch_open or dispatch_state.terminal_pre)
+                        return error.InvalidRecord;
+                } else if (dispatch_state.batch_open or
+                    dispatch_state.terminal_pre or
+                    dispatch_state.validating_recovery)
+                    return error.InvalidRecord;
+            }
+            const dispatch_state = state_entry.value_ptr;
+            if (formal.operation.isRecovery()) {
+                // Product auto-recovery starts a second generation under the
+                // original Write id.  Direct/embedding callers deliberately
+                // default auto-recovery off, so their model-authored Edit uses
+                // a fresh id.  Preserve that public path, but accept its
+                // recovery operation only when this run already contains an
+                // outstanding enforced recovery direction for the exact
+                // candidate and control identity.  Move that obligation to the
+                // new dispatch rather than merely observing it: a successful
+                // recovery must not leave stale authority behind, while a
+                // retry-eligible block can explicitly transfer it again.
+                // A bare recovery label is not authority.
+                if (!dispatch_state.validating_recovery) {
+                    if (!takePendingRecoveryCandidate(
+                        state.formal_dispatches,
+                        formal.candidate_id,
+                        identity,
+                    )) return error.InvalidRecord;
+                    dispatch_state.validating_recovery = true;
+                    dispatch_state.pending_recovery_candidate = formal.candidate_id;
+                }
+                const expected = dispatch_state.pending_recovery_candidate orelse
+                    return error.InvalidRecord;
+                if (dispatch_state.recovery_seen or
+                    !std.mem.eql(u8, &expected, &formal.candidate_id))
+                    return error.InvalidRecord;
+                dispatch_state.recovery_seen = true;
+            } else if (formal.operation != .pre_decision) {
                 return error.InvalidRecord;
-            state_entry.value_ptr.pre_count = std.math.add(
+            }
+            dispatch_state.pre_count = std.math.add(
                 u32,
-                state_entry.value_ptr.pre_count,
+                dispatch_state.pre_count,
                 1,
             ) catch return error.InvalidRecord;
-            if (formal.actuation == .enforced and formal.result != .admit)
-                state_entry.value_ptr.terminal_pre = true;
-            try state.pre_decisions.put(
-                formalPairKey(
-                    formal.dispatch_id,
-                    formal.candidate_id,
-                    formal.operation,
-                ),
-                .{ .identity = identity, .result = formal.result },
+            const pair_key = formalPairKey(
+                formal.dispatch_id,
+                formal.candidate_id,
+                formal.operation,
             );
+            if (state.pre_decisions.get(pair_key)) |prior| {
+                if (prior.generation == dispatch_state.generation)
+                    return error.InvalidRecord;
+            }
+            try state.pre_decisions.put(pair_key, .{
+                .identity = identity,
+                .result = formal.result,
+                .generation = dispatch_state.generation,
+                .post_seen = false,
+            });
+            if (formal.actuation == .enforced and formal.result != .admit) {
+                dispatch_state.terminal_pre = true;
+                dispatch_state.pending_recovery_candidate =
+                    if (formal.result == .block and
+                    formal.recovery_action == .edit_existing_file_exact and
+                    (!dispatch_state.validating_recovery or
+                        formal.operation == .recovery_pre_decision))
+                        formal.candidate_id
+                    else
+                        null;
+            }
+            if (boundary.is_batch and boundary.last) {
+                if (!dispatch_state.batch_open or
+                    (dispatch_state.validating_recovery and
+                        !dispatch_state.recovery_seen))
+                    return error.InvalidRecord;
+                dispatch_state.batch_open = false;
+                if (dispatch_state.validating_recovery) {
+                    dispatch_state.validating_recovery = false;
+                    if (!dispatch_state.terminal_pre)
+                        dispatch_state.pending_recovery_candidate = null;
+                } else if (!dispatch_state.terminal_pre) {
+                    dispatch_state.pending_recovery_candidate = null;
+                }
+            }
         },
         .post => {
             const opened = state.open_dispatches.getPtr(dispatch_key) orelse
                 return error.InvalidRecord;
             const dispatch_state = state.formal_dispatches.get(dispatch_key) orelse
                 return error.InvalidRecord;
-            const prior = state.pre_decisions.get(
-                formalPairKey(
-                    formal.dispatch_id,
-                    formal.candidate_id,
-                    formal.operation,
-                ),
-            ) orelse return error.InvalidRecord;
+            if (boundary.is_batch and boundary.first) {
+                if (opened.post_batch_open or opened.post_batch_seen or
+                    opened.post_count != 0)
+                    return error.InvalidRecord;
+                opened.post_batch_open = true;
+                opened.post_batch_seen = true;
+            } else if (boundary.is_batch) {
+                if (!opened.post_batch_open) return error.InvalidRecord;
+            } else if (opened.post_batch_open or opened.post_batch_seen) {
+                return error.InvalidRecord;
+            }
+            const pair_key = formalPairKey(
+                formal.dispatch_id,
+                formal.candidate_id,
+                formal.operation,
+            );
+            const prior = state.pre_decisions.getPtr(pair_key) orelse
+                return error.InvalidRecord;
             if (!opened.governed or opened.terminal_post or
                 (formal.actuation == .enforced and prior.result != .admit) or
+                prior.generation != dispatch_state.generation or
+                prior.post_seen or
                 !std.meta.eql(prior.identity, identity) or
                 !std.meta.eql(dispatch_state.identity, identity))
                 return error.InvalidRecord;
+            prior.post_seen = true;
             opened.post_count = std.math.add(u32, opened.post_count, 1) catch
+                return error.InvalidRecord;
+            if (opened.post_count > opened.expected_post_count)
                 return error.InvalidRecord;
             if (formal.actuation == .enforced and formal.result != .admit)
                 opened.terminal_post = true;
+            if (boundary.is_batch and boundary.last) {
+                if (!opened.post_batch_open) return error.InvalidRecord;
+                opened.post_batch_open = false;
+            }
         },
     }
+}
+
+/// Consume exactly one outstanding direction and transfer it to a fresh
+/// recovery dispatch.  Matching the complete control identity prevents a rule
+/// from borrowing an obligation emitted under another project, bundle revision,
+/// kernel, or actuation mode.  Candidate identity alone is not sufficient.
+fn takePendingRecoveryCandidate(
+    formal_dispatches: *std.AutoHashMap([32]u8, FormalDispatchState),
+    candidate_id: [64]u8,
+    identity: FormalControlIdentity,
+) bool {
+    var states = formal_dispatches.valueIterator();
+    while (states.next()) |state| {
+        const pending = state.pending_recovery_candidate orelse continue;
+        if (state.terminal_pre and !state.started and
+            std.meta.eql(state.identity, identity) and
+            std.mem.eql(u8, &pending, &candidate_id))
+        {
+            state.pending_recovery_candidate = null;
+            return true;
+        }
+    }
+    return false;
 }
 
 fn formalIdentity(formal: anytype) FormalControlIdentity {
@@ -1021,13 +1194,15 @@ fn formalEventKey(
     dispatch_id: []const u8,
     candidate_id: [64]u8,
     operation: observation.FormalOperation,
+    request_sha256: [64]u8,
 ) [32]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("metacodes-formal-event-key-v2\x00");
+    hasher.update("metacodes-formal-event-key-v3\x00");
     hasher.update(dispatch_id);
     hasher.update("\x00");
     hasher.update(&candidate_id);
     hasher.update(&.{@intFromEnum(operation)});
+    hasher.update(&request_sha256);
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     return digest;
@@ -1415,6 +1590,336 @@ test "formal journal enforces pre dispatch post finish wiring and permits pre bl
     const recovery_events = [_]observation.Event{recovery_event};
     try writeTestRun(recovery_dir, sid, &recovery_events);
     _ = try validate(recovery_dir, sid);
+
+    // A selected exact recovery is a second pre generation for the same
+    // model tool-use id.  Only that latest generation owes post decisions;
+    // the denied Write generation remains durable provenance, not an extra
+    // post obligation for the host-synthesized Edit.
+    const initial_rewrite_decisions = [_]observation.FormalCandidateDecision{
+        .{
+            .result = .admit,
+            .candidate_id = .{'1'} ** 64,
+            .request_sha256 = .{'5'} ** 64,
+            .verdict_sha256 = .{'6'} ** 64,
+            .checker_failure = null,
+        },
+        .{
+            .result = .block,
+            .recovery_action = .edit_existing_file_exact,
+            .candidate_id = .{'2'} ** 64,
+            .request_sha256 = .{'7'} ** 64,
+            .verdict_sha256 = .{'8'} ** 64,
+            .checker_failure = null,
+        },
+    };
+    const rewrite_pre_decisions = [_]observation.FormalCandidateDecision{
+        .{
+            .result = .admit,
+            .candidate_id = .{'1'} ** 64,
+            .request_sha256 = .{'9'} ** 64,
+            .verdict_sha256 = .{'a'} ** 64,
+            .checker_failure = null,
+        },
+        .{
+            .operation = .recovery_pre_decision,
+            .result = .admit,
+            .candidate_id = .{'2'} ** 64,
+            .request_sha256 = .{'b'} ** 64,
+            .verdict_sha256 = .{'c'} ** 64,
+            .checker_failure = null,
+        },
+    };
+    const rewrite_post_decisions = [_]observation.FormalCandidateDecision{
+        .{
+            .operation = .post_decision,
+            .result = .admit,
+            .candidate_id = .{'1'} ** 64,
+            .request_sha256 = .{'d'} ** 64,
+            .verdict_sha256 = .{'e'} ** 64,
+            .checker_failure = null,
+        },
+        .{
+            .operation = .recovery_post_decision,
+            .result = .admit,
+            .candidate_id = .{'2'} ** 64,
+            .request_sha256 = .{'f'} ** 64,
+            .verdict_sha256 = .{'0'} ** 64,
+            .checker_failure = null,
+        },
+    };
+    var initial_rewrite = testFormalBatchEvent(
+        "exact-rewrite",
+        .pre,
+        2,
+        &initial_rewrite_decisions,
+    );
+    initial_rewrite.formal_decision_batch.file_target_state = .regular_existing;
+    var rewrite_start = testDispatchStart("exact-rewrite");
+    rewrite_start.dispatch_started.dispatched_name = "Edit";
+    var rewrite_finish = testDispatchFinish("exact-rewrite");
+    rewrite_finish.dispatch_finished.dispatched_name = "Edit";
+    const exact_rewrite_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/exact-rewrite",
+        .{root},
+    );
+    defer std.testing.allocator.free(exact_rewrite_dir);
+    const exact_rewrite_events = [_]observation.Event{
+        initial_rewrite,
+        testFormalBatchEvent("exact-rewrite", .pre, 2, &rewrite_pre_decisions),
+        rewrite_start,
+        testFormalBatchEvent("exact-rewrite", .post, 2, &rewrite_post_decisions),
+        rewrite_finish,
+    };
+    try writeTestRun(exact_rewrite_dir, sid, &exact_rewrite_events);
+    _ = try validate(exact_rewrite_dir, sid);
+
+    var missing_recovery = rewrite_pre_decisions;
+    missing_recovery[1].operation = .pre_decision;
+    const missing_recovery_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/missing-recovery-transition",
+        .{root},
+    );
+    defer std.testing.allocator.free(missing_recovery_dir);
+    const missing_recovery_events = [_]observation.Event{
+        initial_rewrite,
+        testFormalBatchEvent("exact-rewrite", .pre, 2, &missing_recovery),
+    };
+    try writeTestRun(missing_recovery_dir, sid, &missing_recovery_events);
+    try std.testing.expectError(error.InvalidRecord, validate(missing_recovery_dir, sid));
+
+    var wrong_recovery = rewrite_pre_decisions;
+    wrong_recovery[0].operation = .recovery_pre_decision;
+    wrong_recovery[1].operation = .pre_decision;
+    const wrong_recovery_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/wrong-recovery-candidate",
+        .{root},
+    );
+    defer std.testing.allocator.free(wrong_recovery_dir);
+    const wrong_recovery_events = [_]observation.Event{
+        initial_rewrite,
+        testFormalBatchEvent("exact-rewrite", .pre, 2, &wrong_recovery),
+    };
+    try writeTestRun(wrong_recovery_dir, sid, &wrong_recovery_events);
+    try std.testing.expectError(error.InvalidRecord, validate(wrong_recovery_dir, sid));
+
+    var stale_source_post = rewrite_post_decisions;
+    stale_source_post[1].operation = .post_decision;
+    const stale_source_post_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/stale-source-post",
+        .{root},
+    );
+    defer std.testing.allocator.free(stale_source_post_dir);
+    const stale_source_post_events = [_]observation.Event{
+        initial_rewrite,
+        testFormalBatchEvent("exact-rewrite", .pre, 2, &rewrite_pre_decisions),
+        rewrite_start,
+        testFormalBatchEvent("exact-rewrite", .post, 2, &stale_source_post),
+        rewrite_finish,
+    };
+    try writeTestRun(stale_source_post_dir, sid, &stale_source_post_events);
+    try std.testing.expectError(error.InvalidRecord, validate(stale_source_post_dir, sid));
+
+    // Direct/embedding RuntimeGate construction deliberately leaves automatic
+    // host synthesis disabled. Its legitimate recovery therefore arrives as
+    // a later model-authored Edit with a fresh tool-use id. Keep accepting that
+    // public path, but only when an earlier enforced block in this same run
+    // selected exact recovery for the same candidate.
+    var manual_direction = testFormalBatchEvent(
+        "manual-write",
+        .pre,
+        1,
+        &recovery_decisions,
+    );
+    manual_direction.formal_decision_batch.file_target_state = .regular_existing;
+    const manual_recovery_pre_decisions = [_]observation.FormalCandidateDecision{.{
+        .operation = .recovery_pre_decision,
+        .result = .admit,
+        .candidate_id = .{'1'} ** 64,
+        .request_sha256 = .{'7'} ** 64,
+        .verdict_sha256 = .{'8'} ** 64,
+        .checker_failure = null,
+    }};
+    const manual_recovery_post_decisions = [_]observation.FormalCandidateDecision{.{
+        .operation = .recovery_post_decision,
+        .result = .admit,
+        .candidate_id = .{'1'} ** 64,
+        .request_sha256 = .{'9'} ** 64,
+        .verdict_sha256 = .{'a'} ** 64,
+        .checker_failure = null,
+    }};
+    var manual_start = testDispatchStart("manual-edit");
+    manual_start.dispatch_started.requested_name = "Edit";
+    manual_start.dispatch_started.dispatched_name = "Edit";
+    var manual_finish = testDispatchFinish("manual-edit");
+    manual_finish.dispatch_finished.requested_name = "Edit";
+    manual_finish.dispatch_finished.dispatched_name = "Edit";
+    const manual_recovery_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/manual-recovery-new-id",
+        .{root},
+    );
+    defer std.testing.allocator.free(manual_recovery_dir);
+    const manual_recovery_events = [_]observation.Event{
+        manual_direction,
+        testFormalBatchEvent(
+            "manual-edit",
+            .pre,
+            1,
+            &manual_recovery_pre_decisions,
+        ),
+        manual_start,
+        testFormalBatchEvent(
+            "manual-edit",
+            .post,
+            1,
+            &manual_recovery_post_decisions,
+        ),
+        manual_finish,
+    };
+    try writeTestRun(manual_recovery_dir, sid, &manual_recovery_events);
+    _ = try validate(manual_recovery_dir, sid);
+
+    // The successful recovery consumed the only outstanding direction.  A
+    // later recovery-labelled pre decision cannot borrow stale authority from
+    // the already completed Edit.
+    const consumed_direction_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/manual-recovery-consumed",
+        .{root},
+    );
+    defer std.testing.allocator.free(consumed_direction_dir);
+    const consumed_direction_events = [_]observation.Event{
+        manual_direction,
+        testFormalBatchEvent(
+            "manual-edit",
+            .pre,
+            1,
+            &manual_recovery_pre_decisions,
+        ),
+        manual_start,
+        testFormalBatchEvent(
+            "manual-edit",
+            .post,
+            1,
+            &manual_recovery_post_decisions,
+        ),
+        manual_finish,
+        testFormalBatchEvent(
+            "manual-edit-stale",
+            .pre,
+            1,
+            &manual_recovery_pre_decisions,
+        ),
+    };
+    try writeTestRun(consumed_direction_dir, sid, &consumed_direction_events);
+    try std.testing.expectError(
+        error.InvalidRecord,
+        validate(consumed_direction_dir, sid),
+    );
+
+    // A Lean retry direction transfers the same outstanding obligation to the
+    // next fresh tool-use id.  This is the direct/embedding compatibility path
+    // when automatic host synthesis is disabled.
+    const retryable_recovery_pre_decisions = [_]observation.FormalCandidateDecision{.{
+        .operation = .recovery_pre_decision,
+        .result = .block,
+        .recovery_action = .edit_existing_file_exact,
+        .candidate_id = .{'1'} ** 64,
+        .request_sha256 = .{'b'} ** 64,
+        .verdict_sha256 = .{'c'} ** 64,
+        .checker_failure = null,
+    }};
+    var retry_start = manual_start;
+    retry_start.dispatch_started.id = "manual-edit-retry";
+    var retry_finish = manual_finish;
+    retry_finish.dispatch_finished.id = "manual-edit-retry";
+    var retryable_recovery_event = testFormalBatchEvent(
+        "manual-edit-malformed",
+        .pre,
+        1,
+        &retryable_recovery_pre_decisions,
+    );
+    retryable_recovery_event.formal_decision_batch.file_target_state =
+        .regular_existing;
+    const retry_transfer_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/manual-recovery-retry-transfer",
+        .{root},
+    );
+    defer std.testing.allocator.free(retry_transfer_dir);
+    const retry_transfer_events = [_]observation.Event{
+        manual_direction,
+        retryable_recovery_event,
+        testFormalBatchEvent(
+            "manual-edit-retry",
+            .pre,
+            1,
+            &manual_recovery_pre_decisions,
+        ),
+        retry_start,
+        testFormalBatchEvent(
+            "manual-edit-retry",
+            .post,
+            1,
+            &manual_recovery_post_decisions,
+        ),
+        retry_finish,
+    };
+    try writeTestRun(retry_transfer_dir, sid, &retry_transfer_events);
+    _ = try validate(retry_transfer_dir, sid);
+
+    // Candidate equality cannot bridge a project-rule revision.  The complete
+    // formal control identity is part of the outstanding direction.
+    var cross_revision_recovery = testFormalBatchEvent(
+        "manual-edit-cross-revision",
+        .pre,
+        1,
+        &manual_recovery_pre_decisions,
+    );
+    cross_revision_recovery.formal_decision_batch.bundle_revision = 2;
+    const cross_revision_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/manual-recovery-cross-revision",
+        .{root},
+    );
+    defer std.testing.allocator.free(cross_revision_dir);
+    const cross_revision_events = [_]observation.Event{
+        manual_direction,
+        cross_revision_recovery,
+    };
+    try writeTestRun(cross_revision_dir, sid, &cross_revision_events);
+    try std.testing.expectError(
+        error.InvalidRecord,
+        validate(cross_revision_dir, sid),
+    );
+
+    const forged_manual_recovery_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/manual-recovery-without-direction",
+        .{root},
+    );
+    defer std.testing.allocator.free(forged_manual_recovery_dir);
+    const forged_manual_recovery_events = [_]observation.Event{
+        testFormalBatchEvent(
+            "manual-edit",
+            .pre,
+            1,
+            &manual_recovery_pre_decisions,
+        ),
+    };
+    try writeTestRun(
+        forged_manual_recovery_dir,
+        sid,
+        &forged_manual_recovery_events,
+    );
+    try std.testing.expectError(
+        error.InvalidRecord,
+        validate(forged_manual_recovery_dir, sid),
+    );
 
     var forged_legacy_recovery = recovery_event;
     forged_legacy_recovery.formal_decision_batch.schema_version =

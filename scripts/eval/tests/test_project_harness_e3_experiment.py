@@ -18,6 +18,10 @@ from scripts.eval.project_harness_e3_experiment import (
     LEGACY_ROLLOUT_SCHEMA,
     LEGACY_SCHEDULE_SEED,
     ROLLOUT_SCHEMA,
+    V2_ANALYSIS_PLAN,
+    V2_CASES,
+    V2_ROLLOUT_SCHEMA,
+    V2_SCHEDULE_SEED,
     CORRECTION_FAMILY,
     _canonical_sha256,
     _harness_fingerprint,
@@ -245,9 +249,33 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
         self.assertEqual(8, ANALYSIS_PLAN["expected_exact_edit_recovery_directions"])
         self.assertEqual(8, ANALYSIS_PLAN["expected_exact_edit_recovery_pre_admits"])
         self.assertEqual(8, ANALYSIS_PLAN["expected_exact_edit_recovery_post_admits"])
+        self.assertEqual(8, ANALYSIS_PLAN["expected_symbolic_write_to_exact_edit_rewrites"])
         self.assertTrue(
             {case["id"] for case in CASES}.isdisjoint(
                 {case["id"] for case in LEGACY_CASES}
+            )
+        )
+        self.assertTrue(
+            {case["id"] for case in CASES}.isdisjoint(
+                {case["id"] for case in V2_CASES}
+            )
+        )
+        self.assertTrue(
+            {case["prompt"] for case in CASES}.isdisjoint(
+                {case["prompt"] for case in (*LEGACY_CASES, *V2_CASES)}
+            )
+        )
+        self.assertTrue(
+            {
+                name
+                for case in CASES
+                for name in case["initial_files"]
+            }.isdisjoint(
+                {
+                    name
+                    for case in (*LEGACY_CASES, *V2_CASES)
+                    for name in case["initial_files"]
+                }
             )
         )
         self.assertTrue(
@@ -263,10 +291,16 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
             48,
             len(_schedule(LEGACY_CASES, LEGACY_SCHEDULE_SEED)),
         )
+        self.assertEqual(48, len(_schedule(V2_CASES, V2_SCHEDULE_SEED)))
         self.assertNotEqual(ANALYSIS_PLAN, LEGACY_ANALYSIS_PLAN)
+        self.assertNotEqual(ANALYSIS_PLAN, V2_ANALYSIS_PLAN)
         self.assertEqual(
             ROLLOUT_SCHEMA,
             rollout_schema_for_manifest({"analysis_plan": ANALYSIS_PLAN}),
+        )
+        self.assertEqual(
+            V2_ROLLOUT_SCHEMA,
+            rollout_schema_for_manifest({"analysis_plan": V2_ANALYSIS_PLAN}),
         )
         self.assertEqual(
             LEGACY_ROLLOUT_SCHEMA,
@@ -379,6 +413,7 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
                             "exact_edit_recovery_pre_blocks": 1 if hazard and evolved else 0,
                             "exact_edit_recovery_post_admits": 1 if hazard and evolved else 0,
                             "exact_edit_recovery_post_blocks": 0,
+                            "symbolic_write_to_exact_edit_rewrites": 1 if hazard and evolved else 0,
                         },
                     }
                 )
@@ -583,6 +618,139 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
         self.assertEqual(1, result["enforced_hazard_blocks"])
         self.assertEqual(0, result["repeated_prohibited_attempts_after_block"])
         self.assertTrue(result["trustworthy_task_success"])
+
+    def test_lean_authorized_host_rewrite_is_recovery_not_write_dispatch(self) -> None:
+        project = "1" * 64
+        kernel = "2" * 64
+        candidate = "3" * 64
+
+        def decision_batch(
+            *,
+            phase: str,
+            operation: str,
+            result: str,
+            recovery_action: str,
+            sequence_token: str,
+        ) -> dict:
+            return {
+                "schema_version": "metacodes-project-formal-decision-batch-v4",
+                "dispatch_id": "write-1",
+                "phase": phase,
+                "actuation": "enforced",
+                "file_target_state": "regular_existing",
+                "project_sha256": project,
+                "bundle_sha256": "4" * 64,
+                "bundle_revision": 1,
+                "kernel_sha256": kernel,
+                "checker_call_sha256": sequence_token * 64,
+                "checker_verdict_sha256": sequence_token * 64,
+                "checker_batch_size": 1,
+                "checker_elapsed_ns": 1,
+                "checker_bytes": 1,
+                "decisions": [{
+                    "operation": operation,
+                    "candidate_id": candidate,
+                    "result": result,
+                    "recovery_action": recovery_action,
+                    "request_sha256": sequence_token * 64,
+                    "verdict_sha256": sequence_token * 64,
+                    "checker_failure": None,
+                }],
+            }
+
+        direction = decision_batch(
+            phase="pre",
+            operation="pre_decision",
+            result="block",
+            recovery_action="edit_existing_file_exact",
+            sequence_token="5",
+        )
+        recovery_pre = decision_batch(
+            phase="pre",
+            operation="recovery_pre_decision",
+            result="admit",
+            recovery_action="none",
+            sequence_token="6",
+        )
+        recovery_post = decision_batch(
+            phase="post",
+            operation="recovery_post_decision",
+            result="admit",
+            recovery_action="none",
+            sequence_token="7",
+        )
+        records = b"".join(
+            [
+                _record(0, {"run_started": {}}),
+                _record(1, {"tool_observation": {"formal_decision_batch": direction}}),
+                _record(2, {"tool_observation": {"formal_decision_batch": recovery_pre}}),
+                _record(3, {"tool_observation": {"dispatch_started": {
+                    "id": "write-1", "requested_name": "Write", "dispatched_name": "Edit",
+                    "origin": "authoritative", "file_target_state": "regular_existing",
+                }}}),
+                _record(4, {"tool_observation": {"formal_decision_batch": recovery_post}}),
+                _record(5, {"tool_observation": {"dispatch_finished": {
+                    "id": "write-1", "requested_name": "Write", "dispatched_name": "Edit",
+                    "origin": "authoritative", "outcome": "succeeded", "effect_valid": True,
+                    "effect": None,
+                }}}),
+                _record(6, {"run_finished": {"stop_reason": "end_turn"}}),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            journal = Path(temporary) / "tool-observations.jsonl"
+            journal.write_bytes(records)
+            result = analyze_journal(
+                path=journal,
+                arm="evolved_enforced",
+                oracle_class="hazard_recurrence",
+                project_sha256=project,
+                kernel_sha256=kernel,
+                candidate_id=candidate,
+                task_success=True,
+            )
+        self.assertTrue(result["existing_file_write_recurrence"])
+        self.assertFalse(result["existing_file_write_dispatch"])
+        self.assertEqual(1, result["symbolic_write_to_exact_edit_rewrites"])
+        self.assertTrue(result["successful_recovery_after_block"])
+        self.assertTrue(result["trustworthy_task_success"])
+        self.assertEqual(1, result["exact_edit_recovery_directions"])
+        self.assertEqual(1, result["exact_edit_recovery_pre_admits"])
+        self.assertEqual(1, result["exact_edit_recovery_post_admits"])
+
+        # A requested-Write/dispatched-Edit label is not evidence of formal
+        # authorization by itself.  Removing the distinct recovery-pre admit
+        # must make the analyzer reject the otherwise plausible trace.
+        missing_recovery_pre = b"".join(
+            [
+                _record(0, {"run_started": {}}),
+                _record(1, {"tool_observation": {"formal_decision_batch": direction}}),
+                _record(2, {"tool_observation": {"dispatch_started": {
+                    "id": "write-1", "requested_name": "Write", "dispatched_name": "Edit",
+                    "origin": "authoritative", "file_target_state": "regular_existing",
+                }}}),
+                _record(3, {"tool_observation": {"formal_decision_batch": recovery_post}}),
+                _record(4, {"tool_observation": {"dispatch_finished": {
+                    "id": "write-1", "requested_name": "Write", "dispatched_name": "Edit",
+                    "origin": "authoritative", "outcome": "succeeded", "effect_valid": True,
+                    "effect": None,
+                }}}),
+                _record(5, {"run_finished": {"stop_reason": "end_turn"}}),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            journal = Path(temporary) / "tool-observations.jsonl"
+            journal.write_bytes(missing_recovery_pre)
+            with self.assertRaisesRegex(E3Error, "formal pre/dispatch/post/finish"):
+                analyze_journal(
+                    path=journal,
+                    arm="evolved_enforced",
+                    oracle_class="hazard_recurrence",
+                    project_sha256=project,
+                    kernel_sha256=kernel,
+                    candidate_id=candidate,
+                    task_success=True,
+                )
 
 
 if __name__ == "__main__":

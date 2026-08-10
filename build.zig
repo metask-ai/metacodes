@@ -896,7 +896,23 @@ pub fn build(b: *std.Build) void {
     const project_harness_python = if (@import("builtin").os.tag == .windows) "python" else "python3";
     const project_harness_binary_boundary_cmd = b.addSystemCommand(&.{
         project_harness_python,
-        "scripts/eval/project_harness_binary_boundary.py",
+    });
+    // The Python entrypoint and its local imports are evidence-producing build
+    // inputs.  Passing only string paths lets Zig reuse a cached command after
+    // an assertion changes, which can make a stale report look freshly green.
+    project_harness_binary_boundary_cmd.addFileArg(
+        b.path("scripts/eval/project_harness_binary_boundary.py"),
+    );
+    project_harness_binary_boundary_cmd.addFileInput(
+        b.path("scripts/eval/project_harness_evolution.py"),
+    );
+    project_harness_binary_boundary_cmd.addFileInput(
+        b.path("scripts/eval/memory_agent_runtime.py"),
+    );
+    project_harness_binary_boundary_cmd.addFileInput(
+        b.path("scripts/build_project_rule.py"),
+    );
+    project_harness_binary_boundary_cmd.addArgs(&.{
         "--repo",
         b.build_root.path orelse ".",
         "--production",

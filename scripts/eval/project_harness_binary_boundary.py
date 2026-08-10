@@ -4,7 +4,8 @@ The test builds one real promoted rule through the E2 lifecycle, then drives
 both complete CLI artifacts through the same loopback Anthropic request.  It
 proves that shadow is a compile-time artifact property: the first provider body
 is byte-identical, the shadow app records a block but dispatches Write, and the
-production app blocks Write before dispatch and permits an Edit recovery.
+production app lowers the same requested Write into one Lean-authorized native
+exact Edit without another provider-authored repair turn.
 
 This is mechanism evidence only.  The provider is scripted, no credential is
 loaded, and the result must never be reported as an E3 model-quality outcome.
@@ -36,7 +37,7 @@ else:
     from .project_harness_evolution import run_evolution
 
 
-SCHEMA = "metacodes-project-harness-binary-boundary-v1"
+SCHEMA = "metacodes-project-harness-binary-boundary-v2"
 SHADOW_SESSION = "111111111111111111111111"
 ENFORCED_SESSION = "222222222222222222222222"
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
@@ -52,6 +53,32 @@ def _sha256(value: bytes) -> str:
 
 def _file_sha256(path: Path) -> str:
     return _sha256(path.read_bytes())
+
+
+def _tool_result_error_flags(body: Mapping[str, Any]) -> Dict[str, bool]:
+    """Read provider-visible tool-result protocol flags without inferring from content."""
+
+    result: Dict[str, bool] = {}
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        raise BoundaryError("provider request has no messages array")
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "tool_result":
+                continue
+            tool_id = item.get("tool_use_id")
+            if not isinstance(tool_id, str):
+                raise BoundaryError("provider-visible tool result has no string id")
+            raw_is_error = item.get("is_error", False)
+            if not isinstance(raw_is_error, bool):
+                raise BoundaryError("provider-visible tool result has invalid is_error")
+            if tool_id in result:
+                raise BoundaryError("provider-visible tool result id is duplicated")
+            result[tool_id] = raw_is_error
+    return result
 
 
 def _write_report(path: Path, value: Mapping[str, Any]) -> None:
@@ -112,6 +139,8 @@ class BoundaryProvider:
         self.target = target
         self.raw_requests: List[bytes] = []
         self.requests: List[Mapping[str, Any]] = []
+        self.tool_results: Dict[str, str] = {}
+        self.tool_result_is_errors: Dict[str, bool] = {}
         self._server: socketserver.TCPServer | None = None
         self._thread: threading.Thread | None = None
         self.port: int | None = None
@@ -147,27 +176,15 @@ class BoundaryProvider:
                         )
                     else:
                         results = _tool_results(body)
-                        write_result = results.get("boundary-write", "")
-                        if "boundary-edit" in results:
-                            response = _text_sse("boundary-complete", request_id)
-                        elif "boundary-read" in results:
-                            response = _tool_sse(
-                                [("boundary-edit", "Edit", {
-                                    "file_path": str(outer.target),
-                                    "old_string": "old\n",
-                                    "new_string": "new-via-edit\n",
-                                })],
-                                request_id,
-                            )
-                        elif "project_rule_blocked" in write_result:
-                            response = _tool_sse(
-                                [("boundary-read", "Read", {
-                                    "file_path": str(outer.target),
-                                })],
-                                request_id,
-                            )
-                        else:
-                            response = _text_sse("boundary-complete", request_id)
+                        # Shadow dispatches the requested Write; production
+                        # completes the same tool id through the host rewrite.
+                        # In neither arm does this scripted provider author an
+                        # Edit or receive a repair contract.
+                        if "boundary-write" not in results:
+                            raise BoundaryError("provider did not receive the original tool result")
+                        outer.tool_results.update(results)
+                        outer.tool_result_is_errors.update(_tool_result_error_flags(body))
+                        response = _text_sse("boundary-complete", request_id)
                 except (BoundaryError, UnicodeError, json.JSONDecodeError, ValueError):
                     self.send_response(400)
                     self.end_headers()
@@ -225,6 +242,8 @@ def _journal_summary(path: Path) -> Dict[str, Any]:
     actuations: set[str] = set()
     blocks: List[str] = []
     dispatches: List[str] = []
+    dispatch_pairs: List[Dict[str, str]] = []
+    dispatch_finishes: List[Dict[str, Any]] = []
     finished = False
     for record in _journal_events(path):
         event = record.get("event")
@@ -251,12 +270,43 @@ def _journal_summary(path: Path) -> Dict[str, Any]:
         started = tool_event.get("dispatch_started")
         if isinstance(started, dict) and isinstance(started.get("dispatched_name"), str):
             dispatches.append(str(started["dispatched_name"]))
+            requested_name = started.get("requested_name")
+            if not isinstance(requested_name, str):
+                raise BoundaryError("dispatch start has no requested tool name")
+            dispatch_pairs.append({
+                "requested_name": requested_name,
+                "dispatched_name": str(started["dispatched_name"]),
+            })
+        finished_event = tool_event.get("dispatch_finished")
+        if isinstance(finished_event, dict):
+            requested_name = finished_event.get("requested_name")
+            dispatched_name = finished_event.get("dispatched_name")
+            outcome = finished_event.get("outcome")
+            error_code = finished_event.get("error_code")
+            effect_valid = finished_event.get("effect_valid")
+            if (
+                not isinstance(requested_name, str)
+                or not isinstance(dispatched_name, str)
+                or not isinstance(outcome, str)
+                or (error_code is not None and not isinstance(error_code, str))
+                or not isinstance(effect_valid, bool)
+            ):
+                raise BoundaryError("dispatch finish evidence is malformed")
+            dispatch_finishes.append({
+                "requested_name": requested_name,
+                "dispatched_name": dispatched_name,
+                "outcome": outcome,
+                "error_code": error_code,
+                "effect_valid": effect_valid,
+            })
     if not finished:
         raise BoundaryError("journal has no durable run_finished event")
     return {
         "actuations": sorted(actuations),
         "blocked_dispatch_ids": blocks,
         "dispatched_tools": dispatches,
+        "dispatch_pairs": dispatch_pairs,
+        "dispatch_finishes": dispatch_finishes,
         "journal_sha256": _file_sha256(path),
     }
 
@@ -345,6 +395,8 @@ def _run_arm(
         "binary_sha256": _file_sha256(binary),
         "first_request": provider.raw_requests[0],
         "provider_requests": len(provider.raw_requests),
+        "provider_tool_results": dict(provider.tool_results),
+        "provider_tool_result_is_errors": dict(provider.tool_result_is_errors),
         "target_content": target.read_text(encoding="utf-8"),
         "journal": _journal_summary(journal),
     }
@@ -419,23 +471,80 @@ def run_boundary(
             raise BoundaryError("shadow artifact did not observe the expected formal block")
         if "Write" not in shadow_result["journal"]["dispatched_tools"]:
             raise BoundaryError("shadow artifact actuated the block instead of dispatching Write")
+        if shadow_result["journal"]["dispatch_pairs"] != [{
+            "requested_name": "Write",
+            "dispatched_name": "Write",
+        }]:
+            raise BoundaryError("shadow artifact did not execute exactly one requested Write")
+        if shadow_result["journal"]["dispatch_finishes"] != [{
+            "requested_name": "Write",
+            "dispatched_name": "Write",
+            "outcome": "tool_error",
+            "error_code": "NotRead",
+            # No mutation effect was reported, but the empty effect slot is
+            # itself structurally valid rather than corrupt/incomplete.
+            "effect_valid": True,
+        }]:
+            raise BoundaryError("shadow artifact did not durably record the real Write outcome")
+        if shadow_result["target_content"] != "old\n":
+            raise BoundaryError("shadow Write unexpectedly changed the unread existing file")
+        shadow_tool_result = shadow_result["provider_tool_results"].get("boundary-write")
+        try:
+            shadow_tool_payload = json.loads(shadow_tool_result or "")
+        except json.JSONDecodeError as exc:
+            raise BoundaryError("shadow provider received a malformed tool result") from exc
+        if (
+            not isinstance(shadow_tool_payload, dict)
+            or not isinstance(shadow_tool_payload.get("error"), dict)
+            or shadow_tool_payload["error"].get("code") != "not_read"
+        ):
+            raise BoundaryError(
+                "shadow provider did not receive the real NotRead result: "
+                f"{shadow_tool_result!r}"
+            )
         if shadow_result["provider_requests"] != 2:
             raise BoundaryError("shadow artifact deviated from the deterministic two-request path")
+        if shadow_result["provider_tool_result_is_errors"] != {"boundary-write": True}:
+            raise BoundaryError("shadow provider-visible NotRead result was not marked is_error")
         if enforced_result["journal"]["actuations"] != ["enforced"]:
             raise BoundaryError("production artifact did not remain enforced")
         if "boundary-write" not in enforced_result["journal"]["blocked_dispatch_ids"]:
             raise BoundaryError("production artifact did not record the expected block")
         if "Write" in enforced_result["journal"]["dispatched_tools"]:
             raise BoundaryError("production artifact dispatched a formally blocked Write")
-        if (
-            "Read" not in enforced_result["journal"]["dispatched_tools"]
-            or "Edit" not in enforced_result["journal"]["dispatched_tools"]
-        ):
-            raise BoundaryError("production artifact did not execute the Read/Edit recovery")
-        if enforced_result["provider_requests"] != 4:
-            raise BoundaryError("production artifact deviated from the deterministic recovery path")
+        if enforced_result["journal"]["dispatch_pairs"] != [{
+            "requested_name": "Write",
+            "dispatched_name": "Edit",
+        }]:
+            raise BoundaryError("production artifact did not execute exactly one host Write-to-Edit rewrite")
+        if enforced_result["journal"]["dispatch_finishes"] != [{
+            "requested_name": "Write",
+            "dispatched_name": "Edit",
+            "outcome": "succeeded",
+            "error_code": None,
+            "effect_valid": True,
+        }]:
+            raise BoundaryError(
+                "production artifact did not durably record the recovered Edit outcome: "
+                f"{enforced_result['journal']['dispatch_finishes']!r}"
+            )
+        if enforced_result["provider_requests"] != 2:
+            raise BoundaryError("production artifact added a provider repair round trip")
+        if enforced_result["provider_tool_result_is_errors"] != {"boundary-write": False}:
+            raise BoundaryError("production provider-visible recovery receipt was marked as an error")
         if enforced_result["target_content"] != "new-via-edit\n":
             raise BoundaryError("production recovery side effect was not re-observed")
+        enforced_tool_result = enforced_result["provider_tool_results"].get("boundary-write")
+        try:
+            enforced_tool_payload = json.loads(enforced_tool_result or "")
+        except json.JSONDecodeError as exc:
+            raise BoundaryError("production provider received a malformed tool result") from exc
+        if (
+            not isinstance(enforced_tool_payload, dict)
+            or enforced_tool_payload.get("success") is not True
+            or enforced_tool_payload.get("recovery") != "lean_authorized_source_cas"
+        ):
+            raise BoundaryError("production provider did not receive the bounded recovery receipt")
 
         return {
             "schema_version": SCHEMA,

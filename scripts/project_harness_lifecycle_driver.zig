@@ -5,7 +5,8 @@
 //! `finalize` consumes an independently sandboxed Lean build, records the
 //! production lifecycle, promotes through the fixed kernel, and exercises the
 //! production RunControl.  The evolved flavor blocks an existing-file Write
-//! and recovers through Edit; the static flavor admits a bounded Write and
+//! direction and lowers it through a separately admitted exact Edit; the
+//! static flavor admits a bounded Write and
 //! requires a host-reobserved mutation.
 //! `audit` is a separate-process, read-only reopening of the complete chain.
 
@@ -381,28 +382,19 @@ fn finalize(init: std.process.Init, allocator: std.mem.Allocator, options: Optio
         .{ .bytes = [_]u8{'e'} ** 12 },
     );
     const blocked = switch (flavor) {
-        .evolved => try requireProjectRuleBlock(allocator, write_outcome),
+        .evolved => blk: {
+            // Production auto-recovery keeps the model's original tool id but
+            // returns the successful native exact-Edit result. The durable
+            // journal below, not a model-facing error string, proves that the
+            // ordinary Write direction was blocked before this dispatch.
+            try requireToolSuccess(allocator, write_outcome);
+            break :blk true;
+        },
         .static => blk: {
             try requireToolSuccess(allocator, write_outcome);
             break :blk false;
         },
     };
-    if (flavor == .evolved) {
-        const edit_input = try std.json.Stringify.valueAlloc(allocator, .{
-            .file_path = protected_path,
-            .old_string = "old",
-            .new_string = "new",
-        }, .{});
-        const edit_outcome = try cc.tool_exec.executeOne(
-            &ctx,
-            "Edit",
-            edit_input,
-            "runtime-edit",
-            allocator,
-            .{ .bytes = [_]u8{'e'} ** 12 },
-        );
-        try requireToolSuccess(allocator, edit_outcome);
-    }
     try control.finishRun("end_turn");
     const runtime_binding = try control.journal.runBinding();
     control.deinit();
@@ -731,11 +723,12 @@ fn verifyRuntimeRun(
 ) !void {
     var run = try cc.tool_observation_journal.loadRunDispatches(allocator, runtime_dir, binding);
     defer run.deinit();
-    const expected_id = if (flavor == .evolved) "runtime-edit" else "runtime-write";
+    const expected_id = "runtime-write";
     const expected_tool = if (flavor == .evolved) "Edit" else "Write";
     const expected_decisions: usize = if (flavor == .evolved) 3 else 2;
     if (run.dispatches.len != 1 or
         !std.mem.eql(u8, run.dispatches[0].id, expected_id) or
+        !std.mem.eql(u8, run.dispatches[0].requested_name, "Write") or
         !std.mem.eql(u8, run.dispatches[0].dispatched_name, expected_tool) or
         run.dispatches[0].outcome != .succeeded or
         run.formal_decisions.len != expected_decisions)
@@ -756,13 +749,11 @@ fn verifyRuntimeRun(
     if ((flavor == .evolved and (target_pre_blocks != 1 or dispatched_admits != 2)) or
         (flavor == .static and (target_pre_blocks != 0 or dispatched_admits != 2)))
         return error.InvalidRuntimeEvidence;
-    if (flavor == .static) {
-        const effect = run.dispatches[0].effect orelse return error.InvalidRuntimeEvidence;
-        switch (effect) {
-            .file_mutation_v2 => |mutation| if (mutation.reobservation.state != .matched)
-                return error.InvalidRuntimeEvidence,
-            else => return error.InvalidRuntimeEvidence,
-        }
+    const effect = run.dispatches[0].effect orelse return error.InvalidRuntimeEvidence;
+    switch (effect) {
+        .file_mutation_v2 => |mutation| if (mutation.reobservation.state != .matched)
+            return error.InvalidRuntimeEvidence,
+        else => return error.InvalidRuntimeEvidence,
     }
 }
 
@@ -777,22 +768,6 @@ fn requireToolSuccess(
         },
         else => return error.UnexpectedToolResult,
     }
-}
-
-fn requireProjectRuleBlock(
-    allocator: std.mem.Allocator,
-    outcome: cc.tool_exec.OneResult,
-) !bool {
-    return switch (outcome) {
-        .done => |done| blk: {
-            defer if (done.content) |bytes| allocator.free(bytes);
-            if (!done.is_error or done.content == null or
-                std.mem.indexOf(u8, done.content.?, "project_rule_blocked") == null)
-                return error.ExpectedProjectRuleBlock;
-            break :blk true;
-        },
-        else => error.UnexpectedToolResult,
-    };
 }
 
 fn requireEnvironmentConfig(config: cc.project_harness_runtime.Config) !void {

@@ -32,6 +32,95 @@ pub fn observePre(
     };
 }
 
+/// Deterministically lower one model-proposed existing-file Write into the
+/// exact Edit selected by Lean.  The source bytes come from a bounded,
+/// no-follow descriptor read whose same-fd type, link-count, size and byte
+/// count are checked before/after; the replacement bytes are the original
+/// Write content. The later recovery-pre decision and
+/// native same-descriptor compare remain the authority-bearing source checks.
+/// No model-visible rendering (notably Read's line-number view) participates,
+/// so terminal newlines and every other byte survive the transformation.
+///
+/// This function does not authorize or execute anything.  `executeOne` must
+/// feed the returned Edit input through `observePre` and the formal gate again,
+/// and only `admit_exact_edit` may reach the native whole-file implementation.
+pub fn synthesizeExactEditInput(
+    ctx: *const ToolContext,
+    write_input: []const u8,
+) ![]u8 {
+    if (!pfs.atomic_final_nofollow)
+        return error.ProjectExactEditNativeUnavailable;
+    const escaped_path = common.extractJsonArg(write_input, "file_path") orelse
+        common.extractJsonArg(write_input, "path") orelse return error.MissingPath;
+    const escaped_content = common.extractJsonArg(write_input, "content") orelse
+        return error.MissingContent;
+    const path = try util_json.unescapeString(escaped_path, ctx.allocator);
+    defer ctx.allocator.free(path);
+    const replacement = try util_json.unescapeString(escaped_content, ctx.allocator);
+    defer ctx.allocator.free(replacement);
+    if (path.len == 0) return error.EmptyPath;
+    const normalized = try path_mod.normalizeChecked(ctx.allocator, path, .{
+        .home = ctx.home_dir,
+        .base_dir = ctx.cwd_abs,
+        .resolve_relative = ctx.resolve_relative_paths,
+    });
+    defer ctx.allocator.free(normalized);
+    const source = try readStableRegularFile(ctx.allocator, normalized);
+    defer ctx.allocator.free(source);
+    // The synthesized Edit travels through the ordinary JSON tool-input seam.
+    // Arbitrary file bytes are therefore not representable without inventing a
+    // separate binary transport.  Reject them explicitly instead of relying on
+    // encoder behavior that could produce malformed JSON or silently rewrite
+    // the source snapshot.
+    if (!std.unicode.utf8ValidateSlice(source))
+        return error.ProjectExactEditSourceNotUtf8;
+
+    var out: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"file_path\":");
+    try std.json.Stringify.encodeJsonString(normalized, .{}, &out.writer);
+    try out.writer.writeAll(",\"old_string\":");
+    try std.json.Stringify.encodeJsonString(source, .{}, &out.writer);
+    try out.writer.writeAll(",\"new_string\":");
+    try std.json.Stringify.encodeJsonString(replacement, .{}, &out.writer);
+    try out.writer.writeAll(",\"replace_all\":false}");
+    if (out.written().len > project_rule_spec.MAX_INPUT_BYTES)
+        return error.ProjectExactEditInputTooLarge;
+    return try out.toOwnedSlice();
+}
+
+fn readStableRegularFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) ![]u8 {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.ProjectExactEditTargetUnavailable;
+    defer _ = pfs.close(fd);
+    pfs.makeCloseOnExec(fd) catch return error.ProjectExactEditTargetUnavailable;
+    const before = pfs.fileInfo(fd) catch
+        return error.ProjectExactEditTargetUnavailable;
+    if (!before.is_regular or before.link_count != 1 or
+        before.size > project_rule_spec.MAX_INPUT_BYTES)
+        return error.ProjectExactEditTargetUnavailable;
+    const bytes = common.readAllFromFdCapped(
+        fd,
+        allocator,
+        @intCast(project_rule_spec.MAX_INPUT_BYTES),
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.ProjectExactEditTargetUnavailable,
+    };
+    errdefer allocator.free(bytes);
+    const after = pfs.fileInfo(fd) catch
+        return error.ProjectExactEditTargetUnavailable;
+    if (!after.is_regular or after.link_count != 1 or
+        after.size != before.size or bytes.len != @as(usize, @intCast(before.size)))
+        return error.ProjectExactEditTargetUnavailable;
+    return bytes;
+}
+
 pub fn observeFileTarget(
     ctx: *const ToolContext,
     tool: []const u8,
