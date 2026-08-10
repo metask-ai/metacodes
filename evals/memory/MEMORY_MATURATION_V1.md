@@ -286,7 +286,9 @@ The manifest must contain exactly one online case per procedural family and sche
 siblings for every arm/trial. Observations must occur in that frozen line order, with no missing or duplicate
 tuple. Replay recomputes QA exact match from hidden manifest gold and accepts procedural success only from the
 pinned deterministic validator. A scored non-control offline row must use the same graph revision as its online
-predecessor, and that predecessor must have valid execution and evaluator state.
+predecessor. The predecessor must have completed execution and either a ready evaluator or an independently
+preserved `workspace.deterministic_success=true` fact. An evaluator-only query-plan failure therefore cannot
+erase a successfully materialized online state, while an execution failure still blocks every dependent score.
 
 Fail-closed invariants include:
 
@@ -309,6 +311,31 @@ python3 -m scripts.eval.cli replay-memory \
   --markdown /tmp/memory-maturation-smoke.md \
   --json /tmp/memory-maturation-smoke-summary.json
 ```
+
+## Failed paid-run query-plan reanalysis
+
+If every provider transaction committed but canonical publication failed on a stricter post-run query-plan
+invariant, never retry the provider schedule. Use the dedicated read-only analyzer against the immutable failed
+checkpoint:
+
+```bash
+python3 -m scripts.eval.memory_failed_run_analysis \
+  --run-dir /private/path/to/failed-run/run \
+  --manifest /path/to/frozen/manifest.json \
+  --dataset-source /path/to/frozen/source.json \
+  --output-dir /private/path/to/new-analysis-bundle
+
+python3 -m scripts.eval.memory_failed_run_analysis \
+  --verify-bundle /private/path/to/new-analysis-bundle
+```
+
+The analyzer reopens the hash-chained budget checkpoint and live journal, validates all receipt-bound artifacts,
+recomputes lexical traces from raw provider cassettes, and re-observes the complete source tree before publishing.
+Multiple distinct seed plans remain multiple `exact` audit variants; they are never relabeled as semantic queries.
+Only evaluator-invalid rows may retain that bounded violation, and they stay unscored. The output is a separate
+`analysis_only` bundle with `quality_evidence=false`, `promotion=false`, and no canonical runtime receipt. Run it
+under an OS network-deny profile when producing paper evidence; byte-identical output demonstrates that provider
+access was neither needed nor used.
 
 ## Metrics hierarchy
 
