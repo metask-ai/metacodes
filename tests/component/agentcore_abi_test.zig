@@ -736,12 +736,38 @@ fn sessionCreateConfig(
 }
 
 const PublicMcpProbe = struct {
+    const Connection = struct {
+        owner: ?*anyopaque = null,
+        purpose_code: u32 = 0,
+        era_code: u32 = 0,
+        closed: bool = false,
+    };
+
+    server_era_code: u32 = wire.MCP_ERA_2026_07_28,
+    advertise_tools: bool = true,
+    required_task: bool = false,
+    tool_count: u8 = 1,
+    probe_open_status: u32 = wire.MCP_OPEN_OK,
+    probe_exchange_status: ?u32 = null,
+    connections: [8]Connection = [_]Connection{.{}} ** 8,
+    connection_count: usize = 0,
+    open_attempts: u32 = 0,
+    probe_open_attempts: u32 = 0,
+    actual_open_attempts: u32 = 0,
     opens: u32 = 0,
     probe_opens: u32 = 0,
     actual_opens: u32 = 0,
+    actual_2025_11_opens: u32 = 0,
+    actual_2025_06_opens: u32 = 0,
+    request_attempts: u32 = 0,
     requests: u32 = 0,
+    list_requests: u32 = 0,
+    list_requests_by_era: [4]u32 = [_]u32{0} ** 4,
+    call_requests: u32 = 0,
     notifications: u32 = 0,
+    notifications_by_era: [4]u32 = [_]u32{0} ** 4,
     closes: u32 = 0,
+    double_closes: u32 = 0,
     releases: u32 = 0,
 
     fn connector(self: *@This()) wire.McpConnectorV1 {
@@ -766,15 +792,47 @@ const PublicMcpProbe = struct {
         const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.MCP_OPEN_FATAL));
         const out = out_connection_ctx orelse return wire.MCP_OPEN_FATAL;
         out.* = null;
-        if (requested_era_code != wire.MCP_ERA_2026_07_28)
-            return wire.MCP_OPEN_NETWORK_ERROR;
+        self.open_attempts += 1;
         switch (purpose_code) {
-            wire.MCP_CONNECTION_DISPOSABLE_PROBE => self.probe_opens += 1,
-            wire.MCP_CONNECTION_ACTUAL => self.actual_opens += 1,
+            wire.MCP_CONNECTION_DISPOSABLE_PROBE => {
+                self.probe_open_attempts += 1;
+                if (requested_era_code != wire.MCP_ERA_2026_07_28)
+                    return wire.MCP_OPEN_FATAL;
+                if (self.probe_open_status != wire.MCP_OPEN_OK)
+                    return self.probe_open_status;
+                self.probe_opens += 1;
+            },
+            wire.MCP_CONNECTION_ACTUAL => {
+                self.actual_open_attempts += 1;
+                if (self.server_era_code == wire.MCP_ERA_2026_07_28 and
+                    requested_era_code != wire.MCP_ERA_2026_07_28)
+                    return wire.MCP_OPEN_NETWORK_ERROR;
+                if (self.server_era_code == wire.MCP_ERA_2025_11_25 and
+                    requested_era_code != wire.MCP_ERA_2025_11_25)
+                    return wire.MCP_OPEN_NETWORK_ERROR;
+                if (self.server_era_code == wire.MCP_ERA_2025_06_18 and
+                    requested_era_code != wire.MCP_ERA_2025_11_25 and
+                    requested_era_code != wire.MCP_ERA_2025_06_18)
+                    return wire.MCP_OPEN_NETWORK_ERROR;
+                self.actual_opens += 1;
+                if (requested_era_code == wire.MCP_ERA_2025_11_25)
+                    self.actual_2025_11_opens += 1;
+                if (requested_era_code == wire.MCP_ERA_2025_06_18)
+                    self.actual_2025_06_opens += 1;
+            },
             else => return wire.MCP_OPEN_FATAL,
         }
+        if (self.connection_count == self.connections.len)
+            return wire.MCP_OPEN_FATAL;
+        const connection = &self.connections[self.connection_count];
+        self.connection_count += 1;
+        connection.* = .{
+            .owner = raw,
+            .purpose_code = purpose_code,
+            .era_code = requested_era_code,
+        };
         self.opens += 1;
-        out.* = self;
+        out.* = connection;
         return wire.MCP_OPEN_OK;
     }
 
@@ -787,25 +845,76 @@ const PublicMcpProbe = struct {
         out_response: ?*wire.OwnedBytesV1,
     ) callconv(.c) u32 {
         const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.MCP_EXCHANGE_FATAL));
-        if (connection_ctx != raw) return wire.MCP_EXCHANGE_FATAL;
+        const connection = liveConnection(raw, connection_ctx) orelse
+            return wire.MCP_EXCHANGE_FATAL;
         const out = out_response orelse return wire.MCP_EXCHANGE_FATAL;
         out.* = .{ .ptr = null, .len = 0 };
+        self.request_attempts += 1;
+        if (connection.purpose_code == wire.MCP_CONNECTION_DISPOSABLE_PROBE)
+            if (self.probe_exchange_status) |status| return status;
         const encoded = sdk.borrowedBytes(request_json) catch return wire.MCP_EXCHANGE_FATAL;
         const id = requestId(encoded) orelse return wire.MCP_EXCHANGE_FATAL;
-        const response = if (std.mem.indexOf(u8, encoded, "server/discover") != null)
-            std.fmt.allocPrint(
+        const response = if (std.mem.indexOf(u8, encoded, "server/discover") != null) blk: {
+            if (connection.era_code != wire.MCP_ERA_2026_07_28)
+                return wire.MCP_EXCHANGE_FATAL;
+            break :blk if (self.server_era_code == wire.MCP_ERA_2026_07_28) std.fmt.allocPrint(
                 std.heap.c_allocator,
                 "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{{}},\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
                 .{id},
-            )
-        else if (std.mem.indexOf(u8, encoded, "tools/list") != null)
-            std.fmt.allocPrint(
+            ) else std.fmt.allocPrint(
+                std.heap.c_allocator,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"error\":{{\"code\":-32601,\"message\":\"Method not found\"}}}}",
+                .{id},
+            );
+        } else if (std.mem.indexOf(u8, encoded, "initialize") != null) blk: {
+            if (connection.purpose_code != wire.MCP_CONNECTION_ACTUAL or
+                connection.era_code == wire.MCP_ERA_2026_07_28)
+                return wire.MCP_EXCHANGE_FATAL;
+            break :blk std.fmt.allocPrint(
+                std.heap.c_allocator,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"protocolVersion\":\"{s}\",\"capabilities\":{s},\"serverInfo\":{{\"name\":\"public-test\",\"version\":\"1\"}}}}}}",
+                .{
+                    id,
+                    mcpVersion(self.server_era_code) orelse return wire.MCP_EXCHANGE_FATAL,
+                    if (self.advertise_tools) "{\"tools\":{}}" else "{}",
+                },
+            );
+        } else if (std.mem.indexOf(u8, encoded, "tools/list") != null) blk: {
+            if (connection.purpose_code != wire.MCP_CONNECTION_ACTUAL or
+                connection.era_code != self.server_era_code)
+                return wire.MCP_EXCHANGE_FATAL;
+            self.list_requests += 1;
+            self.list_requests_by_era[
+                eraIndex(connection.era_code) orelse
+                    return wire.MCP_EXCHANGE_FATAL
+            ] += 1;
+            if (self.tool_count == 0 or self.tool_count > 2)
+                return wire.MCP_EXCHANGE_FATAL;
+            break :blk if (self.required_task) std.fmt.allocPrint(
+                std.heap.c_allocator,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"tasked\",\"inputSchema\":{{\"type\":\"object\"}},\"execution\":{{\"taskSupport\":\"required\"}}}}],\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
+                .{id},
+            ) else if (self.server_era_code == wire.MCP_ERA_2026_07_28 and self.tool_count == 2) std.fmt.allocPrint(
+                std.heap.c_allocator,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"city\":{{\"type\":\"string\"}}}},\"required\":[\"city\"],\"additionalProperties\":false}},\"outputSchema\":{{\"type\":\"object\",\"properties\":{{\"ok\":{{\"type\":\"boolean\"}}}},\"required\":[\"ok\"]}}}},{{\"name\":\"alerts\",\"inputSchema\":{{\"type\":\"object\"}}}}],\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
+                .{id},
+            ) else if (self.server_era_code == wire.MCP_ERA_2026_07_28) std.fmt.allocPrint(
                 std.heap.c_allocator,
                 "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"city\":{{\"type\":\"string\"}}}},\"required\":[\"city\"],\"additionalProperties\":false}},\"outputSchema\":{{\"type\":\"object\",\"properties\":{{\"ok\":{{\"type\":\"boolean\"}}}},\"required\":[\"ok\"]}}}}],\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
                 .{id},
-            )
-        else
+            ) else if (self.tool_count == 2) std.fmt.allocPrint(
+                std.heap.c_allocator,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"city\":{{\"type\":\"string\"}}}},\"required\":[\"city\"],\"additionalProperties\":false}},\"outputSchema\":{{\"type\":\"object\",\"properties\":{{\"ok\":{{\"type\":\"boolean\"}}}},\"required\":[\"ok\"]}}}},{{\"name\":\"alerts\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}",
+                .{id},
+            ) else std.fmt.allocPrint(
+                std.heap.c_allocator,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"city\":{{\"type\":\"string\"}}}},\"required\":[\"city\"],\"additionalProperties\":false}},\"outputSchema\":{{\"type\":\"object\",\"properties\":{{\"ok\":{{\"type\":\"boolean\"}}}},\"required\":[\"ok\"]}}}}]}}}}",
+                .{id},
+            );
+        } else if (std.mem.indexOf(u8, encoded, "tools/call") != null) {
+            self.call_requests += 1;
             return wire.MCP_EXCHANGE_FATAL;
+        } else return wire.MCP_EXCHANGE_FATAL;
         const owned = response catch return wire.MCP_EXCHANGE_FATAL;
         self.requests += 1;
         out.* = .{ .ptr = owned.ptr, .len = owned.len };
@@ -815,20 +924,45 @@ const PublicMcpProbe = struct {
     fn notify(
         raw: ?*anyopaque,
         connection_ctx: ?*anyopaque,
-        _: wire.BytesViewV1,
+        notification_json: wire.BytesViewV1,
         _: u32,
         _: ?*const wire.McpCancellationV1,
     ) callconv(.c) u32 {
         const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.MCP_NOTIFY_FATAL));
-        if (connection_ctx != raw) return wire.MCP_NOTIFY_FATAL;
+        const connection = liveConnection(raw, connection_ctx) orelse
+            return wire.MCP_NOTIFY_FATAL;
+        if (connection.purpose_code != wire.MCP_CONNECTION_ACTUAL or
+            connection.era_code == wire.MCP_ERA_2026_07_28)
+            return wire.MCP_NOTIFY_FATAL;
+        const encoded = sdk.borrowedBytes(notification_json) catch
+            return wire.MCP_NOTIFY_FATAL;
+        if (std.mem.indexOf(u8, encoded, "notifications/initialized") == null)
+            return wire.MCP_NOTIFY_FATAL;
         self.notifications += 1;
+        self.notifications_by_era[
+            eraIndex(connection.era_code) orelse
+                return wire.MCP_NOTIFY_FATAL
+        ] += 1;
         return wire.MCP_NOTIFY_OK;
     }
 
     fn close(raw: ?*anyopaque, connection_ctx: ?*anyopaque) callconv(.c) void {
         const self: *@This() = @ptrCast(@alignCast(raw orelse return));
-        if (connection_ctx != raw) return;
+        const connection: *Connection = @ptrCast(@alignCast(connection_ctx orelse return));
+        if (connection.owner != raw) return;
+        if (connection.closed) {
+            self.double_closes += 1;
+            return;
+        }
+        connection.closed = true;
         self.closes += 1;
+    }
+
+    fn expectClosedExactlyOnce(self: *const @This()) !void {
+        try std.testing.expectEqual(self.opens, self.closes);
+        try std.testing.expectEqual(@as(u32, 0), self.double_closes);
+        for (self.connections[0..self.connection_count]) |connection|
+            try std.testing.expect(connection.closed);
     }
 
     fn releaseResponse(
@@ -837,7 +971,7 @@ const PublicMcpProbe = struct {
         response: ?*wire.OwnedBytesV1,
     ) callconv(.c) void {
         const self: *@This() = @ptrCast(@alignCast(raw orelse return));
-        if (connection_ctx != raw) return;
+        _ = liveConnection(raw, connection_ctx) orelse return;
         const out = response orelse return;
         if (out.ptr) |ptr| {
             const len = std.math.cast(usize, out.len) orelse return;
@@ -847,12 +981,34 @@ const PublicMcpProbe = struct {
         out.* = .{ .ptr = null, .len = 0 };
     }
 
+    fn liveConnection(raw: ?*anyopaque, connection_ctx: ?*anyopaque) ?*Connection {
+        const connection: *Connection = @ptrCast(@alignCast(connection_ctx orelse return null));
+        if (connection.owner != raw or connection.closed) return null;
+        return connection;
+    }
+
+    fn eraIndex(era_code: u32) ?usize {
+        if (era_code < wire.MCP_ERA_2026_07_28 or
+            era_code > wire.MCP_ERA_2025_06_18)
+            return null;
+        return @intCast(era_code);
+    }
+
     fn requestId(encoded: []const u8) ?u64 {
         const marker = "\"id\":";
         const start = (std.mem.indexOf(u8, encoded, marker) orelse return null) + marker.len;
         var end = start;
         while (end < encoded.len and std.ascii.isDigit(encoded[end])) : (end += 1) {}
         return std.fmt.parseInt(u64, encoded[start..end], 10) catch null;
+    }
+
+    fn mcpVersion(era_code: u32) ?[]const u8 {
+        return switch (era_code) {
+            wire.MCP_ERA_2026_07_28 => "2026-07-28",
+            wire.MCP_ERA_2025_11_25 => "2025-11-25",
+            wire.MCP_ERA_2025_06_18 => "2025-06-18",
+            else => null,
+        };
     }
 };
 
@@ -921,6 +1077,485 @@ const PublicCheckpointBuffer = struct {
         return wire.CHECKPOINT_IO_OK;
     }
 };
+
+test "L2 Revision 7 public MCP exact 2025-06 and AUTO reopen reach one canonical catalog" {
+    const cases = [_]struct {
+        policy: u32,
+        probe_opens: u32,
+        actual_11_opens: u32,
+        actual_06_opens: u32,
+        closes_before_destroy: u32,
+    }{
+        .{
+            .policy = wire.MCP_NEGOTIATION_LEGACY_2025_06_ONLY,
+            .probe_opens = 0,
+            .actual_11_opens = 0,
+            .actual_06_opens = 1,
+            .closes_before_destroy = 0,
+        },
+        .{
+            .policy = wire.MCP_NEGOTIATION_AUTO,
+            .probe_opens = 1,
+            .actual_11_opens = 1,
+            .actual_06_opens = 1,
+            .closes_before_destroy = 2,
+        },
+    };
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+
+    for (cases, 0..) |case, index| {
+        var probe = PublicMcpProbe{ .server_era_code = wire.MCP_ERA_2025_06_18 };
+        var server = std.mem.zeroes(wire.McpServerV1);
+        server.struct_size = @sizeOf(wire.McpServerV1);
+        server.transport_code = wire.MCP_TRANSPORT_STDIO;
+        server.negotiation_policy_code = case.policy;
+        server.server_binding_identity = [_]u8{@intCast(0x60 + index)} ** 32;
+        server.namespace = sdk.bytesView(if (index == 0) "exact06" else "auto06");
+        server.client_name = sdk.bytesView("agentcore-r7-test");
+        server.client_version = sdk.bytesView("7");
+        server.timeout_ms = 1000;
+        server.connector = probe.connector();
+        const servers = [_]wire.McpServerV1{server};
+        var config = std.mem.zeroes(wire.RuntimeConfigV1);
+        config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+        config.mcp_servers = &servers;
+        config.mcp_server_count = servers.len;
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        var runtime: ?*wire.RuntimeHandle = null;
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.runtimeCreate()(&config, &runtime, &diagnostic),
+        );
+        defer api.bufferRelease()(&diagnostic);
+        var generation: u64 = 0;
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.runtimeRefreshMcp()(runtime, &generation, &diagnostic),
+        );
+        try std.testing.expectEqual(@as(u64, 1), generation);
+        var description = std.mem.zeroes(wire.OwnedBytesV1);
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.runtimeDescribeMcp()(runtime, &description, &diagnostic),
+        );
+        const encoded = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
+        const decoded = try sdk.decodeMcpCatalog(std.testing.allocator, encoded);
+        defer decoded.deinit();
+        try std.testing.expectEqual(@as(usize, 1), decoded.value.servers.len);
+        try std.testing.expectEqual(@as(usize, 1), decoded.value.tools.len);
+        try std.testing.expectEqualStrings(
+            "2025-06-18",
+            decoded.value.servers[0].negotiated_protocol,
+        );
+        api.bufferRelease()(&description);
+        try std.testing.expectEqual(case.probe_opens, probe.probe_opens);
+        try std.testing.expectEqual(case.actual_11_opens, probe.actual_2025_11_opens);
+        try std.testing.expectEqual(case.actual_06_opens, probe.actual_2025_06_opens);
+        try std.testing.expectEqual(
+            @as(usize, @intCast(case.probe_opens + case.actual_11_opens + case.actual_06_opens)),
+            probe.connection_count,
+        );
+        try std.testing.expectEqual(
+            @as(u32, 0),
+            probe.notifications_by_era[wire.MCP_ERA_2025_11_25],
+        );
+        try std.testing.expectEqual(
+            @as(u32, 1),
+            probe.notifications_by_era[wire.MCP_ERA_2025_06_18],
+        );
+        try std.testing.expectEqual(
+            @as(u32, 0),
+            probe.list_requests_by_era[wire.MCP_ERA_2025_11_25],
+        );
+        try std.testing.expectEqual(
+            @as(u32, 1),
+            probe.list_requests_by_era[wire.MCP_ERA_2025_06_18],
+        );
+        if (case.policy == wire.MCP_NEGOTIATION_AUTO) {
+            try std.testing.expect(probe.connections[0].closed);
+            try std.testing.expect(probe.connections[1].closed);
+            try std.testing.expect(!probe.connections[2].closed);
+            try std.testing.expectEqual(
+                wire.MCP_CONNECTION_DISPOSABLE_PROBE,
+                probe.connections[0].purpose_code,
+            );
+            try std.testing.expectEqual(
+                wire.MCP_ERA_2025_11_25,
+                probe.connections[1].era_code,
+            );
+            try std.testing.expectEqual(
+                wire.MCP_ERA_2025_06_18,
+                probe.connections[2].era_code,
+            );
+        }
+        try std.testing.expectEqual(case.closes_before_destroy, probe.closes);
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.runtimeDestroy()(runtime, &diagnostic),
+        );
+        runtime = null;
+        try probe.expectClosedExactlyOnce();
+    }
+}
+
+test "L2 public MCP wire failures preserve downgrade and no-replay semantics" {
+    const cases = [_]struct {
+        transport: u32,
+        probe_open_status: u32 = wire.MCP_OPEN_OK,
+        probe_exchange_status: ?u32 = null,
+        expected_servers: usize,
+        expected_issue: ?[]const u8,
+        expected_actual_attempts: u32,
+        expected_request_attempts: u32,
+        expected_tools: usize = 0,
+        expected_protocol: ?[]const u8 = null,
+    }{
+        .{
+            .transport = wire.MCP_TRANSPORT_STDIO,
+            .probe_open_status = wire.MCP_OPEN_TIMEOUT,
+            .expected_servers = 1,
+            .expected_issue = null,
+            .expected_actual_attempts = 1,
+            .expected_request_attempts = 2,
+            .expected_tools = 1,
+            .expected_protocol = "2025-11-25",
+        },
+        .{
+            .transport = wire.MCP_TRANSPORT_STDIO,
+            .probe_open_status = wire.MCP_OPEN_CHILD_EXIT,
+            .expected_servers = 1,
+            .expected_issue = null,
+            .expected_actual_attempts = 1,
+            .expected_request_attempts = 2,
+            .expected_tools = 1,
+            .expected_protocol = "2025-11-25",
+        },
+        .{
+            .transport = wire.MCP_TRANSPORT_STREAMABLE_HTTP,
+            .probe_open_status = wire.MCP_OPEN_NETWORK_ERROR,
+            .expected_servers = 0,
+            .expected_issue = "downgrade_refused",
+            .expected_actual_attempts = 0,
+            .expected_request_attempts = 0,
+        },
+        .{
+            .transport = wire.MCP_TRANSPORT_STREAMABLE_HTTP,
+            .probe_open_status = wire.MCP_OPEN_AUTH_ERROR,
+            .expected_servers = 0,
+            .expected_issue = "downgrade_refused",
+            .expected_actual_attempts = 0,
+            .expected_request_attempts = 0,
+        },
+        .{
+            .transport = wire.MCP_TRANSPORT_STREAMABLE_HTTP,
+            .probe_open_status = wire.MCP_OPEN_SERVER_ERROR,
+            .expected_servers = 0,
+            .expected_issue = "downgrade_refused",
+            .expected_actual_attempts = 0,
+            .expected_request_attempts = 0,
+        },
+        .{
+            .transport = wire.MCP_TRANSPORT_STDIO,
+            .probe_exchange_status = wire.MCP_EXCHANGE_TIMEOUT,
+            .expected_servers = 1,
+            .expected_issue = null,
+            .expected_actual_attempts = 1,
+            .expected_request_attempts = 3,
+            .expected_tools = 1,
+            .expected_protocol = "2025-11-25",
+        },
+        .{
+            .transport = wire.MCP_TRANSPORT_STDIO,
+            .probe_exchange_status = wire.MCP_EXCHANGE_CHILD_EXIT,
+            .expected_servers = 1,
+            .expected_issue = null,
+            .expected_actual_attempts = 1,
+            .expected_request_attempts = 3,
+            .expected_tools = 1,
+            .expected_protocol = "2025-11-25",
+        },
+        .{
+            .transport = wire.MCP_TRANSPORT_STREAMABLE_HTTP,
+            .probe_exchange_status = wire.MCP_EXCHANGE_NETWORK_ERROR,
+            .expected_servers = 0,
+            .expected_issue = "downgrade_refused",
+            .expected_actual_attempts = 0,
+            .expected_request_attempts = 1,
+        },
+        .{
+            .transport = wire.MCP_TRANSPORT_STREAMABLE_HTTP,
+            .probe_exchange_status = wire.MCP_EXCHANGE_AUTH_ERROR,
+            .expected_servers = 0,
+            .expected_issue = "downgrade_refused",
+            .expected_actual_attempts = 0,
+            .expected_request_attempts = 1,
+        },
+        .{
+            .transport = wire.MCP_TRANSPORT_STREAMABLE_HTTP,
+            .probe_exchange_status = wire.MCP_EXCHANGE_SERVER_ERROR,
+            .expected_servers = 0,
+            .expected_issue = "downgrade_refused",
+            .expected_actual_attempts = 0,
+            .expected_request_attempts = 1,
+        },
+        .{
+            .transport = wire.MCP_TRANSPORT_STDIO,
+            .probe_exchange_status = wire.MCP_EXCHANGE_CANCELLED,
+            .expected_servers = 0,
+            .expected_issue = "probe_failed",
+            .expected_actual_attempts = 0,
+            .expected_request_attempts = 1,
+        },
+        .{
+            .transport = wire.MCP_TRANSPORT_STDIO,
+            .probe_exchange_status = wire.MCP_EXCHANGE_INDETERMINATE,
+            .expected_servers = 0,
+            .expected_issue = "probe_failed",
+            .expected_actual_attempts = 0,
+            .expected_request_attempts = 1,
+        },
+    };
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+
+    for (cases, 0..) |case, index| {
+        var probe = PublicMcpProbe{
+            .server_era_code = wire.MCP_ERA_2025_11_25,
+            .probe_open_status = case.probe_open_status,
+            .probe_exchange_status = case.probe_exchange_status,
+        };
+        var server = std.mem.zeroes(wire.McpServerV1);
+        server.struct_size = @sizeOf(wire.McpServerV1);
+        server.transport_code = case.transport;
+        server.negotiation_policy_code = wire.MCP_NEGOTIATION_AUTO;
+        server.server_binding_identity = [_]u8{@intCast(0x79 + index)} ** 32;
+        server.namespace = sdk.bytesView("failure");
+        server.client_name = sdk.bytesView("agentcore-r7-test");
+        server.client_version = sdk.bytesView("7");
+        server.timeout_ms = 1000;
+        server.connector = probe.connector();
+        const servers = [_]wire.McpServerV1{server};
+        var config = std.mem.zeroes(wire.RuntimeConfigV1);
+        config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+        config.mcp_servers = &servers;
+        config.mcp_server_count = servers.len;
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        defer api.bufferRelease()(&diagnostic);
+        var runtime: ?*wire.RuntimeHandle = null;
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.runtimeCreate()(&config, &runtime, &diagnostic),
+        );
+        var generation: u64 = 0;
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.runtimeRefreshMcp()(runtime, &generation, &diagnostic),
+        );
+        var description = std.mem.zeroes(wire.OwnedBytesV1);
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.runtimeDescribeMcp()(runtime, &description, &diagnostic),
+        );
+        const encoded = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
+        const decoded = try sdk.decodeMcpCatalog(std.testing.allocator, encoded);
+        defer decoded.deinit();
+        try std.testing.expectEqual(case.expected_servers, decoded.value.servers.len);
+        try std.testing.expectEqual(case.expected_tools, decoded.value.tools.len);
+        if (case.expected_protocol) |expected| try std.testing.expectEqualStrings(
+            expected,
+            decoded.value.servers[0].negotiated_protocol,
+        );
+        if (case.expected_issue) |expected| {
+            try std.testing.expectEqual(@as(usize, 1), decoded.value.issues.len);
+            try std.testing.expectEqualStrings(expected, decoded.value.issues[0].kind);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), decoded.value.issues.len);
+        }
+        api.bufferRelease()(&description);
+        try std.testing.expectEqual(@as(u32, 1), probe.probe_open_attempts);
+        try std.testing.expectEqual(case.expected_actual_attempts, probe.actual_open_attempts);
+        try std.testing.expectEqual(case.expected_request_attempts, probe.request_attempts);
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.runtimeDestroy()(runtime, &diagnostic),
+        );
+        runtime = null;
+        try probe.expectClosedExactlyOnce();
+    }
+}
+
+test "L2 public MCP catalog preserves heterogeneous multi-server tool windows" {
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+
+    var first_probe = PublicMcpProbe{ .tool_count = 2 };
+    var second_probe = PublicMcpProbe{ .tool_count = 1 };
+    const bindings = [_][32]u8{
+        [_]u8{0x83} ** 32,
+        [_]u8{0x84} ** 32,
+    };
+    const namespaces = [_][]const u8{ "single", "double" };
+    var servers = [_]wire.McpServerV1{
+        std.mem.zeroes(wire.McpServerV1),
+        std.mem.zeroes(wire.McpServerV1),
+    };
+    const connectors = [_]wire.McpConnectorV1{
+        first_probe.connector(),
+        second_probe.connector(),
+    };
+    for (&servers, 0..) |*server, index| {
+        server.struct_size = @sizeOf(wire.McpServerV1);
+        server.transport_code = wire.MCP_TRANSPORT_STDIO;
+        server.negotiation_policy_code = wire.MCP_NEGOTIATION_AUTO;
+        server.server_binding_identity = bindings[index];
+        server.namespace = sdk.bytesView(namespaces[index]);
+        server.client_name = sdk.bytesView("agentcore-r7-test");
+        server.client_version = sdk.bytesView("7");
+        server.timeout_ms = 1000;
+        server.connector = connectors[index];
+    }
+    var config = std.mem.zeroes(wire.RuntimeConfigV1);
+    config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    config.mcp_servers = &servers;
+    config.mcp_server_count = servers.len;
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeCreate()(&config, &runtime, &diagnostic),
+    );
+    var generation: u64 = 0;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeRefreshMcp()(runtime, &generation, &diagnostic),
+    );
+    var description = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeDescribeMcp()(runtime, &description, &diagnostic),
+    );
+    const encoded = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
+    const decoded = try sdk.decodeMcpCatalog(std.testing.allocator, encoded);
+    defer decoded.deinit();
+    api.bufferRelease()(&description);
+
+    try std.testing.expectEqual(@as(usize, 2), decoded.value.servers.len);
+    try std.testing.expectEqual(@as(usize, 3), decoded.value.tools.len);
+    const expected_counts = [_]u32{ 2, 1 };
+    var next_tool_offset: u32 = 0;
+    for (decoded.value.servers, expected_counts, 0..) |server, expected_count, index| {
+        try std.testing.expectEqual(next_tool_offset, server.tool_offset);
+        try std.testing.expectEqual(expected_count, server.tool_count);
+        try std.testing.expectEqualStrings(namespaces[index], server.namespace);
+        try std.testing.expectEqual(@as(usize, 64), server.server_binding_identity.len);
+        const start: usize = @intCast(server.tool_offset);
+        const end: usize = @intCast(server.tool_offset + server.tool_count);
+        for (decoded.value.tools[start..end]) |tool| try std.testing.expectEqualSlices(
+            u8,
+            server.server_binding_identity,
+            tool.server_binding_identity,
+        );
+        next_tool_offset += server.tool_count;
+    }
+    try std.testing.expectEqual(@as(u32, 3), next_tool_offset);
+
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeDestroy()(runtime, &diagnostic),
+    );
+    runtime = null;
+    try first_probe.expectClosedExactlyOnce();
+    try second_probe.expectClosedExactlyOnce();
+}
+
+test "L2 Revision 7 MCP no-tools and required-task peers expose zero executable tools" {
+    const cases = [_]struct {
+        era: u32,
+        policy: u32,
+        advertise_tools: bool,
+        required_task: bool,
+        expected_list_requests: u32,
+        expected_issues: usize,
+        expected_protocol: []const u8,
+    }{
+        .{
+            .era = wire.MCP_ERA_2025_11_25,
+            .policy = wire.MCP_NEGOTIATION_LEGACY_ONLY,
+            .advertise_tools = false,
+            .required_task = false,
+            .expected_list_requests = 0,
+            .expected_issues = 0,
+            .expected_protocol = "2025-11-25",
+        },
+        .{
+            .era = wire.MCP_ERA_2026_07_28,
+            .policy = wire.MCP_NEGOTIATION_AUTO,
+            .advertise_tools = true,
+            .required_task = true,
+            .expected_list_requests = 1,
+            .expected_issues = 1,
+            .expected_protocol = "2026-07-28",
+        },
+    };
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    for (cases, 0..) |case, index| {
+        var probe = PublicMcpProbe{
+            .server_era_code = case.era,
+            .advertise_tools = case.advertise_tools,
+            .required_task = case.required_task,
+        };
+        var server = std.mem.zeroes(wire.McpServerV1);
+        server.struct_size = @sizeOf(wire.McpServerV1);
+        server.transport_code = wire.MCP_TRANSPORT_STDIO;
+        server.negotiation_policy_code = case.policy;
+        server.server_binding_identity = [_]u8{@intCast(0x70 + index)} ** 32;
+        server.namespace = sdk.bytesView(if (index == 0) "notools" else "required");
+        server.client_name = sdk.bytesView("agentcore-r7-test");
+        server.client_version = sdk.bytesView("7");
+        server.timeout_ms = 1000;
+        server.connector = probe.connector();
+        const servers = [_]wire.McpServerV1{server};
+        var config = std.mem.zeroes(wire.RuntimeConfigV1);
+        config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+        config.mcp_servers = &servers;
+        config.mcp_server_count = servers.len;
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        defer api.bufferRelease()(&diagnostic);
+        var runtime: ?*wire.RuntimeHandle = null;
+        try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreate()(&config, &runtime, &diagnostic));
+        var generation: u64 = 0;
+        try std.testing.expectEqual(wire.STATUS_OK, api.runtimeRefreshMcp()(runtime, &generation, &diagnostic));
+        var description = std.mem.zeroes(wire.OwnedBytesV1);
+        try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDescribeMcp()(runtime, &description, &diagnostic));
+        const encoded = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
+        const decoded = try sdk.decodeMcpCatalog(std.testing.allocator, encoded);
+        defer decoded.deinit();
+        try std.testing.expectEqual(@as(usize, 1), decoded.value.servers.len);
+        try std.testing.expectEqualStrings(
+            case.expected_protocol,
+            decoded.value.servers[0].negotiated_protocol,
+        );
+        try std.testing.expectEqual(@as(usize, 0), decoded.value.tools.len);
+        try std.testing.expectEqual(case.expected_issues, decoded.value.issues.len);
+        if (case.required_task) try std.testing.expectEqualStrings(
+            "task_required_unsupported",
+            decoded.value.issues[0].kind,
+        );
+        try std.testing.expectEqual(case.expected_list_requests, probe.list_requests);
+        try std.testing.expectEqual(@as(u32, 0), probe.call_requests);
+        api.bufferRelease()(&description);
+        try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+        runtime = null;
+        try probe.expectClosedExactlyOnce();
+    }
+}
 
 const PublicPermissionProbe = struct {
     expected_session: ?*wire.SessionHandle = null,
@@ -1119,7 +1754,7 @@ test "L2 SDK rejects API tables that violate rigid v1 discovery" {
     try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&extra_capability));
 }
 
-test "L2 Revision 6 public mutations and compact use the exact hard-cut table" {
+test "L2 Revision 7 public mutations and compact use the exact hard-cut table" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1251,7 +1886,7 @@ test "L2 Revision 6 public mutations and compact use the exact hard-cut table" {
     );
 }
 
-test "L2 Revision 6 public MCP checkpoint restore facade preserves Conversation under narrower current authority" {
+test "L2 Revision 7 public MCP checkpoint restore facade preserves Conversation under narrower current authority" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1534,7 +2169,7 @@ test "L2 Revision 6 public MCP checkpoint restore facade preserves Conversation 
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    std.mem.writeInt(u32, checkpoint.bytes.items[20..24], 7, .little);
+    std.mem.writeInt(u32, checkpoint.bytes.items[20..24], 6, .little);
     source = checkpoint.source();
     restore_config.source = &source;
     try std.testing.expectEqual(
@@ -1694,11 +2329,11 @@ test "L2 Revision 6 public MCP checkpoint restore facade preserves Conversation 
     try std.testing.expectEqual(@as(u32, 2), mcp_probe.opens);
     try std.testing.expectEqual(@as(u32, 1), mcp_probe.probe_opens);
     try std.testing.expectEqual(@as(u32, 1), mcp_probe.actual_opens);
-    try std.testing.expectEqual(mcp_probe.opens, mcp_probe.closes);
+    try mcp_probe.expectClosedExactlyOnce();
     try std.testing.expectEqual(mcp_probe.requests, mcp_probe.releases);
 }
 
-test "L2 Revision 6 public Permission callback and provenance bind the exact Host invocation" {
+test "L2 Revision 7 public Permission callback and provenance bind the exact Host invocation" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1813,7 +2448,7 @@ test "L2 Revision 6 public Permission callback and provenance bind the exact Hos
     try std.testing.expectEqual(@as(u32, 1), probe.host_releases);
 }
 
-test "L2 Revision 6 imported permission rules control the next Run" {
+test "L2 Revision 7 imported permission rules control the next Run" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2419,7 +3054,7 @@ test "L2 public compact abort is concurrent bounded and leaves the facade reusab
     );
 }
 
-test "L2 Revision 6 catalog and explicit selection bind before Session" {
+test "L2 Revision 7 catalog and explicit selection bind before Session" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
