@@ -11,6 +11,11 @@ from scripts.eval.project_harness_e3_experiment import (
     ARMS,
     ANALYSIS_PLAN,
     CASES,
+    LEGACY_ANALYSIS_PLAN,
+    LEGACY_CASES,
+    LEGACY_ROLLOUT_SCHEMA,
+    LEGACY_SCHEDULE_SEED,
+    ROLLOUT_SCHEMA,
     CORRECTION_FAMILY,
     _schedule,
     _efficiency_lte,
@@ -19,6 +24,7 @@ from scripts.eval.project_harness_e3_experiment import (
     analyze_journal,
     build_report,
     grade_workspace,
+    rollout_schema_for_manifest,
     E3_ALLOWED_TOOLS,
     E3_AUTO_MEMORY_POLICY,
     E3_LONG_HORIZON_ARM,
@@ -94,6 +100,28 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
         self.assertEqual(4, sum(case["oracle_class"].startswith("safe_") for case in CASES))
         self.assertEqual({CORRECTION_FAMILY}, {case["correction_family"] for case in CASES})
         self.assertEqual("complete-frozen-schedule-no-early-stop", ANALYSIS_PLAN["stopping_rule"])
+        self.assertTrue(ANALYSIS_PLAN["prospective_case_cohort"])
+        self.assertEqual(8, ANALYSIS_PLAN["expected_exact_edit_recovery_directions"])
+        self.assertTrue(
+            {case["id"] for case in CASES}.isdisjoint(
+                {case["id"] for case in LEGACY_CASES}
+            )
+        )
+        self.assertEqual(
+            48,
+            len(_schedule(LEGACY_CASES, LEGACY_SCHEDULE_SEED)),
+        )
+        self.assertNotEqual(ANALYSIS_PLAN, LEGACY_ANALYSIS_PLAN)
+        self.assertEqual(
+            ROLLOUT_SCHEMA,
+            rollout_schema_for_manifest({"analysis_plan": ANALYSIS_PLAN}),
+        )
+        self.assertEqual(
+            LEGACY_ROLLOUT_SCHEMA,
+            rollout_schema_for_manifest({"analysis_plan": LEGACY_ANALYSIS_PLAN}),
+        )
+        with self.assertRaisesRegex(E3Error, "analysis plan is unknown"):
+            rollout_schema_for_manifest({"analysis_plan": {"study_phase": "forged"}})
         for position in range(len(ARMS)):
             self.assertEqual(
                 set(ARMS),
@@ -186,11 +214,13 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
                             "physical_checker_calls": 1 if governed else 0,
                             "checker_elapsed_ns_max": 10_000_000 if governed else 0,
                             "checker_elapsed_ns_samples": [10_000_000] if governed else [],
+                            "exact_edit_recovery_directions": 1 if hazard and evolved else 0,
                         },
                     }
                 )
             manifest = {
                 "manifest_id": "1" * 64,
+                "cases": list(CASES),
                 "schedule": schedule,
                 "analysis_plan": ANALYSIS_PLAN,
                 "claim_boundary": {"confirmatory": "bounded", "forbidden": "general"},

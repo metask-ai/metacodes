@@ -254,6 +254,7 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
             run_dir.mkdir()
             manifest = {
                 "manifest_id": "1" * 64,
+                "cases": [case],
                 "root": str(root),
                 "project_root": str(workspace),
                 "project_sha256": "2" * 64,
@@ -368,6 +369,7 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
             run_dir.mkdir()
             manifest = {
                 "manifest_id": "a" * 64,
+                "cases": [case],
                 "root": str(root),
                 "project_root": str(workspace),
                 "project_sha256": templates["project_sha256"],
@@ -483,6 +485,7 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
             run_dir.mkdir()
             manifest = {
                 "manifest_id": "d" * 64,
+                "cases": [case],
                 "root": str(root),
                 "project_root": str(workspace),
                 "project_sha256": "e" * 64,

@@ -60,13 +60,11 @@ if __package__ in {None, ""}:
     from scripts.eval.model import stable_json  # type: ignore
     from scripts.eval.project_harness_e3_experiment import (  # type: ignore
         ARMS,
-        CASE_BY_ID,
         E3_AUTO_MEMORY_POLICY,
         E3_LONG_HORIZON_ARM,
         E3_ALLOWED_TOOLS,
         E3_DISALLOWED_TOOLS,
         E3Error,
-        ROLLOUT_SCHEMA,
         _canonical_sha256,
         _kernel_runtime_dependencies,
         _reopen_rollout_receipt,
@@ -74,6 +72,7 @@ if __package__ in {None, ""}:
         build_report,
         freeze_manifest,
         grade_workspace,
+        rollout_schema_for_manifest,
         validate_manifest,
     )
     from scripts.eval.project_harness_e3_templates import verify_templates  # type: ignore
@@ -120,13 +119,11 @@ else:
     from .model import stable_json
     from .project_harness_e3_experiment import (
         ARMS,
-        CASE_BY_ID,
         E3_AUTO_MEMORY_POLICY,
         E3_LONG_HORIZON_ARM,
         E3_ALLOWED_TOOLS,
         E3_DISALLOWED_TOOLS,
         E3Error,
-        ROLLOUT_SCHEMA,
         _canonical_sha256,
         _kernel_runtime_dependencies,
         _reopen_rollout_receipt,
@@ -134,6 +131,7 @@ else:
         build_report,
         freeze_manifest,
         grade_workspace,
+        rollout_schema_for_manifest,
         validate_manifest,
     )
     from .project_harness_e3_templates import verify_templates
@@ -430,7 +428,20 @@ def _run_one(
 ) -> Mapping[str, Any]:
     sequence = int(schedule["sequence"])
     arm = str(schedule["arm"])
-    case = CASE_BY_ID[str(schedule["case_id"])]
+    frozen_cases = manifest.get("cases")
+    if not isinstance(frozen_cases, list):
+        raise E3Error("E3 manifest has no frozen case cohort")
+    case_by_id = {
+        str(case.get("id")): case
+        for case in frozen_cases
+        if isinstance(case, Mapping)
+    }
+    if len(case_by_id) != len(frozen_cases):
+        raise E3Error("E3 frozen case cohort is malformed or duplicated")
+    try:
+        case = case_by_id[str(schedule["case_id"])]
+    except KeyError as exc:
+        raise E3Error("E3 schedule case is outside the frozen cohort") from exc
     root = Path(str(manifest["root"]))
     workspace = Path(str(manifest["project_root"]))
     _reset_workspace(workspace, case, root)
@@ -759,7 +770,7 @@ def _run_one(
     snapshot = artifact_dir / "workspace-final"
     _copy_workspace_snapshot(workspace, snapshot)
     receipt: Mapping[str, Any] = {
-        "schema_version": ROLLOUT_SCHEMA,
+        "schema_version": rollout_schema_for_manifest(manifest),
         "evidence_level": (
             "E3-paid-model-rollout" if test_base_url is None else "E2-loopback-runner-boundary"
         ),

@@ -756,6 +756,18 @@ This is new E0/E1/L2 mechanism evidence only; it does not retroactively change
 the non-significant E3 result. A new frozen paid replication is required before
 claiming outcome benefit.
 
+That replication uses a prospective cohort rather than replaying the twelve
+cases inspected during diagnosis. Its eight hazard recurrences target new
+TOML, YAML, Markdown, GraphQL, lock, ownership, environment and JSON artifacts;
+four new-file or targeted-edit cases remain safe negatives. Case ids, prompts,
+opaque values and expected files are disjoint from the prior cohort and are
+committed before manifest freeze. The prior study contract remains accepted as
+an explicit legacy cohort so old receipts do not silently acquire the new
+intervention or analysis plan. The new plan additionally preregisters eight
+`edit_existing_file_exact` formal directions in `evolved_enforced`; absence of
+any direction, even with a coincidentally successful actor recovery, fails the
+production-stability claim.
+
 The retained local report has manifest id
 `dbf52121cbef1a0f11f4f99c27f6d8f0b18529047ca38dada0bba75e54288485`
 and SHA-256
