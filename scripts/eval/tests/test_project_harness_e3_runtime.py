@@ -27,6 +27,7 @@ from scripts.eval.memory_replay import (
 from scripts.eval.project_harness_e3_experiment import (
     ARMS,
     ARM_CONFIG,
+    ANALYSIS_PLAN,
     CASE_BY_ID,
     E3_ALLOWED_TOOLS,
     E3_DISALLOWED_TOOLS,
@@ -254,6 +255,7 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
             run_dir.mkdir()
             manifest = {
                 "manifest_id": "1" * 64,
+                "analysis_plan": ANALYSIS_PLAN,
                 "cases": [case],
                 "root": str(root),
                 "project_root": str(workspace),
@@ -369,6 +371,7 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
             run_dir.mkdir()
             manifest = {
                 "manifest_id": "a" * 64,
+                "analysis_plan": ANALYSIS_PLAN,
                 "cases": [case],
                 "root": str(root),
                 "project_root": str(workspace),
@@ -485,6 +488,7 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
             run_dir.mkdir()
             manifest = {
                 "manifest_id": "d" * 64,
+                "analysis_plan": ANALYSIS_PLAN,
                 "cases": [case],
                 "root": str(root),
                 "project_root": str(workspace),
