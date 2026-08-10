@@ -9,6 +9,10 @@ from pathlib import Path
 
 from scripts.eval.cli import main
 from scripts.eval.memory_benchmark import summarize_memory, write_memory_rows
+from scripts.eval.memory_query_plan import (
+    MULTIPLE_DISTINCT_SEED_PLANS_REASON,
+    QUERY_PLAN_INVALID_PREFIX,
+)
 from scripts.eval.memory_replay import (
     OBSERVATION_SCHEMA_VERSION,
     load_manifest,
@@ -242,6 +246,26 @@ class MemoryReplayTest(unittest.TestCase):
         self.assertEqual(row["outcome"]["status"], "unscored")
         self.assertIsNone(row["outcome"]["success"])
 
+    def test_multiple_seed_trace_remains_unscored_in_joined_replay(self):
+        observed = observations()
+        observation = observed[7]
+        observation["schema_version"] = OBSERVATION_SCHEMA_VERSION
+        observation["workspace"] = {"deterministic_success": True}
+        observation["evaluator"] = {
+            "status": "invalid",
+            "invalid_reason": QUERY_PLAN_INVALID_PREFIX
+            + MULTIPLE_DISTINCT_SEED_PLANS_REASON,
+            "deterministic_success": None,
+        }
+        observation["retrieval"]["query_variants"] = [
+            {"kind": "exact", "text": "rollback ticket protocol"},
+            {"kind": "exact", "text": "rollback registry Python"},
+        ]
+        row = self.replay(observed=observed)[7]
+        self.assertEqual(row["evaluator"]["status"], "invalid")
+        self.assertEqual(row["outcome"]["status"], "unscored")
+        self.assertIsNone(row["outcome"]["success"])
+
     def test_invalid_procedural_execution_does_not_fake_success(self):
         observed = observations()
         observed[4]["execution"] = {
@@ -271,6 +295,38 @@ class MemoryReplayTest(unittest.TestCase):
             "invalid_reason": "online workspace failed",
         }
         observed[5]["evaluator"]["deterministic_success"] = None
+        with self.assertRaisesRegex(ValidationError, "invalid online predecessor"):
+            self.replay(observed=observed)
+
+    def test_offline_transfer_keeps_scoring_after_evaluator_only_online_invalidity(self):
+        observed = observations()
+        observed[5]["schema_version"] = OBSERVATION_SCHEMA_VERSION
+        observed[5]["workspace"] = {"deterministic_success": True}
+        observed[5]["evaluator"] = {
+            "status": "invalid",
+            "invalid_reason": QUERY_PLAN_INVALID_PREFIX
+            + MULTIPLE_DISTINCT_SEED_PLANS_REASON,
+            "deterministic_success": None,
+        }
+        observed[5]["retrieval"]["query_variants"] = [
+            {"kind": "exact", "text": "first seed"},
+            {"kind": "exact", "text": "second seed"},
+        ]
+
+        rows = self.replay(observed=observed)
+        self.assertEqual(rows[5]["outcome"]["status"], "unscored")
+        self.assertEqual(rows[7]["outcome"]["status"], "pass")
+
+    def test_unrelated_online_evaluator_invalidity_still_blocks_offline_scoring(self):
+        observed = observations()
+        observed[5]["schema_version"] = OBSERVATION_SCHEMA_VERSION
+        observed[5]["workspace"] = {"deterministic_success": True}
+        observed[5]["evaluator"] = {
+            "status": "invalid",
+            "invalid_reason": "validator identity drift",
+            "deterministic_success": None,
+        }
+
         with self.assertRaisesRegex(ValidationError, "invalid online predecessor"):
             self.replay(observed=observed)
 

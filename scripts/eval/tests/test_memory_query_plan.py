@@ -5,11 +5,14 @@ import unittest
 from pathlib import Path
 
 from scripts.eval.memory_query_plan import (
+    MULTIPLE_DISTINCT_SEED_PLANS_REASON,
     SIDECAR_NAME,
     _plan_fingerprint,
     build_query_plan_trace,
     load_and_verify_query_plan_sidecar,
+    project_query_variants,
     summarize_query_plan_traces,
+    validate_query_plan_trace,
 )
 from scripts.eval.model import ValidationError, stable_json
 
@@ -147,6 +150,43 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             self.assertEqual(summary["repeated_hit_count"], 1)
             self.assertEqual(summary["unique_gain_ratio"], 0.75)
 
+    def test_distinct_seed_plans_are_invalid_and_preserved_as_exact(self):
+        first = self._call(
+            "kg-1",
+            variants=[{"kind": "exact", "text": "rollback ticket protocol"}],
+            hits=(7,),
+        )
+        second = self._call(
+            "kg-2",
+            variants=[{"kind": "exact", "text": "rollback registry Python"}],
+            hits=(11,),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(cassette, [first, second])
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-multiple-seeds",
+                arm="tinykg_lexical",
+                memory_backend="tinykg",
+            )
+
+        self.assertEqual(trace["status"], "invalid")
+        self.assertIn(MULTIPLE_DISTINCT_SEED_PLANS_REASON, trace["invalid_reasons"])
+        self.assertEqual(len(trace["calls"]), 2)
+        self.assertEqual(
+            project_query_variants(trace),
+            [
+                {"kind": "exact", "text": "rollback ticket protocol"},
+                {"kind": "exact", "text": "rollback registry Python"},
+            ],
+        )
+        forged = copy.deepcopy(trace)
+        forged["status"] = "verified"
+        forged["invalid_reasons"] = []
+        with self.assertRaisesRegex(ValidationError, "multiple distinct seed plans"):
+            validate_query_plan_trace(forged)
+
     def test_forged_gain_receipt_is_invalid_not_zero_gain(self):
         variants = [{"kind": "exact", "text": "needle"}]
         forged = self._call(
@@ -167,6 +207,32 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             self.assertEqual(trace["status"], "invalid")
             self.assertEqual(trace["calls"], [])
             self.assertRegex(trace["invalid_reasons"][0], "gain counts")
+
+    def test_failed_second_distinct_seed_still_invalidates_the_run(self):
+        first = self._call(
+            "kg-1",
+            variants=[{"kind": "exact", "text": "first seed"}],
+            hits=(7,),
+        )
+        second_use, second_result = self._call(
+            "kg-2",
+            variants=[{"kind": "exact", "text": "second seed"}],
+        )
+        second_result["is_error"] = True
+        second_result["content"] = '{"error":{"code":"permission_denied"}}'
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(cassette, [first, (second_use, second_result)])
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-failed-second-seed",
+                arm="tinykg_lexical",
+                memory_backend="tinykg",
+            )
+
+        self.assertEqual(trace["status"], "invalid")
+        self.assertIn(MULTIPLE_DISTINCT_SEED_PLANS_REASON, trace["invalid_reasons"])
+        self.assertRegex(trace["invalid_reasons"][0], "no successful observable result")
 
     def test_missing_receipt_and_plan_sha_drift_are_invalid(self):
         variants = [{"kind": "exact", "text": "needle"}]

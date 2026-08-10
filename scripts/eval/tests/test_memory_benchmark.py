@@ -13,6 +13,10 @@ from scripts.eval.memory_benchmark import (
     summarize_memory,
     validate_memory_row,
 )
+from scripts.eval.memory_query_plan import (
+    MULTIPLE_DISTINCT_SEED_PLANS_REASON,
+    QUERY_PLAN_INVALID_PREFIX,
+)
 from scripts.eval.model import ValidationError
 
 
@@ -146,6 +150,32 @@ class MemoryBenchmarkTest(unittest.TestCase):
             for index in range(4)
         )
         with self.assertRaisesRegex(ValidationError, "at most four semantic variants"):
+            validate_memory_row(row)
+
+    def test_multiple_seed_violation_is_audited_only_when_evaluator_invalid(self):
+        row = memory_row()
+        row["retrieval"]["query_variants"] = [
+            {"kind": "exact", "text": "rollback ticket protocol"},
+            {"kind": "exact", "text": "rollback registry Python"},
+        ]
+        with self.assertRaisesRegex(ValidationError, "exactly one exact query"):
+            validate_memory_row(row)
+
+        row["evaluator"] = {
+            "status": "invalid",
+            "invalid_reason": QUERY_PLAN_INVALID_PREFIX
+            + MULTIPLE_DISTINCT_SEED_PLANS_REASON,
+        }
+        row["outcome"]["status"] = "unscored"
+        row["outcome"]["success"] = None
+        group = summarize_memory([row])["groups"][
+            "multihop_retrieval/tinykg_lexical/test"
+        ]
+        self.assertEqual(group["invalid_rows"], 1)
+        self.assertEqual(group["scored_rows"], 0)
+
+        row["evaluator"]["invalid_reason"] = "unrelated evaluator failure"
+        with self.assertRaisesRegex(ValidationError, "exactly one exact query"):
             validate_memory_row(row)
 
     def test_verified_evidence_must_have_been_retrieved(self):

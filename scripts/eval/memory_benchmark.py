@@ -19,6 +19,11 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
+from .memory_query_plan import (
+    MAX_OBSERVATION_QUERY_VARIANTS,
+    MULTIPLE_DISTINCT_SEED_PLANS_REASON,
+    QUERY_PLAN_INVALID_PREFIX,
+)
 from .model import ValidationError
 
 
@@ -282,10 +287,26 @@ def validate_memory_row(row: Mapping[str, Any], where: str = "memory row") -> No
     if retrieval["enabled"]:
         if not variants or variants[0]["kind"] != "exact":
             _fail(f"{where}.retrieval.query_variants", "enabled retrieval must start with one exact query")
-        if exact_count != 1:
+        invalid_reasons = (
+            evaluator["invalid_reason"][len(QUERY_PLAN_INVALID_PREFIX) :].split("; ")
+            if evaluator_status == "invalid"
+            and isinstance(evaluator["invalid_reason"], str)
+            and evaluator["invalid_reason"].startswith(QUERY_PLAN_INVALID_PREFIX)
+            else []
+        )
+        preserves_multiple_seed_violation = (
+            exact_count > 1
+            and MULTIPLE_DISTINCT_SEED_PLANS_REASON in invalid_reasons
+        )
+        if exact_count != 1 and not preserves_multiple_seed_violation:
             _fail(f"{where}.retrieval.query_variants", "must contain exactly one exact query")
         if semantic_count > 4:
             _fail(f"{where}.retrieval.query_variants", "at most four semantic variants are allowed")
+        if len(variants) > MAX_OBSERVATION_QUERY_VARIANTS:
+            _fail(
+                f"{where}.retrieval.query_variants",
+                f"at most {MAX_OBSERVATION_QUERY_VARIANTS} audit variants are allowed",
+            )
     elif variants or k != 0 or hop_count != 0:
         _fail(f"{where}.retrieval", "disabled retrieval must have empty queries and zero k/hops")
     expected = _string_list(retrieval["expected_evidence_ids"], f"{where}.retrieval.expected_evidence_ids")

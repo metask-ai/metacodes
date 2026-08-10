@@ -23,6 +23,9 @@ TRACE_SCHEMA_VERSION = "metacodes-memory-query-plan-trace-v1"
 REPORT_SCHEMA_VERSION = "metacodes-memory-query-plan-report-v2"
 LEXICAL_PLAN_SCHEMA_VERSION = "lexical-query-plan-v1"
 SIDECAR_NAME = "query-plan.json"
+QUERY_PLAN_INVALID_PREFIX = "query-plan trace invalid: "
+MULTIPLE_DISTINCT_SEED_PLANS_REASON = "multiple distinct seed plans in one run"
+MAX_OBSERVATION_QUERY_VARIANTS = 5
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 INTENTS = frozenset(
     {
@@ -411,17 +414,22 @@ def build_query_plan_trace(
     reasons: List[str] = []
     calls: List[Mapping[str, Any]] = []
     plan_seen: MutableMapping[str, set[int]] = defaultdict(set)
+    declared_seed_plans: set[str] = set()
     for call_index, (_tool_id, _name, tool_input, raw_result, is_error) in enumerate(recall_tools):
         # Invalid reasons are persisted evidence. Keep them independent from
         # caller diagnostics and model-controlled ids so later replay is
         # byte-stable and bounded.
         call_where = f"KgRecall[{call_index}]"
-        if is_error:
-            reasons.append(f"call {call_index}: KgRecall has no successful observable result")
-            continue
         try:
             parsed_plan = _parse_plan(tool_input, call_where)
             plan_sha = str(parsed_plan["plan_sha256"])
+            if parsed_plan["stage"] == "seed":
+                declared_seed_plans.add(plan_sha)
+            if is_error:
+                reasons.append(
+                    f"call {call_index}: KgRecall has no successful observable result"
+                )
+                continue
             expected_seen = plan_seen[plan_sha]
             if set(parsed_plan["seen_node_ids"]) != expected_seen:
                 _fail(call_where, "declared seen ids do not match prior hits for this plan")
@@ -448,6 +456,8 @@ def build_query_plan_trace(
             )
         except ValidationError as exc:
             reasons.append(f"call {call_index}: {exc}")
+    if len(declared_seed_plans) > 1:
+        reasons.append(MULTIPLE_DISTINCT_SEED_PLANS_REASON)
     if not recall_tools:
         reasons.append("TinyKG backend executed no KgRecall")
     status = "verified" if not reasons and len(calls) == len(recall_tools) else "invalid"
@@ -461,6 +471,42 @@ def build_query_plan_trace(
         "invalid_reasons": reasons,
         "calls": calls,
     }
+
+
+def project_query_variants(
+    trace: Mapping[str, Any],
+    *,
+    limit: int = MAX_OBSERVATION_QUERY_VARIANTS,
+) -> List[Mapping[str, str]]:
+    """Project a bounded audit view without relabeling protocol violations.
+
+    The complete call sequence remains in ``query-plan.json``.  Observation
+    rows intentionally carry at most the result protocol's five variants.
+    Multiple distinct seed plans therefore remain multiple ``exact`` entries;
+    the caller must pair that shape with an evaluator-invalid verdict rather
+    than laundering later seeds into semantic expansions.
+    """
+
+    validate_query_plan_trace(trace)
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        _fail("memory query-plan projection limit", "expected an integer >= 1")
+    projected: List[Mapping[str, str]] = []
+    seen_text: set[str] = set()
+    for call in trace["calls"]:
+        text = str(call["query"])
+        normalized = " ".join(text.casefold().split())
+        if not normalized or normalized in seen_text:
+            continue
+        seen_text.add(normalized)
+        projected.append(
+            {
+                "kind": "exact" if call["stage"] == "seed" else "semantic",
+                "text": text,
+            }
+        )
+        if len(projected) == limit:
+            break
+    return projected
 
 
 def validate_query_plan_trace(trace: Mapping[str, Any], where: str = "query-plan sidecar") -> None:
@@ -504,6 +550,16 @@ def validate_query_plan_trace(trace: Mapping[str, Any], where: str = "query-plan
             _integer(call[key], f"{where}.calls[{index}].{key}")
         if call["seen_state_verified"] is not True or call["ledger_scope"] != "agent_run_plan":
             _fail(f"{where}.calls[{index}]", "host verification claim is absent")
+    distinct_seed_plans = {
+        str(call["plan_sha256"])
+        for call in calls
+        if call["stage"] == "seed"
+    }
+    if len(distinct_seed_plans) > 1:
+        if status == "verified":
+            _fail(where, "verified trace contains multiple distinct seed plans")
+        if MULTIPLE_DISTINCT_SEED_PLANS_REASON not in reasons:
+            _fail(where, "multiple seed plans are missing their invalid reason")
     if status == "verified" and (
         backend not in TINYKG_BACKENDS
         or reasons

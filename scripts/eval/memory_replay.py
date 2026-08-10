@@ -35,6 +35,8 @@ from .memory_consolidation import (
     validate_receipt as _validate_consolidation_receipt,
 )
 from .memory_query_plan import (
+    QUERY_PLAN_INVALID_PREFIX,
+    build_query_plan_trace,
     load_and_verify_query_plan_sidecar,
     summarize_query_plan_traces,
 )
@@ -74,6 +76,11 @@ PRODUCTION_RUNTIME_RECEIPT_VERSIONS = frozenset(
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }
 )
+# Deliberately private and identity-checked: canonical replay must never opt
+# into recomputing a historical query-plan sidecar through a convenient bool.
+# The failed-run analyzer imports this capability explicitly and still emits
+# analysis-only, non-promotable output.
+_FAILED_RUN_QUERY_PLAN_REANALYSIS = object()
 LEGACY_RUNNER_SOURCE_MODULES = (
     "e2e_adapter",
     "memory_agent_runtime",
@@ -3146,14 +3153,29 @@ def validate_runtime_artifacts(
     receipt: Mapping[str, Any],
     artifact_root: Path,
     where: str = "memory runtime artifacts",
+    *,
+    _query_plan_reanalysis: object | None = None,
 ) -> None:
     """Re-open every native artifact instead of trusting receipt-shaped hashes."""
 
     schema_version = receipt.get("schema_version")
     if schema_version not in NATIVE_RUNTIME_RECEIPT_VERSIONS:
         return
+    if (
+        _query_plan_reanalysis is not None
+        and _query_plan_reanalysis is not _FAILED_RUN_QUERY_PLAN_REANALYSIS
+    ):
+        _fail(where, "unknown query-plan artifact policy")
+    recompute_query_plans = (
+        _query_plan_reanalysis is _FAILED_RUN_QUERY_PLAN_REANALYSIS
+    )
     seen_paths: set[str] = set()
     query_plan_bound = _query_plan_source_bound(receipt, where)
+    if recompute_query_plans and not query_plan_bound:
+        _fail(
+            f"{where}.runner_sources",
+            "failed-run query-plan reanalysis requires a source-bound runtime",
+        )
     checkpoint_transactions: Mapping[str, Mapping[str, Any]] | None = None
     if schema_version in {
         RUNTIME_RECEIPT_SCHEMA_VERSION,
@@ -3872,14 +3894,28 @@ def validate_runtime_artifacts(
                     _fail(f"{rollout_where}.memory_read_events", "raw cassette count mismatch")
                 if expected_writes != raw_rollout.get("memory_write_events"):
                     _fail(f"{rollout_where}.memory_write_events", "raw cassette count mismatch")
-                load_and_verify_query_plan_sidecar(
-                    path,
-                    run_id=str(raw_rollout.get("run_id")),
-                    arm=str(raw_rollout.get("arm")),
-                    memory_backend=str(raw_rollout.get("memory_backend")),
-                    required=query_plan_bound,
-                    where=f"{rollout_where}.query_plan",
-                )
+                if recompute_query_plans:
+                    # Failed-run reanalysis is allowed to reinterpret a
+                    # source-bound legacy sidecar only from the immutable raw
+                    # request cassette. The cassette tree digest above still
+                    # binds the historical bytes; canonical replay keeps the
+                    # strict sidecar equality path below.
+                    build_query_plan_trace(
+                        path,
+                        run_id=str(raw_rollout.get("run_id")),
+                        arm=str(raw_rollout.get("arm")),
+                        memory_backend=str(raw_rollout.get("memory_backend")),
+                        where=f"{rollout_where}.query_plan.recomputed",
+                    )
+                else:
+                    load_and_verify_query_plan_sidecar(
+                        path,
+                        run_id=str(raw_rollout.get("run_id")),
+                        arm=str(raw_rollout.get("arm")),
+                        memory_backend=str(raw_rollout.get("memory_backend")),
+                        required=query_plan_bound,
+                        where=f"{rollout_where}.query_plan",
+                    )
                 if schema_version in PRODUCTION_RUNTIME_RECEIPT_VERSIONS:
                     runtime_arm = _production_runtime_arm(str(raw_rollout.get("arm")))
                     activation = _cassette_treatment_activation(
@@ -4399,6 +4435,7 @@ def replay_observations(
     dataset_source: Path,
     runtime_receipt: Mapping[str, Any],
     runtime_artifact_root: Path | None = None,
+    _query_plan_reanalysis: object | None = None,
 ) -> List[Dict[str, Any]]:
     validate_manifest(manifest)
     try:
@@ -4423,7 +4460,11 @@ def replay_observations(
                 "memory runtime artifacts",
                 "native replay requires the receipt directory for raw-artifact re-observation",
             )
-        validate_runtime_artifacts(runtime_receipt, runtime_artifact_root)
+        validate_runtime_artifacts(
+            runtime_receipt,
+            runtime_artifact_root,
+            _query_plan_reanalysis=_query_plan_reanalysis,
+        )
 
     cases = _case_map(manifest)
     arms = _arm_map(manifest)
@@ -4436,6 +4477,7 @@ def replay_observations(
     }
     seen: set[Tuple[str, int, str]] = set()
     rows: List[Dict[str, Any]] = []
+    workspace_success_by_key: Dict[Tuple[str, int, str], bool | None] = {}
     manifest_sha256 = _canonical_sha256(manifest)
     runtime_receipt_sha256 = _canonical_sha256(runtime_receipt)
 
@@ -4494,6 +4536,7 @@ def replay_observations(
                 ("deterministic_success",),
             )
             workspace_success = workspace["deterministic_success"]
+        workspace_success_by_key[schedule_key] = workspace_success
 
         evaluator = _object(
             observation["evaluator"],
@@ -4683,9 +4726,21 @@ def replay_observations(
                             f"procedural family {family!r} offline graph revision does not "
                             "match its online predecessor",
                         )
-                    online_usable = (
-                        online["execution"]["status"] == "completed"
-                        and online["evaluator"]["status"] == "ready"
+                    online_evaluator = online["evaluator"]
+                    evaluator_only_query_plan_failure = (
+                        online_evaluator["status"] == "invalid"
+                        and isinstance(online_evaluator["invalid_reason"], str)
+                        and online_evaluator["invalid_reason"].startswith(
+                            QUERY_PLAN_INVALID_PREFIX
+                        )
+                        and workspace_success_by_key[
+                            (online_case["id"], trial, arm_id)
+                        ]
+                        is True
+                    )
+                    online_usable = online["execution"]["status"] == "completed" and (
+                        online_evaluator["status"] == "ready"
+                        or evaluator_only_query_plan_failure
                     )
                     offline_scored = (
                         offline["execution"]["status"] == "completed"

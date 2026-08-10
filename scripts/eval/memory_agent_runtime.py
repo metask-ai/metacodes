@@ -52,8 +52,10 @@ from .memory_procedural_adapter import (
     validate_validator_bundle,
 )
 from .memory_query_plan import (
+    QUERY_PLAN_INVALID_PREFIX,
     SIDECAR_NAME as QUERY_PLAN_SIDECAR_NAME,
     build_query_plan_trace,
+    project_query_variants,
 )
 from .memory_replay import (
     PRODUCTION_EXECUTION_MODE,
@@ -3506,26 +3508,16 @@ def run_memory_agent_schedule(
             scoped_recall_activation is not None
             and scoped_recall_activation.get("status") == "injected"
         )
-        if query_plan_trace["status"] == "verified":
-            governed_variants: List[Mapping[str, str]] = []
-            governed_text: set[str] = set()
-            for call in query_plan_trace["calls"]:
-                text = str(call["query"])
-                normalized = " ".join(text.casefold().split())
-                if normalized in governed_text:
-                    continue
-                governed_text.add(normalized)
-                governed_variants.append(
-                    {
-                        "kind": "exact" if call["stage"] == "seed" else "semantic",
-                        "text": text,
-                    }
-                )
+        governed_variants = project_query_variants(query_plan_trace)
+        if governed_variants:
             query_variants = governed_variants
-        elif host_recall_injected and not query_variants:
+        if host_recall_injected and not any(
+            variant["kind"] == "exact" for variant in query_variants
+        ):
             prompt_bytes = str(case["prompt"]).encode("utf-8")[:400]
             query_variants = [
-                {"kind": "exact", "text": prompt_bytes.decode("utf-8", errors="ignore")}
+                {"kind": "exact", "text": prompt_bytes.decode("utf-8", errors="ignore")},
+                *query_variants[:4],
             ]
         retrieved = tool_data["retrieved"]
         verified = tool_data["verified"]
@@ -3730,7 +3722,7 @@ def run_memory_agent_schedule(
             query_plan_trace,
         )
         if query_plan_trace["status"] == "invalid" and not host_only_query_plan_gap:
-            evaluator_invalid = "query-plan trace invalid: " + "; ".join(
+            evaluator_invalid = QUERY_PLAN_INVALID_PREFIX + "; ".join(
                 str(reason) for reason in query_plan_trace["invalid_reasons"]
             )
         if case["benchmark"] == "procedural_transfer":
