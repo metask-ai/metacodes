@@ -7,7 +7,7 @@
 //!
 //! 修复后:
 //!   1. KG 降级 → lead TaskStore 启用 mirror_path → create 时同步写 tasks.json
-//!   2. teammate 启动时 setMirror + loadFromMirror → 内存 store 合并 lead 的任务
+//!   2. teammate 启动时 setMirror + loadFromMirror → 内存 store 重开共享任务
 //!   3. teammate TaskList → hasLiveKgFrontier false → 看自己的内存 store(已合并 lead 任务)→ frontier 非空
 //!
 //! 本测试直接验证 TaskStore 文件镜像机制(不 spawn 真 teammate,纯单元测试 + 文件 IO)。
@@ -34,7 +34,7 @@ test "Bug ②: KG 降级时 lead 写 mirror,teammate 读 mirror 看到任务" {
     // lead 端:启用 mirror,创建 3 个任务
     var lead_store = task_store.TaskStore.init(testing.allocator);
     defer lead_store.deinit();
-    lead_store.setMirror(mirror_path);
+    try lead_store.setMirror(mirror_path);
 
     _ = try lead_store.create("调研 #1 入口层", "调研 main.zig/app.zig", null);
     _ = try lead_store.create("调研 #2 agent core", "调研 agent_loop", null);
@@ -59,8 +59,8 @@ test "Bug ②: KG 降级时 lead 写 mirror,teammate 读 mirror 看到任务" {
     // teammate 端:独立 TaskStore,启用同一 mirror,loadFromMirror
     var teammate_store = task_store.TaskStore.init(testing.allocator);
     defer teammate_store.deinit();
-    teammate_store.setMirror(mirror_path);
-    teammate_store.loadFromMirror();
+    try teammate_store.setMirror(mirror_path);
+    try teammate_store.loadFromMirror();
 
     // 验证 teammate 内存 store 现在有 3 个任务(从 mirror 加载)
     try testing.expectEqual(@as(usize, 3), teammate_store.tasks.items.len);
@@ -83,7 +83,7 @@ test "Bug ②: lead 后续 TaskUpdate 同步到 mirror,teammate reload 看到状
     // lead 建任务 + 完成一个
     var lead_store = task_store.TaskStore.init(testing.allocator);
     defer lead_store.deinit();
-    lead_store.setMirror(mirror_path);
+    try lead_store.setMirror(mirror_path);
 
     _ = try lead_store.create("Task A", "do A", null);
     _ = try lead_store.create("Task B", "do B", null);
@@ -92,8 +92,8 @@ test "Bug ②: lead 后续 TaskUpdate 同步到 mirror,teammate reload 看到状
     // teammate 第一次 load
     var teammate_store = task_store.TaskStore.init(testing.allocator);
     defer teammate_store.deinit();
-    teammate_store.setMirror(mirror_path);
-    teammate_store.loadFromMirror();
+    try teammate_store.setMirror(mirror_path);
+    try teammate_store.loadFromMirror();
 
     try testing.expectEqual(@as(usize, 2), teammate_store.tasks.items.len);
     // Task 1 应该是 completed(从 mirror 加载的状态)
@@ -103,13 +103,10 @@ test "Bug ②: lead 后续 TaskUpdate 同步到 mirror,teammate reload 看到状
     // lead 删除 Task 2
     try lead_store.updateStatus("2", .deleted);
 
-    // teammate reload——已知限制:loadFromMirror 是 id 去重 merge,不传播删除。
-    // Task 2 仍在 teammate 内存(lead 的删除没传过来)。这是接受的权衡:
-    // mirror 是单向 append-merge(简单 + 大部分场景够用),双向同步复杂度不值得。
-    // teammate 完成自己领的任务时用 TaskUpdate(completed) 闭合,不依赖 lead 的删除传播。
-    teammate_store.loadFromMirror();
-    // Task 2 仍在(merge 不删);Task 1 状态保持 completed
-    try testing.expectEqual(@as(usize, 2), teammate_store.tasks.items.len);
+    // mirror 是共享真源而不是 append-only cache；删除必须传播，否则 teammate 会继续
+    // 执行已经撤销的任务。
+    try teammate_store.loadFromMirror();
+    try testing.expectEqual(@as(usize, 1), teammate_store.tasks.items.len);
     try testing.expectEqual(@as(task_store.TaskStatus, .completed), teammate_store.tasks.items[0].status);
     try testing.expectEqualStrings("1", teammate_store.tasks.items[0].id);
 }
@@ -125,13 +122,13 @@ test "Bug ②: loadFromMirror 文件不存在时静默返回(无 crash,无任务
 
     var store = task_store.TaskStore.init(testing.allocator);
     defer store.deinit();
-    store.setMirror(mirror_path);
+    try store.setMirror(mirror_path);
     // 不存在文件 → 静默返回,store 仍空
-    store.loadFromMirror();
+    try store.loadFromMirror();
     try testing.expectEqual(@as(usize, 0), store.tasks.items.len);
 }
 
-test "Bug ②: loadFromMirror id 去重——已存在任务不被覆盖" {
+test "Bug ②: stale writer 先 reload 再写,不会覆盖其它进程的新任务" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -143,20 +140,28 @@ test "Bug ②: loadFromMirror id 去重——已存在任务不被覆盖" {
     // lead 建任务
     var lead_store = task_store.TaskStore.init(testing.allocator);
     defer lead_store.deinit();
-    lead_store.setMirror(mirror_path);
+    try lead_store.setMirror(mirror_path);
     _ = try lead_store.create("Original", "from lead", null);
 
-    // teammate 自己也有 Task 1(模拟 teammate 自己 create 了 id=1)
+    // teammate 先加载旧快照；随后 lead 又创建 B，使 teammate 的内存变 stale。
     var teammate_store = task_store.TaskStore.init(testing.allocator);
     defer teammate_store.deinit();
-    teammate_store.setMirror(mirror_path);
-    _ = try teammate_store.create("Teammate own", "from teammate", null);
-    // 现在 teammate 有 id=1 的 "Teammate own"
+    try teammate_store.setMirror(mirror_path);
+    try teammate_store.loadFromMirror();
+    _ = try lead_store.create("Lead later", "must survive", null);
 
-    // reload mirror:lead 的 "Original" id=1 已存在 → 跳过(teammate 的版本优先)
-    teammate_store.loadFromMirror();
-    try testing.expectEqual(@as(usize, 1), teammate_store.tasks.items.len);
-    try testing.expectEqualStrings("Teammate own", teammate_store.tasks.items[0].subject);
+    // teammate create 必须在 file lock 内先 reload，所以新任务拿 id=3，且不会抹掉 B。
+    const teammate_task = try teammate_store.create("Teammate own", "from teammate", null);
+    try testing.expectEqualStrings("3", teammate_task.id);
+
+    var observer = task_store.TaskStore.init(testing.allocator);
+    defer observer.deinit();
+    try observer.setMirror(mirror_path);
+    try observer.loadFromMirror();
+    try testing.expectEqual(@as(usize, 3), observer.tasks.items.len);
+    try testing.expectEqualStrings("Original", observer.tasks.items[0].subject);
+    try testing.expectEqualStrings("Lead later", observer.tasks.items[1].subject);
+    try testing.expectEqualStrings("Teammate own", observer.tasks.items[2].subject);
 }
 
 test "Bug ②: KG 可用路径不启用 mirror(向后兼容)" {
@@ -167,4 +172,73 @@ test "Bug ②: KG 可用路径不启用 mirror(向后兼容)" {
     _ = try store.create("Task without mirror", "no file written", null);
     try testing.expectEqual(@as(usize, 1), store.tasks.items.len);
     try testing.expect(store.mirror_path == null);
+    try testing.expect(!cc.swarm_teammate.shouldUseDegradedTaskMirror(true, "/tmp/project"));
+    try testing.expect(cc.swarm_teammate.shouldUseDegradedTaskMirror(false, "/tmp/project"));
+    try testing.expect(!cc.swarm_teammate.shouldUseDegradedTaskMirror(false, ""));
+}
+
+test "Bug ② L2: real TaskList reopens lead mirror instead of returning stale teammate state" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp_dir.dir.realPath(testing.io, &pbuf);
+    const mirror_path = try std.fmt.allocPrint(testing.allocator, "{s}/tasks.json", .{pbuf[0..tmp_path_len]});
+    defer testing.allocator.free(mirror_path);
+
+    var lead_store = task_store.TaskStore.init(testing.allocator);
+    defer lead_store.deinit();
+    try lead_store.setMirror(mirror_path);
+    _ = try lead_store.create("Visible through TaskList", "runtime wiring", null);
+
+    var teammate_store = task_store.TaskStore.init(testing.allocator);
+    defer teammate_store.deinit();
+    try teammate_store.setMirror(mirror_path);
+    var ctx = cc.tool_context.ToolContext{ .allocator = testing.allocator, .tasks = &teammate_store };
+    const first = try cc.task_tools.executeList(&ctx, "{}");
+    defer testing.allocator.free(first);
+    try testing.expect(std.mem.indexOf(u8, first, "Visible through TaskList") != null);
+
+    _ = try lead_store.create("Added after first read", "must refresh", null);
+    const second = try cc.task_tools.executeList(&ctx, "{}");
+    defer testing.allocator.free(second);
+    try testing.expect(std.mem.indexOf(u8, second, "Added after first read") != null);
+}
+
+test "Bug ②: corrupt mirror blocks mutation without overwriting evidence" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp_dir.dir.realPath(testing.io, &pbuf);
+    const mirror_path = try std.fmt.allocPrint(testing.allocator, "{s}/tasks.json", .{pbuf[0..tmp_path_len]});
+    defer testing.allocator.free(mirror_path);
+
+    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_z, "{s}", .{mirror_path});
+    const f = std.c.fopen(path.ptr, "w") orelse return error.TestWriteFailed;
+    _ = std.c.fwrite("{truncated".ptr, 1, "{truncated".len, f);
+    _ = std.c.fclose(f);
+
+    var store = task_store.TaskStore.init(testing.allocator);
+    defer store.deinit();
+    try store.setMirror(mirror_path);
+    try testing.expectError(error.MirrorCorrupt, store.create("must not publish", "fail closed", null));
+
+    const check = std.c.fopen(path.ptr, "r") orelse return error.TestReadFailed;
+    var check_open = true;
+    defer {
+        if (check_open) _ = std.c.fclose(check);
+    }
+    var bytes: [32]u8 = undefined;
+    const n = std.c.fread(&bytes, 1, bytes.len, check);
+    try testing.expectEqualStrings("{truncated", bytes[0..n]);
+
+    // Exercise the post-allocation decode error path too: prior implementations could
+    // free required strings once through Task.deinit and once through outer errdefer.
+    _ = std.c.fclose(check);
+    check_open = false;
+    const malformed = "[{\"id\":\"1\",\"subject\":\"s\",\"description\":\"d\",\"blocks\":[1]}]";
+    const rewrite = std.c.fopen(path.ptr, "w") orelse return error.TestWriteFailed;
+    _ = std.c.fwrite(malformed.ptr, 1, malformed.len, rewrite);
+    _ = std.c.fclose(rewrite);
+    try testing.expectError(error.MirrorCorrupt, store.loadFromMirror());
 }

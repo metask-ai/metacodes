@@ -7,7 +7,8 @@
 //! - spawn 超时 35s **必须大于** tinykg 30s 目录锁超时——绝不在锁等待中 killpg
 //!   制造无主锁(无主锁要等满 30s 才能被下一个调用者回收)。
 //! - 版本门:store-info 的 storage_format_version 必须 = 2、schema_version 必须 = 3;
-//!   任一不符 → degraded，旧 schema v2 必须显式 copy-on-write 迁移。
+//!   manifest-less legacy store 在 host migration lock 下自动 copy-on-write 迁移并保留
+//!   rollback backup；其它不匹配（包括 schema v2）仍明确 degraded。
 //!   绝不用不匹配的二进制碰 store(格式 skew 实证:直接 FileNotFound/损坏风险)。
 //! - degraded 后不再 spawn:后续调用直接返回降级说明(防反复失败撞熔断器)。
 //! - KG 是增强非依赖:任何失败都不影响 cc-zig 其余功能。
@@ -23,6 +24,7 @@ const common = @import("../tools/common.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const log = @import("../util/log.zig");
 const execution_knowledge = @import("execution_knowledge.zig");
+const file_lock = @import("../swarm/file_lock.zig");
 
 pub const EXPECTED_STORAGE_FORMAT_VERSION = "2";
 pub const EXPECTED_SCHEMA_VERSION = "3";
@@ -463,6 +465,13 @@ pub const KgClient = struct {
         };
         // store 缺 → init(先建父目录)。
         if (!dirExists(self.store_path)) {
+            switch (self.recoverInterruptedAutoMigration(bin)) {
+                .not_needed => {},
+                .recovered => {},
+                .failed => return,
+            }
+        }
+        if (!dirExists(self.store_path)) {
             ensureParentDir(self.allocator, self.store_path) catch {};
             const out = self.runRaw(&.{ "init", self.store_path }) catch {
                 self.setDegraded("tinykg init 失败(bin={s} store={s});检查磁盘/权限", .{ bin, self.store_path });
@@ -493,8 +502,17 @@ pub const KgClient = struct {
         }
         const ver = extractInfoField(out.stdout, "storage_format_version") orelse "missing";
         if (std.mem.eql(u8, ver, EXPECTED_STORAGE_FORMAT_VERSION)) {
-            // storage_format 通过,继续检查 schema_version
-            return self.checkSchemaVersion(bin);
+            // Normal startup stays one subprocess: the same store-info already carries
+            // schema_version. A second probe here doubled every session's KG startup cost.
+            const schema_ver = extractInfoField(out.stdout, "schema_version") orelse "missing";
+            if (!std.mem.eql(u8, schema_ver, EXPECTED_SCHEMA_VERSION)) {
+                self.setDegraded(
+                    "store schema 版本不符:期望 {s} 实际 {s}(store={s})。不要原地改 canonical store;请先运行 `tinykg migrate-store-v2 {s} <new-store> --task-status-v1 --verify`,核验后再切换 store",
+                    .{ EXPECTED_SCHEMA_VERSION, schema_ver, self.store_path, self.store_path },
+                );
+                return false;
+            }
+            return true;
         }
         // storage_format 不符:仅 legacy 自动 migrate,其它版本直接 degraded
         if (!std.mem.eql(u8, ver, "legacy")) {
@@ -507,76 +525,125 @@ pub const KgClient = struct {
             return false;
         }
         log.info("kg", "legacy→v2 自动 migrate 成功 store={s}", .{self.store_path});
-        // migrate 后重新跑 store-info + schema 检查(不再递归 storage_format 检查,直接 schema)
-        return self.checkSchemaVersion(bin);
+        // autoMigrateLegacyStore only returns true after probeStore reopens canonical
+        // and sees the exact 2/3 pair; do not add a third redundant subprocess here.
+        return true;
     }
 
-    /// schema_version 检查(storage_format 已通过或 migrate 后调用)。
-    fn checkSchemaVersion(self: *KgClient, bin: []const u8) bool {
-        const out = self.runRaw(&.{ "store-info", self.store_path }) catch {
-            self.setDegraded("store-info 失败(schema 检查)(bin={s} store={s})", .{ bin, self.store_path });
-            return false;
+    const StoreProbe = enum { expected, legacy, incompatible, unavailable };
+    const MigrationRecovery = enum { not_needed, recovered, failed };
+
+    fn probeStore(self: *KgClient, path: []const u8) StoreProbe {
+        const out = self.runRaw(&.{ "store-info", path }) catch return .unavailable;
+        defer self.freeOut(out);
+        if (out.exit_code != 0) return .unavailable;
+        const storage_ver = extractInfoField(out.stdout, "storage_format_version") orelse return .incompatible;
+        const schema_ver = extractInfoField(out.stdout, "schema_version") orelse return .incompatible;
+        if (std.mem.eql(u8, storage_ver, EXPECTED_STORAGE_FORMAT_VERSION) and
+            std.mem.eql(u8, schema_ver, EXPECTED_SCHEMA_VERSION)) return .expected;
+        if (std.mem.eql(u8, storage_ver, "legacy")) return .legacy;
+        return .incompatible;
+    }
+
+    fn migrationBackupPath(self: *KgClient) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}.legacy.bak", .{self.store_path});
+    }
+
+    fn migrationLockTarget(self: *KgClient) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}.metacodes-auto-migrate", .{self.store_path});
+    }
+
+    fn acquireMigrationLock(self: *KgClient) !file_lock.Lock {
+        const target = try self.migrationLockTarget();
+        defer self.allocator.free(target);
+        // tinykg subprocess timeout is 35s. The host lock must not be stolen while that
+        // child is alive, while a crashed holder must still be recoverable within the
+        // waiter's retry budget (~52s > 45s stale threshold).
+        return file_lock.acquire(target, .{ .retries = 520, .stale_ms = 45_000 });
+    }
+
+    /// Crash recovery runs before `init`: if canonical disappeared after legacy→backup,
+    /// resume TinyKG's idempotent migration rather than creating a new empty store.
+    fn recoverInterruptedAutoMigration(self: *KgClient, bin: []const u8) MigrationRecovery {
+        const backup = self.migrationBackupPath() catch {
+            self.setDegraded("legacy migrate recovery path allocation failed(store={s})", .{self.store_path});
+            return .failed;
+        };
+        defer self.allocator.free(backup);
+        if (!dirExists(backup)) return .not_needed;
+
+        var lock = self.acquireMigrationLock() catch |err| {
+            self.setDegraded("legacy migrate recovery lock failed: {s}(store={s})", .{ @errorName(err), self.store_path });
+            return .failed;
+        };
+        defer lock.release();
+        if (dirExists(self.store_path)) return .recovered; // another process completed while we waited
+        if (self.probeStore(backup) != .legacy) {
+            self.setDegraded("legacy migrate recovery found an incompatible rollback artifact(bin={s} backup={s})", .{ bin, backup });
+            return .failed;
+        }
+        if (self.migrateBackupToCanonical(backup)) return .recovered;
+        if (!dirExists(self.store_path)) {
+            if (!renamePath(backup, self.store_path)) {
+                self.setDegraded("legacy migrate recovery failed and rollback rename failed(bin={s} backup={s} store={s})", .{ bin, backup, self.store_path });
+                return .failed;
+            }
+        }
+        self.setDegraded("legacy migrate recovery failed; original store restored, automatic retry disabled for this session(bin={s} store={s})", .{ bin, self.store_path });
+        return .failed;
+    }
+
+    /// legacy → v2/v3：先在 host lock 内把 canonical 原子改名为 rollback backup，
+    /// 再让 TinyKG 自己从 backup 事务化发布 canonical target。这样只有一个 host rename，
+    /// 发布、verify、staging recovery 仍由 TinyKG 原生实现；backup 始终保留可回滚原店。
+    fn autoMigrateLegacyStore(self: *KgClient) bool {
+        var lock = self.acquireMigrationLock() catch return false;
+        defer lock.release();
+
+        // Another metacodes process may have completed while this one waited.
+        switch (self.probeStore(self.store_path)) {
+            .expected => return true,
+            .legacy => {},
+            else => return false,
+        }
+        const backup = self.migrationBackupPath() catch return false;
+        defer self.allocator.free(backup);
+        // Never rotate or overwrite an unknown rollback artifact automatically.
+        if (dirExists(backup)) return false;
+        if (!renamePath(self.store_path, backup)) return false;
+
+        if (self.migrateBackupToCanonical(backup)) {
+            log.info("kg", "auto migrate: verified legacy backup retained at {s}", .{backup});
+            return true;
+        }
+        // A failed/timeout migration is allowed to have published already; only restore
+        // when canonical is still absent. Never overwrite a possibly committed target.
+        if (!dirExists(self.store_path)) _ = renamePath(backup, self.store_path);
+        return false;
+    }
+
+    fn migrateBackupToCanonical(self: *KgClient, backup: []const u8) bool {
+        const out = self.runRaw(&.{ "migrate-store-v2", backup, self.store_path, "--task-status-v1", "--verify" }) catch {
+            return self.probeStore(self.store_path) == .expected;
         };
         defer self.freeOut(out);
         if (out.exit_code != 0) {
-            self.setDegraded("store-info 退出码 {d}(schema 检查): {s}", .{ out.exit_code, trimForLog(out.stderr) });
-            return false;
+            log.warn("kg", "auto migrate subprocess failed exit={d}: {s}", .{ out.exit_code, trimForLog(out.stderr) });
+            return self.probeStore(self.store_path) == .expected;
         }
-        const schema_ver = extractInfoField(out.stdout, "schema_version") orelse "missing";
-        if (!std.mem.eql(u8, schema_ver, EXPECTED_SCHEMA_VERSION)) {
-            self.setDegraded(
-                "store schema 版本不符:期望 {s} 实际 {s}(store={s})。不要原地改 canonical store;请先运行 `tinykg migrate-store-v2 {s} <new-store> --task-status-v1 --verify`,核验后再切换 store",
-                .{ EXPECTED_SCHEMA_VERSION, schema_ver, self.store_path, self.store_path },
-            );
-            return false;
-        }
-        return true;
+        return self.probeStore(self.store_path) == .expected;
     }
 
-    /// legacy store → v2 自动 migrate:tmp store → verify → 备份旧 → 替换。true=成功。
-    /// 不预删 tmp/backup(目录删除复杂,改用唯一后缀避冲突);旧 store 备份到 .legacy.bak。
-    fn autoMigrateLegacyStore(self: *KgClient) bool {
-        // tmp store 路径(同目录加 .migrating 后缀;如已存在则加时间戳避冲突)
-        const tmp_store = std.fmt.allocPrint(self.allocator, "{s}.migrating", .{self.store_path}) catch return false;
-        defer self.allocator.free(tmp_store);
-        const backup_dir = std.fmt.allocPrint(self.allocator, "{s}.legacy-backup", .{self.store_path}) catch return false;
-        defer self.allocator.free(backup_dir);
-        // 跑 migrate-store-v2(tinykg 自己处理 tmp 已存在的情况——它会报错,我们 fallback)
-        const out = self.runRaw(&.{ "migrate-store-v2", self.store_path, tmp_store, "--backup", backup_dir, "--task-status-v1", "--verify" }) catch return false;
-        self.freeOut(out);
-        // rename 旧 store → .legacy.bak,tmp store → 原路径(原子替换)
-        const bak_path = std.fmt.allocPrint(self.allocator, "{s}.legacy.bak", .{self.store_path}) catch return false;
-        defer self.allocator.free(bak_path);
-        // bak 如已存在(上次 migrate 遗留),加 .old 后缀避冲突
-        const bak_old = std.fmt.allocPrint(self.allocator, "{s}.old", .{bak_path}) catch return false;
-        defer self.allocator.free(bak_old);
-        _ = renamePath(self.allocator, bak_path, bak_old); // bak → bak.old(失败也无妨)
-        if (!renamePath(self.allocator, self.store_path, bak_path)) {
-            // 旧 store rename 失败:migrate 出来的 tmp 留给用户手动处理
-            log.warn("kg", "auto migrate: 旧 store rename 失败,tmp store 在 {s}", .{tmp_store});
-            return false;
-        }
-        if (!renamePath(self.allocator, tmp_store, self.store_path)) {
-            // tmp → 原路径失败:恢复旧 store
-            _ = renamePath(self.allocator, bak_path, self.store_path);
-            return false;
-        }
-        log.info("kg", "auto migrate: legacy backup at {s}(old backup at {s})", .{ bak_path, bak_old });
-        return true;
-    }
-
-    /// best-effort rename(文件或目录)。成功 true。失败 false(不 brick)。
-    /// 用 std.c.rename(POSIX 原子,支持文件和目录)。
-    fn renamePath(allocator: std.mem.Allocator, from: []const u8, to: []const u8) bool {
-        _ = allocator;
-        var from_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-        var to_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    /// 同父目录 rename；canonical 缺失时 POSIX/Windows 都是原子路径切换。
+    fn renamePath(from: []const u8, to: []const u8) bool {
+        var from_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+        var to_buf: [std.fs.max_path_bytes:0]u8 = undefined;
         if (from.len >= from_buf.len or to.len >= to_buf.len) return false;
         @memcpy(from_buf[0..from.len], from);
         from_buf[from.len] = 0;
         @memcpy(to_buf[0..to.len], to);
         to_buf[to.len] = 0;
-        return std.c.rename(@ptrCast(&from_buf), @ptrCast(&to_buf)) == 0;
+        return pfs.renameReplace(@ptrCast(&from_buf), @ptrCast(&to_buf)) == 0;
     }
 
     fn setDegraded(self: *KgClient, comptime fmt: []const u8, args: anytype) void {
@@ -1215,9 +1282,8 @@ pub const KgClient = struct {
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{root_id}) catch unreachable;
         const out = try self.runChecked(&.{
             "task-snapshot", self.store_path, id_str,
-            "--max-tasks", "256",
-            "--max-edges", "1024",
-            "--max-chars", "200000",
+            "--max-tasks",   "256",           "--max-edges",
+            "1024",          "--max-chars",   "200000",
         });
         defer self.freeOut(out);
         const snapshot = std.mem.trim(u8, out.stdout, " \r\n\t");

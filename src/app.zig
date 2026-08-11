@@ -1019,9 +1019,15 @@ pub const App = struct {
                 .{app.kg_projects_dir},
             ) catch return;
             defer app.allocator.free(mirror_path);
-            app.tasks.setMirror(mirror_path);
-            // 启动时合并已有 mirror(承接上次会话的内存任务)
-            app.tasks.loadFromMirror();
+            app.tasks.setMirror(mirror_path) catch |err| {
+                @import("util/log.zig").warn("kg", "degraded task mirror setup failed: {s}", .{@errorName(err)});
+                return;
+            };
+            // 启动时重开共享 mirror；损坏时保留 mirror 配置，让后续 Task* 在写前
+            // fail closed，而不是用局部状态覆盖仍可取证的坏文件。
+            app.tasks.loadFromMirror() catch |err| {
+                @import("util/log.zig").warn("kg", "degraded task mirror reopen failed: {s}", .{@errorName(err)});
+            };
         }
     }
 

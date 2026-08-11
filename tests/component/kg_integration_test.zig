@@ -46,6 +46,33 @@ fn overwriteFile(allocator: std.mem.Allocator, path: []const u8, bytes: []const 
     if (bytes.len > 0 and std.c.fwrite(bytes.ptr, 1, bytes.len, file) != bytes.len) return error.WriteFailed;
 }
 
+fn pathExists(path: []const u8) bool {
+    var path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (path.len >= path_buf.len) return false;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    return @import("platform").fs.exists(@ptrCast(&path_buf));
+}
+
+fn unlinkPath(path: []const u8) !void {
+    var path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (path.len >= path_buf.len) return error.PathTooLong;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    if (std.c.unlink(@ptrCast(&path_buf)) != 0) return error.UnlinkFailed;
+}
+
+fn renamePathForTest(from: []const u8, to: []const u8) !void {
+    var from_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    var to_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (from.len >= from_buf.len or to.len >= to_buf.len) return error.PathTooLong;
+    @memcpy(from_buf[0..from.len], from);
+    from_buf[from.len] = 0;
+    @memcpy(to_buf[0..to.len], to);
+    to_buf[to.len] = 0;
+    if (@import("platform").fs.renameReplace(@ptrCast(&from_buf), @ptrCast(&to_buf)) != 0) return error.RenameFailed;
+}
+
 /// 建一个用临时 store + 指定 bin 的 KgClient(绕过 env,直接注入路径)。
 fn makeClient(a: std.mem.Allocator, bin: []const u8, store: []const u8, domain: []const u8) !KgClient {
     return KgClient.init(a, .{
@@ -800,6 +827,109 @@ test "L2 KG: schema v2 明确 degraded 并给 copy-on-write task-status-v1 迁�
     try std.testing.expect(std.mem.indexOf(u8, reason, "期望 3 实际 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, reason, "migrate-store-v2") != null);
     try std.testing.expect(std.mem.indexOf(u8, reason, "--task-status-v1 --verify") != null);
+}
+
+test "L2 KG migrate: legacy canonical 自动迁移并保留 rollback backup" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/auto-legacy.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    // 用当前 binary 创建结构正确的店，再移除 manifest，机械模拟 legacy store。
+    {
+        var current = try makeClient(a, bin, store, "proj-auto-migrate");
+        defer current.deinit();
+        current.ensureReady();
+        if (!current.ready) return error.SkipZigTest;
+    }
+    const manifest = try std.fmt.allocPrint(a, "{s}/.tinykg/store-manifest.json", .{store});
+    defer a.free(manifest);
+    try unlinkPath(manifest);
+
+    var migrated = try makeClient(a, bin, store, "proj-auto-migrate");
+    defer migrated.deinit();
+    migrated.ensureReady();
+    try std.testing.expect(migrated.ready);
+    const backup = try std.fmt.allocPrint(a, "{s}.legacy.bak", .{store});
+    defer a.free(backup);
+    try std.testing.expect(pathExists(store));
+    try std.testing.expect(pathExists(backup));
+}
+
+test "L2 KG migrate: canonical rename 后崩溃窗口由 backup 恢复且不会 init 空店" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/recover-legacy.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+    {
+        var current = try makeClient(a, bin, store, "proj-auto-recover");
+        defer current.deinit();
+        current.ensureReady();
+        if (!current.ready) return error.SkipZigTest;
+    }
+    const manifest = try std.fmt.allocPrint(a, "{s}/.tinykg/store-manifest.json", .{store});
+    defer a.free(manifest);
+    try unlinkPath(manifest);
+    const backup = try std.fmt.allocPrint(a, "{s}.legacy.bak", .{store});
+    defer a.free(backup);
+    // 精确模拟 host 已把 canonical 改名为 backup、尚未调用 provider/tinykg 的崩溃窗。
+    try renamePathForTest(store, backup);
+    try std.testing.expect(!pathExists(store));
+
+    var recovered = try makeClient(a, bin, store, "proj-auto-recover");
+    defer recovered.deinit();
+    recovered.ensureReady();
+    try std.testing.expect(recovered.ready);
+    try std.testing.expect(pathExists(store));
+    try std.testing.expect(pathExists(backup));
+}
+
+test "L2 KG migrate: TinyKG 发布失败时恢复 legacy 且 session fail closed" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/failed-legacy.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+    {
+        var current = try makeClient(a, bin, store, "proj-auto-fail");
+        defer current.deinit();
+        current.ensureReady();
+        if (!current.ready) return error.SkipZigTest;
+    }
+    const manifest = try std.fmt.allocPrint(a, "{s}/.tinykg/store-manifest.json", .{store});
+    defer a.free(manifest);
+    try unlinkPath(manifest);
+
+    // TinyKG 只会回收带 request-matched marker 的 staging；外来目录必须拒绝。
+    const foreign_staging = try std.fmt.allocPrint(a, "{s}.tinykg-migrate-store-v2.tmp", .{store});
+    defer a.free(foreign_staging);
+    const staging_z = try a.dupeZ(u8, foreign_staging);
+    defer a.free(staging_z);
+    if (std.c.mkdir(staging_z.ptr, 0o700) != 0) return error.MkdirFailed;
+
+    var failed = try makeClient(a, bin, store, "proj-auto-fail");
+    defer failed.deinit();
+    failed.ensureReady();
+    try std.testing.expect(!failed.ready);
+    try std.testing.expect(pathExists(store)); // rollback 恢复原店，不留下 canonical 缺口
+    const backup = try std.fmt.allocPrint(a, "{s}.legacy.bak", .{store});
+    defer a.free(backup);
+    try std.testing.expect(!pathExists(backup));
+    try std.testing.expect(std.mem.indexOf(u8, failed.degradedMessage(), "自动 migrate 失败") != null);
 }
 
 test "L2 KG: plan 落图 → frontier → 闭合解锁(DAG 驱动全链)" {

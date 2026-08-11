@@ -877,6 +877,12 @@ fn waitForMail(a: std.mem.Allocator, e: *TeammateEntry, kg: ?*@import("../kg/cli
 
 pub const ClaimResult = struct { task_id: u64, prompt: []u8 };
 
+/// The file backlog is mutually exclusive with a live TinyKG control plane.
+/// Public for the focused degraded-frontier L2 that guards stale mirror leakage.
+pub fn shouldUseDegradedTaskMirror(shared_kg_ready: bool, kg_projects_dir: []const u8) bool {
+    return !shared_kg_ready and kg_projects_dir.len > 0;
+}
+
 /// SW3 自领:解析共享 inbox root(lead 的 TaskCreate 落此)→ frontier → 领第一个 ready
 /// 无主叶子(claimTask 原子租约)→ 组装成下一轮 prompt(owned)。无可领 → null。
 /// 只领 role=leaf & status=open & readiness=ready & claimed_by=null 的行
@@ -975,19 +981,6 @@ fn teammateThreadMain(input: *TeammateInput) void {
     };
     var sub_tasks = TaskStore.init(a);
     defer sub_tasks.deinit();
-    // Bug ② 修复:KG 降级时 lead 的 TaskStore 用文件镜像({kg_projects_dir}/tasks.json),
-    // teammate 也设同一 mirror 路径 + 启动时 loadFromMirror,这样 teammate 的 TaskList
-    // 在 KG 降级路径(无 kg_inbox 指针 → hasLiveKgFrontier false → 只看内存 store)能看到
-    // lead 创建的任务。KG 可用时 lead 不启用 mirror(mirror_path=null),这里 setMirror
-    // 也无副作用——loadFromMirror 找不到文件静默返回。
-    if (input.kg_projects_dir.len > 0) {
-        const mirror_path = std.fmt.allocPrint(a, "{s}/tasks.json", .{input.kg_projects_dir}) catch null;
-        if (mirror_path) |mp| {
-            defer a.free(mp);
-            sub_tasks.setMirror(mp);
-            sub_tasks.loadFromMirror();
-        }
-    }
 
     // Linus SW3 H1:每 teammate 一个**独立 KgClient**(c_allocator),不共享 App arena 客户端
     // (多线程定时 poll frontier/claim 会在非线程安全 arena 上并发 alloc/free → 堆损坏)。
@@ -995,17 +988,40 @@ fn teammateThreadMain(input: *TeammateInput) void {
     // (自领关闭,mailbox 派活仍工作)。self-claim 与 teammate 的 task 工具都用它。
     var own_kg: ?@import("../kg/client.zig").KgClient = null;
     if (input.kg) |shared| {
-        if (shared.cloneForThread(std.heap.c_allocator, input.home)) |c| {
-            own_kg = c;
-            own_kg.?.ensureReady();
-            if (!own_kg.?.ready) {
-                own_kg.?.deinit();
-                own_kg = null;
-            }
-        } else |_| {}
+        // Keep the whole session on one control plane. A degraded lead publishes the
+        // file fallback; a teammate must not independently revive TinyKG and split the
+        // backlog between graph and mirror.
+        if (shared.ready) {
+            if (shared.cloneForThread(std.heap.c_allocator, input.home)) |c| {
+                own_kg = c;
+                own_kg.?.ensureReady();
+                if (!own_kg.?.ready) {
+                    own_kg.?.deinit();
+                    own_kg = null;
+                }
+            } else |_| {}
+        }
     }
     defer if (own_kg) |*k| k.deinit();
     const kg_ptr: ?*@import("../kg/client.zig").KgClient = if (own_kg) |*k| k else null;
+
+    // Only a lead that started degraded publishes `{kg_projects_dir}/tasks.json`.
+    // Never open an old mirror while the lead's TinyKG is authoritative: a stale file
+    // from an earlier degraded session would otherwise leak numeric tasks into TaskList
+    // and teammate writes would recreate a second truth source beside TinyKG.
+    const shared_kg_ready = if (input.kg) |shared| shared.ready else false;
+    if (shouldUseDegradedTaskMirror(shared_kg_ready, input.kg_projects_dir)) {
+        const mirror_path = std.fmt.allocPrint(a, "{s}/tasks.json", .{input.kg_projects_dir}) catch null;
+        if (mirror_path) |mp| {
+            defer a.free(mp);
+            sub_tasks.setMirror(mp) catch |err| {
+                log.warn("swarm", "teammate task mirror setup failed: {s}", .{@errorName(err)});
+            };
+            sub_tasks.loadFromMirror() catch |err| {
+                log.warn("swarm", "teammate task mirror reopen failed: {s}", .{@errorName(err)});
+            };
+        }
+    }
 
     // 每 teammate 一个 SwarmContext(is_lead=false):让 teammate 的 SendMessage 能回 lead/peer
     // (Linus/PM F1)。team_sanitized 借 entry.team、home 借 input.home——**不 deinit 本地 sw**
@@ -1027,9 +1043,11 @@ fn teammateThreadMain(input: *TeammateInput) void {
     };
 
     while (true) {
-        // Bug ② 修复:每 turn 开始前 reload mirror——lead 可能在此前 idle 期间又写了新任务。
-        // loadFromMirror 是 best-effort + id 去重(已有任务跳过),不会重复加载。
-        sub_tasks.loadFromMirror();
+        // Degraded mode refreshes the complete locked snapshot each turn; when TinyKG is
+        // authoritative mirror_path is null and this is a zero-cost no-op.
+        sub_tasks.loadFromMirror() catch |err| {
+            log.warn("swarm", "teammate task mirror refresh failed: {s}", .{@errorName(err)});
+        };
         e.setStatus(.working);
         // 首轮此写与 spawn 的 addMember(is_active=true)重复,曾试图"只在值变化时写"去重——
         // 撤销(2026-07-18 实测):这次写恰好是 turn 前的天然停顿,满编 spawn 时把线程拖到

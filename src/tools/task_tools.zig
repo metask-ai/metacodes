@@ -418,6 +418,7 @@ pub fn executeGet(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
 
     const store = try requireStore(ctx);
+    try store.loadFromMirror();
     const t = store.get(id) orelse return error.TaskNotFound;
 
     var out: std.ArrayList(u8) = .empty;
@@ -433,6 +434,10 @@ pub fn executeGet(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 pub fn executeList(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     _ = args;
     const store = try requireStore(ctx);
+    // KG degraded mirror is a shared cross-process projection. Reopen it at the
+    // actual TaskList boundary so a test of TaskStore helpers alone cannot hide
+    // missing runtime wiring or stale teammate state.
+    try store.loadFromMirror();
     const kg_live = hasLiveKgFrontier(ctx);
 
     var out: std.ArrayList(u8) = .empty;
