@@ -1,0 +1,7 @@
+metacodes source-distribution license notice
+
+The cc-t2z repository does not currently publish a repository-wide software
+license.  Production WorkBuddy evaluation artifacts therefore record the
+metacodes license expression as NOASSERTION.  This notice is provenance only;
+it does not grant, restrict, or replace any rights.
+

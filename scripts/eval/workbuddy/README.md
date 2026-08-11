@@ -24,6 +24,12 @@ python3 -m scripts.eval.workbuddy.stage_artifacts \
   --lean-license /path/to/lean4/LICENSE
 ```
 
+The repository currently has no repository-wide metacodes license.  Until that
+changes, production staging must use
+`scripts/eval/workbuddy/licenses/METACODES-NOASSERTION.txt` together with
+`--metacodes-license-spdx NOASSERTION`; the artifact manifest preserves that
+fact instead of implying a license grant.
+
 Run the zero-provider W0 vertical slice:
 
 ```bash
@@ -75,6 +81,13 @@ python3 -m scripts.eval.workbuddy.launch_gate run \
 The command above is a protocol sketch; no real paid run is authorized until
 the production split mount, launch-gate L2, and the phase-specific manifest
 have all passed.
+
+The first paid cohort is frozen in
+`configs/jobs/metacodes-glm52-code-3-canary.yaml` by the maintained overlay.  It
+selects the first three Code `dev` tasks from the committed cohort manifest,
+uses one attempt and one concurrent trial, and records complete provider I/O.
+Do not widen that job in place; later Code16 and cross-domain waves get separate
+job files and budget transactions.
 
 W0 uses a static synthetic ELF, Docker `network_mode: none`, `n_attempts=1`,
 and concurrency 1. The ELF also asserts at runtime that its namespace has no

@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 from scripts.eval.workbuddy.cohort_manifest import (
     CohortError,
     SUBSETS,
@@ -246,6 +248,39 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         config = (task / "task.toml").read_text(encoding="utf-8")
         self.assertIn("network_mode: none", compose)
         self.assertEqual(config.count('network_mode = "public"'), 3)
+
+    def test_paid_code_canary_is_frozen_to_first_three_code_dev_tasks(self):
+        root = Path(__file__).parents[1] / "workbuddy"
+        overlay = root / "overlay"
+        job = yaml.safe_load(
+            (overlay / "configs/jobs/metacodes-glm52-code-3-canary.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        model = yaml.safe_load(
+            (overlay / "configs/models/metacodes-glm52.yaml").read_text(
+                encoding="utf-8"
+            )
+        )["model"]
+        cohort = json.loads(
+            (root / "manifests/workbuddy-v1-cohorts.json").read_text(encoding="utf-8")
+        )
+        expected = cohort["subsets"]["code"]["cohorts"]["dev"][
+            "task_selection"
+        ]["names"][:3]
+        self.assertEqual(job["task_selection"], {"mode": "name", "names": expected})
+        self.assertEqual(job["dataset"], cohort["subsets"]["code"]["dataset"])
+        self.assertEqual(job["n_attempts"], 1)
+        self.assertTrue(job["record_full_io"])
+        self.assertEqual(job["orchestrator_override"]["n_concurrent_trials"], 1)
+        self.assertEqual(model["name"], "glm-5.2")
+        self.assertEqual(model["protocols"], ["anthropic"])
+        self.assertEqual(
+            model["backend_key_env"],
+            "METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF",
+        )
+        self.assertEqual(model["max_concurrent"], 1)
+        self.assertEqual(model["context_window"], job["context_window"])
 
 
 class WorkBuddyCredentialFdTest(unittest.TestCase):
