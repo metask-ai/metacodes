@@ -131,6 +131,20 @@ pub const Dialect = struct {
         allocator: std.mem.Allocator,
     ) anyerror!bool = defaultSerializePromptCacheKey,
 
+    /// 请求侧:把 parallel_tool_calls 翻译成厂商 wire,追加到 `out`。返回是否追加了内容。
+    /// default = 不发。
+    /// - OpenAI dialect:`,\"parallel_tool_calls\":true/false`(Mistral 独有;OpenAI 原生也有此
+    ///   字段但默认 true,通常不需要显式发)。能力守门:profile.supports_parallel_tool_calls=false 不发。
+    /// - Anthropic dialect:不发(Claude 默认并行,无此控制)。
+    /// - Gemini dialect:不发(Gemini 默认并行,无此控制)。
+    serializeParallelToolCallsFn: *const fn (
+        ctx: *anyopaque,
+        profile: ModelProfile,
+        enabled: ?bool,
+        out: *std.ArrayList(u8),
+        allocator: std.mem.Allocator,
+    ) anyerror!bool = defaultSerializeParallelToolCalls,
+
     /// 暴露纯数据 profile 供 UI/agent_loop 快速问能力。单一真相源收口(step 8 后)。
     /// default = 返回 profileFor 的结果。
     profileFn: *const fn (ctx: *anyopaque, kind: ProviderKind, model: []const u8) ModelProfile = defaultProfile,
@@ -159,6 +173,9 @@ pub const Dialect = struct {
     }
     pub fn serializePromptCacheKey(self: Dialect, p: ModelProfile, key: ?[]const u8, out: *std.ArrayList(u8), a: std.mem.Allocator) !bool {
         return try self.serializePromptCacheKeyFn(self.ctx, p, key, out, a);
+    }
+    pub fn serializeParallelToolCalls(self: Dialect, p: ModelProfile, enabled: ?bool, out: *std.ArrayList(u8), a: std.mem.Allocator) !bool {
+        return try self.serializeParallelToolCallsFn(self.ctx, p, enabled, out, a);
     }
     pub fn profileFor(self: Dialect, kind: ProviderKind, model: []const u8) ModelProfile {
         return self.profileFn(self.ctx, kind, model);
@@ -260,6 +277,15 @@ fn defaultSerializePromptCacheKey(ctx: *anyopaque, p: ModelProfile, key: ?[]cons
     _ = ctx;
     _ = p;
     _ = key;
+    _ = out;
+    _ = a;
+    return false;
+}
+
+fn defaultSerializeParallelToolCalls(ctx: *anyopaque, p: ModelProfile, enabled: ?bool, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
+    _ = ctx;
+    _ = p;
+    _ = enabled;
     _ = out;
     _ = a;
     return false;
@@ -546,6 +572,77 @@ test "M5 Gemini dialect: prompt_cache_key 不发(用 cachedContent)" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
     const got = try d.serializePromptCacheKey(p, "key", &out, a);
+    try std.testing.expect(!got);
+    try std.testing.expect(out.items.len == 0);
+}
+
+// ── M6:parallel_tool_calls 端到端字节断言(声明=接线=测试 DoD)────────────────────
+
+test "M6 OpenAI dialect: parallel_tool_calls Mistral true 发 wire" {
+    const a = std.testing.allocator;
+    const d = dialectFor(.openai, "mistral-large");
+    const p = d.profileFor(.openai, "mistral-large");
+    try std.testing.expect(p.supports_parallel_tool_calls);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializeParallelToolCalls(p, true, &out, a);
+    try std.testing.expect(got);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"parallel_tool_calls\":true") != null);
+}
+
+test "M6 OpenAI dialect: parallel_tool_calls Mistral false 发 wire" {
+    const a = std.testing.allocator;
+    const d = dialectFor(.openai, "mistral-large");
+    const p = d.profileFor(.openai, "mistral-large");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializeParallelToolCalls(p, false, &out, a);
+    try std.testing.expect(got);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"parallel_tool_calls\":false") != null);
+}
+
+test "M6 OpenAI dialect: GPT-4o 不支持 parallel_tool_calls(能力守门)" {
+    // GPT-4o profile.supports_parallel_tool_calls=false(OpenAI 原生默认 true,无需显式发)。
+    const a = std.testing.allocator;
+    const d = dialectFor(.openai, "gpt-4o");
+    const p = d.profileFor(.openai, "gpt-4o");
+    try std.testing.expect(!p.supports_parallel_tool_calls);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializeParallelToolCalls(p, true, &out, a);
+    try std.testing.expect(!got);
+    try std.testing.expect(out.items.len == 0);
+}
+
+test "M6 OpenAI dialect: parallel_tool_calls null 不发" {
+    const a = std.testing.allocator;
+    const d = dialectFor(.openai, "mistral-large");
+    const p = d.profileFor(.openai, "mistral-large");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializeParallelToolCalls(p, null, &out, a);
+    try std.testing.expect(!got);
+    try std.testing.expect(out.items.len == 0);
+}
+
+test "M6 Claude dialect: parallel_tool_calls 不发(Claude 默认并行)" {
+    const a = std.testing.allocator;
+    const d = dialectFor(.anthropic, "claude-opus-4");
+    const p = d.profileFor(.anthropic, "claude-opus-4");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializeParallelToolCalls(p, true, &out, a);
+    try std.testing.expect(!got);
+    try std.testing.expect(out.items.len == 0);
+}
+
+test "M6 Gemini dialect: parallel_tool_calls 不发(Gemini 默认并行)" {
+    const a = std.testing.allocator;
+    const d = dialectFor(.gemini, "gemini-2.5-pro");
+    const p = d.profileFor(.gemini, "gemini-2.5-pro");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializeParallelToolCalls(p, true, &out, a);
     try std.testing.expect(!got);
     try std.testing.expect(out.items.len == 0);
 }

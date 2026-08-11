@@ -124,6 +124,20 @@ fn openaiSerializePromptCacheKey(ctx: *anyopaque, p: ModelProfile, key: ?[]const
     return true;
 }
 
+// ── 共享:parallel_tool_calls 序列化(Mistral 独有控制)──────────────────────────
+//
+// 中立 enabled → OpenAI chat/completions 顶层 \"parallel_tool_calls\":true/false。
+// OpenAI 原生也有此字段但默认 true(通常不需要显式发);Mistral 默认 true 但支持显式关闭。
+// 能力守门:profile.supports_parallel_tool_calls=false 时不发(避免误导)。
+fn openaiSerializeParallelToolCalls(ctx: *anyopaque, p: ModelProfile, enabled: ?bool, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
+    _ = ctx;
+    if (!p.supports_parallel_tool_calls) return false;
+    const e = enabled orelse return false;
+    try out.appendSlice(a, ",\"parallel_tool_calls\":");
+    try out.appendSlice(a, if (e) "true" else "false");
+    return true;
+}
+
 // ── OpenAI 原生(GPT-4o / GPT-5 / o1 / o3)──────────────────────────────────
 const OpenAINative = struct {
     fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
@@ -151,6 +165,7 @@ const OpenAINative = struct {
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
+        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
         // injectSystemMods / supportsToolChoice / supportsResponseFormat / profile 走 default
     };
 };
@@ -201,6 +216,7 @@ const Glm = struct {
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
+        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
     };
 };
 
@@ -238,6 +254,7 @@ const Kimi = struct {
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
+        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
     };
 };
 
@@ -271,6 +288,7 @@ const DeepSeek = struct {
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
+        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
     };
 };
 
@@ -301,6 +319,7 @@ const Qwen = struct {
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
+        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
     };
 };
 
@@ -320,6 +339,7 @@ const Mistral = struct {
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
         .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
+        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
     };
 };
 
