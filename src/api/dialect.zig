@@ -43,8 +43,14 @@ pub const Dialect = struct {
     /// 请求侧:把 thinking 控制(effort)翻译成 wire 格式,追加到 `out`。
     /// 例如 OpenAI 原生发 `,"reasoning_effort":"high"`;GLM 发 `,"thinking":{"type":"enabled"}`;
     /// K3 发 `,"thinking":{"type":"enabled","keep":"all","effort":"high"}`;Anthropic 发顶层
-    /// `thinking:{type:adaptive,...}`;Gemini 发 `generation_config.thinkingLevel`。
+    /// `thinking:{type:adaptive,...}`;Gemini 发 `"thinking_level":"high"` 片段(进 gen_cfg 合并)。
     /// default = no-op(thinking_mode==.none)。
+    /// **`out` 契约**:dialect 自行决定逗号策略 + 追加位置。OpenAI/Claude 追加到主请求体
+    /// (前导逗号);Gemini 追加到 gen_cfg 子 ArrayList(片段格式,if 非空加前导逗号)。
+    /// 调用方按 dialect 文档传对应 ArrayList——serializeOpenAIRequest 传主请求体,
+    /// serializeGeminiRequest 传 gen_cfg。**跨 dialect 传错 ArrayList 会生成错误 JSON**
+    /// (如 Gemini 片段进主请求体顶层 → 服务端拒)。dialectFor 已按 model 选对 dialect,
+    /// 消费方只需用对应的 serialize*Request 函数。
     serializeThinkingFn: *const fn (
         ctx: *anyopaque,
         profile: ModelProfile,
@@ -106,9 +112,12 @@ pub const Dialect = struct {
 
     /// 请求侧:把中立 ResponseFormat(json_object/json_schema)翻译成厂商 wire,追加到 `out`。
     /// 返回是否追加了内容。default = 不发(不支持 JSON mode 的 dialect / null 入参)。
+    /// **`out` 契约**:dialect 自行决定逗号策略。OpenAI 追加到主请求体(前导逗号),
+    /// Gemini 追加到 gen_cfg 子 ArrayList(片段格式,if 非空加前导逗号)。调用方按
+    /// dialect 文档传对应 ArrayList。
     /// - OpenAI dialect:`,\"response_format\":{\"type\":\"json_object\"}` 或
     ///   `{\"type\":\"json_schema\",\"json_schema\":{schema}}`。GLM-5 仅 json_object(降级 schema→object)。
-    /// - Gemini dialect:`,\"generation_config\":{\"response_mime_type\":\"application/json\"}`(留位)。
+    /// - Gemini dialect:`\"response_mime_type\":\"application/json\"` 片段(进 gen_cfg 合并)。
     /// - Anthropic dialect:不发(用 system prompt 指示 JSON)。
     serializeResponseFormatFn: *const fn (
         ctx: *anyopaque,

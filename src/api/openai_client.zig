@@ -848,6 +848,19 @@ test "M3 serializeOpenAIRequest: tool_choice=none → \"none\"" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"none\"") != null);
 }
 
+test "M3 serializeOpenAIRequest: tool_choice=tool 缺 name → 退到 required" {
+    // tool 类型但 name=null,无法指定具体工具,退到 required(强制选一个)。
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const tc = json_mod.ToolChoice{ .type = "tool", .name = null };
+    const body = try serializeOpenAIRequest(a, "gpt-4o", &msgs, "sys", null, null, tc);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"required\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"function\"") == null);
+}
+
 test "M3 serializeOpenAIRequest: GLM-5 tool_choice=required 降级为 auto(能力守门)" {
     // 声明=接线=测试:GLM-5 profile.tool_choice_support==.auto_only,任何非 auto/none 都必须降级。
     // 不降级 → 服务端 400;dialect 必须守门。
