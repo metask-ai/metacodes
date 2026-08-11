@@ -119,6 +119,7 @@ pub const Api = struct {
             raw.runtime_create == null or raw.runtime_destroy == null or
             raw.runtime_query_skill_catalog == null or raw.skill_catalog_release == null or
             raw.runtime_refresh_mcp == null or raw.runtime_describe_mcp == null or
+            raw.runtime_apply_mcp_configuration == null or
             raw.session_restore == null or raw.session_describe == null or
             raw.session_create == null or raw.session_destroy == null or
             raw.session_set_model == null or raw.session_update_skills == null or
@@ -148,6 +149,9 @@ pub const Api = struct {
     }
     pub fn runtimeDescribeMcp(self: Api) types.RuntimeDescribeMcpFnV1 {
         return self.raw.runtime_describe_mcp.?;
+    }
+    pub fn runtimeApplyMcpConfiguration(self: Api) types.RuntimeApplyMcpConfigurationFnV1 {
+        return self.raw.runtime_apply_mcp_configuration.?;
     }
     pub fn sessionCreate(self: Api) types.SessionCreateFnV1 {
         return self.raw.session_create.?;

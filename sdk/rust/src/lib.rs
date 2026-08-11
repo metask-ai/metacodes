@@ -50,6 +50,7 @@ impl Api {
             || table.skill_catalog_release.is_none()
             || table.runtime_refresh_mcp.is_none()
             || table.runtime_describe_mcp.is_none()
+            || table.runtime_apply_mcp_configuration.is_none()
             || table.session_create.is_none()
             || table.session_restore.is_none()
             || table.session_destroy.is_none()
@@ -327,7 +328,9 @@ impl raw::metask_agentcore_mcp_connector_v1 {
             notify: None,
             close: None,
             release_response: None,
-            reserved: [0; 3],
+            retain_connector: None,
+            release_connector: None,
+            reserved: [0; 1],
         }
     }
 }
@@ -373,7 +376,15 @@ mod tests {
         assert_eq!(raw::METASK_AGENTCORE_MCP_ERA_2026_07_28, 1);
         assert_eq!(raw::METASK_AGENTCORE_MCP_ERA_2025_11_25, 2);
         assert_eq!(raw::METASK_AGENTCORE_MCP_ERA_2025_06_18, 3);
-        assert_eq!(size_of::<raw::metask_agentcore_api_v1>(), 216);
+        assert_eq!(raw::METASK_AGENTCORE_MCP_APPLY_APPLIED, 1);
+        assert_eq!(raw::METASK_AGENTCORE_MCP_APPLY_SUPERSEDED, 2);
+        assert_eq!(raw::METASK_AGENTCORE_MCP_APPLY_REJECTED, 3);
+        assert_eq!(size_of::<raw::metask_agentcore_api_v1>(), 224);
+        assert_eq!(
+            size_of::<raw::metask_agentcore_mcp_configuration_v1>(),
+            64
+        );
+        assert_eq!(size_of::<raw::metask_agentcore_mcp_apply_report_v1>(), 64);
         assert_eq!(
             size_of::<raw::metask_agentcore_session_host_config_v1>(),
             168

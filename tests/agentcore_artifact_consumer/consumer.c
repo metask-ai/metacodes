@@ -16,7 +16,10 @@
     METASK_AGENTCORE_MCP_NEGOTIATION_LEGACY_2025_06_ONLY != 4u || \
     METASK_AGENTCORE_MCP_ERA_2026_07_28 != 1u || \
     METASK_AGENTCORE_MCP_ERA_2025_11_25 != 2u || \
-    METASK_AGENTCORE_MCP_ERA_2025_06_18 != 3u
+    METASK_AGENTCORE_MCP_ERA_2025_06_18 != 3u || \
+    METASK_AGENTCORE_MCP_APPLY_APPLIED != 1u || \
+    METASK_AGENTCORE_MCP_APPLY_SUPERSEDED != 2u || \
+    METASK_AGENTCORE_MCP_APPLY_REJECTED != 3u
 #error "source-free Revision 7 MCP codes must match the public contract"
 #endif
 
@@ -326,6 +329,20 @@ int main(void) {
     if (api->runtime_create(&runtime_config, &runtime, &diagnostic) != METASK_AGENTCORE_STATUS_OK ||
         runtime == NULL) {
         return release_error(api, &diagnostic, 12);
+    }
+    metask_agentcore_mcp_configuration_v1 mcp_configuration = {0};
+    mcp_configuration.struct_size = sizeof(mcp_configuration);
+    mcp_configuration.desired_revision = 1;
+    metask_agentcore_mcp_apply_report_v1 mcp_report = {0};
+    if (api->runtime_apply_mcp_configuration(
+            runtime, &mcp_configuration, &mcp_report, &diagnostic) !=
+            METASK_AGENTCORE_STATUS_OK ||
+        mcp_report.struct_size != sizeof(mcp_report) ||
+        mcp_report.disposition_code != METASK_AGENTCORE_MCP_APPLY_APPLIED ||
+        mcp_report.desired_revision != 1 || mcp_report.active_revision != 1 ||
+        mcp_report.catalog_generation != 1) {
+        api->runtime_destroy(runtime, &diagnostic);
+        return release_error(api, &diagnostic, 40);
     }
 
     char cwd[PATH_MAX];

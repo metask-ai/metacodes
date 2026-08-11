@@ -99,6 +99,8 @@ pub const Connector = struct {
         purpose: ConnectionPurpose,
         requested_era: canonical.Era,
     ) anyerror!OpenOutcome,
+    retain_fn: *const fn (ctx: *anyopaque) anyerror!void = retainNoop,
+    release_fn: *const fn (ctx: *anyopaque) void = releaseNoop,
 
     pub fn open(
         self: Connector,
@@ -107,6 +109,17 @@ pub const Connector = struct {
     ) anyerror!OpenOutcome {
         return self.open_fn(self.ctx, purpose, era);
     }
+
+    pub fn retain(self: Connector) anyerror!void {
+        return self.retain_fn(self.ctx);
+    }
+
+    pub fn release(self: Connector) void {
+        self.release_fn(self.ctx);
+    }
+
+    fn retainNoop(_: *anyopaque) anyerror!void {}
+    fn releaseNoop(_: *anyopaque) void {}
 };
 
 pub const Config = struct {

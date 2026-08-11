@@ -137,6 +137,9 @@ extern "C" {
 #define METASK_AGENTCORE_MCP_ERA_2026_07_28 1u
 #define METASK_AGENTCORE_MCP_ERA_2025_11_25 2u
 #define METASK_AGENTCORE_MCP_ERA_2025_06_18 3u
+#define METASK_AGENTCORE_MCP_APPLY_APPLIED 1u
+#define METASK_AGENTCORE_MCP_APPLY_SUPERSEDED 2u
+#define METASK_AGENTCORE_MCP_APPLY_REJECTED 3u
 #define METASK_AGENTCORE_MCP_CONNECTION_DISPOSABLE_PROBE 1u
 #define METASK_AGENTCORE_MCP_CONNECTION_ACTUAL 2u
 #define METASK_AGENTCORE_MCP_OPEN_OK 0u
@@ -270,11 +273,15 @@ typedef uint32_t (*metask_agentcore_mcp_notify_fn_v1)(
 typedef void (*metask_agentcore_mcp_close_fn_v1)(void *, void *);
 typedef void (*metask_agentcore_mcp_release_response_fn_v1)(
     void *, void *, metask_agentcore_owned_bytes_v1 *);
+typedef void (*metask_agentcore_mcp_retain_connector_fn_v1)(void *);
+typedef void (*metask_agentcore_mcp_release_connector_fn_v1)(void *);
 
-/* Host owns connector ctx, credentials, and live connection contexts. Every
- * successful open is closed exactly once. Every non-empty response descriptor
- * is released exactly once, independent of request status. AgentCore copies
- * successful response bytes before release. */
+/* Host owns connector ctx, credentials, and live connection contexts.
+ * retain_connector and release_connector are mandatory and must be thread-safe;
+ * they keep ctx alive across Runtime calls. Every successful open is closed
+ * exactly once. Every non-empty response descriptor is released exactly once,
+ * independent of request status. AgentCore copies successful response bytes
+ * before release. */
 typedef struct {
     uint32_t struct_size;
     uint32_t reserved0;
@@ -284,7 +291,9 @@ typedef struct {
     metask_agentcore_mcp_notify_fn_v1 notify;
     metask_agentcore_mcp_close_fn_v1 close;
     metask_agentcore_mcp_release_response_fn_v1 release_response;
-    uint64_t reserved[3];
+    metask_agentcore_mcp_retain_connector_fn_v1 retain_connector;
+    metask_agentcore_mcp_release_connector_fn_v1 release_connector;
+    uint64_t reserved[1];
 } metask_agentcore_mcp_connector_v1;
 
 typedef struct {
@@ -317,8 +326,27 @@ typedef struct {
     uint32_t reserved1;
     metask_agentcore_mcp_connector_v1 connector;
     const metask_agentcore_mcp_protocol_limits_v1 *protocol_limits;
-    uint64_t reserved[4];
+    /* Stable non-secret identity of connection-relevant configuration. */
+    uint8_t configuration_fingerprint[32];
 } metask_agentcore_mcp_server_v1;
+
+typedef struct {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    uint64_t desired_revision;
+    const metask_agentcore_mcp_server_v1 *servers;
+    uint64_t server_count;
+    uint64_t reserved[4];
+} metask_agentcore_mcp_configuration_v1;
+
+typedef struct {
+    uint32_t struct_size;
+    uint32_t disposition_code;
+    uint64_t desired_revision;
+    uint64_t active_revision;
+    uint64_t catalog_generation;
+    uint64_t reserved[4];
+} metask_agentcore_mcp_apply_report_v1;
 
 typedef struct {
     uint32_t struct_size;
@@ -570,6 +598,9 @@ typedef uint32_t (*metask_agentcore_runtime_refresh_mcp_fn_v1)(
 typedef uint32_t (*metask_agentcore_runtime_describe_mcp_fn_v1)(
     metask_agentcore_runtime *, metask_agentcore_owned_bytes_v1 *,
     metask_agentcore_owned_bytes_v1 *);
+typedef uint32_t (*metask_agentcore_runtime_apply_mcp_configuration_fn_v1)(
+    metask_agentcore_runtime *, const metask_agentcore_mcp_configuration_v1 *,
+    metask_agentcore_mcp_apply_report_v1 *, metask_agentcore_owned_bytes_v1 *);
 typedef uint32_t (*metask_agentcore_session_create_fn_v1)(
     metask_agentcore_runtime *, const metask_agentcore_session_create_config_v1 *,
     const metask_agentcore_session_callbacks_v1 *, metask_agentcore_session **,
@@ -641,7 +672,8 @@ typedef struct {
     metask_agentcore_session_abort_compact_fn_v1 session_abort_compact;
     metask_agentcore_session_export_checkpoint_fn_v1 session_export_checkpoint;
     metask_agentcore_buffer_release_fn_v1 buffer_release;
-    uint64_t reserved[4];
+    metask_agentcore_runtime_apply_mcp_configuration_fn_v1 runtime_apply_mcp_configuration;
+    uint64_t reserved[3];
 } metask_agentcore_api_v1;
 
 /* The final owned-bytes output of AgentCore calls is optional and write-only.
@@ -682,6 +714,8 @@ metask_agentcore_api_v1_is_compatible(const metask_agentcore_api_v1 *api) {
                (metask_agentcore_runtime_refresh_mcp_fn_v1)0 &&
            api->runtime_describe_mcp !=
                (metask_agentcore_runtime_describe_mcp_fn_v1)0 &&
+           api->runtime_apply_mcp_configuration !=
+               (metask_agentcore_runtime_apply_mcp_configuration_fn_v1)0 &&
            api->session_create != (metask_agentcore_session_create_fn_v1)0 &&
            api->session_restore != (metask_agentcore_session_restore_fn_v1)0 &&
            api->session_destroy != (metask_agentcore_session_destroy_fn_v1)0 &&
@@ -751,6 +785,10 @@ METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_ERA_2026_07_28 == 1u &&
                                    METASK_AGENTCORE_MCP_ERA_2025_11_25 == 2u &&
                                    METASK_AGENTCORE_MCP_ERA_2025_06_18 == 3u,
                                "MCP era codes");
+METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_APPLY_APPLIED == 1u &&
+                                   METASK_AGENTCORE_MCP_APPLY_SUPERSEDED == 2u &&
+                                   METASK_AGENTCORE_MCP_APPLY_REJECTED == 3u,
+                               "MCP apply disposition codes");
 
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_bytes_view_v1, 16);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_owned_bytes_v1, 16);
@@ -760,6 +798,8 @@ METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_cancellation_v1, 40);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_connector_v1, 80);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_protocol_limits_v1, 96);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_server_v1, 224);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_configuration_v1, 64);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_apply_report_v1, 64);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_catalog_limits_v1, 64);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_runtime_config_v1, 96);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_callbacks_v1, 72);
@@ -790,6 +830,7 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_host_tool_v1, ctx, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_connector_v1, ctx, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_server_v1, connector, 104);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_server_v1, protocol_limits, 184);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_server_v1, configuration_fingerprint, 192);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_runtime_config_v1, mcp_servers, 40);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_runtime_config_v1, mcp_catalog_limits, 56);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, api_key, 16);
@@ -813,7 +854,8 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, session_update_mcp, 128)
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, session_run_input, 136);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, session_export_checkpoint, 168);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, buffer_release, 176);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, reserved, 184);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, runtime_apply_mcp_configuration, 184);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, reserved, 192);
 
 #undef METASK_AGENTCORE_ASSERT_OFFSET
 #undef METASK_AGENTCORE_ASSERT_SIZE

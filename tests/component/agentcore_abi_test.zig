@@ -769,6 +769,8 @@ const PublicMcpProbe = struct {
     closes: u32 = 0,
     double_closes: u32 = 0,
     releases: u32 = 0,
+    connector_retains: u32 = 0,
+    connector_releases: u32 = 0,
 
     fn connector(self: *@This()) wire.McpConnectorV1 {
         var result = std.mem.zeroes(wire.McpConnectorV1);
@@ -779,7 +781,19 @@ const PublicMcpProbe = struct {
         result.notify = notify;
         result.close = close;
         result.release_response = releaseResponse;
+        result.retain_connector = retainConnector;
+        result.release_connector = releaseConnector;
         return result;
+    }
+
+    fn retainConnector(raw: ?*anyopaque) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return));
+        self.connector_retains += 1;
+    }
+
+    fn releaseConnector(raw: ?*anyopaque) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return));
+        self.connector_releases += 1;
     }
 
     fn open(
@@ -1197,6 +1211,187 @@ test "L2 Revision 7 public MCP exact 2025-06 and AUTO reopen reach one canonical
         );
         runtime = null;
         try probe.expectClosedExactlyOnce();
+    }
+}
+
+test "L2 Revision 7 public MCP Apply publishes complete sets and replaces changed instances" {
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+    );
+    defer if (runtime) |handle| {
+        _ = api.runtimeDestroy()(handle, &diagnostic);
+    };
+
+    var first_probe = PublicMcpProbe{};
+    var rejected_probe = PublicMcpProbe{ .server_era_code = wire.MCP_ERA_2025_11_25 };
+    var second_probe = PublicMcpProbe{};
+    var server = std.mem.zeroes(wire.McpServerV1);
+    server.struct_size = @sizeOf(wire.McpServerV1);
+    server.transport_code = wire.MCP_TRANSPORT_STDIO;
+    server.negotiation_policy_code = wire.MCP_NEGOTIATION_MODERN_ONLY;
+    server.server_binding_identity = [_]u8{0xd1} ** 32;
+    server.configuration_fingerprint = [_]u8{0xa1} ** 32;
+    server.namespace = sdk.bytesView("live");
+    server.client_name = sdk.bytesView("agentcore-r7-test");
+    server.client_version = sdk.bytesView("7");
+    server.timeout_ms = 1000;
+    server.connector = first_probe.connector();
+    var servers = [_]wire.McpServerV1{server};
+
+    var configuration = std.mem.zeroes(wire.McpConfigurationV1);
+    configuration.struct_size = @sizeOf(wire.McpConfigurationV1);
+    configuration.desired_revision = 1;
+    configuration.servers = &servers;
+    configuration.server_count = servers.len;
+    var report = std.mem.zeroes(wire.McpApplyReportV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeApplyMcpConfiguration()(runtime, &configuration, &report, &diagnostic),
+    );
+    try std.testing.expectEqual(@as(u32, @sizeOf(wire.McpApplyReportV1)), report.struct_size);
+    try std.testing.expectEqual(wire.MCP_APPLY_APPLIED, report.disposition_code);
+    try std.testing.expectEqual(@as(u64, 1), report.desired_revision);
+    try std.testing.expectEqual(@as(u64, 1), report.active_revision);
+    try std.testing.expectEqual(@as(u64, 1), report.catalog_generation);
+    try std.testing.expectEqual(@as(u32, 1), first_probe.actual_opens);
+
+    configuration.desired_revision = 2;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeApplyMcpConfiguration()(runtime, &configuration, &report, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.MCP_APPLY_APPLIED, report.disposition_code);
+    try std.testing.expectEqual(@as(u64, 1), report.catalog_generation);
+    try std.testing.expectEqual(@as(u32, 1), first_probe.actual_opens);
+
+    servers[0].configuration_fingerprint = [_]u8{0xaf} ** 32;
+    servers[0].connector = rejected_probe.connector();
+    configuration.desired_revision = 3;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeApplyMcpConfiguration()(runtime, &configuration, &report, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.MCP_APPLY_REJECTED, report.disposition_code);
+    try std.testing.expectEqual(@as(u64, 3), report.desired_revision);
+    try std.testing.expectEqual(@as(u64, 2), report.active_revision);
+    try std.testing.expectEqual(@as(u64, 1), report.catalog_generation);
+    try std.testing.expectEqual(@as(u32, 0), first_probe.closes);
+    try std.testing.expectEqual(@as(u32, 1), rejected_probe.actual_open_attempts);
+
+    var description = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeDescribeMcp()(runtime, &description, &diagnostic),
+    );
+    const encoded = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
+    const decoded = try sdk.decodeMcpCatalog(std.testing.allocator, encoded);
+    defer decoded.deinit();
+    api.bufferRelease()(&description);
+    try std.testing.expectEqual(@as(u64, 1), decoded.value.catalog_generation);
+    try std.testing.expectEqual(@as(usize, 1), decoded.value.servers.len);
+    try std.testing.expectEqualStrings("live", decoded.value.servers[0].namespace);
+
+    // A rejected revision remains retryable. Reusing revision 3 with a healthy
+    // connector must replace the last-known-good generation atomically.
+    servers[0].configuration_fingerprint = [_]u8{0xa2} ** 32;
+    servers[0].connector = second_probe.connector();
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeApplyMcpConfiguration()(runtime, &configuration, &report, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.MCP_APPLY_APPLIED, report.disposition_code);
+    try std.testing.expectEqual(@as(u64, 2), report.catalog_generation);
+    try std.testing.expectEqual(@as(u32, 1), second_probe.actual_opens);
+    try first_probe.expectClosedExactlyOnce();
+
+    configuration.desired_revision = 4;
+    configuration.servers = null;
+    configuration.server_count = 0;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeApplyMcpConfiguration()(runtime, &configuration, &report, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.MCP_APPLY_APPLIED, report.disposition_code);
+    try std.testing.expectEqual(@as(u64, 3), report.catalog_generation);
+    try second_probe.expectClosedExactlyOnce();
+
+    configuration.desired_revision = 3;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeApplyMcpConfiguration()(runtime, &configuration, &report, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.MCP_APPLY_SUPERSEDED, report.disposition_code);
+    try std.testing.expectEqual(@as(u64, 4), report.desired_revision);
+    try std.testing.expectEqual(@as(u64, 4), report.active_revision);
+    try std.testing.expectEqual(@as(u64, 3), report.catalog_generation);
+
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+    runtime = null;
+    try std.testing.expectEqual(first_probe.connector_retains, first_probe.connector_releases);
+    try std.testing.expectEqual(rejected_probe.connector_retains, rejected_probe.connector_releases);
+    try std.testing.expectEqual(second_probe.connector_retains, second_probe.connector_releases);
+}
+
+test "L2 Revision 7 public MCP Apply requires connector lifetime callbacks" {
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+    );
+    defer if (runtime) |handle| {
+        _ = api.runtimeDestroy()(handle, &diagnostic);
+    };
+
+    const missing_callbacks = [_]enum { retain, release }{ .retain, .release };
+    for (missing_callbacks) |missing| {
+        var probe = PublicMcpProbe{};
+        var server = std.mem.zeroes(wire.McpServerV1);
+        server.struct_size = @sizeOf(wire.McpServerV1);
+        server.transport_code = wire.MCP_TRANSPORT_STDIO;
+        server.negotiation_policy_code = wire.MCP_NEGOTIATION_MODERN_ONLY;
+        server.server_binding_identity = [_]u8{0xd2} ** 32;
+        server.configuration_fingerprint = [_]u8{0xb1} ** 32;
+        server.namespace = sdk.bytesView("lifetime");
+        server.client_name = sdk.bytesView("agentcore-r7-test");
+        server.client_version = sdk.bytesView("7");
+        server.timeout_ms = 1000;
+        server.connector = probe.connector();
+        switch (missing) {
+            .retain => server.connector.retain_connector = null,
+            .release => server.connector.release_connector = null,
+        }
+        var servers = [_]wire.McpServerV1{server};
+        var configuration = std.mem.zeroes(wire.McpConfigurationV1);
+        configuration.struct_size = @sizeOf(wire.McpConfigurationV1);
+        configuration.desired_revision = 1;
+        configuration.servers = &servers;
+        configuration.server_count = servers.len;
+        var report = std.mem.zeroes(wire.McpApplyReportV1);
+
+        try std.testing.expectEqual(
+            wire.STATUS_INVALID_ARGUMENT,
+            api.runtimeApplyMcpConfiguration()(runtime, &configuration, &report, &diagnostic),
+        );
+        try std.testing.expectEqual(@as(u32, 0), probe.connector_retains);
+        try std.testing.expectEqual(@as(u32, 0), probe.connector_releases);
+        try std.testing.expectEqual(@as(u32, 0), probe.open_attempts);
+        api.bufferRelease()(&diagnostic);
     }
 }
 

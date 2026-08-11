@@ -153,9 +153,49 @@ const AbiMcpConnector = struct {
     descriptor: wire.McpConnectorV1,
     max_frame_bytes: u64,
     timeout_ms: u32,
+    refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+
+    fn create(
+        descriptor: wire.McpConnectorV1,
+        max_frame_bytes: u64,
+        timeout_ms: u32,
+    ) error{OutOfMemory}!*AbiMcpConnector {
+        const self = allocator.create(AbiMcpConnector) catch
+            return error.OutOfMemory;
+        self.* = .{
+            .descriptor = descriptor,
+            .max_frame_bytes = max_frame_bytes,
+            .timeout_ms = timeout_ms,
+        };
+        descriptor.retain_connector.?(descriptor.ctx);
+        return self;
+    }
 
     fn connector(self: *AbiMcpConnector) mcp_runtime.Connector {
-        return .{ .ctx = self, .open_fn = open };
+        return .{
+            .ctx = self,
+            .open_fn = open,
+            .retain_fn = retain,
+            .release_fn = release,
+        };
+    }
+
+    fn retain(raw: *anyopaque) anyerror!void {
+        const self: *AbiMcpConnector = @ptrCast(@alignCast(raw));
+        const previous = self.refs.fetchAdd(1, .monotonic);
+        if (previous == std.math.maxInt(u32)) {
+            _ = self.refs.fetchSub(1, .monotonic);
+            return error.ResourceLimit;
+        }
+    }
+
+    fn release(raw: *anyopaque) void {
+        const self: *AbiMcpConnector = @ptrCast(@alignCast(raw));
+        const previous = self.refs.fetchSub(1, .acq_rel);
+        std.debug.assert(previous != 0);
+        if (previous != 1) return;
+        self.descriptor.release_connector.?(self.descriptor.ctx);
+        allocator.destroy(self);
     }
 
     fn open(
@@ -192,6 +232,7 @@ const AbiMcpConnector = struct {
                 .max_frame_bytes = self.max_frame_bytes,
                 .host_connection = host_connection,
             };
+            self.descriptor.retain_connector.?(self.descriptor.ctx);
             return .{ .connection = connection.interface() };
         }
         if (connection_ctx) |unexpected| {
@@ -307,6 +348,7 @@ const AbiMcpConnection = struct {
             self.descriptor.ctx,
             self.host_connection,
         );
+        self.descriptor.release_connector.?(self.descriptor.ctx);
         allocator.destroy(self);
     }
 
@@ -320,7 +362,6 @@ const AbiMcpConnection = struct {
 const AbiRuntime = struct {
     core_runtime: *core.agent_session.AgentRuntime,
     host_tools: []AbiHostTool,
-    mcp_connectors: ?[]AbiMcpConnector = null,
     catalogs: skill_catalog_handles.RuntimeCatalogs,
     materializations: skill_materialization.Manager,
     /// Populated by the Revision 6 Runtime configuration seam. Null keeps the
@@ -3780,6 +3821,90 @@ fn parseMcpCatalogLimits(
     };
 }
 
+const ParsedMcpSpecs = struct {
+    connectors: []*AbiMcpConnector,
+    specs: []mcp_catalog.ServerSpec,
+
+    fn deinit(self: ParsedMcpSpecs) void {
+        for (self.connectors) |connector| connector.connector().release();
+    }
+};
+
+fn parseMcpSpecs(
+    scratch: std.mem.Allocator,
+    descriptors_ptr: ?[*]const wire.McpServerV1,
+    descriptor_count: u64,
+    limits: mcp_catalog.Limits,
+    metadata_bytes: *u64,
+) !ParsedMcpSpecs {
+    if (descriptor_count > wire.MAX_MCP_SERVERS_V1 or
+        descriptor_count > limits.max_servers)
+        return error.ResourceLimit;
+    const count = std.math.cast(usize, descriptor_count) orelse
+        return error.Overflow;
+    const descriptors = if (count == 0) &.{} else (descriptors_ptr orelse
+        return error.InvalidArgument)[0..count];
+    const connectors = try scratch.alloc(*AbiMcpConnector, count);
+    var initialized: usize = 0;
+    errdefer for (connectors[0..initialized]) |connector|
+        connector.connector().release();
+    const specs = try scratch.alloc(mcp_catalog.ServerSpec, count);
+    for (descriptors, connectors, specs) |descriptor, *connector_slot, *spec| {
+        if (descriptor.struct_size != @sizeOf(wire.McpServerV1) or
+            descriptor.reserved0 != 0 or descriptor.reserved1 != 0 or
+            descriptor.connector.struct_size != @sizeOf(wire.McpConnectorV1) or
+            descriptor.connector.reserved0 != 0 or
+            !allZero(descriptor.connector.reserved) or
+            descriptor.connector.open == null or
+            descriptor.connector.request == null or
+            descriptor.connector.notify == null or
+            descriptor.connector.close == null or
+            descriptor.connector.release_response == null or
+            descriptor.connector.retain_connector == null or
+            descriptor.connector.release_connector == null)
+            return error.InvalidArgument;
+        const transport = mcpTransport(descriptor.transport_code) orelse
+            return error.InvalidArgument;
+        const policy = mcpNegotiationPolicy(descriptor.negotiation_policy_code) orelse
+            return error.InvalidArgument;
+        if (descriptor.timeout_ms == 0) return error.InvalidArgument;
+        for ([_]wire.BytesViewV1{
+            descriptor.namespace,
+            descriptor.client_name,
+            descriptor.client_version,
+        }) |value| try addMetadata(
+            metadata_bytes,
+            value.len,
+            wire.MAX_RUNTIME_METADATA_BYTES_V1,
+        );
+        const namespace = try text(descriptor.namespace);
+        const client_name = try text(descriptor.client_name);
+        const client_version = try text(descriptor.client_version);
+        if (client_name.len == 0 or client_version.len == 0)
+            return error.InvalidArgument;
+        const protocol_limits = try parseMcpProtocolLimits(descriptor.protocol_limits);
+        const connector = try AbiMcpConnector.create(
+            descriptor.connector,
+            protocol_limits.max_frame_bytes,
+            descriptor.timeout_ms,
+        );
+        connector_slot.* = connector;
+        initialized += 1;
+        spec.* = .{
+            .binding = descriptor.server_binding_identity,
+            .namespace = namespace,
+            .configuration_fingerprint = descriptor.configuration_fingerprint,
+            .connector = connector.connector(),
+            .transport = transport,
+            .policy = policy,
+            .client = .{ .name = client_name, .version = client_version },
+            .timeout_ms = descriptor.timeout_ms,
+            .protocol_limits = protocol_limits,
+        };
+    }
+    return .{ .connectors = connectors, .specs = specs };
+}
+
 fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire.RuntimeHandle, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
     if (out_runtime) |out| out.* = null;
     emptyError(out_error);
@@ -3812,17 +3937,17 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
         return fail(wire.STATUS_INVALID_ARGUMENT, "host_tools is required", out_error))[0..host_count];
     const mcp_limits = parseMcpCatalogLimits(config.mcp_catalog_limits) catch |err|
         return failError(inputErrorStatus(err), err, out_error);
-    if (config.mcp_server_count > wire.MAX_MCP_SERVERS_V1 or
-        config.mcp_server_count > mcp_limits.max_servers)
-        return fail(wire.STATUS_RESOURCE_LIMIT, "MCP server count exceeds AgentCore ABI v1 limits", out_error);
-    const mcp_count = std.math.cast(usize, config.mcp_server_count) orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "MCP server count overflow", out_error);
-    const mcp_descriptors = if (mcp_count == 0) &.{} else (config.mcp_servers orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "mcp_servers is required", out_error))[0..mcp_count];
+    const parsed_mcp = parseMcpSpecs(
+        a,
+        config.mcp_servers,
+        config.mcp_server_count,
+        mcp_limits,
+        &runtime_metadata,
+    ) catch |err| return failError(inputErrorStatus(err), err, out_error);
+    defer parsed_mcp.deinit();
 
     const self = allocator.create(AbiRuntime) catch return fail(wire.STATUS_OUT_OF_MEMORY, "allocating Runtime failed", out_error);
     self.mcp_manager = null;
-    self.mcp_connectors = null;
     var keep_self = false;
     defer if (!keep_self) allocator.destroy(self);
     self.catalogs = skill_catalog_handles.RuntimeCatalogs.init(allocator) catch |err|
@@ -3871,73 +3996,9 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
         };
         native_tools[i] = .{ .definition = .{ .name = name, .description = description, .input_schema = schema }, .ctx = &self.host_tools[i], .execute = AbiHostTool.execute };
     }
-    const connectors = allocator.alloc(AbiMcpConnector, mcp_count) catch
-        return fail(wire.STATUS_OUT_OF_MEMORY, "allocating MCP connectors failed", out_error);
-    self.mcp_connectors = connectors;
-    var keep_connectors = false;
-    defer if (!keep_connectors) {
-        allocator.free(connectors);
-        self.mcp_connectors = null;
-    };
-    const mcp_specs = a.alloc(mcp_catalog.ServerSpec, mcp_count) catch
-        return fail(wire.STATUS_OUT_OF_MEMORY, "allocating MCP server specifications failed", out_error);
-    for (mcp_descriptors, connectors, mcp_specs) |descriptor, *connector, *spec| {
-        if (descriptor.struct_size != @sizeOf(wire.McpServerV1) or
-            descriptor.reserved0 != 0 or descriptor.reserved1 != 0 or
-            !allZero(descriptor.reserved) or
-            descriptor.connector.struct_size != @sizeOf(wire.McpConnectorV1) or
-            descriptor.connector.reserved0 != 0 or
-            !allZero(descriptor.connector.reserved) or
-            descriptor.connector.open == null or
-            descriptor.connector.request == null or
-            descriptor.connector.notify == null or
-            descriptor.connector.close == null or
-            descriptor.connector.release_response == null)
-            return fail(wire.STATUS_INVALID_ARGUMENT, "invalid MCP server or connector descriptor", out_error);
-        const transport = mcpTransport(descriptor.transport_code) orelse
-            return fail(wire.STATUS_INVALID_ARGUMENT, "unknown MCP transport", out_error);
-        const policy = mcpNegotiationPolicy(descriptor.negotiation_policy_code) orelse
-            return fail(wire.STATUS_INVALID_ARGUMENT, "unknown MCP negotiation policy", out_error);
-        if (descriptor.timeout_ms == 0)
-            return fail(wire.STATUS_INVALID_ARGUMENT, "MCP timeout must be nonzero", out_error);
-        for ([_]wire.BytesViewV1{
-            descriptor.namespace,
-            descriptor.client_name,
-            descriptor.client_version,
-        }) |value| addMetadata(
-            &runtime_metadata,
-            value.len,
-            wire.MAX_RUNTIME_METADATA_BYTES_V1,
-        ) catch |err| return failError(inputErrorStatus(err), err, out_error);
-        const namespace = text(descriptor.namespace) catch |err|
-            return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
-        const client_name = text(descriptor.client_name) catch |err|
-            return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
-        const client_version = text(descriptor.client_version) catch |err|
-            return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
-        if (client_name.len == 0 or client_version.len == 0)
-            return fail(wire.STATUS_INVALID_ARGUMENT, "MCP client name and version are required", out_error);
-        const protocol_limits = parseMcpProtocolLimits(descriptor.protocol_limits) catch |err|
-            return failError(inputErrorStatus(err), err, out_error);
-        connector.* = .{
-            .descriptor = descriptor.connector,
-            .max_frame_bytes = protocol_limits.max_frame_bytes,
-            .timeout_ms = descriptor.timeout_ms,
-        };
-        spec.* = .{
-            .binding = descriptor.server_binding_identity,
-            .namespace = namespace,
-            .connector = connector.connector(),
-            .transport = transport,
-            .policy = policy,
-            .client = .{ .name = client_name, .version = client_version },
-            .timeout_ms = descriptor.timeout_ms,
-            .protocol_limits = protocol_limits,
-        };
-    }
     self.mcp_manager = mcp_catalog.Manager.init(
         allocator,
-        mcp_specs,
+        parsed_mcp.specs,
         mcp_limits,
     ) catch |err| return failError(inputErrorStatus(err), err, out_error);
     var keep_mcp_manager = false;
@@ -3951,7 +4012,6 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
     out.* = self.handle();
     keep_host_tools = true;
     keep_mcp_manager = true;
-    keep_connectors = true;
     keep_materializations = true;
     keep_catalogs = true;
     keep_self = true;
@@ -3972,7 +4032,6 @@ fn runtimeDestroy(handle: ?*wire.RuntimeHandle, out_error: ?*wire.OwnedBytesV1) 
     self.catalogs.finishDestroy();
     destroy_committed = true;
     allocator.free(self.host_tools);
-    if (self.mcp_connectors) |connectors| allocator.free(connectors);
     allocator.destroy(self);
     return wire.STATUS_OK;
 }
@@ -4183,6 +4242,65 @@ fn runtimeRefreshMcp(
         error.ReentrantControlCall => wire.STATUS_INVALID_STATE,
         else => wire.STATUS_CORE_ERROR,
     }, err, out_error);
+    return wire.STATUS_OK;
+}
+
+fn runtimeApplyMcpConfiguration(
+    runtime_handle: ?*wire.RuntimeHandle,
+    configuration_ptr: ?*const wire.McpConfigurationV1,
+    out_report: ?*wire.McpApplyReportV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    if (out_report) |out| out.* = std.mem.zeroes(wire.McpApplyReportV1);
+    emptyError(out_error);
+    const runtime = runtimeFrom(runtime_handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "runtime is required", out_error));
+    const configuration = configuration_ptr orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "MCP configuration is required", out_error);
+    const out = out_report orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "out_apply_report is required", out_error);
+    if (configuration.struct_size != @sizeOf(wire.McpConfigurationV1) or
+        configuration.reserved0 != 0 or !allZero(configuration.reserved) or
+        configuration.desired_revision == 0)
+        return fail(wire.STATUS_INVALID_ARGUMENT, "invalid McpConfigurationV1", out_error);
+    var runtime_call = runtime.catalogs.enterCall() catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    defer runtime_call.deinit();
+    const manager = if (runtime.mcp_manager) |*value| value else return fail(wire.STATUS_INVALID_STATE, "Runtime has no MCP manager", out_error);
+
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    var metadata_bytes: u64 = 0;
+    const parsed = parseMcpSpecs(
+        scratch.allocator(),
+        configuration.servers,
+        configuration.server_count,
+        manager.limits,
+        &metadata_bytes,
+    ) catch |err| return failError(inputErrorStatus(err), err, out_error);
+    defer parsed.deinit();
+    const report = manager.apply(
+        configuration.desired_revision,
+        parsed.specs,
+    ) catch |err| return failError(switch (err) {
+        error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
+        error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
+        error.InvalidConfig => wire.STATUS_INVALID_ARGUMENT,
+        error.NotRefreshed => wire.STATUS_MCP_NOT_REFRESHED,
+        error.ReentrantControlCall => wire.STATUS_INVALID_STATE,
+    }, err, out_error);
+    out.* = .{
+        .struct_size = @sizeOf(wire.McpApplyReportV1),
+        .disposition_code = switch (report.disposition) {
+            .applied => wire.MCP_APPLY_APPLIED,
+            .superseded => wire.MCP_APPLY_SUPERSEDED,
+            .rejected => wire.MCP_APPLY_REJECTED,
+        },
+        .desired_revision = report.desired_revision,
+        .active_revision = report.active_revision,
+        .catalog_generation = report.catalog_generation,
+        .reserved = [_]u64{0} ** 4,
+    };
     return wire.STATUS_OK;
 }
 
@@ -5830,6 +5948,7 @@ const api_v1 = wire.ApiV1{
     .skill_catalog_release = skillCatalogRelease,
     .runtime_refresh_mcp = runtimeRefreshMcp,
     .runtime_describe_mcp = runtimeDescribeMcp,
+    .runtime_apply_mcp_configuration = runtimeApplyMcpConfiguration,
     .session_create = sessionCreate,
     .session_restore = sessionRestore,
     .session_destroy = sessionDestroy,
@@ -5844,7 +5963,7 @@ const api_v1 = wire.ApiV1{
     .session_abort_compact = sessionAbortCompact,
     .session_export_checkpoint = sessionExportCheckpoint,
     .buffer_release = bufferRelease,
-    .reserved = [_]u64{0} ** 4,
+    .reserved = [_]u64{0} ** 3,
 };
 
 pub export fn metask_agentcore_get_api(requested_abi: u32) callconv(.c) ?*const anyopaque {

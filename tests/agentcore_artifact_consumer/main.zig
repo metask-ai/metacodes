@@ -11,7 +11,10 @@ comptime {
         wire.MCP_NEGOTIATION_LEGACY_2025_06_ONLY != 4 or
         wire.MCP_ERA_2026_07_28 != 1 or
         wire.MCP_ERA_2025_11_25 != 2 or
-        wire.MCP_ERA_2025_06_18 != 3)
+        wire.MCP_ERA_2025_06_18 != 3 or
+        wire.MCP_APPLY_APPLIED != 1 or
+        wire.MCP_APPLY_SUPERSEDED != 2 or
+        wire.MCP_APPLY_REJECTED != 3)
         @compileError("source-free Revision 7 MCP codes must match the public contract");
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
@@ -363,6 +366,21 @@ pub fn main(init: std.process.Init) !void {
     defer if (runtime) |handle| {
         _ = api.runtimeDestroy()(handle, &diagnostic);
     };
+    var mcp_configuration = std.mem.zeroes(wire.McpConfigurationV1);
+    mcp_configuration.struct_size = @sizeOf(wire.McpConfigurationV1);
+    mcp_configuration.desired_revision = 1;
+    var mcp_report = std.mem.zeroes(wire.McpApplyReportV1);
+    try expectStatus(.ok, api.runtimeApplyMcpConfiguration()(
+        runtime,
+        &mcp_configuration,
+        &mcp_report,
+        &diagnostic,
+    ), diagnostic);
+    if (mcp_report.struct_size != @sizeOf(wire.McpApplyReportV1) or
+        mcp_report.disposition_code != wire.MCP_APPLY_APPLIED or
+        mcp_report.desired_revision != 1 or mcp_report.active_revision != 1 or
+        mcp_report.catalog_generation != 1)
+        return error.InvalidMcpApplyReport;
 
     var query = wire.SkillCatalogQueryV1{
         .struct_size = @sizeOf(wire.SkillCatalogQueryV1),

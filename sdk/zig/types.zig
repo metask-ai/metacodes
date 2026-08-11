@@ -223,6 +223,9 @@ pub const MCP_NEGOTIATION_LEGACY_2025_06_ONLY: u32 = 4;
 pub const MCP_ERA_2026_07_28: u32 = 1;
 pub const MCP_ERA_2025_11_25: u32 = 2;
 pub const MCP_ERA_2025_06_18: u32 = 3;
+pub const MCP_APPLY_APPLIED: u32 = 1;
+pub const MCP_APPLY_SUPERSEDED: u32 = 2;
+pub const MCP_APPLY_REJECTED: u32 = 3;
 pub const MCP_CONNECTION_DISPOSABLE_PROBE: u32 = 1;
 pub const MCP_CONNECTION_ACTUAL: u32 = 2;
 pub const MCP_OPEN_OK: u32 = 0;
@@ -399,6 +402,11 @@ pub const McpReleaseResponseFnV1 = *const fn (
     connection_ctx: ?*anyopaque,
     response_json: ?*OwnedBytesV1,
 ) callconv(.c) void;
+/// AgentCore retains the opaque connector context before an operation returns
+/// and releases it after every configured definition and live connection has
+/// stopped using it. Both callbacks are mandatory and must be thread-safe.
+pub const McpRetainConnectorFnV1 = *const fn (connector_ctx: ?*anyopaque) callconv(.c) void;
+pub const McpReleaseConnectorFnV1 = *const fn (connector_ctx: ?*anyopaque) callconv(.c) void;
 
 pub const McpConnectorV1 = extern struct {
     struct_size: u32,
@@ -409,7 +417,9 @@ pub const McpConnectorV1 = extern struct {
     notify: ?McpNotifyFnV1,
     close: ?McpCloseFnV1,
     release_response: ?McpReleaseResponseFnV1,
-    reserved: [3]u64,
+    retain_connector: ?McpRetainConnectorFnV1,
+    release_connector: ?McpReleaseConnectorFnV1,
+    reserved: [1]u64,
 };
 
 pub const McpProtocolLimitsV1 = extern struct {
@@ -440,6 +450,29 @@ pub const McpServerV1 = extern struct {
     reserved1: u32,
     connector: McpConnectorV1,
     protocol_limits: ?*const McpProtocolLimitsV1,
+    /// Stable, non-secret identity of every connection-relevant input. A
+    /// changed value replaces the ServerInstance; secret bytes and
+    /// secret-derived digests must never be supplied here.
+    configuration_fingerprint: [32]u8,
+};
+
+/// One complete desired MCP server set. Apply is declarative: omitted servers
+/// are removed, and `desired_revision` is non-zero and monotonic per Runtime.
+pub const McpConfigurationV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    desired_revision: u64,
+    servers: ?[*]const McpServerV1,
+    server_count: u64,
+    reserved: [4]u64,
+};
+
+pub const McpApplyReportV1 = extern struct {
+    struct_size: u32,
+    disposition_code: u32,
+    desired_revision: u64,
+    active_revision: u64,
+    catalog_generation: u64,
     reserved: [4]u64,
 };
 
@@ -738,6 +771,12 @@ pub const RuntimeDescribeMcpFnV1 = *const fn (
     out_description_json: ?*OwnedBytesV1,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
+pub const RuntimeApplyMcpConfigurationFnV1 = *const fn (
+    runtime: ?*RuntimeHandle,
+    configuration: ?*const McpConfigurationV1,
+    out_report: ?*McpApplyReportV1,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
 pub const SessionCreateFnV1 = *const fn (?*RuntimeHandle, ?*const SessionCreateConfigV1, ?*const SessionCallbacksV1, ?*?*SessionHandle, ?*OwnedBytesV1) callconv(.c) u32;
 pub const SessionRestoreFnV1 = *const fn (
     runtime: ?*RuntimeHandle,
@@ -853,7 +892,8 @@ pub const ApiV1 = extern struct {
     session_abort_compact: ?SessionAbortCompactFnV1,
     session_export_checkpoint: ?SessionExportCheckpointFnV1,
     buffer_release: ?BufferReleaseFnV1,
-    reserved: [4]u64,
+    runtime_apply_mcp_configuration: ?RuntimeApplyMcpConfigurationFnV1,
+    reserved: [3]u64,
 };
 
 test "ABI v1 public layouts are fixed on supported 64-bit targets" {
@@ -866,6 +906,8 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 80), @sizeOf(McpConnectorV1));
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(McpProtocolLimitsV1));
     try std.testing.expectEqual(@as(usize, 224), @sizeOf(McpServerV1));
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(McpConfigurationV1));
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(McpApplyReportV1));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(McpCatalogLimitsV1));
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(RuntimeConfigV1));
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(SessionCallbacksV1));
@@ -895,6 +937,7 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(McpConnectorV1, "ctx"));
     try std.testing.expectEqual(@as(usize, 104), @offsetOf(McpServerV1, "connector"));
     try std.testing.expectEqual(@as(usize, 184), @offsetOf(McpServerV1, "protocol_limits"));
+    try std.testing.expectEqual(@as(usize, 192), @offsetOf(McpServerV1, "configuration_fingerprint"));
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(RuntimeConfigV1, "mcp_servers"));
     try std.testing.expectEqual(@as(usize, 56), @offsetOf(RuntimeConfigV1, "mcp_catalog_limits"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(SessionHostConfigV1, "api_key"));
@@ -934,7 +977,8 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 160), @offsetOf(ApiV1, "session_abort_compact"));
     try std.testing.expectEqual(@as(usize, 168), @offsetOf(ApiV1, "session_export_checkpoint"));
     try std.testing.expectEqual(@as(usize, 176), @offsetOf(ApiV1, "buffer_release"));
-    try std.testing.expectEqual(@as(usize, 184), @offsetOf(ApiV1, "reserved"));
+    try std.testing.expectEqual(@as(usize, 184), @offsetOf(ApiV1, "runtime_apply_mcp_configuration"));
+    try std.testing.expectEqual(@as(usize, 192), @offsetOf(ApiV1, "reserved"));
 }
 
 test "typed status and stop reason validate every public code" {
@@ -969,4 +1013,7 @@ test "Revision 7 MCP codes append without changing Revision 6 meanings" {
     try std.testing.expectEqual(@as(u32, 1), MCP_ERA_2026_07_28);
     try std.testing.expectEqual(@as(u32, 2), MCP_ERA_2025_11_25);
     try std.testing.expectEqual(@as(u32, 3), MCP_ERA_2025_06_18);
+    try std.testing.expectEqual(@as(u32, 1), MCP_APPLY_APPLIED);
+    try std.testing.expectEqual(@as(u32, 2), MCP_APPLY_SUPERSEDED);
+    try std.testing.expectEqual(@as(u32, 3), MCP_APPLY_REJECTED);
 }

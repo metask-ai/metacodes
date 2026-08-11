@@ -356,6 +356,8 @@ fn ownSpecs(
     if (specs.len > limits.max_servers) return error.InvalidConfig;
     const owned = allocator.alloc(OwnedSpec, specs.len) catch
         return error.OutOfMemory;
+    var initialized: usize = 0;
+    errdefer for (owned[0..initialized]) |spec| spec.connector.release();
     const namespace_limit = @min(limits.max_namespace_bytes, MAX_NAMESPACE_BYTES);
     for (specs, owned, 0..) |spec, *destination, index| {
         if (allZero(&spec.binding) or
@@ -386,8 +388,14 @@ fn ownSpecs(
             .timeout_ms = spec.timeout_ms,
             .protocol_limits = spec.protocol_limits,
         };
+        spec.connector.retain() catch return error.ResourceLimit;
+        initialized += 1;
     }
     return owned;
+}
+
+fn releaseOwnedSpecs(specs: []const OwnedSpec) void {
+    for (specs) |spec| spec.connector.release();
 }
 
 fn findOwnedSpec(specs: []const OwnedSpec, binding: *const [32]u8) ?*const OwnedSpec {
@@ -481,42 +489,8 @@ pub const Manager = struct {
             return error.InvalidConfig;
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
-        const owned = arena.allocator().alloc(OwnedSpec, specs.len) catch
-            return error.OutOfMemory;
-        const effective_namespace_limit = @min(
-            limits.max_namespace_bytes,
-            MAX_NAMESPACE_BYTES,
-        );
-        for (specs, owned, 0..) |spec, *destination, index| {
-            if (allZero(&spec.binding) or
-                !validNamespace(spec.namespace, effective_namespace_limit) or
-                spec.timeout_ms == 0 or
-                spec.protocol_limits.max_tools > (canonical.Limits{}).max_tools)
-                return error.InvalidConfig;
-            spec.protocol_limits.validate() catch return error.InvalidConfig;
-            for (specs[0..index]) |previous| {
-                if (std.mem.eql(u8, &previous.binding, &spec.binding) or
-                    std.mem.eql(u8, previous.namespace, spec.namespace))
-                    return error.InvalidConfig;
-            }
-            const namespace = arena.allocator().dupe(u8, spec.namespace) catch
-                return error.OutOfMemory;
-            const client_name = arena.allocator().dupe(u8, spec.client.name) catch
-                return error.OutOfMemory;
-            const client_version = arena.allocator().dupe(u8, spec.client.version) catch
-                return error.OutOfMemory;
-            destination.* = .{
-                .binding = spec.binding,
-                .namespace = namespace,
-                .configuration_fingerprint = spec.configuration_fingerprint,
-                .connector = spec.connector,
-                .transport = spec.transport,
-                .policy = spec.policy,
-                .client = .{ .name = client_name, .version = client_version },
-                .timeout_ms = spec.timeout_ms,
-                .protocol_limits = spec.protocol_limits,
-            };
-        }
+        const owned = try ownSpecs(arena.allocator(), specs, limits);
+        errdefer releaseOwnedSpecs(owned);
         const instances = allocator.create(instance_pool.Pool) catch
             return error.OutOfMemory;
         instances.* = instance_pool.Pool.init(allocator);
@@ -534,6 +508,7 @@ pub const Manager = struct {
         if (self.current) |snapshot| snapshot.release();
         self.instances.deinit();
         self.allocator.destroy(self.instances);
+        releaseOwnedSpecs(self.specs);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -594,6 +569,8 @@ pub const Manager = struct {
             specs,
             self.limits,
         );
+        var candidate_specs_owned = true;
+        defer if (candidate_specs_owned) releaseOwnedSpecs(candidate_specs);
         try self.beginReconcile();
         defer self.finishReconcile();
 
@@ -681,10 +658,13 @@ pub const Manager = struct {
         self.convergence = .converged;
         self.current_mutex.unlock();
         var retired_arena = self.arena;
+        const retired_specs = self.specs;
         self.arena = candidate_arena;
         candidate_transferred = true;
         self.specs = candidate_specs;
+        candidate_specs_owned = false;
         if (retired) |snapshot| snapshot.release();
+        releaseOwnedSpecs(retired_specs);
         retired_arena.deinit();
         return .{
             .disposition = .applied,

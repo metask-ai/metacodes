@@ -115,6 +115,9 @@ pub const METASK_AGENTCORE_MCP_NEGOTIATION_LEGACY_2025_06_ONLY: u32 = 4;
 pub const METASK_AGENTCORE_MCP_ERA_2026_07_28: u32 = 1;
 pub const METASK_AGENTCORE_MCP_ERA_2025_11_25: u32 = 2;
 pub const METASK_AGENTCORE_MCP_ERA_2025_06_18: u32 = 3;
+pub const METASK_AGENTCORE_MCP_APPLY_APPLIED: u32 = 1;
+pub const METASK_AGENTCORE_MCP_APPLY_SUPERSEDED: u32 = 2;
+pub const METASK_AGENTCORE_MCP_APPLY_REJECTED: u32 = 3;
 pub const METASK_AGENTCORE_MCP_CONNECTION_DISPOSABLE_PROBE: u32 = 1;
 pub const METASK_AGENTCORE_MCP_CONNECTION_ACTUAL: u32 = 2;
 pub const METASK_AGENTCORE_MCP_OPEN_OK: u32 = 0;
@@ -370,6 +373,10 @@ pub type metask_agentcore_mcp_release_response_fn_v1 = ::std::option::Option<
         arg3: *mut metask_agentcore_owned_bytes_v1,
     ),
 >;
+pub type metask_agentcore_mcp_retain_connector_fn_v1 =
+    ::std::option::Option<unsafe extern "C" fn(arg1: *mut ::std::os::raw::c_void)>;
+pub type metask_agentcore_mcp_release_connector_fn_v1 =
+    ::std::option::Option<unsafe extern "C" fn(arg1: *mut ::std::os::raw::c_void)>;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct metask_agentcore_mcp_connector_v1 {
@@ -381,7 +388,9 @@ pub struct metask_agentcore_mcp_connector_v1 {
     pub notify: metask_agentcore_mcp_notify_fn_v1,
     pub close: metask_agentcore_mcp_close_fn_v1,
     pub release_response: metask_agentcore_mcp_release_response_fn_v1,
-    pub reserved: [u64; 3usize],
+    pub retain_connector: metask_agentcore_mcp_retain_connector_fn_v1,
+    pub release_connector: metask_agentcore_mcp_release_connector_fn_v1,
+    pub reserved: [u64; 1usize],
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
@@ -405,8 +414,12 @@ const _: () = {
         [::std::mem::offset_of!(metask_agentcore_mcp_connector_v1, close) - 40usize];
     ["Offset of field: metask_agentcore_mcp_connector_v1::release_response"]
         [::std::mem::offset_of!(metask_agentcore_mcp_connector_v1, release_response) - 48usize];
+    ["Offset of field: metask_agentcore_mcp_connector_v1::retain_connector"]
+        [::std::mem::offset_of!(metask_agentcore_mcp_connector_v1, retain_connector) - 56usize];
+    ["Offset of field: metask_agentcore_mcp_connector_v1::release_connector"]
+        [::std::mem::offset_of!(metask_agentcore_mcp_connector_v1, release_connector) - 64usize];
     ["Offset of field: metask_agentcore_mcp_connector_v1::reserved"]
-        [::std::mem::offset_of!(metask_agentcore_mcp_connector_v1, reserved) - 56usize];
+        [::std::mem::offset_of!(metask_agentcore_mcp_connector_v1, reserved) - 72usize];
 };
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -476,7 +489,7 @@ pub struct metask_agentcore_mcp_server_v1 {
     pub reserved1: u32,
     pub connector: metask_agentcore_mcp_connector_v1,
     pub protocol_limits: *const metask_agentcore_mcp_protocol_limits_v1,
-    pub reserved: [u64; 4usize],
+    pub configuration_fingerprint: [u8; 32usize],
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
@@ -508,8 +521,66 @@ const _: () = {
         [::std::mem::offset_of!(metask_agentcore_mcp_server_v1, connector) - 104usize];
     ["Offset of field: metask_agentcore_mcp_server_v1::protocol_limits"]
         [::std::mem::offset_of!(metask_agentcore_mcp_server_v1, protocol_limits) - 184usize];
-    ["Offset of field: metask_agentcore_mcp_server_v1::reserved"]
-        [::std::mem::offset_of!(metask_agentcore_mcp_server_v1, reserved) - 192usize];
+    ["Offset of field: metask_agentcore_mcp_server_v1::configuration_fingerprint"]
+        [::std::mem::offset_of!(metask_agentcore_mcp_server_v1, configuration_fingerprint) - 192usize];
+};
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct metask_agentcore_mcp_configuration_v1 {
+    pub struct_size: u32,
+    pub reserved0: u32,
+    pub desired_revision: u64,
+    pub servers: *const metask_agentcore_mcp_server_v1,
+    pub server_count: u64,
+    pub reserved: [u64; 4usize],
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of metask_agentcore_mcp_configuration_v1"]
+        [::std::mem::size_of::<metask_agentcore_mcp_configuration_v1>() - 64usize];
+    ["Alignment of metask_agentcore_mcp_configuration_v1"]
+        [::std::mem::align_of::<metask_agentcore_mcp_configuration_v1>() - 8usize];
+    ["Offset of field: metask_agentcore_mcp_configuration_v1::struct_size"]
+        [::std::mem::offset_of!(metask_agentcore_mcp_configuration_v1, struct_size) - 0usize];
+    ["Offset of field: metask_agentcore_mcp_configuration_v1::reserved0"]
+        [::std::mem::offset_of!(metask_agentcore_mcp_configuration_v1, reserved0) - 4usize];
+    ["Offset of field: metask_agentcore_mcp_configuration_v1::desired_revision"]
+        [::std::mem::offset_of!(metask_agentcore_mcp_configuration_v1, desired_revision) - 8usize];
+    ["Offset of field: metask_agentcore_mcp_configuration_v1::servers"]
+        [::std::mem::offset_of!(metask_agentcore_mcp_configuration_v1, servers) - 16usize];
+    ["Offset of field: metask_agentcore_mcp_configuration_v1::server_count"]
+        [::std::mem::offset_of!(metask_agentcore_mcp_configuration_v1, server_count) - 24usize];
+    ["Offset of field: metask_agentcore_mcp_configuration_v1::reserved"]
+        [::std::mem::offset_of!(metask_agentcore_mcp_configuration_v1, reserved) - 32usize];
+};
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct metask_agentcore_mcp_apply_report_v1 {
+    pub struct_size: u32,
+    pub disposition_code: u32,
+    pub desired_revision: u64,
+    pub active_revision: u64,
+    pub catalog_generation: u64,
+    pub reserved: [u64; 4usize],
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of metask_agentcore_mcp_apply_report_v1"]
+        [::std::mem::size_of::<metask_agentcore_mcp_apply_report_v1>() - 64usize];
+    ["Alignment of metask_agentcore_mcp_apply_report_v1"]
+        [::std::mem::align_of::<metask_agentcore_mcp_apply_report_v1>() - 8usize];
+    ["Offset of field: metask_agentcore_mcp_apply_report_v1::struct_size"]
+        [::std::mem::offset_of!(metask_agentcore_mcp_apply_report_v1, struct_size) - 0usize];
+    ["Offset of field: metask_agentcore_mcp_apply_report_v1::disposition_code"]
+        [::std::mem::offset_of!(metask_agentcore_mcp_apply_report_v1, disposition_code) - 4usize];
+    ["Offset of field: metask_agentcore_mcp_apply_report_v1::desired_revision"]
+        [::std::mem::offset_of!(metask_agentcore_mcp_apply_report_v1, desired_revision) - 8usize];
+    ["Offset of field: metask_agentcore_mcp_apply_report_v1::active_revision"]
+        [::std::mem::offset_of!(metask_agentcore_mcp_apply_report_v1, active_revision) - 16usize];
+    ["Offset of field: metask_agentcore_mcp_apply_report_v1::catalog_generation"]
+        [::std::mem::offset_of!(metask_agentcore_mcp_apply_report_v1, catalog_generation) - 24usize];
+    ["Offset of field: metask_agentcore_mcp_apply_report_v1::reserved"]
+        [::std::mem::offset_of!(metask_agentcore_mcp_apply_report_v1, reserved) - 32usize];
 };
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -1343,6 +1414,14 @@ pub type metask_agentcore_runtime_describe_mcp_fn_v1 = ::std::option::Option<
         arg3: *mut metask_agentcore_owned_bytes_v1,
     ) -> u32,
 >;
+pub type metask_agentcore_runtime_apply_mcp_configuration_fn_v1 = ::std::option::Option<
+    unsafe extern "C" fn(
+        arg1: *mut metask_agentcore_runtime,
+        arg2: *const metask_agentcore_mcp_configuration_v1,
+        arg3: *mut metask_agentcore_mcp_apply_report_v1,
+        arg4: *mut metask_agentcore_owned_bytes_v1,
+    ) -> u32,
+>;
 pub type metask_agentcore_session_create_fn_v1 = ::std::option::Option<
     unsafe extern "C" fn(
         arg1: *mut metask_agentcore_runtime,
@@ -1475,7 +1554,8 @@ pub struct metask_agentcore_api_v1 {
     pub session_abort_compact: metask_agentcore_session_abort_compact_fn_v1,
     pub session_export_checkpoint: metask_agentcore_session_export_checkpoint_fn_v1,
     pub buffer_release: metask_agentcore_buffer_release_fn_v1,
-    pub reserved: [u64; 4usize],
+    pub runtime_apply_mcp_configuration: metask_agentcore_runtime_apply_mcp_configuration_fn_v1,
+    pub reserved: [u64; 3usize],
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
@@ -1535,8 +1615,10 @@ const _: () = {
         [::std::mem::offset_of!(metask_agentcore_api_v1, session_export_checkpoint) - 168usize];
     ["Offset of field: metask_agentcore_api_v1::buffer_release"]
         [::std::mem::offset_of!(metask_agentcore_api_v1, buffer_release) - 176usize];
+    ["Offset of field: metask_agentcore_api_v1::runtime_apply_mcp_configuration"]
+        [::std::mem::offset_of!(metask_agentcore_api_v1, runtime_apply_mcp_configuration) - 184usize];
     ["Offset of field: metask_agentcore_api_v1::reserved"]
-        [::std::mem::offset_of!(metask_agentcore_api_v1, reserved) - 184usize];
+        [::std::mem::offset_of!(metask_agentcore_api_v1, reserved) - 192usize];
 };
 unsafe extern "C" {
     pub fn metask_agentcore_get_api(requested_abi: u32) -> *const ::std::os::raw::c_void;
