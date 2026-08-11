@@ -118,6 +118,19 @@ pub const Dialect = struct {
         allocator: std.mem.Allocator,
     ) anyerror!bool = defaultSerializeResponseFormat,
 
+    /// 请求侧:把 prompt_cache_key 翻译成厂商 wire,追加到 `out`。返回是否追加了内容。
+    /// default = 不发。
+    /// - OpenAI dialect:`,\"prompt_cache_key\":\"<key>\"`(OpenAI/DeepSeek/Kimi 显式 cache 提示)。
+    /// - Anthropic dialect:不发(用 cache_control block,既有 request.zig 路径处理)。
+    /// - Gemini dialect:不发(用 cachedContent,既有 gemini_client.zig 路径处理)。
+    serializePromptCacheKeyFn: *const fn (
+        ctx: *anyopaque,
+        profile: ModelProfile,
+        key: ?[]const u8,
+        out: *std.ArrayList(u8),
+        allocator: std.mem.Allocator,
+    ) anyerror!bool = defaultSerializePromptCacheKey,
+
     /// 暴露纯数据 profile 供 UI/agent_loop 快速问能力。单一真相源收口(step 8 后)。
     /// default = 返回 profileFor 的结果。
     profileFn: *const fn (ctx: *anyopaque, kind: ProviderKind, model: []const u8) ModelProfile = defaultProfile,
@@ -143,6 +156,9 @@ pub const Dialect = struct {
     }
     pub fn serializeResponseFormat(self: Dialect, p: ModelProfile, rf: ?ResponseFormatRequest, out: *std.ArrayList(u8), a: std.mem.Allocator) !bool {
         return try self.serializeResponseFormatFn(self.ctx, p, rf, out, a);
+    }
+    pub fn serializePromptCacheKey(self: Dialect, p: ModelProfile, key: ?[]const u8, out: *std.ArrayList(u8), a: std.mem.Allocator) !bool {
+        return try self.serializePromptCacheKeyFn(self.ctx, p, key, out, a);
     }
     pub fn profileFor(self: Dialect, kind: ProviderKind, model: []const u8) ModelProfile {
         return self.profileFn(self.ctx, kind, model);
@@ -235,6 +251,15 @@ fn defaultSerializeResponseFormat(ctx: *anyopaque, p: ModelProfile, rf: ?Respons
     _ = ctx;
     _ = p;
     _ = rf;
+    _ = out;
+    _ = a;
+    return false;
+}
+
+fn defaultSerializePromptCacheKey(ctx: *anyopaque, p: ModelProfile, key: ?[]const u8, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
+    _ = ctx;
+    _ = p;
+    _ = key;
     _ = out;
     _ = a;
     return false;
@@ -446,6 +471,81 @@ test "M4 Claude dialect: response_format 不发(用 system prompt 指示 JSON)" 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
     const got = try d.serializeResponseFormat(p, .{ .kind = .json_object }, &out, a);
+    try std.testing.expect(!got);
+    try std.testing.expect(out.items.len == 0);
+}
+
+// ── M5:prompt_cache_key 端到端字节断言(声明=接线=测试 DoD)─────────────────────
+
+test "M5 OpenAI dialect: prompt_cache_key Kimi 发 wire" {
+    // Kimi K3 profile.supports_prompt_cache_key=true,显式 cache 提示。
+    const a = std.testing.allocator;
+    const d = dialectFor(.openai, "kimi-k2");
+    const p = d.profileFor(.openai, "kimi-k2");
+    try std.testing.expect(p.supports_prompt_cache_key);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializePromptCacheKey(p, "session-abc-123", &out, a);
+    try std.testing.expect(got);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"prompt_cache_key\":\"session-abc-123\"") != null);
+}
+
+test "M5 OpenAI dialect: prompt_cache_key GPT-4o 不发(OpenAI 原生不经此字段,走自动 prefix cache)" {
+    // OpenAI 原生自动 prefix cache(服务端自动,不显式 prompt_cache_key),
+    // profile.supports_prompt_cache_key=false(只有 Kimi 设 true)。
+    const a = std.testing.allocator;
+    const d = dialectFor(.openai, "gpt-4o");
+    const p = d.profileFor(.openai, "gpt-4o");
+    try std.testing.expect(!p.supports_prompt_cache_key);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializePromptCacheKey(p, "key-xyz", &out, a);
+    try std.testing.expect(!got);
+    try std.testing.expect(out.items.len == 0);
+}
+
+test "M5 OpenAI dialect: GLM-5 不支持 prompt_cache_key(能力守门)" {
+    // GLM-5 profile.supports_prompt_cache_key=false,不发(能力探测诚实)。
+    const a = std.testing.allocator;
+    const d = dialectFor(.openai, "glm-5.2");
+    const p = d.profileFor(.openai, "glm-5.2");
+    try std.testing.expect(!p.supports_prompt_cache_key);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializePromptCacheKey(p, "key", &out, a);
+    try std.testing.expect(!got);
+    try std.testing.expect(out.items.len == 0);
+}
+
+test "M5 OpenAI dialect: prompt_cache_key null 不发" {
+    const a = std.testing.allocator;
+    const d = dialectFor(.openai, "kimi-k2");
+    const p = d.profileFor(.openai, "kimi-k2");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializePromptCacheKey(p, null, &out, a);
+    try std.testing.expect(!got);
+    try std.testing.expect(out.items.len == 0);
+}
+
+test "M5 Claude dialect: prompt_cache_key 不发(用 cache_control block)" {
+    const a = std.testing.allocator;
+    const d = dialectFor(.anthropic, "claude-opus-4");
+    const p = d.profileFor(.anthropic, "claude-opus-4");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializePromptCacheKey(p, "key", &out, a);
+    try std.testing.expect(!got);
+    try std.testing.expect(out.items.len == 0);
+}
+
+test "M5 Gemini dialect: prompt_cache_key 不发(用 cachedContent)" {
+    const a = std.testing.allocator;
+    const d = dialectFor(.gemini, "gemini-2.5-pro");
+    const p = d.profileFor(.gemini, "gemini-2.5-pro");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializePromptCacheKey(p, "key", &out, a);
     try std.testing.expect(!got);
     try std.testing.expect(out.items.len == 0);
 }

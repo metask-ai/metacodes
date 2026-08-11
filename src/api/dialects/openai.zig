@@ -108,6 +108,22 @@ fn openaiSerializeResponseFormat(ctx: *anyopaque, p: ModelProfile, rf: ?Response
     return false;
 }
 
+// ── 共享:prompt_cache_key 序列化(OpenAI 原生 + DeepSeek + Kimi 支持)─────────────
+//
+// 中立 key → OpenAI chat/completions 顶层 \"prompt_cache_key\":\"<key>\"。
+// 该字段是 OpenAI 2024 引入的显式 cache 提示(同 prompt 命中率提升),DeepSeek/Kimi
+// 兼容此字段。GLM-5/Qwen/Mistral 当前不支持,但服务端忽略未知字段(无害)。
+// 能力守门:profile.supports_prompt_cache_key=false 时不发(避免给不支持的服务端
+// 加无意义字段;虽然无害,但能力探测应保持诚实)。
+fn openaiSerializePromptCacheKey(ctx: *anyopaque, p: ModelProfile, key: ?[]const u8, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
+    _ = ctx;
+    if (!p.supports_prompt_cache_key) return false;
+    const k = key orelse return false;
+    try out.appendSlice(a, ",\"prompt_cache_key\":");
+    try util_json.serializeString(k, out, a);
+    return true;
+}
+
 // ── OpenAI 原生(GPT-4o / GPT-5 / o1 / o3)──────────────────────────────────
 const OpenAINative = struct {
     fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
@@ -134,6 +150,7 @@ const OpenAINative = struct {
         .extractThinkingDeltaFn = extractThinkingDelta,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
+        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
         // injectSystemMods / supportsToolChoice / supportsResponseFormat / profile 走 default
     };
 };
@@ -183,6 +200,7 @@ const Glm = struct {
         .extractThinkingDeltaFn = extractThinkingDelta,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
+        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
     };
 };
 
@@ -219,6 +237,7 @@ const Kimi = struct {
         .extractThinkingDeltaFn = extractThinkingDelta,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
+        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
     };
 };
 
@@ -251,6 +270,7 @@ const DeepSeek = struct {
         .extractThinkingDeltaFn = extractThinkingDelta,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
+        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
     };
 };
 
@@ -280,6 +300,7 @@ const Qwen = struct {
         .extractThinkingDeltaFn = extractThinkingDelta,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
+        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
     };
 };
 
@@ -298,6 +319,7 @@ const Mistral = struct {
         .extractThinkingDeltaFn = extractThinkingDelta,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
+        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
     };
 };
 
