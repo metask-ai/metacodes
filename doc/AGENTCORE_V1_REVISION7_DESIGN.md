@@ -1,30 +1,84 @@
-# AgentCore ABI v1 Revision 7 — MCP Protocol Runtime Completion
+# AgentCore ABI v1 Revision 7 — MCP Runtime and Live Configuration
 
 ## Status and scope
 
-Revision 7 is an explicit AgentCore ABI hard cut. It completes the MCP Runtime
-architecture without replacing `McpRuntime` wholesale and without modifying
-the product MCP stack or `src/core/agent_loop.zig`.
+Revision 7 is an explicit AgentCore ABI hard cut. It completes one end-to-end
+product path: a user can add, change, disable, remove, and test an MCP server in
+the running application without restarting it.
 
 The owned path is:
 
 ```text
-Host transport
-  -> Negotiator
-  -> exact-era connection
+Host configuration, credentials, transport, and UI
+  -> declarative DesiredMcpConfiguration
+  -> serial Runtime reconcile
+  -> exact-era ServerInstance
   -> era adapter
-  -> canonical discovered server
-  -> Catalog admission
-  -> lightweight immutable Snapshot
-  -> Session-selected materialization
-  -> Run authority and dispatch
+  -> copied canonical discovery values
+  -> immutable CatalogGeneration
+  -> Session value-only selection
+  -> Run generation lease
+  -> exact-instance dispatch lease
 ```
 
-Out of scope: MCP Tasks, notification pumps, automatic replay, dynamic adapter
-registries, CLI MCP merging, product-agent integration, and unrelated Memory
-or Harness changes.
+Revision 7 includes product integration and removal of the legacy product MCP
+protocol/client/registry lifecycle. It does not keep two executable MCP paths.
 
-## Stable public codes
+Out of scope: MCP Tasks, automatic replay, interactive connection affinity,
+sampling/elicitation routing, credential lifecycle management, configurable
+replacement policies, bounded drain and rollback, dynamic protocol adapter
+plugins, cross-process pooling, and unrelated subsystems.
+
+## Ownership
+
+The Host owns:
+
+- user and Workspace MCP definitions;
+- credentials and OAuth state;
+- trust and persistent permission decisions;
+- physical stdio/HTTP transport resources and opaque Connector contexts;
+- configuration change observation and UI feedback.
+
+The AgentCore Runtime owns the logical lifecycle:
+
+- protocol negotiation and exact-era reopen decisions;
+- `ServerInstancePool` records and immutable catalog generations;
+- serial declarative reconcile and blue/green publication;
+- exact-instance dispatch and the no-replay boundary.
+
+The Host allocates and releases physical transport resources through the
+Connector contract. AgentCore decides when logical instances open, stop
+admitting, cancel, and close. A Session never owns a Client, transport pointer,
+or mutable catalog storage.
+
+## Stable identity model
+
+`IsolationDomain` is a Host-only key. It consists of the user/security
+principal, Workspace identity, and policy boundary. It does not enter the ABI,
+catalog, checkpoint, or permission identity. The Host maps one stable domain to
+one AgentCore Runtime.
+
+Within a Runtime:
+
+```text
+ServerDefinitionId = definition scope + canonical server identity
+
+ServerInstanceKey =
+    ServerDefinitionId
+  + resolved configuration fingerprint
+```
+
+Configuration fingerprints never contain secret bytes or secret-derived
+digests. When credentials or another connection-relevant input changes, the
+Host supplies a new non-secret configuration fingerprint. Token refresh within
+one unchanged Host Connector remains a Host transport concern.
+
+`InstanceId` is a Runtime-local monotonic integer. It is never reused. Every
+stdio process restart, HTTP re-initialize after session loss, or exact-era
+reopen creates a new `InstanceId`. An ID is an opaque lookup key, never a
+pointer, permission identity, or persisted value.
+
+## Stable public protocol codes
 
 Existing Revision 6 meanings are retained exactly:
 
@@ -53,72 +107,188 @@ Existing Revision 6 meanings are retained exactly:
 - No indeterminate `tools/call` is replayed.
 
 Each successful Host Connector `open` binds one opaque connection context to
-its purpose and requested exact era for its entire lifetime. Streamable HTTP
-state is Host-owned: after initialization the Host supplies the matching
-`MCP-Protocol-Version`, retains any `MCP-Session-Id`, and never shares that
-state between a disposable probe, an actual connection, or an exact-era
-reopen. AgentCore, not the Host, decides when a mismatch requires close and
-reopen; an existing connection never changes era in place.
+its purpose and requested exact era for its lifetime. Streamable HTTP state is
+Host-owned and is never shared between a disposable probe, an actual
+connection, or an exact-era reopen. An existing connection never changes era
+in place.
 
-## Era adapters and capabilities
+## Catalog generations
+
+Catalog is the sole executable admission authority, but it does not own or
+borrow instance memory. A `CatalogGeneration` contains only copied values in
+its own arena:
+
+- namespace, era, cache and diagnostic values;
+- exact `InstanceId` provenance;
+- copied canonical Tool identities, descriptions, schemas, and capabilities;
+- stable model aliases and copied projection diagnostics.
+
+It never contains a Client pointer, transport pointer, Connector context, or a
+slice owned by a ServerInstance. A stale or retired `InstanceId` resolves to a
+clean server-scoped failure, not use-after-free.
+
+Discovery and execution are causally bound: a catalog entry can dispatch only
+to the exact instance that produced it. It must never resolve a server name to
+the newest instance. A restarted instance receives a new ID and must produce a
+new catalog generation before it is executable.
+
+## Session, Run, and dispatch leases
+
+A Session persists only value selectors and permission state. It does not
+retain a Runtime catalog generation between Runs.
+
+Selection update and Run admission deliberately have different failure
+semantics. An explicit Host selection update is strict and atomic: every
+selected tool must exist and be fresh. Run admission is availability-tolerant:
+selectors whose server is missing, expired, or schema-invalidated are omitted
+from that Run and counted as invalidated authority. MCP unavailability may
+shrink the Run tool surface but must never prevent the Conversation itself from
+running.
+
+At Run admission, AgentCore resolves the remaining Session selectors against
+the current catalog generation and creates an immutable Run view. The Run
+retains that generation, so its tool definitions and validation schema remain
+stable. The next Run sees the latest published generation automatically.
+
+Dispatch acquires a short lease for the exact `InstanceId` copied into the Run
+generation. It retains that ServerInstance before writing the request and
+releases it after the terminal result. Destruction order is Run and dispatch
+leases, instance records, then catalog arenas.
+
+Permission identity remains stable server binding identity + canonical Tool
+name + schema fingerprint. `InstanceId`, catalog generation, and era are
+provenance and never grant authority. A semantic schema change invalidates the
+existing selection; a reconnect alone does not.
+
+## Declarative configuration Apply
+
+Every Apply supplies one complete `DesiredMcpConfiguration`. The control plane
+does not expose command-style add/remove mutation:
+
+```text
+DesiredMcpConfiguration {
+    desired_revision,
+    complete server set,
+}
+```
+
+The Runtime computes unchanged, added, changed, and removed servers from stable
+binding identity and the Host-supplied configuration fingerprint. Apply calls
+are synchronous and serialized. A later caller waits for the in-flight Apply,
+then its monotonic desired revision is evaluated against the published state.
+No permanent AgentCore background thread and no Host tick are required.
+
+Unchanged healthy servers retain their exact instance. A configuration-equal
+Apply is a no-op only when the current catalog contains every desired server;
+otherwise missing servers are reconnected. Added or changed servers are built
+off-side. If a strict candidate fails, the current configuration and catalog
+remain last-known-good. A successful candidate is published atomically and the
+old generation retires through ordinary reference ownership.
+
+Reconcile serialization and published-state synchronization are separate
+mechanisms. Connector open/request/notify/close callbacks execute without any
+Manager mutex held. A reconcile mutex serializes mutation; a separate
+current-state mutex atomically publishes the catalog pointer and
+desired/active/convergence values. Description retains the published generation
+under the current-state mutex, then copies and encodes it after unlocking, so a
+network handshake cannot block observation. Reentry from the reconcile owner
+thread fails deterministically before waiting.
+
+Apply terminal results are:
+
+- `applied`: the desired set was processed and published or proved a complete
+  no-op;
+- `superseded`: a newer desired revision is already authoritative;
+- `rejected`: candidate failed and the last-known-good configuration remains;
+
+Apply and refresh must not be called reentrantly from a Connector callback.
+Such calls fail deterministically instead of waiting on their own reconcile.
+
+Runtime description is safe concurrently with Apply and reports desired and
+active revisions plus value-only `converged` or `rejected` state.
+
+## Era adapters and canonical capabilities
 
 `mcp_modern.zig` owns 2026 behavior. `mcp_classic.zig` is parameterized by a
 `ClassicProfile` for 2025-11 and 2025-06. Each adapter interprets its own
-capability shape before producing `CanonicalCapabilities`.
+capability shape before producing copied canonical values.
 
 Classic `capabilities.tools` controls whether `tools/list` is legal. Modern
-discovery does not reuse that Classic rule. Canonical state retains only
-`tool_catalog_available`; raw capability JSON is diagnostic data.
+discovery does not reuse that Classic rule. Execution modes normalize to
+`ordinary`, `task_optional`, or `task_required`. Optional task support remains
+callable as an ordinary request. Required-task tools remain unavailable because
+Revision 7 does not implement MCP Tasks.
 
-Execution modes normalize to `ordinary`, `task_optional`, or `task_required`.
-2025-06 is ordinary. Optional task support remains callable as an ordinary
-request. Required-task tools are unavailable because Revision 7 does not
-implement MCP Tasks.
+## Host configuration and product integration
 
-## Catalog and Session ownership
+The product resolves managed policy, Session overlay, Workspace definition,
+and user definition into the complete desired set. Workspace files may store
+secret references but never secret values. Project-defined executable servers
+require user trust, and a security-relevant definition change invalidates the
+corresponding trust decision.
 
-Catalog is the only executable admission authority. For each admitted Tool the
-Snapshot stores a canonical pointer, stable model alias, and compact copied
-projection diagnostics. The full provider schema parse uses temporary storage
-and is released after inspection.
+Saving configuration invokes Apply in a Host worker thread. The UI can query
+Runtime description concurrently. On successful convergence, the current
+Session sees new tools on its next Run without restarting the application.
 
-Session selection resolves only admitted entries. It lazily materializes a
-`PreparedTool` for selected entries using the same schema logic. A non-OOM
-disagreement is `AdmissionInvariantViolation`, not a second admission outcome.
-View destruction releases prepared tools before releasing its retained
-Snapshot.
+The completed product path replaces startup-only `App.connectMcpServers()` and
+the mutable registry bindings that borrow product `McpClient` pointers. Once
+the AgentCore path supports the existing product features, the duplicate
+product protocol, Client, and registry lifecycle implementations are removed.
+Retaining both executable paths is a Revision 7 release blocker.
 
-Permission identity remains server binding identity + canonical Tool name +
-schema fingerprint. Era is provenance and does not change that identity.
+## ABI contract
 
-## Failure boundaries
+Revision 7 keeps the existing exact protocol-era codes and checkpoint value
+identity while completing the public MCP control plane. Runtime creation may
+provide an initial complete server set. The final Revision 7 table provides:
 
-- Runtime-local allocation failure aborts refresh and preserves the prior
-  Snapshot.
-- Server transport, protocol, and remote resource failures become
-  server-scoped catalog issues and do not suppress healthy peers.
-- Schema and required-task rejection become tool-scoped issues and are absent
-  from discovery and selection.
-- Budget and Permission checks remain before external Tool dispatch.
+- declarative complete-set MCP Apply;
+- refresh of the current desired set;
+- value-only Runtime description and convergence status;
+- Session value-selection updates;
+- Connector context retain/release ownership.
 
-## Persistence and ABI
+IsolationDomain, InstanceId, live handles, credentials, transport session
+state, and internal refcounts are not public or persisted.
 
-The AgentCore API is exactly ABI v1 Revision 7. C, Zig, Rust, manifests, and
-source-free consumers reject Revision 6 tables.
+The MCP checkpoint section writes `R7MCP` revision 2 and accepts exact
+`R6MCP` revision 1 or `R7MCP` revision 2 pairs. It persists value-only Session
+selection and permission identity. The outer AgentCore checkpoint remains
+Revision-7-only.
 
-The MCP value section writes `R7MCP` revision 2 and accepts only exact
-`R6MCP` revision 1 or `R7MCP` revision 2 pairs. Era values are append-only.
-No credentials, connections, capabilities, transport state, or live handles
-are persisted. The outer AgentCore checkpoint remains Revision-7-only.
+C, Zig, Rust, manifests, link probes, component fixtures, and source-free
+consumers are updated together and reject Revision 6 tables.
 
 ## Verification gates
 
-- per-era adapter parsing and canonical parity;
+- per-era adapter parsing, negotiation, and canonical parity;
 - deterministic probe/open/close/notify/release traces;
-- exact 2025-06 and AUTO 11-to-06 public Host connector tests;
-- no-tools and required-task zero-call negatives;
-- rejected schemas are undiscoverable and unselectable;
-- immutable generation and admitted Run stability;
-- R6MCP1 to R7MCP2 decoder migration tests;
-- strict C/Zig/Rust ABI and source-free consumers;
-- full AgentCore test, bundle, archive, diff, and scope gates.
+- exact 2025-06 and AUTO 11-to-06 public Connector tests;
+- Catalog generations contain no Client or transport pointers;
+- exact InstanceId dispatch, no ABA, and no old-catalog/new-instance drift;
+- add/change/remove/no-op complete-set Apply;
+- concurrent Apply serialization and reentrant callback rejection;
+- blue/green failure preserves last-known-good;
+- reapplying an unchanged set reconnects servers missing from the catalog;
+- schema changes invalidate grants while reconnects preserve identity;
+- configuration, diagnostics, logs, and checkpoints contain no secrets;
+- Runtime description is safe during Apply and exposes no internal IDs;
+- saving product configuration makes tools usable in the current application's
+  next Run without restart;
+- the duplicate product MCP protocol/client/registry lifecycle is removed;
+- strict C/Zig/Rust ABI, source-free consumers, bundle/archive/diff gates, and
+  full AgentCore and product component suites pass.
+
+Revision 7 freezes only after every gate above passes and the final architecture
+and implementation reviews converge.
+
+## Deferred supervisor capabilities
+
+The ownership boundaries above intentionally permit a later general-purpose
+MCP supervisor, but Revision 7 does not expose placeholders for unimplemented
+behavior. Interactive affinity, sampling/elicitation routing, dedicated
+credential principal/epoch identity, latest-wins coalescing, configurable
+drain deadlines, singleton stop-then-start, forced cancellation, rollback, and
+degraded generations require separate product needs, implementations, and ABI
+review before they become normative contracts.
