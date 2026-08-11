@@ -1,3 +1,4 @@
+pub const version = @import("version.zig");
 pub const core = @import("core.zig");
 pub const storage = @import("storage.zig");
 pub const schema = @import("schema.zig");
@@ -26,6 +27,7 @@ pub const NodeKind = core.NodeKind;
 pub const RelKind = core.RelKind;
 
 test {
+    _ = version;
     _ = core;
     _ = storage;
     _ = schema;

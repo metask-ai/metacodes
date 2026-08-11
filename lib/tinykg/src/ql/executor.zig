@@ -10,352 +10,23 @@ const text_mod = @import("../text.zig");
 const ast = @import("ast.zig");
 const optimizer = @import("optimizer.zig");
 const planner = @import("planner.zig");
+const execution_result_mod = @import("executor/execution_result.zig");
 
-pub const Binding = struct {
-    name: []u8,
-    node_id: core.NodeId,
-};
+const execution_result = execution_result_mod.ExecutionResult(
+    core,
+    index.QueryStats,
+    optimizer.PhysicalPlan,
+);
 
-pub const EdgeBinding = struct {
-    name: []u8,
-    edge_id: core.EdgeId,
-};
-
-pub const PathBinding = struct {
-    from_var: []u8,
-    to_var: []u8,
-    nodes: []core.NodeId,
-};
-
-pub const ScoreBinding = struct {
-    var_name: []u8,
-    score: f32,
-};
-
-pub const Row = struct {
-    bindings: std.ArrayList(Binding),
-    edge_bindings: std.ArrayList(EdgeBinding),
-    paths: std.ArrayList(PathBinding),
-    scores: std.ArrayList(ScoreBinding),
-
-    pub fn init() Row {
-        return .{ .bindings = .empty, .edge_bindings = .empty, .paths = .empty, .scores = .empty };
-    }
-
-    pub fn initBinding(allocator: std.mem.Allocator, name: []const u8, node_id: core.NodeId) !Row {
-        var row = Row.init();
-        errdefer row.deinit(allocator);
-        try row.bindings.ensureTotalCapacity(allocator, 1);
-        try row.appendBindingAssumeCapacity(allocator, name, node_id);
-        return row;
-    }
-
-    pub fn initBindingScore(allocator: std.mem.Allocator, name: []const u8, node_id: core.NodeId, score: f32) !Row {
-        var row = try Row.initBinding(allocator, name, node_id);
-        errdefer row.deinit(allocator);
-        try row.scores.ensureTotalCapacity(allocator, 1);
-        try row.appendScoreAssumeCapacity(allocator, name, score);
-        return row;
-    }
-
-    pub fn deinit(self: *Row, allocator: std.mem.Allocator) void {
-        for (self.scores.items) |score| allocator.free(score.var_name);
-        self.scores.deinit(allocator);
-        for (self.paths.items) |path| {
-            allocator.free(path.from_var);
-            allocator.free(path.to_var);
-            allocator.free(path.nodes);
-        }
-        self.paths.deinit(allocator);
-        for (self.edge_bindings.items) |binding| allocator.free(binding.name);
-        self.edge_bindings.deinit(allocator);
-        for (self.bindings.items) |binding| allocator.free(binding.name);
-        self.bindings.deinit(allocator);
-    }
-
-    pub fn get(self: Row, name: []const u8) ?core.NodeId {
-        for (self.bindings.items) |binding| {
-            if (std.mem.eql(u8, binding.name, name)) return binding.node_id;
-        }
-        return null;
-    }
-
-    pub fn getEdge(self: Row, name: []const u8) ?core.EdgeId {
-        for (self.edge_bindings.items) |binding| {
-            if (std.mem.eql(u8, binding.name, name)) return binding.edge_id;
-        }
-        return null;
-    }
-
-    fn getAt(self: Row, index_pos: ?usize, name: []const u8) ?core.NodeId {
-        if (index_pos) |pos| {
-            if (pos < self.bindings.items.len and std.mem.eql(u8, self.bindings.items[pos].name, name)) {
-                return self.bindings.items[pos].node_id;
-            }
-        }
-        return self.get(name);
-    }
-
-    pub fn put(self: *Row, allocator: std.mem.Allocator, name: []const u8, node_id: core.NodeId) !bool {
-        for (self.bindings.items) |*binding| {
-            if (std.mem.eql(u8, binding.name, name)) {
-                return binding.node_id.toInt() == node_id.toInt();
-            }
-        }
-        const owned_name = try allocator.dupe(u8, name);
-        errdefer allocator.free(owned_name);
-        try self.bindings.append(allocator, .{ .name = owned_name, .node_id = node_id });
-        return true;
-    }
-
-    pub fn putEdge(self: *Row, allocator: std.mem.Allocator, name: []const u8, edge_id: core.EdgeId) !bool {
-        for (self.edge_bindings.items) |*binding| {
-            if (std.mem.eql(u8, binding.name, name)) {
-                return binding.edge_id.toInt() == edge_id.toInt();
-            }
-        }
-        const owned_name = try allocator.dupe(u8, name);
-        errdefer allocator.free(owned_name);
-        try self.edge_bindings.append(allocator, .{ .name = owned_name, .edge_id = edge_id });
-        return true;
-    }
-
-    pub fn putPath(self: *Row, allocator: std.mem.Allocator, from_var: []const u8, to_var: []const u8, nodes: []const core.NodeId) !void {
-        for (self.paths.items) |*path| {
-            if (std.mem.eql(u8, path.from_var, from_var) and std.mem.eql(u8, path.to_var, to_var)) {
-                const owned_nodes = try allocator.dupe(core.NodeId, nodes);
-                errdefer allocator.free(owned_nodes);
-                allocator.free(path.nodes);
-                path.nodes = owned_nodes;
-                return;
-            }
-        }
-        const owned_from_var = try allocator.dupe(u8, from_var);
-        errdefer allocator.free(owned_from_var);
-        const owned_to_var = try allocator.dupe(u8, to_var);
-        errdefer allocator.free(owned_to_var);
-        const owned_nodes = try allocator.dupe(core.NodeId, nodes);
-        errdefer allocator.free(owned_nodes);
-        try self.paths.append(allocator, .{
-            .from_var = owned_from_var,
-            .to_var = owned_to_var,
-            .nodes = owned_nodes,
-        });
-    }
-
-    pub fn getPath(self: Row, from_var: []const u8, to_var: []const u8) ?[]const core.NodeId {
-        for (self.paths.items) |path| {
-            if (std.mem.eql(u8, path.from_var, from_var) and std.mem.eql(u8, path.to_var, to_var)) {
-                return path.nodes;
-            }
-        }
-        return null;
-    }
-
-    pub fn putScore(self: *Row, allocator: std.mem.Allocator, var_name: []const u8, score: f32) !void {
-        for (self.scores.items) |*binding| {
-            if (std.mem.eql(u8, binding.var_name, var_name)) {
-                binding.score = score;
-                return;
-            }
-        }
-        const owned_var_name = try allocator.dupe(u8, var_name);
-        errdefer allocator.free(owned_var_name);
-        try self.scores.append(allocator, .{ .var_name = owned_var_name, .score = score });
-    }
-
-    pub fn getScore(self: Row, var_name: []const u8) ?f32 {
-        for (self.scores.items) |binding| {
-            if (std.mem.eql(u8, binding.var_name, var_name)) return binding.score;
-        }
-        return null;
-    }
-
-    fn appendBindingAssumeCapacity(self: *Row, allocator: std.mem.Allocator, name: []const u8, node_id: core.NodeId) !void {
-        const owned_name = try allocator.dupe(u8, name);
-        errdefer allocator.free(owned_name);
-        self.bindings.appendAssumeCapacity(.{ .name = owned_name, .node_id = node_id });
-    }
-
-    fn appendClonedBindingAssumeCapacity(self: *Row, allocator: std.mem.Allocator, binding: Binding) !void {
-        try self.appendBindingAssumeCapacity(allocator, binding.name, binding.node_id);
-    }
-
-    fn appendEdgeBindingAssumeCapacity(self: *Row, allocator: std.mem.Allocator, name: []const u8, edge_id: core.EdgeId) !void {
-        const owned_name = try allocator.dupe(u8, name);
-        errdefer allocator.free(owned_name);
-        self.edge_bindings.appendAssumeCapacity(.{ .name = owned_name, .edge_id = edge_id });
-    }
-
-    fn appendClonedEdgeBindingAssumeCapacity(self: *Row, allocator: std.mem.Allocator, binding: EdgeBinding) !void {
-        try self.appendEdgeBindingAssumeCapacity(allocator, binding.name, binding.edge_id);
-    }
-
-    fn appendClonedPathAssumeCapacity(self: *Row, allocator: std.mem.Allocator, path: PathBinding) !void {
-        const owned_from_var = try allocator.dupe(u8, path.from_var);
-        errdefer allocator.free(owned_from_var);
-        const owned_to_var = try allocator.dupe(u8, path.to_var);
-        errdefer allocator.free(owned_to_var);
-        const owned_nodes = try allocator.dupe(core.NodeId, path.nodes);
-        errdefer allocator.free(owned_nodes);
-        self.paths.appendAssumeCapacity(.{
-            .from_var = owned_from_var,
-            .to_var = owned_to_var,
-            .nodes = owned_nodes,
-        });
-    }
-
-    fn appendScoreAssumeCapacity(self: *Row, allocator: std.mem.Allocator, var_name: []const u8, score: f32) !void {
-        const owned_var_name = try allocator.dupe(u8, var_name);
-        errdefer allocator.free(owned_var_name);
-        self.scores.appendAssumeCapacity(.{ .var_name = owned_var_name, .score = score });
-    }
-
-    fn appendClonedScoreAssumeCapacity(self: *Row, allocator: std.mem.Allocator, score: ScoreBinding) !void {
-        try self.appendScoreAssumeCapacity(allocator, score.var_name, score.score);
-    }
-
-    pub fn clone(self: Row, allocator: std.mem.Allocator) !Row {
-        return (try self.cloneWithOptionalBinding(allocator, null)).?;
-    }
-
-    pub fn cloneWithBinding(self: Row, allocator: std.mem.Allocator, name: []const u8, node_id: core.NodeId) !?Row {
-        return try self.cloneWithOptionalBinding(allocator, .{ .name = name, .node_id = node_id });
-    }
-
-    fn cloneAppendingBinding(self: Row, allocator: std.mem.Allocator, name: []const u8, node_id: core.NodeId, keep_scores: bool) !Row {
-        var out = Row.init();
-        errdefer out.deinit(allocator);
-        try out.bindings.ensureTotalCapacity(allocator, self.bindings.items.len + 1);
-        for (self.bindings.items) |binding| {
-            try out.appendClonedBindingAssumeCapacity(allocator, binding);
-        }
-        try out.appendBindingAssumeCapacity(allocator, name, node_id);
-        try out.edge_bindings.ensureTotalCapacity(allocator, self.edge_bindings.items.len);
-        for (self.edge_bindings.items) |binding| {
-            try out.appendClonedEdgeBindingAssumeCapacity(allocator, binding);
-        }
-        try out.paths.ensureTotalCapacity(allocator, self.paths.items.len);
-        for (self.paths.items) |path| {
-            try out.appendClonedPathAssumeCapacity(allocator, path);
-        }
-        if (keep_scores) {
-            try out.scores.ensureTotalCapacity(allocator, self.scores.items.len);
-            for (self.scores.items) |score| {
-                try out.appendClonedScoreAssumeCapacity(allocator, score);
-            }
-        }
-        return out;
-    }
-
-    const ExtraBinding = struct {
-        name: []const u8,
-        node_id: core.NodeId,
-    };
-
-    fn cloneWithOptionalBinding(self: Row, allocator: std.mem.Allocator, extra: ?ExtraBinding) !?Row {
-        return try self.cloneWithOptionalBindingAndScores(allocator, extra, true);
-    }
-
-    fn cloneWithOptionalBindingAndScores(self: Row, allocator: std.mem.Allocator, extra: ?ExtraBinding, keep_scores: bool) !?Row {
-        var append_extra = false;
-        if (extra) |binding| {
-            append_extra = true;
-            for (self.bindings.items) |existing| {
-                if (std.mem.eql(u8, existing.name, binding.name)) {
-                    if (existing.node_id.toInt() != binding.node_id.toInt()) return null;
-                    append_extra = false;
-                    break;
-                }
-            }
-        }
-
-        var out = Row.init();
-        errdefer out.deinit(allocator);
-        try out.bindings.ensureTotalCapacity(allocator, self.bindings.items.len + @intFromBool(append_extra));
-        for (self.bindings.items) |binding| {
-            try out.appendClonedBindingAssumeCapacity(allocator, binding);
-        }
-        if (append_extra) {
-            const binding = extra.?;
-            try out.appendBindingAssumeCapacity(allocator, binding.name, binding.node_id);
-        }
-        try out.edge_bindings.ensureTotalCapacity(allocator, self.edge_bindings.items.len);
-        for (self.edge_bindings.items) |binding| {
-            try out.appendClonedEdgeBindingAssumeCapacity(allocator, binding);
-        }
-        try out.paths.ensureTotalCapacity(allocator, self.paths.items.len);
-        for (self.paths.items) |path| {
-            try out.appendClonedPathAssumeCapacity(allocator, path);
-        }
-        if (keep_scores) {
-            try out.scores.ensureTotalCapacity(allocator, self.scores.items.len);
-            for (self.scores.items) |score| {
-                try out.appendClonedScoreAssumeCapacity(allocator, score);
-            }
-        }
-        return out;
-    }
-};
-
-pub const ResultTable = struct {
-    rows: std.ArrayList(Row),
-    stats: index.QueryStats = .{},
-    /// Persistent task leases are evaluated against one wall-clock snapshot
-    /// for the whole query, including CLI projection after execution.
-    read_timestamp_ns: ?u64 = null,
-
-    pub fn init() ResultTable {
-        return .{ .rows = .empty };
-    }
-
-    pub fn deinit(self: *ResultTable, allocator: std.mem.Allocator) void {
-        for (self.rows.items) |*row| row.deinit(allocator);
-        self.rows.deinit(allocator);
-    }
-};
-
-pub const OperatorTiming = struct {
-    op_index: usize,
-    op_name: []const u8,
-    elapsed_ns: u128,
-    input_rows: usize,
-    output_rows: usize,
-    nodes_visited_delta: usize,
-    edges_visited_delta: usize,
-    budget_exceeded: bool,
-};
-
-pub const OperatorTimingRecorder = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    entries: std.ArrayList(OperatorTiming) = .empty,
-
-    pub fn init(allocator: std.mem.Allocator, io: std.Io) OperatorTimingRecorder {
-        return .{ .allocator = allocator, .io = io };
-    }
-
-    pub fn deinit(self: *OperatorTimingRecorder) void {
-        self.entries.deinit(self.allocator);
-    }
-
-    pub fn clearRetainingCapacity(self: *OperatorTimingRecorder) void {
-        self.entries.clearRetainingCapacity();
-    }
-
-    pub fn ensureCapacityForPlan(self: *OperatorTimingRecorder, plan: optimizer.PhysicalPlan) !void {
-        try self.entries.ensureUnusedCapacity(self.allocator, plan.ops.items.len);
-    }
-
-    pub fn nowNs(self: OperatorTimingRecorder) u128 {
-        const timestamp = std.Io.Clock.awake.now(self.io).nanoseconds;
-        return if (timestamp < 0) 0 else @intCast(timestamp);
-    }
-
-    pub fn recordAssumeCapacity(self: *OperatorTimingRecorder, timing: OperatorTiming) void {
-        self.entries.appendAssumeCapacity(timing);
-    }
-};
+pub const Binding = execution_result.Binding;
+pub const EdgeBinding = execution_result.EdgeBinding;
+pub const PathBinding = execution_result.PathBinding;
+pub const ScoreBinding = execution_result.ScoreBinding;
+pub const Row = execution_result.Row;
+pub const ResultTable = execution_result.ResultTable;
+pub const OperatorTiming = execution_result.OperatorTiming;
+pub const OperatorTimingRecorder = execution_result.OperatorTimingRecorder;
+const execution_result_internal = execution_result.Internal;
 
 const NodeView = struct {
     id: core.NodeId,
@@ -1860,7 +1531,7 @@ fn executeWithCursorDeadline(
                     if (can_apply_result_limit) if (limit) |max| {
                         if (next.rows.items.len >= max) break;
                     };
-                    const left_id = row.getAt(left_binding_index, expand.left_var) orelse continue;
+                    const left_id = execution_result_internal.rowGetAt(row, left_binding_index, expand.left_var) orelse continue;
                     const limit_reached = try expandFromRow(allocator, node_cursor, edge_cursor, row, expand, left_id, &next, if (can_apply_result_limit) limit else null, budget, deadline, store_paths, right_var_absent, store_scores, edge_property_filter);
                     if (limit_reached) break;
                 }
@@ -2328,9 +1999,9 @@ fn expandEdgeCallback(ctx: *ExpandEdgeContext, edge: index.EdgeRef) !bool {
     if (!can_return_at_depth) return false;
     if (!node_matches) return false;
     var new_row = if (ctx.right_var_absent)
-        try ctx.row.cloneAppendingBinding(ctx.allocator, ctx.expand.right_var, next_id, ctx.store_scores)
+        try execution_result_internal.rowCloneAppendingBinding(ctx.row, ctx.allocator, ctx.expand.right_var, next_id, ctx.store_scores)
     else
-        (try ctx.row.cloneWithOptionalBindingAndScores(ctx.allocator, .{ .name = ctx.expand.right_var, .node_id = next_id }, ctx.store_scores)) orelse return false;
+        (try execution_result_internal.rowCloneWithBindingAndScores(ctx.row, ctx.allocator, ctx.expand.right_var, next_id, ctx.store_scores)) orelse return false;
     errdefer new_row.deinit(ctx.allocator);
     if (ctx.expand.edge_var) |edge_var| {
         if (!try new_row.putEdge(ctx.allocator, edge_var, edge.edge_id)) return false;
@@ -2365,43 +2036,6 @@ fn pathContains(nodes: []const core.NodeId, id: core.NodeId) bool {
         if (node.toInt() == id.toInt()) return true;
     }
     return false;
-}
-
-test "row clone preserves values with independent ownership" {
-    var row = Row.init();
-    defer row.deinit(std.testing.allocator);
-    try std.testing.expect(try row.put(std.testing.allocator, "a", .fromInt(1)));
-    try row.putPath(std.testing.allocator, "a", "b", &.{ .fromInt(1), .fromInt(2) });
-    try row.putScore(std.testing.allocator, "a", 1.25);
-
-    var cloned = try row.clone(std.testing.allocator);
-    defer cloned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(u64, 1), cloned.get("a").?.toInt());
-    try std.testing.expectEqual(@as(f32, 1.25), cloned.getScore("a").?);
-    const cloned_path = cloned.getPath("a", "b") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(usize, 2), cloned_path.len);
-    try std.testing.expectEqual(@as(u64, 2), cloned_path[1].toInt());
-
-    try std.testing.expect(try row.put(std.testing.allocator, "c", .fromInt(3)));
-    try row.putPath(std.testing.allocator, "a", "b", &.{ .fromInt(1), .fromInt(3) });
-    try row.putScore(std.testing.allocator, "a", 9.0);
-
-    try std.testing.expect(cloned.get("c") == null);
-    try std.testing.expectEqual(@as(f32, 1.25), cloned.getScore("a").?);
-    try std.testing.expectEqual(@as(u64, 2), cloned.getPath("a", "b").?[1].toInt());
-}
-
-test "row seed helpers create owned binding rows" {
-    var row = try Row.initBinding(std.testing.allocator, "n", .fromInt(99));
-    defer row.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 99), row.get("n").?.toInt());
-    try std.testing.expect(row.getScore("n") == null);
-
-    var scored = try Row.initBindingScore(std.testing.allocator, "hit", .fromInt(7), 3.5);
-    defer scored.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 7), scored.get("hit").?.toInt());
-    try std.testing.expectEqual(@as(f32, 3.5), scored.getScore("hit").?);
 }
 
 test "seed row reservation respects result limit remainder" {
@@ -2446,43 +2080,6 @@ test "expand row reservation is bounded by effective result limit" {
     try std.testing.expectEqual(before, table.rows.capacity);
 }
 
-test "row clone with binding preserves conflict semantics" {
-    var row = try Row.initBinding(std.testing.allocator, "a", .fromInt(1));
-    defer row.deinit(std.testing.allocator);
-    try row.putPath(std.testing.allocator, "a", "b", &.{ .fromInt(1), .fromInt(2) });
-
-    var appended = (try row.cloneWithBinding(std.testing.allocator, "b", .fromInt(2))).?;
-    defer appended.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 1), appended.get("a").?.toInt());
-    try std.testing.expectEqual(@as(u64, 2), appended.get("b").?.toInt());
-    try std.testing.expectEqual(@as(u64, 2), appended.getPath("a", "b").?[1].toInt());
-
-    var matching = (try row.cloneWithBinding(std.testing.allocator, "a", .fromInt(1))).?;
-    defer matching.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, row.bindings.items.len), matching.bindings.items.len);
-    try std.testing.expectEqual(@as(u64, 1), matching.get("a").?.toInt());
-
-    const conflict = try row.cloneWithBinding(std.testing.allocator, "a", .fromInt(9));
-    try std.testing.expect(conflict == null);
-}
-
-test "row clone appending binding skips conflict scan when caller proves absence" {
-    var row = try Row.initBindingScore(std.testing.allocator, "hit", .fromInt(1), 2.5);
-    defer row.deinit(std.testing.allocator);
-
-    var appended = try row.cloneAppendingBinding(std.testing.allocator, "next", .fromInt(2), true);
-    defer appended.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(u64, 1), appended.get("hit").?.toInt());
-    try std.testing.expectEqual(@as(u64, 2), appended.get("next").?.toInt());
-    try std.testing.expectEqual(@as(f32, 2.5), appended.getScore("hit").?);
-    try std.testing.expectEqual(@as(usize, 2), appended.bindings.items.len);
-
-    var without_score = try row.cloneAppendingBinding(std.testing.allocator, "next", .fromInt(2), false);
-    defer without_score.deinit(std.testing.allocator);
-    try std.testing.expect(without_score.getScore("hit") == null);
-}
-
 test "executor detects common binding slot for factorized expand input" {
     var first = try Row.initBinding(std.testing.allocator, "left", .fromInt(1));
     defer first.deinit(std.testing.allocator);
@@ -2493,7 +2090,7 @@ test "executor detects common binding slot for factorized expand input" {
 
     var rows = [_]Row{ first, second };
     try std.testing.expectEqual(@as(?usize, 0), commonBindingIndex(&rows, "left"));
-    try std.testing.expectEqual(@as(u64, 2), rows[1].getAt(commonBindingIndex(&rows, "left"), "left").?.toInt());
+    try std.testing.expectEqual(@as(u64, 2), execution_result_internal.rowGetAt(rows[1], commonBindingIndex(&rows, "left"), "left").?.toInt());
     try std.testing.expect(!anyRowHasBinding(&rows, "missing"));
 
     var mismatched = try Row.initBinding(std.testing.allocator, "other", .fromInt(3));
@@ -2501,7 +2098,7 @@ test "executor detects common binding slot for factorized expand input" {
     try std.testing.expect(try mismatched.put(std.testing.allocator, "left", .fromInt(4)));
     var mixed = [_]Row{ first, mismatched };
     try std.testing.expectEqual(@as(?usize, null), commonBindingIndex(&mixed, "left"));
-    try std.testing.expectEqual(@as(u64, 4), mixed[1].getAt(commonBindingIndex(&mixed, "left"), "left").?.toInt());
+    try std.testing.expectEqual(@as(u64, 4), execution_result_internal.rowGetAt(mixed[1], commonBindingIndex(&mixed, "left"), "left").?.toInt());
 }
 
 test "executor expands outgoing edge" {

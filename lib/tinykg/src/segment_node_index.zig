@@ -1,9 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const core = @import("core.zig");
+const format_mod = @import("segment_node_index/format.zig");
 const segment_catalog_summary = @import("segment_catalog_summary.zig");
 const segment_manifest = @import("segment_manifest.zig");
-const segment_executor = @import("ql/segment_executor.zig");
+const segment_node_catalog = @import("segment_node_catalog.zig");
 const read_only_memory_map = @import("read_only_memory_map.zig");
 
 pub const exact_texts_leaf = "segment_node_texts.idx";
@@ -17,10 +18,42 @@ const max_index_file_bytes: u64 = 256 * 1024 * 1024;
 const catalog_id_run_chunk_records: usize = 64 * 1024;
 const catalog_id_run_read_buffer_bytes: usize = 256 * 1024;
 
+const format = format_mod.SegmentNodeIndexFormat(core, @intCast(max_nodes), max_text_bytes);
+const IndexHeader = format.IndexHeader;
+const NodeByIdRecord = format.NodeByIdRecord;
+const ExactTextRecord = format.ExactTextRecord;
+const encodeIndexHeader = format.encodeIndexHeader;
+const decodeIndexHeader = format.decodeIndexHeader;
+const decodeNodeByIdIndexHeader = format.decodeNodeByIdIndexHeader;
+const decodeNodeByIdIndexHeaderWithCount = format.decodeNodeByIdIndexHeaderWithCount;
+const nodeByIdHeaderUsesDenseIds = format.nodeByIdHeaderUsesDenseIds;
+const nodeByIdHeaderUsesUniformKind = format.nodeByIdHeaderUsesUniformKind;
+const validateExactTextHeader = format.validateExactTextHeader;
+const exactTextHeaderUsesDenseOrdinals = format.exactTextHeaderUsesDenseOrdinals;
+const exactTextRecordLen = format.exactTextRecordLen;
+const encodeNodeByIdLogicalRecord = format.encodeNodeByIdLogicalRecord;
+const encodeSparseNodeByIdRecord = format.encodeSparseNodeByIdRecord;
+const encodeSparseUniformKindNodeByIdRecord = format.encodeSparseUniformKindNodeByIdRecord;
+const encodeDenseNodeByIdRecord = format.encodeDenseNodeByIdRecord;
+const encodeDenseUniformKindNodeByIdRecord = format.encodeDenseUniformKindNodeByIdRecord;
+const encodeNodeTextLenMinusOne = format.encodeNodeTextLenMinusOne;
+const encodeNodeTextOffset = format.encodeNodeTextOffset;
+const decodeNodeTextLen = format.decodeNodeTextLen;
+const decodeSparseNodeByIdRecord = format.decodeSparseNodeByIdRecord;
+const decodeNodeByIdRecord = format.decodeNodeByIdRecord;
+const decodeNodeByIdRecordAt = format.decodeNodeByIdRecordAt;
+const validateNodeByIdRecordDigest = format.validateNodeByIdRecordDigest;
+const encodeExactTextLogicalRecord = format.encodeExactTextLogicalRecord;
+const encodeDenseOrdinalExactTextRecord = format.encodeDenseOrdinalExactTextRecord;
+const decodeExactTextRecord = format.decodeExactTextRecord;
+const validateExactRecordDigest = format.validateExactRecordDigest;
+const recordOffset = format.recordOffset;
+const validNodeId = format.validNodeId;
+
 pub const OwnedCatalog = struct {
     texts: []u8,
-    exact_texts: []segment_executor.ExactTextEntry,
-    nodes_by_id: []segment_executor.NodeInfoEntry,
+    exact_texts: []segment_node_catalog.ExactTextEntry,
+    nodes_by_id: []segment_node_catalog.NodeInfoEntry,
 
     pub fn deinit(self: *OwnedCatalog, allocator: std.mem.Allocator) void {
         allocator.free(self.nodes_by_id);
@@ -28,7 +61,7 @@ pub const OwnedCatalog = struct {
         allocator.free(self.texts);
     }
 
-    pub fn catalog(self: OwnedCatalog) segment_executor.SegmentNodeCatalog {
+    pub fn catalog(self: OwnedCatalog) segment_node_catalog.SegmentNodeCatalog {
         return .{
             .exact_texts = self.exact_texts,
             .nodes_by_id = self.nodes_by_id,
@@ -171,7 +204,7 @@ pub const MappedCatalog = struct {
         return true;
     }
 
-    pub fn nodeInfo(self: *const MappedCatalog, id: core.NodeId) !?segment_executor.NodeInfoEntry {
+    pub fn nodeInfo(self: *const MappedCatalog, id: core.NodeId) !?segment_node_catalog.NodeInfoEntry {
         const index_pos = try self.lowerBoundNodeId(id);
         if (index_pos >= self.nodes_header.node_count) return null;
         const entry = try self.nodeByIdAt(index_pos);
@@ -408,45 +441,6 @@ const SliceBytesStream = struct {
     }
 };
 
-const IndexHeader = struct {
-    const version: u16 = 7;
-    const encoded_len: usize = 56;
-    const flag_uniform_kind: u16 = 1;
-
-    magic: [4]u8,
-    record_len: u16,
-    flags: u16 = 0,
-    uniform_kind: ?core.NodeKind = null,
-    node_count: u64,
-    texts_bytes: u64,
-    record_digest: u64,
-    texts_digest: u64,
-    id_base: u64 = 0,
-};
-
-const NodeByIdRecord = struct {
-    const magic = [_]u8{ 'T', 'K', 'N', 'I' };
-    const dense_uniform_kind_encoded_len: usize = 6;
-    const dense_encoded_len: usize = 8;
-    const sparse_uniform_kind_encoded_len: usize = 14;
-    const sparse_encoded_len: usize = 16;
-    const logical_encoded_len: usize = 24;
-
-    id: core.NodeId,
-    kind: core.NodeKind,
-    text_offset: u64,
-    text_len: u32,
-};
-
-const ExactTextRecord = struct {
-    const magic = [_]u8{ 'T', 'K', 'N', 'E' };
-    const dense_ordinal_encoded_len: usize = 4;
-    const id_encoded_len: usize = 8;
-    const logical_encoded_len: usize = id_encoded_len;
-
-    id: core.NodeId,
-};
-
 const ExactTextKey = struct {
     id: core.NodeId,
     kind: core.NodeKind,
@@ -457,7 +451,7 @@ pub fn writeCatalog(
     allocator: std.mem.Allocator,
     io: std.Io,
     dir_path: []const u8,
-    nodes: []const segment_executor.NodeInfoEntry,
+    nodes: []const segment_node_catalog.NodeInfoEntry,
 ) !void {
     if (nodes.len > max_nodes) return error.RecordTooLarge;
     try std.Io.Dir.cwd().createDirPath(io, dir_path);
@@ -606,7 +600,7 @@ pub fn openCatalog(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u
     const exact_texts = try readExactTexts(allocator, io, exact_path, texts, texts_digest, nodes_by_id);
     errdefer allocator.free(exact_texts);
 
-    const catalog = segment_executor.SegmentNodeCatalog{
+    const catalog = segment_node_catalog.SegmentNodeCatalog{
         .exact_texts = exact_texts,
         .nodes_by_id = nodes_by_id,
         .validated = true,
@@ -1428,11 +1422,11 @@ fn readNodesById(
     path: []const u8,
     texts: []u8,
     texts_digest: u64,
-) ![]segment_executor.NodeInfoEntry {
+) ![]segment_node_catalog.NodeInfoEntry {
     const bytes = try readRegularFile(allocator, io, path, max_index_file_bytes);
     defer allocator.free(bytes);
     const header = try decodeNodeByIdIndexHeader(bytes, texts.len, texts_digest);
-    const records = try allocator.alloc(segment_executor.NodeInfoEntry, @intCast(header.node_count));
+    const records = try allocator.alloc(segment_node_catalog.NodeInfoEntry, @intCast(header.node_count));
     errdefer allocator.free(records);
     try validateNodeByIdRecordDigest(bytes, header);
     for (records, 0..) |*out, index| {
@@ -1452,13 +1446,13 @@ fn readExactTexts(
     path: []const u8,
     texts: []u8,
     texts_digest: u64,
-    nodes_by_id: []const segment_executor.NodeInfoEntry,
-) ![]segment_executor.ExactTextEntry {
+    nodes_by_id: []const segment_node_catalog.NodeInfoEntry,
+) ![]segment_node_catalog.ExactTextEntry {
     const bytes = try readRegularFile(allocator, io, path, max_index_file_bytes);
     defer allocator.free(bytes);
     const header = try decodeIndexHeader(bytes, ExactTextRecord.magic, 0, texts.len, texts_digest);
     try validateExactTextHeaderFromEntries(header, nodes_by_id);
-    const records = try allocator.alloc(segment_executor.ExactTextEntry, @intCast(header.node_count));
+    const records = try allocator.alloc(segment_node_catalog.ExactTextEntry, @intCast(header.node_count));
     errdefer allocator.free(records);
     var digest = std.hash.Wyhash.init(0x544B_4E45);
     var logical_bytes: [ExactTextRecord.logical_encoded_len]u8 = undefined;
@@ -1481,159 +1475,7 @@ fn readExactTexts(
     return records;
 }
 
-fn encodeIndexHeader(header: IndexHeader, out: []u8) void {
-    @memcpy(out[0..4], &header.magic);
-    std.mem.writeInt(u16, out[4..6], IndexHeader.version, .little);
-    std.mem.writeInt(u16, out[6..8], IndexHeader.encoded_len, .little);
-    std.mem.writeInt(u16, out[8..10], header.record_len, .little);
-    const flags: u16 = if (header.uniform_kind != null) header.flags | IndexHeader.flag_uniform_kind else header.flags;
-    std.mem.writeInt(u16, out[10..12], flags, .little);
-    std.mem.writeInt(u16, out[12..14], if (header.uniform_kind) |kind| @intFromEnum(kind) else 0, .little);
-    @memset(out[14..16], 0);
-    std.mem.writeInt(u64, out[16..24], header.node_count, .little);
-    std.mem.writeInt(u64, out[24..32], header.texts_bytes, .little);
-    std.mem.writeInt(u64, out[32..40], header.record_digest, .little);
-    std.mem.writeInt(u64, out[40..48], header.texts_digest, .little);
-    std.mem.writeInt(u64, out[48..56], header.id_base, .little);
-}
-
-fn decodeIndexHeader(bytes: []const u8, magic: [4]u8, record_len: usize, texts_len: usize, texts_digest: u64) !IndexHeader {
-    if (bytes.len < IndexHeader.encoded_len) return error.InvalidRecord;
-    if (!std.mem.eql(u8, bytes[0..4], &magic)) return error.InvalidRecord;
-    if (std.mem.readInt(u16, bytes[4..6], .little) != IndexHeader.version) return error.InvalidRecord;
-    if (std.mem.readInt(u16, bytes[6..8], .little) != IndexHeader.encoded_len) return error.InvalidRecord;
-    const physical_record_len = std.mem.readInt(u16, bytes[8..10], .little);
-    if (record_len != 0 and physical_record_len != record_len) return error.InvalidRecord;
-    const flags = std.mem.readInt(u16, bytes[10..12], .little);
-    const uniform_kind_value = std.mem.readInt(u16, bytes[12..14], .little);
-    if (flags & IndexHeader.flag_uniform_kind == 0 and uniform_kind_value != 0) return error.InvalidRecord;
-    if (!allZero(bytes[14..16])) return error.InvalidRecord;
-    const node_count = std.mem.readInt(u64, bytes[16..24], .little);
-    if (node_count > max_nodes) return error.RecordTooLarge;
-    const texts_bytes = std.mem.readInt(u64, bytes[24..32], .little);
-    if (texts_bytes != texts_len) return error.InvalidRecord;
-    const payload_size = std.math.mul(usize, @intCast(node_count), physical_record_len) catch return error.RecordTooLarge;
-    const expected_size = std.math.add(usize, IndexHeader.encoded_len, payload_size) catch return error.RecordTooLarge;
-    if (bytes.len != expected_size) return error.InvalidRecord;
-    const header = IndexHeader{
-        .magic = magic,
-        .record_len = physical_record_len,
-        .flags = flags,
-        .uniform_kind = if (flags & IndexHeader.flag_uniform_kind != 0) kindFromInt(uniform_kind_value) orelse return error.InvalidRecord else null,
-        .node_count = node_count,
-        .texts_bytes = texts_bytes,
-        .record_digest = std.mem.readInt(u64, bytes[32..40], .little),
-        .texts_digest = std.mem.readInt(u64, bytes[40..48], .little),
-        .id_base = std.mem.readInt(u64, bytes[48..56], .little),
-    };
-    if (header.texts_digest != texts_digest) return error.InvalidRecord;
-    try validateIndexHeaderFlags(header);
-    return header;
-}
-
-fn decodeNodeByIdIndexHeader(bytes: []const u8, texts_len: usize, texts_digest: u64) !IndexHeader {
-    const header = try decodeIndexHeader(bytes, NodeByIdRecord.magic, 0, texts_len, texts_digest);
-    try validateNodeByIdHeaderRecordLen(header.record_len);
-    try validateNodeByIdHeaderLayout(header);
-    try validateNodeByIdDenseRange(header);
-    if (!nodeByIdHeaderUsesDenseIds(header) and header.id_base != 0) return error.InvalidRecord;
-    return header;
-}
-
-fn decodeNodeByIdIndexHeaderWithCount(bytes: []const u8, node_count: u64) !IndexHeader {
-    if (bytes.len < IndexHeader.encoded_len) return error.InvalidRecord;
-    if (!std.mem.eql(u8, bytes[0..4], &NodeByIdRecord.magic)) return error.InvalidRecord;
-    if (std.mem.readInt(u16, bytes[4..6], .little) != IndexHeader.version) return error.InvalidRecord;
-    if (std.mem.readInt(u16, bytes[6..8], .little) != IndexHeader.encoded_len) return error.InvalidRecord;
-    const record_len = std.mem.readInt(u16, bytes[8..10], .little);
-    try validateNodeByIdHeaderRecordLen(record_len);
-    const flags = std.mem.readInt(u16, bytes[10..12], .little);
-    const uniform_kind_value = std.mem.readInt(u16, bytes[12..14], .little);
-    if (flags & IndexHeader.flag_uniform_kind == 0 and uniform_kind_value != 0) return error.InvalidRecord;
-    if (!allZero(bytes[14..16])) return error.InvalidRecord;
-    const header = IndexHeader{
-        .magic = NodeByIdRecord.magic,
-        .record_len = record_len,
-        .flags = flags,
-        .uniform_kind = if (flags & IndexHeader.flag_uniform_kind != 0) kindFromInt(uniform_kind_value) orelse return error.InvalidRecord else null,
-        .node_count = std.mem.readInt(u64, bytes[16..24], .little),
-        .texts_bytes = std.mem.readInt(u64, bytes[24..32], .little),
-        .record_digest = std.mem.readInt(u64, bytes[32..40], .little),
-        .texts_digest = std.mem.readInt(u64, bytes[40..48], .little),
-        .id_base = std.mem.readInt(u64, bytes[48..56], .little),
-    };
-    try validateIndexHeaderFlags(header);
-    if (header.node_count != node_count) return error.InvalidRecord;
-    try validateNodeByIdHeaderLayout(header);
-    try validateNodeByIdDenseRange(header);
-    if (!nodeByIdHeaderUsesDenseIds(header) and header.id_base != 0) return error.InvalidRecord;
-    const payload_size = std.math.mul(usize, @intCast(header.node_count), header.record_len) catch return error.RecordTooLarge;
-    const expected_size = std.math.add(usize, IndexHeader.encoded_len, payload_size) catch return error.RecordTooLarge;
-    if (bytes.len != expected_size) return error.InvalidRecord;
-    return header;
-}
-
-fn validateNodeByIdHeaderRecordLen(record_len: u16) !void {
-    if (record_len != NodeByIdRecord.dense_uniform_kind_encoded_len and
-        record_len != NodeByIdRecord.dense_encoded_len and
-        record_len != NodeByIdRecord.sparse_uniform_kind_encoded_len and
-        record_len != NodeByIdRecord.sparse_encoded_len)
-    {
-        return error.InvalidRecord;
-    }
-}
-
-fn validateIndexHeaderFlags(header: IndexHeader) !void {
-    const known_flags = IndexHeader.flag_uniform_kind;
-    if (header.flags & ~known_flags != 0) return error.InvalidRecord;
-    if (header.uniform_kind == null and header.flags != 0) return error.InvalidRecord;
-    if (header.uniform_kind != null and header.flags != IndexHeader.flag_uniform_kind) return error.InvalidRecord;
-    if (header.uniform_kind != null and !std.mem.eql(u8, &header.magic, &NodeByIdRecord.magic)) return error.InvalidRecord;
-}
-
-fn validateNodeByIdHeaderLayout(header: IndexHeader) !void {
-    if (nodeByIdHeaderUsesUniformKind(header)) {
-        if (header.record_len != NodeByIdRecord.dense_uniform_kind_encoded_len and
-            header.record_len != NodeByIdRecord.sparse_uniform_kind_encoded_len)
-        {
-            return error.InvalidRecord;
-        }
-    } else if (header.record_len != NodeByIdRecord.dense_encoded_len and
-        header.record_len != NodeByIdRecord.sparse_encoded_len)
-    {
-        return error.InvalidRecord;
-    }
-}
-
-fn nodeByIdHeaderUsesDenseIds(header: IndexHeader) bool {
-    return header.record_len == NodeByIdRecord.dense_uniform_kind_encoded_len or header.record_len == NodeByIdRecord.dense_encoded_len;
-}
-
-fn nodeByIdHeaderUsesUniformKind(header: IndexHeader) bool {
-    return header.uniform_kind != null;
-}
-
-fn validateNodeByIdDenseRange(header: IndexHeader) !void {
-    if (!nodeByIdHeaderUsesDenseIds(header)) return;
-    if (header.node_count == 0) return error.InvalidRecord;
-    if (!validNodeId(core.NodeId.fromInt(header.id_base))) return error.InvalidRecord;
-    const last_offset = header.node_count - 1;
-    const last_id = std.math.add(u64, header.id_base, last_offset) catch return error.InvalidRecord;
-    if (!validNodeId(core.NodeId.fromInt(last_id))) return error.InvalidRecord;
-}
-
-fn validateExactTextHeader(header: IndexHeader, nodes_header: IndexHeader) !void {
-    if (header.record_len != ExactTextRecord.dense_ordinal_encoded_len and header.record_len != ExactTextRecord.id_encoded_len) return error.InvalidRecord;
-    if (exactTextHeaderUsesDenseOrdinals(header)) {
-        if (!nodeByIdHeaderUsesDenseIds(nodes_header)) return error.InvalidRecord;
-        if (header.id_base != nodes_header.id_base) return error.InvalidRecord;
-        if (!validNodeId(core.NodeId.fromInt(header.id_base))) return error.InvalidRecord;
-    } else if (header.id_base != 0) {
-        return error.InvalidRecord;
-    }
-}
-
-fn validateExactTextHeaderFromEntries(header: IndexHeader, nodes_by_id: []const segment_executor.NodeInfoEntry) !void {
+fn validateExactTextHeaderFromEntries(header: IndexHeader, nodes_by_id: []const segment_node_catalog.NodeInfoEntry) !void {
     if (header.record_len != ExactTextRecord.dense_ordinal_encoded_len and header.record_len != ExactTextRecord.id_encoded_len) return error.InvalidRecord;
     if (exactTextHeaderUsesDenseOrdinals(header)) {
         const id_base = nodeInfoEntriesDenseIdBase(nodes_by_id) orelse return error.InvalidRecord;
@@ -1643,7 +1485,7 @@ fn validateExactTextHeaderFromEntries(header: IndexHeader, nodes_by_id: []const 
     }
 }
 
-fn nodeInfoEntriesDenseIdBase(entries: []const segment_executor.NodeInfoEntry) ?u64 {
+fn nodeInfoEntriesDenseIdBase(entries: []const segment_node_catalog.NodeInfoEntry) ?u64 {
     if (entries.len == 0) return null;
     const id_base = entries[0].id.toInt();
     if (!validNodeId(entries[0].id)) return null;
@@ -1653,148 +1495,7 @@ fn nodeInfoEntriesDenseIdBase(entries: []const segment_executor.NodeInfoEntry) ?
     }
     return id_base;
 }
-
-fn exactTextHeaderUsesDenseOrdinals(header: IndexHeader) bool {
-    return header.record_len == ExactTextRecord.dense_ordinal_encoded_len;
-}
-
-fn exactTextRecordLen(node_id_base: u64) u16 {
-    return if (node_id_base != 0) ExactTextRecord.dense_ordinal_encoded_len else ExactTextRecord.id_encoded_len;
-}
-
-fn encodeNodeByIdLogicalRecord(record: NodeByIdRecord, out: *[NodeByIdRecord.logical_encoded_len]u8) void {
-    std.mem.writeInt(u64, out[0..8], record.id.toInt(), .little);
-    std.mem.writeInt(u16, out[8..10], @intFromEnum(record.kind), .little);
-    @memset(out[10..12], 0);
-    std.mem.writeInt(u32, out[12..16], record.text_len, .little);
-    std.mem.writeInt(u64, out[16..24], record.text_offset, .little);
-}
-
-fn encodeSparseNodeByIdRecord(record: NodeByIdRecord, out: *[NodeByIdRecord.sparse_encoded_len]u8) !void {
-    std.mem.writeInt(u64, out[0..8], record.id.toInt(), .little);
-    std.mem.writeInt(u16, out[8..10], @intFromEnum(record.kind), .little);
-    std.mem.writeInt(u16, out[10..12], try encodeNodeTextLenMinusOne(record.text_len), .little);
-    std.mem.writeInt(u32, out[12..16], try encodeNodeTextOffset(record.text_offset), .little);
-}
-
-fn encodeSparseUniformKindNodeByIdRecord(record: NodeByIdRecord, out: *[NodeByIdRecord.sparse_uniform_kind_encoded_len]u8) !void {
-    std.mem.writeInt(u64, out[0..8], record.id.toInt(), .little);
-    std.mem.writeInt(u16, out[8..10], try encodeNodeTextLenMinusOne(record.text_len), .little);
-    std.mem.writeInt(u32, out[10..14], try encodeNodeTextOffset(record.text_offset), .little);
-}
-
-fn encodeDenseNodeByIdRecord(record: NodeByIdRecord, out: *[NodeByIdRecord.dense_encoded_len]u8) !void {
-    std.mem.writeInt(u16, out[0..2], @intFromEnum(record.kind), .little);
-    std.mem.writeInt(u16, out[2..4], try encodeNodeTextLenMinusOne(record.text_len), .little);
-    std.mem.writeInt(u32, out[4..8], try encodeNodeTextOffset(record.text_offset), .little);
-}
-
-fn encodeDenseUniformKindNodeByIdRecord(record: NodeByIdRecord, out: *[NodeByIdRecord.dense_uniform_kind_encoded_len]u8) !void {
-    std.mem.writeInt(u16, out[0..2], try encodeNodeTextLenMinusOne(record.text_len), .little);
-    std.mem.writeInt(u32, out[2..6], try encodeNodeTextOffset(record.text_offset), .little);
-}
-
-fn encodeNodeTextLenMinusOne(text_len: u32) !u16 {
-    if (text_len == 0 or text_len > max_text_bytes) return error.InvalidRecord;
-    return @intCast(text_len - 1);
-}
-
-fn encodeNodeTextOffset(text_offset: u64) !u32 {
-    return std.math.cast(u32, text_offset) orelse error.RecordTooLarge;
-}
-
-fn decodeNodeTextLen(encoded: u16) u32 {
-    return @as(u32, encoded) + 1;
-}
-
-fn decodeSparseNodeByIdRecord(bytes: []const u8) !NodeByIdRecord {
-    if (bytes.len != NodeByIdRecord.sparse_encoded_len) return error.InvalidRecord;
-    return .{
-        .id = core.NodeId.fromInt(std.mem.readInt(u64, bytes[0..8], .little)),
-        .kind = kindFromInt(std.mem.readInt(u16, bytes[8..10], .little)) orelse return error.InvalidRecord,
-        .text_len = decodeNodeTextLen(std.mem.readInt(u16, bytes[10..12], .little)),
-        .text_offset = std.mem.readInt(u32, bytes[12..16], .little),
-    };
-}
-
-fn decodeNodeByIdRecord(bytes: []const u8, header: IndexHeader, index: u64) !NodeByIdRecord {
-    if (nodeByIdHeaderUsesDenseIds(header)) {
-        if (nodeByIdHeaderUsesUniformKind(header)) {
-            if (bytes.len != NodeByIdRecord.dense_uniform_kind_encoded_len) return error.InvalidRecord;
-            const id = std.math.add(u64, header.id_base, index) catch return error.InvalidRecord;
-            return .{
-                .id = core.NodeId.fromInt(id),
-                .kind = header.uniform_kind orelse return error.InvalidRecord,
-                .text_len = decodeNodeTextLen(std.mem.readInt(u16, bytes[0..2], .little)),
-                .text_offset = std.mem.readInt(u32, bytes[2..6], .little),
-            };
-        }
-        if (bytes.len != NodeByIdRecord.dense_encoded_len) return error.InvalidRecord;
-        const id = std.math.add(u64, header.id_base, index) catch return error.InvalidRecord;
-        return .{
-            .id = core.NodeId.fromInt(id),
-            .kind = kindFromInt(std.mem.readInt(u16, bytes[0..2], .little)) orelse return error.InvalidRecord,
-            .text_len = decodeNodeTextLen(std.mem.readInt(u16, bytes[2..4], .little)),
-            .text_offset = std.mem.readInt(u32, bytes[4..8], .little),
-        };
-    }
-    if (nodeByIdHeaderUsesUniformKind(header)) {
-        if (bytes.len != NodeByIdRecord.sparse_uniform_kind_encoded_len) return error.InvalidRecord;
-        return .{
-            .id = core.NodeId.fromInt(std.mem.readInt(u64, bytes[0..8], .little)),
-            .kind = header.uniform_kind orelse return error.InvalidRecord,
-            .text_len = decodeNodeTextLen(std.mem.readInt(u16, bytes[8..10], .little)),
-            .text_offset = std.mem.readInt(u32, bytes[10..14], .little),
-        };
-    }
-    return try decodeSparseNodeByIdRecord(bytes);
-}
-
-fn decodeNodeByIdRecordAt(bytes: []const u8, header: IndexHeader, index: u64) !NodeByIdRecord {
-    if (index >= header.node_count) return error.InvalidRecord;
-    const offset = try recordOffset(index, header.record_len);
-    const record_len: usize = header.record_len;
-    return try decodeNodeByIdRecord(bytes[offset..][0..record_len], header, index);
-}
-
-fn validateNodeByIdRecordDigest(bytes: []const u8, header: IndexHeader) !void {
-    var digest = std.hash.Wyhash.init(0x544B_4E49);
-    var logical_bytes: [NodeByIdRecord.logical_encoded_len]u8 = undefined;
-    var index: u64 = 0;
-    while (index < header.node_count) : (index += 1) {
-        const record = try decodeNodeByIdRecordAt(bytes, header, index);
-        encodeNodeByIdLogicalRecord(record, &logical_bytes);
-        digest.update(&logical_bytes);
-    }
-    if (digest.final() != header.record_digest) return error.InvalidRecord;
-}
-
-fn encodeExactTextLogicalRecord(record: ExactTextRecord, out: *[ExactTextRecord.logical_encoded_len]u8) void {
-    std.mem.writeInt(u64, out[0..8], record.id.toInt(), .little);
-}
-
-fn encodeDenseOrdinalExactTextRecord(record: ExactTextRecord, id_base: u64, out: *[ExactTextRecord.dense_ordinal_encoded_len]u8) !void {
-    const id = record.id.toInt();
-    if (id < id_base) return error.InvalidRecord;
-    const ordinal = id - id_base;
-    if (ordinal > std.math.maxInt(u32)) return error.RecordTooLarge;
-    std.mem.writeInt(u32, out[0..4], @intCast(ordinal), .little);
-}
-
-fn decodeExactTextRecord(bytes: []const u8, header: IndexHeader) !ExactTextRecord {
-    if (exactTextHeaderUsesDenseOrdinals(header)) {
-        if (bytes.len != ExactTextRecord.dense_ordinal_encoded_len) return error.InvalidRecord;
-        const ordinal = std.mem.readInt(u32, bytes[0..4], .little);
-        const id = std.math.add(u64, header.id_base, ordinal) catch return error.InvalidRecord;
-        return .{ .id = core.NodeId.fromInt(id) };
-    }
-    if (bytes.len != ExactTextRecord.id_encoded_len) return error.InvalidRecord;
-    return .{
-        .id = core.NodeId.fromInt(std.mem.readInt(u64, bytes[0..8], .little)),
-    };
-}
-
-fn validateNode(node: segment_executor.NodeInfoEntry) !void {
+fn validateNode(node: segment_node_catalog.NodeInfoEntry) !void {
     if (node.id == .none or node.id.toInt() == std.math.maxInt(u64)) return core.Error.InvalidId;
     if (node.text.len == 0 or node.text.len > max_text_bytes) return error.InvalidRecord;
     if (std.mem.indexOfScalar(u8, node.text, 0) != null) return error.InvalidRecord;
@@ -1822,14 +1523,14 @@ fn nameBytesSlice(texts: []const u8, offset: u64, len: u32) ![]const u8 {
     return text;
 }
 
-fn validateCatalogCrossLinks(catalog: segment_executor.SegmentNodeCatalog) !void {
+fn validateCatalogCrossLinks(catalog: segment_node_catalog.SegmentNodeCatalog) !void {
     for (catalog.exact_texts) |entry| {
         const matches = (try catalog.matchNode(entry.id, entry.kind, entry.text)) orelse return error.InvalidRecord;
         if (!matches) return error.InvalidRecord;
     }
 }
 
-fn nodeInfoById(entries: []const segment_executor.NodeInfoEntry, id: core.NodeId) ?segment_executor.NodeInfoEntry {
+fn nodeInfoById(entries: []const segment_node_catalog.NodeInfoEntry, id: core.NodeId) ?segment_node_catalog.NodeInfoEntry {
     var low: usize = 0;
     var high = entries.len;
     const target = id.toInt();
@@ -1843,29 +1544,6 @@ fn nodeInfoById(entries: []const segment_executor.NodeInfoEntry, id: core.NodeId
     }
     if (low >= entries.len or entries[low].id != id) return null;
     return entries[low];
-}
-
-fn validateExactRecordDigest(bytes: []const u8, header: IndexHeader) !void {
-    var digest = std.hash.Wyhash.init(0x544B_4E45);
-    var logical_bytes: [ExactTextRecord.logical_encoded_len]u8 = undefined;
-    var index: u64 = 0;
-    while (index < header.node_count) : (index += 1) {
-        const offset = try recordOffset(index, header.record_len);
-        const record_len: usize = header.record_len;
-        const record = try decodeExactTextRecord(bytes[offset..][0..record_len], header);
-        encodeExactTextLogicalRecord(record, &logical_bytes);
-        digest.update(&logical_bytes);
-    }
-    if (digest.final() != header.record_digest) return error.InvalidRecord;
-}
-
-fn recordOffset(index: u64, record_len: usize) !u64 {
-    const payload_offset = std.math.mul(u64, index, record_len) catch return error.RecordTooLarge;
-    return std.math.add(u64, IndexHeader.encoded_len, payload_offset) catch return error.RecordTooLarge;
-}
-
-fn validNodeId(id: core.NodeId) bool {
-    return id != .none and id.toInt() != std.math.maxInt(u64);
 }
 
 fn compareExactTextRecordKeys(left: ExactTextKey, right: ExactTextKey) std.math.Order {
@@ -1939,20 +1617,6 @@ fn renameReplace(io: std.Io, tmp_path: []const u8, final_path: []const u8) !void
     }
 }
 
-fn kindFromInt(value: u16) ?core.NodeKind {
-    inline for (@typeInfo(core.NodeKind).@"enum".fields) |field| {
-        if (field.value == value) return @enumFromInt(value);
-    }
-    return null;
-}
-
-fn allZero(bytes: []const u8) bool {
-    for (bytes) |byte| {
-        if (byte != 0) return false;
-    }
-    return true;
-}
-
 const CatalogRecordStream = struct {
     records: []const CatalogRecord,
     pos: usize = 0,
@@ -1969,9 +1633,7 @@ const CatalogRecordStream = struct {
     }
 };
 
-test "segment node index writes durable catalog and drives one-hop segment executor" {
-    const optimizer = @import("ql/optimizer.zig");
-
+test "segment node index writes and reopens durable catalog through manifest entry" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1980,7 +1642,7 @@ test "segment node index writes durable catalog and drives one-hop segment execu
     const dir_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "segment" });
     defer std.testing.allocator.free(dir_path);
 
-    const nodes = [_]segment_executor.NodeInfoEntry{
+    const nodes = [_]segment_node_catalog.NodeInfoEntry{
         .{ .id = .fromInt(3), .kind = .document, .text = "README" },
         .{ .id = .fromInt(1), .kind = .file, .text = "src/main.zig" },
         .{ .id = .fromInt(2), .kind = .function, .text = "main" },
@@ -2025,12 +1687,6 @@ test "segment node index writes durable catalog and drives one-hop segment execu
     wrong_summary.node_count += 1;
     try std.testing.expectError(error.InvalidRecord, MappedCatalog.openTrusted(std.testing.io, dir_path, wrong_summary));
 
-    const edges = [_]@import("segment.zig").EdgeRecord{
-        .{ .edge_id = .fromInt(1), .src = .fromInt(1), .rel = .defines, .dst = .fromInt(2) },
-    };
-    var segment = try @import("segment.zig").ImmutableAdjacencySegment.build(std.testing.allocator, std.testing.io, dir_path, &edges);
-    defer segment.deinit();
-
     const manifest_dir = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "manifest" });
     defer std.testing.allocator.free(manifest_dir);
     var manifest_store = try segment_manifest.Store.init(std.testing.allocator, std.testing.io, manifest_dir);
@@ -2056,47 +1712,9 @@ test "segment node index writes durable catalog and drives one-hop segment execu
         snapshot.entries.items[0].asEntry(),
     );
     defer manifest_trusted_catalog.deinit();
-
-    var ops = std.ArrayList(optimizer.PhysicalOp).empty;
-    defer ops.deinit(std.testing.allocator);
-    try ops.append(std.testing.allocator, .{ .node_lookup_by_text = .{ .var_name = "f", .kind = .file, .text = "src/main.zig" } });
-    try ops.append(std.testing.allocator, .{ .expand = .{
-        .left_var = "f",
-        .rel = .defines,
-        .right_var = "s",
-        .right_kind = .function,
-    } });
-    try ops.append(std.testing.allocator, .{ .project = &.{} });
-
-    var table = try segment_executor.executeExactTextPath(
-        std.testing.allocator,
-        .{ .catalog = catalog.catalog(), .segment = &segment },
-        .{ .ops = ops },
-        .{},
-    );
-    defer table.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), table.rows.items.len);
-    try std.testing.expectEqual(@as(u64, 2), table.rows.items[0].get("s").?.toInt());
-
-    var mapped_table = try segment_executor.executeExactTextPathWithCatalog(
-        std.testing.allocator,
-        .{ .catalog = &mapped_catalog, .segment = &segment },
-        .{ .ops = ops },
-        .{},
-    );
-    defer mapped_table.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), mapped_table.rows.items.len);
-    try std.testing.expectEqual(@as(u64, 2), mapped_table.rows.items[0].get("s").?.toInt());
-
-    var manifest_trusted_table = try segment_executor.executeExactTextPathWithCatalog(
-        std.testing.allocator,
-        .{ .catalog = &manifest_trusted_catalog, .segment = &segment },
-        .{ .ops = ops },
-        .{},
-    );
-    defer manifest_trusted_table.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), manifest_trusted_table.rows.items.len);
-    try std.testing.expectEqual(@as(u64, 2), manifest_trusted_table.rows.items[0].get("s").?.toInt());
+    var manifest_ids = try manifest_trusted_catalog.lookupExact(std.testing.allocator, .file, "src/main.zig", 8);
+    defer manifest_ids.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(core.NodeId, &.{.fromInt(1)}, manifest_ids.items);
 }
 
 test "segment node index derives dense by-id records from header base and ordinal" {
@@ -2108,7 +1726,7 @@ test "segment node index derives dense by-id records from header base and ordina
     const dir_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "segment" });
     defer std.testing.allocator.free(dir_path);
 
-    const nodes = [_]segment_executor.NodeInfoEntry{
+    const nodes = [_]segment_node_catalog.NodeInfoEntry{
         .{ .id = .fromInt(41), .kind = .file, .text = "a.zig" },
         .{ .id = .fromInt(40), .kind = .document, .text = "README" },
         .{ .id = .fromInt(42), .kind = .function, .text = "main" },
@@ -2150,7 +1768,7 @@ test "segment node index derives uniform-kind dense by-id records from header ki
     const dir_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "segment" });
     defer std.testing.allocator.free(dir_path);
 
-    const nodes = [_]segment_executor.NodeInfoEntry{
+    const nodes = [_]segment_node_catalog.NodeInfoEntry{
         .{ .id = .fromInt(40), .kind = .file, .text = "a.zig" },
         .{ .id = .fromInt(41), .kind = .file, .text = "b.zig" },
         .{ .id = .fromInt(42), .kind = .file, .text = "c.zig" },
@@ -2192,7 +1810,7 @@ test "segment node index keeps sparse by-id records when ids are not ordinal den
     const dir_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "segment" });
     defer std.testing.allocator.free(dir_path);
 
-    const nodes = [_]segment_executor.NodeInfoEntry{
+    const nodes = [_]segment_node_catalog.NodeInfoEntry{
         .{ .id = .fromInt(10), .kind = .file, .text = "a.zig" },
         .{ .id = .fromInt(30), .kind = .function, .text = "main" },
     };
@@ -2226,7 +1844,7 @@ test "segment node index derives uniform-kind sparse by-id records from header k
     const dir_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "segment" });
     defer std.testing.allocator.free(dir_path);
 
-    const nodes = [_]segment_executor.NodeInfoEntry{
+    const nodes = [_]segment_node_catalog.NodeInfoEntry{
         .{ .id = .fromInt(10), .kind = .file, .text = "a.zig" },
         .{ .id = .fromInt(30), .kind = .file, .text = "main.zig" },
     };
@@ -2260,7 +1878,7 @@ test "segment node index compact text span encoding preserves max text length" {
     defer std.testing.allocator.free(text);
     @memset(text, 'x');
 
-    const nodes = [_]segment_executor.NodeInfoEntry{
+    const nodes = [_]segment_node_catalog.NodeInfoEntry{
         .{ .id = .fromInt(1), .kind = .document, .text = text },
     };
     try writeCatalog(std.testing.allocator, std.testing.io, dir_path, &nodes);
@@ -2422,7 +2040,7 @@ test "segment node catalog single chunk validates exact ids without temp run" {
     defer std.testing.allocator.free(stale_run_dir);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, stale_run_dir);
 
-    const nodes = [_]segment_executor.NodeInfoEntry{
+    const nodes = [_]segment_node_catalog.NodeInfoEntry{
         .{ .id = core.NodeId.fromInt(3), .kind = .function, .text = "gamma" },
         .{ .id = core.NodeId.fromInt(1), .kind = .file, .text = "alpha" },
         .{ .id = core.NodeId.fromInt(2), .kind = .symbol, .text = "beta" },
@@ -2509,7 +2127,7 @@ test "segment node index rejects corrupted exact-text digest" {
     const dir_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "segment" });
     defer std.testing.allocator.free(dir_path);
 
-    const nodes = [_]segment_executor.NodeInfoEntry{
+    const nodes = [_]segment_node_catalog.NodeInfoEntry{
         .{ .id = .fromInt(1), .kind = .file, .text = "src/main.zig" },
     };
     try writeCatalog(std.testing.allocator, std.testing.io, dir_path, &nodes);
@@ -2539,7 +2157,7 @@ test "segment node index trusted lookup rejects exact-text id without node cross
     const dir_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "segment" });
     defer std.testing.allocator.free(dir_path);
 
-    const nodes = [_]segment_executor.NodeInfoEntry{
+    const nodes = [_]segment_node_catalog.NodeInfoEntry{
         .{ .id = .fromInt(1), .kind = .file, .text = "src/main.zig" },
     };
     try writeCatalog(std.testing.allocator, std.testing.io, dir_path, &nodes);
@@ -2573,7 +2191,7 @@ test "segment node index rejects texts payload corruption through header digest"
     const dir_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "segment" });
     defer std.testing.allocator.free(dir_path);
 
-    const nodes = [_]segment_executor.NodeInfoEntry{
+    const nodes = [_]segment_node_catalog.NodeInfoEntry{
         .{ .id = .fromInt(1), .kind = .file, .text = "src/main.zig" },
         .{ .id = .fromInt(2), .kind = .function, .text = "main" },
     };

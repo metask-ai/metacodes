@@ -1,5 +1,5 @@
 vendored from: https://github.com/shuzuan-org/tinykg.git
-commit: 93d89bcd4d0208c994da3632fb6166efffcc86e7
+commit: 5505b06b8eab8eb0612abf80d2044141dd66ba44
 note: 源码快照(非 submodule)。更新用 scripts/vendor-deps.sh。
 storage_format_version: 2  # 变更须同步 src/kg/client.zig EXPECTED_STORAGE_FORMAT_VERSION
 schema_version: 3  # 变更须同步 src/kg/client.zig EXPECTED_SCHEMA_VERSION

@@ -1,6 +1,6 @@
 const std = @import("std");
 const core = @import("core.zig");
-const dag = @import("dag.zig");
+const in_memory_dag = @import("dag/in_memory.zig");
 const graph_mod = @import("graph.zig");
 const index = @import("index.zig");
 
@@ -42,7 +42,7 @@ pub const GraphSnapshot = struct {
     }
 
     pub fn addEdgeChecked(self: *GraphSnapshot, src: core.NodeId, rel: core.RelKind, dst: core.NodeId, budget: core.QueryBudget) !core.EdgeId {
-        if (try dag.wouldCreateCycleWithIndex(&self.graph, &self.index, src, dst, rel, budget)) {
+        if (try in_memory_dag.wouldCreateCycleWithIndex(&self.graph, &self.index, src, dst, rel, budget)) {
             return core.Error.CycleDetected;
         }
         const id = try self.graph.addEdgeUnchecked(src, rel, dst);

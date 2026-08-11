@@ -98,6 +98,15 @@ pub const RelKind = enum(u16) {
     _,
 };
 
+/// Fixed engine-native relations used by the agent-memory control plane.
+/// Application schemas may add domain relations, but a canonical agent profile
+/// must register every entry here with the same numeric identity.
+pub const native_agent_relation_kinds = [_]RelKind{
+    .related_to,
+    .deprecated_by,
+    .merged_into,
+};
+
 pub fn parseNodeKind(value: []const u8) ?NodeKind {
     inline for (@typeInfo(NodeKind).@"enum".fields) |field| {
         if (std.ascii.eqlIgnoreCase(value, field.name)) {

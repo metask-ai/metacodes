@@ -5,367 +5,610 @@ const graph_mod = @import("graph.zig");
 const schema = @import("schema.zig");
 const storage_mod = @import("storage.zig");
 const read_only_memory_map = @import("read_only_memory_map.zig");
-
-const default_max_token_bytes: usize = 128;
-/// A stale persistent catalog may be searched through an ephemeral, read-only
-/// index only while the whole-store scan remains predictably bounded. Larger
-/// stores must run explicit maintenance; silently materializing GBs of BM25
-/// state on every query is worse than reporting the stale index.
-pub const stale_store_scan_max_nodes: u64 = 100_000;
-pub const stale_store_scan_max_text_bytes: u64 = 128 * 1024 * 1024;
-pub const stale_store_scan_max_event_bytes: u64 = 64 * 1024 * 1024;
-pub const stale_store_scan_max_property_delta_bytes: u64 = 64 * 1024 * 1024;
-var text_temp_nonce: std.atomic.Value(u64) = .init(0);
-
-fn currentProcessIdForTempPath() u64 {
-    return switch (builtin.os.tag) {
-        .windows => 1,
-        .linux => @intCast(std.os.linux.getpid()),
-        else => if (builtin.link_libc) @intCast(std.c.getpid()) else 1,
-    };
-}
-
-comptime {
-    if (default_max_token_bytes > std.math.maxInt(u8)) {
-        @compileError("persistent TextTermEntry.term_len is one byte; raise the text format before increasing default_max_token_bytes");
-    }
-}
-
-pub const TokenizerOptions = struct {
-    max_token_bytes: usize = default_max_token_bytes,
-    emit_original_compound: bool = true,
-    emit_cjk_bigrams: bool = true,
-    emit_cjk_unigrams: bool = true,
+const tokenizer_mod = @import("text/tokenizer.zig");
+const catalog_format_mod = @import("text/catalog_format.zig");
+const scoring_mod = @import("text/scoring.zig");
+const search_contract_mod = @import("text/search_contract.zig");
+const posting_format_mod = @import("text/posting_format.zig");
+const term_format_mod = @import("text/term_format.zig");
+const search_acceleration_format_mod = @import("text/search_acceleration_format.zig");
+const rebuild_runtime_mod = @import("text/rebuild_runtime.zig");
+const rebuild_session_mod = @import("text/rebuild_session.zig");
+const streaming_run_catalog_publication_mod = @import("text/streaming_run_catalog_publication.zig");
+const query_execution_mod = @import("text/query_execution.zig");
+const persistent_query_execution_hot_path_mod = @import("text/persistent_query_execution_hot_path.zig");
+const document_catalog_stream_writer_mod = @import("text/document_catalog_stream_writer.zig");
+const term_posting_catalog_publication_mod = @import("text/term_posting_catalog_publication.zig");
+const persistent_catalog_validation_mod = @import("text/persistent_catalog_validation.zig");
+const searchable_document_mod = @import("text/searchable_document.zig");
+const in_memory_index_mod = @import("text/in_memory_index.zig");
+const posting_run_builder_mod = @import("text/posting_run_builder.zig");
+const posting_run_codec_merge_mod = @import("text/posting_run_codec_merge.zig");
+const catalog_format = catalog_format_mod.CatalogFormat(core);
+const search_contract = search_contract_mod.SearchContract(core, schema, tokenizer_mod, scoring_mod);
+const PostingFormatConfig = struct {
+    pub const persistent_text_index_version = catalog_format.persistent_text_index_version;
+    pub const persistent_posting_max_doc_id = catalog_format.persistent_posting_max_doc_id;
+    pub const persistent_posting_max_field_freq: u32 = std.math.maxInt(u16);
+    pub const persistent_posting_max_kind_freq: u32 = 0;
 };
-
-pub const TokenList = struct {
-    allocator: std.mem.Allocator,
-    items: std.ArrayList([]u8),
-
-    pub fn init(allocator: std.mem.Allocator) TokenList {
-        return .{ .allocator = allocator, .items = .empty };
-    }
-
-    pub fn deinit(self: *TokenList) void {
-        for (self.items.items) |token| self.allocator.free(token);
-        self.items.deinit(self.allocator);
-    }
-
-    pub fn appendOwned(self: *TokenList, token: []u8, max_token_bytes: usize) !void {
-        if (token.len == 0 or token.len > max_token_bytes) {
-            self.allocator.free(token);
-            return;
-        }
-        errdefer self.allocator.free(token);
-        try self.items.append(self.allocator, token);
-    }
-
-    pub fn appendLowerAscii(self: *TokenList, bytes: []const u8, max_token_bytes: usize) !void {
-        if (bytes.len == 0 or bytes.len > max_token_bytes) return;
-        const token = try self.allocator.alloc(u8, bytes.len);
-        errdefer self.allocator.free(token);
-        for (bytes, 0..) |byte, i| token[i] = std.ascii.toLower(byte);
-        try self.items.append(self.allocator, token);
-    }
-
-    pub fn contains(self: TokenList, needle: []const u8) bool {
-        for (self.items.items) |token| {
-            if (std.mem.eql(u8, token, needle)) return true;
-        }
-        return false;
-    }
+const posting_format = posting_format_mod.PostingFormat(PostingFormatConfig);
+const TermFormatConfig = struct {
+    pub const persistent_term_max_len = tokenizer_mod.default_max_token_bytes;
+    pub const persistent_all_docs_synthesis_min_postings = persistent_all_docs_synthesis_min_postings_value;
 };
+const term_format = term_format_mod.TermFormat(PostingFormatConfig, TermFormatConfig);
+const SearchAccelerationFormatConfig = struct {
+    pub const persistent_text_index_version = catalog_format.persistent_text_index_version;
+    pub const persistent_posting_max_doc_id = catalog_format.persistent_posting_max_doc_id;
+    pub const persistent_posting_max_field_freq = PostingFormatConfig.persistent_posting_max_field_freq;
+    pub const persistent_term_top_hit_capacity: u64 = 64;
+};
+const search_acceleration_format = search_acceleration_format_mod.SearchAccelerationFormat(SearchAccelerationFormatConfig);
+const rebuild_runtime = rebuild_runtime_mod.RebuildRuntime(core);
+const rebuild_session = rebuild_session_mod.RebuildSession(core, storage_mod, RebuildSessionOps);
+const streaming_run_catalog_publication = streaming_run_catalog_publication_mod.StreamingRunCatalogPublication(core, storage_mod, StreamingRunCatalogPublicationOps);
+const query_execution = query_execution_mod.QueryExecution(core, schema, storage_mod, QueryExecutionOps);
+const persistent_query_execution_hot_path = persistent_query_execution_hot_path_mod.PersistentQueryExecutionHotPath(core, schema, storage_mod, PersistentQueryExecutionHotPathOps);
+const document_catalog_stream_writer = document_catalog_stream_writer_mod.DocumentCatalogStreamWriter(core, storage_mod, DocumentCatalogStreamWriterOps);
+const term_posting_catalog_publication = term_posting_catalog_publication_mod.TermPostingCatalogPublication(core, storage_mod, TermPostingCatalogPublicationOps);
+const persistent_catalog_validation = persistent_catalog_validation_mod.PersistentCatalogValidation(core, storage_mod, PersistentCatalogValidationOps);
+const searchable_document = searchable_document_mod.SearchableDocument(core, storage_mod);
+const in_memory_index = in_memory_index_mod.InMemoryIndex(core, schema, graph_mod, storage_mod, query_execution.TextQueryPlanStats);
+const rebuildPersistentTextCatalogWithGraphRepair = rebuild_session.Internal.rebuildPersistentTextCatalogWithGraphRepair;
+const rebuildPersistentTextCatalogFromRunsOnceDeadline = rebuild_session.Internal.rebuildPersistentTextCatalogFromRunsOnceDeadline;
+const rebuildPersistentTextCatalogFromRunsOnceDeadlineTimed = rebuild_session.Internal.rebuildPersistentTextCatalogFromRunsOnceDeadlineTimed;
+const textPostingRunsBasePath = rebuild_session.Internal.postingRunsBasePath;
 
-pub fn tokenize(allocator: std.mem.Allocator, input: []const u8, options: TokenizerOptions) !TokenList {
-    try validateTokenizerOptions(options);
-    var tokens = TokenList.init(allocator);
-    errdefer tokens.deinit();
+const default_max_token_bytes = tokenizer_mod.default_max_token_bytes;
+pub const TokenizerOptions = tokenizer_mod.TokenizerOptions;
+pub const TokenList = tokenizer_mod.TokenList;
+pub const tokenize = tokenizer_mod.tokenize;
+const validateTokenizerOptions = tokenizer_mod.validateTokenizerOptions;
+const Decoded = tokenizer_mod.Decoded;
+const decodeUtf8 = tokenizer_mod.decodeUtf8;
+const isCjk = tokenizer_mod.isCjk;
+const isCjkJoiner = tokenizer_mod.isCjkJoiner;
+const normalizedRunByte = tokenizer_mod.normalizedRunByte;
+const isRunByte = tokenizer_mod.isRunByte;
+const shouldEmitOriginal = tokenizer_mod.shouldEmitOriginal;
+const containsCamelBoundary = tokenizer_mod.containsCamelBoundary;
+const isCamelSplit = tokenizer_mod.isCamelSplit;
+const appendNormalizedCjkCodepoint = tokenizer_mod.appendNormalizedCjkCodepoint;
+const countTokens = tokenizer_mod.countTokens;
+const countTermInText = tokenizer_mod.countTermInText;
+pub const Bm25Params = scoring_mod.Bm25Params;
+pub const bm25Idf = scoring_mod.bm25Idf;
+pub const bm25TermScore = scoring_mod.bm25TermScore;
+pub const bm25WeightedTermScore = scoring_mod.bm25WeightedTermScore;
+pub const TextSearchOptions = search_contract.TextSearchOptions;
+pub const TextSearchHit = search_contract.TextSearchHit;
+pub const TextDocument = searchable_document.TextDocument;
+pub const TextFieldWeights = in_memory_index.TextFieldWeights;
+pub const TextIndex = in_memory_index.TextIndex;
+const SearchableNodeMetadata = searchable_document.SearchableNodeMetadata;
+const SearchableNodeMetadataSnapshot = searchable_document.SearchableNodeMetadataSnapshot;
+const readSearchableNodeMetadata = searchable_document.readSearchableNodeMetadata;
+const isDeletedNodeTombstoneText = searchable_document.Internal.isDeletedNodeTombstoneText;
+const isDeletedNodeTombstoneNode = searchable_document.Internal.isDeletedNodeTombstoneNode;
+const textSearchHasNodeFilter = search_contract.Internal.hasNodeFilter;
+const textSearchMatchesNodeKind = search_contract.Internal.matchesNodeKind;
+const cjkBigramCoverageFloor = search_contract.Internal.cjkBigramCoverageFloor;
+const isCjkMultiCodepointTerm = search_contract.Internal.isCjkMultiCodepointTerm;
+const termHasNonCjkCodepoint = search_contract.Internal.termHasNonCjkCodepoint;
+const countQueryTermOccurrences = search_contract.Internal.countQueryTermOccurrences;
+const validateTextSearchOptions = search_contract.Internal.validateOptions;
+const textSearchPreallocCapacity = search_contract.Internal.preallocCapacity;
+const chargeTextPostingScan = search_contract.Internal.chargePostingScan;
+const tokenizerOptionsEqual = search_contract.Internal.tokenizerOptionsEqual;
+const textSearchHitLessThan = search_contract.Internal.hitLessThan;
+const appendTopTextHitBounded = search_contract.Internal.appendTopHitBounded;
+const appendTopTextHitBoundedCachedWorst = search_contract.Internal.appendTopHitBoundedCachedWorst;
+const worstTopTextHitScore = search_contract.Internal.worstTopHitScore;
+const hitsContainNode = search_contract.Internal.hitsContainNode;
+const encodeTextPostingsHeader = posting_format.Internal.encodeHeader;
+const decodeTextPostingsHeader = posting_format.Internal.decodeHeader;
+const encodeTextPostingRecord = posting_format.Internal.encodeRecord;
+const decodeTextPostingRecord = posting_format.Internal.decodeRecord;
+const validateTextPostingFields = posting_format.Internal.validateFields;
+const compressed_posting_tag_text_unit = posting_format.Internal.compressed_tag_text_unit;
+const compressed_posting_tag_text_two = posting_format.Internal.compressed_tag_text_two;
+const compressed_posting_tag_text_three = posting_format.Internal.compressed_tag_text_three;
+const compressed_posting_tag_text_explicit = posting_format.Internal.compressed_tag_text_explicit;
+const compressed_posting_field_tag_bits = posting_format.Internal.compressed_field_tag_bits;
+const compressed_posting_field_tag_mask = posting_format.Internal.compressed_field_tag_mask;
+const DecodedCompressedPostingDelta = posting_format.Internal.DecodedCompressedPostingDelta;
+const compressedPostingTextFreqTag = posting_format.Internal.compressedTextFreqTag;
+const compressedPostingFieldTag = posting_format.Internal.compressedFieldTag;
+const taggedCompressedPostingDelta = posting_format.Internal.taggedCompressedDelta;
+const decodeTaggedCompressedPostingDelta = posting_format.Internal.decodeTaggedCompressedDelta;
+const compressedPostingTagInlineTextFreq = posting_format.Internal.compressedTagInlineTextFreq;
+const compressedPostingTagTextExplicit = posting_format.Internal.compressedTagTextExplicit;
+const validateCompressedPostingExplicitFreq = posting_format.Internal.validateCompressedExplicitFreq;
+const encodeTextTermsHeader = term_format.Internal.encodeHeader;
+const decodeTextTermsHeader = term_format.Internal.decodeHeader;
+const validateTextTermsHeaderShape = term_format.Internal.validateHeaderShape;
+const encodeTextTermEntry = term_format.Internal.encodeEntry;
+const decodeTextTermEntry = term_format.Internal.decodeEntry;
+const textTermEntryWithDocFreq = term_format.Internal.entryWithDocFreq;
+const textTermEntryFrontPrefixLen = term_format.Internal.entryFrontPrefixLen;
+const textTermEntryFrontSuffixLen = term_format.Internal.entryFrontSuffixLen;
+const TextTermSingletonPayloadCheckpoint = term_format.Internal.TextTermSingletonPayloadCheckpoint;
+const encodeTextTermSingletonPayloadCheckpoint = term_format.Internal.encodeSingletonCheckpoint;
+const decodeTextTermSingletonPayloadCheckpoint = term_format.Internal.decodeSingletonCheckpoint;
+const TextTermExceptionRecord = term_format.Internal.TextTermExceptionRecord;
+const encodeTextTermExceptionRecord = term_format.Internal.encodeExceptionRecord;
+const decodeTextTermExceptionRecord = term_format.Internal.decodeExceptionRecord;
+const termEntryHasInlinePosting = term_format.Internal.termEntryHasInlinePosting;
+const encodeVirtualAllDocsPostingPayload = term_format.Internal.encodeVirtualAllDocsPostingPayload;
+const termEntryVirtualAllDocsTextFreq = term_format.Internal.termEntryVirtualAllDocsTextFreq;
+const denseAllDocsFreqStreamOffsetFromPayload = term_format.Internal.denseAllDocsFreqStreamOffsetFromPayload;
+const denseAllDocsFreqStreamOffset = term_format.Internal.denseAllDocsFreqStreamOffset;
+const termEntryDenseAllDocsFreqStreamOffset = term_format.Internal.termEntryDenseAllDocsFreqStreamOffset;
+const termEntryPostingPayloadValid = term_format.Internal.termEntryPostingPayloadValid;
+const encodeDenseAllDocsFreqStreamPayload = term_format.Internal.encodeDenseAllDocsFreqStreamPayload;
+const canInlineSingletonPosting = term_format.Internal.canInlineSingletonPosting;
+const encodeInlineSingletonPostingPayload = term_format.Internal.encodeInlineSingletonPostingPayload;
+const decodeInlineSingletonPostingPayload = term_format.Internal.decodeInlineSingletonPostingPayload;
+const encodeZigZagI64 = term_format.Internal.encodeZigZagI64;
+const singletonPayloadDelta = term_format.Internal.singletonPayloadDelta;
+const applySingletonPayloadDelta = term_format.Internal.applySingletonPayloadDelta;
+const persistentTermCommonPrefixLen = term_format.Internal.termCommonPrefixLen;
+const persistentTermFrontCodedPrefixLen = term_format.Internal.termFrontCodedPrefixLen;
+const frontCodedPrefixInlineable = term_format.Internal.frontCodedPrefixInlineable;
+const frontCodedPrefixByteCount = term_format.Internal.frontCodedPrefixByteCount;
+const frontCodedEncodedLen = term_format.Internal.frontCodedEncodedLen;
+const textTermEntryOffset = term_format.Internal.termEntryOffset;
+const textTermsBytesOffset = term_format.Internal.termsBytesOffset;
+const textTermByteOffsetCheckpointCount = term_format.Internal.termByteOffsetCheckpointCount;
+const textTermByteOffsetCheckpointTableBytes = term_format.Internal.termByteOffsetCheckpointTableBytes;
+const textTermByteOffsetCheckpointTableOffset = term_format.Internal.termByteOffsetCheckpointTableOffset;
+const textTermByteOffsetCheckpointOffset = term_format.Internal.termByteOffsetCheckpointOffset;
+const textTermExceptionRankCheckpointCount = term_format.Internal.termExceptionRankCheckpointCount;
+const textTermExceptionRankCheckpointTableBytes = term_format.Internal.termExceptionRankCheckpointTableBytes;
+const textTermExceptionMembershipBytes = term_format.Internal.termExceptionMembershipBytes;
+const textTermExceptionPayloadTableBytes = term_format.Internal.termExceptionPayloadTableBytes;
+const textTermExceptionTableBytes = term_format.Internal.termExceptionTableBytes;
+const textTermExceptionTableOffset = term_format.Internal.termExceptionTableOffset;
+const textTermExceptionRankCheckpointTableOffset = term_format.Internal.termExceptionRankCheckpointTableOffset;
+const textTermExceptionRankCheckpointOffset = term_format.Internal.termExceptionRankCheckpointOffset;
+const textTermExceptionMembershipBitsetOffset = term_format.Internal.termExceptionMembershipBitsetOffset;
+const textTermExceptionMembershipByteOffset = term_format.Internal.termExceptionMembershipByteOffset;
+const textTermExceptionPayloadTableOffset = term_format.Internal.termExceptionPayloadTableOffset;
+const textTermExceptionRecordOffset = term_format.Internal.termExceptionRecordOffset;
+const textTermSingletonPayloadCount = term_format.Internal.termSingletonPayloadCount;
+const textTermSingletonPayloadCheckpointCount = term_format.Internal.termSingletonPayloadCheckpointCount;
+const textTermSingletonPayloadCheckpointTableBytes = term_format.Internal.termSingletonPayloadCheckpointTableBytes;
+const textTermSingletonPayloadCheckpointTableOffset = term_format.Internal.termSingletonPayloadCheckpointTableOffset;
+const textTermSingletonPayloadCheckpointOffset = term_format.Internal.termSingletonPayloadCheckpointOffset;
+const textTermSingletonPayloadStreamOffset = term_format.Internal.termSingletonPayloadStreamOffset;
+const textTermsFileSize = term_format.Internal.termsFileSize;
+const textTermsFileSizeForHeader = term_format.Internal.termsFileSizeForHeader;
+const cleanupTextPostingRunScratchFiles = rebuild_runtime.Internal.cleanupPostingRunScratchFiles;
+const recordPersistentTextRebuildObserver = rebuild_runtime.Internal.recordObserver;
+const textMonotonicNs = rebuild_runtime.Internal.monotonicNs;
+const textElapsedNs = rebuild_runtime.Internal.elapsedNs;
+const tmpPathFor = rebuild_runtime.Internal.tmpPathFor;
 
-    var i: usize = 0;
-    while (i < input.len) {
-        const decoded = decodeUtf8(input, i);
-        const cp = decoded.codepoint;
-        if (isCjk(cp)) {
-            var normalized = std.ArrayList(u8).empty;
-            defer normalized.deinit(allocator);
-            try appendNormalizedCjkCodepoint(&normalized, allocator, input, &i, decoded);
-            while (i < input.len) {
-                const next = decodeUtf8(input, i);
-                if (!isCjk(next.codepoint)) {
-                    if (isCjkJoiner(next.codepoint)) {
-                        const after_joiner = i + next.len;
-                        if (after_joiner < input.len and isCjk(decodeUtf8(input, after_joiner).codepoint)) {
-                            i = after_joiner;
-                            continue;
-                        }
-                    }
-                    break;
-                }
-                try appendNormalizedCjkCodepoint(&normalized, allocator, input, &i, next);
+pub const stale_store_scan_max_nodes = query_execution.stale_store_scan_max_nodes;
+pub const stale_store_scan_max_text_bytes = query_execution.stale_store_scan_max_text_bytes;
+pub const stale_store_scan_max_event_bytes = query_execution.stale_store_scan_max_event_bytes;
+pub const stale_store_scan_max_property_delta_bytes = query_execution.stale_store_scan_max_property_delta_bytes;
+pub const TextQueryPlanStats = query_execution.TextQueryPlanStats;
+pub const searchText = query_execution.searchText;
+pub const textQueryPlanStats = query_execution.textQueryPlanStats;
+
+/// Private data-plane adapter for `text.query_execution`.  The control module
+/// sees only bounded operations; persistent catalog and in-memory index
+/// representations remain owned by this façade until their own cohesive
+/// boundaries are extracted.
+const QueryExecutionOps = struct {
+    pub fn persistentCatalogQuickStaleDeadline(
+        allocator: std.mem.Allocator,
+        store: storage_mod.Store,
+        deadline: core.QueryDeadline,
+    ) !bool {
+        return persistent_catalog_validation.persistentTextCatalogQuickStaleDeadline(allocator, store, deadline);
+    }
+
+    pub fn searchPersistentTokens(
+        allocator: std.mem.Allocator,
+        store: storage_mod.Store,
+        query_terms: []const []u8,
+        options: TextSearchOptions,
+    ) !std.ArrayList(TextSearchHit) {
+        return persistent_query_execution_hot_path.searchPersistentTokens(allocator, store, query_terms, options);
+    }
+
+    pub fn searchStoreScan(
+        allocator: std.mem.Allocator,
+        store: storage_mod.Store,
+        query: []const u8,
+        options: TextSearchOptions,
+        max_metadata_bytes: u64,
+        max_property_delta_bytes: u64,
+    ) !std.ArrayList(TextSearchHit) {
+        var index = try TextIndex.buildFromStoreReadOnlyDeadline(
+            allocator,
+            store,
+            max_metadata_bytes,
+            max_property_delta_bytes,
+            options.deadline,
+        );
+        defer index.deinit();
+        return index.search(query, options);
+    }
+
+    pub fn fillPersistentPlanStats(
+        allocator: std.mem.Allocator,
+        store: storage_mod.Store,
+        query_terms: []const []u8,
+        stats: anytype,
+    ) !void {
+        const meta = try readPersistentTextMeta(allocator, store);
+        if (meta.doc_count == 0) return;
+
+        var catalog = try PersistentPostingCatalog.open(allocator, store, meta.doc_count);
+        defer catalog.deinit();
+        var unique_query_terms = std.StringHashMap(void).init(allocator);
+        defer unique_query_terms.deinit();
+        try unique_query_terms.ensureTotalCapacity(@intCast(query_terms.len));
+
+        for (query_terms) |term| {
+            const unique_entry = try unique_query_terms.getOrPut(term);
+            if (unique_entry.found_existing) continue;
+            unique_entry.value_ptr.* = {};
+            stats.unique_query_terms += 1;
+            if (try catalog.findTermEntry(term)) |lookup| {
+                stats.matched_terms += 1;
+                stats.postings_count_total = std.math.add(u64, stats.postings_count_total, lookup.entry.postings_count) catch return error.RecordTooLarge;
+                stats.max_postings_count = @max(stats.max_postings_count, lookup.entry.postings_count);
             }
-            try appendCjkTokens(&tokens, normalized.items, options);
-        } else if (normalizedRunByte(cp)) |first_byte| {
-            var run = std.ArrayList(u8).empty;
-            defer run.deinit(allocator);
-            try run.append(allocator, first_byte);
-            i += decoded.len;
-            while (i < input.len) {
-                const next = decodeUtf8(input, i);
-                const byte = normalizedRunByte(next.codepoint) orelse break;
-                try run.append(allocator, byte);
-                i += next.len;
-            }
-            try appendRunTokens(&tokens, run.items, options);
-        } else {
-            i += decoded.len;
         }
     }
 
-    return tokens;
-}
-
-pub const Bm25Params = struct {
-    k1: f32 = 1.2,
-    b: f32 = 0.75,
-};
-
-fn validateTokenizerOptions(options: TokenizerOptions) !void {
-    if (options.max_token_bytes == 0) return core.Error.Unsupported;
-    if (options.emit_cjk_unigrams and options.max_token_bytes < 4) return core.Error.Unsupported;
-    if (options.emit_cjk_bigrams and options.max_token_bytes < 8) return core.Error.Unsupported;
-}
-
-fn validBm25Params(params: Bm25Params) bool {
-    return std.math.isFinite(params.k1) and
-        std.math.isFinite(params.b) and
-        params.k1 > 0 and
-        params.b >= 0 and
-        params.b <= 1;
-}
-
-pub fn bm25Idf(doc_count: u64, doc_freq: u64) f32 {
-    if (doc_count == 0 or doc_freq == 0) return 0;
-    const n: f32 = @floatFromInt(doc_count);
-    const df: f32 = @floatFromInt(@min(doc_freq, doc_count));
-    return @log(1.0 + (n - df + 0.5) / (df + 0.5));
-}
-
-pub fn bm25TermScore(
-    term_freq: u32,
-    doc_len: u32,
-    avg_doc_len: f32,
-    doc_count: u64,
-    doc_freq: u64,
-    params: Bm25Params,
-) f32 {
-    if (!validBm25Params(params) or term_freq == 0 or doc_len == 0 or !std.math.isFinite(avg_doc_len) or avg_doc_len <= 0) return 0;
-    const tf: f32 = @floatFromInt(term_freq);
-    const len: f32 = @floatFromInt(doc_len);
-    const norm = (1.0 - params.b) + params.b * (len / avg_doc_len);
-    const numerator = tf * (params.k1 + 1.0);
-    const denominator = tf + params.k1 * norm;
-    const score = bm25Idf(doc_count, doc_freq) * numerator / denominator;
-    return if (std.math.isFinite(score)) score else 0;
-}
-
-pub fn bm25WeightedTermScore(
-    weighted_term_freq: f32,
-    doc_len: f32,
-    avg_doc_len: f32,
-    doc_count: u64,
-    doc_freq: u64,
-    params: Bm25Params,
-) f32 {
-    if (!validBm25Params(params) or
-        !std.math.isFinite(weighted_term_freq) or
-        !std.math.isFinite(doc_len) or
-        !std.math.isFinite(avg_doc_len) or
-        weighted_term_freq <= 0 or
-        doc_len <= 0 or
-        avg_doc_len <= 0) return 0;
-    const norm = (1.0 - params.b) + params.b * (doc_len / avg_doc_len);
-    const numerator = weighted_term_freq * (params.k1 + 1.0);
-    const denominator = weighted_term_freq + params.k1 * norm;
-    const score = bm25Idf(doc_count, doc_freq) * numerator / denominator;
-    return if (std.math.isFinite(score)) score else 0;
-}
-
-pub fn searchText(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    query: []const u8,
-    options: TextSearchOptions,
-) !std.ArrayList(TextSearchHit) {
-    try validatePersistentTextSearchOptions(options);
-    if (options.deadline.expired()) return core.Error.BudgetExceeded;
-    if (options.limit == 0) return std.ArrayList(TextSearchHit).empty;
-    var query_tokens = try tokenize(allocator, query, options.tokenizer);
-    defer query_tokens.deinit();
-    if (query_tokens.items.items.len == 0) return std.ArrayList(TextSearchHit).empty;
-
-    const stale = try persistentTextCatalogQuickStaleDeadline(allocator, store, options.deadline);
-    if (stale) return try searchTextStoreScan(allocator, store, query, options);
-    return searchTextPersistentTokens(allocator, store, query_tokens.items.items, options) catch |err| switch (err) {
-        error.FileNotFound, error.InvalidRecord => try searchTextStoreScan(allocator, store, query, options),
-        else => |e| return e,
-    };
-}
-
-fn searchTextStoreScan(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    query: []const u8,
-    options: TextSearchOptions,
-) !std.ArrayList(TextSearchHit) {
-    const max_metadata_bytes = try admitStaleStoreScan(store, options.deadline);
-    var index = TextIndex.buildFromStoreReadOnlyDeadline(allocator, store, max_metadata_bytes, stale_store_scan_max_property_delta_bytes, options.deadline) catch |err| switch (err) {
-        error.SearchableMetadataBudgetExceeded => return error.TextIndexMaintenanceRequired,
-        else => |e| return e,
-    };
-    defer index.deinit();
-    return try index.search(query, options);
-}
-
-fn staleStoreScanAllowed(node_count: u64, logical_text_bytes: u64, event_bytes: u64, property_delta_bytes: u64) bool {
-    return node_count <= stale_store_scan_max_nodes and
-        logical_text_bytes <= stale_store_scan_max_text_bytes and
-        event_bytes <= stale_store_scan_max_event_bytes and
-        property_delta_bytes <= stale_store_scan_max_property_delta_bytes;
-}
-
-test "stale store scan admission rejects unbounded node and text volumes" {
-    try std.testing.expect(staleStoreScanAllowed(stale_store_scan_max_nodes, stale_store_scan_max_text_bytes, stale_store_scan_max_event_bytes, stale_store_scan_max_property_delta_bytes));
-    try std.testing.expect(!staleStoreScanAllowed(stale_store_scan_max_nodes + 1, 0, 0, 0));
-    try std.testing.expect(!staleStoreScanAllowed(0, stale_store_scan_max_text_bytes + 1, 0, 0));
-    try std.testing.expect(!staleStoreScanAllowed(0, 0, stale_store_scan_max_event_bytes + 1, 0));
-    try std.testing.expect(!staleStoreScanAllowed(0, 0, 0, stale_store_scan_max_property_delta_bytes + 1));
-}
-
-fn admitStaleStoreScan(store: storage_mod.Store, deadline: core.QueryDeadline) !u64 {
-    if (deadline.expired()) return core.Error.BudgetExceeded;
-    // IndexMeta is allowed to lag the canonical event log after a crash, so
-    // its node count is not a safe admission bound. Stat the event log first:
-    // large stores fail without replay, while a bounded log can be counted
-    // exactly before the read-only fallback materializes graph/index state.
-    // events.bin and node_texts.dat are canonical data, not rebuildable text
-    // artifacts. Corruption or disappearance must retain its real error;
-    // reporting "maintenance required" would send operators toward an index
-    // rebuild that cannot repair lost primary records.
-    const event_bytes = try store.eventByteCount();
-    if (event_bytes > stale_store_scan_max_event_bytes) return error.TextIndexMaintenanceRequired;
-    const node_count = try store.nodeEventCountUpTo(stale_store_scan_max_nodes);
-    if (node_count > stale_store_scan_max_nodes) return error.TextIndexMaintenanceRequired;
-    const logical_text_bytes = try store.primaryNodeTextLogicalBytes();
-    const property_delta_bytes = try store.propertyPayloadDeltaByteCount();
-    if (!staleStoreScanAllowed(node_count, logical_text_bytes, event_bytes, property_delta_bytes)) return error.TextIndexMaintenanceRequired;
-    return stale_store_scan_max_text_bytes - logical_text_bytes;
-}
-
-pub const TextQueryPlanStats = struct {
-    query_terms: usize = 0,
-    unique_query_terms: usize = 0,
-    matched_terms: usize = 0,
-    postings_count_total: u64 = 0,
-    max_postings_count: u64 = 0,
-};
-
-pub fn textQueryPlanStats(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    query: []const u8,
-    options: TextSearchOptions,
-) !TextQueryPlanStats {
-    try validatePersistentTextSearchOptions(options);
-    if (options.deadline.expired()) return core.Error.BudgetExceeded;
-    var query_tokens = try tokenize(allocator, query, options.tokenizer);
-    defer query_tokens.deinit();
-    if (query_tokens.items.items.len == 0) return .{};
-
-    const stale = try persistentTextCatalogQuickStaleDeadline(allocator, store, options.deadline);
-    if (stale) return try textQueryPlanStatsStoreScan(allocator, store, query, options);
-    return textQueryPlanStatsPersistentTokens(allocator, store, query_tokens.items.items) catch |err| switch (err) {
-        error.FileNotFound, error.InvalidRecord => try textQueryPlanStatsStoreScan(allocator, store, query, options),
-        else => |e| return e,
-    };
-}
-
-fn textQueryPlanStatsStoreScan(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    query: []const u8,
-    options: TextSearchOptions,
-) !TextQueryPlanStats {
-    const max_metadata_bytes = try admitStaleStoreScan(store, options.deadline);
-    var index = TextIndex.buildFromStoreReadOnlyDeadline(allocator, store, max_metadata_bytes, stale_store_scan_max_property_delta_bytes, options.deadline) catch |err| switch (err) {
-        error.SearchableMetadataBudgetExceeded => return error.TextIndexMaintenanceRequired,
-        else => |e| return e,
-    };
-    defer index.deinit();
-    return try index.queryPlanStats(query, options);
-}
-
-fn textQueryPlanStatsPersistentTokens(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    query_terms: []const []u8,
-) !TextQueryPlanStats {
-    const meta = try readPersistentTextMeta(allocator, store);
-    if (meta.doc_count == 0) return .{ .query_terms = query_terms.len };
-
-    var catalog = try PersistentPostingCatalog.open(allocator, store, meta.doc_count);
-    defer catalog.deinit();
-    var unique_query_terms = std.StringHashMap(void).init(allocator);
-    defer unique_query_terms.deinit();
-    try unique_query_terms.ensureTotalCapacity(@intCast(query_terms.len));
-
-    var stats = TextQueryPlanStats{ .query_terms = query_terms.len };
-    for (query_terms) |term| {
-        const unique_entry = try unique_query_terms.getOrPut(term);
-        if (unique_entry.found_existing) continue;
-        unique_entry.value_ptr.* = {};
-        stats.unique_query_terms += 1;
-        if (try catalog.findTermEntry(term)) |lookup| {
-            stats.matched_terms += 1;
-            stats.postings_count_total = std.math.add(u64, stats.postings_count_total, lookup.entry.postings_count) catch return error.RecordTooLarge;
-            stats.max_postings_count = @max(stats.max_postings_count, lookup.entry.postings_count);
-        }
+    pub fn fillStoreScanPlanStats(
+        allocator: std.mem.Allocator,
+        store: storage_mod.Store,
+        query: []const u8,
+        options: TextSearchOptions,
+        max_metadata_bytes: u64,
+        max_property_delta_bytes: u64,
+        stats: anytype,
+    ) !void {
+        var index = try TextIndex.buildFromStoreReadOnlyDeadline(
+            allocator,
+            store,
+            max_metadata_bytes,
+            max_property_delta_bytes,
+            options.deadline,
+        );
+        defer index.deinit();
+        stats.* = try index.queryPlanStats(query, options);
     }
-    return stats;
-}
+};
 
-fn rebuildPersistentTextCatalogWithGraphRepair(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    graph_index_repaired: *bool,
-    deadline: core.QueryDeadline,
-) !PersistentTextMeta {
-    var rebuild_lock = try acquirePersistentTextRebuildLockDeadline(allocator, store, deadline);
-    defer rebuild_lock.deinit();
+/// Private persisted-reader backend for the cohesive token execution owner.
+/// It exposes no runtime entrypoint: callers reach the implementation only
+/// through `QueryExecutionOps.searchPersistentTokens` above.
+const PersistentQueryExecutionHotPathOps = struct {
+    pub const PersistentTextMeta_dep = PersistentTextMeta;
+    pub const PersistentPostingCatalog_dep = PersistentPostingCatalog;
+    pub const TextDocsFileView_dep = TextDocsFileView;
+    pub const CachedTextDoc_dep = CachedTextDoc;
+    pub const TextDocRecord_dep = TextDocRecord;
+    pub const PersistentQueryTermPlan_dep = PersistentQueryTermPlan;
+    pub const PersistentQueryTermFreqCache_dep = PersistentQueryTermFreqCache;
+    pub const PersistentSearchTermContext_dep = PersistentSearchTermContext;
+    pub const PersistentSearchCandidateContext_dep = PersistentSearchCandidateContext;
+    pub const PersistentSearchMediumTopCandidateContext_dep = PersistentSearchMediumTopCandidateContext;
+    pub const SingleTermSearchContext_dep = SingleTermSearchContext;
+    pub const FieldTermFreq_dep = FieldTermFreq;
+    pub const persistent_query_term_freq_cache_max_terms_dep = persistent_query_term_freq_cache_max_terms;
+    pub const persistent_multi_term_exact_candidate_max_postings_dep = persistent_multi_term_exact_candidate_max_postings;
+    pub const persistent_search_canonical_freq_validate_posting_limit_dep = persistent_search_canonical_freq_validate_posting_limit;
+    pub const persistent_term_top_hit_capacity_dep = persistent_term_top_hit_capacity;
+    pub const persistent_term_top_hit_capacity_usize_dep = persistent_term_top_hit_capacity_usize;
+    pub const persistent_posting_max_doc_id_dep = persistent_posting_max_doc_id;
+    pub const readPersistentTextMeta_dep = readPersistentTextMeta;
+    pub const deinitCachedTextDocs_dep = deinitCachedTextDocs;
+    pub const openPersistentTextDocsView_dep = openPersistentTextDocsView;
+    pub const persistentAvgDocLen_dep = persistentAvgDocLen;
+    pub const persistentQueryTermPlanLessThan_dep = persistentQueryTermPlanLessThan;
+    pub const persistentQueryTermPlanPostingTotal_dep = persistentQueryTermPlanPostingTotal;
+    pub const forEachPersistentTermPostingLookupInCatalog_dep = forEachPersistentTermPostingLookupInCatalog;
+    pub const scorePersistentSearchPosting_dep = scorePersistentSearchPosting;
+    pub const getCachedTextDocFromView_dep = getCachedTextDocFromView;
+    pub const getCachedTextDocRecordFromView_dep = getCachedTextDocRecordFromView;
+    pub const textBenchTraceEnabled_dep = textBenchTraceEnabled;
+    pub const canUsePersistentTermTopHitCandidateCache_dep = canUsePersistentTermTopHitCandidateCache;
+    pub const textTermTopHitsPath_dep = textTermTopHitsPath;
+    pub const regularFileSize_dep = regularFileSize;
+    pub const readTextTermTopHitsHeaderFromFile_dep = readTextTermTopHitsHeaderFromFile;
+    pub const textTermTopHitsFileSize_dep = textTermTopHitsFileSize;
+    pub const putPersistentCandidateTextFreq_dep = putPersistentCandidateTextFreq;
+    pub const collectPersistentSearchMediumTopCandidatePosting_dep = collectPersistentSearchMediumTopCandidatePosting;
+    pub const collectPersistentSearchCandidatePosting_dep = collectPersistentSearchCandidatePosting;
+    pub const readTextTermTopHitTermAt_dep = readTextTermTopHitTermAt;
+    pub const readTextTermTopHitRecordAt_dep = readTextTermTopHitRecordAt;
+    pub const fillPersistentCandidateTextFreqsFromCatalogDeadline_dep = fillPersistentCandidateTextFreqsFromCatalogDeadline;
+    pub const catalogTextFreqForDoc_dep = catalogTextFreqForDoc;
+    pub const persistentWeightedTfFromFieldFreq_dep = persistentWeightedTfFromFieldFreq;
+    pub const persistentDocLen_dep = persistentDocLen;
+    pub const canUsePersistentTermTopHitCache_dep = canUsePersistentTermTopHitCache;
+    pub const readPersistentTermTopHitCache_dep = readPersistentTermTopHitCache;
+    pub const publishedPostingBlockCountForEntry_dep = publishedPostingBlockCountForEntry;
+    pub const scanPersistentTermPostings_dep = scanPersistentTermPostings;
+    pub const appendSingleTermSearchPosting_dep = appendSingleTermSearchPosting;
+    pub const persistentBlockPostingCount_dep = persistentBlockPostingCount;
+    pub const scanPersistentPostingRange_dep = scanPersistentPostingRange;
+};
 
-    return try rebuildPersistentTextCatalogLockedWithGraphRepair(allocator, store, graph_index_repaired, deadline);
-}
+/// Private backend for document catalog construction. Only the two complete
+/// writer entrypoints cross the owner boundary; tokenizer, storage iteration,
+/// posting builders, timing, and atomic replacement stay façade-owned.
+const DocumentCatalogStreamWriterOps = struct {
+    pub const TextBufferedWriter_dep = TextBufferedWriter;
+    pub const TextDocRecord_dep = TextDocRecord;
+    pub const TextDocsHeader_dep = TextDocsHeader;
+    pub const TextDocNodeIdOverflowRecord_dep = TextDocNodeIdOverflowRecord;
+    pub const FieldTermFreq_dep = FieldTermFreq;
+    pub const TextPostingRunBuilder_dep = TextPostingRunBuilder;
+    pub const PersistentTermBuilder_dep = PersistentTermBuilder;
+    pub const PersistentTextMeta_dep = PersistentTextMeta;
+    pub const PersistentTextRebuildTimings_dep = PersistentTextRebuildTimings;
+    pub const PersistentTextRebuildObserver_dep = PersistentTextRebuildObserver;
+    pub const SearchableNodeMetadata_dep = SearchableNodeMetadata;
+    pub const SearchableNodeMetadataSnapshot_dep = SearchableNodeMetadataSnapshot;
+    pub const TextRebuildTextFreqCache_dep = TextRebuildTextFreqCache;
+    pub const clearReusableArenaTermFreqs_dep = clearReusableArenaTermFreqs;
+    pub const clearReusableTermFreqs_dep = clearReusableTermFreqs;
+    pub const searchableNodeTextBytes_dep = searchableNodeTextBytes;
+    pub const collectStreamingSearchableNodeTermFreqs_dep = collectStreamingSearchableNodeTermFreqs;
+    pub const collectSearchableNodeTermFreqs_dep = collectSearchableNodeTermFreqs;
+    pub const textMonotonicNs_dep = textMonotonicNs;
+    pub const textElapsedNs_dep = textElapsedNs;
+    pub const persistent_doc_max_field_tokens_dep = persistent_doc_max_field_tokens;
+    pub const persistent_doc_node_id_inline_max_dep = persistent_doc_node_id_inline_max;
+    pub const nextPersistentTextDocId_dep = nextPersistentTextDocId;
+    pub const isDeletedNodeTombstoneText_dep = isDeletedNodeTombstoneText;
+    pub const isDeletedNodeTombstoneNode_dep = isDeletedNodeTombstoneNode;
+    pub const textDocsPath_dep = textDocsPath;
+    pub const tmpPathFor_dep = tmpPathFor;
+    pub const text_write_buffer_bytes_dep = text_write_buffer_bytes;
+    pub const text_rebuild_observer_doc_sample_interval_dep = text_rebuild_observer_doc_sample_interval;
+    pub const recordPersistentTextRebuildObserver_dep = recordPersistentTextRebuildObserver;
+    pub const textOptionsNeedSync_dep = textOptionsNeedSync;
+    pub const renameReplace_dep = renameReplace;
+};
 
-fn rebuildPersistentTextCatalogLockedWithGraphRepair(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    graph_index_repaired: *bool,
-    deadline: core.QueryDeadline,
-) !PersistentTextMeta {
-    const runs_base_path = try textPostingRunsBasePath(allocator, store);
-    defer allocator.free(runs_base_path);
-    return rebuildPersistentTextCatalogFromRunsOnceDeadline(allocator, store, runs_base_path, deadline) catch |err| switch (err) {
-        error.FileNotFound, error.InvalidRecord => retry: {
-            if (graph_index_repaired.*) return err;
-            graph_index_repaired.* = true;
-            try store.repairPersistentIndexesFromLog();
-            break :retry try rebuildPersistentTextCatalogFromRunsOnceDeadline(allocator, store, runs_base_path, deadline);
-        },
-        else => |e| return e,
-    };
-}
+const writeTextDocsFileFromStore = document_catalog_stream_writer.writeTextDocsFileFromStore;
+const writeTextDocsFileFromStoreWithTermBuilder = document_catalog_stream_writer.writeTextDocsFileFromStoreWithTermBuilder;
 
-pub const persistent_text_index_version: u16 = 76;
-pub const tokenizer_version: u16 = 12;
+/// Private publication backend. The child owns the five-file term/posting
+/// set; the façade retains builders, low-level formats, rebuild session state,
+/// and the final catalog metadata anchor.
+const TermPostingCatalogPublicationOps = struct {
+    pub const PersistentTermBuilder_dep = PersistentTermBuilder;
+    pub const TextDocsFileView_dep = TextDocsFileView;
+    pub const PersistentTextMeta_dep = PersistentTextMeta;
+    pub const PersistentTextCatalogStats_dep = PersistentTextCatalogStats;
+    pub const PersistentTerm_dep = PersistentTerm;
+    pub const TextPostingRecord_dep = TextPostingRecord;
+    pub const TextBufferedWriter_dep = TextBufferedWriter;
+    pub const TextPostingsHeader_dep = TextPostingsHeader;
+    pub const TextPostingBlocksHeader_dep = TextPostingBlocksHeader;
+    pub const TextPostingBlockRecord_dep = TextPostingBlockRecord;
+    pub const TextPostingBlockImpactsHeader_dep = TextPostingBlockImpactsHeader;
+    pub const TextTermTopHitsHeader_dep = TextTermTopHitsHeader;
+    pub const TextTermTopHitTermRecord_dep = TextTermTopHitTermRecord;
+    pub const TextTermTopHitRecord_dep = TextTermTopHitRecord;
+    pub const TextTopHitDocStats_dep = TextTopHitDocStats;
+    pub const TextPostingBlockStats_dep = TextPostingBlockStats;
+    pub const TextTermsHeader_dep = TextTermsHeader;
+    pub const TextTermEntry_dep = TextTermEntry;
+    pub const TextTermExceptionRecord_dep = TextTermExceptionRecord;
+    pub const TextTermSingletonPayloadCheckpoint_dep = TextTermSingletonPayloadCheckpoint;
+    pub const persistentTermLessThan_dep = persistentTermLessThan;
+    pub const termPostingPayloadOrBodyOffset_dep = termPostingPayloadOrBodyOffset;
+    pub const persistentTermFrontCodedLen_dep = persistentTermFrontCodedLen;
+    pub const publishedPostingBodyBytesForTerm_dep = publishedPostingBodyBytesForTerm;
+    pub const textPostingsPath_dep = textPostingsPath;
+    pub const textPostingBlocksPath_dep = textPostingBlocksPath;
+    pub const textPostingBlockImpactsPath_dep = textPostingBlockImpactsPath;
+    pub const textTermTopHitsPath_dep = textTermTopHitsPath;
+    pub const textTermsPath_dep = textTermsPath;
+    pub const persistent_posting_block_size_dep = persistent_posting_block_size;
+    pub const persistent_posting_block_capacity_dep = persistent_posting_block_capacity;
+    pub const persistent_term_top_hit_capacity_dep = persistent_term_top_hit_capacity;
+    pub const persistent_term_top_hit_min_postings_dep = persistent_term_top_hit_min_postings;
+    pub const text_write_buffer_bytes_dep = text_write_buffer_bytes;
+    pub const tmpPathFor_dep = tmpPathFor;
+    pub const textOptionsNeedSync_dep = textOptionsNeedSync;
+    pub const renameReplace_dep = renameReplace;
+    pub const compressedTextPostingBytesForTerm_dep = compressedTextPostingBytesForTerm;
+    pub const encodeTextPostingsHeader_dep = encodeTextPostingsHeader;
+    pub const canVirtualizeAllDocsConstantTextFreqTerm_dep = canVirtualizeAllDocsConstantTextFreqTerm;
+    pub const virtualAllDocsConstantTextFreq_dep = virtualAllDocsConstantTextFreq;
+    pub const canDenseAllDocsFreqStream_dep = canDenseAllDocsFreqStream;
+    pub const appendDenseAllDocsFreqStreamPostings_dep = appendDenseAllDocsFreqStreamPostings;
+    pub const encodeTextPostingRecord_dep = encodeTextPostingRecord;
+    pub const encodeCompressedTextPosting_dep = encodeCompressedTextPosting;
+    pub const textPostingsFileSize_dep = textPostingsFileSize;
+    pub const readTextPostingsHeaderFromFile_dep = readTextPostingsHeaderFromFile;
+    pub const encodeTextPostingBlocksHeader_dep = encodeTextPostingBlocksHeader;
+    pub const textPostingBlockRecordFromStats_dep = textPostingBlockRecordFromStats;
+    pub const encodeTextPostingBlockRecord_dep = encodeTextPostingBlockRecord;
+    pub const textPostingBlocksFileSize_dep = textPostingBlocksFileSize;
+    pub const quantizePersistentBlockScoreBounds_dep = quantizePersistentBlockScoreBounds;
+    pub const encodeTextPostingBlockImpactsHeader_dep = encodeTextPostingBlockImpactsHeader;
+    pub const encodePersistentBlockOrdinal_dep = encodePersistentBlockOrdinal;
+    pub const textPostingBlockImpactsFileSize_dep = textPostingBlockImpactsFileSize;
+    pub const textTermTopHitLessThan_dep = textTermTopHitLessThan;
+    pub const textTermTopHitScoreOrderValid_dep = textTermTopHitScoreOrderValid;
+    pub const persistentWeightedTf_dep = persistentWeightedTf;
+    pub const persistentDocLen_dep = persistentDocLen;
+    pub const persistentAvgDocLen_dep = persistentAvgDocLen;
+    pub const encodeTextTermTopHitsHeader_dep = encodeTextTermTopHitsHeader;
+    pub const encodeTextTermTopHitTermRecord_dep = encodeTextTermTopHitTermRecord;
+    pub const encodeTextTermTopHitRecord_dep = encodeTextTermTopHitRecord;
+    pub const textTermTopHitsFileSize_dep = textTermTopHitsFileSize;
+    pub const canInlineSingletonPosting_dep = canInlineSingletonPosting;
+    pub const textTermEntryFromPersistentTerm_dep = textTermEntryFromPersistentTerm;
+    pub const persistentTermFrontCodedPrefixLen_dep = persistentTermFrontCodedPrefixLen;
+    pub const appendPersistentFrontCodedTerm_dep = appendPersistentFrontCodedTerm;
+    pub const encodeTextTermExceptionRecord_dep = encodeTextTermExceptionRecord;
+    pub const encodeTextTermSingletonPayloadCheckpoint_dep = encodeTextTermSingletonPayloadCheckpoint;
+    pub const textTermsFileSizeForHeader_dep = textTermsFileSizeForHeader;
+    pub const textWriteBufferCapacity_dep = textWriteBufferCapacity;
+    pub const termEntryVirtualAllDocsTextFreq_dep = termEntryVirtualAllDocsTextFreq;
+    pub const persistent_term_inline_posting_marker_dep = persistent_term_inline_posting_marker;
+    pub const addPostingToBlockStats_dep = addPostingToBlockStats;
+    pub const termEntryHasInlinePosting_dep = termEntryHasInlinePosting;
+    pub const decodeInlineSingletonPostingPayload_dep = decodeInlineSingletonPostingPayload;
+    pub const textTermSingletonPayloadCount_dep = textTermSingletonPayloadCount;
+    pub const compressed_posting_max_encoded_len_dep = compressed_posting_max_encoded_len;
+    pub const persistent_posting_block_ordinal_len_dep = persistent_posting_block_ordinal_len;
+    pub const textTermTopHitCandidateCannotBeatCurrentWorst_dep = textTermTopHitCandidateCannotBeatCurrentWorst;
+    pub const termEntryDenseAllDocsFreqStreamOffset_dep = termEntryDenseAllDocsFreqStreamOffset;
+    pub const persistent_term_singleton_payload_checkpoint_terms_dep = persistent_term_singleton_payload_checkpoint_terms;
+    pub const textTermSingletonPayloadCheckpointTableBytes_dep = textTermSingletonPayloadCheckpointTableBytes;
+    pub const textTermsFileSize_dep = textTermsFileSize;
+    pub const compressedTextPostingBytesForRange_dep = compressedTextPostingBytesForRange;
+    pub const bm25WeightedTermScore_dep = bm25WeightedTermScore;
+    pub const encodeZigZagI64_dep = encodeZigZagI64;
+    pub const singletonPayloadDelta_dep = singletonPayloadDelta;
+    pub const encodeTextTermsHeader_dep = encodeTextTermsHeader;
+    pub const persistent_posting_block_offset_checkpoint_terms_dep = persistent_posting_block_offset_checkpoint_terms;
+    pub const encodePersistentVarint_dep = encodePersistentVarint;
+    pub const encodeTextTermEntry_dep = encodeTextTermEntry;
+    pub const persistent_posting_block_byte_offset_checkpoint_blocks_dep = persistent_posting_block_byte_offset_checkpoint_blocks;
+    pub const appendTopTextTermHitBoundedCachedWorst_dep = appendTopTextTermHitBoundedCachedWorst;
+    pub const textTermByteOffsetCheckpointTableBytes_dep = textTermByteOffsetCheckpointTableBytes;
+    pub const persistent_term_byte_offset_checkpoint_terms_dep = persistent_term_byte_offset_checkpoint_terms;
+    pub const persistent_term_bytes_max_offset_dep = persistent_term_bytes_max_offset;
+    pub const persistent_term_exception_rank_checkpoint_terms_dep = persistent_term_exception_rank_checkpoint_terms;
+    pub const textTermExceptionRankCheckpointCount_dep = textTermExceptionRankCheckpointCount;
+    pub const textTermExceptionMembershipBytes_dep = textTermExceptionMembershipBytes;
+};
+
+const writeTermsAndPostingsFiles = term_posting_catalog_publication.writeTermsAndPostingsFiles;
+const writeEmptyTermsAndPostingsFiles = term_posting_catalog_publication.writeEmptyTermsAndPostingsFiles;
+const writeTextPostingsFile = term_posting_catalog_publication.writeTextPostingsFile;
+const writeTextPostingBlocksFile = term_posting_catalog_publication.writeTextPostingBlocksFile;
+const MemoryPostingBlockImpact = term_posting_catalog_publication.MemoryPostingBlockImpact;
+const memoryPostingBlockImpactLessThan = term_posting_catalog_publication.memoryPostingBlockImpactLessThan;
+const writeTextPostingBlockImpactsFile = term_posting_catalog_publication.writeTextPostingBlockImpactsFile;
+const writeTextTermTopHitsFile = term_posting_catalog_publication.writeTextTermTopHitsFile;
+const textTermTopHitCount = term_posting_catalog_publication.textTermTopHitCount;
+const textTermTopHitTermCount = term_posting_catalog_publication.textTermTopHitTermCount;
+const persistentTermTopHitCountForTerm = term_posting_catalog_publication.persistentTermTopHitCountForTerm;
+const persistentTermTopHitCountForPostingCount = term_posting_catalog_publication.persistentTermTopHitCountForPostingCount;
+const postingBlockCountForTerms = term_posting_catalog_publication.postingBlockCountForTerms;
+const publishedPostingBlockCountForEntry = term_posting_catalog_publication.publishedPostingBlockCountForEntry;
+const publishedPostingBlockCountForPayload = term_posting_catalog_publication.publishedPostingBlockCountForPayload;
+const publishedPostingBlockCount = term_posting_catalog_publication.publishedPostingBlockCount;
+const postingBlockCount = term_posting_catalog_publication.postingBlockCount;
+const postingBlockStatsFromMemory = term_posting_catalog_publication.postingBlockStatsFromMemory;
+const persistentTermExceptionCount = term_posting_catalog_publication.persistentTermExceptionCount;
+const SingletonPayloadBytes = term_posting_catalog_publication.SingletonPayloadBytes;
+const appendSingletonPayloadBytes = term_posting_catalog_publication.appendSingletonPayloadBytes;
+const buildSingletonPayloadBytes = term_posting_catalog_publication.buildSingletonPayloadBytes;
+const writeTextTermsFile = term_posting_catalog_publication.writeTextTermsFile;
+
+/// Private read-side backend for full and bounded catalog validation. The
+/// owner controls stale/error classification; low-level format readers and
+/// canonical storage access remain behind this façade-supplied interface.
+const PersistentCatalogValidationOps = struct {
+    pub const PersistentTextMeta_dep = PersistentTextMeta;
+    pub const TextDocsHeader_dep = TextDocsHeader;
+    pub const TextDocRecord_dep = TextDocRecord;
+    pub const TextPostingsFileView_dep = TextPostingsFileView;
+    pub const TextPostingsHeader_dep = TextPostingsHeader;
+    pub const TextPostingBlocksHeader_dep = TextPostingBlocksHeader;
+    pub const TextPostingBlockImpactsHeader_dep = TextPostingBlockImpactsHeader;
+    pub const TextTermTopHitsHeader_dep = TextTermTopHitsHeader;
+    pub const TextTermsHeader_dep = TextTermsHeader;
+    pub const TextPostingBlockStats_dep = TextPostingBlockStats;
+    pub const readPersistentTextMeta_dep = readPersistentTextMeta;
+    pub const currentPersistentTextMetaAnchor_dep = currentPersistentTextMetaAnchor;
+    pub const textDocsPath_dep = textDocsPath;
+    pub const regularFileSize_dep = regularFileSize;
+    pub const readTextDocsHeaderFromFile_dep = readTextDocsHeaderFromFile;
+    pub const textDocsFileSizeForHeader_dep = textDocsFileSizeForHeader;
+    pub const stale_store_scan_max_property_delta_bytes_dep = stale_store_scan_max_property_delta_bytes;
+    pub const readTextDocRecordAtWithHeader_dep = readTextDocRecordAtWithHeader;
+    pub const readTextDocNodeIdOverflowRecordAt_dep = readTextDocNodeIdOverflowRecordAt;
+    pub const textDocRecordOffsetForHeader_dep = textDocRecordOffsetForHeader;
+    pub const persistent_doc_node_id_overflow_marker_dep = persistent_doc_node_id_overflow_marker;
+    pub const isDeletedNodeTombstoneNode_dep = isDeletedNodeTombstoneNode;
+    pub const readSearchableNodeMetadata_dep = readSearchableNodeMetadata;
+    pub const validateTextDocAgainstNodeRefCached_dep = validateTextDocAgainstNodeRefCached;
+    pub const textTermsPath_dep = textTermsPath;
+    pub const readTextTermsHeaderFromFile_dep = readTextTermsHeaderFromFile;
+    pub const textTermsFileSizeForHeader_dep = textTermsFileSizeForHeader;
+    pub const textPostingsPath_dep = textPostingsPath;
+    pub const textPostingsFileSize_dep = textPostingsFileSize;
+    pub const readTextPostingsHeaderFromFile_dep = readTextPostingsHeaderFromFile;
+    pub const textPostingBlocksPath_dep = textPostingBlocksPath;
+    pub const readTextPostingBlocksHeaderFromFile_dep = readTextPostingBlocksHeaderFromFile;
+    pub const persistent_posting_block_size_dep = persistent_posting_block_size;
+    pub const textPostingBlocksFileSize_dep = textPostingBlocksFileSize;
+    pub const textPostingBlockImpactsPath_dep = textPostingBlockImpactsPath;
+    pub const readTextPostingBlockImpactsHeaderFromFile_dep = readTextPostingBlockImpactsHeaderFromFile;
+    pub const textPostingBlockImpactsFileSize_dep = textPostingBlockImpactsFileSize;
+    pub const persistentAvgDocLen_dep = persistentAvgDocLen;
+    pub const textTermTopHitsPath_dep = textTermTopHitsPath;
+    pub const readTextTermTopHitsHeaderFromFile_dep = readTextTermTopHitsHeaderFromFile;
+    pub const persistent_term_top_hit_capacity_dep = persistent_term_top_hit_capacity;
+    pub const textTermTopHitsFileSize_dep = textTermTopHitsFileSize;
+    pub const readTextTermTopHitTermRecordAt_dep = readTextTermTopHitTermRecordAt;
+    pub const readTextTermEntryAt_dep = readTextTermEntryAt;
+    pub const termEntryHasInlinePosting_dep = termEntryHasInlinePosting;
+    pub const termEntryVirtualAllDocsTextFreq_dep = termEntryVirtualAllDocsTextFreq;
+    pub const termEntryDenseAllDocsFreqStreamOffset_dep = termEntryDenseAllDocsFreqStreamOffset;
+    pub const persistent_term_byte_offset_checkpoint_terms_dep = persistent_term_byte_offset_checkpoint_terms;
+    pub const readTextTermByteOffsetCheckpointAt_dep = readTextTermByteOffsetCheckpointAt;
+    pub const readFrontCodedTermAtOffset_dep = readFrontCodedTermAtOffset;
+    pub const persistent_posting_block_offset_checkpoint_terms_dep = persistent_posting_block_offset_checkpoint_terms;
+    pub const readTextPostingBlockOffsetCheckpointAt_dep = readTextPostingBlockOffsetCheckpointAt;
+    pub const publishedPostingBlockCountForEntry_dep = publishedPostingBlockCountForEntry;
+    pub const SkipTextPostingContext_dep = SkipTextPostingContext;
+    pub const scanPersistentTermPostings_dep = scanPersistentTermPostings;
+    pub const skipTextPosting_dep = skipTextPosting;
+    pub const scanPersistentPostingBlocks_dep = scanPersistentPostingBlocks;
+    pub const textTermExceptionMembershipBytes_dep = textTermExceptionMembershipBytes;
+    pub const readTextTermExceptionMembershipByteAt_dep = readTextTermExceptionMembershipByteAt;
+    pub const persistent_term_exception_rank_checkpoint_terms_dep = persistent_term_exception_rank_checkpoint_terms;
+    pub const readTextTermExceptionRankCheckpointAt_dep = readTextTermExceptionRankCheckpointAt;
+    pub const readTextTermExceptionRecordAt_dep = readTextTermExceptionRecordAt;
+    pub const readTextPostingImpactBlockIndexAt_dep = readTextPostingImpactBlockIndexAt;
+    pub const readTextPostingBlockRecordAt_dep = readTextPostingBlockRecordAt;
+    pub const bm25WeightedTermScore_dep = bm25WeightedTermScore;
+    pub const textPostingBlockRecordConservativelyMatches_dep = textPostingBlockRecordConservativelyMatches;
+    pub const textPostingBlockRecordFromStats_dep = textPostingBlockRecordFromStats;
+    pub const persistent_posting_block_byte_offset_checkpoint_blocks_dep = persistent_posting_block_byte_offset_checkpoint_blocks;
+    pub const readTextPostingBlockByteOffsetCheckpointAt_dep = readTextPostingBlockByteOffsetCheckpointAt;
+};
+
+const persistentTextMetaAnchorStale = persistent_catalog_validation.persistentTextMetaAnchorStale;
+const persistentTextGraphAnchorStale = persistent_catalog_validation.persistentTextGraphAnchorStale;
+pub const persistentTextCatalogStale = persistent_catalog_validation.persistentTextCatalogStale;
+pub const persistentTextCatalogQuickStale = persistent_catalog_validation.persistentTextCatalogQuickStale;
+const persistentTextCatalogStaleDeadline = persistent_catalog_validation.persistentTextCatalogStaleDeadline;
+const persistentTextCatalogQuickStaleDeadline = persistent_catalog_validation.persistentTextCatalogQuickStaleDeadline;
+const persistentTextDocsHeaderStale = persistent_catalog_validation.persistentTextDocsHeaderStale;
+const persistentTextDocsInvalid = persistent_catalog_validation.persistentTextDocsInvalid;
+const persistentTermsOrPostingsStale = persistent_catalog_validation.persistentTermsOrPostingsStale;
+const persistentTermsOrPostingsHeaderStale = persistent_catalog_validation.persistentTermsOrPostingsHeaderStale;
+const persistentTermTopHitsSparseIndexInvalid = persistent_catalog_validation.persistentTermTopHitsSparseIndexInvalid;
+const persistentTermDictionaryInvalid = persistent_catalog_validation.persistentTermDictionaryInvalid;
+const textTermExceptionTableInvalid = persistent_catalog_validation.textTermExceptionTableInvalid;
+const ValidatePostingBlocksContext = persistent_catalog_validation.ValidatePostingBlocksContext;
+const validatePostingBlockRecord = persistent_catalog_validation.validatePostingBlockRecord;
+
+pub const persistent_text_index_version = catalog_format.persistent_text_index_version;
+pub const tokenizer_version = catalog_format.tokenizer_version;
 const persistent_posting_block_size: u64 = 128;
 const persistent_posting_block_capacity: usize = @intCast(persistent_posting_block_size);
 const production_persistent_posting_block_offset_checkpoint_terms: u64 = 128;
@@ -376,36 +619,33 @@ const test_persistent_posting_block_byte_offset_checkpoint_blocks: u64 = 2;
 const persistent_posting_block_byte_offset_checkpoint_blocks: u64 = if (builtin.is_test) test_persistent_posting_block_byte_offset_checkpoint_blocks else production_persistent_posting_block_byte_offset_checkpoint_blocks;
 const persistent_elias_fano_select_checkpoint_postings: u64 = persistent_posting_block_size;
 const persistent_elias_fano_select_checkpoint_bytes: u64 = 8;
-const persistent_term_byte_offset_checkpoint_terms: u64 = 128;
-const persistent_term_bytes_max_offset: u64 = std.math.maxInt(u32);
-const persistent_term_max_len: u32 = default_max_token_bytes;
-const persistent_doc_max_field_tokens: u64 = std.math.maxInt(u16);
-const persistent_doc_node_id_inline_max: u64 = std.math.maxInt(u32) - 1;
-const persistent_doc_node_id_overflow_marker: u32 = std.math.maxInt(u32);
-const persistent_doc_node_id_overflow_record_len: usize = 12;
-const persistent_term_inline_posting_marker: u32 = 1 << 31;
-const persistent_term_virtual_all_docs_payload_marker: u32 = persistent_term_inline_posting_marker;
-const persistent_term_inline_posting_payload_mask: u32 = persistent_term_inline_posting_marker - 1;
-const persistent_term_dense_all_docs_freq_stream_payload_base: u64 = persistent_posting_max_field_freq + 1;
-const persistent_postings_body_max_offset: u64 = persistent_term_inline_posting_payload_mask;
-const persistent_inline_posting_doc_id_bits: u6 = 31 - compressed_posting_field_tag_bits;
-const persistent_inline_posting_max_doc_id: u64 = @as(u64, 1) << persistent_inline_posting_doc_id_bits;
-const persistent_posting_max_doc_id: u64 = std.math.maxInt(u32) - 1;
-const persistent_posting_max_field_freq: u32 = std.math.maxInt(u16);
-const persistent_posting_max_kind_freq: u32 = 0;
-const persistent_u24_max: u64 = (1 << 24) - 1;
-const persistent_u24_len: usize = 3;
-const persistent_term_max_doc_freq: u64 = (1 << 30) - 1;
-const persistent_term_exception_payload_len: usize = 12;
-const persistent_term_exception_plain_offset_flag: u32 = 1 << 31;
-const persistent_term_exception_dense_freq_stream_flag: u32 = 1 << 30;
-const persistent_term_exception_doc_freq_mask: u32 = (1 << 30) - 1;
-const persistent_term_exception_rank_checkpoint_terms: u64 = 256;
-const persistent_term_singleton_payload_checkpoint_terms: u64 = 128;
-const persistent_term_singleton_payload_checkpoint_len: usize = 8;
-const persistent_posting_max_block_ordinal: u64 = std.math.maxInt(u32);
-const persistent_posting_block_ordinal_len: usize = 4;
-const persistent_block_score_f16_max: f32 = @floatCast(std.math.floatMax(f16));
+const persistent_term_byte_offset_checkpoint_terms = term_format.Internal.term_byte_offset_checkpoint_terms;
+const persistent_term_bytes_max_offset = term_format.Internal.term_bytes_max_offset;
+const persistent_term_max_len = term_format.Internal.term_max_len;
+const persistent_doc_max_field_tokens = catalog_format.persistent_doc_max_field_tokens;
+const persistent_doc_node_id_inline_max = catalog_format.persistent_doc_node_id_inline_max;
+const persistent_doc_node_id_overflow_marker = catalog_format.persistent_doc_node_id_overflow_marker;
+const persistent_term_inline_posting_marker = term_format.Internal.term_inline_posting_marker;
+const persistent_term_virtual_all_docs_payload_marker = term_format.Internal.term_virtual_all_docs_payload_marker;
+const persistent_term_inline_posting_payload_mask = term_format.Internal.term_inline_posting_payload_mask;
+const persistent_term_dense_all_docs_freq_stream_payload_base = term_format.Internal.term_dense_all_docs_freq_stream_payload_base;
+const persistent_postings_body_max_offset = term_format.Internal.postings_body_max_offset;
+const persistent_inline_posting_doc_id_bits = term_format.Internal.inline_posting_doc_id_bits;
+const persistent_inline_posting_max_doc_id = term_format.Internal.inline_posting_max_doc_id;
+const persistent_posting_max_doc_id = catalog_format.persistent_posting_max_doc_id;
+const persistent_posting_max_field_freq = PostingFormatConfig.persistent_posting_max_field_freq;
+const persistent_posting_max_kind_freq = PostingFormatConfig.persistent_posting_max_kind_freq;
+const persistent_term_max_doc_freq = term_format.Internal.term_max_doc_freq;
+const persistent_term_exception_payload_len = term_format.Internal.term_exception_payload_len;
+const persistent_term_exception_plain_offset_flag = term_format.Internal.term_exception_plain_offset_flag;
+const persistent_term_exception_dense_freq_stream_flag = term_format.Internal.term_exception_dense_freq_stream_flag;
+const persistent_term_exception_doc_freq_mask = term_format.Internal.term_exception_doc_freq_mask;
+const persistent_term_exception_rank_checkpoint_terms = term_format.Internal.term_exception_rank_checkpoint_terms;
+const persistent_term_singleton_payload_checkpoint_terms = term_format.Internal.term_singleton_payload_checkpoint_terms;
+const persistent_term_singleton_payload_checkpoint_len = term_format.Internal.term_singleton_payload_checkpoint_len;
+const persistent_posting_max_block_ordinal = search_acceleration_format.Internal.persistent_posting_max_block_ordinal;
+const persistent_posting_block_ordinal_len = search_acceleration_format.Internal.persistent_posting_block_ordinal_len;
+const persistent_block_score_f16_max = search_acceleration_format.Internal.persistent_block_score_f16_max;
 const persistent_term_top_hit_capacity: u64 = 64;
 const persistent_term_top_hit_capacity_usize: usize = @intCast(persistent_term_top_hit_capacity);
 const persistent_term_top_hit_regular_probe_capacity: usize = 8;
@@ -421,10 +661,11 @@ else
 // The agent-text ladder has many medium-frequency terms; letting all-doc terms
 // synthesize at the same rung as top-hit publication avoids repeatedly storing
 // and scanning facts that are already implied by the document catalog.
-const persistent_all_docs_synthesis_min_postings: u64 = if (builtin.is_test)
+const persistent_all_docs_synthesis_min_postings_value: u64 = if (builtin.is_test)
     persistent_term_top_hit_test_min_postings
 else
     persistent_term_top_hit_production_min_postings;
+const persistent_all_docs_synthesis_min_postings = persistent_all_docs_synthesis_min_postings_value;
 const test_high_impact_repeated_term_count: usize = 8;
 const persistent_dense_all_docs_freq_group_size: usize = 8;
 const persistent_dense_all_docs_top_hit_skip_run_max: usize = 4096;
@@ -442,66 +683,12 @@ const text_posting_run_merge_fan_in: usize = 128;
 const text_posting_run_front_coded_legacy_magic = "TKGRUN3\n".*;
 const text_posting_run_front_coded_magic = "TKGRUN4\n".*;
 const text_posting_run_front_coded_prefix_tag_base: u8 = 128;
-const front_coded_entry_prefix_marker: u8 = 0x80;
+const front_coded_entry_prefix_marker = term_format.Internal.front_coded_entry_prefix_marker;
 const text_rebuild_term_arena_retain_limit: usize = 64 * 1024;
 const text_rebuild_term_freq_retain_capacity_limit: usize = 4096;
 const text_rebuild_observer_doc_sample_interval: u64 = 65_536;
 
-pub const PersistentTextMeta = struct {
-    node_digest: u64 = 0,
-    node_by_text_order_digest: u64 = 0,
-    searchable_metadata_digest: u64 = 0,
-    doc_count: u64 = 0,
-    total_text_tokens: u64 = 0,
-    term_count: u64 = 0,
-    term_bytes: u64 = 0,
-    posting_count: u64 = 0,
-    tokenizer: u16 = tokenizer_version,
-
-    const magic = [_]u8{ 'T', 'K', 'G', 'T' };
-    pub const encoded_len: usize = 88;
-
-    fn encode(self: PersistentTextMeta, out: *[encoded_len]u8) void {
-        @memcpy(out[0..4], &magic);
-        std.mem.writeInt(u16, out[4..6], persistent_text_index_version, .little);
-        std.mem.writeInt(u16, out[6..8], encoded_len, .little);
-        std.mem.writeInt(u64, out[8..16], self.node_digest, .little);
-        std.mem.writeInt(u64, out[16..24], self.node_by_text_order_digest, .little);
-        std.mem.writeInt(u64, out[24..32], self.searchable_metadata_digest, .little);
-        std.mem.writeInt(u64, out[32..40], self.doc_count, .little);
-        std.mem.writeInt(u64, out[40..48], self.total_text_tokens, .little);
-        std.mem.writeInt(u64, out[48..56], self.term_count, .little);
-        std.mem.writeInt(u64, out[56..64], self.term_bytes, .little);
-        std.mem.writeInt(u64, out[64..72], self.posting_count, .little);
-        std.mem.writeInt(u16, out[72..74], self.tokenizer, .little);
-        @memset(out[74..88], 0);
-        std.mem.writeInt(u32, out[80..84], persistentTextMetaChecksum(out), .little);
-    }
-
-    fn decode(bytes: *const [encoded_len]u8) !PersistentTextMeta {
-        if (!std.mem.eql(u8, bytes[0..4], &magic)) return error.InvalidRecord;
-        if (std.mem.readInt(u16, bytes[4..6], .little) != persistent_text_index_version) return error.InvalidRecord;
-        if (std.mem.readInt(u16, bytes[6..8], .little) != encoded_len) return error.InvalidRecord;
-        if (!allZero(bytes[74..80]) or !allZero(bytes[84..88])) return error.InvalidRecord;
-        const expected_checksum = std.mem.readInt(u32, bytes[80..84], .little);
-        var checksum_bytes = bytes.*;
-        @memset(checksum_bytes[80..84], 0);
-        if (expected_checksum != persistentTextMetaChecksum(&checksum_bytes)) return error.InvalidRecord;
-        const tokenizer = std.mem.readInt(u16, bytes[72..74], .little);
-        if (tokenizer != tokenizer_version) return error.InvalidRecord;
-        return .{
-            .node_digest = std.mem.readInt(u64, bytes[8..16], .little),
-            .node_by_text_order_digest = std.mem.readInt(u64, bytes[16..24], .little),
-            .searchable_metadata_digest = std.mem.readInt(u64, bytes[24..32], .little),
-            .doc_count = std.mem.readInt(u64, bytes[32..40], .little),
-            .total_text_tokens = std.mem.readInt(u64, bytes[40..48], .little),
-            .term_count = std.mem.readInt(u64, bytes[48..56], .little),
-            .term_bytes = std.mem.readInt(u64, bytes[56..64], .little),
-            .posting_count = std.mem.readInt(u64, bytes[64..72], .little),
-            .tokenizer = tokenizer,
-        };
-    }
-};
+pub const PersistentTextMeta = catalog_format.PersistentTextMeta;
 
 pub const PersistentTextTermsByteStats = struct {
     total_bytes: u64 = 0,
@@ -528,7 +715,7 @@ pub fn readPersistentTextTermsByteStatsAtPath(io: std.Io, path: []const u8) !Per
     var header_bytes: [TextTermsHeader.encoded_len]u8 = undefined;
     const n = try file.readPositionalAll(io, &header_bytes, 0);
     if (n != header_bytes.len) return error.InvalidRecord;
-    const header = try TextTermsHeader.decode(&header_bytes);
+    const header = try decodeTextTermsHeader(&header_bytes);
     const expected_size = try textTermsFileSizeForHeader(header);
     if (stat.size != expected_size) return error.InvalidRecord;
 
@@ -557,464 +744,15 @@ pub fn readPersistentTextTermsByteStatsAtPath(io: std.Io, path: []const u8) !Per
     };
 }
 
-fn persistentTextMetaChecksum(bytes: *const [PersistentTextMeta.encoded_len]u8) u32 {
-    return @truncate(std.hash.Wyhash.hash(0x544B_4754_4D455441, bytes[0..80]));
-}
+pub const TextDocsHeader = catalog_format.TextDocsHeader;
+pub const TextDocRecord = catalog_format.TextDocRecord;
+const TextDocNodeIdOverflowRecord = catalog_format.TextDocNodeIdOverflowRecord;
 
-pub const TextDocsHeader = struct {
-    doc_count: u64 = 0,
-    node_id_overflow_count: u64 = 0,
-    flags: u16 = 0,
-    uniform_kind: u16 = 0,
-    dense_node_id_base: u32 = 0,
+pub const TextTermsHeader = term_format.TextTermsHeader;
+pub const TextTermEntry = term_format.TextTermEntry;
 
-    const magic = [_]u8{ 'T', 'K', 'G', 'D' };
-    pub const encoded_len: usize = 32;
-    const flag_dense_node_ids: u16 = 1;
-    const flag_uniform_kind: u16 = 2;
-    const allowed_flags: u16 = flag_dense_node_ids | flag_uniform_kind;
-
-    fn encode(self: TextDocsHeader, out: *[encoded_len]u8) void {
-        @memcpy(out[0..4], &magic);
-        std.mem.writeInt(u16, out[4..6], persistent_text_index_version, .little);
-        std.mem.writeInt(u16, out[6..8], encoded_len, .little);
-        std.mem.writeInt(u64, out[8..16], self.doc_count, .little);
-        std.mem.writeInt(u64, out[16..24], self.node_id_overflow_count, .little);
-        std.mem.writeInt(u16, out[24..26], self.flags, .little);
-        std.mem.writeInt(u16, out[26..28], self.uniform_kind, .little);
-        std.mem.writeInt(u32, out[28..32], self.dense_node_id_base, .little);
-    }
-
-    fn decode(bytes: []const u8) !TextDocsHeader {
-        if (bytes.len != encoded_len) return error.InvalidRecord;
-        if (!std.mem.eql(u8, bytes[0..4], &magic)) return error.InvalidRecord;
-        if (std.mem.readInt(u16, bytes[4..6], .little) != persistent_text_index_version) return error.InvalidRecord;
-        if (std.mem.readInt(u16, bytes[6..8], .little) != encoded_len) return error.InvalidRecord;
-        const doc_count = std.mem.readInt(u64, bytes[8..16], .little);
-        const node_id_overflow_count = std.mem.readInt(u64, bytes[16..24], .little);
-        const header = TextDocsHeader{
-            .doc_count = doc_count,
-            .node_id_overflow_count = node_id_overflow_count,
-            .flags = std.mem.readInt(u16, bytes[24..26], .little),
-            .uniform_kind = std.mem.readInt(u16, bytes[26..28], .little),
-            .dense_node_id_base = std.mem.readInt(u32, bytes[28..32], .little),
-        };
-        try header.validateShape();
-        return header;
-    }
-
-    fn validateShape(self: TextDocsHeader) !void {
-        if (self.node_id_overflow_count > self.doc_count) return error.InvalidRecord;
-        if ((self.flags & ~allowed_flags) != 0) return error.InvalidRecord;
-        const compact = self.hasDenseNodeIds() and self.hasUniformKind();
-        if (compact) {
-            if (self.doc_count == 0) return error.InvalidRecord;
-            if (self.node_id_overflow_count != 0) return error.InvalidRecord;
-            if (self.dense_node_id_base == 0) return error.InvalidRecord;
-            if (nodeKindFromInt(self.uniform_kind) == null) return error.InvalidRecord;
-            const max_node_id = std.math.add(u64, self.dense_node_id_base, self.doc_count - 1) catch return error.InvalidRecord;
-            if (max_node_id > persistent_doc_node_id_inline_max) return error.InvalidRecord;
-        } else {
-            if (self.flags != 0 or self.uniform_kind != 0 or self.dense_node_id_base != 0) return error.InvalidRecord;
-        }
-    }
-
-    fn denseUniform(doc_count: u64, dense_node_id_base: u32, uniform_kind: core.NodeKind) TextDocsHeader {
-        return .{
-            .doc_count = doc_count,
-            .flags = flag_dense_node_ids | flag_uniform_kind,
-            .uniform_kind = @intFromEnum(uniform_kind),
-            .dense_node_id_base = dense_node_id_base,
-        };
-    }
-
-    fn hasDenseNodeIds(self: TextDocsHeader) bool {
-        return (self.flags & flag_dense_node_ids) != 0;
-    }
-
-    fn hasUniformKind(self: TextDocsHeader) bool {
-        return (self.flags & flag_uniform_kind) != 0;
-    }
-
-    fn hasDenseUniformRecords(self: TextDocsHeader) bool {
-        return self.hasDenseNodeIds() and self.hasUniformKind();
-    }
-
-    fn recordLen(self: TextDocsHeader) u16 {
-        return if (self.hasDenseUniformRecords()) TextDocRecord.dense_uniform_encoded_len else TextDocRecord.encoded_len;
-    }
-};
-
-pub const TextDocRecord = struct {
-    doc_id: u64,
-    node_id: u64,
-    kind: u16,
-    text_tokens: u32,
-
-    pub const encoded_len: usize = 8;
-    pub const dense_uniform_encoded_len: usize = 2;
-
-    fn encode(self: TextDocRecord, out: *[encoded_len]u8) !void {
-        if (self.doc_id == 0 or self.node_id == 0) return error.InvalidRecord;
-        if (self.doc_id == std.math.maxInt(u64) or self.node_id == std.math.maxInt(u64)) return error.InvalidRecord;
-        if (nodeKindFromInt(self.kind) == null) return error.InvalidRecord;
-        if (self.text_tokens > persistent_doc_max_field_tokens) return error.RecordTooLarge;
-        const persisted_node_id: u32 = if (self.node_id > persistent_doc_node_id_inline_max)
-            persistent_doc_node_id_overflow_marker
-        else
-            @intCast(self.node_id);
-        std.mem.writeInt(u32, out[0..4], persisted_node_id, .little);
-        std.mem.writeInt(u16, out[4..6], self.kind, .little);
-        std.mem.writeInt(u16, out[6..8], @intCast(self.text_tokens), .little);
-    }
-
-    fn decode(bytes: []const u8, doc_id: u64) !TextDocRecord {
-        return decodeWithOverflow(bytes, doc_id, null);
-    }
-
-    fn encodeForHeader(self: TextDocRecord, header: TextDocsHeader, out: []u8) !void {
-        if (out.len != header.recordLen()) return error.InvalidRecord;
-        if (!header.hasDenseUniformRecords()) {
-            var full: [encoded_len]u8 = undefined;
-            try self.encode(&full);
-            @memcpy(out, &full);
-            return;
-        }
-        if (self.doc_id == 0 or self.doc_id > header.doc_count) return error.InvalidRecord;
-        const expected_node_id = std.math.add(u64, header.dense_node_id_base, self.doc_id - 1) catch return error.InvalidRecord;
-        if (self.node_id != expected_node_id) return error.InvalidRecord;
-        if (self.kind != header.uniform_kind) return error.InvalidRecord;
-        if (self.text_tokens > persistent_doc_max_field_tokens) return error.RecordTooLarge;
-        std.mem.writeInt(u16, out[0..2], @intCast(self.text_tokens), .little);
-    }
-
-    fn decodeForHeader(bytes: []const u8, header: TextDocsHeader, index: u64, overflow_node_id: ?u64) !TextDocRecord {
-        if (bytes.len != header.recordLen()) return error.InvalidRecord;
-        const doc_id = try nextPersistentTextDocId(index);
-        if (!header.hasDenseUniformRecords()) return decodeWithOverflow(bytes, doc_id, overflow_node_id);
-        if (overflow_node_id != null) return error.InvalidRecord;
-        const node_id = std.math.add(u64, header.dense_node_id_base, index) catch return error.InvalidRecord;
-        if (node_id == 0 or node_id > persistent_doc_node_id_inline_max) return error.InvalidRecord;
-        return .{
-            .doc_id = doc_id,
-            .node_id = node_id,
-            .kind = header.uniform_kind,
-            .text_tokens = std.mem.readInt(u16, bytes[0..2], .little),
-        };
-    }
-
-    fn decodeWithOverflow(bytes: []const u8, doc_id: u64, overflow_node_id: ?u64) !TextDocRecord {
-        if (bytes.len != encoded_len) return error.InvalidRecord;
-        if (doc_id == 0 or doc_id == std.math.maxInt(u64)) return error.InvalidRecord;
-        const kind = std.mem.readInt(u16, bytes[4..6], .little);
-        if (nodeKindFromInt(kind) == null) return error.InvalidRecord;
-        const raw_node_id = std.mem.readInt(u32, bytes[0..4], .little);
-        const node_id = if (raw_node_id == persistent_doc_node_id_overflow_marker)
-            overflow_node_id orelse return error.InvalidRecord
-        else
-            @as(u64, raw_node_id);
-        if (node_id == 0 or node_id == std.math.maxInt(u64)) return error.InvalidRecord;
-        if (raw_node_id != persistent_doc_node_id_overflow_marker and overflow_node_id != null) return error.InvalidRecord;
-        if (raw_node_id == persistent_doc_node_id_overflow_marker and node_id <= persistent_doc_node_id_inline_max) return error.InvalidRecord;
-        return .{
-            .doc_id = doc_id,
-            .node_id = node_id,
-            .kind = kind,
-            .text_tokens = std.mem.readInt(u16, bytes[6..8], .little),
-        };
-    }
-
-    fn needsNodeIdOverflow(self: TextDocRecord) bool {
-        return self.node_id > persistent_doc_node_id_inline_max;
-    }
-
-    pub fn nodeKind(self: TextDocRecord) !core.NodeKind {
-        return nodeKindFromInt(self.kind) orelse error.InvalidRecord;
-    }
-};
-
-const TextDocNodeIdOverflowRecord = struct {
-    doc_id: u64,
-    node_id: u64,
-
-    pub const encoded_len: usize = persistent_doc_node_id_overflow_record_len;
-
-    fn init(doc: TextDocRecord) !TextDocNodeIdOverflowRecord {
-        if (!doc.needsNodeIdOverflow()) return error.InvalidRecord;
-        if (doc.doc_id == 0 or doc.doc_id > persistent_posting_max_doc_id) return error.RecordTooLarge;
-        if (doc.node_id == std.math.maxInt(u64)) return error.InvalidRecord;
-        return .{ .doc_id = doc.doc_id, .node_id = doc.node_id };
-    }
-
-    fn encode(self: TextDocNodeIdOverflowRecord, out: *[encoded_len]u8) !void {
-        if (self.doc_id == 0 or self.doc_id > persistent_posting_max_doc_id) return error.RecordTooLarge;
-        if (self.node_id <= persistent_doc_node_id_inline_max or self.node_id == std.math.maxInt(u64)) return error.InvalidRecord;
-        std.mem.writeInt(u32, out[0..4], @intCast(self.doc_id), .little);
-        std.mem.writeInt(u64, out[4..12], self.node_id, .little);
-    }
-
-    fn decodeBytes(bytes: []const u8) !TextDocNodeIdOverflowRecord {
-        if (bytes.len != encoded_len) return error.InvalidRecord;
-        const doc_id = std.mem.readInt(u32, bytes[0..4], .little);
-        const node_id = std.mem.readInt(u64, bytes[4..12], .little);
-        if (doc_id == 0) return error.InvalidRecord;
-        if (node_id <= persistent_doc_node_id_inline_max or node_id == std.math.maxInt(u64)) return error.InvalidRecord;
-        return .{ .doc_id = doc_id, .node_id = node_id };
-    }
-
-    fn decode(bytes: *const [encoded_len]u8) !TextDocNodeIdOverflowRecord {
-        return decodeBytes(bytes);
-    }
-};
-
-pub const TextTermsHeader = struct {
-    term_count: u64,
-    term_bytes: u64,
-    term_exception_count: u64 = 0,
-    singleton_payload_bytes: u64 = 0,
-
-    const magic = [_]u8{ 'T', 'K', 'G', 'R' };
-    pub const encoded_len: usize = 40;
-
-    fn encode(self: TextTermsHeader, out: *[encoded_len]u8) void {
-        @memcpy(out[0..4], &magic);
-        std.mem.writeInt(u16, out[4..6], persistent_text_index_version, .little);
-        std.mem.writeInt(u16, out[6..8], encoded_len, .little);
-        std.mem.writeInt(u64, out[8..16], self.term_count, .little);
-        std.mem.writeInt(u64, out[16..24], self.term_bytes, .little);
-        std.mem.writeInt(u64, out[24..32], self.term_exception_count, .little);
-        std.mem.writeInt(u64, out[32..40], self.singleton_payload_bytes, .little);
-    }
-
-    fn decode(bytes: []const u8) !TextTermsHeader {
-        if (bytes.len != encoded_len) return error.InvalidRecord;
-        if (!std.mem.eql(u8, bytes[0..4], &magic)) return error.InvalidRecord;
-        if (std.mem.readInt(u16, bytes[4..6], .little) != persistent_text_index_version) return error.InvalidRecord;
-        if (std.mem.readInt(u16, bytes[6..8], .little) != encoded_len) return error.InvalidRecord;
-        const header = TextTermsHeader{
-            .term_count = std.mem.readInt(u64, bytes[8..16], .little),
-            .term_bytes = std.mem.readInt(u64, bytes[16..24], .little),
-            .term_exception_count = std.mem.readInt(u64, bytes[24..32], .little),
-            .singleton_payload_bytes = std.mem.readInt(u64, bytes[32..40], .little),
-        };
-        try header.validateShape();
-        return header;
-    }
-
-    fn validateShape(self: TextTermsHeader) !void {
-        if (self.term_exception_count > self.term_count) return error.InvalidRecord;
-        const singleton_count = self.term_count - self.term_exception_count;
-        if (singleton_count == 0 and self.singleton_payload_bytes != 0) return error.InvalidRecord;
-        if (singleton_count != 0 and self.singleton_payload_bytes == 0) return error.InvalidRecord;
-        if (self.term_bytes > persistent_term_bytes_max_offset) return error.InvalidRecord;
-    }
-};
-
-pub const TextTermEntry = struct {
-    term_len: u32,
-    doc_freq: u32,
-    postings_offset: u64,
-    postings_count: u64,
-    front_prefix_len: ?u8 = null,
-    postings_offset_is_plain: bool = false,
-    postings_offset_is_dense_freq_stream: bool = false,
-
-    pub const encoded_len: usize = 1;
-
-    fn encode(self: TextTermEntry, out: *[encoded_len]u8) !void {
-        if (self.term_len == 0) return error.InvalidRecord;
-        if (self.term_len > persistent_term_max_len) return error.RecordTooLarge;
-        if (self.frontPrefixLen()) |prefix_len| {
-            const suffix_len = try self.frontSuffixLen(prefix_len);
-            if (frontCodedPrefixInlineable(prefix_len, suffix_len)) {
-                out[0] = front_coded_entry_prefix_marker | (prefix_len << 4) | suffix_len;
-                return;
-            }
-        }
-        out[0] = if (self.term_len == persistent_term_max_len) 0 else @intCast(self.term_len);
-    }
-
-    fn decode(bytes: []const u8) !TextTermEntry {
-        if (bytes.len != encoded_len) return error.InvalidRecord;
-        if ((bytes[0] & front_coded_entry_prefix_marker) != 0) {
-            const prefix_len: u8 = (bytes[0] >> 4) & 0x07;
-            const suffix_len: u8 = bytes[0] & 0x0f;
-            if (!frontCodedPrefixInlineable(prefix_len, suffix_len)) return error.InvalidRecord;
-            return .{
-                .term_len = @as(u32, prefix_len) + suffix_len,
-                .doc_freq = 0,
-                .postings_offset = 0,
-                .postings_count = 0,
-                .front_prefix_len = prefix_len,
-            };
-        }
-        const term_len: u32 = if (bytes[0] == 0) persistent_term_max_len else bytes[0];
-        if (term_len > default_max_token_bytes) return error.InvalidRecord;
-        return .{
-            .term_len = term_len,
-            .doc_freq = 0,
-            .postings_offset = 0,
-            .postings_count = 0,
-        };
-    }
-
-    fn withDocFreq(self: TextTermEntry, doc_freq: u32) !TextTermEntry {
-        if (doc_freq == 0) return error.InvalidRecord;
-        if (doc_freq > persistent_term_max_doc_freq) return error.RecordTooLarge;
-        var entry = self;
-        entry.doc_freq = doc_freq;
-        entry.postings_count = doc_freq;
-        if (!termEntryPostingPayloadValid(entry)) return error.InvalidRecord;
-        return entry;
-    }
-
-    fn frontPrefixLen(self: TextTermEntry) ?u8 {
-        return self.front_prefix_len;
-    }
-
-    fn frontSuffixLen(self: TextTermEntry, prefix_len: u8) !u8 {
-        if (prefix_len > self.term_len) return error.InvalidRecord;
-        const suffix_len = self.term_len - prefix_len;
-        if (suffix_len == 0 or suffix_len > persistent_term_max_len) return error.InvalidRecord;
-        return @intCast(suffix_len);
-    }
-};
-
-const TextTermSingletonPayloadCheckpoint = struct {
-    stream_offset: u64,
-    previous_payload: u32,
-
-    pub const encoded_len: usize = persistent_term_singleton_payload_checkpoint_len;
-
-    fn encode(self: TextTermSingletonPayloadCheckpoint, out: *[encoded_len]u8) !void {
-        if (self.stream_offset > std.math.maxInt(u32)) return error.RecordTooLarge;
-        std.mem.writeInt(u32, out[0..4], @intCast(self.stream_offset), .little);
-        std.mem.writeInt(u32, out[4..8], self.previous_payload, .little);
-    }
-
-    fn decode(bytes: *const [encoded_len]u8) !TextTermSingletonPayloadCheckpoint {
-        return .{
-            .stream_offset = std.mem.readInt(u32, bytes[0..4], .little),
-            .previous_payload = std.mem.readInt(u32, bytes[4..8], .little),
-        };
-    }
-};
-
-const TextTermExceptionRecord = struct {
-    doc_freq: u32,
-    postings_offset: u64,
-    postings_offset_is_plain: bool = false,
-    postings_offset_is_dense_freq_stream: bool = false,
-
-    pub const encoded_len: usize = persistent_term_exception_payload_len;
-
-    fn encode(self: TextTermExceptionRecord, out: *[encoded_len]u8) !void {
-        if (self.doc_freq == 0) return error.InvalidRecord;
-        if (self.doc_freq > persistent_term_max_doc_freq) return error.RecordTooLarge;
-        const logical = TextTermEntry{
-            .term_len = 1,
-            .doc_freq = self.doc_freq,
-            .postings_offset = self.postings_offset,
-            .postings_count = self.doc_freq,
-            .postings_offset_is_plain = self.postings_offset_is_plain,
-            .postings_offset_is_dense_freq_stream = self.postings_offset_is_dense_freq_stream,
-        };
-        if (!termEntryPostingPayloadValid(logical)) return error.RecordTooLarge;
-        if (termEntryHasInlinePosting(logical)) return error.InvalidRecord;
-        const encoded_doc_freq = self.doc_freq |
-            (if (self.postings_offset_is_plain) persistent_term_exception_plain_offset_flag else 0) |
-            (if (self.postings_offset_is_dense_freq_stream) persistent_term_exception_dense_freq_stream_flag else 0);
-        std.mem.writeInt(u32, out[0..4], encoded_doc_freq, .little);
-        std.mem.writeInt(u64, out[4..12], self.postings_offset, .little);
-    }
-
-    fn decode(bytes: *const [encoded_len]u8) !TextTermExceptionRecord {
-        const encoded_doc_freq = std.mem.readInt(u32, bytes[0..4], .little);
-        if ((encoded_doc_freq & ~(persistent_term_exception_plain_offset_flag | persistent_term_exception_dense_freq_stream_flag | persistent_term_exception_doc_freq_mask)) != 0) return error.InvalidRecord;
-        const doc_freq = encoded_doc_freq & persistent_term_exception_doc_freq_mask;
-        if (doc_freq == 0) return error.InvalidRecord;
-        if (doc_freq > persistent_term_max_doc_freq) return error.InvalidRecord;
-        const postings_offset = std.mem.readInt(u64, bytes[4..12], .little);
-        const postings_offset_is_plain = (encoded_doc_freq & persistent_term_exception_plain_offset_flag) != 0;
-        const postings_offset_is_dense_freq_stream = (encoded_doc_freq & persistent_term_exception_dense_freq_stream_flag) != 0;
-        const record = TextTermExceptionRecord{
-            .doc_freq = doc_freq,
-            .postings_offset = postings_offset,
-            .postings_offset_is_plain = postings_offset_is_plain,
-            .postings_offset_is_dense_freq_stream = postings_offset_is_dense_freq_stream,
-        };
-        const logical = TextTermEntry{
-            .term_len = 1,
-            .doc_freq = record.doc_freq,
-            .postings_offset = record.postings_offset,
-            .postings_count = record.doc_freq,
-            .postings_offset_is_plain = record.postings_offset_is_plain,
-            .postings_offset_is_dense_freq_stream = record.postings_offset_is_dense_freq_stream,
-        };
-        if (!termEntryPostingPayloadValid(logical)) return error.InvalidRecord;
-        if (termEntryHasInlinePosting(logical)) return error.InvalidRecord;
-        return record;
-    }
-};
-
-pub const TextPostingsHeader = struct {
-    posting_count: u64,
-    body_bytes: u64,
-
-    const magic = [_]u8{ 'T', 'K', 'G', 'P' };
-    pub const encoded_len: usize = 32;
-
-    fn encode(self: TextPostingsHeader, out: *[encoded_len]u8) void {
-        @memcpy(out[0..4], &magic);
-        std.mem.writeInt(u16, out[4..6], persistent_text_index_version, .little);
-        std.mem.writeInt(u16, out[6..8], encoded_len, .little);
-        std.mem.writeInt(u64, out[8..16], self.posting_count, .little);
-        std.mem.writeInt(u64, out[16..24], self.body_bytes, .little);
-        @memset(out[24..32], 0);
-    }
-
-    fn decode(bytes: []const u8) !TextPostingsHeader {
-        if (bytes.len != encoded_len) return error.InvalidRecord;
-        if (!std.mem.eql(u8, bytes[0..4], &magic)) return error.InvalidRecord;
-        if (std.mem.readInt(u16, bytes[4..6], .little) != persistent_text_index_version) return error.InvalidRecord;
-        if (std.mem.readInt(u16, bytes[6..8], .little) != encoded_len) return error.InvalidRecord;
-        if (!allZero(bytes[24..32])) return error.InvalidRecord;
-        return .{
-            .posting_count = std.mem.readInt(u64, bytes[8..16], .little),
-            .body_bytes = std.mem.readInt(u64, bytes[16..24], .little),
-        };
-    }
-};
-
-pub const TextPostingRecord = struct {
-    doc_id: u64,
-    text_freq: u32 = 0,
-    kind_freq: u32 = 0,
-
-    pub const encoded_len: usize = 6;
-
-    fn encode(self: TextPostingRecord, out: *[encoded_len]u8) !void {
-        try validateTextPostingFields(self.doc_id, self.text_freq, self.kind_freq);
-        std.mem.writeInt(u32, out[0..4], @intCast(self.doc_id), .little);
-        std.mem.writeInt(u16, out[4..6], @intCast(self.text_freq), .little);
-    }
-
-    fn decode(bytes: []const u8) !TextPostingRecord {
-        if (bytes.len != encoded_len) return error.InvalidRecord;
-        const doc_id: u64 = std.mem.readInt(u32, bytes[0..4], .little);
-        const text_freq: u32 = std.mem.readInt(u16, bytes[4..6], .little);
-        const kind_freq: u32 = 0;
-        try validateTextPostingFields(doc_id, text_freq, kind_freq);
-        return .{ .doc_id = doc_id, .text_freq = text_freq, .kind_freq = kind_freq };
-    }
-};
-
-fn validateTextPostingFields(doc_id: u64, text_freq: u32, kind_freq: u32) !void {
-    if (doc_id == 0) return error.InvalidRecord;
-    if (doc_id > persistent_posting_max_doc_id) return error.RecordTooLarge;
-    if (text_freq == 0 and kind_freq == 0) return error.InvalidRecord;
-    if (text_freq > persistent_posting_max_field_freq or kind_freq > persistent_posting_max_kind_freq) return error.RecordTooLarge;
-}
+pub const TextPostingsHeader = posting_format.TextPostingsHeader;
+pub const TextPostingRecord = posting_format.TextPostingRecord;
 
 const text_posting_run_record_long_term_threshold = 64;
 
@@ -1030,7 +768,7 @@ const TextPostingRunRecord = struct {
     pub const max_encoded_len: usize = header_len + default_max_token_bytes;
     const term_len_offset: usize = TextPostingRecord.encoded_len;
 
-    fn init(term_bytes: []const u8, posting: TextPostingRecord) !TextPostingRunRecord {
+    pub fn init(term_bytes: []const u8, posting: TextPostingRecord) !TextPostingRunRecord {
         if (term_bytes.len == 0 or term_bytes.len > default_max_token_bytes) return error.InvalidRecord;
         try validateTextPostingFields(posting.doc_id, posting.text_freq, posting.kind_freq);
         var record = TextPostingRunRecord{
@@ -1068,7 +806,7 @@ const TextPostingRunRecord = struct {
     fn encode(self: TextPostingRunRecord, out: *[max_encoded_len]u8) !usize {
         const term_len = std.math.cast(u8, self.term_len) orelse return error.RecordTooLarge;
         var posting_bytes: [TextPostingRecord.encoded_len]u8 = undefined;
-        try (try self.toPosting()).encode(&posting_bytes);
+        try encodeTextPostingRecord(try self.toPosting(), &posting_bytes);
         @memcpy(out[0..TextPostingRecord.encoded_len], &posting_bytes);
         out[term_len_offset] = term_len;
         const term_len_usize: usize = self.term_len;
@@ -1081,11 +819,11 @@ const TextPostingRunRecord = struct {
         const term_len: usize = bytes[term_len_offset];
         if (term_len == 0 or term_len > default_max_token_bytes) return error.InvalidRecord;
         if (bytes.len != header_len + term_len) return error.InvalidRecord;
-        const posting = try TextPostingRecord.decode(bytes[0..TextPostingRecord.encoded_len]);
+        const posting = try decodeTextPostingRecord(bytes[0..TextPostingRecord.encoded_len]);
         return try TextPostingRunRecord.init(bytes[header_len .. header_len + term_len], posting);
     }
 
-    fn term(self: *const TextPostingRunRecord) []const u8 {
+    pub fn term(self: *const TextPostingRunRecord) []const u8 {
         return self.term_bytes[0..@as(usize, self.term_len)];
     }
 
@@ -1098,7 +836,7 @@ const TextPostingRunRecord = struct {
         };
     }
 
-    fn toPostingAssumeValid(self: TextPostingRunRecord) TextPostingRecord {
+    pub fn toPostingAssumeValid(self: TextPostingRunRecord) TextPostingRecord {
         return .{
             .doc_id = self.doc_id,
             .text_freq = self.text_freq,
@@ -1139,7 +877,7 @@ const TextPostingRunChunkRecord = struct {
         };
     }
 
-    fn term(self: TextPostingRunChunkRecord, term_bytes: []const u8) ![]const u8 {
+    pub fn term(self: TextPostingRunChunkRecord, term_bytes: []const u8) ![]const u8 {
         const start: usize = self.term_offset;
         const end = std.math.add(usize, start, self.term_len) catch return error.InvalidRecord;
         if (end > term_bytes.len) return error.InvalidRecord;
@@ -1232,288 +970,31 @@ fn textPostingRunChunkRecordLessThan(term_bytes: []const u8, lhs: TextPostingRun
     return lhs.doc_id < rhs.doc_id;
 }
 
-pub const TextPostingBlocksHeader = struct {
-    term_count: u64,
-    posting_count: u64,
-    block_count: u64,
-    block_size: u64,
+pub const TextPostingBlocksHeader = search_acceleration_format.TextPostingBlocksHeader;
+pub const TextPostingBlockRecord = search_acceleration_format.TextPostingBlockRecord;
+const encodeTextPostingBlocksHeader = search_acceleration_format.Internal.encodeBlocksHeader;
+const decodeTextPostingBlocksHeader = search_acceleration_format.Internal.decodeBlocksHeader;
+const encodeTextPostingBlockRecord = search_acceleration_format.Internal.encodeBlockRecord;
+const decodeTextPostingBlockRecord = search_acceleration_format.Internal.decodeBlockRecord;
+const textPostingBlockRecordFromStats = search_acceleration_format.Internal.blockRecordFromStats;
+const textPostingBlockRecordConservativelyMatches = search_acceleration_format.Internal.blockRecordConservativelyMatches;
+const PersistentBlockScoreBounds = search_acceleration_format.Internal.PersistentBlockScoreBounds;
+const quantizePersistentBlockScoreBounds = search_acceleration_format.Internal.quantizeBlockScoreBounds;
+const encodePersistentBlockOrdinal = search_acceleration_format.Internal.encodeBlockOrdinal;
+const decodePersistentBlockOrdinal = search_acceleration_format.Internal.decodeBlockOrdinal;
 
-    const magic = [_]u8{ 'T', 'K', 'G', 'B' };
-    pub const encoded_len: usize = 40;
-
-    fn encode(self: TextPostingBlocksHeader, out: *[encoded_len]u8) void {
-        @memcpy(out[0..4], &magic);
-        std.mem.writeInt(u16, out[4..6], persistent_text_index_version, .little);
-        std.mem.writeInt(u16, out[6..8], encoded_len, .little);
-        std.mem.writeInt(u64, out[8..16], self.term_count, .little);
-        std.mem.writeInt(u64, out[16..24], self.posting_count, .little);
-        std.mem.writeInt(u64, out[24..32], self.block_count, .little);
-        std.mem.writeInt(u64, out[32..40], self.block_size, .little);
-    }
-
-    fn decode(bytes: []const u8) !TextPostingBlocksHeader {
-        if (bytes.len != encoded_len) return error.InvalidRecord;
-        if (!std.mem.eql(u8, bytes[0..4], &magic)) return error.InvalidRecord;
-        if (std.mem.readInt(u16, bytes[4..6], .little) != persistent_text_index_version) return error.InvalidRecord;
-        if (std.mem.readInt(u16, bytes[6..8], .little) != encoded_len) return error.InvalidRecord;
-        const block_size = std.mem.readInt(u64, bytes[32..40], .little);
-        if (block_size == 0) return error.InvalidRecord;
-        return .{
-            .term_count = std.mem.readInt(u64, bytes[8..16], .little),
-            .posting_count = std.mem.readInt(u64, bytes[16..24], .little),
-            .block_count = std.mem.readInt(u64, bytes[24..32], .little),
-            .block_size = block_size,
-        };
-    }
-};
-
-pub const TextPostingBlockRecord = struct {
-    max_weighted_tf: f32,
-    min_doc_len: f32,
-    last_doc_id: u64,
-
-    pub const encoded_len: usize = 8;
-    const max_tf_offset: usize = 0;
-    const min_doc_len_offset: usize = max_tf_offset + 2;
-    const last_doc_id_offset: usize = min_doc_len_offset + 2;
-
-    fn encode(self: TextPostingBlockRecord, out: *[encoded_len]u8) !void {
-        if (!std.math.isFinite(self.max_weighted_tf) or self.max_weighted_tf <= 0) return error.InvalidRecord;
-        if (!std.math.isFinite(self.min_doc_len) or self.min_doc_len <= 0) return error.InvalidRecord;
-        if (self.last_doc_id == 0 or self.last_doc_id > persistent_posting_max_doc_id) return error.RecordTooLarge;
-        std.mem.writeInt(u16, out[max_tf_offset..min_doc_len_offset], try encodePersistentF16Ceil(self.max_weighted_tf), .little);
-        std.mem.writeInt(u16, out[min_doc_len_offset..last_doc_id_offset], try encodePersistentF16Floor(self.min_doc_len), .little);
-        std.mem.writeInt(u32, out[last_doc_id_offset..encoded_len], @intCast(self.last_doc_id), .little);
-    }
-
-    fn decode(bytes: []const u8) !TextPostingBlockRecord {
-        if (bytes.len != encoded_len) return error.InvalidRecord;
-        const max_weighted_tf = try decodePersistentF16(std.mem.readInt(u16, bytes[max_tf_offset..min_doc_len_offset], .little));
-        const min_doc_len = try decodePersistentF16(std.mem.readInt(u16, bytes[min_doc_len_offset..last_doc_id_offset], .little));
-        const last_doc_id = std.mem.readInt(u32, bytes[last_doc_id_offset..encoded_len], .little);
-        if (!std.math.isFinite(max_weighted_tf) or max_weighted_tf <= 0) return error.InvalidRecord;
-        if (!std.math.isFinite(min_doc_len) or min_doc_len <= 0) return error.InvalidRecord;
-        if (last_doc_id == 0) return error.InvalidRecord;
-        return .{
-            .max_weighted_tf = max_weighted_tf,
-            .min_doc_len = min_doc_len,
-            .last_doc_id = last_doc_id,
-        };
-    }
-
-    fn fromStats(stats: TextPostingBlockStats) !TextPostingBlockRecord {
-        if (stats.last_doc_id == 0 or stats.last_doc_id > persistent_posting_max_doc_id) return error.RecordTooLarge;
-        return .{
-            .max_weighted_tf = stats.max_weighted_tf,
-            .min_doc_len = stats.min_doc_len,
-            .last_doc_id = stats.last_doc_id,
-        };
-    }
-
-    fn conservativelyMatches(self: TextPostingBlockRecord, exact: TextPostingBlockRecord) bool {
-        return self.max_weighted_tf >= exact.max_weighted_tf and
-            self.min_doc_len <= exact.min_doc_len and
-            self.last_doc_id == exact.last_doc_id;
-    }
-};
-
-fn encodePersistentF16Ceil(value: f32) !u16 {
-    if (!std.math.isFinite(value) or value <= 0) return error.InvalidRecord;
-    if (value > persistent_block_score_f16_max) return error.RecordTooLarge;
-    var half: f16 = @floatCast(value);
-    var widened: f32 = @floatCast(half);
-    var bits: u16 = @bitCast(half);
-    if (widened < value) {
-        if (bits >= @as(u16, @bitCast(std.math.floatMax(f16)))) return error.RecordTooLarge;
-        bits += 1;
-        half = @bitCast(bits);
-        widened = @floatCast(half);
-    }
-    if (!std.math.isFinite(widened) or widened < value) return error.RecordTooLarge;
-    return bits;
-}
-
-fn encodePersistentF16Floor(value: f32) !u16 {
-    if (!std.math.isFinite(value) or value <= 0) return error.InvalidRecord;
-    var half: f16 = if (value > persistent_block_score_f16_max)
-        std.math.floatMax(f16)
-    else
-        @floatCast(value);
-    var widened: f32 = @floatCast(half);
-    var bits: u16 = @bitCast(half);
-    if (widened > value) {
-        if (bits == 0) return error.RecordTooLarge;
-        bits -= 1;
-        half = @bitCast(bits);
-        widened = @floatCast(half);
-    }
-    if (!std.math.isFinite(widened) or widened <= 0 or widened > value) return error.RecordTooLarge;
-    return bits;
-}
-
-fn decodePersistentF16(bits: u16) !f32 {
-    const value: f32 = @floatCast(@as(f16, @bitCast(bits)));
-    if (!std.math.isFinite(value) or value <= 0) return error.InvalidRecord;
-    return value;
-}
-
-const PersistentBlockScoreBounds = struct {
-    max_weighted_tf: f32,
-    min_doc_len: f32,
-};
-
-fn quantizePersistentBlockScoreBounds(max_weighted_tf: f32, min_doc_len: f32) !PersistentBlockScoreBounds {
-    return .{
-        .max_weighted_tf = try decodePersistentF16(try encodePersistentF16Ceil(max_weighted_tf)),
-        .min_doc_len = try decodePersistentF16(try encodePersistentF16Floor(min_doc_len)),
-    };
-}
-
-fn encodePersistentU24(value: u64, out: *[persistent_u24_len]u8) !void {
-    if (value > persistent_u24_max) return error.RecordTooLarge;
-    out[0] = @truncate(value);
-    out[1] = @truncate(value >> 8);
-    out[2] = @truncate(value >> 16);
-}
-
-fn decodePersistentU24(bytes: []const u8) !u64 {
-    if (bytes.len != persistent_u24_len) return error.InvalidRecord;
-    return @as(u64, bytes[0]) |
-        (@as(u64, bytes[1]) << 8) |
-        (@as(u64, bytes[2]) << 16);
-}
-
-fn encodePersistentBlockOrdinal(value: u64, out: *[persistent_posting_block_ordinal_len]u8) !void {
-    if (value > persistent_posting_max_block_ordinal) return error.RecordTooLarge;
-    std.mem.writeInt(u32, out, @intCast(value), .little);
-}
-
-fn decodePersistentBlockOrdinal(bytes: []const u8) !u64 {
-    if (bytes.len != persistent_posting_block_ordinal_len) return error.InvalidRecord;
-    return std.mem.readInt(u32, bytes[0..4], .little);
-}
-
-pub const TextPostingBlockImpactsHeader = struct {
-    term_count: u64,
-    block_count: u64,
-
-    const magic = [_]u8{ 'T', 'K', 'G', 'P' };
-    pub const encoded_len: usize = 24;
-
-    fn encode(self: TextPostingBlockImpactsHeader, out: *[encoded_len]u8) void {
-        @memcpy(out[0..4], &magic);
-        std.mem.writeInt(u16, out[4..6], persistent_text_index_version, .little);
-        std.mem.writeInt(u16, out[6..8], encoded_len, .little);
-        std.mem.writeInt(u64, out[8..16], self.term_count, .little);
-        std.mem.writeInt(u64, out[16..24], self.block_count, .little);
-    }
-
-    fn decode(bytes: []const u8) !TextPostingBlockImpactsHeader {
-        if (bytes.len != encoded_len) return error.InvalidRecord;
-        if (!std.mem.eql(u8, bytes[0..4], &magic)) return error.InvalidRecord;
-        if (std.mem.readInt(u16, bytes[4..6], .little) != persistent_text_index_version) return error.InvalidRecord;
-        if (std.mem.readInt(u16, bytes[6..8], .little) != encoded_len) return error.InvalidRecord;
-        return .{
-            .term_count = std.mem.readInt(u64, bytes[8..16], .little),
-            .block_count = std.mem.readInt(u64, bytes[16..24], .little),
-        };
-    }
-};
-
-pub const TextTermTopHitsHeader = struct {
-    term_count: u64,
-    hit_count: u64,
-    hit_term_count: u64,
-    capacity: u64,
-
-    const magic = [_]u8{ 'T', 'K', 'G', 'H' };
-    pub const encoded_len: usize = 40;
-
-    fn encode(self: TextTermTopHitsHeader, out: *[encoded_len]u8) void {
-        @memcpy(out[0..4], &magic);
-        std.mem.writeInt(u16, out[4..6], persistent_text_index_version, .little);
-        std.mem.writeInt(u16, out[6..8], encoded_len, .little);
-        std.mem.writeInt(u64, out[8..16], self.term_count, .little);
-        std.mem.writeInt(u64, out[16..24], self.hit_count, .little);
-        std.mem.writeInt(u64, out[24..32], self.hit_term_count, .little);
-        std.mem.writeInt(u64, out[32..40], self.capacity, .little);
-    }
-
-    fn decode(bytes: []const u8) !TextTermTopHitsHeader {
-        if (bytes.len != encoded_len) return error.InvalidRecord;
-        if (!std.mem.eql(u8, bytes[0..4], &magic)) return error.InvalidRecord;
-        if (std.mem.readInt(u16, bytes[4..6], .little) != persistent_text_index_version) return error.InvalidRecord;
-        if (std.mem.readInt(u16, bytes[6..8], .little) != encoded_len) return error.InvalidRecord;
-        const term_count = std.mem.readInt(u64, bytes[8..16], .little);
-        const hit_count = std.mem.readInt(u64, bytes[16..24], .little);
-        const hit_term_count = std.mem.readInt(u64, bytes[24..32], .little);
-        const capacity = std.mem.readInt(u64, bytes[32..40], .little);
-        if (capacity == 0) return error.InvalidRecord;
-        if (hit_term_count > term_count or hit_term_count > hit_count) return error.InvalidRecord;
-        if (hit_count != 0 and hit_term_count == 0) return error.InvalidRecord;
-        const expected_hit_count = std.math.mul(u64, hit_term_count, capacity) catch return error.InvalidRecord;
-        if (hit_count != expected_hit_count) return error.InvalidRecord;
-        return .{
-            .term_count = term_count,
-            .hit_count = hit_count,
-            .hit_term_count = hit_term_count,
-            .capacity = capacity,
-        };
-    }
-};
-
-pub const TextTermTopHitTermRecord = struct {
-    term_index: u64,
-    hit_offset: u64,
-    hit_count: u64,
-
-    pub const encoded_len: usize = 4;
-
-    fn encode(self: TextTermTopHitTermRecord, out: *[encoded_len]u8) !void {
-        if (self.term_index > std.math.maxInt(u32)) return error.RecordTooLarge;
-        if (self.hit_count != persistent_term_top_hit_capacity) return error.InvalidRecord;
-        std.mem.writeInt(u32, out[0..4], @intCast(self.term_index), .little);
-    }
-
-    fn decode(bytes: []const u8, ordinal: u64, capacity: u64) !TextTermTopHitTermRecord {
-        if (bytes.len != encoded_len) return error.InvalidRecord;
-        if (capacity == 0 or capacity > std.math.maxInt(u32)) return error.InvalidRecord;
-        return .{
-            .term_index = std.mem.readInt(u32, bytes[0..4], .little),
-            .hit_offset = std.math.mul(u64, ordinal, capacity) catch return error.InvalidRecord,
-            .hit_count = capacity,
-        };
-    }
-};
-
-pub const TextTermTopHitRecord = struct {
-    doc_id: u64,
-    text_freq: u32 = 0,
-    node_id: u64 = 0,
-    score: f32,
-
-    pub const encoded_len: usize = 6;
-
-    fn encode(self: TextTermTopHitRecord, out: *[encoded_len]u8) !void {
-        if (self.doc_id == 0) return error.InvalidRecord;
-        if (self.doc_id > persistent_posting_max_doc_id) return error.RecordTooLarge;
-        if (self.text_freq == 0) return error.InvalidRecord;
-        if (self.text_freq > persistent_posting_max_field_freq) return error.RecordTooLarge;
-        if (self.node_id == std.math.maxInt(u64)) return error.InvalidRecord;
-        if (!std.math.isFinite(self.score)) return error.InvalidRecord;
-        std.mem.writeInt(u32, out[0..4], @intCast(self.doc_id), .little);
-        std.mem.writeInt(u16, out[4..6], @intCast(self.text_freq), .little);
-    }
-
-    fn decode(bytes: []const u8) !TextTermTopHitRecord {
-        if (bytes.len != encoded_len) return error.InvalidRecord;
-        const doc_id = std.mem.readInt(u32, bytes[0..4], .little);
-        const text_freq = std.mem.readInt(u16, bytes[4..6], .little);
-        if (doc_id == 0) return error.InvalidRecord;
-        if (text_freq == 0) return error.InvalidRecord;
-        return .{ .doc_id = doc_id, .text_freq = text_freq, .score = 0 };
-    }
-};
+pub const TextPostingBlockImpactsHeader = search_acceleration_format.TextPostingBlockImpactsHeader;
+pub const TextTermTopHitsHeader = search_acceleration_format.TextTermTopHitsHeader;
+pub const TextTermTopHitTermRecord = search_acceleration_format.TextTermTopHitTermRecord;
+pub const TextTermTopHitRecord = search_acceleration_format.TextTermTopHitRecord;
+const encodeTextPostingBlockImpactsHeader = search_acceleration_format.Internal.encodeImpactsHeader;
+const decodeTextPostingBlockImpactsHeader = search_acceleration_format.Internal.decodeImpactsHeader;
+const encodeTextTermTopHitsHeader = search_acceleration_format.Internal.encodeTopHitsHeader;
+const decodeTextTermTopHitsHeader = search_acceleration_format.Internal.decodeTopHitsHeader;
+const encodeTextTermTopHitTermRecord = search_acceleration_format.Internal.encodeTopHitTermRecord;
+const decodeTextTermTopHitTermRecord = search_acceleration_format.Internal.decodeTopHitTermRecord;
+const encodeTextTermTopHitRecord = search_acceleration_format.Internal.encodeTopHitRecord;
+const decodeTextTermTopHitRecord = search_acceleration_format.Internal.decodeTopHitRecord;
 
 const TextTopHitDocStats = struct {
     doc_id: u64,
@@ -1526,7 +1007,7 @@ const TextDocRankEntry = struct {
     doc_id: u32,
     text_tokens: u32,
 
-    fn init(doc: TextDocRecord) !TextDocRankEntry {
+    pub fn init(doc: TextDocRecord) !TextDocRankEntry {
         if (doc.doc_id == 0 or doc.doc_id > persistent_posting_max_doc_id) return error.RecordTooLarge;
         if (doc.node_id == 0 or doc.node_id == std.math.maxInt(u64)) return error.InvalidRecord;
         if (doc.text_tokens > persistent_doc_max_field_tokens) return error.RecordTooLarge;
@@ -1537,7 +1018,7 @@ const TextDocRankEntry = struct {
         };
     }
 
-    fn docLen(self: TextDocRankEntry) f32 {
+    pub fn docLen(self: TextDocRankEntry) f32 {
         return persistentDocLenFromTextTokens(self.text_tokens);
     }
 };
@@ -1571,7 +1052,7 @@ const TextDocsFileView = struct {
         };
     }
 
-    fn deinit(self: *TextDocsFileView) void {
+    pub fn deinit(self: *TextDocsFileView) void {
         if (self.map) |*map| map.destroy(self.io);
         self.file.close(self.io);
     }
@@ -1606,7 +1087,7 @@ const TextDocsFileView = struct {
         return self.header;
     }
 
-    fn readDocAt(self: *TextDocsFileView, index: u64) !TextDocRecord {
+    pub fn readDocAt(self: *TextDocsFileView, index: u64) !TextDocRecord {
         if (index >= self.header.doc_count) return error.InvalidRecord;
         const offset = try textDocRecordOffsetForHeader(self.header, index);
         const record_len = self.header.recordLen();
@@ -1622,7 +1103,7 @@ const TextDocsFileView = struct {
         return try TextDocRecord.decodeForHeader(bytes[0..record_len], self.header, index, overflow_node_id);
     }
 
-    fn readTopHitDocStatsAt(self: *TextDocsFileView, index: u64) !TextTopHitDocStats {
+    pub fn readTopHitDocStatsAt(self: *TextDocsFileView, index: u64) !TextTopHitDocStats {
         if (index >= self.header.doc_count) return error.InvalidRecord;
         const doc_id = try nextPersistentTextDocId(index);
         if (self.header.hasDenseUniformRecords()) {
@@ -1737,19 +1218,19 @@ const TextTermsFileView = struct {
 
     fn readHeader(self: *TextTermsFileView) !TextTermsHeader {
         if (try self.mappedBytesAt(TextTermsHeader.encoded_len, 0)) |bytes| {
-            return try TextTermsHeader.decode(bytes);
+            return try decodeTextTermsHeader(bytes);
         }
         const bytes = try self.readAt(TextTermsHeader.encoded_len, 0);
-        return try TextTermsHeader.decode(&bytes);
+        return try decodeTextTermsHeader(&bytes);
     }
 
     fn readPackedEntryAt(self: *TextTermsFileView, index: u64) !TextTermEntry {
         const offset = try textTermEntryOffset(index);
         if (try self.mappedBytesAt(TextTermEntry.encoded_len, offset)) |bytes| {
-            return try TextTermEntry.decode(bytes);
+            return try decodeTextTermEntry(bytes);
         }
         const bytes = try self.readAt(TextTermEntry.encoded_len, offset);
-        return try TextTermEntry.decode(&bytes);
+        return try decodeTextTermEntry(&bytes);
     }
 
     fn readTermExceptionRecord(self: *TextTermsFileView, header: TextTermsHeader, exception_index: u64) !TextTermExceptionRecord {
@@ -1758,10 +1239,10 @@ const TextTermsFileView = struct {
         if (try self.mappedBytesAt(TextTermExceptionRecord.encoded_len, offset)) |bytes| {
             var copy: [TextTermExceptionRecord.encoded_len]u8 = undefined;
             @memcpy(&copy, bytes);
-            return try TextTermExceptionRecord.decode(&copy);
+            return try decodeTextTermExceptionRecord(&copy);
         }
         const bytes = try self.readAt(TextTermExceptionRecord.encoded_len, offset);
-        return try TextTermExceptionRecord.decode(&bytes);
+        return try decodeTextTermExceptionRecord(&bytes);
     }
 
     fn readTermExceptionRankCheckpoint(self: *TextTermsFileView, header: TextTermsHeader, checkpoint_index: u64) !u64 {
@@ -1831,10 +1312,10 @@ const TextTermsFileView = struct {
         if (try self.mappedBytesAt(TextTermSingletonPayloadCheckpoint.encoded_len, offset)) |bytes| {
             var copy: [TextTermSingletonPayloadCheckpoint.encoded_len]u8 = undefined;
             @memcpy(&copy, bytes);
-            return try TextTermSingletonPayloadCheckpoint.decode(&copy);
+            return try decodeTextTermSingletonPayloadCheckpoint(&copy);
         }
         const bytes = try self.readAt(TextTermSingletonPayloadCheckpoint.encoded_len, offset);
-        return try TextTermSingletonPayloadCheckpoint.decode(&bytes);
+        return try decodeTextTermSingletonPayloadCheckpoint(&bytes);
     }
 
     fn readSingletonPayloadAt(self: *TextTermsFileView, header: TextTermsHeader, singleton_ordinal: u64) !u32 {
@@ -1955,7 +1436,7 @@ const TextTermsFileView = struct {
     }
 
     fn readFrontCodedPrefixLen(self: *TextTermsFileView, header: TextTermsHeader, index: u64, encoded_offset: u64, previous_term_len: usize, entry: TextTermEntry) !u8 {
-        if (entry.frontPrefixLen()) |prefix_len| {
+        if (textTermEntryFrontPrefixLen(entry)) |prefix_len| {
             if (index % persistent_term_byte_offset_checkpoint_terms == 0 and prefix_len != 0) return error.InvalidRecord;
             if (prefix_len > previous_term_len or prefix_len > entry.term_len) return error.InvalidRecord;
             return prefix_len;
@@ -1986,7 +1467,7 @@ const TextPostingsFileView = struct {
     size: u64,
     map: ?std.Io.File.MemoryMap = null,
 
-    fn open(store: storage_mod.Store, path: []const u8) !TextPostingsFileView {
+    pub fn open(store: storage_mod.Store, path: []const u8) !TextPostingsFileView {
         var file = try std.Io.Dir.cwd().openFile(store.io, path, .{});
         errdefer file.close(store.io);
 
@@ -2003,7 +1484,7 @@ const TextPostingsFileView = struct {
         };
     }
 
-    fn deinit(self: *TextPostingsFileView) void {
+    pub fn deinit(self: *TextPostingsFileView) void {
         if (self.map) |*map| map.destroy(self.io);
         self.file.close(self.io);
     }
@@ -2033,12 +1514,12 @@ const TextPostingsFileView = struct {
         return bytes;
     }
 
-    fn readHeader(self: *TextPostingsFileView) !TextPostingsHeader {
+    pub fn readHeader(self: *TextPostingsFileView) !TextPostingsHeader {
         if (try self.mappedBytesAt(TextPostingsHeader.encoded_len, 0)) |bytes| {
-            return try TextPostingsHeader.decode(bytes);
+            return try decodeTextPostingsHeader(bytes);
         }
         const bytes = try self.readAt(TextPostingsHeader.encoded_len, 0);
-        return try TextPostingsHeader.decode(&bytes);
+        return try decodeTextPostingsHeader(&bytes);
     }
 
     fn readByteAt(self: *TextPostingsFileView, offset: u64) !u8 {
@@ -2095,10 +1576,10 @@ const TextPostingBlocksFileView = struct {
 
     fn readHeader(self: *TextPostingBlocksFileView) !TextPostingBlocksHeader {
         if (try self.mappedBytesAt(TextPostingBlocksHeader.encoded_len, 0)) |bytes| {
-            return try TextPostingBlocksHeader.decode(bytes);
+            return try decodeTextPostingBlocksHeader(bytes);
         }
         const bytes = try self.readAt(TextPostingBlocksHeader.encoded_len, 0);
-        return try TextPostingBlocksHeader.decode(&bytes);
+        return try decodeTextPostingBlocksHeader(&bytes);
     }
 
     fn readTermBlockOffsetCheckpoint(self: *TextPostingBlocksFileView, block_count: u64, checkpoint_index: u64) !u64 {
@@ -2119,13 +1600,13 @@ const TextPostingBlocksFileView = struct {
         return std.mem.readInt(u32, &bytes, .little);
     }
 
-    fn readBlockRecordAt(self: *TextPostingBlocksFileView, term_count: u64, index: u64) !TextPostingBlockRecord {
+    pub fn readBlockRecordAt(self: *TextPostingBlocksFileView, term_count: u64, index: u64) !TextPostingBlockRecord {
         const offset = try textPostingBlockRecordOffset(term_count, index);
         if (try self.mappedBytesAt(TextPostingBlockRecord.encoded_len, offset)) |bytes| {
-            return try TextPostingBlockRecord.decode(bytes);
+            return try decodeTextPostingBlockRecord(bytes);
         }
         const bytes = try self.readAt(TextPostingBlockRecord.encoded_len, offset);
-        return try TextPostingBlockRecord.decode(&bytes);
+        return try decodeTextPostingBlockRecord(&bytes);
     }
 };
 
@@ -2176,13 +1657,13 @@ const TextPostingBlockImpactsFileView = struct {
 
     fn readHeader(self: *TextPostingBlockImpactsFileView) !TextPostingBlockImpactsHeader {
         if (try self.mappedBytesAt(TextPostingBlockImpactsHeader.encoded_len, 0)) |bytes| {
-            return try TextPostingBlockImpactsHeader.decode(bytes);
+            return try decodeTextPostingBlockImpactsHeader(bytes);
         }
         const bytes = try self.readAt(TextPostingBlockImpactsHeader.encoded_len, 0);
-        return try TextPostingBlockImpactsHeader.decode(&bytes);
+        return try decodeTextPostingBlockImpactsHeader(&bytes);
     }
 
-    fn readBlockIndexAt(self: *TextPostingBlockImpactsFileView, term_count: u64, index: u64) !u64 {
+    pub fn readBlockIndexAt(self: *TextPostingBlockImpactsFileView, term_count: u64, index: u64) !u64 {
         const offset = try textPostingBlockImpactRecordOffset(term_count, index);
         if (try self.mappedBytesAt(persistent_posting_block_ordinal_len, offset)) |bytes| {
             return try decodePersistentBlockOrdinal(bytes);
@@ -2397,202 +1878,319 @@ const PersistentTextCatalogStats = struct {
     posting_count: u64 = 0,
 };
 
-pub const PersistentTextRebuildTimings = struct {
-    docs_ns: u128 = 0,
-    docs_layout_ns: u128 = 0,
-    docs_node_iter_ns: u128 = 0,
-    docs_text_read_ns: u128 = 0,
-    docs_tokenize_ns: u128 = 0,
-    docs_posting_append_ns: u128 = 0,
-    docs_posting_append_materialize_ns: u128 = 0,
-    docs_posting_append_sweep_ns: u128 = 0,
-    docs_posting_append_regular_sampled_ns: u128 = 0,
-    docs_posting_append_candidate_lookup_sampled_ns: u128 = 0,
-    docs_posting_append_candidate_hit_sampled_ns: u128 = 0,
-    docs_posting_append_virtual_hit_sampled_ns: u128 = 0,
-    docs_posting_append_variable_hit_sampled_ns: u128 = 0,
-    docs_posting_append_variable_freq_sampled_ns: u128 = 0,
-    docs_write_ns: u128 = 0,
-    docs_node_count: u64 = 0,
-    docs_text_bytes: u64 = 0,
-    docs_text_inline_count: u64 = 0,
-    docs_text_inline_bytes: u64 = 0,
-    docs_text_borrowed_count: u64 = 0,
-    docs_text_borrowed_bytes: u64 = 0,
-    docs_text_alloc_count: u64 = 0,
-    docs_text_alloc_bytes: u64 = 0,
-    docs_token_count: u64 = 0,
-    docs_freq_cache_lookup_count: u64 = 0,
-    docs_freq_cache_hit_count: u64 = 0,
-    docs_freq_cache_miss_count: u64 = 0,
-    docs_freq_cache_entry_count: u64 = 0,
-    docs_freq_cache_text_bytes: u64 = 0,
-    docs_freq_cache_term_count: u64 = 0,
-    docs_freq_cache_term_bytes: u64 = 0,
-    docs_posting_append_term_count: u64 = 0,
-    docs_posting_append_regular_record_count: u64 = 0,
-    docs_posting_append_virtual_candidate_put_count: u64 = 0,
-    docs_posting_append_virtual_candidate_hit_count: u64 = 0,
-    docs_posting_append_variable_candidate_hit_count: u64 = 0,
-    docs_posting_append_variable_freq_append_count: u64 = 0,
-    docs_posting_append_candidate_filter_skip_count: u64 = 0,
-    docs_posting_append_candidate_lookup_count: u64 = 0,
-    docs_posting_append_candidate_cache_hit_count: u64 = 0,
-    docs_posting_append_candidate_miss_count: u64 = 0,
-    docs_posting_append_candidate_regularized_hit_count: u64 = 0,
-    docs_posting_append_materialize_call_count: u64 = 0,
-    docs_posting_append_sweep_count: u64 = 0,
-    docs_posting_append_regular_sample_count: u64 = 0,
-    docs_posting_append_candidate_lookup_sample_count: u64 = 0,
-    docs_posting_append_candidate_hit_sample_count: u64 = 0,
-    docs_posting_append_virtual_hit_sample_count: u64 = 0,
-    docs_posting_append_variable_hit_sample_count: u64 = 0,
-    docs_posting_append_variable_freq_sample_count: u64 = 0,
-    term_builder_trim_ns: u128 = 0,
-    run_finish_ns: u128 = 0,
-    run_chunk_sort_ns: u128 = 0,
-    run_chunk_write_ns: u128 = 0,
-    run_chunk_count: u64 = 0,
-    run_chunk_records: u64 = 0,
-    run_chunk_peak_record_bytes: u64 = 0,
-    run_chunk_peak_term_bytes: u64 = 0,
-    run_chunk_peak_scratch_bytes: u64 = 0,
-    run_chunk_peak_record_capacity_bytes: u64 = 0,
-    run_chunk_peak_term_capacity_bytes: u64 = 0,
-    run_chunk_peak_scratch_capacity_bytes: u64 = 0,
-    run_record_term_bytes: u64 = 0,
-    run_record_inline_capacity_bytes: u64 = 0,
-    run_record_term_slack_bytes: u64 = 0,
-    run_record_term_cache_hits: u64 = 0,
-    run_record_term_cache_saved_bytes: u64 = 0,
-    run_record_long_term_count: u64 = 0,
-    run_record_max_term_len: u64 = 0,
-    run_tmp_regular_file_count: u64 = 0,
-    run_tmp_summary_file_count: u64 = 0,
-    run_tmp_synthetic_source_count: u64 = 0,
-    run_tmp_regular_bytes: u64 = 0,
-    run_tmp_summary_bytes: u64 = 0,
-    run_tmp_total_bytes: u64 = 0,
-    run_derived_tmp_postings_bytes: u64 = 0,
-    run_derived_tmp_terms_bytes: u64 = 0,
-    run_derived_tmp_blocks_bytes: u64 = 0,
-    run_derived_tmp_impacts_bytes: u64 = 0,
-    run_derived_tmp_top_hits_bytes: u64 = 0,
-    run_derived_tmp_total_bytes: u64 = 0,
-    run_inline_singleton_materialized_terms: u64 = 0,
-    run_inline_singleton_materialized_records: u64 = 0,
-    run_inline_singleton_materialized_bytes: u64 = 0,
-    run_term_count: u64 = 0,
-    run_block_count: u64 = 0,
-    run_top_hit_term_count: u64 = 0,
-    run_top_hit_candidate_records: u64 = 0,
-    run_top_hit_side_stream_candidate_records: u64 = 0,
-    run_top_hit_local_side_stream_candidate_records: u64 = 0,
-    run_virtual_all_docs_term_count: u64 = 0,
-    run_virtual_all_docs_candidate_records: u64 = 0,
-    run_virtual_all_docs_top_hit_cache_doc_scans: u64 = 0,
-    run_virtual_all_docs_synthetic_records: u64 = 0,
-    run_dense_all_docs_freq_stream_term_count: u64 = 0,
-    run_dense_all_docs_freq_stream_candidate_records: u64 = 0,
-    run_variable_all_docs_synthetic_records: u64 = 0,
-    run_variable_all_docs_freq_stream_cells: u64 = 0,
-    run_variable_all_docs_freq_stream_packed_bytes: u64 = 0,
-    run_variable_all_docs_freq_stream_rle_bytes: u64 = 0,
-    run_variable_all_docs_freq_stream_bitpacked_bytes: u64 = 0,
-    run_variable_all_docs_freq_stream_rle_run_count: u64 = 0,
-    run_variable_all_docs_freq_stream_max_freq: u32 = 0,
-    open_docs_ns: u128 = 0,
-    catalog_ns: u128 = 0,
-    run_summary_ns: u128 = 0,
-    run_derived_ns: u128 = 0,
-    run_derived_regular_ns: u128 = 0,
-    run_derived_next_sampled_ns: u128 = 0,
-    run_derived_next_reader_sampled_ns: u128 = 0,
-    run_derived_next_queue_sampled_ns: u128 = 0,
-    run_derived_next_child_probe_count: u64 = 0,
-    run_derived_next_queue_compare_count: u64 = 0,
-    run_derived_inline_singleton_next_sampled_ns: u128 = 0,
-    run_derived_inline_singleton_publish_sampled_ns: u128 = 0,
-    run_derived_encode_sampled_ns: u128 = 0,
-    run_derived_write_sampled_ns: u128 = 0,
-    run_derived_block_stats_sampled_ns: u128 = 0,
-    run_derived_top_hit_sampled_ns: u128 = 0,
-    run_derived_block_flush_sampled_ns: u128 = 0,
-    run_derived_global_doc_rank_ns: u128 = 0,
-    run_derived_virtual_top_docs_ns: u128 = 0,
-    run_derived_virtual_ns: u128 = 0,
-    run_derived_dense_ns: u128 = 0,
-    run_derived_flush_ns: u128 = 0,
-    run_derived_rename_ns: u128 = 0,
-    run_derived_virtual_source_terms: u64 = 0,
-    run_derived_dense_source_terms: u64 = 0,
-    run_derived_inline_singleton_terms: u64 = 0,
-    run_derived_virtual_terms: u64 = 0,
-    run_derived_dense_terms: u64 = 0,
-    run_derived_block_terms: u64 = 0,
-    run_derived_inline_singleton_records: u64 = 0,
-    run_derived_virtual_records: u64 = 0,
-    run_derived_dense_records: u64 = 0,
-    run_derived_block_records: u64 = 0,
-    run_derived_top_hit_block_evals: u64 = 0,
-    run_derived_top_hit_block_skips: u64 = 0,
-    run_derived_top_hit_block_not_full_evals: u64 = 0,
-    run_derived_top_hit_block_ready_evals: u64 = 0,
-    run_derived_top_hit_block_upper_lt_2x_worst: u64 = 0,
-    run_derived_top_hit_block_upper_lt_4x_worst: u64 = 0,
-    run_derived_top_hit_block_upper_gte_4x_worst: u64 = 0,
-    run_derived_top_hit_candidate_evals: u64 = 0,
-    run_derived_top_hit_doc_reads: u64 = 0,
-    run_derived_top_hit_regular_candidate_evals: u64 = 0,
-    run_derived_top_hit_regular_doc_reads: u64 = 0,
-    run_derived_top_hit_virtual_candidate_evals: u64 = 0,
-    run_derived_top_hit_virtual_doc_reads: u64 = 0,
-    run_derived_top_hit_dense_candidate_evals: u64 = 0,
-    run_derived_top_hit_dense_doc_reads: u64 = 0,
-    run_derived_top_hit_dense_scan_records: u64 = 0,
-    run_derived_top_hit_dense_freq_bound_skips: u64 = 0,
-    run_derived_top_hit_dense_freq_bound_skip_runs: u64 = 0,
-    run_derived_top_hit_regular_term_count: u64 = 0,
-    run_derived_top_hit_regular_doc_read_term_count: u64 = 0,
-    run_derived_top_hit_regular_top1_doc_reads: u64 = 0,
-    run_derived_top_hit_regular_top4_doc_reads: u64 = 0,
-    run_derived_top_hit_regular_top8_doc_reads: u64 = 0,
-    run_derived_top_hit_regular_top1_candidate_evals: u64 = 0,
-    run_derived_top_hit_regular_top4_candidate_evals: u64 = 0,
-    run_derived_top_hit_regular_top8_candidate_evals: u64 = 0,
-    run_derived_top_hit_regular_heaviest_doc_read_term_postings: u64 = 0,
-    run_derived_top_hit_regular_heaviest_doc_read_term_block_evals: u64 = 0,
-    run_derived_top_hit_regular_heaviest_doc_read_term_candidate_evals: u64 = 0,
-    run_derived_top_hit_regular_constant_terms: u64 = 0,
-    run_derived_top_hit_regular_constant_resolved_terms: u64 = 0,
-    run_derived_top_hit_regular_constant_unresolved_terms: u64 = 0,
-    run_derived_top_hit_regular_constant_candidate_evals: u64 = 0,
-    run_derived_top_hit_regular_constant_doc_reads: u64 = 0,
-    run_derived_top_hit_regular_nonconstant_candidate_evals: u64 = 0,
-    run_derived_top_hit_regular_nonconstant_doc_reads: u64 = 0,
-    run_derived_top_hit_regular_constant_resolved_candidate_skips: u64 = 0,
-    run_terms_ns: u128 = 0,
-    meta_write_ns: u128 = 0,
+/// Compile-time data-plane bundle for the external-run publication owner.
+/// Runtime orchestration crosses the boundary through one `write` entry; the
+/// bundle keeps existing run/format representations private to this façade.
+const StreamingRunCatalogPublicationOps = struct {
+    pub const PostingFormatConfig_dep = PostingFormatConfig;
+    pub const TermFormatConfig_dep = TermFormatConfig;
+    pub const SearchAccelerationFormatConfig_dep = SearchAccelerationFormatConfig;
+    pub const persistent_posting_block_size_dep = persistent_posting_block_size;
+    pub const persistent_posting_block_capacity_dep = persistent_posting_block_capacity;
+    pub const persistent_posting_block_offset_checkpoint_terms_dep = persistent_posting_block_offset_checkpoint_terms;
+    pub const persistent_posting_block_byte_offset_checkpoint_blocks_dep = persistent_posting_block_byte_offset_checkpoint_blocks;
+    pub const persistent_term_top_hit_capacity_dep = persistent_term_top_hit_capacity;
+    pub const persistent_term_top_hit_capacity_usize_dep = persistent_term_top_hit_capacity_usize;
+    pub const persistent_term_top_hit_regular_probe_capacity_dep = persistent_term_top_hit_regular_probe_capacity;
+    pub const persistent_all_docs_synthesis_min_postings_dep = persistent_all_docs_synthesis_min_postings;
+    pub const persistent_dense_all_docs_freq_group_size_dep = persistent_dense_all_docs_freq_group_size;
+    pub const persistent_dense_all_docs_top_hit_skip_run_max_dep = persistent_dense_all_docs_top_hit_skip_run_max;
+    pub const persistent_dense_all_docs_freq_mode_packed_dep = persistent_dense_all_docs_freq_mode_packed;
+    pub const TextPostingRunRecord_dep = TextPostingRunRecord;
+    pub const TextTopHitDocStats_dep = TextTopHitDocStats;
+    pub const TextDocRankEntry_dep = TextDocRankEntry;
+    pub const TextDocsFileView_dep = TextDocsFileView;
+    pub const TextPostingBlockStats_dep = TextPostingBlockStats;
+    pub const addPostingToBlockStats_dep = addPostingToBlockStats;
+    pub const PersistentTextCatalogStats_dep = PersistentTextCatalogStats;
+    pub const textBenchTraceEnabled_dep = textBenchTraceEnabled;
+    pub const textBenchTrace_dep = textBenchTrace;
+    pub const textBenchTraceSummaryStats_dep = textBenchTraceSummaryStats;
+    pub const compressed_posting_max_encoded_len_dep = compressed_posting_max_encoded_len;
+    pub const validateDenseAllDocsTextFreq_dep = validateDenseAllDocsTextFreq;
+    pub const encodePersistentVarint_dep = encodePersistentVarint;
+    pub const encodeCompressedTextPosting_dep = encodeCompressedTextPosting;
+    pub const textTermTopHitLessThan_dep = textTermTopHitLessThan;
+    pub const findWorstTextTermTopHitIndex_dep = findWorstTextTermTopHitIndex;
+    pub const appendTopTextTermHitBoundedInline_dep = appendTopTextTermHitBoundedInline;
+    pub const persistentMinPossibleDocLen_dep = persistentMinPossibleDocLen;
+    pub const textTermTopHitCandidateCannotBeatCurrentWorstWithDocLenFloor_dep = textTermTopHitCandidateCannotBeatCurrentWorstWithDocLenFloor;
+    pub const textTermsPath_dep = textTermsPath;
+    pub const textPostingsPath_dep = textPostingsPath;
+    pub const textPostingBlocksPath_dep = textPostingBlocksPath;
+    pub const textPostingBlockImpactsPath_dep = textPostingBlockImpactsPath;
+    pub const textTermTopHitsPath_dep = textTermTopHitsPath;
+    pub const renameReplace_dep = renameReplace;
+    pub const textOptionsNeedSync_dep = textOptionsNeedSync;
+    pub const TextBufferedWriter_dep = TextBufferedWriter;
+    pub const textWriteBufferCapacity_dep = textWriteBufferCapacity;
+    pub const TextPostingRunReader_dep = TextPostingRunReader;
+    pub const TextPostingRunSummaryFile_dep = TextPostingRunSummaryFile;
+    pub const VariableAllDocsFreqSlice_dep = VariableAllDocsFreqSlice;
+    pub const TextPostingSyntheticRunSource_dep = TextPostingSyntheticRunSource;
+    pub const TextPostingRunMerger_dep = TextPostingRunMerger;
+    pub const TextPostingRunTermSummaryRecord_dep = TextPostingRunTermSummaryRecord;
+    pub const textPostingRunSummaryRegularConstantTopHitCandidate_dep = textPostingRunSummaryRegularConstantTopHitCandidate;
+    pub const TextPostingRunSummaryStats_dep = TextPostingRunSummaryStats;
+    pub const TextPostingRunMergedSummaryReader_dep = TextPostingRunMergedSummaryReader;
+    pub const collectTextPostingRunTermSummaryStatsFromFiles_dep = collectTextPostingRunTermSummaryStatsFromFiles;
+    pub const writeEmptyTermsAndPostingsFiles_dep = writeEmptyTermsAndPostingsFiles;
+    pub const appendDenseAllDocsFreqGroup_dep = appendDenseAllDocsFreqGroup;
+    pub const appendDenseAllDocsFreqStreamFreqs_dep = appendDenseAllDocsFreqStreamFreqs;
+    pub const MemoryPostingBlockImpact_dep = MemoryPostingBlockImpact;
+    pub const memoryPostingBlockImpactLessThan_dep = memoryPostingBlockImpactLessThan;
+    pub const persistentTermTopHitCountForPostingCount_dep = persistentTermTopHitCountForPostingCount;
+    pub const textPostingsFileSize_dep = textPostingsFileSize;
+    pub const textPostingBlockCheckpointCount_dep = textPostingBlockCheckpointCount;
+    pub const textPostingBlockCheckpointTableOffset_dep = textPostingBlockCheckpointTableOffset;
+    pub const textPostingBlockByteOffsetCheckpointCount_dep = textPostingBlockByteOffsetCheckpointCount;
+    pub const textPostingBlockByteOffsetCheckpointTableOffset_dep = textPostingBlockByteOffsetCheckpointTableOffset;
+    pub const textPostingBlockRecordOffset_dep = textPostingBlockRecordOffset;
+    pub const textPostingBlocksFileSize_dep = textPostingBlocksFileSize;
+    pub const textPostingBlockImpactRecordOffset_dep = textPostingBlockImpactRecordOffset;
+    pub const textPostingBlockImpactsFileSize_dep = textPostingBlockImpactsFileSize;
+    pub const textTermTopHitTermIndexOffset_dep = textTermTopHitTermIndexOffset;
+    pub const textTermTopHitRecordOffset_dep = textTermTopHitRecordOffset;
+    pub const textTermTopHitsFileSize_dep = textTermTopHitsFileSize;
+    pub const regularFileSize_dep = regularFileSize;
+    pub const persistentWeightedTf_dep = persistentWeightedTf;
+    pub const persistentAvgDocLen_dep = persistentAvgDocLen;
+    pub const appendPersistentFrontCodedTerm_dep = appendPersistentFrontCodedTerm;
 };
 
-pub const PersistentTextRebuildPhase = enum {
-    docs_progress,
-    docs,
-    run_finish,
-    scratch_release,
-    open_docs,
-    catalog,
-    meta,
+const RebuildSessionOps = struct {
+    pub const ExternalContext = PersistentTextExternalRunSession;
 };
 
-pub const PersistentTextRebuildObserver = struct {
-    context: *anyopaque,
-    observe: *const fn (*anyopaque, PersistentTextRebuildPhase) anyerror!void,
+/// Private data-plane adapter for `text.rebuild_session`. The session sees
+/// phase-shaped operations, while posting builders, document views, tracing,
+/// and catalog algorithms remain implementation details of this façade.
+const PersistentTextExternalRunSession = struct {
+    allocator: std.mem.Allocator,
+    store: storage_mod.Store,
+    runs_base_path: []const u8,
+    deadline: core.QueryDeadline,
+    run_builder: TextPostingRunBuilder,
+    text_meta: PersistentTextMeta,
+    docs_view: ?TextDocsFileView = null,
 
-    fn record(self: PersistentTextRebuildObserver, phase: PersistentTextRebuildPhase) !void {
-        try self.observe(self.context, phase);
+    pub fn init(
+        allocator: std.mem.Allocator,
+        store: storage_mod.Store,
+        runs_base_path: []const u8,
+        deadline: core.QueryDeadline,
+        measure_chunks: bool,
+    ) !PersistentTextExternalRunSession {
+        try cleanupTextPostingRunScratchFiles(allocator, store.io, runs_base_path);
+        var run_builder = try TextPostingRunBuilder.initWithChunkTiming(
+            allocator,
+            store.io,
+            runs_base_path,
+            measure_chunks,
+        );
+        errdefer run_builder.deinit();
+        const index_meta = try currentPersistentTextMetaAnchor(store);
+        const text_meta = try currentPersistentTextMetaAnchorDigest(allocator, store, index_meta);
+        return .{
+            .allocator = allocator,
+            .store = store,
+            .runs_base_path = runs_base_path,
+            .deadline = deadline,
+            .run_builder = run_builder,
+            .text_meta = text_meta,
+        };
+    }
+
+    pub fn deinit(self: *PersistentTextExternalRunSession) void {
+        if (self.docs_view) |*view| view.deinit();
+        self.run_builder.deinit();
+    }
+
+    pub fn clockIo(self: *const PersistentTextExternalRunSession) std.Io {
+        return self.store.io;
+    }
+
+    pub fn buildDocs(
+        self: *PersistentTextExternalRunSession,
+        timings: ?*rebuild_runtime.PersistentTextRebuildTimings,
+        observer: ?rebuild_runtime.PersistentTextRebuildObserver,
+    ) !void {
+        textBenchTrace("rebuild_runs_docs_start");
+        document_catalog_stream_writer.writeTextDocsFileFromStore(
+            self.allocator,
+            self.store,
+            self.deadline,
+            &self.run_builder,
+            &self.text_meta,
+            timings,
+            observer,
+        ) catch |err| {
+            textBenchTraceMeta("rebuild_runs_docs_error", self.text_meta);
+            return err;
+        };
+        textBenchTraceMeta("rebuild_runs_docs_done", self.text_meta);
+    }
+
+    pub fn finishRuns(self: *PersistentTextExternalRunSession) !void {
+        textBenchTrace("rebuild_runs_finish_start");
+        self.run_builder.finish() catch |err| {
+            textBenchTraceRunBuilder("rebuild_runs_finish_error", &self.run_builder);
+            return err;
+        };
+        textBenchTraceRunBuilder("rebuild_runs_finish_done", &self.run_builder);
+    }
+
+    pub fn captureRunTimings(
+        self: *PersistentTextExternalRunSession,
+        timings: *rebuild_runtime.PersistentTextRebuildTimings,
+    ) !void {
+        timings.run_chunk_sort_ns = self.run_builder.chunk_sort_ns;
+        timings.run_chunk_write_ns = self.run_builder.chunk_write_ns;
+        timings.run_chunk_count = self.run_builder.chunk_count;
+        timings.run_chunk_records = self.run_builder.chunk_records;
+        timings.run_chunk_peak_record_bytes = self.run_builder.chunk_peak_record_bytes;
+        timings.run_chunk_peak_term_bytes = self.run_builder.chunk_peak_term_bytes;
+        timings.run_chunk_peak_scratch_bytes = self.run_builder.chunk_peak_scratch_bytes;
+        timings.run_chunk_peak_record_capacity_bytes = self.run_builder.chunk_peak_record_capacity_bytes;
+        timings.run_chunk_peak_term_capacity_bytes = self.run_builder.chunk_peak_term_capacity_bytes;
+        timings.run_chunk_peak_scratch_capacity_bytes = self.run_builder.chunk_peak_scratch_capacity_bytes;
+        timings.run_tmp_regular_file_count = @intCast(self.run_builder.run_paths.items.len);
+        timings.run_tmp_summary_file_count = @intCast(self.run_builder.run_summaries.items.len);
+        timings.run_tmp_synthetic_source_count = @intCast(self.run_builder.synthetic_run_sources.items.len);
+        timings.run_tmp_regular_bytes = try sumTextPathFileBytes(self.store.io, self.run_builder.run_paths.items);
+        timings.run_tmp_summary_bytes = 0;
+        for (self.run_builder.run_summaries.items) |summary| {
+            timings.run_tmp_summary_bytes = std.math.add(
+                u64,
+                timings.run_tmp_summary_bytes,
+                summary.file_size,
+            ) catch return error.RecordTooLarge;
+        }
+        timings.run_tmp_total_bytes = std.math.add(
+            u64,
+            timings.run_tmp_regular_bytes,
+            timings.run_tmp_summary_bytes,
+        ) catch return error.RecordTooLarge;
+        timings.run_record_term_bytes = self.run_builder.run_record_term_bytes;
+        timings.run_record_inline_capacity_bytes = self.run_builder.run_record_inline_capacity_bytes;
+        timings.run_record_term_slack_bytes = self.run_builder.run_record_term_slack_bytes;
+        timings.run_record_term_cache_hits = self.run_builder.run_record_term_cache_hits;
+        timings.run_record_term_cache_saved_bytes = self.run_builder.run_record_term_cache_saved_bytes;
+        timings.run_record_long_term_count = self.run_builder.run_record_long_term_count;
+        timings.run_record_max_term_len = self.run_builder.run_record_max_term_len;
+        timings.run_inline_singleton_materialized_terms = self.run_builder.inline_singleton_materialized_terms;
+        timings.run_inline_singleton_materialized_records = self.run_builder.inline_singleton_materialized_records;
+        timings.run_inline_singleton_materialized_bytes = self.run_builder.inline_singleton_materialized_bytes;
+        timings.docs_posting_append_materialize_ns = self.run_builder.docs_posting_append_materialize_ns;
+        timings.docs_posting_append_sweep_ns = self.run_builder.docs_posting_append_sweep_ns;
+        timings.docs_posting_append_regular_sampled_ns = self.run_builder.docs_posting_append_regular_sampled_ns;
+        timings.docs_posting_append_candidate_lookup_sampled_ns = self.run_builder.docs_posting_append_candidate_lookup_sampled_ns;
+        timings.docs_posting_append_candidate_hit_sampled_ns = self.run_builder.docs_posting_append_candidate_hit_sampled_ns;
+        timings.docs_posting_append_virtual_hit_sampled_ns = self.run_builder.docs_posting_append_virtual_hit_sampled_ns;
+        timings.docs_posting_append_variable_hit_sampled_ns = self.run_builder.docs_posting_append_variable_hit_sampled_ns;
+        timings.docs_posting_append_variable_freq_sampled_ns = self.run_builder.docs_posting_append_variable_freq_sampled_ns;
+        timings.docs_posting_append_term_count = self.run_builder.docs_posting_append_term_count;
+        timings.docs_posting_append_regular_record_count = self.run_builder.docs_posting_append_regular_record_count;
+        timings.docs_posting_append_virtual_candidate_put_count = self.run_builder.docs_posting_append_virtual_candidate_put_count;
+        timings.docs_posting_append_virtual_candidate_hit_count = self.run_builder.docs_posting_append_virtual_candidate_hit_count;
+        timings.docs_posting_append_variable_candidate_hit_count = self.run_builder.docs_posting_append_variable_candidate_hit_count;
+        timings.docs_posting_append_variable_freq_append_count = self.run_builder.docs_posting_append_variable_freq_append_count;
+        timings.docs_posting_append_candidate_filter_skip_count = self.run_builder.docs_posting_append_candidate_filter_skip_count;
+        timings.docs_posting_append_candidate_lookup_count = self.run_builder.docs_posting_append_candidate_lookup_count;
+        timings.docs_posting_append_candidate_cache_hit_count = self.run_builder.docs_posting_append_candidate_cache_hit_count;
+        timings.docs_posting_append_candidate_miss_count = self.run_builder.docs_posting_append_candidate_miss_count;
+        timings.docs_posting_append_candidate_regularized_hit_count = self.run_builder.docs_posting_append_candidate_regularized_hit_count;
+        timings.docs_posting_append_materialize_call_count = self.run_builder.docs_posting_append_materialize_call_count;
+        timings.docs_posting_append_sweep_count = self.run_builder.docs_posting_append_sweep_count;
+        timings.docs_posting_append_regular_sample_count = self.run_builder.docs_posting_append_regular_sample_count;
+        timings.docs_posting_append_candidate_lookup_sample_count = self.run_builder.docs_posting_append_candidate_lookup_sample_count;
+        timings.docs_posting_append_candidate_hit_sample_count = self.run_builder.docs_posting_append_candidate_hit_sample_count;
+        timings.docs_posting_append_virtual_hit_sample_count = self.run_builder.docs_posting_append_virtual_hit_sample_count;
+        timings.docs_posting_append_variable_hit_sample_count = self.run_builder.docs_posting_append_variable_hit_sample_count;
+        timings.docs_posting_append_variable_freq_sample_count = self.run_builder.docs_posting_append_variable_freq_sample_count;
+        timings.run_virtual_all_docs_synthetic_records = self.run_builder.virtual_all_docs_synthetic_records;
+        timings.run_variable_all_docs_synthetic_records = self.run_builder.variable_all_docs_synthetic_records;
+        timings.run_variable_all_docs_freq_stream_cells = self.run_builder.variable_all_docs_freq_stream_cells;
+        timings.run_variable_all_docs_freq_stream_packed_bytes = self.run_builder.variable_all_docs_freq_stream_packed_bytes;
+        timings.run_variable_all_docs_freq_stream_rle_bytes = self.run_builder.variable_all_docs_freq_stream_rle_bytes;
+        timings.run_variable_all_docs_freq_stream_bitpacked_bytes = self.run_builder.variable_all_docs_freq_stream_bitpacked_bytes;
+        timings.run_variable_all_docs_freq_stream_rle_run_count = self.run_builder.variable_all_docs_freq_stream_rle_run_count;
+        timings.run_variable_all_docs_freq_stream_max_freq = self.run_builder.variable_all_docs_freq_stream_max_freq;
+    }
+
+    pub fn releaseScratch(self: *PersistentTextExternalRunSession) void {
+        textBenchTrace("rebuild_runs_scratch_release_start");
+        self.run_builder.releaseBuildScratchAfterFinish();
+        textBenchTraceRunBuilder("rebuild_runs_scratch_release_done", &self.run_builder);
+    }
+
+    pub fn openDocs(self: *PersistentTextExternalRunSession) !void {
+        if (self.docs_view != null) return error.InvalidRecord;
+        textBenchTrace("rebuild_runs_open_docs_start");
+        self.docs_view = openPersistentTextDocsView(
+            self.allocator,
+            self.store,
+            self.text_meta.doc_count,
+        ) catch |err| {
+            textBenchTraceMeta("rebuild_runs_open_docs_error", self.text_meta);
+            return err;
+        };
+    }
+
+    pub fn writeCatalog(
+        self: *PersistentTextExternalRunSession,
+        timings: ?*rebuild_runtime.PersistentTextRebuildTimings,
+    ) !PersistentTextCatalogStats {
+        textBenchTrace("rebuild_runs_catalog_start");
+        const docs_view = if (self.docs_view) |*view| view else return error.InvalidRecord;
+        return streaming_run_catalog_publication.write(
+            self.allocator,
+            self.store,
+            self.run_builder.run_paths.items,
+            self.run_builder.run_summaries.items,
+            self.run_builder.synthetic_run_sources.items,
+            self.run_builder.run_paths_disjoint_term_ranges,
+            docs_view,
+            self.text_meta,
+            self.deadline,
+            timings,
+        ) catch |err| {
+            textBenchTraceRunBuilder("rebuild_runs_catalog_error", &self.run_builder);
+            textBenchTraceMeta("rebuild_runs_catalog_meta_error", self.text_meta);
+            return err;
+        };
+    }
+
+    pub fn applyCatalogStats(
+        self: *PersistentTextExternalRunSession,
+        stats: PersistentTextCatalogStats,
+    ) void {
+        self.text_meta.term_count = stats.term_count;
+        self.text_meta.term_bytes = stats.term_bytes;
+        self.text_meta.posting_count = stats.posting_count;
+        textBenchTraceMeta("rebuild_runs_catalog_done", self.text_meta);
+    }
+
+    pub fn writeMeta(self: *PersistentTextExternalRunSession) !void {
+        textBenchTrace("rebuild_runs_meta_start");
+        writeTextMetaFile(self.allocator, self.store, self.text_meta) catch |err| {
+            textBenchTraceMeta("rebuild_runs_meta_error", self.text_meta);
+            return err;
+        };
+    }
+
+    pub fn finishMeta(self: *PersistentTextExternalRunSession) void {
+        textBenchTraceMeta("rebuild_runs_meta_done", self.text_meta);
+    }
+
+    pub fn finalMeta(self: *const PersistentTextExternalRunSession) PersistentTextMeta {
+        return self.text_meta;
     }
 };
+
+pub const PersistentTextRebuildTimings = rebuild_runtime.PersistentTextRebuildTimings;
+pub const PersistentTextRebuildPhase = rebuild_runtime.PersistentTextRebuildPhase;
+pub const PersistentTextRebuildObserver = rebuild_runtime.PersistentTextRebuildObserver;
 
 pub const PersistentPostingCompressionEstimate = struct {
     posting_count: u64 = 0,
@@ -2632,22 +2230,10 @@ pub const PersistentPostingCompressionEstimate = struct {
     text_freq_over_u8_count: u64 = 0,
 };
 
-pub const PersistentTextRebuildBenchResult = struct {
-    meta: PersistentTextMeta,
-    timings: PersistentTextRebuildTimings,
-};
-
-fn textMonotonicNs(io: std.Io) u128 {
-    const timestamp = std.Io.Clock.awake.now(io).nanoseconds;
-    return if (timestamp < 0) 0 else @intCast(timestamp);
-}
-
-fn textElapsedNs(io: std.Io, start: u128) u128 {
-    const now = textMonotonicNs(io);
-    return if (now >= start) now - start else 0;
-}
+pub const PersistentTextRebuildBenchResult = rebuild_runtime.PersistentTextRebuildBenchResult;
 
 fn textBenchTraceEnabled() bool {
+    if (!builtin.link_libc) return false;
     return std.c.getenv("TINYKG_BENCH_TRACE") != null;
 }
 
@@ -2704,45 +2290,6 @@ fn textBenchTraceSummaryStats(comptime label: []const u8, stats: TextPostingRunS
     );
 }
 
-fn textBenchTraceDerivedContext(comptime label: []const u8, context: *const StreamingRunDerivedFilesContext) void {
-    if (!textBenchTraceEnabled()) return;
-    const term = if (context.have_term) context.current_term[0..context.current_term_len] else "";
-    const summary_postings = if (context.have_term) context.current_summary.postings_count else 0;
-    const summary_blocks = if (context.have_term) context.current_summary.block_count else 0;
-    const summary_top_hits = if (context.have_term) context.current_summary.top_hit_count else 0;
-    std.debug.print(
-        "text_trace={s} summary_index={} summary_count={} term=\"{s}\" term_postings_seen={} summary_postings={} summary_blocks={} summary_top_hits={} previous_doc_id={} current_block_postings={} local_block_index={} virtual_freq={} dense={} inline={} postings_written={} blocks_written={} term_entries={}\n",
-        .{
-            label,
-            context.summary_index,
-            context.summary_count,
-            term,
-            context.term_postings_seen,
-            summary_postings,
-            summary_blocks,
-            summary_top_hits,
-            context.previous_doc_id,
-            context.current_block_postings,
-            context.local_block_index,
-            context.virtual_all_docs_text_freq,
-            context.dense_all_docs_freq_stream,
-            context.inline_singleton_posting != null,
-            context.postings_written,
-            context.blocks_written,
-            context.term_entries_written,
-        },
-    );
-}
-
-fn textBenchTraceDerivedRecord(comptime label: []const u8, context: *const StreamingRunDerivedFilesContext, record: TextPostingRunRecord) void {
-    if (!textBenchTraceEnabled()) return;
-    std.debug.print(
-        "text_trace={s} record_term=\"{s}\" doc_id={} text_freq={} kind_freq={}\n",
-        .{ label, record.term(), record.doc_id, record.text_freq, record.kind_freq },
-    );
-    textBenchTraceDerivedContext("derived_record_context", context);
-}
-
 fn textPathFileSize(io: std.Io, path: []const u8) !u64 {
     var file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
@@ -2778,114 +2325,13 @@ fn currentPersistentTextMetaAnchorDigest(allocator: std.mem.Allocator, store: st
     return meta;
 }
 
-fn persistentTextMetaAnchorStale(text_meta: PersistentTextMeta, index_meta: storage_mod.IndexMeta, searchable_metadata_digest: u64) bool {
-    return persistentTextGraphAnchorStale(text_meta, index_meta) or
-        text_meta.searchable_metadata_digest != searchable_metadata_digest;
-}
-
-fn persistentTextGraphAnchorStale(text_meta: PersistentTextMeta, index_meta: storage_mod.IndexMeta) bool {
-    return text_meta.node_digest != index_meta.node_digest or
-        text_meta.node_by_text_order_digest != index_meta.node_by_text_order_digest;
-}
-
-const deleted_node_tombstone_prefix = "__tinykg_deleted_node__ ";
-
-fn isDeletedNodeTombstoneText(text: []const u8) bool {
-    return std.mem.startsWith(u8, text, deleted_node_tombstone_prefix);
-}
-
-fn isDeletedNodeTombstoneNode(kind: core.NodeKind, text: []const u8) bool {
-    return kind == .edit and isDeletedNodeTombstoneText(text);
-}
-
-pub fn rebuildPersistentTextCatalog(allocator: std.mem.Allocator, store: storage_mod.Store) !PersistentTextMeta {
-    var graph_index_repaired = false;
-    return try rebuildPersistentTextCatalogWithGraphRepair(allocator, store, &graph_index_repaired, .none);
-}
-
-/// Benchmark hook for the external posting-run rebuild path. Production rebuild
-/// uses the same path; the benchmark hook lets storage-only probes choose an
-/// explicit temp-run base and compare against the in-memory builder mode.
-pub fn rebuildPersistentTextCatalogFromRunsForBench(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    runs_base_path: []const u8,
-) !PersistentTextMeta {
-    var graph_index_repaired = false;
-    return try rebuildPersistentTextCatalogFromRunsWithGraphRepair(allocator, store, runs_base_path, &graph_index_repaired, .none);
-}
-
-pub fn rebuildPersistentTextCatalogWithTimingsForBench(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    runs_base_path: []const u8,
-) !PersistentTextRebuildBenchResult {
-    return try rebuildPersistentTextCatalogWithTimingsAndObserverForBench(allocator, store, runs_base_path, null);
-}
-
-pub fn rebuildPersistentTextCatalogWithTimingsAndObserverForBench(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    runs_base_path: []const u8,
-    observer: ?PersistentTextRebuildObserver,
-) !PersistentTextRebuildBenchResult {
-    var timings = PersistentTextRebuildTimings{};
-    const meta = try rebuildPersistentTextCatalogFromRunsOnceDeadlineTimed(allocator, store, runs_base_path, .none, &timings, observer);
-    return .{ .meta = meta, .timings = timings };
-}
-
-fn textPostingRunsBasePath(allocator: std.mem.Allocator, store: storage_mod.Store) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}.text_posting_runs", .{store.dir_path});
-}
-
-fn cleanupTextPostingRunScratchFiles(allocator: std.mem.Allocator, io: std.Io, runs_base_path: []const u8) !void {
-    const dir_path = std.fs.path.dirname(runs_base_path) orelse ".";
-    const base_leaf = std.fs.path.basename(runs_base_path);
-    if (base_leaf.len == 0) return error.InvalidRecord;
-    const posting_prefix = try std.fmt.allocPrint(allocator, "{s}.posting_run.", .{base_leaf});
-    defer allocator.free(posting_prefix);
-    const virtual_prefix = try std.fmt.allocPrint(allocator, "{s}.virtual_all_docs.", .{base_leaf});
-    defer allocator.free(virtual_prefix);
-
-    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => |e| return e,
-    };
-    defer dir.close(io);
-    var iter = dir.iterate();
-    while (try iter.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".tmp")) continue;
-        const stale =
-            std.mem.startsWith(u8, entry.name, posting_prefix) or
-            std.mem.startsWith(u8, entry.name, virtual_prefix);
-        if (!stale) continue;
-        const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
-        defer allocator.free(full_path);
-        try std.Io.Dir.cwd().deleteFile(io, full_path);
-    }
-}
+pub const rebuildPersistentTextCatalog = rebuild_session.rebuildPersistentTextCatalog;
+pub const rebuildPersistentTextCatalogFromRunsForBench = rebuild_session.rebuildPersistentTextCatalogFromRunsForBench;
+pub const rebuildPersistentTextCatalogWithTimingsForBench = rebuild_session.rebuildPersistentTextCatalogWithTimingsForBench;
+pub const rebuildPersistentTextCatalogWithTimingsAndObserverForBench = rebuild_session.rebuildPersistentTextCatalogWithTimingsAndObserverForBench;
 
 fn rebuildPersistentTextCatalogOnce(allocator: std.mem.Allocator, store: storage_mod.Store) !PersistentTextMeta {
     return rebuildPersistentTextCatalogOnceDeadline(allocator, store, .none);
-}
-
-fn rebuildPersistentTextCatalogFromRunsWithGraphRepair(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    runs_base_path: []const u8,
-    graph_index_repaired: *bool,
-    deadline: core.QueryDeadline,
-) !PersistentTextMeta {
-    return rebuildPersistentTextCatalogFromRunsOnceDeadline(allocator, store, runs_base_path, deadline) catch |err| switch (err) {
-        error.FileNotFound, error.InvalidRecord => {
-            if (graph_index_repaired.*) return err;
-            graph_index_repaired.* = true;
-            try store.repairPersistentIndexesFromLog();
-            return try rebuildPersistentTextCatalogFromRunsOnceDeadline(allocator, store, runs_base_path, deadline);
-        },
-        else => |e| return e,
-    };
 }
 
 fn rebuildPersistentTextCatalogOnceDeadline(allocator: std.mem.Allocator, store: storage_mod.Store, deadline: core.QueryDeadline) !PersistentTextMeta {
@@ -2904,7 +2350,7 @@ fn rebuildPersistentTextCatalogOnceDeadlineTimed(
     const index_meta = try currentPersistentTextMetaAnchor(store);
     var text_meta = try currentPersistentTextMetaAnchorDigest(allocator, store, index_meta);
     const docs_start = textMonotonicNs(store.io);
-    try writeTextDocsFileFromStoreWithTermBuilder(allocator, store, deadline, &term_builder, &text_meta, timings);
+    try document_catalog_stream_writer.writeTextDocsFileFromStoreWithTermBuilder(allocator, store, deadline, &term_builder, &text_meta, timings);
     if (timings) |t| t.docs_ns = textElapsedNs(store.io, docs_start);
     const trim_start = textMonotonicNs(store.io);
     term_builder.releaseTermIndex();
@@ -2916,7 +2362,7 @@ fn rebuildPersistentTextCatalogOnceDeadlineTimed(
     defer docs_view.deinit();
     if (timings) |t| t.open_docs_ns = textElapsedNs(store.io, open_docs_start);
     const catalog_start = textMonotonicNs(store.io);
-    const catalog_stats = try writeTermsAndPostingsFiles(allocator, store, &term_builder, &docs_view, text_meta);
+    const catalog_stats = try term_posting_catalog_publication.writeTermsAndPostingsFiles(allocator, store, &term_builder, &docs_view, text_meta);
     if (timings) |t| t.catalog_ns = textElapsedNs(store.io, catalog_start);
     text_meta.term_count = catalog_stats.term_count;
     text_meta.term_bytes = catalog_stats.term_bytes;
@@ -2928,156 +2374,7 @@ fn rebuildPersistentTextCatalogOnceDeadlineTimed(
     return text_meta;
 }
 
-fn rebuildPersistentTextCatalogFromRunsOnceDeadline(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    runs_base_path: []const u8,
-    deadline: core.QueryDeadline,
-) !PersistentTextMeta {
-    return rebuildPersistentTextCatalogFromRunsOnceDeadlineTimed(allocator, store, runs_base_path, deadline, null, null);
-}
-
-fn rebuildPersistentTextCatalogFromRunsOnceDeadlineTimed(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    runs_base_path: []const u8,
-    deadline: core.QueryDeadline,
-    timings: ?*PersistentTextRebuildTimings,
-    observer: ?PersistentTextRebuildObserver,
-) !PersistentTextMeta {
-    try cleanupTextPostingRunScratchFiles(allocator, store.io, runs_base_path);
-    var run_builder = try TextPostingRunBuilder.initWithChunkTiming(allocator, store.io, runs_base_path, timings != null);
-    defer run_builder.deinit();
-
-    const index_meta = try currentPersistentTextMetaAnchor(store);
-    var text_meta = try currentPersistentTextMetaAnchorDigest(allocator, store, index_meta);
-    const docs_start = textMonotonicNs(store.io);
-    textBenchTrace("rebuild_runs_docs_start");
-    writeTextDocsFileFromStore(allocator, store, deadline, &run_builder, &text_meta, timings, observer) catch |err| {
-        textBenchTraceMeta("rebuild_runs_docs_error", text_meta);
-        return err;
-    };
-    textBenchTraceMeta("rebuild_runs_docs_done", text_meta);
-    if (timings) |t| t.docs_ns = textElapsedNs(store.io, docs_start);
-    if (observer) |obs| try obs.record(.docs);
-    const finish_start = textMonotonicNs(store.io);
-    textBenchTrace("rebuild_runs_finish_start");
-    run_builder.finish() catch |err| {
-        textBenchTraceRunBuilder("rebuild_runs_finish_error", &run_builder);
-        return err;
-    };
-    textBenchTraceRunBuilder("rebuild_runs_finish_done", &run_builder);
-    if (timings) |t| t.run_finish_ns = textElapsedNs(store.io, finish_start);
-    if (observer) |obs| try obs.record(.run_finish);
-    if (timings) |t| {
-        t.run_chunk_sort_ns = run_builder.chunk_sort_ns;
-        t.run_chunk_write_ns = run_builder.chunk_write_ns;
-        t.run_chunk_count = run_builder.chunk_count;
-        t.run_chunk_records = run_builder.chunk_records;
-        t.run_chunk_peak_record_bytes = run_builder.chunk_peak_record_bytes;
-        t.run_chunk_peak_term_bytes = run_builder.chunk_peak_term_bytes;
-        t.run_chunk_peak_scratch_bytes = run_builder.chunk_peak_scratch_bytes;
-        t.run_chunk_peak_record_capacity_bytes = run_builder.chunk_peak_record_capacity_bytes;
-        t.run_chunk_peak_term_capacity_bytes = run_builder.chunk_peak_term_capacity_bytes;
-        t.run_chunk_peak_scratch_capacity_bytes = run_builder.chunk_peak_scratch_capacity_bytes;
-        t.run_tmp_regular_file_count = @intCast(run_builder.run_paths.items.len);
-        t.run_tmp_summary_file_count = @intCast(run_builder.run_summaries.items.len);
-        t.run_tmp_synthetic_source_count = @intCast(run_builder.synthetic_run_sources.items.len);
-        t.run_tmp_regular_bytes = try sumTextPathFileBytes(store.io, run_builder.run_paths.items);
-        t.run_tmp_summary_bytes = 0;
-        for (run_builder.run_summaries.items) |summary| {
-            t.run_tmp_summary_bytes = std.math.add(u64, t.run_tmp_summary_bytes, summary.file_size) catch return error.RecordTooLarge;
-        }
-        t.run_tmp_total_bytes = std.math.add(u64, t.run_tmp_regular_bytes, t.run_tmp_summary_bytes) catch return error.RecordTooLarge;
-        t.run_record_term_bytes = run_builder.run_record_term_bytes;
-        t.run_record_inline_capacity_bytes = run_builder.run_record_inline_capacity_bytes;
-        t.run_record_term_slack_bytes = run_builder.run_record_term_slack_bytes;
-        t.run_record_term_cache_hits = run_builder.run_record_term_cache_hits;
-        t.run_record_term_cache_saved_bytes = run_builder.run_record_term_cache_saved_bytes;
-        t.run_record_long_term_count = run_builder.run_record_long_term_count;
-        t.run_record_max_term_len = run_builder.run_record_max_term_len;
-        t.run_inline_singleton_materialized_terms = run_builder.inline_singleton_materialized_terms;
-        t.run_inline_singleton_materialized_records = run_builder.inline_singleton_materialized_records;
-        t.run_inline_singleton_materialized_bytes = run_builder.inline_singleton_materialized_bytes;
-        t.docs_posting_append_materialize_ns = run_builder.docs_posting_append_materialize_ns;
-        t.docs_posting_append_sweep_ns = run_builder.docs_posting_append_sweep_ns;
-        t.docs_posting_append_regular_sampled_ns = run_builder.docs_posting_append_regular_sampled_ns;
-        t.docs_posting_append_candidate_lookup_sampled_ns = run_builder.docs_posting_append_candidate_lookup_sampled_ns;
-        t.docs_posting_append_candidate_hit_sampled_ns = run_builder.docs_posting_append_candidate_hit_sampled_ns;
-        t.docs_posting_append_virtual_hit_sampled_ns = run_builder.docs_posting_append_virtual_hit_sampled_ns;
-        t.docs_posting_append_variable_hit_sampled_ns = run_builder.docs_posting_append_variable_hit_sampled_ns;
-        t.docs_posting_append_variable_freq_sampled_ns = run_builder.docs_posting_append_variable_freq_sampled_ns;
-        t.docs_posting_append_term_count = run_builder.docs_posting_append_term_count;
-        t.docs_posting_append_regular_record_count = run_builder.docs_posting_append_regular_record_count;
-        t.docs_posting_append_virtual_candidate_put_count = run_builder.docs_posting_append_virtual_candidate_put_count;
-        t.docs_posting_append_virtual_candidate_hit_count = run_builder.docs_posting_append_virtual_candidate_hit_count;
-        t.docs_posting_append_variable_candidate_hit_count = run_builder.docs_posting_append_variable_candidate_hit_count;
-        t.docs_posting_append_variable_freq_append_count = run_builder.docs_posting_append_variable_freq_append_count;
-        t.docs_posting_append_candidate_filter_skip_count = run_builder.docs_posting_append_candidate_filter_skip_count;
-        t.docs_posting_append_candidate_lookup_count = run_builder.docs_posting_append_candidate_lookup_count;
-        t.docs_posting_append_candidate_cache_hit_count = run_builder.docs_posting_append_candidate_cache_hit_count;
-        t.docs_posting_append_candidate_miss_count = run_builder.docs_posting_append_candidate_miss_count;
-        t.docs_posting_append_candidate_regularized_hit_count = run_builder.docs_posting_append_candidate_regularized_hit_count;
-        t.docs_posting_append_materialize_call_count = run_builder.docs_posting_append_materialize_call_count;
-        t.docs_posting_append_sweep_count = run_builder.docs_posting_append_sweep_count;
-        t.docs_posting_append_regular_sample_count = run_builder.docs_posting_append_regular_sample_count;
-        t.docs_posting_append_candidate_lookup_sample_count = run_builder.docs_posting_append_candidate_lookup_sample_count;
-        t.docs_posting_append_candidate_hit_sample_count = run_builder.docs_posting_append_candidate_hit_sample_count;
-        t.docs_posting_append_virtual_hit_sample_count = run_builder.docs_posting_append_virtual_hit_sample_count;
-        t.docs_posting_append_variable_hit_sample_count = run_builder.docs_posting_append_variable_hit_sample_count;
-        t.docs_posting_append_variable_freq_sample_count = run_builder.docs_posting_append_variable_freq_sample_count;
-        t.run_virtual_all_docs_synthetic_records = run_builder.virtual_all_docs_synthetic_records;
-        t.run_variable_all_docs_synthetic_records = run_builder.variable_all_docs_synthetic_records;
-        t.run_variable_all_docs_freq_stream_cells = run_builder.variable_all_docs_freq_stream_cells;
-        t.run_variable_all_docs_freq_stream_packed_bytes = run_builder.variable_all_docs_freq_stream_packed_bytes;
-        t.run_variable_all_docs_freq_stream_rle_bytes = run_builder.variable_all_docs_freq_stream_rle_bytes;
-        t.run_variable_all_docs_freq_stream_bitpacked_bytes = run_builder.variable_all_docs_freq_stream_bitpacked_bytes;
-        t.run_variable_all_docs_freq_stream_rle_run_count = run_builder.variable_all_docs_freq_stream_rle_run_count;
-        t.run_variable_all_docs_freq_stream_max_freq = run_builder.variable_all_docs_freq_stream_max_freq;
-    }
-    if (deadline.expired()) return core.Error.BudgetExceeded;
-    textBenchTrace("rebuild_runs_scratch_release_start");
-    run_builder.releaseBuildScratchAfterFinish();
-    textBenchTraceRunBuilder("rebuild_runs_scratch_release_done", &run_builder);
-    if (observer) |obs| try obs.record(.scratch_release);
-    const open_docs_start = textMonotonicNs(store.io);
-    textBenchTrace("rebuild_runs_open_docs_start");
-    var docs_view = openPersistentTextDocsView(allocator, store, text_meta.doc_count) catch |err| {
-        textBenchTraceMeta("rebuild_runs_open_docs_error", text_meta);
-        return err;
-    };
-    defer docs_view.deinit();
-    if (timings) |t| t.open_docs_ns = textElapsedNs(store.io, open_docs_start);
-    if (observer) |obs| try obs.record(.open_docs);
-    const catalog_start = textMonotonicNs(store.io);
-    textBenchTrace("rebuild_runs_catalog_start");
-    const catalog_stats = writeTermsAndPostingsFilesFromRuns(allocator, store, run_builder.run_paths.items, run_builder.run_summaries.items, run_builder.synthetic_run_sources.items, run_builder.run_paths_disjoint_term_ranges, &docs_view, text_meta, deadline, timings) catch |err| {
-        textBenchTraceRunBuilder("rebuild_runs_catalog_error", &run_builder);
-        textBenchTraceMeta("rebuild_runs_catalog_meta_error", text_meta);
-        return err;
-    };
-    if (timings) |t| t.catalog_ns = textElapsedNs(store.io, catalog_start);
-    if (observer) |obs| try obs.record(.catalog);
-    text_meta.term_count = catalog_stats.term_count;
-    text_meta.term_bytes = catalog_stats.term_bytes;
-    text_meta.posting_count = catalog_stats.posting_count;
-    textBenchTraceMeta("rebuild_runs_catalog_done", text_meta);
-    if (deadline.expired()) return core.Error.BudgetExceeded;
-    const meta_start = textMonotonicNs(store.io);
-    textBenchTrace("rebuild_runs_meta_start");
-    writeTextMetaFile(allocator, store, text_meta) catch |err| {
-        textBenchTraceMeta("rebuild_runs_meta_error", text_meta);
-        return err;
-    };
-    if (timings) |t| t.meta_write_ns = textElapsedNs(store.io, meta_start);
-    if (observer) |obs| try obs.record(.meta);
-    textBenchTraceMeta("rebuild_runs_meta_done", text_meta);
-    return text_meta;
-}
-
-fn nextPersistentTextDocId(current_doc_count: u64) !u64 {
-    return std.math.add(u64, current_doc_count, 1) catch return error.RecordTooLarge;
-}
+const nextPersistentTextDocId = catalog_format.nextPersistentTextDocId;
 
 pub fn readPersistentTextMeta(allocator: std.mem.Allocator, store: storage_mod.Store) !PersistentTextMeta {
     const path = try textMetaPath(allocator, store);
@@ -3090,178 +2387,6 @@ pub fn readPersistentTextMeta(allocator: std.mem.Allocator, store: storage_mod.S
     if (n != bytes.len) return error.InvalidRecord;
     if (file_size != bytes.len) return error.InvalidRecord;
     return PersistentTextMeta.decode(&bytes);
-}
-
-pub fn persistentTextCatalogStale(allocator: std.mem.Allocator, store: storage_mod.Store) !bool {
-    return persistentTextCatalogStaleDeadline(allocator, store, .none);
-}
-
-/// Cheap enough for status/reporting paths: validates the publication anchors
-/// and file headers without scanning every document/posting.  A true result
-/// means callers must not treat the on-disk BM25 files as current.
-pub fn persistentTextCatalogQuickStale(allocator: std.mem.Allocator, store: storage_mod.Store) !bool {
-    return persistentTextCatalogQuickStaleDeadline(allocator, store, .none);
-}
-
-fn persistentTextCatalogStaleDeadline(allocator: std.mem.Allocator, store: storage_mod.Store, deadline: core.QueryDeadline) !bool {
-    if (deadline.expired()) return core.Error.BudgetExceeded;
-    const text_meta = readPersistentTextMeta(allocator, store) catch |err| switch (err) {
-        error.FileNotFound, error.InvalidRecord => return true,
-        else => |e| return e,
-    };
-    if (deadline.expired()) return core.Error.BudgetExceeded;
-    const index_meta = currentPersistentTextMetaAnchor(store) catch |err| switch (err) {
-        error.FileNotFound, error.InvalidRecord => return true,
-        else => |e| return e,
-    };
-    if (persistentTextGraphAnchorStale(text_meta, index_meta)) return true;
-    const searchable_metadata_digest = store.searchableNodeMetadataDigest(allocator) catch |err| switch (err) {
-        error.FileNotFound, error.InvalidRecord => return true,
-        else => |e| return e,
-    };
-    if (persistentTextMetaAnchorStale(text_meta, index_meta, searchable_metadata_digest)) return true;
-
-    const docs_path = try textDocsPath(allocator, store);
-    defer allocator.free(docs_path);
-    var docs_file = std.Io.Dir.cwd().openFile(store.io, docs_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return true,
-        else => |e| return e,
-    };
-    defer docs_file.close(store.io);
-    const docs_size = try regularFileSize(store, docs_file);
-    const header = readTextDocsHeaderFromFile(store, docs_file) catch |err| switch (err) {
-        error.InvalidRecord => return true,
-        else => |e| return e,
-    };
-    if (header.doc_count != text_meta.doc_count) return true;
-    const expected_size = textDocsFileSizeForHeader(header) catch |err| switch (err) {
-        error.RecordTooLarge => return true,
-        else => |e| return e,
-    };
-    if (docs_size != expected_size) return true;
-    if (try persistentTextDocsInvalid(allocator, store, docs_file, header, text_meta, deadline)) return true;
-    if (persistentTermsOrPostingsStale(allocator, store, text_meta, deadline)) |stale| {
-        if (stale) return true;
-    } else |err| switch (err) {
-        error.FileNotFound, error.InvalidRecord => return true,
-        else => |e| return e,
-    }
-    return false;
-}
-
-fn persistentTextCatalogQuickStaleDeadline(allocator: std.mem.Allocator, store: storage_mod.Store, deadline: core.QueryDeadline) !bool {
-    if (deadline.expired()) return core.Error.BudgetExceeded;
-    const text_meta = readPersistentTextMeta(allocator, store) catch |err| switch (err) {
-        error.FileNotFound, error.InvalidRecord => return true,
-        else => |e| return e,
-    };
-    if (deadline.expired()) return core.Error.BudgetExceeded;
-    const index_meta = currentPersistentTextMetaAnchor(store) catch |err| switch (err) {
-        error.FileNotFound, error.InvalidRecord => return true,
-        else => |e| return e,
-    };
-    if (persistentTextGraphAnchorStale(text_meta, index_meta)) return true;
-    const searchable_metadata_digest = store.searchableNodeMetadataDigestLimitedDeadline(allocator, stale_store_scan_max_property_delta_bytes, deadline) catch |err| switch (err) {
-        error.SearchableMetadataBudgetExceeded => return error.TextIndexMaintenanceRequired,
-        error.FileNotFound, error.InvalidRecord => return true,
-        else => |e| return e,
-    };
-    if (persistentTextMetaAnchorStale(text_meta, index_meta, searchable_metadata_digest)) return true;
-    if (try persistentTextDocsHeaderStale(allocator, store, text_meta)) return true;
-    if (persistentTermsOrPostingsHeaderStale(allocator, store, text_meta)) |stale| {
-        if (stale) return true;
-    } else |err| switch (err) {
-        error.FileNotFound, error.InvalidRecord => return true,
-        else => |e| return e,
-    }
-    return false;
-}
-
-fn persistentTextDocsHeaderStale(allocator: std.mem.Allocator, store: storage_mod.Store, text_meta: PersistentTextMeta) !bool {
-    const docs_path = try textDocsPath(allocator, store);
-    defer allocator.free(docs_path);
-    var docs_file = std.Io.Dir.cwd().openFile(store.io, docs_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return true,
-        else => |e| return e,
-    };
-    defer docs_file.close(store.io);
-    const docs_size = try regularFileSize(store, docs_file);
-    const header = readTextDocsHeaderFromFile(store, docs_file) catch |err| switch (err) {
-        error.InvalidRecord => return true,
-        else => |e| return e,
-    };
-    if (header.doc_count != text_meta.doc_count) return true;
-    const expected_size = textDocsFileSizeForHeader(header) catch |err| switch (err) {
-        error.RecordTooLarge => return true,
-        else => |e| return e,
-    };
-    return docs_size != expected_size;
-}
-
-fn persistentTextDocsInvalid(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    docs_file: std.Io.File,
-    header: TextDocsHeader,
-    meta: PersistentTextMeta,
-    deadline: core.QueryDeadline,
-) !bool {
-    var total_text_tokens: u64 = 0;
-    var node_view = store.openNodeRecordView() catch |err| switch (err) {
-        error.InvalidRecord => return true,
-        else => |e| return e,
-    };
-    defer node_view.deinit();
-    var index: u64 = 0;
-    while (index < header.doc_count) : (index += 1) {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
-        const doc = readTextDocRecordAtWithHeader(store, docs_file, header, index) catch |err| switch (err) {
-            error.InvalidRecord => return true,
-            else => |e| return e,
-        };
-        if (doc.doc_id != index + 1) return true;
-        const node_ref = (node_view.readNodeRefById(core.NodeId.fromInt(doc.node_id)) catch |err| switch (err) {
-            error.InvalidRecord => return true,
-            else => |e| return e,
-        }) orelse return true;
-        var owned_node: ?storage_mod.StoredNode = null;
-        defer if (owned_node) |*node| node.deinit(allocator);
-        const text = if (node_ref.text_bytes) |bytes| bytes else blk: {
-            owned_node = (node_view.readNodeById(allocator, core.NodeId.fromInt(doc.node_id)) catch |err| switch (err) {
-                error.InvalidRecord => return true,
-                else => |e| return e,
-            }) orelse return true;
-            break :blk owned_node.?.text;
-        };
-        if (isDeletedNodeTombstoneNode(node_ref.kind, text)) return true;
-        var metadata = readSearchableNodeMetadata(allocator, store, core.NodeId.fromInt(doc.node_id)) catch |err| switch (err) {
-            error.InvalidRecord => return true,
-            else => |e| return e,
-        };
-        defer metadata.deinit(allocator);
-        validateTextDocAgainstNodeRefCached(allocator, doc, node_ref, text, metadata) catch |err| switch (err) {
-            error.InvalidRecord => return true,
-            else => |e| return e,
-        };
-        total_text_tokens = std.math.add(u64, total_text_tokens, doc.text_tokens) catch return true;
-    }
-    var overflow_index: u64 = 0;
-    var previous_overflow_doc_id: u64 = 0;
-    while (overflow_index < header.node_id_overflow_count) : (overflow_index += 1) {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
-        const overflow = readTextDocNodeIdOverflowRecordAt(store, docs_file, header, overflow_index) catch |err| switch (err) {
-            error.InvalidRecord => return true,
-            else => |e| return e,
-        };
-        if (overflow.doc_id > header.doc_count or overflow.doc_id <= previous_overflow_doc_id) return true;
-        previous_overflow_doc_id = overflow.doc_id;
-        if (header.hasDenseUniformRecords()) return true;
-        var bytes: [TextDocRecord.encoded_len]u8 = undefined;
-        const n = try docs_file.readPositionalAll(store.io, &bytes, try textDocRecordOffsetForHeader(header, overflow.doc_id - 1));
-        if (n != bytes.len) return true;
-        if (std.mem.readInt(u32, bytes[0..4], .little) != persistent_doc_node_id_overflow_marker) return true;
-    }
-    return total_text_tokens != meta.total_text_tokens;
 }
 
 pub fn readPersistentTermPostings(allocator: std.mem.Allocator, store: storage_mod.Store, term: []const u8) !std.ArrayList(TextPostingRecord) {
@@ -3561,139 +2686,7 @@ fn persistentVarintLen(value: anytype) u64 {
     return len;
 }
 
-fn encodeZigZagI64(value: i64) u64 {
-    if (value >= 0) return @as(u64, @intCast(value)) * 2;
-    return @as(u64, @intCast(-value)) * 2 - 1;
-}
-
-fn decodeZigZagI64(value: u64) i64 {
-    const magnitude: i64 = @intCast(value >> 1);
-    return magnitude ^ -@as(i64, @intCast(value & 1));
-}
-
-fn singletonPayloadDelta(previous_payload: u32, payload: u32) i64 {
-    return @as(i64, payload) - @as(i64, previous_payload);
-}
-
-fn applySingletonPayloadDelta(previous_payload: u32, encoded_delta: u64) !u32 {
-    const delta = decodeZigZagI64(encoded_delta);
-    const next = @as(i64, previous_payload) + delta;
-    if (next <= 0 or next > std.math.maxInt(u32)) return error.InvalidRecord;
-    return @intCast(next);
-}
-
-const compressed_posting_tag_text_unit: u8 = 0;
-const compressed_posting_tag_text_two: u8 = 1;
-const compressed_posting_tag_text_three: u8 = 2;
-const compressed_posting_tag_text_explicit: u8 = 3;
-const compressed_posting_field_tag_bits: u6 = 2;
-const compressed_posting_field_tag_mask: u64 = (1 << compressed_posting_field_tag_bits) - 1;
 const compressed_posting_max_encoded_len: usize = 24;
-
-fn compressedPostingTextFreqTag(text_freq: u32) !u8 {
-    if (text_freq == 0) return error.InvalidRecord;
-    if (text_freq > persistent_posting_max_field_freq) return error.RecordTooLarge;
-    return switch (text_freq) {
-        1 => compressed_posting_tag_text_unit,
-        2 => compressed_posting_tag_text_two,
-        3 => compressed_posting_tag_text_three,
-        else => compressed_posting_tag_text_explicit,
-    };
-}
-
-fn compressedPostingFieldTag(posting: TextPostingRecord) !u8 {
-    const has_name = posting.text_freq != 0;
-    const has_kind = posting.kind_freq != 0;
-    if (!has_name and !has_kind) return error.InvalidRecord;
-    if (posting.kind_freq > persistent_posting_max_kind_freq) return error.RecordTooLarge;
-    if (has_kind) return error.RecordTooLarge;
-    if (has_name and !has_kind) return compressedPostingTextFreqTag(posting.text_freq);
-    return error.InvalidRecord;
-}
-
-fn taggedCompressedPostingDelta(doc_delta: u64, posting: TextPostingRecord) !u64 {
-    if (doc_delta == 0) return error.InvalidRecord;
-    if (doc_delta > (std.math.maxInt(u64) >> compressed_posting_field_tag_bits)) return error.RecordTooLarge;
-    return (doc_delta << compressed_posting_field_tag_bits) | try compressedPostingFieldTag(posting);
-}
-
-const DecodedCompressedPostingDelta = struct {
-    doc_delta: u64,
-    field_tag: u8,
-};
-
-fn decodeTaggedCompressedPostingDelta(tagged_delta: u64) !DecodedCompressedPostingDelta {
-    const field_tag: u8 = @intCast(tagged_delta & compressed_posting_field_tag_mask);
-    const doc_delta = tagged_delta >> compressed_posting_field_tag_bits;
-    if (doc_delta == 0) return error.InvalidRecord;
-    return .{ .doc_delta = doc_delta, .field_tag = field_tag };
-}
-
-fn compressedPostingTagInlineTextFreq(field_tag: u8) ?u32 {
-    return switch (field_tag) {
-        compressed_posting_tag_text_unit => 1,
-        compressed_posting_tag_text_two => 2,
-        compressed_posting_tag_text_three => 3,
-        else => null,
-    };
-}
-
-fn compressedPostingTagTextExplicit(field_tag: u8) bool {
-    return field_tag == compressed_posting_tag_text_explicit;
-}
-
-fn termEntryHasInlinePosting(entry: TextTermEntry) bool {
-    if (entry.postings_offset_is_plain) return false;
-    if (entry.postings_offset_is_dense_freq_stream) return false;
-    return entry.postings_count == 1 and (entry.postings_offset & persistent_term_inline_posting_marker) != 0;
-}
-
-fn encodeVirtualAllDocsPostingPayload(text_freq: u32) !u64 {
-    if (text_freq == 0 or text_freq > persistent_posting_max_field_freq) return error.RecordTooLarge;
-    return persistent_term_virtual_all_docs_payload_marker | text_freq;
-}
-
-fn termEntryVirtualAllDocsTextFreq(entry: TextTermEntry) ?u32 {
-    if (entry.postings_offset_is_plain) return null;
-    if (entry.postings_offset_is_dense_freq_stream) return null;
-    if (entry.postings_count < persistent_all_docs_synthesis_min_postings) return null;
-    if ((entry.postings_offset & persistent_term_inline_posting_marker) == 0) return null;
-    const payload = entry.postings_offset & persistent_term_inline_posting_payload_mask;
-    if (payload == 0 or payload > persistent_posting_max_field_freq) return null;
-    return @intCast(payload);
-}
-
-fn denseAllDocsFreqStreamOffsetFromPayload(payload: u64) ?u64 {
-    if (payload < persistent_term_dense_all_docs_freq_stream_payload_base) return null;
-    return payload - persistent_term_dense_all_docs_freq_stream_payload_base;
-}
-
-fn denseAllDocsFreqStreamOffset(postings_count: u64, postings_offset: u64) ?u64 {
-    if (postings_count < persistent_all_docs_synthesis_min_postings) return null;
-    if ((postings_offset & persistent_term_inline_posting_marker) == 0) return null;
-    const payload = postings_offset & persistent_term_inline_posting_payload_mask;
-    return denseAllDocsFreqStreamOffsetFromPayload(payload);
-}
-
-fn termEntryDenseAllDocsFreqStreamOffset(entry: TextTermEntry) ?u64 {
-    if (entry.postings_offset_is_plain) return null;
-    if (entry.postings_offset_is_dense_freq_stream) return entry.postings_offset;
-    return denseAllDocsFreqStreamOffset(entry.postings_count, entry.postings_offset);
-}
-
-fn termEntryPostingPayloadValid(entry: TextTermEntry) bool {
-    if (entry.postings_offset_is_plain and entry.postings_offset_is_dense_freq_stream) return false;
-    if (entry.postings_offset_is_plain) return true;
-    if (entry.postings_offset_is_dense_freq_stream) return entry.postings_count >= persistent_all_docs_synthesis_min_postings;
-    if ((entry.postings_offset & persistent_term_inline_posting_marker) == 0) {
-        return entry.postings_offset <= persistent_postings_body_max_offset;
-    }
-    if (termEntryVirtualAllDocsTextFreq(entry) != null) return true;
-    if (termEntryDenseAllDocsFreqStreamOffset(entry) != null) return true;
-    if (entry.postings_count != 1) return false;
-    _ = decodeInlineSingletonPostingPayload(entry.postings_offset) catch return false;
-    return true;
-}
 
 fn canVirtualizeAllDocsConstantTextFreqTerm(postings_count: u64, doc_count: u64, constant_text_freq: u32) bool {
     return constant_text_freq != 0 and doc_count >= persistent_all_docs_synthesis_min_postings and postings_count == doc_count;
@@ -3727,49 +2720,6 @@ fn canDenseAllDocsFreqStream(postings: []const TextPostingRecord, doc_count: u64
 
 fn canUseDenseAllDocsFreqStream(postings_count: u64, doc_count: u64, all_name_only: bool, constant_text_freq: u32) bool {
     return all_name_only and constant_text_freq == 0 and doc_count >= persistent_all_docs_synthesis_min_postings and postings_count == doc_count;
-}
-
-fn encodeDenseAllDocsFreqStreamPayload(body_offset: u64) !u64 {
-    const payload = std.math.add(u64, persistent_term_dense_all_docs_freq_stream_payload_base, body_offset) catch return error.RecordTooLarge;
-    if (payload > persistent_term_inline_posting_payload_mask) return error.RecordTooLarge;
-    return @as(u64, persistent_term_inline_posting_marker) | payload;
-}
-
-fn canInlineSingletonPosting(posting: TextPostingRecord) bool {
-    const field_tag = compressedPostingFieldTag(posting) catch return false;
-    if (compressedPostingTagTextExplicit(field_tag)) return false;
-    return posting.doc_id >= 1 and posting.doc_id <= persistent_inline_posting_max_doc_id;
-}
-
-fn encodeInlineSingletonPostingPayload(posting: TextPostingRecord) !u64 {
-    if (!canInlineSingletonPosting(posting)) return error.RecordTooLarge;
-    const field_tag = try compressedPostingFieldTag(posting);
-    const encoded_doc_id = posting.doc_id - 1;
-    const payload = (encoded_doc_id << compressed_posting_field_tag_bits) | field_tag;
-    if (payload > persistent_term_inline_posting_payload_mask) return error.RecordTooLarge;
-    return @as(u64, persistent_term_inline_posting_marker) | payload;
-}
-
-fn decodeInlineSingletonPostingPayload(payload: u64) !TextPostingRecord {
-    if ((payload & persistent_term_inline_posting_marker) == 0) return error.InvalidRecord;
-    const raw = payload & persistent_term_inline_posting_payload_mask;
-    const field_tag: u8 = @intCast(raw & compressed_posting_field_tag_mask);
-    if (compressedPostingTagTextExplicit(field_tag)) return error.InvalidRecord;
-    const doc_id = (raw >> compressed_posting_field_tag_bits) + 1;
-    if (doc_id == 0 or doc_id > persistent_inline_posting_max_doc_id) return error.InvalidRecord;
-    const text_freq = compressedPostingTagInlineTextFreq(field_tag) orelse 0;
-    const kind_freq: u32 = 0;
-    try validateTextPostingFields(doc_id, text_freq, kind_freq);
-    return .{ .doc_id = doc_id, .text_freq = text_freq, .kind_freq = kind_freq };
-}
-
-fn validateCompressedPostingExplicitFreq(field_tag: u8, freq: u64) !u32 {
-    const min_explicit: u64 = switch (field_tag) {
-        compressed_posting_tag_text_explicit => 4,
-        else => return error.InvalidRecord,
-    };
-    if (freq < min_explicit) return error.InvalidRecord;
-    return std.math.cast(u32, freq) orelse return error.RecordTooLarge;
 }
 
 fn validateDenseAllDocsTextFreq(freq: u64) !u32 {
@@ -4417,7 +3367,7 @@ const PersistentPostingCatalog = struct {
     impacts_view: TextPostingBlockImpactsFileView,
     impacts_header: TextPostingBlockImpactsHeader,
 
-    fn open(allocator: std.mem.Allocator, store: storage_mod.Store, doc_count: u64) !PersistentPostingCatalog {
+    pub fn open(allocator: std.mem.Allocator, store: storage_mod.Store, doc_count: u64) !PersistentPostingCatalog {
         const terms_path = try textTermsPath(allocator, store);
         defer allocator.free(terms_path);
         var terms_view = try TextTermsFileView.open(store, terms_path);
@@ -4480,7 +3430,7 @@ const PersistentPostingCatalog = struct {
         };
     }
 
-    fn deinit(self: *PersistentPostingCatalog) void {
+    pub fn deinit(self: *PersistentPostingCatalog) void {
         self.impacts_view.deinit();
         self.blocks_view.deinit();
         self.postings_view.deinit();
@@ -4492,7 +3442,7 @@ const PersistentPostingCatalog = struct {
         entry: TextTermEntry,
     };
 
-    fn findTermEntry(self: *PersistentPostingCatalog, term: []const u8) !?TermLookup {
+    pub fn findTermEntry(self: *PersistentPostingCatalog, term: []const u8) !?TermLookup {
         var lo: u64 = 0;
         var hi: u64 = self.terms_header.term_count;
         while (lo < hi) {
@@ -4533,7 +3483,7 @@ const PersistentPostingCatalog = struct {
         }
     }
 
-    fn termBlockOffset(self: *PersistentPostingCatalog, term_index: u64) !u64 {
+    pub fn termBlockOffset(self: *PersistentPostingCatalog, term_index: u64) !u64 {
         if (term_index >= self.blocks_header.term_count) return error.InvalidRecord;
         const checkpoint_index = term_index / persistent_posting_block_offset_checkpoint_terms;
         const checkpoint_term = checkpoint_index * persistent_posting_block_offset_checkpoint_terms;
@@ -4549,7 +3499,7 @@ const PersistentPostingCatalog = struct {
         return offset;
     }
 
-    fn blockPostingOffset(self: *PersistentPostingCatalog, entry: TextTermEntry, term_block_offset: u64, local_block_index: u64) !u64 {
+    pub fn blockPostingOffset(self: *PersistentPostingCatalog, entry: TextTermEntry, term_block_offset: u64, local_block_index: u64) !u64 {
         if (termEntryHasInlinePosting(entry)) return error.InvalidRecord;
         const term_block_count = try publishedPostingBlockCountForEntry(entry, self.blocks_header.block_size);
         if (local_block_index >= term_block_count) return error.InvalidRecord;
@@ -4624,183 +3574,6 @@ fn forEachPersistentTermPostingLookupInCatalog(
     } }, context, callback);
 }
 
-fn searchTextPersistentTokens(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    query_terms: []const []u8,
-    options: TextSearchOptions,
-) !std.ArrayList(TextSearchHit) {
-    if (options.deadline.expired()) return core.Error.BudgetExceeded;
-    var hits = std.ArrayList(TextSearchHit).empty;
-    errdefer hits.deinit(allocator);
-
-    const meta = try readPersistentTextMeta(allocator, store);
-    if (meta.doc_count == 0) return hits;
-
-    var unique_query_terms = std.StringHashMap(void).init(allocator);
-    defer unique_query_terms.deinit();
-    var scores = std.AutoHashMap(u64, f32).init(allocator);
-    defer scores.deinit();
-    var cjk_bigram_match_counts = std.AutoHashMap(u64, u32).init(allocator);
-    defer cjk_bigram_match_counts.deinit();
-    var docs = std.AutoHashMap(u64, CachedTextDoc).init(allocator);
-    defer deinitCachedTextDocs(allocator, &docs);
-    var doc_records = std.AutoHashMap(u64, TextDocRecord).init(allocator);
-    defer doc_records.deinit();
-    const prealloc = textSearchPreallocCapacity(options);
-    try docs.ensureTotalCapacity(@intCast(prealloc));
-    try doc_records.ensureTotalCapacity(@intCast(prealloc));
-    var docs_view = try openPersistentTextDocsView(allocator, store, meta.doc_count);
-    defer docs_view.deinit();
-    var catalog = try PersistentPostingCatalog.open(allocator, store, meta.doc_count);
-    defer catalog.deinit();
-
-    const avg_doc_len = persistentAvgDocLen(meta);
-    if (singleUniqueQueryTerm(query_terms)) |single_term| {
-        return try searchSinglePersistentTermWithBlocks(allocator, store, &docs_view, &catalog, &docs, meta, avg_doc_len, single_term, query_terms, options);
-    }
-    try hits.ensureTotalCapacity(allocator, @min(options.limit, textSearchPreallocCapacity(options)));
-    try unique_query_terms.ensureTotalCapacity(@intCast(@min(query_terms.len, prealloc)));
-    try scores.ensureTotalCapacity(@intCast(prealloc));
-    try cjk_bigram_match_counts.ensureTotalCapacity(@intCast(prealloc));
-
-    var required_cjk_bigram_terms: u32 = 0;
-    var query_has_non_cjk_term = false;
-    var query_term_plans = std.ArrayList(PersistentQueryTermPlan).empty;
-    defer query_term_plans.deinit(allocator);
-    try query_term_plans.ensureTotalCapacity(allocator, @min(query_terms.len, prealloc));
-    for (query_terms) |term| {
-        if (options.deadline.expired()) return core.Error.BudgetExceeded;
-        if (termHasNonCjkCodepoint(term)) query_has_non_cjk_term = true;
-        const unique_entry = try unique_query_terms.getOrPut(term);
-        if (unique_entry.found_existing) continue;
-        unique_entry.value_ptr.* = {};
-        const cjk_bigram_query_term = isCjkMultiCodepointTerm(term);
-        if (cjk_bigram_query_term) {
-            required_cjk_bigram_terms = std.math.add(u32, required_cjk_bigram_terms, 1) catch return error.RecordTooLarge;
-        }
-        const required_cjk_bigram_count = if (cjk_bigram_query_term)
-            try countQueryTermOccurrences(query_terms, term)
-        else
-            0;
-
-        const lookup = try catalog.findTermEntry(term);
-        if (lookup) |found| {
-            try query_term_plans.append(allocator, .{
-                .term = term,
-                .lookup = found,
-                .cjk_bigram_query_term = cjk_bigram_query_term,
-                .required_cjk_bigram_count = required_cjk_bigram_count,
-            });
-        }
-    }
-    std.mem.sort(PersistentQueryTermPlan, query_term_plans.items, {}, persistentQueryTermPlanLessThan);
-    if (query_term_plans.items.len == 0) return hits;
-    for (query_term_plans.items, 0..) |*plan, index| {
-        plan.query_term_index = index;
-    }
-
-    var node_view = try store.openNodeRecordView();
-    defer node_view.deinit();
-    var query_term_freq_cache: ?PersistentQueryTermFreqCache = if (query_term_plans.items.len <= persistent_query_term_freq_cache_max_terms)
-        PersistentQueryTermFreqCache.init(allocator, query_term_plans.items)
-    else
-        null;
-    defer if (query_term_freq_cache) |*cache| cache.deinit();
-    const validate_canonical_freqs = (try persistentQueryTermPlanPostingTotal(query_term_plans.items)) <= persistent_search_canonical_freq_validate_posting_limit;
-
-    if (try persistentQueryTermPlansExceedPostingsBudget(query_term_plans.items, options.max_postings_scanned)) {
-        if (query_term_freq_cache) |*cache| {
-            // CJK multi-term queries can sit just over the global postings
-            // budget while each bigram is individually scannable. Try the same
-            // bounded top-hit candidate path used for over-budget terms first;
-            // if it cannot produce a full page of CJK-valid hits, fall back to
-            // the exact anchor scan below.
-            if (try searchPersistentMultiTermTopHitCandidates(
-                allocator,
-                store,
-                &docs_view,
-                &catalog,
-                &node_view,
-                &docs,
-                query_term_plans.items,
-                cache,
-                meta,
-                avg_doc_len,
-                options,
-                .top_hits_only,
-            )) |candidate_hits| {
-                hits.deinit(allocator);
-                return candidate_hits;
-            }
-            if (try searchPersistentMultiTermTopHitCandidates(
-                allocator,
-                store,
-                &docs_view,
-                &catalog,
-                &node_view,
-                &docs,
-                query_term_plans.items,
-                cache,
-                meta,
-                avg_doc_len,
-                options,
-                .allow_cjk_anchor,
-            )) |candidate_hits| {
-                hits.deinit(allocator);
-                return candidate_hits;
-            }
-        }
-    }
-
-    var postings_scanned: usize = 0;
-    for (query_term_plans.items) |plan| {
-        if (options.deadline.expired()) return core.Error.BudgetExceeded;
-        var term_context = PersistentSearchTermContext{
-            .allocator = allocator,
-            .store = store,
-            .docs_view = &docs_view,
-            .node_view = &node_view,
-            .term = plan.term,
-            .options = options,
-            .docs = &docs,
-            .doc_records = &doc_records,
-            .scores = &scores,
-            .cjk_bigram_match_counts = &cjk_bigram_match_counts,
-            .cjk_bigram_query_term = plan.cjk_bigram_query_term,
-            .required_cjk_bigram_count = plan.required_cjk_bigram_count,
-            .avg_doc_len = avg_doc_len,
-            .doc_count = meta.doc_count,
-            .query_term_index = plan.query_term_index,
-            .query_term_freq_cache = if (query_term_freq_cache) |*cache| cache else null,
-            .validate_canonical_freqs = validate_canonical_freqs,
-        };
-        try forEachPersistentTermPostingLookupInCatalog(&catalog, plan.lookup, options, &postings_scanned, &term_context, scorePersistentSearchPosting);
-    }
-
-    var worst_hit_index: ?usize = null;
-    var score_it = scores.iterator();
-    while (score_it.next()) |entry| {
-        if (options.deadline.expired()) return core.Error.BudgetExceeded;
-        if (!std.math.isFinite(entry.value_ptr.*)) return core.Error.Unsupported;
-        if (entry.value_ptr.* < options.min_score) continue;
-        if (required_cjk_bigram_terms > 0 and !query_has_non_cjk_term and (cjk_bigram_match_counts.get(entry.key_ptr.*) orelse 0) < cjkBigramCoverageFloor(required_cjk_bigram_terms, options.cjk_coverage_ratio)) continue;
-        const doc = if (validate_canonical_freqs)
-            (try getCachedTextDocFromView(allocator, store, &docs_view, &node_view, &docs, entry.key_ptr.*)).doc
-        else
-            try getCachedTextDocRecordFromView(&docs_view, &doc_records, entry.key_ptr.*);
-        try appendTopTextHitBoundedCachedWorst(allocator, &hits, options.limit, &worst_hit_index, .{
-            .node_id = core.NodeId.fromInt(doc.node_id),
-            .kind = try doc.nodeKind(),
-            .score = entry.value_ptr.*,
-            .match_count = cjk_bigram_match_counts.get(entry.key_ptr.*) orelse 0,
-        });
-    }
-
-    std.mem.sort(TextSearchHit, hits.items, {}, textSearchHitLessThan);
-    return hits;
-}
-
 const PersistentQueryTermPlan = struct {
     term: []const u8,
     lookup: PersistentPostingCatalog.TermLookup,
@@ -4816,16 +3589,6 @@ fn persistentQueryTermPlanLessThan(_: void, lhs: PersistentQueryTermPlan, rhs: P
     return std.mem.order(u8, lhs.term, rhs.term) == .lt;
 }
 
-fn persistentQueryTermPlansExceedPostingsBudget(plans: []const PersistentQueryTermPlan, max_postings_scanned: usize) !bool {
-    var remaining = max_postings_scanned;
-    for (plans) |plan| {
-        const count = std.math.cast(usize, plan.lookup.entry.postings_count) orelse return error.RecordTooLarge;
-        if (count > remaining) return true;
-        remaining -= count;
-    }
-    return false;
-}
-
 const persistent_query_term_freq_cache_max_terms: usize = 64;
 const persistent_multi_term_exact_candidate_max_postings: u64 = 4096;
 // Query should not become a validator pass for medium/common terms. Keep
@@ -4838,7 +3601,7 @@ const PersistentQueryTermFreqCache = struct {
     terms: []const PersistentQueryTermPlan,
     entries: std.AutoHashMap(u64, []FieldTermFreq),
 
-    fn init(allocator: std.mem.Allocator, terms: []const PersistentQueryTermPlan) PersistentQueryTermFreqCache {
+    pub fn init(allocator: std.mem.Allocator, terms: []const PersistentQueryTermPlan) PersistentQueryTermFreqCache {
         return .{
             .allocator = allocator,
             .terms = terms,
@@ -4846,13 +3609,13 @@ const PersistentQueryTermFreqCache = struct {
         };
     }
 
-    fn deinit(self: *PersistentQueryTermFreqCache) void {
+    pub fn deinit(self: *PersistentQueryTermFreqCache) void {
         var it = self.entries.valueIterator();
         while (it.next()) |freqs| self.allocator.free(freqs.*);
         self.entries.deinit();
     }
 
-    fn getOrBuild(self: *PersistentQueryTermFreqCache, cached: CachedTextDoc) ![]const FieldTermFreq {
+    pub fn getOrBuild(self: *PersistentQueryTermFreqCache, cached: CachedTextDoc) ![]const FieldTermFreq {
         if (self.entries.get(cached.doc.doc_id)) |freqs| return freqs;
         const freqs = try self.allocator.alloc(FieldTermFreq, self.terms.len);
         @memset(freqs, FieldTermFreq{});
@@ -4887,11 +3650,6 @@ fn persistentQueryTermPlanPostingTotal(plans: []const PersistentQueryTermPlan) !
     return total;
 }
 
-const PersistentMultiTermCandidateMode = enum {
-    top_hits_only,
-    allow_cjk_anchor,
-};
-
 fn persistentCandidateTermFreqKey(doc_id: u64, query_term_index: usize) !u64 {
     if (doc_id == 0 or doc_id > persistent_posting_max_doc_id) return error.InvalidRecord;
     if (query_term_index > std.math.maxInt(u16)) return error.RecordTooLarge;
@@ -4907,281 +3665,6 @@ fn putPersistentCandidateTextFreq(
     if (text_freq == 0) return error.InvalidRecord;
     if (text_freq > persistent_posting_max_field_freq) return error.RecordTooLarge;
     try candidate_freqs.put(try persistentCandidateTermFreqKey(doc_id, query_term_index), .{ .text = text_freq, .kind = 0 });
-}
-
-fn searchPersistentMultiTermTopHitCandidates(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    docs_view: *TextDocsFileView,
-    catalog: *PersistentPostingCatalog,
-    node_view: *storage_mod.Store.NodeRecordView,
-    docs: *std.AutoHashMap(u64, CachedTextDoc),
-    query_term_plans: []const PersistentQueryTermPlan,
-    query_term_freq_cache: *PersistentQueryTermFreqCache,
-    meta: PersistentTextMeta,
-    avg_doc_len: f32,
-    options: TextSearchOptions,
-    mode: PersistentMultiTermCandidateMode,
-) !?std.ArrayList(TextSearchHit) {
-    if (query_term_plans.len == 0 or query_term_plans.len > persistent_query_term_freq_cache_max_terms) return null;
-    // node/member filter 下推纪律(Linus 严重1):本装配的候选来自全库序 bounded top-64
-    // (磁盘 per-term 缓存 + medium/cjk anchor 收集回调),**过滤前截断**——成员在全库 top-64
-    // 之外就永远进不了候选,--project/--schema-type 在大库上静默漏召回。统一退 full-scan
-    // 主路径(那里截断前过滤已就位),与单 term canUsePersistentTermTopHitCache gate 同款。
-    if (textSearchHasNodeFilter(options) or options.member_filter != null) return null;
-    if (textBenchTraceEnabled()) {
-        std.debug.print(
-            "text_trace=multi_top_hit_start terms={} max_postings={} limit={} mode={s}\n",
-            .{ query_term_plans.len, options.max_postings_scanned, options.limit, @tagName(mode) },
-        );
-    }
-    var required_cjk_bigram_terms: u32 = 0;
-    var query_has_non_cjk_term = false;
-    var cjk_anchor_plan_index: ?usize = null;
-    for (query_term_plans, 0..) |plan, index| {
-        if (termHasNonCjkCodepoint(plan.term)) query_has_non_cjk_term = true;
-        if (plan.cjk_bigram_query_term) {
-            required_cjk_bigram_terms = std.math.add(u32, required_cjk_bigram_terms, 1) catch return error.RecordTooLarge;
-            if (plan.lookup.entry.postings_count <= options.max_postings_scanned) {
-                if (cjk_anchor_plan_index) |anchor_index| {
-                    if (plan.lookup.entry.postings_count < query_term_plans[anchor_index].lookup.entry.postings_count) {
-                        cjk_anchor_plan_index = index;
-                    }
-                } else {
-                    cjk_anchor_plan_index = index;
-                }
-            }
-        }
-    }
-    const use_cjk_anchor = mode == .allow_cjk_anchor and required_cjk_bigram_terms > 0 and cjk_anchor_plan_index != null;
-    if (!use_cjk_anchor) {
-        for (query_term_plans) |plan| {
-            if (!canUsePersistentTermTopHitCandidateCache(options, plan.lookup.entry) and plan.lookup.entry.postings_count > options.max_postings_scanned) {
-                if (textBenchTraceEnabled()) {
-                    std.debug.print(
-                        "text_trace=multi_top_hit_skip term=\"{s}\" postings={} max_postings={} limit={}\n",
-                        .{ plan.term, plan.lookup.entry.postings_count, options.max_postings_scanned, options.limit },
-                    );
-                }
-                return null;
-            }
-        }
-    }
-
-    const path = try textTermTopHitsPath(allocator, store);
-    defer allocator.free(path);
-    var file = std.Io.Dir.cwd().openFile(store.io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => |e| return e,
-    };
-    defer file.close(store.io);
-    const file_size = try regularFileSize(store, file);
-    const header = try readTextTermTopHitsHeaderFromFile(store, file);
-    if (header.capacity != persistent_term_top_hit_capacity) return error.InvalidRecord;
-    const expected_size = textTermTopHitsFileSize(header.hit_count, header.hit_term_count) catch |err| switch (err) {
-        error.RecordTooLarge => return error.InvalidRecord,
-        else => |e| return e,
-    };
-    if (file_size != expected_size) return error.InvalidRecord;
-
-    var candidate_docs = std.AutoHashMap(u64, void).init(allocator);
-    defer candidate_docs.deinit();
-    var candidate_freqs = std.AutoHashMap(u64, FieldTermFreq).init(allocator);
-    defer candidate_freqs.deinit();
-    var candidate_freq_terms_filled = [_]bool{false} ** persistent_query_term_freq_cache_max_terms;
-    const top_hit_capacity = std.math.mul(usize, query_term_plans.len, persistent_term_top_hit_capacity_usize) catch return error.RecordTooLarge;
-    try candidate_docs.ensureTotalCapacity(@intCast(top_hit_capacity));
-    try candidate_freqs.ensureTotalCapacity(@intCast(top_hit_capacity));
-
-    var fallback_postings_scanned: usize = 0;
-    for (query_term_plans, 0..) |plan, index| {
-        if (options.deadline.expired()) return core.Error.BudgetExceeded;
-        if (use_cjk_anchor and index == cjk_anchor_plan_index.?) {
-            if (textBenchTraceEnabled()) {
-                std.debug.print(
-                    "text_trace=multi_top_hit_cjk_anchor term=\"{s}\" postings={} bounded_candidates={}\n",
-                    .{ plan.term, plan.lookup.entry.postings_count, persistent_term_top_hit_capacity },
-                );
-            }
-            var cjk_anchor_context = PersistentSearchMediumTopCandidateContext{
-                .docs_view = docs_view,
-                .options = options,
-                .avg_doc_len = avg_doc_len,
-                .doc_count = meta.doc_count,
-                .doc_freq = plan.lookup.entry.postings_count,
-            };
-            try forEachPersistentTermPostingLookupInCatalog(catalog, plan.lookup, options, &fallback_postings_scanned, &cjk_anchor_context, collectPersistentSearchMediumTopCandidatePosting);
-            for (cjk_anchor_context.hits[0..cjk_anchor_context.hit_count]) |hit| {
-                try candidate_docs.put(hit.doc_id, {});
-                try putPersistentCandidateTextFreq(&candidate_freqs, hit.doc_id, plan.query_term_index, hit.text_freq);
-            }
-            continue;
-        }
-        if (!canUsePersistentTermTopHitCandidateCache(options, plan.lookup.entry)) {
-            if (mode == .top_hits_only and required_cjk_bigram_terms > 0) return null;
-            if (use_cjk_anchor) continue;
-            if (mode == .top_hits_only and plan.lookup.entry.postings_count > persistent_multi_term_exact_candidate_max_postings) {
-                if (textBenchTraceEnabled()) {
-                    std.debug.print(
-                        "text_trace=multi_top_hit_medium_anchor term=\"{s}\" postings={} max_exact_anchor={}\n",
-                        .{ plan.term, plan.lookup.entry.postings_count, persistent_multi_term_exact_candidate_max_postings },
-                    );
-                }
-                var medium_context = PersistentSearchMediumTopCandidateContext{
-                    .docs_view = docs_view,
-                    .options = options,
-                    .avg_doc_len = avg_doc_len,
-                    .doc_count = meta.doc_count,
-                    .doc_freq = plan.lookup.entry.postings_count,
-                };
-                var medium_postings_scanned: usize = 0;
-                try forEachPersistentTermPostingLookupInCatalog(catalog, plan.lookup, options, &medium_postings_scanned, &medium_context, collectPersistentSearchMediumTopCandidatePosting);
-                for (medium_context.hits[0..medium_context.hit_count]) |hit| {
-                    try candidate_docs.put(hit.doc_id, {});
-                    try putPersistentCandidateTextFreq(&candidate_freqs, hit.doc_id, plan.query_term_index, hit.text_freq);
-                }
-                continue;
-            }
-            if (textBenchTraceEnabled()) {
-                std.debug.print(
-                    "text_trace=multi_top_hit_fallback_scan term=\"{s}\" postings={} mode={s}\n",
-                    .{ plan.term, plan.lookup.entry.postings_count, @tagName(mode) },
-                );
-            }
-            var context = PersistentSearchCandidateContext{
-                .allocator = allocator,
-                .store = store,
-                .docs_view = docs_view,
-                .node_view = node_view,
-                .options = options,
-                .docs = docs,
-                .candidate_docs = &candidate_docs,
-                .candidate_freqs = &candidate_freqs,
-                .query_term_index = plan.query_term_index,
-                .query_term_freq_cache = query_term_freq_cache,
-            };
-            try forEachPersistentTermPostingLookupInCatalog(catalog, plan.lookup, options, &fallback_postings_scanned, &context, collectPersistentSearchCandidatePosting);
-            continue;
-        }
-
-        if (plan.lookup.index >= header.term_count) return error.InvalidRecord;
-        const term_hits = (try readTextTermTopHitTermAt(store, file, header, plan.lookup.index)) orelse {
-            if (textBenchTraceEnabled()) {
-                std.debug.print(
-                    "text_trace=multi_top_hit_missing term=\"{s}\" term_index={} postings={} hit_term_count={} hit_count={}\n",
-                    .{ plan.term, plan.lookup.index, plan.lookup.entry.postings_count, header.hit_term_count, header.hit_count },
-                );
-            }
-            return null;
-        };
-        if (term_hits.hit_count > header.capacity) return error.InvalidRecord;
-        if (term_hits.hit_offset > header.hit_count or term_hits.hit_count > header.hit_count - term_hits.hit_offset) return error.InvalidRecord;
-        const expected_count = @min(plan.lookup.entry.postings_count, header.capacity);
-        if (term_hits.hit_count != expected_count) return error.InvalidRecord;
-
-        const cjk_top_hit_read_limit = @max(options.limit, @as(usize, 8));
-        const term_hit_read_count = if (required_cjk_bigram_terms > 0)
-            @min(term_hits.hit_count, @as(u64, @intCast(cjk_top_hit_read_limit)))
-        else
-            term_hits.hit_count;
-        var pos: u64 = 0;
-        while (pos < term_hit_read_count) : (pos += 1) {
-            if (options.deadline.expired()) return core.Error.BudgetExceeded;
-            const record = try readTextTermTopHitRecordAt(store, file, term_hits.hit_offset + pos);
-            try candidate_docs.put(record.doc_id, {});
-            try putPersistentCandidateTextFreq(&candidate_freqs, record.doc_id, plan.query_term_index, record.text_freq);
-        }
-    }
-    if (textBenchTraceEnabled()) {
-        std.debug.print("text_trace=multi_top_hit_candidates count={}\n", .{candidate_docs.count()});
-    }
-    if (candidate_docs.count() == 0) return null;
-
-    var hits = std.ArrayList(TextSearchHit).empty;
-    errdefer hits.deinit(allocator);
-    try hits.ensureTotalCapacity(allocator, @min(options.limit, textSearchPreallocCapacity(options)));
-    var worst_hit_index: ?usize = null;
-
-    var candidate_doc_ids = std.ArrayList(u64).empty;
-    defer candidate_doc_ids.deinit(allocator);
-    try candidate_doc_ids.ensureTotalCapacity(allocator, candidate_docs.count());
-    var candidate_it = candidate_docs.keyIterator();
-    while (candidate_it.next()) |doc_id| candidate_doc_ids.appendAssumeCapacity(doc_id.*);
-    std.mem.sort(u64, candidate_doc_ids.items, {}, std.sort.asc(u64));
-
-    for (query_term_plans) |plan| {
-        if (plan.query_term_index >= candidate_freq_terms_filled.len) return error.InvalidRecord;
-        candidate_freq_terms_filled[plan.query_term_index] = try fillPersistentCandidateTextFreqsFromCatalogDeadline(
-            catalog,
-            plan.lookup,
-            candidate_doc_ids.items,
-            plan.query_term_index,
-            &candidate_freqs,
-            options.deadline,
-        );
-    }
-
-    for (candidate_doc_ids.items) |candidate_doc_id| {
-        if (options.deadline.expired()) return core.Error.BudgetExceeded;
-        if (candidate_doc_id == 0) return error.InvalidRecord;
-        const doc = try docs_view.readDocAt(candidate_doc_id - 1);
-        if (doc.doc_id != candidate_doc_id) return error.InvalidRecord;
-        if (!textSearchMatchesNodeKind(options, try doc.nodeKind())) continue;
-        if (options.member_filter) |m| {
-            if (!m.contains(doc.node_id)) continue;
-        }
-        var freqs_storage: ?[]const FieldTermFreq = null;
-        var score: f32 = 0;
-        var cjk_bigram_matches: u32 = 0;
-        for (query_term_plans) |plan| {
-            const freq = candidate_freqs.get(try persistentCandidateTermFreqKey(candidate_doc_id, plan.query_term_index)) orelse
-                (try catalogTextFreqForDoc(&catalog.postings_view, plan.lookup.entry, meta.doc_count, candidate_doc_id)) orelse blk: {
-                if (candidate_freq_terms_filled[plan.query_term_index]) break :blk FieldTermFreq{};
-                if (freqs_storage == null) {
-                    const cached = try getCachedTextDocFromView(allocator, store, docs_view, node_view, docs, candidate_doc_id);
-                    freqs_storage = try query_term_freq_cache.getOrBuild(cached);
-                }
-                const freqs = freqs_storage.?;
-                if (plan.query_term_index >= freqs.len) return error.InvalidRecord;
-                break :blk freqs[plan.query_term_index];
-            };
-            if (freq.text == 0 and freq.kind == 0) continue;
-            if (plan.cjk_bigram_query_term) {
-                const raw_freq = std.math.add(u32, freq.text, freq.kind) catch return error.InvalidRecord;
-                if (raw_freq >= plan.required_cjk_bigram_count) {
-                    cjk_bigram_matches = std.math.add(u32, cjk_bigram_matches, 1) catch return error.RecordTooLarge;
-                }
-            }
-            const term_score = bm25WeightedTermScore(
-                persistentWeightedTfFromFieldFreq(freq),
-                persistentDocLen(doc),
-                avg_doc_len,
-                meta.doc_count,
-                plan.lookup.entry.postings_count,
-                options.params,
-            );
-            score += term_score;
-            if (!std.math.isFinite(score)) return core.Error.Unsupported;
-        }
-        if (!query_has_non_cjk_term and cjk_bigram_matches < cjkBigramCoverageFloor(required_cjk_bigram_terms, options.cjk_coverage_ratio)) continue;
-        if (score < options.min_score) continue;
-        try appendTopTextHitBoundedCachedWorst(allocator, &hits, options.limit, &worst_hit_index, .{
-            .node_id = core.NodeId.fromInt(doc.node_id),
-            .kind = try doc.nodeKind(),
-            .score = score,
-            .match_count = cjk_bigram_matches,
-        });
-    }
-
-    std.mem.sort(TextSearchHit, hits.items, {}, textSearchHitLessThan);
-    if (textBenchTraceEnabled()) {
-        std.debug.print("text_trace=multi_top_hit_done hits={}\n", .{hits.items.len});
-    }
-    if (mode == .top_hits_only and required_cjk_bigram_terms > 0 and hits.items.len < options.limit) {
-        hits.deinit(allocator);
-        return null;
-    }
-    return hits;
 }
 
 const PersistentSearchCandidateContext = struct {
@@ -5616,191 +4099,6 @@ fn denseAllDocsFreqAtFromFile(
     return try validateDenseAllDocsTextFreq(try readPackedBits(bytes[0..read_len], local_bit, bits));
 }
 
-fn singleUniqueQueryTerm(query_terms: []const []u8) ?[]const u8 {
-    if (query_terms.len == 0) return null;
-    const first = query_terms[0];
-    for (query_terms[1..]) |term| {
-        if (!std.mem.eql(u8, first, term)) return null;
-    }
-    return first;
-}
-
-fn searchSinglePersistentTermWithBlocks(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    docs_view: *TextDocsFileView,
-    catalog: *PersistentPostingCatalog,
-    docs: *std.AutoHashMap(u64, CachedTextDoc),
-    meta: PersistentTextMeta,
-    avg_doc_len: f32,
-    term: []const u8,
-    query_terms: []const []u8,
-    options: TextSearchOptions,
-) !std.ArrayList(TextSearchHit) {
-    var hits = std.ArrayList(TextSearchHit).empty;
-    errdefer hits.deinit(allocator);
-
-    const lookup = (try catalog.findTermEntry(term)) orelse return hits;
-    const entry = lookup.entry;
-    const cjk_bigram_query_term = isCjkMultiCodepointTerm(term);
-    const required_cjk_bigram_count = if (cjk_bigram_query_term)
-        try countQueryTermOccurrences(query_terms, term)
-    else
-        0;
-    const validate_canonical_freqs = entry.postings_count <= persistent_search_canonical_freq_validate_posting_limit;
-    if (canUsePersistentTermTopHitCache(options, entry)) {
-        if (try readPersistentTermTopHitCache(allocator, store, docs_view, term, lookup.index, entry, meta, avg_doc_len, cjk_bigram_query_term, required_cjk_bigram_count, options)) |cached_hits| {
-            return cached_hits;
-        }
-    }
-
-    var node_view = try store.openNodeRecordView();
-    defer node_view.deinit();
-    var doc_records = std.AutoHashMap(u64, TextDocRecord).init(allocator);
-    defer doc_records.deinit();
-    try doc_records.ensureTotalCapacity(@intCast(@min(entry.postings_count, @as(u64, @intCast(textSearchPreallocCapacity(options))))));
-    try hits.ensureTotalCapacity(allocator, @min(options.limit, textSearchPreallocCapacity(options)));
-
-    const term_block_offset = try catalog.termBlockOffset(lookup.index);
-    const block_count = try publishedPostingBlockCountForEntry(entry, catalog.blocks_header.block_size);
-    if (term_block_offset > catalog.blocks_header.block_count) return error.InvalidRecord;
-    if (block_count > catalog.blocks_header.block_count - term_block_offset) return error.InvalidRecord;
-    const term_impact_offset = term_block_offset;
-    if (block_count > catalog.impacts_header.block_count - term_impact_offset) return error.InvalidRecord;
-
-    var postings_scanned: usize = 0;
-    var context = SingleTermSearchContext{
-        .allocator = allocator,
-        .store = store,
-        .docs_view = docs_view,
-        .node_view = &node_view,
-        .term = term,
-        .options = options,
-        .docs = docs,
-        .doc_records = &doc_records,
-        .hits = &hits,
-        .avg_doc_len = avg_doc_len,
-        .doc_count = meta.doc_count,
-        .doc_freq = entry.postings_count,
-        .cjk_bigram_query_term = cjk_bigram_query_term,
-        .required_cjk_bigram_count = required_cjk_bigram_count,
-        .validate_canonical_freqs = validate_canonical_freqs,
-    };
-
-    if (block_count == 0) {
-        _ = try scanPersistentTermPostings(&catalog.postings_view, entry, catalog.doc_count, .{ .search = .{
-            .options = options,
-            .postings_scanned = &postings_scanned,
-        } }, &context, appendSingleTermSearchPosting);
-        std.mem.sort(TextSearchHit, hits.items, {}, textSearchHitLessThan);
-        return hits;
-    }
-
-    var seen_blocks = try PostingBlockSeenSet.init(allocator, block_count);
-    defer seen_blocks.deinit(allocator);
-    var impact_pos: u64 = 0;
-    while (impact_pos < block_count) : (impact_pos += 1) {
-        if (options.deadline.expired()) return core.Error.BudgetExceeded;
-        const impact_index = std.math.add(u64, term_impact_offset, impact_pos) catch return error.RecordTooLarge;
-        const global_block_index = try catalog.impacts_view.readBlockIndexAt(catalog.impacts_header.term_count, impact_index);
-        if (global_block_index < term_block_offset) return error.InvalidRecord;
-        const local_block_index = global_block_index - term_block_offset;
-        if (local_block_index >= block_count) return error.InvalidRecord;
-        const local_usize = std.math.cast(usize, local_block_index) orelse return error.RecordTooLarge;
-        try seen_blocks.mark(local_usize);
-
-        const block = try catalog.blocks_view.readBlockRecordAt(catalog.blocks_header.term_count, global_block_index);
-        const block_upper = bm25WeightedTermScore(
-            block.max_weighted_tf,
-            block.min_doc_len,
-            avg_doc_len,
-            meta.doc_count,
-            entry.postings_count,
-            options.params,
-        );
-        if (!std.math.isFinite(block_upper)) return core.Error.Unsupported;
-        if (block_upper < options.min_score) continue;
-
-        if (worstTopTextHitScore(hits.items, options.limit)) |threshold| {
-            if (block_upper < threshold) continue;
-        }
-
-        const block_posting_offset = try catalog.blockPostingOffset(entry, term_block_offset, local_block_index);
-        if (block_posting_offset > catalog.postings_header.body_bytes) return error.InvalidRecord;
-        const block_posting_count = try persistentBlockPostingCount(entry.postings_count, local_block_index, catalog.blocks_header.block_size);
-        _ = try scanPersistentPostingRange(&catalog.postings_view, block_posting_offset, block_posting_count, catalog.doc_count, .{ .search = .{
-            .options = options,
-            .postings_scanned = &postings_scanned,
-        } }, &context, appendSingleTermSearchPosting);
-    }
-    if (seen_blocks.count() != block_count) return error.InvalidRecord;
-
-    std.mem.sort(TextSearchHit, hits.items, {}, textSearchHitLessThan);
-    return hits;
-}
-
-const PostingBlockSeenSet = union(enum) {
-    inline_bits: struct {
-        bits: u64 = 0,
-        seen_count: u64 = 0,
-    },
-    heap_bits: struct {
-        bits: std.DynamicBitSetUnmanaged,
-        seen_count: u64 = 0,
-    },
-
-    fn init(allocator: std.mem.Allocator, block_count: u64) !PostingBlockSeenSet {
-        if (block_count <= 64) return .{ .inline_bits = .{} };
-        return .{ .heap_bits = .{
-            .bits = try std.DynamicBitSetUnmanaged.initEmpty(allocator, std.math.cast(usize, block_count) orelse return error.RecordTooLarge),
-        } };
-    }
-
-    fn deinit(self: *PostingBlockSeenSet, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .inline_bits => {},
-            .heap_bits => |*heap| heap.bits.deinit(allocator),
-        }
-    }
-
-    fn mark(self: *PostingBlockSeenSet, index: usize) !void {
-        switch (self.*) {
-            .inline_bits => |*inline_bits| {
-                if (index >= 64) return error.InvalidRecord;
-                const mask = @as(u64, 1) << @intCast(index);
-                if ((inline_bits.bits & mask) != 0) return error.InvalidRecord;
-                inline_bits.bits |= mask;
-                inline_bits.seen_count += 1;
-            },
-            .heap_bits => |*heap| {
-                if (heap.bits.isSet(index)) return error.InvalidRecord;
-                heap.bits.set(index);
-                heap.seen_count += 1;
-            },
-        }
-    }
-
-    fn count(self: *const PostingBlockSeenSet) u64 {
-        return switch (self.*) {
-            .inline_bits => |inline_bits| inline_bits.seen_count,
-            .heap_bits => |heap| heap.seen_count,
-        };
-    }
-};
-
-test "posting block seen set keeps small terms on stack" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    var small = try PostingBlockSeenSet.init(failing.allocator(), 64);
-    defer small.deinit(failing.allocator());
-    try small.mark(0);
-    try small.mark(63);
-    try std.testing.expectEqual(@as(u64, 2), small.count());
-    try std.testing.expectError(error.InvalidRecord, small.mark(63));
-
-    var large_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(error.OutOfMemory, PostingBlockSeenSet.init(large_failing.allocator(), 65));
-}
-
 fn canUsePersistentTermTopHitCache(options: TextSearchOptions, entry: TextTermEntry) bool {
     if (textSearchHasNodeFilter(options)) return false;
     if (options.member_filter != null) return false; // top-hit 缓存是全库序,过滤前截断会漏
@@ -6025,84 +4323,6 @@ fn validatePersistentTermPostings(
     }
 }
 
-pub const TextFieldWeights = struct {
-    text: f32 = 4.0,
-    kind: f32 = 0,
-};
-
-pub const TextSearchOptions = struct {
-    kind_filter: ?core.NodeKind = null,
-    /// Multi-kind schema descendants. The pointed set only needs to live for
-    /// the synchronous search call; keeping it by reference avoids copying a
-    /// 4096-bit set through every posting callback context.
-    kind_set_filter: ?*const schema.NodeTypeSet = null,
-    /// server-side 成员过滤(截断前生效,kind_filter 同款插入点):非 null 时只有集合内
-    /// node_id 进入打分/top-K。search --project(contain 子树)与 --schema-type(property
-    /// 成员集)都归一到此。**必须在截断前过滤**——后置过滤 + 放大候选窗口是创可贴
-    /// (project 外高分命中把子树内匹配挤出窗口 → 静默漏召回)。
-    member_filter: ?*const std.AutoHashMap(u64, void) = null,
-    limit: usize = 20,
-    max_postings_scanned: usize = core.default_max_text_postings_scanned,
-    min_score: f32 = 0,
-    params: Bm25Params = .{},
-    tokenizer: TokenizerOptions = .{},
-    deadline: core.QueryDeadline = .none,
-    /// CJK bigram **覆盖门** ratio。文档需命中 `max(1, ceil(required*ratio))` 个 query bigram
-    /// 才进结果(required = query 唯一 CJK bigram 数)。
-    /// 默认 0 → floor=1(命中任一 bigram 即可,精度交给覆盖优先排序 + top-K 截断)——修长中文
-    /// 整句 0 召回的根因(旧行为=必须命中全部 bigram)。>0 可收紧(校准用,runtime 可调不重编)。
-    /// **只作用于覆盖门,不影响重复频率门**(叠字 raw_tf 要求)。
-    cjk_coverage_ratio: f32 = 0,
-};
-
-fn textSearchHasNodeFilter(options: TextSearchOptions) bool {
-    return options.kind_filter != null or options.kind_set_filter != null;
-}
-
-fn textSearchMatchesNodeKind(options: TextSearchOptions, kind: core.NodeKind) bool {
-    if (options.kind_filter) |expected| {
-        if (kind != expected) return false;
-    }
-    if (options.kind_set_filter) |set| {
-        if (!set.containsNodeKind(kind)) return false;
-    }
-    return true;
-}
-
-/// CJK bigram 覆盖门 floor:文档至少要命中这么多个 query bigram 才进结果。
-/// required=0(query 无 CJK bigram)→ 0(门失效,纯 ASCII/单字路径不变)。
-/// ratio<=0 → floor=1(默认:命中任一 bigram 即可)。ratio>0 → max(1, ceil(required*ratio))。
-fn cjkBigramCoverageFloor(required: u32, ratio: f32) u32 {
-    if (required == 0) return 0;
-    if (ratio <= 0) return 1;
-    const scaled = @ceil(@as(f32, @floatFromInt(required)) * ratio);
-    const need: u32 = if (scaled < 1) 1 else @intFromFloat(scaled);
-    return @min(need, required);
-}
-
-fn validateTextSearchOptions(options: TextSearchOptions) !void {
-    try validateTokenizerOptions(options.tokenizer);
-    if (!validBm25Params(options.params)) return core.Error.Unsupported;
-    if (!std.math.isFinite(options.min_score)) return core.Error.Unsupported;
-}
-
-fn textSearchPreallocCapacity(options: TextSearchOptions) usize {
-    const max_prealloc: usize = 16 * 1024;
-    return @min(options.max_postings_scanned, max_prealloc);
-}
-
-fn chargeTextPostingScan(postings_scanned: *usize, options: TextSearchOptions) !void {
-    if (postings_scanned.* >= options.max_postings_scanned) return core.Error.BudgetExceeded;
-    postings_scanned.* += 1;
-}
-
-fn tokenizerOptionsEqual(lhs: TokenizerOptions, rhs: TokenizerOptions) bool {
-    return lhs.max_token_bytes == rhs.max_token_bytes and
-        lhs.emit_original_compound == rhs.emit_original_compound and
-        lhs.emit_cjk_bigrams == rhs.emit_cjk_bigrams and
-        lhs.emit_cjk_unigrams == rhs.emit_cjk_unigrams;
-}
-
 fn searchableNodeTextBytes(text: []const u8, metadata: SearchableNodeMetadata) !u64 {
     var bytes: u64 = text.len;
     if (metadata.name) |name| bytes = std.math.add(u64, bytes, name.len) catch return error.RecordTooLarge;
@@ -6159,132 +4379,6 @@ fn countTermInSearchableNode(allocator: std.mem.Allocator, text: []const u8, met
     return freq;
 }
 
-fn validatePersistentTextSearchOptions(options: TextSearchOptions) !void {
-    try validateTextSearchOptions(options);
-    if (!tokenizerOptionsEqual(options.tokenizer, .{})) return core.Error.Unsupported;
-}
-
-pub const TextSearchHit = struct {
-    node_id: core.NodeId,
-    kind: core.NodeKind,
-    score: f32,
-    /// 命中的 CJK bigram 数(覆盖度)。覆盖优先排序用:全覆盖恒排在部分覆盖之上,
-    /// 同覆盖桶内再按 BM25 分决胜。非 CJK query 恒为 0,排序退化为纯 BM25(行为不变)。
-    match_count: u32 = 0,
-};
-
-pub const TextDocument = struct {
-    node_id: core.NodeId,
-    kind: core.NodeKind,
-    text: []const u8,
-    name: ?[]const u8 = null,
-    summary: ?[]const u8 = null,
-};
-
-fn textIndexKindLabel(kind: core.NodeKind, fallback_buffer: *[16]u8) []const u8 {
-    inline for (@typeInfo(core.NodeKind).@"enum".fields) |field| {
-        if (@intFromEnum(kind) == field.value) return field.name;
-    }
-    return std.fmt.bufPrint(fallback_buffer, "type#{}", .{@intFromEnum(kind)}) catch unreachable;
-}
-
-const SearchableNodeMetadata = struct {
-    name: ?[]const u8 = null,
-    summary: ?[]const u8 = null,
-    owned: bool = false,
-
-    fn deinit(self: *SearchableNodeMetadata, allocator: std.mem.Allocator) void {
-        if (self.owned) {
-            if (self.name) |name| allocator.free(name);
-            if (self.summary) |summary| allocator.free(summary);
-        }
-        self.* = .{};
-    }
-};
-
-fn readSearchableNodeMetadata(allocator: std.mem.Allocator, store: storage_mod.Store, node_id: core.NodeId) !SearchableNodeMetadata {
-    var out = SearchableNodeMetadata{ .owned = true };
-    errdefer out.deinit(allocator);
-    out.name = try store.getNodeStringProperty(allocator, node_id, "name");
-    out.summary = try store.getNodeStringProperty(allocator, node_id, "summary");
-    return out;
-}
-
-const SearchableNodeMetadataSnapshot = struct {
-    allocator: std.mem.Allocator,
-    snapshot: storage_mod.PropertySnapshot,
-    by_node: std.AutoHashMap(u64, SearchableNodeMetadata),
-
-    fn init(allocator: std.mem.Allocator, store: storage_mod.Store) !SearchableNodeMetadataSnapshot {
-        const snapshot = try store.loadSearchableNodeMetadataSnapshot(allocator);
-        return try initFromSnapshotDeadline(allocator, snapshot, .none);
-    }
-
-    fn initLimited(
-        allocator: std.mem.Allocator,
-        store: storage_mod.Store,
-        max_string_bytes: u64,
-        max_delta_scan_bytes: u64,
-        deadline: core.QueryDeadline,
-    ) !SearchableNodeMetadataSnapshot {
-        const snapshot = try store.loadSearchableNodeMetadataSnapshotWithLimitsDeadline(allocator, max_string_bytes, max_delta_scan_bytes, deadline);
-        return try initFromSnapshotDeadline(allocator, snapshot, deadline);
-    }
-
-    fn initFromSnapshotDeadline(
-        allocator: std.mem.Allocator,
-        snapshot_input: storage_mod.PropertySnapshot,
-        deadline: core.QueryDeadline,
-    ) !SearchableNodeMetadataSnapshot {
-        var snapshot = snapshot_input;
-        errdefer snapshot.deinit(allocator);
-        var by_node = std.AutoHashMap(u64, SearchableNodeMetadata).init(allocator);
-        errdefer by_node.deinit();
-
-        const name_hash = storage_mod.propertyKeyHashForLookup("name");
-        const summary_hash = storage_mod.propertyKeyHashForLookup("summary");
-        for (snapshot.entries) |entry| {
-            if (deadline.expired()) return core.Error.BudgetExceeded;
-            if (entry.value_kind != .string) continue;
-            const node_id = switch (entry.owner) {
-                .node => |id| id.toInt(),
-                .edge => continue,
-            };
-            if (entry.key_hash != name_hash and entry.key_hash != summary_hash) continue;
-            const slot = try by_node.getOrPut(node_id);
-            if (!slot.found_existing) slot.value_ptr.* = .{};
-            if (entry.key_hash == name_hash) {
-                slot.value_ptr.name = entry.string_value;
-            } else {
-                slot.value_ptr.summary = entry.string_value;
-            }
-        }
-        return .{ .allocator = allocator, .snapshot = snapshot, .by_node = by_node };
-    }
-
-    fn deinit(self: *SearchableNodeMetadataSnapshot) void {
-        self.by_node.deinit();
-        self.snapshot.deinit(self.allocator);
-        self.* = undefined;
-    }
-
-    fn get(self: *const SearchableNodeMetadataSnapshot, node_id: core.NodeId) SearchableNodeMetadata {
-        return self.by_node.get(node_id.toInt()) orelse .{};
-    }
-};
-
-const IndexedDocument = struct {
-    node_id: core.NodeId,
-    kind: core.NodeKind,
-    len: f32,
-};
-
-const Posting = struct {
-    doc_index: usize,
-    weighted_tf: f32,
-    raw_tf: u32,
-};
-
 const PersistentTerm = struct {
     term: []u8,
     postings: PersistentPostingList = .{},
@@ -6298,19 +4392,9 @@ const PendingPersistentTerm = struct {
     postings: PersistentPostingList = .{},
 };
 
-const PendingPostingTerm = struct {
-    term: []u8,
-    postings: std.ArrayList(Posting),
-};
-
 const FieldTermFreq = struct {
     text: u32 = 0,
     kind: u32 = 0,
-};
-
-const WeightedTermFreq = struct {
-    weighted: f32 = 0,
-    raw: u32 = 0,
 };
 
 const PersistentPostingList = struct {
@@ -6374,7 +4458,7 @@ const PersistentPostingList = struct {
         }
     }
 
-    fn items(self: *const PersistentPostingList) []const TextPostingRecord {
+    pub fn items(self: *const PersistentPostingList) []const TextPostingRecord {
         return switch (self.len) {
             0 => &.{},
             1 => self.inline_items[0..1],
@@ -6432,7 +4516,7 @@ const PersistentTermBuilder = struct {
         try self.addDocumentFreqs(doc_id, &freqs);
     }
 
-    fn addDocumentFreqs(self: *PersistentTermBuilder, doc_id: u64, freqs: *std.StringHashMap(FieldTermFreq)) !void {
+    pub fn addDocumentFreqs(self: *PersistentTermBuilder, doc_id: u64, freqs: *std.StringHashMap(FieldTermFreq)) !void {
         if (!self.term_index_active) return error.InvalidRecord;
         var pending_terms = std.ArrayList(PendingPersistentTerm).empty;
         defer {
@@ -6503,403 +4587,6 @@ const PersistentTermBuilder = struct {
         self.terms.shrinkAndFree(self.allocator, self.terms.items.len);
     }
 };
-
-pub const TextIndex = struct {
-    allocator: std.mem.Allocator,
-    postings_by_term: std.StringHashMap(std.ArrayList(Posting)),
-    doc_ids: std.AutoHashMap(u64, void),
-    owned_terms: std.ArrayList([]u8),
-    docs: std.ArrayList(IndexedDocument),
-    total_doc_len: f32 = 0,
-    field_weights: TextFieldWeights = .{},
-    tokenizer_options: TokenizerOptions = .{},
-
-    pub fn init(allocator: std.mem.Allocator) TextIndex {
-        return .{
-            .allocator = allocator,
-            .postings_by_term = std.StringHashMap(std.ArrayList(Posting)).init(allocator),
-            .doc_ids = std.AutoHashMap(u64, void).init(allocator),
-            .owned_terms = .empty,
-            .docs = .empty,
-        };
-    }
-
-    pub fn deinit(self: *TextIndex) void {
-        var postings_it = self.postings_by_term.valueIterator();
-        while (postings_it.next()) |postings| postings.deinit(self.allocator);
-        self.postings_by_term.deinit();
-        self.doc_ids.deinit();
-        for (self.owned_terms.items) |term| self.allocator.free(term);
-        self.owned_terms.deinit(self.allocator);
-        self.docs.deinit(self.allocator);
-    }
-
-    pub fn buildFromGraph(allocator: std.mem.Allocator, graph: *const graph_mod.Graph) !TextIndex {
-        return buildFromGraphDeadline(allocator, graph, .none);
-    }
-
-    pub fn buildFromGraphDeadline(allocator: std.mem.Allocator, graph: *const graph_mod.Graph, deadline: core.QueryDeadline) !TextIndex {
-        return buildFromGraphWithMetadataDeadline(allocator, graph, null, deadline);
-    }
-
-    fn buildFromGraphWithMetadataDeadline(
-        allocator: std.mem.Allocator,
-        graph: *const graph_mod.Graph,
-        metadata: ?*const SearchableNodeMetadataSnapshot,
-        deadline: core.QueryDeadline,
-    ) !TextIndex {
-        var index = TextIndex.init(allocator);
-        errdefer index.deinit();
-        for (graph.nodes.items) |node| {
-            if (deadline.expired()) return core.Error.BudgetExceeded;
-            if (node.status != .active) continue;
-            if (isDeletedNodeTombstoneNode(node.kind, node.text)) continue;
-            const node_metadata = if (metadata) |snapshot| snapshot.get(node.id) else SearchableNodeMetadata{};
-            try index.addDocument(.{
-                .node_id = node.id,
-                .kind = node.kind,
-                .text = node.text,
-                .name = node_metadata.name,
-                .summary = node_metadata.summary,
-            });
-        }
-        return index;
-    }
-
-    pub fn buildFromStore(allocator: std.mem.Allocator, store: storage_mod.Store) !TextIndex {
-        return buildFromStoreOnce(allocator, store, .none) catch |err| switch (err) {
-            error.FileNotFound, error.InvalidRecord => retry: {
-                try store.repairPersistentIndexesFromLog();
-                break :retry try buildFromStoreOnce(allocator, store, .none);
-            },
-            else => |e| return e,
-        };
-    }
-
-    /// Build an ephemeral index without repairing or publishing any store
-    /// files.  Search uses this when the persistent catalog is stale so a
-    /// read cannot unexpectedly become an O(N) write transaction.
-    pub fn buildFromStoreReadOnlyDeadline(
-        allocator: std.mem.Allocator,
-        store: storage_mod.Store,
-        max_searchable_metadata_bytes: u64,
-        max_searchable_property_scan_bytes: u64,
-        deadline: core.QueryDeadline,
-    ) !TextIndex {
-        // Property corruption is not a graph-index repair signal. Materialize
-        // and validate metadata before entering the graph fallback so a bad
-        // property delta cannot silently erase name/summary search terms.
-        var metadata = try SearchableNodeMetadataSnapshot.initLimited(allocator, store, max_searchable_metadata_bytes, max_searchable_property_scan_bytes, deadline);
-        defer metadata.deinit();
-        return buildFromStoreOnceWithMetadata(allocator, store, &metadata, deadline) catch |err| switch (err) {
-            // A read-only fallback may replay the canonical event log in
-            // memory, but it must never publish repaired graph indexes.
-            error.FileNotFound, error.InvalidRecord => {
-                var graph = try store.loadGraphDeadline(deadline);
-                defer graph.deinit();
-                return try buildFromGraphWithMetadataDeadline(allocator, &graph, &metadata, deadline);
-            },
-            else => |e| return e,
-        };
-    }
-
-    fn buildFromStoreOnce(allocator: std.mem.Allocator, store: storage_mod.Store, deadline: core.QueryDeadline) !TextIndex {
-        var metadata = try SearchableNodeMetadataSnapshot.init(allocator, store);
-        defer metadata.deinit();
-        return buildFromStoreOnceWithMetadata(allocator, store, &metadata, deadline);
-    }
-
-    fn buildFromStoreOnceWithMetadata(
-        allocator: std.mem.Allocator,
-        store: storage_mod.Store,
-        metadata: *const SearchableNodeMetadataSnapshot,
-        deadline: core.QueryDeadline,
-    ) !TextIndex {
-        var index = TextIndex.init(allocator);
-        errdefer index.deinit();
-
-        var nodes = try store.nodeRecordsIterator(null);
-        defer nodes.deinit();
-        while (try nodes.nextRef()) |node| {
-            if (deadline.expired()) return core.Error.BudgetExceeded;
-            const node_metadata = metadata.get(node.id);
-            if (node.text_bytes) |text| {
-                if (isDeletedNodeTombstoneNode(node.kind, text)) continue;
-                try index.addDocument(.{ .node_id = node.id, .kind = node.kind, .text = text, .name = node_metadata.name, .summary = node_metadata.summary });
-            } else if (try nodes.readRefTextBorrowed(node)) |text| {
-                if (isDeletedNodeTombstoneNode(node.kind, text)) continue;
-                try index.addDocument(.{ .node_id = node.id, .kind = node.kind, .text = text, .name = node_metadata.name, .summary = node_metadata.summary });
-            } else {
-                const text = try nodes.readRefTextAlloc(allocator, node);
-                defer allocator.free(text);
-                if (isDeletedNodeTombstoneNode(node.kind, text)) continue;
-                try index.addDocument(.{ .node_id = node.id, .kind = node.kind, .text = text, .name = node_metadata.name, .summary = node_metadata.summary });
-            }
-        }
-        return index;
-    }
-
-    pub fn queryPlanStats(self: TextIndex, query: []const u8, options: TextSearchOptions) !TextQueryPlanStats {
-        try validateTextSearchOptions(options);
-        if (!tokenizerOptionsEqual(options.tokenizer, self.tokenizer_options)) return core.Error.Unsupported;
-        if (options.deadline.expired()) return core.Error.BudgetExceeded;
-
-        var query_tokens = try tokenize(self.allocator, query, options.tokenizer);
-        defer query_tokens.deinit();
-        var unique_query_terms = std.StringHashMap(void).init(self.allocator);
-        defer unique_query_terms.deinit();
-        try unique_query_terms.ensureTotalCapacity(@intCast(query_tokens.items.items.len));
-
-        var stats = TextQueryPlanStats{ .query_terms = query_tokens.items.items.len };
-        for (query_tokens.items.items) |term| {
-            if (options.deadline.expired()) return core.Error.BudgetExceeded;
-            const entry = try unique_query_terms.getOrPut(term);
-            if (entry.found_existing) continue;
-            entry.value_ptr.* = {};
-            stats.unique_query_terms += 1;
-            if (self.postings_by_term.get(term)) |postings| {
-                stats.matched_terms += 1;
-                stats.postings_count_total = std.math.add(u64, stats.postings_count_total, postings.items.len) catch return error.RecordTooLarge;
-                stats.max_postings_count = @max(stats.max_postings_count, postings.items.len);
-            }
-        }
-        return stats;
-    }
-
-    pub fn addDocument(self: *TextIndex, doc: TextDocument) !void {
-        try validateTokenizerOptions(self.tokenizer_options);
-        if (doc.node_id == .none or doc.node_id.toInt() == std.math.maxInt(u64) or self.doc_ids.contains(doc.node_id.toInt())) return core.Error.InvalidId;
-        const doc_index = self.docs.items.len;
-        var term_weights = std.StringHashMap(WeightedTermFreq).init(self.allocator);
-        defer term_weights.deinit();
-        var owned_term_weights = std.ArrayList([]u8).empty;
-        defer {
-            for (owned_term_weights.items) |term| self.allocator.free(term);
-            owned_term_weights.deinit(self.allocator);
-        }
-
-        var doc_len: f32 = 0;
-        try self.collectFieldTerms(&term_weights, &owned_term_weights, doc.text, self.field_weights.text, &doc_len);
-        if (doc.name) |name| try self.collectFieldTerms(&term_weights, &owned_term_weights, name, self.field_weights.text, &doc_len);
-        if (doc.summary) |summary| try self.collectFieldTerms(&term_weights, &owned_term_weights, summary, self.field_weights.text, &doc_len);
-        if (self.field_weights.kind != 0) {
-            var kind_label_buffer: [16]u8 = undefined;
-            try self.collectFieldTerms(&term_weights, &owned_term_weights, textIndexKindLabel(doc.kind, &kind_label_buffer), self.field_weights.kind, &doc_len);
-        }
-        if (doc_len <= 0) return core.Error.Unsupported;
-        const next_total_doc_len = self.total_doc_len + doc_len;
-        if (!std.math.isFinite(next_total_doc_len)) return core.Error.Unsupported;
-
-        var pending_terms = std.ArrayList(PendingPostingTerm).empty;
-        defer {
-            for (pending_terms.items) |*pending| {
-                self.allocator.free(pending.term);
-                pending.postings.deinit(self.allocator);
-            }
-            pending_terms.deinit(self.allocator);
-        }
-
-        var new_term_count: usize = 0;
-        var it = term_weights.iterator();
-        while (it.next()) |entry| {
-            if (!self.postings_by_term.contains(entry.key_ptr.*)) {
-                new_term_count += 1;
-                var postings = std.ArrayList(Posting).empty;
-                errdefer postings.deinit(self.allocator);
-                try postings.append(self.allocator, .{
-                    .doc_index = doc_index,
-                    .weighted_tf = entry.value_ptr.weighted,
-                    .raw_tf = entry.value_ptr.raw,
-                });
-                const owned_term = try self.allocator.dupe(u8, entry.key_ptr.*);
-                errdefer self.allocator.free(owned_term);
-                try pending_terms.append(self.allocator, .{ .term = owned_term, .postings = postings });
-            }
-        }
-
-        try self.docs.ensureUnusedCapacity(self.allocator, 1);
-        try self.doc_ids.ensureUnusedCapacity(1);
-        try self.owned_terms.ensureUnusedCapacity(self.allocator, new_term_count);
-        try self.postings_by_term.ensureUnusedCapacity(@intCast(new_term_count));
-
-        it = term_weights.iterator();
-        while (it.next()) |entry| {
-            if (self.postings_by_term.getPtr(entry.key_ptr.*)) |postings| {
-                try postings.ensureUnusedCapacity(self.allocator, 1);
-            }
-        }
-
-        self.docs.appendAssumeCapacity(.{
-            .node_id = doc.node_id,
-            .kind = doc.kind,
-            .len = doc_len,
-        });
-        self.total_doc_len = next_total_doc_len;
-
-        it = term_weights.iterator();
-        while (it.next()) |entry| {
-            const posting = Posting{
-                .doc_index = doc_index,
-                .weighted_tf = entry.value_ptr.weighted,
-                .raw_tf = entry.value_ptr.raw,
-            };
-            if (self.postings_by_term.getPtr(entry.key_ptr.*)) |postings| {
-                postings.appendAssumeCapacity(posting);
-            }
-        }
-
-        for (pending_terms.items) |pending| {
-            self.owned_terms.appendAssumeCapacity(pending.term);
-            self.postings_by_term.putAssumeCapacityNoClobber(pending.term, pending.postings);
-        }
-        self.doc_ids.putAssumeCapacityNoClobber(doc.node_id.toInt(), {});
-        pending_terms.clearRetainingCapacity();
-    }
-
-    pub fn search(self: TextIndex, query: []const u8, options: TextSearchOptions) !std.ArrayList(TextSearchHit) {
-        try validateTextSearchOptions(options);
-        if (!tokenizerOptionsEqual(options.tokenizer, self.tokenizer_options)) return core.Error.Unsupported;
-        if (options.deadline.expired()) return core.Error.BudgetExceeded;
-        var hits = std.ArrayList(TextSearchHit).empty;
-        if (options.limit == 0 or self.docs.items.len == 0) return hits;
-        errdefer hits.deinit(self.allocator);
-        try hits.ensureTotalCapacity(self.allocator, @min(options.limit, textSearchPreallocCapacity(options)));
-
-        var query_tokens = try tokenize(self.allocator, query, options.tokenizer);
-        defer query_tokens.deinit();
-        if (query_tokens.items.items.len == 0) return hits;
-
-        var unique_query_terms = std.StringHashMap(void).init(self.allocator);
-        defer unique_query_terms.deinit();
-        var scores = std.AutoHashMap(usize, f32).init(self.allocator);
-        defer scores.deinit();
-        var cjk_bigram_match_counts = std.AutoHashMap(usize, u32).init(self.allocator);
-        defer cjk_bigram_match_counts.deinit();
-        const prealloc = textSearchPreallocCapacity(options);
-        try unique_query_terms.ensureTotalCapacity(@intCast(@min(query_tokens.items.items.len, prealloc)));
-        try scores.ensureTotalCapacity(@intCast(prealloc));
-        try cjk_bigram_match_counts.ensureTotalCapacity(@intCast(prealloc));
-
-        var required_cjk_bigram_terms: u32 = 0;
-        var query_has_non_cjk_term = false;
-        var postings_scanned: usize = 0;
-        for (query_tokens.items.items) |term| {
-            if (options.deadline.expired()) return core.Error.BudgetExceeded;
-            if (termHasNonCjkCodepoint(term)) query_has_non_cjk_term = true;
-            const unique_entry = try unique_query_terms.getOrPut(term);
-            if (unique_entry.found_existing) continue;
-            unique_entry.value_ptr.* = {};
-            const cjk_bigram_query_term = isCjkMultiCodepointTerm(term);
-            if (cjk_bigram_query_term) {
-                required_cjk_bigram_terms = std.math.add(u32, required_cjk_bigram_terms, 1) catch return error.RecordTooLarge;
-            }
-            const required_cjk_bigram_count = if (cjk_bigram_query_term)
-                try countQueryTermOccurrences(query_tokens.items.items, term)
-            else
-                0;
-
-            const postings = self.postings_by_term.get(term) orelse continue;
-            const doc_freq: u64 = @intCast(postings.items.len);
-            for (postings.items) |posting| {
-                if (options.deadline.expired()) return core.Error.BudgetExceeded;
-                try chargeTextPostingScan(&postings_scanned, options);
-                const doc = self.docs.items[posting.doc_index];
-                if (!textSearchMatchesNodeKind(options, doc.kind)) continue;
-                if (options.member_filter) |m| {
-                    if (!m.contains(doc.node_id.toInt())) continue;
-                }
-                if (cjk_bigram_query_term) {
-                    if (posting.raw_tf >= required_cjk_bigram_count) {
-                        const entry = try cjk_bigram_match_counts.getOrPut(posting.doc_index);
-                        if (!entry.found_existing) entry.value_ptr.* = 0;
-                        entry.value_ptr.* = std.math.add(u32, entry.value_ptr.*, 1) catch return error.RecordTooLarge;
-                    }
-                }
-                const score = bm25WeightedTermScore(
-                    posting.weighted_tf,
-                    doc.len,
-                    self.avgDocLen(),
-                    @intCast(self.docs.items.len),
-                    doc_freq,
-                    options.params,
-                );
-                const entry = try scores.getOrPut(posting.doc_index);
-                if (!entry.found_existing) entry.value_ptr.* = 0;
-                const next = entry.value_ptr.* + score;
-                if (!std.math.isFinite(next)) return core.Error.Unsupported;
-                entry.value_ptr.* = next;
-            }
-        }
-
-        var worst_hit_index: ?usize = null;
-        var score_it = scores.iterator();
-        while (score_it.next()) |entry| {
-            if (options.deadline.expired()) return core.Error.BudgetExceeded;
-            if (!std.math.isFinite(entry.value_ptr.*)) return core.Error.Unsupported;
-            if (entry.value_ptr.* < options.min_score) continue;
-            if (required_cjk_bigram_terms > 0 and !query_has_non_cjk_term and (cjk_bigram_match_counts.get(entry.key_ptr.*) orelse 0) < cjkBigramCoverageFloor(required_cjk_bigram_terms, options.cjk_coverage_ratio)) continue;
-            try appendTopTextHitBoundedCachedWorst(self.allocator, &hits, options.limit, &worst_hit_index, .{
-                .node_id = self.docs.items[entry.key_ptr.*].node_id,
-                .kind = self.docs.items[entry.key_ptr.*].kind,
-                .score = entry.value_ptr.*,
-                .match_count = cjk_bigram_match_counts.get(entry.key_ptr.*) orelse 0,
-            });
-        }
-
-        std.mem.sort(TextSearchHit, hits.items, {}, textSearchHitLessThan);
-        return hits;
-    }
-
-    pub fn avgDocLen(self: TextIndex) f32 {
-        if (self.docs.items.len == 0) return 0;
-        const count: f32 = @floatFromInt(self.docs.items.len);
-        return self.total_doc_len / count;
-    }
-
-    fn collectFieldTerms(
-        self: TextIndex,
-        term_weights: *std.StringHashMap(WeightedTermFreq),
-        owned_term_weights: *std.ArrayList([]u8),
-        text: []const u8,
-        weight: f32,
-        doc_len: *f32,
-    ) !void {
-        if (!std.math.isFinite(weight) or weight < 0) return core.Error.Unsupported;
-        if (weight == 0) return;
-        var tokens = try tokenize(self.allocator, text, self.tokenizer_options);
-        defer tokens.deinit();
-        for (tokens.items.items) |term| {
-            const next_doc_len = doc_len.* + weight;
-            if (!std.math.isFinite(next_doc_len)) return core.Error.Unsupported;
-            doc_len.* = next_doc_len;
-            if (term_weights.getPtr(term)) |current| {
-                const next_weight = current.weighted + weight;
-                if (!std.math.isFinite(next_weight)) return core.Error.Unsupported;
-                current.weighted = next_weight;
-                current.raw = std.math.add(u32, current.raw, 1) catch return error.RecordTooLarge;
-            } else {
-                const owned = try self.allocator.dupe(u8, term);
-                var registered = false;
-                errdefer if (!registered) self.allocator.free(owned);
-                try owned_term_weights.append(self.allocator, owned);
-                registered = true;
-                try term_weights.put(owned, .{ .weighted = weight, .raw = 1 });
-            }
-        }
-    }
-};
-
-fn textSearchHitLessThan(_: void, lhs: TextSearchHit, rhs: TextSearchHit) bool {
-    const lhs_finite = std.math.isFinite(lhs.score);
-    const rhs_finite = std.math.isFinite(rhs.score);
-    if (lhs_finite != rhs_finite) return lhs_finite;
-    // 覆盖优先:命中 CJK bigram 多的排前——全覆盖恒在部分覆盖之上,top-K 截断先砍低覆盖。
-    // (Linus S1:纯 BM25 排序无覆盖分量,命中 1 个稀有 bigram 的短文档会压过全覆盖文档 → 精度塌。)
-    // 非 CJK query 恒 match_count=0 → 落到纯 BM25 分数,行为不变。
-    if (lhs.match_count != rhs.match_count) return lhs.match_count > rhs.match_count;
-    if (lhs_finite and lhs.score != rhs.score) return lhs.score > rhs.score;
-    return lhs.node_id.toInt() < rhs.node_id.toInt();
-}
 
 fn textTermTopHitLessThan(_: void, lhs: TextTermTopHitRecord, rhs: TextTermTopHitRecord) bool {
     const lhs_finite = std.math.isFinite(lhs.score);
@@ -7039,58 +4726,6 @@ fn textTermTopHitCandidateCannotBeatCurrentWorstWithDocLenFloor(
     return upper_score < hits[slot].score;
 }
 
-fn appendTopTextHitBounded(allocator: std.mem.Allocator, hits: *std.ArrayList(TextSearchHit), limit: usize, hit: TextSearchHit) !void {
-    var worst_index: ?usize = null;
-    try appendTopTextHitBoundedCachedWorst(allocator, hits, limit, &worst_index, hit);
-}
-
-fn findWorstTextSearchHitIndex(hits: []const TextSearchHit) usize {
-    std.debug.assert(hits.len > 0);
-    var worst_index: usize = 0;
-    for (hits[1..], 1..) |candidate, i| {
-        if (textSearchHitLessThan({}, hits[worst_index], candidate)) worst_index = i;
-    }
-    return worst_index;
-}
-
-fn appendTopTextHitBoundedCachedWorst(
-    allocator: std.mem.Allocator,
-    hits: *std.ArrayList(TextSearchHit),
-    limit: usize,
-    worst_index: *?usize,
-    hit: TextSearchHit,
-) !void {
-    if (limit == 0) return;
-    if (hits.items.len < limit) {
-        try hits.append(allocator, hit);
-        if (hits.items.len == limit) worst_index.* = findWorstTextSearchHitIndex(hits.items);
-        return;
-    }
-    const slot = worst_index.* orelse findWorstTextSearchHitIndex(hits.items);
-    if (textSearchHitLessThan({}, hit, hits.items[slot])) {
-        hits.items[slot] = hit;
-        worst_index.* = findWorstTextSearchHitIndex(hits.items);
-    } else {
-        worst_index.* = slot;
-    }
-}
-
-fn worstTopTextHitScore(hits: []const TextSearchHit, limit: usize) ?f32 {
-    if (limit == 0 or hits.len < limit) return null;
-    var worst_index: usize = 0;
-    for (hits[1..], 1..) |candidate, i| {
-        if (textSearchHitLessThan({}, hits[worst_index], candidate)) worst_index = i;
-    }
-    return hits[worst_index].score;
-}
-
-fn hitsContainNode(hits: []const TextSearchHit, node_id: core.NodeId) bool {
-    for (hits) |hit| {
-        if (hit.node_id == node_id) return true;
-    }
-    return false;
-}
-
 fn textMetaPath(allocator: std.mem.Allocator, store: storage_mod.Store) ![]u8 {
     return std.fs.path.join(allocator, &.{ store.dir_path, "text_meta.idx" });
 }
@@ -7117,109 +4752,6 @@ fn textPostingBlockImpactsPath(allocator: std.mem.Allocator, store: storage_mod.
 
 fn textTermTopHitsPath(allocator: std.mem.Allocator, store: storage_mod.Store) ![]u8 {
     return std.fs.path.join(allocator, &.{ store.dir_path, "text_term_top_hits.idx" });
-}
-
-fn textRebuildLockPath(allocator: std.mem.Allocator, store: storage_mod.Store) ![]u8 {
-    return std.fs.path.join(allocator, &.{ store.dir_path, "text_rebuild.lock" });
-}
-
-const PersistentTextRebuildLock = struct {
-    io: std.Io,
-    file: std.Io.File,
-    allocator: std.mem.Allocator,
-    path: []u8,
-
-    fn deinit(self: *PersistentTextRebuildLock) void {
-        self.file.unlock(self.io);
-        self.file.close(self.io);
-        self.allocator.free(self.path);
-        self.path = &.{};
-    }
-};
-
-const text_rebuild_lock_poll_duration = std.Io.Duration.fromMilliseconds(1);
-
-fn acquirePersistentTextRebuildLock(allocator: std.mem.Allocator, store: storage_mod.Store) !PersistentTextRebuildLock {
-    return acquirePersistentTextRebuildLockDeadline(allocator, store, .none);
-}
-
-fn acquirePersistentTextRebuildLockDeadline(allocator: std.mem.Allocator, store: storage_mod.Store, deadline: core.QueryDeadline) !PersistentTextRebuildLock {
-    const path = try textRebuildLockPath(allocator, store);
-    errdefer allocator.free(path);
-    const nonblocking = deadline != .none;
-    var file: std.Io.File = undefined;
-    while (true) {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
-        file = std.Io.Dir.cwd().createFile(store.io, path, .{
-            .read = true,
-            .truncate = false,
-            .lock = .exclusive,
-            .lock_nonblocking = nonblocking,
-        }) catch |err| switch (err) {
-            error.WouldBlock => {
-                try std.Io.sleep(store.io, text_rebuild_lock_poll_duration, .awake);
-                continue;
-            },
-            else => |e| return e,
-        };
-        break;
-    }
-    return .{
-        .io = store.io,
-        .file = file,
-        .allocator = allocator,
-        .path = path,
-    };
-}
-
-fn tmpPathFor(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const pid = currentProcessIdForTempPath();
-    const nonce = text_temp_nonce.fetchAdd(1, .monotonic);
-    return std.fmt.allocPrint(allocator, "{s}.tmp.{d}.{x}", .{ path, pid, nonce });
-}
-
-test "persistent text temp paths are unique per writer" {
-    const first = try tmpPathFor(std.testing.allocator, "/tmp/tinykg-text.idx");
-    defer std.testing.allocator.free(first);
-    const second = try tmpPathFor(std.testing.allocator, "/tmp/tinykg-text.idx");
-    defer std.testing.allocator.free(second);
-
-    try std.testing.expect(!std.mem.eql(u8, first, second));
-    try std.testing.expect(std.mem.startsWith(u8, first, "/tmp/tinykg-text.idx.tmp."));
-    try std.testing.expect(std.mem.startsWith(u8, second, "/tmp/tinykg-text.idx.tmp."));
-}
-
-test "persistent text rebuild lock is store local and reusable" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
-    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
-    defer std.testing.allocator.free(store_path);
-
-    var store = try storage_mod.Store.init(std.testing.allocator, std.testing.io, store_path);
-    defer store.deinit();
-    try store.createEmpty();
-
-    const expected_lock_path = try textRebuildLockPath(std.testing.allocator, store);
-    defer std.testing.allocator.free(expected_lock_path);
-
-    try std.testing.expectError(core.Error.BudgetExceeded, acquirePersistentTextRebuildLockDeadline(std.testing.allocator, store, .immediate));
-
-    {
-        var rebuild_lock = try acquirePersistentTextRebuildLock(std.testing.allocator, store);
-        defer rebuild_lock.deinit();
-        try std.testing.expectEqualStrings(expected_lock_path, rebuild_lock.path);
-    }
-    {
-        var rebuild_lock = try acquirePersistentTextRebuildLock(std.testing.allocator, store);
-        defer rebuild_lock.deinit();
-        try std.testing.expectEqualStrings(expected_lock_path, rebuild_lock.path);
-    }
-
-    var lock_file = try std.Io.Dir.cwd().openFile(std.testing.io, expected_lock_path, .{});
-    lock_file.close(std.testing.io);
 }
 
 fn renameReplace(io: std.Io, tmp_path: []const u8, final_path: []const u8) !void {
@@ -7253,12 +4785,12 @@ const TextBufferedWriter = struct {
     len: usize = 0,
     offset: u64 = 0,
 
-    fn init(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, capacity: usize) !TextBufferedWriter {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, capacity: usize) !TextBufferedWriter {
         std.debug.assert(capacity > 0);
         return try initAtOffset(allocator, io, file, capacity, 0);
     }
 
-    fn initAtOffset(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, capacity: usize, offset: u64) !TextBufferedWriter {
+    pub fn initAtOffset(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, capacity: usize, offset: u64) !TextBufferedWriter {
         std.debug.assert(capacity > 0);
         return .{
             .io = io,
@@ -7269,11 +4801,11 @@ const TextBufferedWriter = struct {
         };
     }
 
-    fn deinit(self: *TextBufferedWriter) void {
+    pub fn deinit(self: *TextBufferedWriter) void {
         self.allocator.free(self.buffer);
     }
 
-    fn append(self: *TextBufferedWriter, bytes: []const u8) !void {
+    pub fn append(self: *TextBufferedWriter, bytes: []const u8) !void {
         if (bytes.len > self.buffer.len) {
             try self.flush();
             try self.file.writePositionalAll(self.io, bytes, self.offset);
@@ -7285,7 +4817,7 @@ const TextBufferedWriter = struct {
         self.len += bytes.len;
     }
 
-    fn flush(self: *TextBufferedWriter) !void {
+    pub fn flush(self: *TextBufferedWriter) !void {
         if (self.len == 0) return;
         try self.file.writePositionalAll(self.io, self.buffer[0..self.len], self.offset);
         self.offset = std.math.add(u64, self.offset, self.len) catch return error.RecordTooLarge;
@@ -7310,7 +4842,7 @@ const TextPostingRunSummaryWriter = struct {
     raw_len: usize = 0,
     physical_bytes: u64 = text_run_summary_compressed_magic.len,
 
-    fn init(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File) !TextPostingRunSummaryWriter {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File) !TextPostingRunSummaryWriter {
         var output = try TextBufferedWriter.init(allocator, io, file, text_write_buffer_bytes);
         errdefer output.deinit();
         const raw_buffer = try allocator.alloc(u8, text_run_summary_block_bytes);
@@ -7330,14 +4862,14 @@ const TextPostingRunSummaryWriter = struct {
         };
     }
 
-    fn deinit(self: *TextPostingRunSummaryWriter) void {
+    pub fn deinit(self: *TextPostingRunSummaryWriter) void {
         self.allocator.free(self.flate_buffer);
         self.allocator.free(self.compressed_buffer);
         self.allocator.free(self.raw_buffer);
         self.output.deinit();
     }
 
-    fn append(self: *TextPostingRunSummaryWriter, bytes: []const u8) !void {
+    pub fn append(self: *TextPostingRunSummaryWriter, bytes: []const u8) !void {
         var pos: usize = 0;
         while (pos < bytes.len) {
             if (self.raw_len == self.raw_buffer.len) try self.flushBlock();
@@ -7368,7 +4900,7 @@ const TextPostingRunSummaryWriter = struct {
         self.raw_len = 0;
     }
 
-    fn flush(self: *TextPostingRunSummaryWriter) !void {
+    pub fn flush(self: *TextPostingRunSummaryWriter) !void {
         try self.flushBlock();
         try self.output.flush();
     }
@@ -7400,7 +4932,7 @@ const TextPostingRunReader = struct {
     current_term_sort_prefix: u64 = 0,
     previous_doc_id: u32 = 0,
 
-    fn init(
+    pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
         file: std.Io.File,
@@ -7429,7 +4961,7 @@ const TextPostingRunReader = struct {
         };
     }
 
-    fn deinit(self: *TextPostingRunReader) void {
+    pub fn deinit(self: *TextPostingRunReader) void {
         self.allocator.free(self.buffer);
         self.file.close(self.io);
     }
@@ -7533,66 +5065,8 @@ const TextPostingRunReader = struct {
         self.previous_doc_id = @intCast(doc_id);
         return .{ .doc_id = @intCast(doc_id), .text_freq = @intCast(validated_freq), .encoded_len = encoded_len };
     }
-
     fn readNextFrontCodedTextPosting(self: *TextPostingRunReader) !?DecodedFrontCodedTextPosting {
-        if (self.consumed_bytes == self.file_size) return null;
-        if (self.consumed_bytes > self.file_size) return error.InvalidRecord;
-        if (self.file_size - self.consumed_bytes < 2) return error.InvalidRecord;
-
-        const tag = try self.readByte();
-        self.consumed_bytes = std.math.add(u64, self.consumed_bytes, 1) catch return error.InvalidRecord;
-        var term_changed = false;
-        if (tag == 0) {
-            if (self.current_term_len == 0) return error.InvalidRecord;
-        } else if (tag <= default_max_token_bytes) {
-            const term_len: usize = tag;
-            if (self.file_size - self.consumed_bytes < term_len + self.minEncodedPostingBytes()) return error.InvalidRecord;
-            try self.readBytes(self.current_term[0..term_len]);
-            self.consumed_bytes = std.math.add(u64, self.consumed_bytes, term_len) catch return error.InvalidRecord;
-            self.current_term_len = term_len;
-            term_changed = true;
-        } else {
-            if (tag == text_posting_run_front_coded_prefix_tag_base) return error.InvalidRecord;
-            if (self.current_term_len == 0) return error.InvalidRecord;
-            const prefix_len: usize = tag - text_posting_run_front_coded_prefix_tag_base;
-            if (prefix_len > self.current_term_len) return error.InvalidRecord;
-            if (self.file_size - self.consumed_bytes < 1 + self.minEncodedPostingBytes()) return error.InvalidRecord;
-            const suffix_len = try self.readByte();
-            self.consumed_bytes = std.math.add(u64, self.consumed_bytes, 1) catch return error.InvalidRecord;
-            if (suffix_len == 0) return error.InvalidRecord;
-            const term_len = std.math.add(usize, prefix_len, suffix_len) catch return error.InvalidRecord;
-            if (term_len > default_max_token_bytes) return error.InvalidRecord;
-            if (self.file_size - self.consumed_bytes < suffix_len + self.minEncodedPostingBytes()) return error.InvalidRecord;
-            try self.readBytes(self.current_term[prefix_len..term_len]);
-            self.consumed_bytes = std.math.add(u64, self.consumed_bytes, suffix_len) catch return error.InvalidRecord;
-            self.current_term_len = term_len;
-            term_changed = true;
-        }
-        if (term_changed) {
-            self.current_term_sort_prefix = termSortPrefixKey(self.current_term[0..self.current_term_len]);
-            self.previous_doc_id = 0;
-        }
-
-        const posting = switch (self.format) {
-            .front_coded_terms_fixed_posting => posting: {
-                if (self.file_size - self.consumed_bytes < TextPostingRecord.encoded_len) return error.InvalidRecord;
-                const decoded = try self.readTextPostingFields();
-                self.previous_doc_id = decoded.doc_id;
-                break :posting DecodedRunTextPostingFields{
-                    .doc_id = decoded.doc_id,
-                    .text_freq = decoded.text_freq,
-                    .encoded_len = TextPostingRecord.encoded_len,
-                };
-            },
-            .front_coded_terms_delta_posting => try self.readDeltaTextPostingFields(),
-        };
-        self.consumed_bytes = std.math.add(u64, self.consumed_bytes, posting.encoded_len) catch return error.InvalidRecord;
-        try validateTextPostingFields(posting.doc_id, posting.text_freq, 0);
-        return .{
-            .doc_id = posting.doc_id,
-            .text_freq = posting.text_freq,
-            .term_changed = term_changed,
-        };
+        return posting_run_codec.readNextFrontCodedTextPosting(self);
     }
 
     fn nextFrontCodedTermRecord(self: *TextPostingRunReader) !?TextPostingRunRecord {
@@ -7623,13 +5097,13 @@ const TextPostingRunReader = struct {
         return true;
     }
 
-    fn nextRecord(self: *TextPostingRunReader) !?TextPostingRunRecord {
+    pub fn nextRecord(self: *TextPostingRunReader) !?TextPostingRunRecord {
         return switch (self.format) {
             .front_coded_terms_fixed_posting, .front_coded_terms_delta_posting => try self.nextFrontCodedTermRecord(),
         };
     }
 
-    fn nextRecordInto(self: *TextPostingRunReader, out: *TextPostingRunRecord) !bool {
+    pub fn nextRecordInto(self: *TextPostingRunReader, out: *TextPostingRunRecord) !bool {
         return switch (self.format) {
             .front_coded_terms_fixed_posting, .front_coded_terms_delta_posting => try self.nextFrontCodedTermRecordInto(out),
         };
@@ -7666,1558 +5140,56 @@ const TextPostingRunSummaryReadScratch = struct {
     }
 };
 
-const VirtualAllDocsRunCandidate = struct {
-    text_freq: u32,
-    last_seen_doc_id: u64,
+const PostingRunBuilderOps = struct {
+    pub const std = @import("std");
+    pub const TextBufferedWriter_dep = TextBufferedWriter;
+    pub const DenseAllDocsFreqStreamSizeStats_dep = DenseAllDocsFreqStreamSizeStats;
+    pub const appendDenseAllDocsFreqStreamFreqs_dep = appendDenseAllDocsFreqStreamFreqs;
+    pub const appendDenseAllDocsFreqStreamFreqsWithStats_dep = appendDenseAllDocsFreqStreamFreqsWithStats;
+    pub const denseAllDocsFreqStreamSizeStatsForFreqs_dep = denseAllDocsFreqStreamSizeStatsForFreqs;
+    pub const validateDenseAllDocsTextFreq_dep = validateDenseAllDocsTextFreq;
+    pub const default_max_token_bytes_dep = default_max_token_bytes;
+    pub const TextPostingRunSummaryFile_dep = TextPostingRunSummaryFile;
+    pub const CollectTextPostingRunSummaryContext_dep = CollectTextPostingRunSummaryContext;
+    pub const FieldTermFreq_dep = FieldTermFreq;
+    pub const TextPostingRecord_dep = TextPostingRecord;
+    pub const TextPostingRunChunkRecord_dep = TextPostingRunChunkRecord;
+    pub const TextPostingRunFrontCodedWriter_dep = TextPostingRunFrontCodedWriter;
+    pub const TextPostingRunRecord_dep = TextPostingRunRecord;
+    pub const TextPostingRunSummaryStats_dep = TextPostingRunSummaryStats;
+    pub const TextPostingRunSummaryWriter_dep = TextPostingRunSummaryWriter;
+    pub const TextPostingRunTermSummaryRecord_dep = TextPostingRunTermSummaryRecord;
+    pub const TextRebuildTextFreqCache_dep = TextRebuildTextFreqCache;
+    pub const text_posting_run_chunk_records_dep = text_posting_run_chunk_records;
+    pub const termSortPrefixKey_dep = termSortPrefixKey;
+    pub const termSortTailKey_dep = termSortTailKey;
+    pub const textMonotonicNs_dep = textMonotonicNs;
+    pub const textElapsedNs_dep = textElapsedNs;
+    pub const text_write_buffer_bytes_dep = text_write_buffer_bytes;
+    pub const appendTextPostingRunSummaryRecord_dep = appendTextPostingRunSummaryRecord;
+    pub const textBenchTraceRunBuilder_dep = textBenchTraceRunBuilder;
+    pub const text_posting_run_direct_merge_fan_in_dep = text_posting_run_direct_merge_fan_in;
+    pub const writeMergedTextPostingRunWithSummary_dep = writeMergedTextPostingRunWithSummary;
+    pub const text_posting_run_merge_fan_in_dep = text_posting_run_merge_fan_in;
+    pub const collectTextPostingRunTermSummariesFromFilesToFile_dep = collectTextPostingRunTermSummariesFromFilesToFile;
+    pub const writeSortedTextPostingRunChunkWithSummary_dep = writeSortedTextPostingRunChunkWithSummary;
+    pub const collectTextPostingRunSummaryFields_dep = collectTextPostingRunSummaryFields;
+    pub const validateTextPostingFields_dep = validateTextPostingFields;
+    pub const textPostingRunChunkRecordLessThan_dep = textPostingRunChunkRecordLessThan;
+    pub const text_posting_run_record_long_term_threshold_dep = text_posting_run_record_long_term_threshold;
+    pub const flushTextPostingRunSummary_dep = flushTextPostingRunSummary;
 };
-
-const VariableAllDocsFreqSlice = union(enum) {
-    narrow: []const u8,
-    wide: []const u16,
-
-    fn len(self: VariableAllDocsFreqSlice) usize {
-        return switch (self) {
-            .narrow => |freqs| freqs.len,
-            .wide => |freqs| freqs.len,
-        };
-    }
-
-    fn at(self: VariableAllDocsFreqSlice, index: usize) u32 {
-        return switch (self) {
-            .narrow => |freqs| freqs[index],
-            .wide => |freqs| freqs[index],
-        };
-    }
-
-    fn boundedRunLenLeq(self: VariableAllDocsFreqSlice, start: usize, max_freq: u32, max_run: usize) usize {
-        const total_len = self.len();
-        std.debug.assert(start < total_len);
-        var index = start;
-        const requested_end = std.math.add(usize, start, max_run) catch total_len;
-        const end = @min(total_len, requested_end);
-        while (index < end and self.at(index) <= max_freq) : (index += 1) {}
-        return index - start;
-    }
-
-    fn elementSize(self: VariableAllDocsFreqSlice) usize {
-        return switch (self) {
-            .narrow => 1,
-            .wide => 2,
-        };
-    }
-
-    fn appendDenseAllDocsFreqStream(self: VariableAllDocsFreqSlice, writer: *TextBufferedWriter) !u64 {
-        return switch (self) {
-            .narrow => |freqs| appendDenseAllDocsFreqStreamFreqs(writer, freqs),
-            .wide => |freqs| appendDenseAllDocsFreqStreamFreqs(writer, freqs),
-        };
-    }
-
-    fn appendDenseAllDocsFreqStreamWithStats(self: VariableAllDocsFreqSlice, writer: *TextBufferedWriter, stats: DenseAllDocsFreqStreamSizeStats) !u64 {
-        return switch (self) {
-            .narrow => |freqs| appendDenseAllDocsFreqStreamFreqsWithStats(writer, freqs, stats),
-            .wide => |freqs| appendDenseAllDocsFreqStreamFreqsWithStats(writer, freqs, stats),
-        };
-    }
-
-    fn sizeStats(self: VariableAllDocsFreqSlice) !DenseAllDocsFreqStreamSizeStats {
-        return switch (self) {
-            .narrow => |freqs| denseAllDocsFreqStreamSizeStatsForFreqs(freqs),
-            .wide => |freqs| denseAllDocsFreqStreamSizeStatsForFreqs(freqs),
-        };
-    }
-};
-
-const VariableAllDocsFreqBuffer = union(enum) {
-    narrow: std.ArrayList(u8),
-    wide: std.ArrayList(u16),
-
-    fn deinit(self: *VariableAllDocsFreqBuffer, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .narrow => |*freqs| freqs.deinit(allocator),
-            .wide => |*freqs| freqs.deinit(allocator),
-        }
-    }
-
-    fn len(self: VariableAllDocsFreqBuffer) usize {
-        return switch (self) {
-            .narrow => |freqs| freqs.items.len,
-            .wide => |freqs| freqs.items.len,
-        };
-    }
-
-    fn at(self: VariableAllDocsFreqBuffer, index: usize) u32 {
-        return switch (self) {
-            .narrow => |freqs| freqs.items[index],
-            .wide => |freqs| freqs.items[index],
-        };
-    }
-
-    fn elementSize(self: VariableAllDocsFreqBuffer) usize {
-        return switch (self) {
-            .narrow => 1,
-            .wide => 2,
-        };
-    }
-
-    fn slice(self: VariableAllDocsFreqBuffer) VariableAllDocsFreqSlice {
-        return switch (self) {
-            .narrow => |freqs| .{ .narrow = freqs.items },
-            .wide => |freqs| .{ .wide = freqs.items },
-        };
-    }
-
-    fn appendDenseAllDocsFreqStream(self: VariableAllDocsFreqBuffer, writer: *TextBufferedWriter) !u64 {
-        return self.slice().appendDenseAllDocsFreqStream(writer);
-    }
-
-    fn ensureTotalCapacityPrecise(self: *VariableAllDocsFreqBuffer, allocator: std.mem.Allocator, capacity: usize) !void {
-        switch (self.*) {
-            .narrow => |*freqs| try freqs.ensureTotalCapacityPrecise(allocator, capacity),
-            .wide => |*freqs| try freqs.ensureTotalCapacityPrecise(allocator, capacity),
-        }
-    }
-
-    fn ensureWide(self: *VariableAllDocsFreqBuffer, allocator: std.mem.Allocator) !void {
-        switch (self.*) {
-            .wide => {},
-            .narrow => |*narrow| {
-                var wide = std.ArrayList(u16).empty;
-                errdefer wide.deinit(allocator);
-                try wide.ensureTotalCapacityPrecise(allocator, narrow.capacity);
-                for (narrow.items) |freq| wide.appendAssumeCapacity(freq);
-                narrow.deinit(allocator);
-                self.* = .{ .wide = wide };
-            },
-        }
-    }
-
-    fn appendAssumeCapacity(self: *VariableAllDocsFreqBuffer, freq: u32) !void {
-        const validated = try validateDenseAllDocsTextFreq(freq);
-        switch (self.*) {
-            .narrow => |*freqs| {
-                if (validated > std.math.maxInt(u8)) return error.InvalidRecord;
-                freqs.appendAssumeCapacity(@intCast(validated));
-            },
-            .wide => |*freqs| freqs.appendAssumeCapacity(@intCast(validated)),
-        }
-    }
-
-    fn append(self: *VariableAllDocsFreqBuffer, allocator: std.mem.Allocator, freq: u32) !void {
-        const validated = try validateDenseAllDocsTextFreq(freq);
-        if (validated > std.math.maxInt(u8)) try self.ensureWide(allocator);
-        switch (self.*) {
-            .narrow => |*freqs| try freqs.append(allocator, @intCast(validated)),
-            .wide => |*freqs| try freqs.append(allocator, @intCast(validated)),
-        }
-    }
-};
-
-const VariableAllDocsRunCandidate = struct {
-    freqs: VariableAllDocsFreqBuffer = .{ .narrow = .empty },
-    last_seen_doc_id: u64,
-
-    fn deinit(self: *VariableAllDocsRunCandidate, allocator: std.mem.Allocator) void {
-        self.freqs.deinit(allocator);
-    }
-};
-
-const AllDocsRunCandidate = union(enum) {
-    virtual: VirtualAllDocsRunCandidate,
-    variable: VariableAllDocsRunCandidate,
-
-    fn deinit(self: *AllDocsRunCandidate, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .virtual => {},
-            .variable => |*candidate| candidate.deinit(allocator),
-        }
-    }
-};
-
-const text_posting_run_variable_all_docs_gb100_doc_budget: u64 = 182_000_000;
-const text_posting_run_variable_all_docs_gb100_term_budget: u64 = 32;
-const text_posting_run_variable_all_docs_max_freq_cells: u64 =
-    text_posting_run_variable_all_docs_gb100_doc_budget * text_posting_run_variable_all_docs_gb100_term_budget;
-const text_posting_run_all_docs_candidate_sweep_interval: u64 = 4096;
-
-const CandidateByteSet = [4]u64;
-const CandidateByteFilter = [default_max_token_bytes + 1]CandidateByteSet;
-const text_posting_append_probe_sample_mask: u64 = 0xfff;
-const all_docs_candidate_cache_slots = 4096;
-comptime {
-    if (!std.math.isPowerOfTwo(all_docs_candidate_cache_slots)) {
-        @compileError("all-doc candidate cache slots must stay a power of two");
-    }
+const posting_run_builder = posting_run_builder_mod.PostingRunBuilder(PostingRunBuilderOps);
+test {
+    _ = posting_run_builder;
 }
-const text_posting_run_chunk_term_cache_slots = 1024;
-comptime {
-    if (!std.math.isPowerOfTwo(text_posting_run_chunk_term_cache_slots)) {
-        @compileError("text posting run chunk term cache slots must stay a power of two");
-    }
-}
-
-const AllDocsCandidateCacheSlot = struct {
-    generation: u64 = 0,
-    term_cache_key: u64 = 0,
-    term_len: u8 = 0,
-    key: []const u8 = &.{},
-    value: *AllDocsRunCandidate = undefined,
-};
-
-const TextPostingRunChunkTermCacheSlot = struct {
-    term_sort_prefix: u64 = 0,
-    term_len: u8 = 0,
-    term_offset: u32 = 0,
-    occupied: bool = false,
-};
-
-fn setCandidateByte(filter: *CandidateByteFilter, len: usize, byte: u8) void {
-    filter[len][byte / 64] |= @as(u64, 1) << @intCast(byte % 64);
-}
-
-fn candidateByteSetContains(set: CandidateByteSet, byte: u8) bool {
-    return (set[byte / 64] & (@as(u64, 1) << @intCast(byte % 64))) != 0;
-}
-
-const TextPostingSyntheticRunSource = union(enum) {
-    virtual_all_docs: struct {
-        term: []const u8,
-        text_freq: u32,
-    },
-    variable_all_docs: struct {
-        term: []const u8,
-        freqs: VariableAllDocsFreqBuffer,
-        freq_stats: DenseAllDocsFreqStreamSizeStats,
-    },
-
-    fn term(self: TextPostingSyntheticRunSource) []const u8 {
-        return switch (self) {
-            .virtual_all_docs => |source| source.term,
-            .variable_all_docs => |source| source.term,
-        };
-    }
-
-    fn deinit(self: *TextPostingSyntheticRunSource, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .virtual_all_docs => |source| allocator.free(source.term),
-            .variable_all_docs => |*source| {
-                allocator.free(source.term);
-                source.freqs.deinit(allocator);
-            },
-        }
-    }
-};
-
-fn textPostingSyntheticRunSourceLessThan(_: void, lhs: TextPostingSyntheticRunSource, rhs: TextPostingSyntheticRunSource) bool {
-    return std.mem.order(u8, lhs.term(), rhs.term()) == .lt;
-}
-
-const RepeatedTextTermSegment = struct {
-    doc_ids: []const u32,
-    text_freq: u32,
-};
-
-const RepeatedTextSegmentCursor = struct {
-    segment: RepeatedTextTermSegment,
-    index: usize = 0,
-};
-
-fn compareRepeatedTextSegmentCursor(_: void, lhs: RepeatedTextSegmentCursor, rhs: RepeatedTextSegmentCursor) std.math.Order {
-    const lhs_doc = lhs.segment.doc_ids[lhs.index];
-    const rhs_doc = rhs.segment.doc_ids[rhs.index];
-    return switch (std.math.order(lhs_doc, rhs_doc)) {
-        .eq => std.math.order(lhs.segment.text_freq, rhs.segment.text_freq),
-        else => |order| order,
-    };
-}
-
-fn stringSliceLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
-    return std.mem.order(u8, lhs, rhs) == .lt;
-}
-
-const repeated_text_direct_run_terms_per_file: usize = 16 * 1024;
-
-const TextPostingRunBuilder = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    base_path: []const u8,
-    measure_chunks: bool = false,
-    run_paths: std.ArrayList([]u8) = .empty,
-    run_summaries: std.ArrayList(TextPostingRunSummaryFile) = .empty,
-    chunk: std.ArrayList(TextPostingRunChunkRecord) = .empty,
-    chunk_term_bytes: std.ArrayList(u8) = .empty,
-    chunk_term_cache: [text_posting_run_chunk_term_cache_slots]TextPostingRunChunkTermCacheSlot = [_]TextPostingRunChunkTermCacheSlot{.{}} ** text_posting_run_chunk_term_cache_slots,
-    chunk_sort_ns: u128 = 0,
-    chunk_write_ns: u128 = 0,
-    chunk_count: u64 = 0,
-    chunk_records: u64 = 0,
-    chunk_peak_record_bytes: u64 = 0,
-    chunk_peak_term_bytes: u64 = 0,
-    chunk_peak_scratch_bytes: u64 = 0,
-    chunk_peak_record_capacity_bytes: u64 = 0,
-    chunk_peak_term_capacity_bytes: u64 = 0,
-    chunk_peak_scratch_capacity_bytes: u64 = 0,
-    run_record_term_bytes: u64 = 0,
-    run_record_inline_capacity_bytes: u64 = 0,
-    run_record_term_slack_bytes: u64 = 0,
-    run_record_term_cache_hits: u64 = 0,
-    run_record_term_cache_saved_bytes: u64 = 0,
-    run_record_long_term_count: u64 = 0,
-    run_record_max_term_len: u64 = 0,
-    inline_singleton_materialized_terms: u64 = 0,
-    inline_singleton_materialized_records: u64 = 0,
-    inline_singleton_materialized_bytes: u64 = 0,
-    docs_posting_append_materialize_ns: u128 = 0,
-    docs_posting_append_sweep_ns: u128 = 0,
-    docs_posting_append_regular_sampled_ns: u128 = 0,
-    docs_posting_append_candidate_lookup_sampled_ns: u128 = 0,
-    docs_posting_append_candidate_hit_sampled_ns: u128 = 0,
-    docs_posting_append_virtual_hit_sampled_ns: u128 = 0,
-    docs_posting_append_variable_hit_sampled_ns: u128 = 0,
-    docs_posting_append_variable_freq_sampled_ns: u128 = 0,
-    docs_posting_append_term_count: u64 = 0,
-    docs_posting_append_regular_record_count: u64 = 0,
-    docs_posting_append_virtual_candidate_put_count: u64 = 0,
-    docs_posting_append_virtual_candidate_hit_count: u64 = 0,
-    docs_posting_append_variable_candidate_hit_count: u64 = 0,
-    docs_posting_append_variable_freq_append_count: u64 = 0,
-    docs_posting_append_candidate_filter_skip_count: u64 = 0,
-    docs_posting_append_candidate_lookup_count: u64 = 0,
-    docs_posting_append_candidate_cache_hit_count: u64 = 0,
-    docs_posting_append_candidate_miss_count: u64 = 0,
-    docs_posting_append_candidate_regularized_hit_count: u64 = 0,
-    docs_posting_append_materialize_call_count: u64 = 0,
-    docs_posting_append_sweep_count: u64 = 0,
-    docs_posting_append_regular_sample_count: u64 = 0,
-    docs_posting_append_candidate_lookup_sample_count: u64 = 0,
-    docs_posting_append_candidate_hit_sample_count: u64 = 0,
-    docs_posting_append_virtual_hit_sample_count: u64 = 0,
-    docs_posting_append_variable_hit_sample_count: u64 = 0,
-    docs_posting_append_variable_freq_sample_count: u64 = 0,
-    doc_count: u64 = 0,
-    all_docs_candidates: std.StringHashMap(AllDocsRunCandidate),
-    all_docs_candidate_cache_generation: u64 = 1,
-    all_docs_candidate_cache: [all_docs_candidate_cache_slots]AllDocsCandidateCacheSlot = [_]AllDocsCandidateCacheSlot{.{}} ** all_docs_candidate_cache_slots,
-    all_docs_candidate_first_bytes: CandidateByteFilter = std.mem.zeroes(CandidateByteFilter),
-    all_docs_candidate_second_bytes: CandidateByteFilter = std.mem.zeroes(CandidateByteFilter),
-    all_docs_candidate_penultimate_bytes: CandidateByteFilter = std.mem.zeroes(CandidateByteFilter),
-    all_docs_candidate_last_bytes: CandidateByteFilter = std.mem.zeroes(CandidateByteFilter),
-    all_docs_candidate_shape_filter_dirty: bool = false,
-    virtual_all_docs_failed_terms: std.ArrayList([]const u8) = .empty,
-    variable_all_docs_failed_terms: std.ArrayList([]const u8) = .empty,
-    virtual_all_docs_synthetic_records: u64 = 0,
-    variable_all_docs_synthetic_records: u64 = 0,
-    variable_all_docs_freq_cells: u64 = 0,
-    variable_all_docs_disabled: bool = false,
-    variable_all_docs_freq_stream_cells: u64 = 0,
-    variable_all_docs_freq_stream_packed_bytes: u64 = 0,
-    variable_all_docs_freq_stream_rle_bytes: u64 = 0,
-    variable_all_docs_freq_stream_bitpacked_bytes: u64 = 0,
-    variable_all_docs_freq_stream_rle_run_count: u64 = 0,
-    variable_all_docs_freq_stream_max_freq: u32 = 0,
-    synthetic_run_sources: std.ArrayList(TextPostingSyntheticRunSource) = .empty,
-    run_paths_disjoint_term_ranges: bool = false,
-
-    fn init(allocator: std.mem.Allocator, io: std.Io, base_path: []const u8) !TextPostingRunBuilder {
-        return initWithChunkTiming(allocator, io, base_path, false);
-    }
-
-    fn initWithChunkTiming(allocator: std.mem.Allocator, io: std.Io, base_path: []const u8, measure_chunks: bool) !TextPostingRunBuilder {
-        var builder = TextPostingRunBuilder{
-            .allocator = allocator,
-            .io = io,
-            .base_path = base_path,
-            .measure_chunks = measure_chunks,
-            .all_docs_candidates = std.StringHashMap(AllDocsRunCandidate).init(allocator),
-        };
-        errdefer builder.deinit();
-        try builder.chunk.ensureTotalCapacityPrecise(allocator, text_posting_run_chunk_records);
-        return builder;
-    }
-
-    fn deinit(self: *TextPostingRunBuilder) void {
-        self.clearAllDocsCandidatesAndFree();
-        self.all_docs_candidates.deinit();
-        self.virtual_all_docs_failed_terms.deinit(self.allocator);
-        self.variable_all_docs_failed_terms.deinit(self.allocator);
-        for (self.synthetic_run_sources.items) |*source| source.deinit(self.allocator);
-        self.synthetic_run_sources.deinit(self.allocator);
-        for (self.run_summaries.items) |summary| {
-            std.Io.Dir.cwd().deleteFile(self.io, summary.path) catch {};
-            self.allocator.free(summary.path);
-        }
-        self.run_summaries.deinit(self.allocator);
-        for (self.run_paths.items) |run_path| {
-            std.Io.Dir.cwd().deleteFile(self.io, run_path) catch {};
-            self.allocator.free(run_path);
-        }
-        self.run_paths.deinit(self.allocator);
-        self.chunk_term_bytes.deinit(self.allocator);
-        self.chunk.deinit(self.allocator);
-    }
-
-    fn clearAllDocsCandidatesAndFree(self: *TextPostingRunBuilder) void {
-        var candidate_it = self.all_docs_candidates.iterator();
-        while (candidate_it.next()) |entry| {
-            entry.value_ptr.deinit(self.allocator);
-            self.allocator.free(entry.key_ptr.*);
-        }
-        self.all_docs_candidates.clearAndFree();
-        self.invalidateAllDocsCandidateCache();
-        self.all_docs_candidate_first_bytes = std.mem.zeroes(CandidateByteFilter);
-        self.all_docs_candidate_second_bytes = std.mem.zeroes(CandidateByteFilter);
-        self.all_docs_candidate_penultimate_bytes = std.mem.zeroes(CandidateByteFilter);
-        self.all_docs_candidate_last_bytes = std.mem.zeroes(CandidateByteFilter);
-        self.all_docs_candidate_shape_filter_dirty = false;
-        self.variable_all_docs_freq_cells = 0;
-    }
-
-    fn invalidateAllDocsCandidateCache(self: *TextPostingRunBuilder) void {
-        self.all_docs_candidate_cache_generation +%= 1;
-        if (self.all_docs_candidate_cache_generation == 0) self.all_docs_candidate_cache_generation = 1;
-    }
-
-    fn allDocsCandidateCacheKey(term: []const u8) u64 {
-        const prefix = termSortPrefixKey(term);
-        const suffix = if (term.len > @sizeOf(u64)) termSortTailKey(term) else prefix;
-        return prefix ^ std.math.rotl(u64, suffix, 17) ^ (@as(u64, term.len) *% 0x9e3779b97f4a7c15);
-    }
-
-    fn allDocsCandidateCacheIndex(term_cache_key: u64) usize {
-        var mixed = term_cache_key;
-        mixed ^= mixed >> 32;
-        mixed ^= mixed >> 16;
-        mixed ^= mixed >> 8;
-        return @intCast(mixed & (all_docs_candidate_cache_slots - 1));
-    }
-
-    fn cachedAllDocsCandidate(self: *TextPostingRunBuilder, term: []const u8, term_cache_key: u64) ?*AllDocsRunCandidate {
-        if (term.len == 0 or term.len > default_max_token_bytes) return null;
-        const slot_index = allDocsCandidateCacheIndex(term_cache_key);
-        const slot = self.all_docs_candidate_cache[slot_index];
-        if (slot.generation == self.all_docs_candidate_cache_generation and
-            slot.term_len == term.len and
-            slot.term_cache_key == term_cache_key and
-            std.mem.eql(u8, slot.key, term))
-        {
-            if (self.measure_chunks) self.docs_posting_append_candidate_cache_hit_count += 1;
-            return slot.value;
-        }
-        return null;
-    }
-
-    fn rememberAllDocsCandidateCache(self: *TextPostingRunBuilder, term: []const u8, term_cache_key: u64, value: *AllDocsRunCandidate) void {
-        if (term.len == 0 or term.len > default_max_token_bytes) return;
-        self.all_docs_candidate_cache[allDocsCandidateCacheIndex(term_cache_key)] = .{
-            .generation = self.all_docs_candidate_cache_generation,
-            .term_cache_key = term_cache_key,
-            .term_len = @intCast(term.len),
-            .key = term,
-            .value = value,
-        };
-    }
-
-    fn lookupAllDocsCandidate(self: *TextPostingRunBuilder, term: []const u8) ?*AllDocsRunCandidate {
-        const term_cache_key = allDocsCandidateCacheKey(term);
-        if (self.cachedAllDocsCandidate(term, term_cache_key)) |candidate| return candidate;
-        const entry = self.all_docs_candidates.getEntry(term) orelse return null;
-        self.rememberAllDocsCandidateCache(entry.key_ptr.*, term_cache_key, entry.value_ptr);
-        return entry.value_ptr;
-    }
-
-    fn markAllDocsCandidateShape(self: *TextPostingRunBuilder, term: []const u8) void {
-        if (term.len == 0 or term.len > default_max_token_bytes) return;
-        setCandidateByte(&self.all_docs_candidate_first_bytes, term.len, term[0]);
-        if (term.len > 1) {
-            setCandidateByte(&self.all_docs_candidate_second_bytes, term.len, term[1]);
-            setCandidateByte(&self.all_docs_candidate_penultimate_bytes, term.len, term[term.len - 2]);
-        }
-        setCandidateByte(&self.all_docs_candidate_last_bytes, term.len, term[term.len - 1]);
-    }
-
-    fn markAllDocsCandidateShapeFilterDirty(self: *TextPostingRunBuilder) void {
-        self.all_docs_candidate_shape_filter_dirty = true;
-    }
-
-    fn rebuildAllDocsCandidateShapeFilter(self: *TextPostingRunBuilder) void {
-        self.all_docs_candidate_first_bytes = std.mem.zeroes(CandidateByteFilter);
-        self.all_docs_candidate_second_bytes = std.mem.zeroes(CandidateByteFilter);
-        self.all_docs_candidate_penultimate_bytes = std.mem.zeroes(CandidateByteFilter);
-        self.all_docs_candidate_last_bytes = std.mem.zeroes(CandidateByteFilter);
-        var candidate_it = self.all_docs_candidates.iterator();
-        while (candidate_it.next()) |entry| {
-            self.markAllDocsCandidateShape(entry.key_ptr.*);
-        }
-        self.all_docs_candidate_shape_filter_dirty = false;
-    }
-
-    fn mayMatchAllDocsCandidateShape(self: *TextPostingRunBuilder, term: []const u8) bool {
-        if (self.all_docs_candidate_shape_filter_dirty) self.rebuildAllDocsCandidateShapeFilter();
-        if (term.len == 0 or term.len > default_max_token_bytes) return true;
-        if (!candidateByteSetContains(self.all_docs_candidate_first_bytes[term.len], term[0])) return false;
-        if (!candidateByteSetContains(self.all_docs_candidate_last_bytes[term.len], term[term.len - 1])) return false;
-        if (term.len > 1) {
-            if (!candidateByteSetContains(self.all_docs_candidate_second_bytes[term.len], term[1])) return false;
-            if (!candidateByteSetContains(self.all_docs_candidate_penultimate_bytes[term.len], term[term.len - 2])) return false;
-        }
-        return true;
-    }
-
-    fn chunkTermCacheIndex(term_sort_prefix: u64, term_len: usize) usize {
-        var mixed = term_sort_prefix ^ (@as(u64, term_len) *% 0x517cc1b727220a95);
-        mixed ^= mixed >> 33;
-        mixed *%= 0xff51afd7ed558ccd;
-        mixed ^= mixed >> 33;
-        return @intCast(mixed & (text_posting_run_chunk_term_cache_slots - 1));
-    }
-
-    fn cachedChunkTermOffset(self: *const TextPostingRunBuilder, term: []const u8, term_sort_prefix: u64) ?u32 {
-        if (term.len == 0 or term.len > default_max_token_bytes) return null;
-        const slot = self.chunk_term_cache[chunkTermCacheIndex(term_sort_prefix, term.len)];
-        if (!slot.occupied or slot.term_len != term.len or slot.term_sort_prefix != term_sort_prefix) return null;
-        const offset: usize = slot.term_offset;
-        const end = offset + term.len;
-        if (end > self.chunk_term_bytes.items.len) return null;
-        if (!std.mem.eql(u8, self.chunk_term_bytes.items[offset..end], term)) return null;
-        return slot.term_offset;
-    }
-
-    fn rememberChunkTermOffset(self: *TextPostingRunBuilder, term: []const u8, term_sort_prefix: u64, term_offset: u32) void {
-        if (term.len == 0 or term.len > default_max_token_bytes) return;
-        self.chunk_term_cache[chunkTermCacheIndex(term_sort_prefix, term.len)] = .{
-            .term_sort_prefix = term_sort_prefix,
-            .term_len = @intCast(term.len),
-            .term_offset = term_offset,
-            .occupied = true,
-        };
-    }
-
-    fn clearChunkTermCache(self: *TextPostingRunBuilder) void {
-        self.chunk_term_cache = [_]TextPostingRunChunkTermCacheSlot{.{}} ** text_posting_run_chunk_term_cache_slots;
-    }
-
-    fn appendRegularRunRecord(self: *TextPostingRunBuilder, term: []const u8, posting: TextPostingRecord) !void {
-        const sample = self.measure_chunks and ((self.docs_posting_append_regular_record_count & text_posting_append_probe_sample_mask) == 0);
-        const sample_start = if (sample) textMonotonicNs(self.io) else 0;
-        try self.appendTermPosting(term, posting);
-        if (self.measure_chunks) {
-            self.docs_posting_append_regular_record_count += 1;
-            if (sample) {
-                self.docs_posting_append_regular_sampled_ns += textElapsedNs(self.io, sample_start);
-                self.docs_posting_append_regular_sample_count += 1;
-            }
-        }
-    }
-
-    fn appendDocumentFreqs(self: *TextPostingRunBuilder, doc_id: u64, freqs: *std.StringHashMap(FieldTermFreq)) !void {
-        if (doc_id != self.doc_count + 1) return error.InvalidRecord;
-        self.doc_count = doc_id;
-        var it = freqs.iterator();
-        while (it.next()) |entry| {
-            if (self.measure_chunks) self.docs_posting_append_term_count += 1;
-            const posting = TextPostingRecord{
-                .doc_id = doc_id,
-                .text_freq = entry.value_ptr.text,
-                .kind_freq = entry.value_ptr.kind,
-            };
-
-            if (doc_id == 1) {
-                if (posting.kind_freq == 0 and posting.text_freq != 0) {
-                    const owned_term = try self.allocator.dupe(u8, entry.key_ptr.*);
-                    errdefer self.allocator.free(owned_term);
-                    try self.all_docs_candidates.put(owned_term, .{ .virtual = .{
-                        .text_freq = posting.text_freq,
-                        .last_seen_doc_id = doc_id,
-                    } });
-                    self.invalidateAllDocsCandidateCache();
-                    self.markAllDocsCandidateShape(entry.key_ptr.*);
-                    if (self.measure_chunks) self.docs_posting_append_virtual_candidate_put_count += 1;
-                    continue;
-                }
-            } else if (self.all_docs_candidates.count() == 0 or
-                !self.mayMatchAllDocsCandidateShape(entry.key_ptr.*))
-            {
-                if (self.measure_chunks) self.docs_posting_append_candidate_filter_skip_count += 1;
-                try self.appendRegularRunRecord(entry.key_ptr.*, posting);
-                continue;
-            } else {
-                if (self.measure_chunks) self.docs_posting_append_candidate_lookup_count += 1;
-                const lookup_sample = self.measure_chunks and ((self.docs_posting_append_candidate_lookup_count & text_posting_append_probe_sample_mask) == 0);
-                const lookup_start = if (lookup_sample) textMonotonicNs(self.io) else 0;
-                const candidate_ptr = self.lookupAllDocsCandidate(entry.key_ptr.*);
-                if (lookup_sample) {
-                    self.docs_posting_append_candidate_lookup_sampled_ns += textElapsedNs(self.io, lookup_start);
-                    self.docs_posting_append_candidate_lookup_sample_count += 1;
-                }
-                if (candidate_ptr) |candidate| {
-                    const hit_sample = lookup_sample;
-                    const hit_start = if (hit_sample) textMonotonicNs(self.io) else 0;
-                    defer if (hit_sample) {
-                        self.docs_posting_append_candidate_hit_sampled_ns += textElapsedNs(self.io, hit_start);
-                        self.docs_posting_append_candidate_hit_sample_count += 1;
-                    };
-                    switch (candidate.*) {
-                        .variable => |*variable| {
-                            const variable_hit_start = if (hit_sample) textMonotonicNs(self.io) else 0;
-                            defer if (hit_sample) {
-                                self.docs_posting_append_variable_hit_sampled_ns += textElapsedNs(self.io, variable_hit_start);
-                                self.docs_posting_append_variable_hit_sample_count += 1;
-                            };
-                            if (self.measure_chunks) self.docs_posting_append_variable_candidate_hit_count += 1;
-                            if (variable.last_seen_doc_id != doc_id - 1) {
-                                const materialize_start = if (self.measure_chunks) textMonotonicNs(self.io) else 0;
-                                try self.materializeFailedVariableAllDocsCandidate(entry.key_ptr.*);
-                                if (self.measure_chunks) {
-                                    self.docs_posting_append_materialize_ns += textElapsedNs(self.io, materialize_start);
-                                    self.docs_posting_append_materialize_call_count += 1;
-                                }
-                            } else if (posting.kind_freq == 0 and posting.text_freq != 0) {
-                                if (try self.appendVariableAllDocsRunCandidateFreq(variable, posting.text_freq)) {
-                                    variable.last_seen_doc_id = doc_id;
-                                    if (self.measure_chunks) self.docs_posting_append_variable_freq_append_count += 1;
-                                    continue;
-                                }
-                                const materialize_start = if (self.measure_chunks) textMonotonicNs(self.io) else 0;
-                                try self.materializeAllVariableAllDocsCandidates();
-                                if (self.measure_chunks) {
-                                    self.docs_posting_append_materialize_ns += textElapsedNs(self.io, materialize_start);
-                                    self.docs_posting_append_materialize_call_count += 1;
-                                }
-                            } else {
-                                const materialize_start = if (self.measure_chunks) textMonotonicNs(self.io) else 0;
-                                try self.materializeFailedVariableAllDocsCandidate(entry.key_ptr.*);
-                                if (self.measure_chunks) {
-                                    self.docs_posting_append_materialize_ns += textElapsedNs(self.io, materialize_start);
-                                    self.docs_posting_append_materialize_call_count += 1;
-                                }
-                            }
-                        },
-                        .virtual => |*virtual| {
-                            const virtual_hit_start = if (hit_sample) textMonotonicNs(self.io) else 0;
-                            defer if (hit_sample) {
-                                self.docs_posting_append_virtual_hit_sampled_ns += textElapsedNs(self.io, virtual_hit_start);
-                                self.docs_posting_append_virtual_hit_sample_count += 1;
-                            };
-                            if (self.measure_chunks) self.docs_posting_append_virtual_candidate_hit_count += 1;
-                            if (virtual.last_seen_doc_id != doc_id - 1) {
-                                const materialize_start = if (self.measure_chunks) textMonotonicNs(self.io) else 0;
-                                try self.materializeFailedVirtualAllDocsCandidate(entry.key_ptr.*, virtual.last_seen_doc_id);
-                                if (self.measure_chunks) {
-                                    self.docs_posting_append_materialize_ns += textElapsedNs(self.io, materialize_start);
-                                    self.docs_posting_append_materialize_call_count += 1;
-                                }
-                            } else if (posting.kind_freq == 0 and posting.text_freq == virtual.text_freq) {
-                                virtual.last_seen_doc_id = doc_id;
-                                continue;
-                            } else if (posting.kind_freq == 0 and posting.text_freq != 0) {
-                                if (try self.convertVirtualAllDocsCandidateToVariable(entry.key_ptr.*, doc_id, posting.text_freq)) {
-                                    if (self.measure_chunks) self.docs_posting_append_variable_freq_append_count += 1;
-                                    continue;
-                                }
-                                const materialize_start = if (self.measure_chunks) textMonotonicNs(self.io) else 0;
-                                try self.materializeAllVariableAllDocsCandidates();
-                                if (self.measure_chunks) {
-                                    self.docs_posting_append_materialize_ns += textElapsedNs(self.io, materialize_start);
-                                    self.docs_posting_append_materialize_call_count += 1;
-                                }
-                            }
-                        },
-                    }
-                    if (self.measure_chunks) self.docs_posting_append_candidate_regularized_hit_count += 1;
-                } else if (self.measure_chunks) {
-                    self.docs_posting_append_candidate_miss_count += 1;
-                }
-            }
-
-            try self.appendRegularRunRecord(entry.key_ptr.*, posting);
-        }
-        if (doc_id % text_posting_run_all_docs_candidate_sweep_interval == 0) {
-            const sweep_start = if (self.measure_chunks) textMonotonicNs(self.io) else 0;
-            try self.materializeStaleVirtualAllDocsCandidates(doc_id);
-            try self.materializeStaleVariableAllDocsCandidates(doc_id);
-            if (self.measure_chunks) {
-                self.docs_posting_append_sweep_ns += textElapsedNs(self.io, sweep_start);
-                self.docs_posting_append_sweep_count += 1;
-            }
-        }
-    }
-
-    fn noteSyntheticDocument(self: *TextPostingRunBuilder, doc_id: u64) !void {
-        if (doc_id != self.doc_count + 1) return error.InvalidRecord;
-        self.doc_count = doc_id;
-    }
-
-    fn appendRepeatedTextCacheRun(self: *TextPostingRunBuilder, cache: *TextRebuildTextFreqCache) !void {
-        if (cache.entries.items.len == 0) return;
-        const had_existing_run_paths = self.run_paths.items.len != 0;
-        if (had_existing_run_paths) self.run_paths_disjoint_term_ranges = false;
-        var groups = std.StringHashMap(std.ArrayList(RepeatedTextTermSegment)).init(self.allocator);
-        defer {
-            var value_it = groups.valueIterator();
-            while (value_it.next()) |segments| segments.deinit(self.allocator);
-            groups.deinit();
-        }
-
-        for (cache.entries.items) |*name_entry| {
-            if (name_entry.doc_ids.items.len == 0) continue;
-            for (name_entry.terms) |term_freq| {
-                if (term_freq.freq.kind != 0 or term_freq.freq.text == 0) return error.InvalidRecord;
-                const group_entry = try groups.getOrPut(term_freq.term);
-                if (!group_entry.found_existing) {
-                    group_entry.value_ptr.* = .empty;
-                }
-                try group_entry.value_ptr.append(self.allocator, .{
-                    .doc_ids = name_entry.doc_ids.items,
-                    .text_freq = term_freq.freq.text,
-                });
-            }
-        }
-
-        var terms = std.ArrayList([]const u8).empty;
-        defer terms.deinit(self.allocator);
-        try terms.ensureTotalCapacityPrecise(self.allocator, groups.count());
-        var key_it = groups.keyIterator();
-        while (key_it.next()) |term| terms.appendAssumeCapacity(term.*);
-        std.mem.sort([]const u8, terms.items, {}, stringSliceLessThan);
-
-        var queue = std.PriorityQueue(RepeatedTextSegmentCursor, void, compareRepeatedTextSegmentCursor).initContext({});
-        defer queue.deinit(self.allocator);
-        var previous_doc_id: u32 = 0;
-
-        var term_start: usize = 0;
-        while (term_start < terms.items.len) {
-            const term_end = @min(term_start + repeated_text_direct_run_terms_per_file, terms.items.len);
-            const file_ordinal = self.run_summaries.items.len;
-
-            const run_path = try std.fmt.allocPrint(self.allocator, "{s}.posting_run.{d}.tmp", .{ self.base_path, file_ordinal });
-            var run_path_owned = true;
-            errdefer {
-                std.Io.Dir.cwd().deleteFile(self.io, run_path) catch {};
-                if (run_path_owned) self.allocator.free(run_path);
-            }
-            const summary_path = try std.fmt.allocPrint(self.allocator, "{s}.posting_run.{d}.summary.tmp", .{ self.base_path, file_ordinal });
-            var summary_path_owned = true;
-            errdefer {
-                std.Io.Dir.cwd().deleteFile(self.io, summary_path) catch {};
-                if (summary_path_owned) self.allocator.free(summary_path);
-            }
-            const synthetic_summary_path = try std.fmt.allocPrint(self.allocator, "{s}.posting_run.{d}.synthetic.summary.tmp", .{ self.base_path, file_ordinal });
-            var synthetic_summary_path_owned = true;
-            errdefer {
-                std.Io.Dir.cwd().deleteFile(self.io, synthetic_summary_path) catch {};
-                if (synthetic_summary_path_owned) self.allocator.free(synthetic_summary_path);
-            }
-
-            var run_file = try std.Io.Dir.cwd().createFile(self.io, run_path, .{ .read = true, .truncate = true });
-            defer run_file.close(self.io);
-            var run_output = try TextBufferedWriter.init(self.allocator, self.io, run_file, text_write_buffer_bytes);
-            defer run_output.deinit();
-            var run_writer = TextPostingRunFrontCodedWriter{ .writer = &run_output };
-            var expected_run_size = try run_writer.writeHeader();
-
-            var summary_file = try std.Io.Dir.cwd().createFile(self.io, summary_path, .{ .read = true, .truncate = true });
-            defer summary_file.close(self.io);
-            var summary_writer = try TextPostingRunSummaryWriter.init(self.allocator, self.io, summary_file);
-            defer summary_writer.deinit();
-            var summary_context = CollectTextPostingRunSummaryContext{ .writer = &summary_writer };
-
-            var synthetic_summary_file = try std.Io.Dir.cwd().createFile(self.io, synthetic_summary_path, .{ .read = true, .truncate = true });
-            defer synthetic_summary_file.close(self.io);
-            var synthetic_summary_writer = try TextPostingRunSummaryWriter.init(self.allocator, self.io, synthetic_summary_file);
-            defer synthetic_summary_writer.deinit();
-            var synthetic_summary_context = CollectTextPostingRunSummaryContext{ .writer = &synthetic_summary_writer };
-
-            var regular_records_written: u64 = 0;
-            for (terms.items[term_start..term_end]) |term| {
-                const segments = groups.get(term) orelse return error.InvalidRecord;
-                if (try self.appendRepeatedTextAllDocsSyntheticTerm(term, segments.items, &synthetic_summary_context)) {
-                    continue;
-                }
-                queue.clearRetainingCapacity();
-                try queue.ensureTotalCapacityPrecise(self.allocator, segments.items.len);
-                for (segments.items) |segment| {
-                    if (segment.doc_ids.len == 0) return error.InvalidRecord;
-                    try queue.push(self.allocator, .{ .segment = segment });
-                }
-                previous_doc_id = 0;
-                while (queue.pop()) |cursor| {
-                    const doc_id = cursor.segment.doc_ids[cursor.index];
-                    if (doc_id <= previous_doc_id) return error.InvalidRecord;
-                    previous_doc_id = doc_id;
-                    const posting = TextPostingRecord{
-                        .doc_id = doc_id,
-                        .text_freq = cursor.segment.text_freq,
-                        .kind_freq = 0,
-                    };
-                    const encoded_len = try run_writer.appendCheckedTermPosting(term, posting);
-                    expected_run_size = std.math.add(u64, expected_run_size, encoded_len) catch return error.RecordTooLarge;
-                    try collectTextPostingRunSummaryFields(&summary_context, term, posting, encoded_len);
-                    regular_records_written = std.math.add(u64, regular_records_written, 1) catch return error.RecordTooLarge;
-                    if (self.measure_chunks) {
-                        self.chunk_records = std.math.add(u64, self.chunk_records, 1) catch return error.RecordTooLarge;
-                        self.run_record_term_bytes = std.math.add(u64, self.run_record_term_bytes, term.len) catch return error.RecordTooLarge;
-                        self.run_record_inline_capacity_bytes = std.math.add(u64, self.run_record_inline_capacity_bytes, default_max_token_bytes) catch return error.RecordTooLarge;
-                        self.run_record_term_slack_bytes = std.math.add(u64, self.run_record_term_slack_bytes, default_max_token_bytes - term.len) catch return error.RecordTooLarge;
-                        if (term.len > text_posting_run_record_long_term_threshold) self.run_record_long_term_count += 1;
-                        self.run_record_max_term_len = @max(self.run_record_max_term_len, @as(u64, @intCast(term.len)));
-                    }
-                    const next_index = cursor.index + 1;
-                    if (next_index < cursor.segment.doc_ids.len) {
-                        try queue.push(self.allocator, .{ .segment = cursor.segment, .index = next_index });
-                    }
-                }
-            }
-            try flushTextPostingRunSummary(&summary_context);
-            try flushTextPostingRunSummary(&synthetic_summary_context);
-            try run_output.flush();
-            try summary_writer.flush();
-            try synthetic_summary_writer.flush();
-
-            const run_stat = try run_file.stat(self.io);
-            if (run_stat.kind != .file or run_stat.size != expected_run_size) return error.InvalidRecord;
-            const summary_stat = try summary_file.stat(self.io);
-            if (summary_stat.kind != .file or summary_stat.size != summary_writer.physical_bytes) return error.InvalidRecord;
-            summary_context.summary_file_bytes = summary_writer.physical_bytes;
-            const synthetic_summary_stat = try synthetic_summary_file.stat(self.io);
-            if (synthetic_summary_stat.kind != .file or synthetic_summary_stat.size != synthetic_summary_writer.physical_bytes) return error.InvalidRecord;
-            synthetic_summary_context.summary_file_bytes = synthetic_summary_writer.physical_bytes;
-
-            if (regular_records_written != 0) {
-                try self.run_paths.append(self.allocator, run_path);
-                run_path_owned = false;
-                try self.run_summaries.append(self.allocator, .{
-                    .path = summary_path,
-                    .term_count = summary_context.term_count,
-                    .file_size = summary_context.summary_file_bytes,
-                });
-                summary_path_owned = false;
-            } else {
-                try std.Io.Dir.cwd().deleteFile(self.io, run_path);
-                self.allocator.free(run_path);
-                run_path_owned = false;
-                try std.Io.Dir.cwd().deleteFile(self.io, summary_path);
-                self.allocator.free(summary_path);
-                summary_path_owned = false;
-            }
-            if (synthetic_summary_context.term_count != 0) {
-                try self.run_summaries.append(self.allocator, .{
-                    .path = synthetic_summary_path,
-                    .term_count = synthetic_summary_context.term_count,
-                    .file_size = synthetic_summary_context.summary_file_bytes,
-                });
-                synthetic_summary_path_owned = false;
-            } else {
-                try std.Io.Dir.cwd().deleteFile(self.io, synthetic_summary_path);
-                self.allocator.free(synthetic_summary_path);
-                synthetic_summary_path_owned = false;
-            }
-            if (self.measure_chunks) self.chunk_count += 1;
-            term_start = term_end;
-        }
-        if (!had_existing_run_paths and self.run_paths.items.len != 0) self.run_paths_disjoint_term_ranges = true;
-    }
-
-    fn appendRepeatedTextAllDocsSyntheticTerm(
-        self: *TextPostingRunBuilder,
-        term: []const u8,
-        segments: []const RepeatedTextTermSegment,
-        summary_context: *CollectTextPostingRunSummaryContext,
-    ) !bool {
-        if (self.doc_count == 0) return false;
-        var total_postings: u64 = 0;
-        for (segments) |segment| {
-            total_postings = std.math.add(u64, total_postings, @intCast(segment.doc_ids.len)) catch return error.RecordTooLarge;
-        }
-        if (total_postings != self.doc_count) return false;
-
-        var queue = std.PriorityQueue(RepeatedTextSegmentCursor, void, compareRepeatedTextSegmentCursor).initContext({});
-        defer queue.deinit(self.allocator);
-        try queue.ensureTotalCapacityPrecise(self.allocator, segments.len);
-        for (segments) |segment| {
-            if (segment.doc_ids.len == 0) return error.InvalidRecord;
-            try queue.push(self.allocator, .{ .segment = segment });
-        }
-
-        var freqs = VariableAllDocsFreqBuffer{ .narrow = .empty };
-        var freqs_owned = true;
-        errdefer if (freqs_owned) freqs.deinit(self.allocator);
-        try freqs.ensureTotalCapacityPrecise(self.allocator, std.math.cast(usize, self.doc_count) orelse return error.RecordTooLarge);
-        var expected_doc_id: u32 = 1;
-        var constant_text_freq: u32 = 0;
-        var constant = true;
-        while (queue.pop()) |cursor| {
-            const doc_id = cursor.segment.doc_ids[cursor.index];
-            if (doc_id != expected_doc_id) {
-                freqs.deinit(self.allocator);
-                freqs_owned = false;
-                return false;
-            }
-            const text_freq = cursor.segment.text_freq;
-            if (constant_text_freq == 0) {
-                constant_text_freq = text_freq;
-            } else if (constant_text_freq != text_freq) {
-                constant = false;
-            }
-            try freqs.append(self.allocator, text_freq);
-            expected_doc_id += 1;
-            const next_index = cursor.index + 1;
-            if (next_index < cursor.segment.doc_ids.len) {
-                try queue.push(self.allocator, .{ .segment = cursor.segment, .index = next_index });
-            }
-        }
-        if (@as(u64, expected_doc_id) != self.doc_count + 1) {
-            freqs.deinit(self.allocator);
-            freqs_owned = false;
-            return false;
-        }
-
-        const summary_text_freq = if (constant) constant_text_freq else 0;
-        const record = try TextPostingRunTermSummaryRecord.initWithFreqSummary(term, self.doc_count, summary_text_freq, true, self.doc_count == 1);
-        try appendTextPostingRunSummaryRecord(summary_context, record);
-        if (constant) {
-            freqs.deinit(self.allocator);
-            freqs_owned = false;
-            var source = TextPostingSyntheticRunSource{ .virtual_all_docs = .{
-                .term = try self.allocator.dupe(u8, term),
-                .text_freq = constant_text_freq,
-            } };
-            errdefer source.deinit(self.allocator);
-            try self.synthetic_run_sources.append(self.allocator, source);
-            self.virtual_all_docs_synthetic_records = std.math.add(u64, self.virtual_all_docs_synthetic_records, self.doc_count) catch return error.RecordTooLarge;
-        } else {
-            const freq_stats = try freqs.slice().sizeStats();
-            if (self.measure_chunks) {
-                self.variable_all_docs_freq_stream_cells = std.math.add(u64, self.variable_all_docs_freq_stream_cells, @intCast(freqs.len())) catch return error.RecordTooLarge;
-                self.variable_all_docs_freq_stream_packed_bytes = std.math.add(u64, self.variable_all_docs_freq_stream_packed_bytes, freq_stats.packed_bytes) catch return error.RecordTooLarge;
-                self.variable_all_docs_freq_stream_rle_bytes = std.math.add(u64, self.variable_all_docs_freq_stream_rle_bytes, freq_stats.rle_bytes) catch return error.RecordTooLarge;
-                self.variable_all_docs_freq_stream_bitpacked_bytes = std.math.add(u64, self.variable_all_docs_freq_stream_bitpacked_bytes, freq_stats.bitpacked_bytes) catch return error.RecordTooLarge;
-                self.variable_all_docs_freq_stream_rle_run_count = std.math.add(u64, self.variable_all_docs_freq_stream_rle_run_count, freq_stats.rle_run_count) catch return error.RecordTooLarge;
-                self.variable_all_docs_freq_stream_max_freq = @max(self.variable_all_docs_freq_stream_max_freq, freq_stats.max_freq);
-            }
-            var source = TextPostingSyntheticRunSource{ .variable_all_docs = .{
-                .term = try self.allocator.dupe(u8, term),
-                .freqs = freqs,
-                .freq_stats = freq_stats,
-            } };
-            freqs_owned = false;
-            errdefer source.deinit(self.allocator);
-            try self.synthetic_run_sources.append(self.allocator, source);
-            self.variable_all_docs_synthetic_records = std.math.add(u64, self.variable_all_docs_synthetic_records, self.doc_count) catch return error.RecordTooLarge;
-        }
-        return true;
-    }
-
-    fn append(self: *TextPostingRunBuilder, record: TextPostingRunRecord) !void {
-        try self.appendTermPosting(record.term(), try record.toPosting());
-    }
-
-    fn appendTermPosting(self: *TextPostingRunBuilder, term: []const u8, posting: TextPostingRecord) !void {
-        self.run_paths_disjoint_term_ranges = false;
-        if (self.chunk.items.len == text_posting_run_chunk_records) try self.flushRun();
-        if (term.len == 0 or term.len > default_max_token_bytes) return error.InvalidRecord;
-        try validateTextPostingFields(posting.doc_id, posting.text_freq, posting.kind_freq);
-        const term_sort_prefix = termSortPrefixKey(term);
-        var term_offset: u32 = undefined;
-        if (self.cachedChunkTermOffset(term, term_sort_prefix)) |cached_offset| {
-            term_offset = cached_offset;
-            if (self.measure_chunks) {
-                self.run_record_term_cache_hits += 1;
-                self.run_record_term_cache_saved_bytes += term.len;
-            }
-        } else {
-            if (self.chunk_term_bytes.items.len > std.math.maxInt(u32)) return error.RecordTooLarge;
-            term_offset = @intCast(self.chunk_term_bytes.items.len);
-            try self.chunk_term_bytes.appendSlice(self.allocator, term);
-            self.rememberChunkTermOffset(term, term_sort_prefix, term_offset);
-        }
-        const chunk_record = TextPostingRunChunkRecord{
-            .term_sort_prefix = term_sort_prefix,
-            .doc_id = @intCast(posting.doc_id),
-            .term_offset = term_offset,
-            .text_freq = @intCast(posting.text_freq),
-            .kind_freq = @intCast(posting.kind_freq),
-            .term_len = @intCast(term.len),
-        };
-        if (self.measure_chunks) {
-            const term_len: u64 = @intCast(term.len);
-            self.run_record_term_bytes += term_len;
-            self.run_record_inline_capacity_bytes += default_max_token_bytes;
-            self.run_record_term_slack_bytes += default_max_token_bytes - term_len;
-            if (term.len > text_posting_run_record_long_term_threshold) self.run_record_long_term_count += 1;
-            self.run_record_max_term_len = @max(self.run_record_max_term_len, term_len);
-        }
-        self.chunk.appendAssumeCapacity(chunk_record);
-    }
-
-    fn finish(self: *TextPostingRunBuilder) !void {
-        textBenchTraceRunBuilder("run_builder_finish_materialize_virtual_start", self);
-        self.materializeStaleVirtualAllDocsCandidates(self.doc_count) catch |err| {
-            textBenchTraceRunBuilder("run_builder_finish_materialize_virtual_error", self);
-            return err;
-        };
-        textBenchTraceRunBuilder("run_builder_finish_materialize_variable_start", self);
-        self.materializeStaleVariableAllDocsCandidates(self.doc_count) catch |err| {
-            textBenchTraceRunBuilder("run_builder_finish_materialize_variable_error", self);
-            return err;
-        };
-        textBenchTraceRunBuilder("run_builder_finish_flush_run_start", self);
-        self.flushRun() catch |err| {
-            textBenchTraceRunBuilder("run_builder_finish_flush_run_error", self);
-            return err;
-        };
-        textBenchTraceRunBuilder("run_builder_finish_compact_start", self);
-        self.compactForFanIn() catch |err| {
-            textBenchTraceRunBuilder("run_builder_finish_compact_error", self);
-            return err;
-        };
-        textBenchTraceRunBuilder("run_builder_finish_flush_virtual_start", self);
-        self.flushVirtualAllDocsCandidates() catch |err| {
-            textBenchTraceRunBuilder("run_builder_finish_flush_virtual_error", self);
-            return err;
-        };
-        textBenchTraceRunBuilder("run_builder_finish_flush_variable_start", self);
-        self.flushVariableAllDocsCandidates() catch |err| {
-            textBenchTraceRunBuilder("run_builder_finish_flush_variable_error", self);
-            return err;
-        };
-        std.mem.sort(TextPostingSyntheticRunSource, self.synthetic_run_sources.items, {}, textPostingSyntheticRunSourceLessThan);
-        textBenchTraceRunBuilder("run_builder_finish_coalesce_summaries_start", self);
-        self.coalesceSummariesForFinalMerge() catch |err| {
-            textBenchTraceRunBuilder("run_builder_finish_coalesce_summaries_error", self);
-            return err;
-        };
-    }
-
-    fn releaseBuildScratchAfterFinish(self: *TextPostingRunBuilder) void {
-        self.chunk.deinit(self.allocator);
-        self.chunk = .empty;
-        self.chunk_term_bytes.deinit(self.allocator);
-        self.chunk_term_bytes = .empty;
-        self.virtual_all_docs_failed_terms.deinit(self.allocator);
-        self.virtual_all_docs_failed_terms = .empty;
-        self.variable_all_docs_failed_terms.deinit(self.allocator);
-        self.variable_all_docs_failed_terms = .empty;
-        self.clearAllDocsCandidatesAndFree();
-    }
-
-    fn materializeFailedVirtualAllDocsCandidate(self: *TextPostingRunBuilder, term: []const u8, last_doc_id: u64) !void {
-        const candidate = switch (self.all_docs_candidates.get(term) orelse return error.InvalidRecord) {
-            .virtual => |candidate| candidate,
-            .variable => return error.InvalidRecord,
-        };
-        const removed = self.all_docs_candidates.fetchRemove(term) orelse return error.InvalidRecord;
-        self.invalidateAllDocsCandidateCache();
-        self.markAllDocsCandidateShapeFilterDirty();
-        defer self.allocator.free(removed.key);
-        var doc_id: u64 = 1;
-        while (doc_id <= last_doc_id) : (doc_id += 1) {
-            try self.appendTermPosting(removed.key, .{
-                .doc_id = doc_id,
-                .text_freq = candidate.text_freq,
-                .kind_freq = 0,
-            });
-        }
-    }
-
-    fn reserveVariableAllDocsFreqCells(self: *TextPostingRunBuilder, cells: u64) bool {
-        if (self.variable_all_docs_disabled) return false;
-        const next = std.math.add(u64, self.variable_all_docs_freq_cells, cells) catch {
-            self.variable_all_docs_disabled = true;
-            return false;
-        };
-        if (next > text_posting_run_variable_all_docs_max_freq_cells) {
-            self.variable_all_docs_disabled = true;
-            return false;
-        }
-        self.variable_all_docs_freq_cells = next;
-        return true;
-    }
-
-    fn releaseVariableAllDocsFreqCells(self: *TextPostingRunBuilder, cells: u64) void {
-        if (cells > self.variable_all_docs_freq_cells) {
-            self.variable_all_docs_freq_cells = 0;
-            return;
-        }
-        self.variable_all_docs_freq_cells -= cells;
-    }
-
-    fn convertVirtualAllDocsCandidateToVariable(self: *TextPostingRunBuilder, term: []const u8, doc_id: u64, text_freq: u32) !bool {
-        const candidate_slot = self.all_docs_candidates.getPtr(term) orelse return error.InvalidRecord;
-        const existing = switch (candidate_slot.*) {
-            .virtual => |candidate| candidate,
-            .variable => return error.InvalidRecord,
-        };
-        const prior_freq = try validateDenseAllDocsTextFreq(existing.text_freq);
-        const next_freq = try validateDenseAllDocsTextFreq(text_freq);
-        if (!self.reserveVariableAllDocsFreqCells(doc_id)) return false;
-        errdefer self.releaseVariableAllDocsFreqCells(doc_id);
-        var candidate = VariableAllDocsRunCandidate{ .last_seen_doc_id = doc_id };
-        errdefer candidate.deinit(self.allocator);
-        const prior_docs = std.math.cast(usize, doc_id - 1) orelse return error.RecordTooLarge;
-        if (prior_freq > std.math.maxInt(u8) or next_freq > std.math.maxInt(u8)) try candidate.freqs.ensureWide(self.allocator);
-        try candidate.freqs.ensureTotalCapacityPrecise(self.allocator, prior_docs + 1);
-        var prior_doc_id: u64 = 1;
-        while (prior_doc_id < doc_id) : (prior_doc_id += 1) {
-            try candidate.freqs.appendAssumeCapacity(prior_freq);
-        }
-        try candidate.freqs.appendAssumeCapacity(next_freq);
-        candidate_slot.* = .{ .variable = candidate };
-        return true;
-    }
-
-    fn appendVariableAllDocsRunCandidateFreq(self: *TextPostingRunBuilder, candidate: *VariableAllDocsRunCandidate, text_freq: u32) !bool {
-        const sample = self.measure_chunks and ((self.docs_posting_append_variable_freq_append_count & text_posting_append_probe_sample_mask) == 0);
-        const sample_start = if (sample) textMonotonicNs(self.io) else 0;
-        if (!self.reserveVariableAllDocsFreqCells(1)) return false;
-        errdefer self.releaseVariableAllDocsFreqCells(1);
-        try candidate.freqs.append(self.allocator, text_freq);
-        if (sample) {
-            self.docs_posting_append_variable_freq_sampled_ns += textElapsedNs(self.io, sample_start);
-            self.docs_posting_append_variable_freq_sample_count += 1;
-        }
-        return true;
-    }
-
-    fn materializeFailedVariableAllDocsCandidate(self: *TextPostingRunBuilder, term: []const u8) !void {
-        const existing = switch (self.all_docs_candidates.get(term) orelse return error.InvalidRecord) {
-            .virtual => return error.InvalidRecord,
-            .variable => |candidate| candidate,
-        };
-        const candidate_cells: u64 = @intCast(existing.freqs.len());
-        const removed = self.all_docs_candidates.fetchRemove(term) orelse return error.InvalidRecord;
-        self.invalidateAllDocsCandidateCache();
-        self.markAllDocsCandidateShapeFilterDirty();
-        var candidate = switch (removed.value) {
-            .virtual => unreachable,
-            .variable => |candidate| candidate,
-        };
-        defer {
-            candidate.deinit(self.allocator);
-            self.allocator.free(removed.key);
-            self.releaseVariableAllDocsFreqCells(candidate_cells);
-        }
-        if (candidate_cells != candidate.last_seen_doc_id) return error.InvalidRecord;
-        const freqs = candidate.freqs.slice();
-        var index: usize = 0;
-        while (index < freqs.len()) : (index += 1) {
-            try self.appendTermPosting(removed.key, .{
-                .doc_id = @intCast(index + 1),
-                .text_freq = freqs.at(index),
-                .kind_freq = 0,
-            });
-        }
-    }
-
-    fn materializeAllVariableAllDocsCandidates(self: *TextPostingRunBuilder) !void {
-        self.variable_all_docs_failed_terms.clearRetainingCapacity();
-        var candidate_it = self.all_docs_candidates.iterator();
-        while (candidate_it.next()) |entry| {
-            switch (entry.value_ptr.*) {
-                .virtual => {},
-                .variable => try self.variable_all_docs_failed_terms.append(self.allocator, entry.key_ptr.*),
-            }
-        }
-        for (self.variable_all_docs_failed_terms.items) |term| {
-            try self.materializeFailedVariableAllDocsCandidate(term);
-        }
-        self.variable_all_docs_failed_terms.clearRetainingCapacity();
-    }
-
-    fn materializeStaleVirtualAllDocsCandidates(self: *TextPostingRunBuilder, current_doc_id: u64) !void {
-        self.virtual_all_docs_failed_terms.clearRetainingCapacity();
-        var candidate_it = self.all_docs_candidates.iterator();
-        while (candidate_it.next()) |entry| {
-            switch (entry.value_ptr.*) {
-                .virtual => |candidate| if (candidate.last_seen_doc_id != current_doc_id) {
-                    try self.virtual_all_docs_failed_terms.append(self.allocator, entry.key_ptr.*);
-                },
-                .variable => {},
-            }
-        }
-        for (self.virtual_all_docs_failed_terms.items) |term| {
-            const candidate = switch (self.all_docs_candidates.get(term) orelse return error.InvalidRecord) {
-                .virtual => |candidate| candidate,
-                .variable => return error.InvalidRecord,
-            };
-            try self.materializeFailedVirtualAllDocsCandidate(term, candidate.last_seen_doc_id);
-        }
-        self.virtual_all_docs_failed_terms.clearRetainingCapacity();
-    }
-
-    fn materializeStaleVariableAllDocsCandidates(self: *TextPostingRunBuilder, current_doc_id: u64) !void {
-        self.variable_all_docs_failed_terms.clearRetainingCapacity();
-        var candidate_it = self.all_docs_candidates.iterator();
-        while (candidate_it.next()) |entry| {
-            switch (entry.value_ptr.*) {
-                .virtual => {},
-                .variable => |candidate| if (candidate.last_seen_doc_id != current_doc_id) {
-                    try self.variable_all_docs_failed_terms.append(self.allocator, entry.key_ptr.*);
-                },
-            }
-        }
-        for (self.variable_all_docs_failed_terms.items) |term| {
-            try self.materializeFailedVariableAllDocsCandidate(term);
-        }
-        self.variable_all_docs_failed_terms.clearRetainingCapacity();
-    }
-
-    const VirtualAllDocsSyntheticTerm = struct {
-        term: []const u8,
-        text_freq: u32,
-    };
-
-    fn virtualAllDocsSyntheticTermLessThan(_: void, lhs: VirtualAllDocsSyntheticTerm, rhs: VirtualAllDocsSyntheticTerm) bool {
-        return std.mem.order(u8, lhs.term, rhs.term) == .lt;
-    }
-
-    const VariableAllDocsSyntheticTerm = struct {
-        term: []const u8,
-    };
-
-    fn variableAllDocsSyntheticTermLessThan(_: void, lhs: VariableAllDocsSyntheticTerm, rhs: VariableAllDocsSyntheticTerm) bool {
-        return std.mem.order(u8, lhs.term, rhs.term) == .lt;
-    }
-
-    fn flushVirtualAllDocsCandidates(self: *TextPostingRunBuilder) !void {
-        var virtual_count: usize = 0;
-        var count_it = self.all_docs_candidates.iterator();
-        while (count_it.next()) |entry| {
-            switch (entry.value_ptr.*) {
-                .virtual => virtual_count += 1,
-                .variable => {},
-            }
-        }
-        if (virtual_count == 0) return;
-        if (self.doc_count == 0) return error.InvalidRecord;
-
-        var terms = std.ArrayList(VirtualAllDocsSyntheticTerm).empty;
-        defer terms.deinit(self.allocator);
-        try terms.ensureTotalCapacityPrecise(self.allocator, virtual_count);
-        var candidate_it = self.all_docs_candidates.iterator();
-        while (candidate_it.next()) |entry| {
-            switch (entry.value_ptr.*) {
-                .virtual => |candidate| {
-                    if (candidate.last_seen_doc_id != self.doc_count) return error.InvalidRecord;
-                    terms.appendAssumeCapacity(.{
-                        .term = entry.key_ptr.*,
-                        .text_freq = candidate.text_freq,
-                    });
-                },
-                .variable => {},
-            }
-        }
-        std.mem.sort(VirtualAllDocsSyntheticTerm, terms.items, {}, virtualAllDocsSyntheticTermLessThan);
-
-        const summary_path = try std.fmt.allocPrint(self.allocator, "{s}.virtual_all_docs.summary.tmp", .{self.base_path});
-        var summary_path_owned = true;
-        errdefer {
-            std.Io.Dir.cwd().deleteFile(self.io, summary_path) catch {};
-            if (summary_path_owned) self.allocator.free(summary_path);
-        }
-
-        var summary_file = try std.Io.Dir.cwd().createFile(self.io, summary_path, .{ .read = true, .truncate = true });
-        defer summary_file.close(self.io);
-        var summary_writer = try TextPostingRunSummaryWriter.init(self.allocator, self.io, summary_file);
-        defer summary_writer.deinit();
-
-        var summary_context = CollectTextPostingRunSummaryContext{ .writer = &summary_writer };
-        for (terms.items) |term| {
-            const record = try TextPostingRunTermSummaryRecord.initWithFreqSummary(term.term, self.doc_count, term.text_freq, true, self.doc_count == 1);
-            try appendTextPostingRunSummaryRecord(&summary_context, record);
-
-            const removed = self.all_docs_candidates.fetchRemove(term.term) orelse return error.InvalidRecord;
-            self.invalidateAllDocsCandidateCache();
-            self.markAllDocsCandidateShapeFilterDirty();
-            const candidate = switch (removed.value) {
-                .virtual => |candidate| candidate,
-                .variable => return error.InvalidRecord,
-            };
-            if (candidate.last_seen_doc_id != self.doc_count or candidate.text_freq != term.text_freq) return error.InvalidRecord;
-            var source = TextPostingSyntheticRunSource{ .virtual_all_docs = .{
-                .term = removed.key,
-                .text_freq = candidate.text_freq,
-            } };
-            var source_owned = true;
-            errdefer if (source_owned) source.deinit(self.allocator);
-            try self.synthetic_run_sources.append(self.allocator, source);
-            source_owned = false;
-            self.virtual_all_docs_synthetic_records = std.math.add(u64, self.virtual_all_docs_synthetic_records, self.doc_count) catch return error.RecordTooLarge;
-        }
-        try summary_writer.flush();
-        const summary_stat = try summary_file.stat(self.io);
-        if (summary_stat.kind != .file or summary_stat.size != summary_writer.physical_bytes) return error.InvalidRecord;
-        summary_context.summary_file_bytes = summary_writer.physical_bytes;
-
-        try self.run_summaries.append(self.allocator, .{
-            .path = summary_path,
-            .term_count = summary_context.term_count,
-            .file_size = summary_context.summary_file_bytes,
-        });
-        summary_path_owned = false;
-    }
-
-    fn flushVariableAllDocsCandidates(self: *TextPostingRunBuilder) !void {
-        var variable_count: usize = 0;
-        var count_it = self.all_docs_candidates.iterator();
-        while (count_it.next()) |entry| {
-            switch (entry.value_ptr.*) {
-                .virtual => {},
-                .variable => variable_count += 1,
-            }
-        }
-        if (variable_count == 0) return;
-        if (self.doc_count == 0) return error.InvalidRecord;
-
-        var terms = std.ArrayList(VariableAllDocsSyntheticTerm).empty;
-        defer terms.deinit(self.allocator);
-        try terms.ensureTotalCapacityPrecise(self.allocator, variable_count);
-        var candidate_it = self.all_docs_candidates.iterator();
-        while (candidate_it.next()) |entry| {
-            switch (entry.value_ptr.*) {
-                .virtual => {},
-                .variable => |candidate| {
-                    if (candidate.last_seen_doc_id != self.doc_count) return error.InvalidRecord;
-                    if (@as(u64, @intCast(candidate.freqs.len())) != self.doc_count) return error.InvalidRecord;
-                    terms.appendAssumeCapacity(.{ .term = entry.key_ptr.* });
-                },
-            }
-        }
-        std.mem.sort(VariableAllDocsSyntheticTerm, terms.items, {}, variableAllDocsSyntheticTermLessThan);
-
-        const summary_path = try std.fmt.allocPrint(self.allocator, "{s}.variable_all_docs.summary.tmp", .{self.base_path});
-        var summary_path_owned = true;
-        errdefer {
-            std.Io.Dir.cwd().deleteFile(self.io, summary_path) catch {};
-            if (summary_path_owned) self.allocator.free(summary_path);
-        }
-
-        var summary_file = try std.Io.Dir.cwd().createFile(self.io, summary_path, .{ .read = true, .truncate = true });
-        defer summary_file.close(self.io);
-        var summary_writer = try TextPostingRunSummaryWriter.init(self.allocator, self.io, summary_file);
-        defer summary_writer.deinit();
-
-        var summary_context = CollectTextPostingRunSummaryContext{ .writer = &summary_writer };
-        for (terms.items) |term| {
-            const record = try TextPostingRunTermSummaryRecord.initWithFreqSummary(term.term, self.doc_count, 0, true, self.doc_count == 1);
-            try appendTextPostingRunSummaryRecord(&summary_context, record);
-
-            const removed = self.all_docs_candidates.fetchRemove(term.term) orelse return error.InvalidRecord;
-            self.invalidateAllDocsCandidateCache();
-            self.markAllDocsCandidateShapeFilterDirty();
-            const candidate = switch (removed.value) {
-                .virtual => return error.InvalidRecord,
-                .variable => |candidate| candidate,
-            };
-            if (candidate.last_seen_doc_id != self.doc_count) return error.InvalidRecord;
-            if (@as(u64, @intCast(candidate.freqs.len())) != self.doc_count) return error.InvalidRecord;
-            const freq_stats = try candidate.freqs.slice().sizeStats();
-            if (self.measure_chunks) {
-                self.variable_all_docs_freq_stream_cells = std.math.add(u64, self.variable_all_docs_freq_stream_cells, @intCast(candidate.freqs.len())) catch return error.RecordTooLarge;
-                self.variable_all_docs_freq_stream_packed_bytes = std.math.add(u64, self.variable_all_docs_freq_stream_packed_bytes, freq_stats.packed_bytes) catch return error.RecordTooLarge;
-                self.variable_all_docs_freq_stream_rle_bytes = std.math.add(u64, self.variable_all_docs_freq_stream_rle_bytes, freq_stats.rle_bytes) catch return error.RecordTooLarge;
-                self.variable_all_docs_freq_stream_bitpacked_bytes = std.math.add(u64, self.variable_all_docs_freq_stream_bitpacked_bytes, freq_stats.bitpacked_bytes) catch return error.RecordTooLarge;
-                self.variable_all_docs_freq_stream_rle_run_count = std.math.add(u64, self.variable_all_docs_freq_stream_rle_run_count, freq_stats.rle_run_count) catch return error.RecordTooLarge;
-                self.variable_all_docs_freq_stream_max_freq = @max(self.variable_all_docs_freq_stream_max_freq, freq_stats.max_freq);
-            }
-            var source = TextPostingSyntheticRunSource{ .variable_all_docs = .{
-                .term = removed.key,
-                .freqs = candidate.freqs,
-                .freq_stats = freq_stats,
-            } };
-            var source_owned = true;
-            errdefer if (source_owned) source.deinit(self.allocator);
-            try self.synthetic_run_sources.append(self.allocator, source);
-            source_owned = false;
-            self.variable_all_docs_synthetic_records = std.math.add(u64, self.variable_all_docs_synthetic_records, self.doc_count) catch return error.RecordTooLarge;
-        }
-        try summary_writer.flush();
-        const summary_stat = try summary_file.stat(self.io);
-        if (summary_stat.kind != .file or summary_stat.size != summary_writer.physical_bytes) return error.InvalidRecord;
-        summary_context.summary_file_bytes = summary_writer.physical_bytes;
-
-        try self.run_summaries.append(self.allocator, .{
-            .path = summary_path,
-            .term_count = summary_context.term_count,
-            .file_size = summary_context.summary_file_bytes,
-        });
-        summary_path_owned = false;
-    }
-
-    fn flushRun(self: *TextPostingRunBuilder) !void {
-        if (self.chunk.items.len == 0) return;
-        if (self.measure_chunks) {
-            const record_bytes = std.math.mul(u64, @intCast(self.chunk.items.len), @as(u64, @sizeOf(TextPostingRunChunkRecord))) catch return error.RecordTooLarge;
-            const term_bytes: u64 = @intCast(self.chunk_term_bytes.items.len);
-            const scratch_bytes = std.math.add(u64, record_bytes, term_bytes) catch return error.RecordTooLarge;
-            const record_capacity_bytes = std.math.mul(u64, @intCast(self.chunk.capacity), @as(u64, @sizeOf(TextPostingRunChunkRecord))) catch return error.RecordTooLarge;
-            const term_capacity_bytes: u64 = @intCast(self.chunk_term_bytes.capacity);
-            const scratch_capacity_bytes = std.math.add(u64, record_capacity_bytes, term_capacity_bytes) catch return error.RecordTooLarge;
-            self.chunk_peak_record_bytes = @max(self.chunk_peak_record_bytes, record_bytes);
-            self.chunk_peak_term_bytes = @max(self.chunk_peak_term_bytes, term_bytes);
-            self.chunk_peak_scratch_bytes = @max(self.chunk_peak_scratch_bytes, scratch_bytes);
-            self.chunk_peak_record_capacity_bytes = @max(self.chunk_peak_record_capacity_bytes, record_capacity_bytes);
-            self.chunk_peak_term_capacity_bytes = @max(self.chunk_peak_term_capacity_bytes, term_capacity_bytes);
-            self.chunk_peak_scratch_capacity_bytes = @max(self.chunk_peak_scratch_capacity_bytes, scratch_capacity_bytes);
-        }
-        const run_path = try std.fmt.allocPrint(self.allocator, "{s}.posting_run.{d}.tmp", .{ self.base_path, self.run_paths.items.len });
-        var run_path_owned = true;
-        errdefer {
-            std.Io.Dir.cwd().deleteFile(self.io, run_path) catch {};
-            if (run_path_owned) self.allocator.free(run_path);
-        }
-        const summary_path = try std.fmt.allocPrint(self.allocator, "{s}.posting_run.{d}.summary.tmp", .{ self.base_path, self.run_paths.items.len });
-        var summary_path_owned = true;
-        errdefer {
-            std.Io.Dir.cwd().deleteFile(self.io, summary_path) catch {};
-            if (summary_path_owned) self.allocator.free(summary_path);
-        }
-        if (self.chunk.items.len > std.math.maxInt(u32)) return error.RecordTooLarge;
-        const sort_start = if (self.measure_chunks) textMonotonicNs(self.io) else 0;
-        std.mem.sort(TextPostingRunChunkRecord, self.chunk.items, self.chunk_term_bytes.items, textPostingRunChunkRecordLessThan);
-        if (self.measure_chunks) {
-            self.chunk_sort_ns += textElapsedNs(self.io, sort_start);
-        }
-        const write_start = if (self.measure_chunks) textMonotonicNs(self.io) else 0;
-        const summary_stats = try writeSortedTextPostingRunChunkWithSummary(self.allocator, self.io, run_path, summary_path, self.chunk.items, self.chunk_term_bytes.items);
-        if (self.measure_chunks) {
-            self.chunk_write_ns += textElapsedNs(self.io, write_start);
-            self.chunk_count = std.math.add(u64, self.chunk_count, 1) catch return error.RecordTooLarge;
-            self.chunk_records = std.math.add(u64, self.chunk_records, self.chunk.items.len) catch return error.RecordTooLarge;
-            self.inline_singleton_materialized_terms = std.math.add(u64, self.inline_singleton_materialized_terms, summary_stats.inline_singleton_materialized_terms) catch return error.RecordTooLarge;
-            self.inline_singleton_materialized_records = std.math.add(u64, self.inline_singleton_materialized_records, summary_stats.inline_singleton_materialized_records) catch return error.RecordTooLarge;
-            self.inline_singleton_materialized_bytes = std.math.add(u64, self.inline_singleton_materialized_bytes, summary_stats.inline_singleton_materialized_bytes) catch return error.RecordTooLarge;
-        }
-        try self.run_paths.append(self.allocator, run_path);
-        run_path_owned = false;
-        try self.run_summaries.append(self.allocator, .{
-            .path = summary_path,
-            .term_count = summary_stats.term_count,
-            .file_size = summary_stats.summary_file_bytes,
-        });
-        summary_path_owned = false;
-        self.chunk_term_bytes.clearRetainingCapacity();
-        self.chunk.clearRetainingCapacity();
-        self.clearChunkTermCache();
-    }
-
-    fn compactForFanIn(self: *TextPostingRunBuilder) !void {
-        try self.compactForFanInLimit(text_posting_run_direct_merge_fan_in);
-    }
-
-    fn compactForFanInLimit(self: *TextPostingRunBuilder, fan_in: usize) !void {
-        if (fan_in == 0) return error.InvalidRecord;
-        if (self.run_paths.items.len <= fan_in) return;
-
-        var pass_index: usize = 0;
-        while (self.run_paths.items.len > fan_in) : (pass_index += 1) {
-            var next_run_paths = std.ArrayList([]u8).empty;
-            errdefer {
-                for (next_run_paths.items) |path| {
-                    std.Io.Dir.cwd().deleteFile(self.io, path) catch {};
-                    self.allocator.free(path);
-                }
-                next_run_paths.deinit(self.allocator);
-            }
-            var next_summaries = std.ArrayList(TextPostingRunSummaryFile).empty;
-            errdefer {
-                for (next_summaries.items) |summary| {
-                    std.Io.Dir.cwd().deleteFile(self.io, summary.path) catch {};
-                    self.allocator.free(summary.path);
-                }
-                next_summaries.deinit(self.allocator);
-            }
-
-            var start: usize = 0;
-            var group_index: usize = 0;
-            while (start < self.run_paths.items.len) : (group_index += 1) {
-                const end = @min(start + fan_in, self.run_paths.items.len);
-                const out_path = try std.fmt.allocPrint(self.allocator, "{s}.posting_run.compact.{d}.{d}.tmp", .{ self.base_path, pass_index, group_index });
-                var out_path_owned = true;
-                errdefer {
-                    std.Io.Dir.cwd().deleteFile(self.io, out_path) catch {};
-                    if (out_path_owned) self.allocator.free(out_path);
-                }
-                const out_summary_path = try std.fmt.allocPrint(self.allocator, "{s}.posting_run.compact.{d}.{d}.summary.tmp", .{ self.base_path, pass_index, group_index });
-                var out_summary_path_owned = true;
-                errdefer {
-                    std.Io.Dir.cwd().deleteFile(self.io, out_summary_path) catch {};
-                    if (out_summary_path_owned) self.allocator.free(out_summary_path);
-                }
-
-                const summary_stats = try writeMergedTextPostingRunWithSummary(
-                    self.allocator,
-                    self.io,
-                    self.run_paths.items[start..end],
-                    out_path,
-                    out_summary_path,
-                    .none,
-                );
-                try next_run_paths.append(self.allocator, out_path);
-                out_path_owned = false;
-                try next_summaries.append(self.allocator, .{
-                    .path = out_summary_path,
-                    .term_count = summary_stats.term_count,
-                    .file_size = summary_stats.summary_file_bytes,
-                });
-                out_summary_path_owned = false;
-
-                for (self.run_paths.items[start..end]) |path| {
-                    std.Io.Dir.cwd().deleteFile(self.io, path) catch {};
-                    self.allocator.free(path);
-                }
-                for (self.run_summaries.items[start..end]) |summary| {
-                    std.Io.Dir.cwd().deleteFile(self.io, summary.path) catch {};
-                    self.allocator.free(summary.path);
-                }
-                start = end;
-            }
-
-            self.run_paths.deinit(self.allocator);
-            self.run_paths = next_run_paths;
-            self.run_summaries.deinit(self.allocator);
-            self.run_summaries = next_summaries;
-        }
-    }
-
-    fn coalesceSummariesForFinalMerge(self: *TextPostingRunBuilder) !void {
-        try self.coalesceSummariesForFinalMergeLimit(text_posting_run_merge_fan_in);
-    }
-
-    fn coalesceSummariesForFinalMergeLimit(self: *TextPostingRunBuilder, fan_in: usize) !void {
-        if (fan_in == 0) return error.InvalidRecord;
-        if (self.run_summaries.items.len <= fan_in) return;
-
-        const summary_path = try std.fmt.allocPrint(self.allocator, "{s}.posting_run.final.summary.tmp", .{self.base_path});
-        var summary_path_owned = true;
-        errdefer {
-            std.Io.Dir.cwd().deleteFile(self.io, summary_path) catch {};
-            if (summary_path_owned) self.allocator.free(summary_path);
-        }
-        var final_stats = TextPostingRunSummaryStats{};
-        const summary_stats = try collectTextPostingRunTermSummariesFromFilesToFile(
-            self.allocator,
-            self.io,
-            self.run_summaries.items,
-            summary_path,
-            self.doc_count,
-            &final_stats,
-            .none,
-        );
-
-        for (self.run_summaries.items) |summary| {
-            std.Io.Dir.cwd().deleteFile(self.io, summary.path) catch {};
-            self.allocator.free(summary.path);
-        }
-        self.run_summaries.clearRetainingCapacity();
-        try self.run_summaries.append(self.allocator, .{
-            .path = summary_path,
-            .term_count = summary_stats.term_count,
-            .file_size = summary_stats.summary_file_bytes,
-            .final_stats = final_stats,
-        });
-        summary_path_owned = false;
-    }
-};
+const VariableAllDocsFreqSlice = posting_run_builder.VariableAllDocsFreqSlice;
+const AllDocsRunCandidate = posting_run_builder.AllDocsRunCandidate;
+const AllDocsCandidateCacheSlot = posting_run_builder.AllDocsCandidateCacheSlot;
+const TextPostingSyntheticRunSource = posting_run_builder.TextPostingSyntheticRunSource;
+const TextPostingRunBuilder = posting_run_builder.TextPostingRunBuilder;
+const text_posting_run_variable_all_docs_max_freq_cells = posting_run_builder.text_posting_run_variable_all_docs_max_freq_cells;
+const text_posting_run_all_docs_candidate_sweep_interval = posting_run_builder.text_posting_run_all_docs_candidate_sweep_interval;
 
 fn textPostingRunIndexLessThan(records: []const TextPostingRunRecord, lhs_index: u32, rhs_index: u32) bool {
     return textPostingRunRecordLessThan({}, records[lhs_index], records[rhs_index]);
@@ -9236,7 +5208,7 @@ const TextPostingRunMerger = struct {
     current_records: std.ArrayList(TextPostingRunRecord),
     queue: std.PriorityQueue(usize, []const TextPostingRunRecord, compareTextPostingRunReaderIndex),
 
-    fn init(allocator: std.mem.Allocator, io: std.Io, run_paths: []const []const u8) !TextPostingRunMerger {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, run_paths: []const []const u8) !TextPostingRunMerger {
         var readers = std.ArrayList(TextPostingRunReader).empty;
         errdefer {
             for (readers.items) |*reader| reader.deinit();
@@ -9281,7 +5253,7 @@ const TextPostingRunMerger = struct {
         };
     }
 
-    fn deinit(self: *TextPostingRunMerger) void {
+    pub fn deinit(self: *TextPostingRunMerger) void {
         self.queue.deinit(self.allocator);
         self.current_records.deinit(self.allocator);
         for (self.readers.items) |*reader| reader.deinit();
@@ -9332,17 +5304,17 @@ const TextPostingRunMerger = struct {
         self.queue.items[index] = target;
     }
 
-    const NextProbe = struct {
+    pub const NextProbe = struct {
         reader_ns: u128 = 0,
         queue_ns: u128 = 0,
         queue_compare_count: u64 = 0,
     };
 
-    fn next(self: *TextPostingRunMerger) !?TextPostingRunRecord {
+    pub fn next(self: *TextPostingRunMerger) !?TextPostingRunRecord {
         return self.nextWithProbe(null);
     }
 
-    fn nextWithProbe(self: *TextPostingRunMerger, probe: ?*NextProbe) !?TextPostingRunRecord {
+    pub fn nextWithProbe(self: *TextPostingRunMerger, probe: ?*NextProbe) !?TextPostingRunRecord {
         const reader_index = self.queue.peek() orelse return null;
         const record = self.current_records.items[reader_index];
         const reader = &self.readers.items[reader_index];
@@ -9372,7 +5344,7 @@ const TextSyntheticPostingRunCursor = struct {
     source_index: usize = 0,
     doc_index: u64 = 0,
 
-    fn nextWithDocCount(self: *TextSyntheticPostingRunCursor, doc_count: u64) !?TextPostingRunRecord {
+    pub fn nextWithDocCount(self: *TextSyntheticPostingRunCursor, doc_count: u64) !?TextPostingRunRecord {
         if (self.source_index >= self.sources.len) return null;
         const source = self.sources[self.source_index];
         const source_posting_count: u64 = switch (source) {
@@ -9440,24 +5412,24 @@ const TextPostingRunFrontCodedWriter = struct {
     previous_term_len: usize = 0,
     previous_doc_id: u32 = 0,
 
-    fn writeHeader(self: *TextPostingRunFrontCodedWriter) !u64 {
+    pub fn writeHeader(self: *TextPostingRunFrontCodedWriter) !u64 {
         try self.writer.append(&text_posting_run_front_coded_magic);
         return text_posting_run_front_coded_magic.len;
     }
 
-    fn append(self: *TextPostingRunFrontCodedWriter, record: TextPostingRunRecord) !u64 {
+    pub fn append(self: *TextPostingRunFrontCodedWriter, record: TextPostingRunRecord) !u64 {
         return try self.appendCheckedTermPosting(record.term(), try record.toPosting());
     }
 
-    fn appendTrusted(self: *TextPostingRunFrontCodedWriter, record: TextPostingRunRecord) !u64 {
+    pub fn appendTrusted(self: *TextPostingRunFrontCodedWriter, record: TextPostingRunRecord) !u64 {
         return try self.appendTrustedRecordFields(record.term(), record.doc_id, record.text_freq, record.kind_freq);
     }
 
-    fn appendCheckedTermPosting(self: *TextPostingRunFrontCodedWriter, term: []const u8, posting: TextPostingRecord) !u64 {
+    pub fn appendCheckedTermPosting(self: *TextPostingRunFrontCodedWriter, term: []const u8, posting: TextPostingRecord) !u64 {
         return try self.appendEncodedPosting(term, posting);
     }
 
-    fn appendTrustedRecordFields(self: *TextPostingRunFrontCodedWriter, term: []const u8, doc_id: u32, text_freq: u16, kind_freq: u8) !u64 {
+    pub fn appendTrustedRecordFields(self: *TextPostingRunFrontCodedWriter, term: []const u8, doc_id: u32, text_freq: u16, kind_freq: u8) !u64 {
         try validateTextPostingFields(doc_id, text_freq, kind_freq);
         return try self.appendEncodedPosting(term, .{
             .doc_id = doc_id,
@@ -9555,186 +5527,9 @@ fn writeTextPostingRunTrustedOrderWithSummary(
 ) !TextPostingRunSummaryStats {
     return writeTextPostingRunInOrderWithSummaryMode(allocator, io, path, summary_path, records, order, .trusted_sorted_records);
 }
-
-fn writeTextPostingRunChunkTrustedOrderWithSummary(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    path: []const u8,
-    summary_path: []const u8,
-    records: []const TextPostingRunChunkRecord,
-    term_bytes: []const u8,
-    order: []const u32,
-) !TextPostingRunSummaryStats {
-    if (order.len != records.len) return error.InvalidRecord;
-    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
-    defer file.close(io);
-    var summary_file = try std.Io.Dir.cwd().createFile(io, summary_path, .{ .read = true, .truncate = true });
-    defer summary_file.close(io);
-
-    var writer = try TextBufferedWriter.init(allocator, io, file, text_write_buffer_bytes);
-    defer writer.deinit();
-    var summary_writer = try TextPostingRunSummaryWriter.init(allocator, io, summary_file);
-    defer summary_writer.deinit();
-
-    var summary_context = CollectTextPostingRunSummaryContext{ .writer = &summary_writer };
-    var run_writer = TextPostingRunFrontCodedWriter{ .writer = &writer };
-    var expected_size: u64 = try run_writer.writeHeader();
-    for (order) |index| {
-        if (index >= records.len) return error.InvalidRecord;
-        const record = records[index];
-        const term = try record.term(term_bytes);
-        const posting = TextPostingRecord{
-            .doc_id = record.doc_id,
-            .text_freq = record.text_freq,
-            .kind_freq = record.kind_freq,
-        };
-        const encoded_len = try run_writer.appendTrustedRecordFields(term, record.doc_id, record.text_freq, record.kind_freq);
-        expected_size = std.math.add(u64, expected_size, encoded_len) catch return error.RecordTooLarge;
-        try collectTextPostingRunSummaryFields(&summary_context, term, posting, encoded_len);
-    }
-    try flushTextPostingRunSummary(&summary_context);
-    try writer.flush();
-    try summary_writer.flush();
-
-    const stat = try file.stat(io);
-    if (stat.kind != .file or stat.size != expected_size) return error.InvalidRecord;
-    const summary_stat = try summary_file.stat(io);
-    if (summary_stat.kind != .file or summary_stat.size != summary_writer.physical_bytes) return error.InvalidRecord;
-    summary_context.summary_file_bytes = summary_writer.physical_bytes;
-    return .{
-        .term_count = summary_context.term_count,
-        .term_bytes_len = summary_context.term_bytes_len,
-        .term_exception_count = summary_context.term_exception_count,
-        .summary_file_bytes = summary_context.summary_file_bytes,
-        .posting_count = summary_context.total_postings,
-        .block_count = summary_context.total_blocks,
-        .hit_count = summary_context.total_hits,
-        .inline_singleton_materialized_terms = summary_context.inline_singleton_materialized_terms,
-        .inline_singleton_materialized_records = summary_context.inline_singleton_materialized_records,
-        .inline_singleton_materialized_bytes = summary_context.inline_singleton_materialized_bytes,
-    };
-}
-
-fn writeSortedTextPostingRunChunkWithSummary(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    path: []const u8,
-    summary_path: []const u8,
-    records: []const TextPostingRunChunkRecord,
-    term_bytes: []const u8,
-) !TextPostingRunSummaryStats {
-    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
-    defer file.close(io);
-    var summary_file = try std.Io.Dir.cwd().createFile(io, summary_path, .{ .read = true, .truncate = true });
-    defer summary_file.close(io);
-
-    var writer = try TextBufferedWriter.init(allocator, io, file, text_write_buffer_bytes);
-    defer writer.deinit();
-    var summary_writer = try TextPostingRunSummaryWriter.init(allocator, io, summary_file);
-    defer summary_writer.deinit();
-
-    var summary_context = CollectTextPostingRunSummaryContext{ .writer = &summary_writer };
-    var run_writer = TextPostingRunFrontCodedWriter{ .writer = &writer };
-    var expected_size: u64 = try run_writer.writeHeader();
-    for (records) |record| {
-        const term = try record.term(term_bytes);
-        const posting = TextPostingRecord{
-            .doc_id = record.doc_id,
-            .text_freq = record.text_freq,
-            .kind_freq = record.kind_freq,
-        };
-        const encoded_len = try run_writer.appendTrustedRecordFields(term, record.doc_id, record.text_freq, record.kind_freq);
-        expected_size = std.math.add(u64, expected_size, encoded_len) catch return error.RecordTooLarge;
-        try collectTextPostingRunSummaryFields(&summary_context, term, posting, encoded_len);
-    }
-    try flushTextPostingRunSummary(&summary_context);
-    try writer.flush();
-    try summary_writer.flush();
-
-    const stat = try file.stat(io);
-    if (stat.kind != .file or stat.size != expected_size) return error.InvalidRecord;
-    const summary_stat = try summary_file.stat(io);
-    if (summary_stat.kind != .file or summary_stat.size != summary_writer.physical_bytes) return error.InvalidRecord;
-    summary_context.summary_file_bytes = summary_writer.physical_bytes;
-    return .{
-        .term_count = summary_context.term_count,
-        .term_bytes_len = summary_context.term_bytes_len,
-        .term_exception_count = summary_context.term_exception_count,
-        .summary_file_bytes = summary_context.summary_file_bytes,
-        .posting_count = summary_context.total_postings,
-        .block_count = summary_context.total_blocks,
-        .hit_count = summary_context.total_hits,
-        .inline_singleton_materialized_terms = summary_context.inline_singleton_materialized_terms,
-        .inline_singleton_materialized_records = summary_context.inline_singleton_materialized_records,
-        .inline_singleton_materialized_bytes = summary_context.inline_singleton_materialized_bytes,
-    };
-}
-
-fn writeTextPostingRunInOrderWithSummaryMode(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    path: []const u8,
-    summary_path: []const u8,
-    records: []const TextPostingRunRecord,
-    order: []const u32,
-    mode: TextPostingRunWriteMode,
-) !TextPostingRunSummaryStats {
-    if (order.len != records.len) return error.InvalidRecord;
-    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
-    defer file.close(io);
-    var summary_file = try std.Io.Dir.cwd().createFile(io, summary_path, .{ .read = true, .truncate = true });
-    defer summary_file.close(io);
-
-    var writer = try TextBufferedWriter.init(allocator, io, file, text_write_buffer_bytes);
-    defer writer.deinit();
-    var summary_writer = try TextPostingRunSummaryWriter.init(allocator, io, summary_file);
-    defer summary_writer.deinit();
-
-    var summary_context = CollectTextPostingRunSummaryContext{ .writer = &summary_writer };
-    var run_writer = TextPostingRunFrontCodedWriter{ .writer = &writer };
-    var previous: ?TextPostingRunRecord = null;
-    var expected_size: u64 = try run_writer.writeHeader();
-    for (order) |index| {
-        if (index >= records.len) return error.InvalidRecord;
-        const record = records[index];
-        if (mode == .checked and previous != null) {
-            const prev = previous.?;
-            if (!textPostingRunRecordLessThan({}, prev, record)) return error.InvalidRecord;
-        }
-        if (mode == .checked) previous = record;
-        const encoded_len = switch (mode) {
-            .checked => try run_writer.append(record),
-            .trusted_sorted_records => try run_writer.appendTrusted(record),
-        };
-        expected_size = std.math.add(u64, expected_size, encoded_len) catch return error.RecordTooLarge;
-        const summary_mode: TextPostingRunSummaryCollectMode = switch (mode) {
-            .checked => .checked,
-            .trusted_sorted_records => .trusted_record_fields,
-        };
-        try collectTextPostingRunSummary(&summary_context, record, summary_mode, encoded_len);
-    }
-    try flushTextPostingRunSummary(&summary_context);
-    try writer.flush();
-    try summary_writer.flush();
-
-    const stat = try file.stat(io);
-    if (stat.kind != .file or stat.size != expected_size) return error.InvalidRecord;
-    const summary_stat = try summary_file.stat(io);
-    if (summary_stat.kind != .file or summary_stat.size != summary_writer.physical_bytes) return error.InvalidRecord;
-    summary_context.summary_file_bytes = summary_writer.physical_bytes;
-    return .{
-        .term_count = summary_context.term_count,
-        .term_bytes_len = summary_context.term_bytes_len,
-        .term_exception_count = summary_context.term_exception_count,
-        .summary_file_bytes = summary_context.summary_file_bytes,
-        .posting_count = summary_context.total_postings,
-        .block_count = summary_context.total_blocks,
-        .hit_count = summary_context.total_hits,
-        .inline_singleton_materialized_terms = summary_context.inline_singleton_materialized_terms,
-        .inline_singleton_materialized_records = summary_context.inline_singleton_materialized_records,
-        .inline_singleton_materialized_bytes = summary_context.inline_singleton_materialized_bytes,
-    };
-}
+const writeTextPostingRunChunkTrustedOrderWithSummary = posting_run_codec.writeTextPostingRunChunkTrustedOrderWithSummary;
+const writeSortedTextPostingRunChunkWithSummary = posting_run_codec.writeSortedTextPostingRunChunkWithSummary;
+const writeTextPostingRunInOrderWithSummaryMode = posting_run_codec.writeTextPostingRunInOrderWithSummaryMode;
 
 fn collectMergedTextPostingRuns(
     allocator: std.mem.Allocator,
@@ -9786,142 +5581,9 @@ fn collectMergedTextPostingRunsWithSynthetic(
     try forEachMergedTextPostingRunWithSynthetic(allocator, io, run_paths, synthetic_sources, doc_count, .none, &context, collectMergedTextPostingRunRecord);
     return out;
 }
-
-fn writeMergedTextPostingRunWithSummary(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    run_paths: []const []const u8,
-    path: []const u8,
-    summary_path: []const u8,
-    deadline: core.QueryDeadline,
-) !TextPostingRunSummaryStats {
-    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
-    defer file.close(io);
-    var summary_file = try std.Io.Dir.cwd().createFile(io, summary_path, .{ .read = true, .truncate = true });
-    defer summary_file.close(io);
-
-    var writer = try TextBufferedWriter.init(allocator, io, file, text_write_buffer_bytes);
-    defer writer.deinit();
-    var summary_writer = try TextPostingRunSummaryWriter.init(allocator, io, summary_file);
-    defer summary_writer.deinit();
-
-    var merger = try TextPostingRunMerger.init(allocator, io, run_paths);
-    defer merger.deinit();
-    var summary_context = CollectTextPostingRunSummaryContext{ .writer = &summary_writer };
-    var run_writer = TextPostingRunFrontCodedWriter{ .writer = &writer };
-    var previous: ?TextPostingRunRecord = null;
-    var record_count: u64 = 0;
-    var expected_size: u64 = try run_writer.writeHeader();
-
-    while (try merger.next()) |record| {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
-        if (previous) |prev| {
-            if (!textPostingRunRecordLessThan({}, prev, record)) return error.InvalidRecord;
-        }
-        previous = record;
-        const encoded_len = try run_writer.append(record);
-        expected_size = std.math.add(u64, expected_size, encoded_len) catch return error.RecordTooLarge;
-        try collectTextPostingRunSummary(&summary_context, record, .checked, encoded_len);
-        record_count = std.math.add(u64, record_count, 1) catch return error.RecordTooLarge;
-    }
-
-    try flushTextPostingRunSummary(&summary_context);
-    try writer.flush();
-    try summary_writer.flush();
-    const stat = try file.stat(io);
-    if (stat.kind != .file or stat.size != expected_size) return error.InvalidRecord;
-    const summary_stat = try summary_file.stat(io);
-    if (summary_stat.kind != .file or summary_stat.size != summary_writer.physical_bytes) return error.InvalidRecord;
-    summary_context.summary_file_bytes = summary_writer.physical_bytes;
-    return .{
-        .term_count = summary_context.term_count,
-        .term_bytes_len = summary_context.term_bytes_len,
-        .term_exception_count = summary_context.term_exception_count,
-        .summary_file_bytes = summary_context.summary_file_bytes,
-        .posting_count = summary_context.total_postings,
-        .block_count = summary_context.total_blocks,
-        .hit_count = summary_context.total_hits,
-        .top_hit_term_count = summary_context.top_hit_terms,
-        .top_hit_candidate_postings = summary_context.top_hit_candidate_postings,
-        .top_hit_side_stream_candidates = summary_context.top_hit_side_stream_candidates,
-        .top_hit_local_side_stream_candidates = summary_context.top_hit_local_side_stream_candidates,
-        .inline_singleton_materialized_terms = summary_context.inline_singleton_materialized_terms,
-        .inline_singleton_materialized_records = summary_context.inline_singleton_materialized_records,
-        .inline_singleton_materialized_bytes = summary_context.inline_singleton_materialized_bytes,
-    };
-}
-
-fn forEachMergedTextPostingRun(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    run_paths: []const []const u8,
-    deadline: core.QueryDeadline,
-    context: anytype,
-    comptime callback: fn (@TypeOf(context), TextPostingRunRecord) anyerror!void,
-) !void {
-    var merger = try TextPostingRunMerger.init(allocator, io, run_paths);
-    defer merger.deinit();
-
-    var previous: ?TextPostingRunRecord = null;
-    while (try merger.next()) |record| {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
-        if (previous) |prev| {
-            if (!textPostingRunRecordLessThan({}, prev, record)) return error.InvalidRecord;
-        }
-        previous = record;
-        try callback(context, record);
-    }
-}
-
-fn forEachMergedTextPostingRunWithSynthetic(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    run_paths: []const []const u8,
-    synthetic_sources: []const TextPostingSyntheticRunSource,
-    doc_count: u64,
-    deadline: core.QueryDeadline,
-    context: anytype,
-    comptime callback: fn (@TypeOf(context), TextPostingRunRecord) anyerror!void,
-) !void {
-    var merger = try TextPostingRunMerger.init(allocator, io, run_paths);
-    defer merger.deinit();
-    var synthetic_cursor = TextSyntheticPostingRunCursor{ .sources = synthetic_sources };
-
-    var next_run_record = try merger.next();
-    var next_synthetic_record = try synthetic_cursor.nextWithDocCount(doc_count);
-    var previous: ?TextPostingRunRecord = null;
-
-    while (next_run_record != null or next_synthetic_record != null) {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
-
-        const take_synthetic = if (next_run_record) |run_record|
-            if (next_synthetic_record) |synthetic_record|
-                textPostingRunRecordLessThan({}, synthetic_record, run_record)
-            else
-                false
-        else
-            true;
-
-        const record = if (take_synthetic) blk: {
-            const current = next_synthetic_record orelse return error.InvalidRecord;
-            next_synthetic_record = try synthetic_cursor.nextWithDocCount(doc_count);
-            break :blk current;
-        } else blk: {
-            const current = next_run_record orelse return error.InvalidRecord;
-            next_run_record = try merger.next();
-            break :blk current;
-        };
-
-        if (previous) |prev| {
-            if (!textPostingRunRecordLessThan({}, prev, record)) {
-                if (textPostingRunSameTermAndDoc(prev, record)) return error.InvalidRecord;
-                return error.InvalidRecord;
-            }
-        }
-        previous = record;
-        try callback(context, record);
-    }
-}
+const writeMergedTextPostingRunWithSummary = posting_run_codec.writeMergedTextPostingRunWithSummary;
+const forEachMergedTextPostingRun = posting_run_codec.forEachMergedTextPostingRun;
+const forEachMergedTextPostingRunWithSynthetic = posting_run_codec.forEachMergedTextPostingRunWithSynthetic;
 
 const TextPostingRunTermSummaryRecord = struct {
     term_hash: u64,
@@ -9946,7 +5608,7 @@ const TextPostingRunTermSummaryRecord = struct {
         return initWithFreqSummary(term_bytes, postings_count, constant_text_freq, constant_text_freq != 0, false);
     }
 
-    fn initWithFreqSummary(term_bytes: []const u8, postings_count: u64, constant_text_freq: u32, all_text_freqs: bool, inline_singleton: bool) !TextPostingRunTermSummaryRecord {
+    pub fn initWithFreqSummary(term_bytes: []const u8, postings_count: u64, constant_text_freq: u32, all_text_freqs: bool, inline_singleton: bool) !TextPostingRunTermSummaryRecord {
         if (term_bytes.len == 0 or term_bytes.len > default_max_token_bytes) return error.InvalidRecord;
         if (postings_count == 0 or postings_count > std.math.maxInt(u32)) return error.InvalidRecord;
         if (inline_singleton and postings_count != 1) return error.InvalidRecord;
@@ -9997,11 +5659,11 @@ const TextPostingRunTermSummaryRecord = struct {
         return record;
     }
 
-    fn packedLen(self: TextPostingRunTermSummaryRecord) u64 {
+    pub fn packedLen(self: TextPostingRunTermSummaryRecord) u64 {
         return header_len + @as(u64, self.term_len);
     }
 
-    fn encodeHeader(self: TextPostingRunTermSummaryRecord, out: *[header_len]u8) void {
+    pub fn encodeHeader(self: TextPostingRunTermSummaryRecord, out: *[header_len]u8) void {
         std.mem.writeInt(u64, out[0..8], self.term_hash, .little);
         std.mem.writeInt(u64, out[8..16], self.postings_count, .little);
         std.mem.writeInt(u64, out[16..24], self.block_count, .little);
@@ -10043,29 +5705,29 @@ const TextPostingRunTermSummaryRecord = struct {
         return record;
     }
 
-    fn term(self: *const TextPostingRunTermSummaryRecord) []const u8 {
+    pub fn term(self: *const TextPostingRunTermSummaryRecord) []const u8 {
         return self.term_bytes[0..self.term_len];
     }
 
-    fn constantTextFreq(self: TextPostingRunTermSummaryRecord) u16 {
+    pub fn constantTextFreq(self: TextPostingRunTermSummaryRecord) u16 {
         return if ((self.flags & constant_text_freq_flag) != 0) self.constant_text_freq else 0;
     }
 
-    fn allTextFreqs(self: TextPostingRunTermSummaryRecord) bool {
+    pub fn allTextFreqs(self: TextPostingRunTermSummaryRecord) bool {
         return (self.flags & all_text_freqs_flag) != 0;
     }
 
-    fn inlineSingleton(self: TextPostingRunTermSummaryRecord) bool {
+    pub fn inlineSingleton(self: TextPostingRunTermSummaryRecord) bool {
         return (self.flags & inline_singleton_flag) != 0;
     }
 
-    fn virtualAllDocsTextFreq(self: TextPostingRunTermSummaryRecord, doc_count: u64) ?u32 {
+    pub fn virtualAllDocsTextFreq(self: TextPostingRunTermSummaryRecord, doc_count: u64) ?u32 {
         const text_freq = self.constantTextFreq();
         if (!canVirtualizeAllDocsConstantTextFreqTerm(self.postings_count, doc_count, text_freq)) return null;
         return text_freq;
     }
 
-    fn denseAllDocsFreqStream(self: TextPostingRunTermSummaryRecord, doc_count: u64) bool {
+    pub fn denseAllDocsFreqStream(self: TextPostingRunTermSummaryRecord, doc_count: u64) bool {
         return canUseDenseAllDocsFreqStream(self.postings_count, doc_count, self.allTextFreqs(), self.constantTextFreq());
     }
 };
@@ -10144,53 +5806,8 @@ fn collectTextPostingRunSummaryFields(context: *CollectTextPostingRunSummaryCont
 fn collectTextPostingRunSummaryChecked(context: *CollectTextPostingRunSummaryContext, record: TextPostingRunRecord) !void {
     try collectTextPostingRunSummary(context, record, .checked, 0);
 }
-
-fn appendTextPostingRunSummaryRecord(context: *CollectTextPostingRunSummaryContext, record: TextPostingRunTermSummaryRecord) !void {
-    var header: [TextPostingRunTermSummaryRecord.header_len]u8 = undefined;
-    record.encodeHeader(&header);
-    try context.writer.append(&header);
-    try context.writer.append(record.term());
-    const previous_term: ?[]const u8 = if (context.have_previous_flushed_term)
-        context.previous_flushed_term[0..context.previous_flushed_term_len]
-    else
-        null;
-    const encoded_term_len = try persistentTermFrontCodedLen(context.term_count, previous_term, record.term());
-    context.term_count = std.math.add(u64, context.term_count, 1) catch return error.RecordTooLarge;
-    context.term_bytes_len = std.math.add(u64, context.term_bytes_len, encoded_term_len) catch return error.RecordTooLarge;
-    context.summary_file_bytes = std.math.add(u64, context.summary_file_bytes, record.packedLen()) catch return error.RecordTooLarge;
-    context.total_postings = std.math.add(u64, context.total_postings, record.postings_count) catch return error.RecordTooLarge;
-    if (!record.inlineSingleton()) {
-        context.term_exception_count = std.math.add(u64, context.term_exception_count, 1) catch return error.RecordTooLarge;
-    }
-    context.total_blocks = std.math.add(u64, context.total_blocks, record.block_count) catch return error.RecordTooLarge;
-    context.total_hits = std.math.add(u64, context.total_hits, record.top_hit_count) catch return error.RecordTooLarge;
-    context.top_hit_side_stream_candidates = std.math.add(u64, context.top_hit_side_stream_candidates, @min(record.postings_count, persistent_term_top_hit_capacity)) catch return error.RecordTooLarge;
-    context.top_hit_local_side_stream_candidates = std.math.add(u64, context.top_hit_local_side_stream_candidates, record.top_hit_count) catch return error.RecordTooLarge;
-    if (record.top_hit_count != 0) {
-        context.top_hit_terms = std.math.add(u64, context.top_hit_terms, 1) catch return error.RecordTooLarge;
-        context.top_hit_candidate_postings = std.math.add(u64, context.top_hit_candidate_postings, record.postings_count) catch return error.RecordTooLarge;
-    }
-    if (record.inlineSingleton()) {
-        context.inline_singleton_materialized_terms = std.math.add(u64, context.inline_singleton_materialized_terms, 1) catch return error.RecordTooLarge;
-        context.inline_singleton_materialized_records = std.math.add(u64, context.inline_singleton_materialized_records, record.postings_count) catch return error.RecordTooLarge;
-        context.inline_singleton_materialized_bytes = std.math.add(u64, context.inline_singleton_materialized_bytes, context.current_term_materialized_bytes) catch return error.RecordTooLarge;
-    }
-    @memcpy(context.previous_flushed_term[0..record.term().len], record.term());
-    context.previous_flushed_term_len = record.term().len;
-    context.have_previous_flushed_term = true;
-}
-
-fn flushTextPostingRunSummary(context: *CollectTextPostingRunSummaryContext) !void {
-    if (context.current_term_len == 0) return;
-    const record = try TextPostingRunTermSummaryRecord.initWithFreqSummary(context.current_term[0..context.current_term_len], context.postings_count, context.constant_text_freq, context.all_text_freqs, context.inline_singleton);
-    try appendTextPostingRunSummaryRecord(context, record);
-    context.current_term_len = 0;
-    context.postings_count = 0;
-    context.constant_text_freq = 0;
-    context.inline_singleton = false;
-    context.current_term_materialized_bytes = 0;
-    context.all_text_freqs = false;
-}
+const appendTextPostingRunSummaryRecord = posting_run_codec.appendTextPostingRunSummaryRecord;
+const flushTextPostingRunSummary = posting_run_codec.flushTextPostingRunSummary;
 
 const TextPostingRunSummaryStats = struct {
     term_count: u64 = 0,
@@ -10216,43 +5833,7 @@ const TextPostingRunSummaryStats = struct {
     previous_term_len: usize = 0,
     have_previous_term: bool = false,
 };
-
-fn collectTextPostingRunTermSummariesToFile(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    run_paths: []const []const u8,
-    summary_path: []const u8,
-    deadline: core.QueryDeadline,
-) !TextPostingRunSummaryStats {
-    var file = try std.Io.Dir.cwd().createFile(io, summary_path, .{ .read = true, .truncate = true });
-    defer file.close(io);
-    var writer = try TextPostingRunSummaryWriter.init(allocator, io, file);
-    defer writer.deinit();
-    var context = CollectTextPostingRunSummaryContext{ .writer = &writer };
-    try forEachMergedTextPostingRun(allocator, io, run_paths, deadline, &context, collectTextPostingRunSummaryChecked);
-    try flushTextPostingRunSummary(&context);
-    try writer.flush();
-    const stat = try file.stat(io);
-    if (stat.kind != .file) return error.InvalidRecord;
-    if (stat.size != writer.physical_bytes) return error.InvalidRecord;
-    context.summary_file_bytes = writer.physical_bytes;
-    return .{
-        .term_count = context.term_count,
-        .term_bytes_len = context.term_bytes_len,
-        .term_exception_count = context.term_exception_count,
-        .summary_file_bytes = context.summary_file_bytes,
-        .posting_count = context.total_postings,
-        .block_count = context.total_blocks,
-        .hit_count = context.total_hits,
-        .top_hit_term_count = context.top_hit_terms,
-        .top_hit_candidate_postings = context.top_hit_candidate_postings,
-        .top_hit_side_stream_candidates = context.top_hit_side_stream_candidates,
-        .top_hit_local_side_stream_candidates = context.top_hit_local_side_stream_candidates,
-        .inline_singleton_materialized_terms = context.inline_singleton_materialized_terms,
-        .inline_singleton_materialized_records = context.inline_singleton_materialized_records,
-        .inline_singleton_materialized_bytes = context.inline_singleton_materialized_bytes,
-    };
-}
+const collectTextPostingRunTermSummariesToFile = posting_run_codec.collectTextPostingRunTermSummariesToFile;
 
 const TextPostingRunSummaryReader = struct {
     allocator: std.mem.Allocator,
@@ -10404,7 +5985,7 @@ const TextPostingRunSummaryMerger = struct {
     current_records: std.ArrayList(TextPostingRunTermSummaryRecord),
     queue: std.PriorityQueue(usize, []const TextPostingRunTermSummaryRecord, compareTextPostingRunSummaryReaderIndex),
 
-    fn init(allocator: std.mem.Allocator, io: std.Io, summary_files: []const TextPostingRunSummaryFile) !TextPostingRunSummaryMerger {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, summary_files: []const TextPostingRunSummaryFile) !TextPostingRunSummaryMerger {
         var scratch = try TextPostingRunSummaryReadScratch.init(allocator);
         errdefer scratch.deinit();
         var readers = std.ArrayList(TextPostingRunSummaryReader).empty;
@@ -10442,7 +6023,7 @@ const TextPostingRunSummaryMerger = struct {
         };
     }
 
-    fn deinit(self: *TextPostingRunSummaryMerger) void {
+    pub fn deinit(self: *TextPostingRunSummaryMerger) void {
         self.queue.deinit(self.allocator);
         self.current_records.deinit(self.allocator);
         for (self.readers.items) |*reader| reader.deinit();
@@ -10471,7 +6052,7 @@ const TextPostingRunSummaryMerger = struct {
         self.queue.items[index] = target;
     }
 
-    fn next(self: *TextPostingRunSummaryMerger) !?TextPostingRunTermSummaryRecord {
+    pub fn next(self: *TextPostingRunSummaryMerger) !?TextPostingRunTermSummaryRecord {
         const reader_index = self.queue.peek() orelse return null;
         const record = self.current_records.items[reader_index];
         const reader = &self.readers.items[reader_index];
@@ -10485,129 +6066,25 @@ const TextPostingRunSummaryMerger = struct {
         return record;
     }
 };
-
-fn appendMergedTextPostingRunSummaryToFile(
-    context: *CollectTextPostingRunSummaryContext,
-    final_stats: ?*TextPostingRunSummaryStats,
-    final_doc_count: ?u64,
-    term: []const u8,
-    postings_count: u64,
-    constant_text_freq: u32,
-    all_text_freqs: bool,
-    inline_singleton: bool,
-) !void {
-    const record = try TextPostingRunTermSummaryRecord.initWithFreqSummary(term, postings_count, constant_text_freq, all_text_freqs, inline_singleton);
-    try appendTextPostingRunSummaryRecord(context, record);
-    if (final_stats) |stats| {
-        const doc_count = final_doc_count orelse return error.InvalidRecord;
-        try addMergedTextPostingRunSummaryStats(stats, term, postings_count, constant_text_freq, all_text_freqs, inline_singleton, doc_count);
-    }
-}
-
-fn collectTextPostingRunTermSummariesFromFilesToFile(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    summary_files: []const TextPostingRunSummaryFile,
-    summary_path: []const u8,
-    final_doc_count: ?u64,
-    final_stats_out: ?*TextPostingRunSummaryStats,
-    deadline: core.QueryDeadline,
-) !TextPostingRunSummaryStats {
-    if (final_stats_out != null and final_doc_count == null) return error.InvalidRecord;
-    var file = try std.Io.Dir.cwd().createFile(io, summary_path, .{ .read = true, .truncate = true });
-    defer file.close(io);
-    var writer = try TextPostingRunSummaryWriter.init(allocator, io, file);
-    defer writer.deinit();
-    var context = CollectTextPostingRunSummaryContext{ .writer = &writer };
-    var merger = try TextPostingRunSummaryMerger.init(allocator, io, summary_files);
-    defer merger.deinit();
-
-    var previous: ?TextPostingRunTermSummaryRecord = null;
-    var side_stream_candidates: u64 = 0;
-    var local_side_stream_candidates: u64 = 0;
-    var final_stats = TextPostingRunSummaryStats{};
-    const maybe_final_stats: ?*TextPostingRunSummaryStats = if (final_doc_count != null) &final_stats else null;
-    var current_term: [default_max_token_bytes]u8 = [_]u8{0} ** default_max_token_bytes;
-    var current_term_len: usize = 0;
-    var postings_count: u64 = 0;
-    var constant_text_freq: u32 = 0;
-    var all_text_freqs = false;
-    var inline_singleton = false;
-    while (try merger.next()) |summary| {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
-        if (previous) |prev| {
-            if (!textPostingRunSummaryLessThan({}, prev, summary) and !textPostingRunSummarySameTerm(prev, summary)) return error.InvalidRecord;
-        }
-        previous = summary;
-        side_stream_candidates = std.math.add(u64, side_stream_candidates, @min(summary.postings_count, persistent_term_top_hit_capacity)) catch return error.RecordTooLarge;
-        local_side_stream_candidates = std.math.add(u64, local_side_stream_candidates, summary.top_hit_count) catch return error.RecordTooLarge;
-        if (current_term_len != 0) {
-            if (current_term_len == summary.term().len and std.mem.eql(u8, current_term[0..current_term_len], summary.term())) {
-                postings_count = std.math.add(u64, postings_count, summary.postings_count) catch return error.RecordTooLarge;
-                if (constant_text_freq != 0 and summary.constantTextFreq() != constant_text_freq) {
-                    constant_text_freq = 0;
-                }
-                all_text_freqs = all_text_freqs and summary.allTextFreqs();
-                inline_singleton = false;
-                continue;
-            }
-            try appendMergedTextPostingRunSummaryToFile(&context, maybe_final_stats, final_doc_count, current_term[0..current_term_len], postings_count, constant_text_freq, all_text_freqs, inline_singleton);
-        }
-
-        @memcpy(current_term[0..summary.term().len], summary.term());
-        current_term_len = summary.term().len;
-        postings_count = summary.postings_count;
-        constant_text_freq = summary.constantTextFreq();
-        all_text_freqs = summary.allTextFreqs();
-        inline_singleton = summary.inlineSingleton();
-    }
-    if (current_term_len != 0) {
-        try appendMergedTextPostingRunSummaryToFile(&context, maybe_final_stats, final_doc_count, current_term[0..current_term_len], postings_count, constant_text_freq, all_text_freqs, inline_singleton);
-    }
-    try writer.flush();
-    const stat = try file.stat(io);
-    if (stat.kind != .file) return error.InvalidRecord;
-    if (stat.size != writer.physical_bytes) return error.InvalidRecord;
-    context.summary_file_bytes = writer.physical_bytes;
-    if (final_doc_count) |doc_count| {
-        _ = doc_count;
-        final_stats.top_hit_side_stream_candidates = side_stream_candidates;
-        final_stats.top_hit_local_side_stream_candidates = local_side_stream_candidates;
-        if (final_stats.term_count != context.term_count) return error.InvalidRecord;
-        if (final_stats_out) |out| out.* = final_stats;
-    }
-    return .{
-        .term_count = context.term_count,
-        .term_bytes_len = context.term_bytes_len,
-        .term_exception_count = context.term_exception_count,
-        .summary_file_bytes = context.summary_file_bytes,
-        .posting_count = context.total_postings,
-        .block_count = context.total_blocks,
-        .hit_count = context.total_hits,
-        .top_hit_term_count = context.top_hit_terms,
-        .top_hit_candidate_postings = context.top_hit_candidate_postings,
-        .top_hit_side_stream_candidates = side_stream_candidates,
-        .top_hit_local_side_stream_candidates = local_side_stream_candidates,
-    };
-}
+const collectTextPostingRunTermSummariesFromFilesToFile = posting_run_codec.collectTextPostingRunTermSummariesFromFilesToFile;
 
 const TextPostingRunMergedSummaryReader = struct {
     merger: TextPostingRunSummaryMerger,
     pending: ?TextPostingRunTermSummaryRecord = null,
     doc_count: u64,
 
-    fn init(allocator: std.mem.Allocator, io: std.Io, summary_files: []const TextPostingRunSummaryFile, doc_count: u64) !TextPostingRunMergedSummaryReader {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, summary_files: []const TextPostingRunSummaryFile, doc_count: u64) !TextPostingRunMergedSummaryReader {
         return .{
             .merger = try TextPostingRunSummaryMerger.init(allocator, io, summary_files),
             .doc_count = doc_count,
         };
     }
 
-    fn deinit(self: *TextPostingRunMergedSummaryReader) void {
+    pub fn deinit(self: *TextPostingRunMergedSummaryReader) void {
         self.merger.deinit();
     }
 
-    fn nextRecord(self: *TextPostingRunMergedSummaryReader) !?TextPostingRunTermSummaryRecord {
+    pub fn nextRecord(self: *TextPostingRunMergedSummaryReader) !?TextPostingRunTermSummaryRecord {
         const first = if (self.pending) |pending| pending else (try self.merger.next()) orelse return null;
         self.pending = null;
         var postings_count = first.postings_count;
@@ -10631,112 +6108,60 @@ const TextPostingRunMergedSummaryReader = struct {
         return try TextPostingRunTermSummaryRecord.initMergedFromTrustedFirst(first, postings_count, constant_text_freq, all_text_freqs, self.doc_count);
     }
 };
+const addMergedTextPostingRunSummaryStats = posting_run_codec.addMergedTextPostingRunSummaryStats;
+const collectTextPostingRunTermSummaryStatsFromFiles = posting_run_codec.collectTextPostingRunTermSummaryStatsFromFiles;
 
-fn addMergedTextPostingRunSummaryStats(stats: *TextPostingRunSummaryStats, term: []const u8, postings_count: u64, constant_text_freq: u32, all_text_freqs: bool, inline_singleton: bool, doc_count: u64) !void {
-    if (term.len == 0 or term.len > default_max_token_bytes) return error.InvalidRecord;
-    if (postings_count == 0 or postings_count > std.math.maxInt(u32)) return error.InvalidRecord;
-    if (inline_singleton and postings_count != 1) return error.InvalidRecord;
-    if (constant_text_freq > persistent_posting_max_field_freq) return error.RecordTooLarge;
-    if (constant_text_freq != 0 and !all_text_freqs) return error.InvalidRecord;
-
-    const previous_term: ?[]const u8 = if (stats.have_previous_term)
-        stats.previous_term[0..stats.previous_term_len]
-    else
-        null;
-    const encoded_term_len = try persistentTermFrontCodedLen(stats.term_count, previous_term, term);
-    const virtual_all_docs = canVirtualizeAllDocsConstantTextFreqTerm(postings_count, doc_count, constant_text_freq);
-    const dense_all_docs_freq_stream = canUseDenseAllDocsFreqStream(postings_count, doc_count, all_text_freqs, constant_text_freq);
-    const block_count: u64 = if (virtual_all_docs or dense_all_docs_freq_stream)
-        0
-    else
-        try publishedPostingBlockCount(@intCast(postings_count), persistent_posting_block_size);
-    const top_hit_count = persistentTermTopHitCountForPostingCount(postings_count);
-
-    stats.term_count = std.math.add(u64, stats.term_count, 1) catch return error.RecordTooLarge;
-    stats.term_bytes_len = std.math.add(u64, stats.term_bytes_len, encoded_term_len) catch return error.RecordTooLarge;
-    stats.summary_file_bytes = std.math.add(u64, stats.summary_file_bytes, TextPostingRunTermSummaryRecord.header_len + @as(u64, term.len)) catch return error.RecordTooLarge;
-    stats.posting_count = std.math.add(u64, stats.posting_count, postings_count) catch return error.RecordTooLarge;
-    if (!inline_singleton) {
-        stats.term_exception_count = std.math.add(u64, stats.term_exception_count, 1) catch return error.RecordTooLarge;
-    }
-    stats.block_count = std.math.add(u64, stats.block_count, block_count) catch return error.RecordTooLarge;
-    stats.hit_count = std.math.add(u64, stats.hit_count, top_hit_count) catch return error.RecordTooLarge;
-    if (top_hit_count != 0) {
-        stats.top_hit_term_count = std.math.add(u64, stats.top_hit_term_count, 1) catch return error.RecordTooLarge;
-        stats.top_hit_candidate_postings = std.math.add(u64, stats.top_hit_candidate_postings, postings_count) catch return error.RecordTooLarge;
-    }
-    if (top_hit_count != 0 and !virtual_all_docs and !dense_all_docs_freq_stream and constant_text_freq != 0) {
-        stats.regular_constant_top_hit_term_count = std.math.add(u64, stats.regular_constant_top_hit_term_count, 1) catch return error.RecordTooLarge;
-    }
-    if (virtual_all_docs) {
-        stats.virtual_all_docs_term_count = std.math.add(u64, stats.virtual_all_docs_term_count, 1) catch return error.RecordTooLarge;
-        stats.virtual_all_docs_candidate_records = std.math.add(u64, stats.virtual_all_docs_candidate_records, postings_count) catch return error.RecordTooLarge;
-    } else if (dense_all_docs_freq_stream) {
-        stats.dense_all_docs_freq_stream_term_count = std.math.add(u64, stats.dense_all_docs_freq_stream_term_count, 1) catch return error.RecordTooLarge;
-        stats.dense_all_docs_freq_stream_candidate_records = std.math.add(u64, stats.dense_all_docs_freq_stream_candidate_records, postings_count) catch return error.RecordTooLarge;
-    }
-    @memcpy(stats.previous_term[0..term.len], term);
-    stats.previous_term_len = term.len;
-    stats.have_previous_term = true;
-}
-
-fn collectTextPostingRunTermSummaryStatsFromFiles(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    summary_files: []const TextPostingRunSummaryFile,
-    doc_count: u64,
-    deadline: core.QueryDeadline,
-) !TextPostingRunSummaryStats {
-    if (deadline.expired()) return core.Error.BudgetExceeded;
-    if (summary_files.len == 1) {
-        if (summary_files[0].final_stats) |stats| {
-            if (stats.term_count != summary_files[0].term_count) return error.InvalidRecord;
-            return stats;
-        }
-    }
-    var merger = try TextPostingRunSummaryMerger.init(allocator, io, summary_files);
-    defer merger.deinit();
-    var stats = TextPostingRunSummaryStats{};
-    var current_term: [default_max_token_bytes]u8 = [_]u8{0} ** default_max_token_bytes;
-    var current_term_len: usize = 0;
-    var postings_count: u64 = 0;
-    var constant_text_freq: u32 = 0;
-    var all_text_freqs = false;
-    var inline_singleton = false;
-    var previous: ?TextPostingRunTermSummaryRecord = null;
-    while (try merger.next()) |summary| {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
-        if (previous) |prev| {
-            if (!textPostingRunSummaryLessThan({}, prev, summary) and !textPostingRunSummarySameTerm(prev, summary)) return error.InvalidRecord;
-        }
-        previous = summary;
-        stats.top_hit_side_stream_candidates = std.math.add(u64, stats.top_hit_side_stream_candidates, @min(summary.postings_count, persistent_term_top_hit_capacity)) catch return error.RecordTooLarge;
-        stats.top_hit_local_side_stream_candidates = std.math.add(u64, stats.top_hit_local_side_stream_candidates, summary.top_hit_count) catch return error.RecordTooLarge;
-
-        if (current_term_len != 0) {
-            if (current_term_len == summary.term().len and std.mem.eql(u8, current_term[0..current_term_len], summary.term())) {
-                postings_count = std.math.add(u64, postings_count, summary.postings_count) catch return error.RecordTooLarge;
-                if (constant_text_freq != 0 and summary.constantTextFreq() != constant_text_freq) {
-                    constant_text_freq = 0;
-                }
-                all_text_freqs = all_text_freqs and summary.allTextFreqs();
-                inline_singleton = false;
-                continue;
-            }
-            try addMergedTextPostingRunSummaryStats(&stats, current_term[0..current_term_len], postings_count, constant_text_freq, all_text_freqs, inline_singleton, doc_count);
-        }
-
-        @memcpy(current_term[0..summary.term().len], summary.term());
-        current_term_len = summary.term().len;
-        postings_count = summary.postings_count;
-        constant_text_freq = summary.constantTextFreq();
-        all_text_freqs = summary.allTextFreqs();
-        inline_singleton = summary.inlineSingleton();
-    }
-    if (current_term_len != 0) {
-        try addMergedTextPostingRunSummaryStats(&stats, current_term[0..current_term_len], postings_count, constant_text_freq, all_text_freqs, inline_singleton, doc_count);
-    }
-    return stats;
+const PostingRunCodecMergeOps = struct {
+    pub const std = @import("std");
+    pub const core_dep = core;
+    pub const default_max_token_bytes_dep = default_max_token_bytes;
+    pub const text_posting_run_front_coded_prefix_tag_base_dep = text_posting_run_front_coded_prefix_tag_base;
+    pub const text_write_buffer_bytes_dep = text_write_buffer_bytes;
+    pub const persistent_term_top_hit_capacity_dep = persistent_term_top_hit_capacity;
+    pub const persistent_posting_max_field_freq_dep = persistent_posting_max_field_freq;
+    pub const persistent_posting_block_size_dep = persistent_posting_block_size;
+    pub const TextPostingRecord_dep = TextPostingRecord;
+    pub const TextPostingRunRecord_dep = TextPostingRunRecord;
+    pub const TextPostingRunChunkRecord_dep = TextPostingRunChunkRecord;
+    pub const TextPostingRunReader_dep = TextPostingRunReader;
+    pub const DecodedFrontCodedTextPosting_dep = TextPostingRunReader.DecodedFrontCodedTextPosting;
+    pub const DecodedRunTextPostingFields_dep = TextPostingRunReader.DecodedRunTextPostingFields;
+    pub const TextBufferedWriter_dep = TextBufferedWriter;
+    pub const TextPostingRunSummaryWriter_dep = TextPostingRunSummaryWriter;
+    pub const CollectTextPostingRunSummaryContext_dep = CollectTextPostingRunSummaryContext;
+    pub const TextPostingRunFrontCodedWriter_dep = TextPostingRunFrontCodedWriter;
+    pub const TextPostingRunWriteMode_dep = TextPostingRunWriteMode;
+    pub const TextPostingRunSummaryCollectMode_dep = TextPostingRunSummaryCollectMode;
+    pub const TextPostingRunSummaryStats_dep = TextPostingRunSummaryStats;
+    pub const TextPostingRunMerger_dep = TextPostingRunMerger;
+    pub const TextPostingSyntheticRunSource_dep = TextPostingSyntheticRunSource;
+    pub const TextSyntheticPostingRunCursor_dep = TextSyntheticPostingRunCursor;
+    pub const TextPostingRunTermSummaryRecord_dep = TextPostingRunTermSummaryRecord;
+    pub const TextPostingRunSummaryFile_dep = TextPostingRunSummaryFile;
+    pub const TextPostingRunSummaryMerger_dep = TextPostingRunSummaryMerger;
+    pub const readerReadByte_dep = TextPostingRunReader.readByte;
+    pub const readerReadBytes_dep = TextPostingRunReader.readBytes;
+    pub const readerMinEncodedPostingBytes_dep = TextPostingRunReader.minEncodedPostingBytes;
+    pub const readerReadTextPostingFields_dep = TextPostingRunReader.readTextPostingFields;
+    pub const readerReadDeltaTextPostingFields_dep = TextPostingRunReader.readDeltaTextPostingFields;
+    pub const termSortPrefixKey_dep = termSortPrefixKey;
+    pub const validateTextPostingFields_dep = validateTextPostingFields;
+    pub const collectTextPostingRunSummaryFields_dep = collectTextPostingRunSummaryFields;
+    pub const collectTextPostingRunSummary_dep = collectTextPostingRunSummary;
+    pub const collectTextPostingRunSummaryChecked_dep = collectTextPostingRunSummaryChecked;
+    pub const textPostingRunRecordLessThan_dep = textPostingRunRecordLessThan;
+    pub const textPostingRunSameTermAndDoc_dep = textPostingRunSameTermAndDoc;
+    pub const persistentTermFrontCodedLen_dep = persistentTermFrontCodedLen;
+    pub const textPostingRunSummaryLessThan_dep = textPostingRunSummaryLessThan;
+    pub const textPostingRunSummarySameTerm_dep = textPostingRunSummarySameTerm;
+    pub const canVirtualizeAllDocsConstantTextFreqTerm_dep = canVirtualizeAllDocsConstantTextFreqTerm;
+    pub const canUseDenseAllDocsFreqStream_dep = canUseDenseAllDocsFreqStream;
+    pub const publishedPostingBlockCount_dep = publishedPostingBlockCount;
+    pub const persistentTermTopHitCountForPostingCount_dep = persistentTermTopHitCountForPostingCount;
+};
+const posting_run_codec = posting_run_codec_merge_mod.PostingRunCodecMerge(PostingRunCodecMergeOps);
+test {
+    _ = posting_run_codec;
 }
 
 test "text write buffer capacity is bounded by file size and cap" {
@@ -11216,41 +6641,6 @@ test "text posting run builder writes and cleans temporary runs" {
 
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, run_path_copy, .{}));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, summary_path_copy, .{}));
-}
-
-test "text posting run scratch cleanup removes only current base files" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
-    const base_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg.text_posting_runs" });
-    defer std.testing.allocator.free(base_path);
-
-    const stale_run = try std.fmt.allocPrint(std.testing.allocator, "{s}.posting_run.0.tmp", .{base_path});
-    defer std.testing.allocator.free(stale_run);
-    const stale_summary = try std.fmt.allocPrint(std.testing.allocator, "{s}.posting_run.final.summary.tmp", .{base_path});
-    defer std.testing.allocator.free(stale_summary);
-    const stale_virtual = try std.fmt.allocPrint(std.testing.allocator, "{s}.virtual_all_docs.summary.tmp", .{base_path});
-    defer std.testing.allocator.free(stale_virtual);
-    const unrelated = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "other.text_posting_runs.posting_run.0.tmp" });
-    defer std.testing.allocator.free(unrelated);
-    const same_base_non_tmp = try std.fmt.allocPrint(std.testing.allocator, "{s}.posting_run.1.dat", .{base_path});
-    defer std.testing.allocator.free(same_base_non_tmp);
-
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = stale_run, .data = "run", .flags = .{ .truncate = true } });
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = stale_summary, .data = "summary", .flags = .{ .truncate = true } });
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = stale_virtual, .data = "virtual", .flags = .{ .truncate = true } });
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = unrelated, .data = "other", .flags = .{ .truncate = true } });
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = same_base_non_tmp, .data = "keep", .flags = .{ .truncate = true } });
-
-    try cleanupTextPostingRunScratchFiles(std.testing.allocator, std.testing.io, base_path);
-
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, stale_run, .{}));
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, stale_summary, .{}));
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, stale_virtual, .{}));
-    try std.Io.Dir.cwd().access(std.testing.io, unrelated, .{});
-    try std.Io.Dir.cwd().access(std.testing.io, same_base_non_tmp, .{});
 }
 
 test "text posting run builder scratch allocation is exact compact chunk" {
@@ -12474,14 +7864,14 @@ const TextRebuildTextFreqCache = struct {
     term_bytes: usize = 0,
     disabled: bool = false,
 
-    fn init(allocator: std.mem.Allocator) TextRebuildTextFreqCache {
+    pub fn init(allocator: std.mem.Allocator) TextRebuildTextFreqCache {
         return .{
             .allocator = allocator,
             .by_hash = std.AutoHashMap(u64, usize).init(allocator),
         };
     }
 
-    fn deinit(self: *TextRebuildTextFreqCache) void {
+    pub fn deinit(self: *TextRebuildTextFreqCache) void {
         for (self.entries.items) |*entry| entry.deinit(self.allocator);
         self.entries.deinit(self.allocator);
         self.by_hash.deinit();
@@ -12502,7 +7892,7 @@ const TextRebuildTextFreqCache = struct {
         return std.hash.Wyhash.hash(text.len, text);
     }
 
-    fn lookup(self: *TextRebuildTextFreqCache, text: []const u8) ?*CachedRebuildTextFreqs {
+    pub fn lookup(self: *TextRebuildTextFreqCache, text: []const u8) ?*CachedRebuildTextFreqs {
         if (self.disabled) return null;
         const text_hash = hashText(text);
         const index = self.by_hash.get(text_hash) orelse return null;
@@ -12511,7 +7901,7 @@ const TextRebuildTextFreqCache = struct {
         return entry;
     }
 
-    fn populateFreqs(
+    pub fn populateFreqs(
         self: *TextRebuildTextFreqCache,
         freqs: *std.StringHashMap(FieldTermFreq),
         cached: *const CachedRebuildTextFreqs,
@@ -12523,7 +7913,7 @@ const TextRebuildTextFreqCache = struct {
         }
     }
 
-    fn store(
+    pub fn store(
         self: *TextRebuildTextFreqCache,
         text: []const u8,
         text_tokens: u64,
@@ -12601,2901 +7991,6 @@ const TextRebuildTextFreqCache = struct {
         return &self.entries.items[index];
     }
 };
-
-fn appendRunTextDocFromNode(
-    term_allocator: std.mem.Allocator,
-    scratch_allocator: std.mem.Allocator,
-    writer: *TextBufferedWriter,
-    record_bytes: *[TextDocRecord.encoded_len]u8,
-    docs_header: TextDocsHeader,
-    overflow_records: *std.ArrayList(TextDocNodeIdOverflowRecord),
-    freqs: *std.StringHashMap(FieldTermFreq),
-    term_arena: *std.heap.ArenaAllocator,
-    tokenizer_scratch: *std.ArrayList(u8),
-    text_freq_cache: *TextRebuildTextFreqCache,
-    run_builder: *TextPostingRunBuilder,
-    text_meta: *PersistentTextMeta,
-    timings: ?*PersistentTextRebuildTimings,
-    node_id: core.NodeId,
-    kind: core.NodeKind,
-    text: []const u8,
-    metadata: SearchableNodeMetadata,
-) !void {
-    clearReusableArenaTermFreqs(freqs, term_arena);
-
-    if (timings) |t| {
-        t.docs_node_count = std.math.add(u64, t.docs_node_count, 1) catch return error.RecordTooLarge;
-        t.docs_text_bytes = std.math.add(u64, t.docs_text_bytes, try searchableNodeTextBytes(text, metadata)) catch return error.RecordTooLarge;
-    }
-    const doc_id = try nextPersistentTextDocId(text_meta.doc_count);
-    const tokenize_start = if (timings != null) textMonotonicNs(run_builder.io) else 0;
-    const can_use_text_freq_cache = metadata.name == null and metadata.summary == null;
-    const text_tokens = if (can_use_text_freq_cache) tokens: {
-        if (timings) |t| t.docs_freq_cache_lookup_count += 1;
-        if (text_freq_cache.lookup(text)) |cached| {
-            try text_freq_cache.populateFreqs(freqs, cached);
-            if (timings) |t| t.docs_freq_cache_hit_count += 1;
-            break :tokens cached.text_tokens;
-        }
-        if (timings) |t| t.docs_freq_cache_miss_count += 1;
-        const collected = try collectStreamingSearchableNodeTermFreqs(term_allocator, scratch_allocator, freqs, null, text, metadata, tokenizer_scratch);
-        if (text_freq_cache.disabled) break :tokens collected;
-        _ = text_freq_cache.store(text, collected, freqs) catch |err| switch (err) {
-            error.RecordTooLarge, error.InvalidRecord => if (text_freq_cache.disabled)
-                null
-            else
-                return err,
-            else => |e| return e,
-        };
-        break :tokens collected;
-    } else try collectStreamingSearchableNodeTermFreqs(term_allocator, scratch_allocator, freqs, null, text, metadata, tokenizer_scratch);
-    if (timings) |t| {
-        t.docs_tokenize_ns += textElapsedNs(run_builder.io, tokenize_start);
-        t.docs_token_count = std.math.add(u64, t.docs_token_count, text_tokens) catch return error.RecordTooLarge;
-    }
-    if (text_tokens > persistent_doc_max_field_tokens) return error.RecordTooLarge;
-
-    text_meta.total_text_tokens = std.math.add(u64, text_meta.total_text_tokens, text_tokens) catch return error.RecordTooLarge;
-    const record = TextDocRecord{
-        .doc_id = doc_id,
-        .node_id = node_id.toInt(),
-        .kind = @intFromEnum(kind),
-        .text_tokens = @intCast(text_tokens),
-    };
-    const append_start = if (timings != null) textMonotonicNs(run_builder.io) else 0;
-    try run_builder.appendDocumentFreqs(doc_id, freqs);
-    if (timings) |t| t.docs_posting_append_ns += textElapsedNs(run_builder.io, append_start);
-    const write_start = if (timings != null) textMonotonicNs(run_builder.io) else 0;
-    try record.encodeForHeader(docs_header, record_bytes[0..docs_header.recordLen()]);
-    try writer.append(record_bytes[0..docs_header.recordLen()]);
-    if (record.needsNodeIdOverflow()) {
-        try overflow_records.append(scratch_allocator, try TextDocNodeIdOverflowRecord.init(record));
-    }
-    if (timings) |t| t.docs_write_ns += textElapsedNs(run_builder.io, write_start);
-    text_meta.doc_count = doc_id;
-}
-
-fn appendBuilderTextDocFromNode(
-    allocator: std.mem.Allocator,
-    writer: *TextBufferedWriter,
-    record_bytes: *[TextDocRecord.encoded_len]u8,
-    docs_header: TextDocsHeader,
-    overflow_records: *std.ArrayList(TextDocNodeIdOverflowRecord),
-    freqs: *std.StringHashMap(FieldTermFreq),
-    owned: *std.ArrayList([]u8),
-    term_builder: *PersistentTermBuilder,
-    text_meta: *PersistentTextMeta,
-    timings: ?*PersistentTextRebuildTimings,
-    io: std.Io,
-    node_id: core.NodeId,
-    kind: core.NodeKind,
-    text: []const u8,
-    metadata: SearchableNodeMetadata,
-) !void {
-    clearReusableTermFreqs(allocator, freqs, owned);
-
-    if (timings) |t| {
-        t.docs_node_count = std.math.add(u64, t.docs_node_count, 1) catch return error.RecordTooLarge;
-        t.docs_text_bytes = std.math.add(u64, t.docs_text_bytes, try searchableNodeTextBytes(text, metadata)) catch return error.RecordTooLarge;
-    }
-    const tokenize_start = if (timings != null) textMonotonicNs(io) else 0;
-    const text_tokens = try collectSearchableNodeTermFreqs(allocator, freqs, owned, text, metadata);
-    if (timings) |t| {
-        t.docs_tokenize_ns += textElapsedNs(io, tokenize_start);
-        t.docs_token_count = std.math.add(u64, t.docs_token_count, text_tokens) catch return error.RecordTooLarge;
-    }
-    if (text_tokens > persistent_doc_max_field_tokens) return error.RecordTooLarge;
-    const doc_id = try nextPersistentTextDocId(text_meta.doc_count);
-    const append_start = if (timings != null) textMonotonicNs(io) else 0;
-    try term_builder.addDocumentFreqs(doc_id, freqs);
-    if (timings) |t| t.docs_posting_append_ns += textElapsedNs(io, append_start);
-
-    text_meta.total_text_tokens = std.math.add(u64, text_meta.total_text_tokens, text_tokens) catch return error.RecordTooLarge;
-    const record = TextDocRecord{
-        .doc_id = doc_id,
-        .node_id = node_id.toInt(),
-        .kind = @intFromEnum(kind),
-        .text_tokens = @intCast(text_tokens),
-    };
-    const write_start = if (timings != null) textMonotonicNs(io) else 0;
-    try record.encodeForHeader(docs_header, record_bytes[0..docs_header.recordLen()]);
-    try writer.append(record_bytes[0..docs_header.recordLen()]);
-    if (record.needsNodeIdOverflow()) {
-        try overflow_records.append(allocator, try TextDocNodeIdOverflowRecord.init(record));
-    }
-    if (timings) |t| t.docs_write_ns += textElapsedNs(io, write_start);
-    text_meta.doc_count = doc_id;
-}
-
-const TextDocsTextSource = enum {
-    inline_or_mapped,
-    borrowed,
-    allocated,
-};
-
-fn recordTextDocsTextSource(timings: ?*PersistentTextRebuildTimings, source: TextDocsTextSource, text_len: usize) void {
-    const t = timings orelse return;
-    const bytes: u64 = @intCast(text_len);
-    switch (source) {
-        .inline_or_mapped => {
-            t.docs_text_inline_count += 1;
-            t.docs_text_inline_bytes += bytes;
-        },
-        .borrowed => {
-            t.docs_text_borrowed_count += 1;
-            t.docs_text_borrowed_bytes += bytes;
-        },
-        .allocated => {
-            t.docs_text_alloc_count += 1;
-            t.docs_text_alloc_bytes += bytes;
-        },
-    }
-}
-
-fn detectTextDocsHeaderLayout(store: storage_mod.Store, deadline: core.QueryDeadline) !TextDocsHeader {
-    if (deadline.expired()) return core.Error.BudgetExceeded;
-    if (try store.searchableNodeIndexLayoutHint()) |hint| {
-        if (hint.node_count != 0 and hint.dense_node_id_base != 0) {
-            if (hint.uniform_kind) |uniform_kind| {
-                const max_node_id = std.math.add(u64, hint.dense_node_id_base, hint.node_count - 1) catch return error.InvalidRecord;
-                if (max_node_id <= persistent_doc_node_id_inline_max) {
-                    return TextDocsHeader.denseUniform(hint.node_count, hint.dense_node_id_base, uniform_kind);
-                }
-            }
-        }
-        return .{ .doc_count = hint.node_count };
-    }
-
-    var nodes = try store.nodeRecordsIterator(null);
-    defer nodes.deinit();
-
-    var doc_count: u64 = 0;
-    var dense_base: u64 = 0;
-    var dense_node_ids = true;
-    var uniform_kind: ?core.NodeKind = null;
-    var uniform_kind_ok = true;
-
-    while (try nodes.nextRef()) |node| {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
-        if (node.kind == .edit) {
-            if (node.text_bytes) |text| {
-                if (isDeletedNodeTombstoneText(text)) continue;
-            } else {
-                const text = try nodes.readRefTextAlloc(store.allocator, node);
-                defer store.allocator.free(text);
-                if (isDeletedNodeTombstoneText(text)) continue;
-            }
-        }
-        const node_id = node.id.toInt();
-        if (doc_count == 0) {
-            dense_base = node_id;
-            uniform_kind = node.kind;
-        } else {
-            if (uniform_kind.? != node.kind) uniform_kind_ok = false;
-        }
-        const expected_node_id = std.math.add(u64, dense_base, doc_count) catch {
-            dense_node_ids = false;
-            doc_count = std.math.add(u64, doc_count, 1) catch return error.RecordTooLarge;
-            continue;
-        };
-        if (node_id != expected_node_id or node_id > persistent_doc_node_id_inline_max) dense_node_ids = false;
-        doc_count = std.math.add(u64, doc_count, 1) catch return error.RecordTooLarge;
-    }
-
-    if (doc_count != 0 and dense_node_ids and uniform_kind_ok and dense_base != 0 and dense_base <= std.math.maxInt(u32)) {
-        return TextDocsHeader.denseUniform(doc_count, @intCast(dense_base), uniform_kind.?);
-    }
-    return .{ .doc_count = doc_count };
-}
-
-fn writeTextDocsFileFromStore(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    deadline: core.QueryDeadline,
-    run_builder: *TextPostingRunBuilder,
-    text_meta: *PersistentTextMeta,
-    timings: ?*PersistentTextRebuildTimings,
-    observer: ?PersistentTextRebuildObserver,
-) !void {
-    const path = try textDocsPath(allocator, store);
-    defer allocator.free(path);
-    const tmp_path = try tmpPathFor(allocator, path);
-    defer allocator.free(tmp_path);
-    errdefer std.Io.Dir.cwd().deleteFile(store.io, tmp_path) catch {};
-    const layout_start = if (timings != null) textMonotonicNs(store.io) else 0;
-    const layout_header = try detectTextDocsHeaderLayout(store, deadline);
-    if (timings) |t| t.docs_layout_ns = textElapsedNs(store.io, layout_start);
-
-    {
-        const include_metadata = text_meta.searchable_metadata_digest != 0;
-        var metadata_snapshot: ?SearchableNodeMetadataSnapshot = if (include_metadata)
-            try SearchableNodeMetadataSnapshot.init(allocator, store)
-        else
-            null;
-        defer if (metadata_snapshot) |*snapshot| snapshot.deinit();
-        var file = try std.Io.Dir.cwd().createFile(store.io, tmp_path, .{ .read = true, .truncate = true });
-        defer file.close(store.io);
-        var writer = try TextBufferedWriter.init(allocator, store.io, file, text_write_buffer_bytes);
-        defer writer.deinit();
-
-        var header_bytes: [TextDocsHeader.encoded_len]u8 = undefined;
-        layout_header.encode(&header_bytes);
-        try writer.append(&header_bytes);
-        var record_bytes: [TextDocRecord.encoded_len]u8 = undefined;
-        var overflow_records = std.ArrayList(TextDocNodeIdOverflowRecord).empty;
-        defer overflow_records.deinit(allocator);
-        var term_arena = std.heap.ArenaAllocator.init(allocator);
-        defer term_arena.deinit();
-        const term_allocator = term_arena.allocator();
-        var tokenizer_scratch = std.ArrayList(u8).empty;
-        defer tokenizer_scratch.deinit(allocator);
-        var text_freq_cache = TextRebuildTextFreqCache.init(allocator);
-        defer text_freq_cache.deinit();
-        var freqs = std.StringHashMap(FieldTermFreq).init(allocator);
-        defer freqs.deinit();
-
-        var nodes = try store.nodeRecordsIterator(null);
-        defer nodes.deinit();
-        while (true) {
-            const iter_start = if (timings != null) textMonotonicNs(store.io) else 0;
-            const maybe_node = try nodes.nextRef();
-            if (timings) |t| t.docs_node_iter_ns += textElapsedNs(store.io, iter_start);
-            const node = maybe_node orelse break;
-            if (deadline.expired()) return core.Error.BudgetExceeded;
-            if (node.text_bytes) |text| {
-                recordTextDocsTextSource(timings, .inline_or_mapped, text.len);
-                if (isDeletedNodeTombstoneNode(node.kind, text)) continue;
-                const metadata = if (metadata_snapshot) |*snapshot| snapshot.get(node.id) else SearchableNodeMetadata{};
-                try appendRunTextDocFromNode(term_allocator, allocator, &writer, &record_bytes, layout_header, &overflow_records, &freqs, &term_arena, &tokenizer_scratch, &text_freq_cache, run_builder, text_meta, timings, node.id, node.kind, text, metadata);
-            } else {
-                const text_read_start = if (timings != null) textMonotonicNs(store.io) else 0;
-                const borrowed_text = try nodes.readRefTextBorrowed(node);
-                if (borrowed_text) |text| {
-                    if (timings) |t| t.docs_text_read_ns += textElapsedNs(store.io, text_read_start);
-                    recordTextDocsTextSource(timings, .borrowed, text.len);
-                    if (isDeletedNodeTombstoneNode(node.kind, text)) continue;
-                    const metadata = if (metadata_snapshot) |*snapshot| snapshot.get(node.id) else SearchableNodeMetadata{};
-                    try appendRunTextDocFromNode(term_allocator, allocator, &writer, &record_bytes, layout_header, &overflow_records, &freqs, &term_arena, &tokenizer_scratch, &text_freq_cache, run_builder, text_meta, timings, node.id, node.kind, text, metadata);
-                } else {
-                    const text = try nodes.readRefTextAlloc(allocator, node);
-                    defer allocator.free(text);
-                    if (timings) |t| t.docs_text_read_ns += textElapsedNs(store.io, text_read_start);
-                    recordTextDocsTextSource(timings, .allocated, text.len);
-                    if (isDeletedNodeTombstoneNode(node.kind, text)) continue;
-                    const metadata = if (metadata_snapshot) |*snapshot| snapshot.get(node.id) else SearchableNodeMetadata{};
-                    try appendRunTextDocFromNode(term_allocator, allocator, &writer, &record_bytes, layout_header, &overflow_records, &freqs, &term_arena, &tokenizer_scratch, &text_freq_cache, run_builder, text_meta, timings, node.id, node.kind, text, metadata);
-                }
-            }
-            if (observer) |obs| {
-                if (text_meta.doc_count % text_rebuild_observer_doc_sample_interval == 0) {
-                    try obs.record(.docs_progress);
-                }
-            }
-        }
-        var overflow_bytes: [TextDocNodeIdOverflowRecord.encoded_len]u8 = undefined;
-        for (overflow_records.items) |overflow| {
-            try overflow.encode(&overflow_bytes);
-            try writer.append(&overflow_bytes);
-        }
-        try writer.flush();
-        try run_builder.appendRepeatedTextCacheRun(&text_freq_cache);
-
-        if (timings) |t| {
-            t.docs_freq_cache_entry_count = @intCast(text_freq_cache.entries.items.len);
-            t.docs_freq_cache_text_bytes = @intCast(text_freq_cache.text_bytes);
-            t.docs_freq_cache_term_count = @intCast(text_freq_cache.term_count);
-            t.docs_freq_cache_term_bytes = @intCast(text_freq_cache.term_bytes);
-        }
-
-        if (text_meta.doc_count != layout_header.doc_count) return error.InvalidRecord;
-        var final_header = layout_header;
-        final_header.node_id_overflow_count = @intCast(overflow_records.items.len);
-        try final_header.validateShape();
-        final_header.encode(&header_bytes);
-        try file.writePositionalAll(store.io, &header_bytes, 0);
-        if (textOptionsNeedSync(store)) try file.sync(store.io);
-    }
-    try renameReplace(store.io, tmp_path, path);
-}
-
-fn writeTextDocsFileFromStoreWithTermBuilder(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    deadline: core.QueryDeadline,
-    term_builder: *PersistentTermBuilder,
-    text_meta: *PersistentTextMeta,
-    timings: ?*PersistentTextRebuildTimings,
-) !void {
-    const path = try textDocsPath(allocator, store);
-    defer allocator.free(path);
-    const tmp_path = try tmpPathFor(allocator, path);
-    defer allocator.free(tmp_path);
-    errdefer std.Io.Dir.cwd().deleteFile(store.io, tmp_path) catch {};
-    const layout_start = if (timings != null) textMonotonicNs(store.io) else 0;
-    const layout_header = try detectTextDocsHeaderLayout(store, deadline);
-    if (timings) |t| t.docs_layout_ns = textElapsedNs(store.io, layout_start);
-
-    {
-        const include_metadata = text_meta.searchable_metadata_digest != 0;
-        var metadata_snapshot: ?SearchableNodeMetadataSnapshot = if (include_metadata)
-            try SearchableNodeMetadataSnapshot.init(allocator, store)
-        else
-            null;
-        defer if (metadata_snapshot) |*snapshot| snapshot.deinit();
-        var file = try std.Io.Dir.cwd().createFile(store.io, tmp_path, .{ .read = true, .truncate = true });
-        defer file.close(store.io);
-        var writer = try TextBufferedWriter.init(allocator, store.io, file, text_write_buffer_bytes);
-        defer writer.deinit();
-
-        var header_bytes: [TextDocsHeader.encoded_len]u8 = undefined;
-        layout_header.encode(&header_bytes);
-        try writer.append(&header_bytes);
-        var record_bytes: [TextDocRecord.encoded_len]u8 = undefined;
-        var overflow_records = std.ArrayList(TextDocNodeIdOverflowRecord).empty;
-        defer overflow_records.deinit(allocator);
-        var freqs = std.StringHashMap(FieldTermFreq).init(allocator);
-        defer freqs.deinit();
-        var owned = std.ArrayList([]u8).empty;
-        defer {
-            for (owned.items) |term| allocator.free(term);
-            owned.deinit(allocator);
-        }
-
-        var nodes = try store.nodeRecordsIterator(null);
-        defer nodes.deinit();
-        while (true) {
-            const iter_start = if (timings != null) textMonotonicNs(store.io) else 0;
-            const maybe_node = try nodes.nextRef();
-            if (timings) |t| t.docs_node_iter_ns += textElapsedNs(store.io, iter_start);
-            const node = maybe_node orelse break;
-            if (deadline.expired()) return core.Error.BudgetExceeded;
-            if (node.text_bytes) |text| {
-                recordTextDocsTextSource(timings, .inline_or_mapped, text.len);
-                if (isDeletedNodeTombstoneNode(node.kind, text)) continue;
-                const metadata = if (metadata_snapshot) |*snapshot| snapshot.get(node.id) else SearchableNodeMetadata{};
-                try appendBuilderTextDocFromNode(allocator, &writer, &record_bytes, layout_header, &overflow_records, &freqs, &owned, term_builder, text_meta, timings, store.io, node.id, node.kind, text, metadata);
-            } else {
-                const text_read_start = if (timings != null) textMonotonicNs(store.io) else 0;
-                const borrowed_text = try nodes.readRefTextBorrowed(node);
-                if (borrowed_text) |text| {
-                    if (timings) |t| t.docs_text_read_ns += textElapsedNs(store.io, text_read_start);
-                    recordTextDocsTextSource(timings, .borrowed, text.len);
-                    if (isDeletedNodeTombstoneNode(node.kind, text)) continue;
-                    const metadata = if (metadata_snapshot) |*snapshot| snapshot.get(node.id) else SearchableNodeMetadata{};
-                    try appendBuilderTextDocFromNode(allocator, &writer, &record_bytes, layout_header, &overflow_records, &freqs, &owned, term_builder, text_meta, timings, store.io, node.id, node.kind, text, metadata);
-                } else {
-                    const text = try nodes.readRefTextAlloc(allocator, node);
-                    defer allocator.free(text);
-                    if (timings) |t| t.docs_text_read_ns += textElapsedNs(store.io, text_read_start);
-                    recordTextDocsTextSource(timings, .allocated, text.len);
-                    if (isDeletedNodeTombstoneNode(node.kind, text)) continue;
-                    const metadata = if (metadata_snapshot) |*snapshot| snapshot.get(node.id) else SearchableNodeMetadata{};
-                    try appendBuilderTextDocFromNode(allocator, &writer, &record_bytes, layout_header, &overflow_records, &freqs, &owned, term_builder, text_meta, timings, store.io, node.id, node.kind, text, metadata);
-                }
-            }
-        }
-        var overflow_bytes: [TextDocNodeIdOverflowRecord.encoded_len]u8 = undefined;
-        for (overflow_records.items) |overflow| {
-            try overflow.encode(&overflow_bytes);
-            try writer.append(&overflow_bytes);
-        }
-        try writer.flush();
-
-        if (text_meta.doc_count != layout_header.doc_count) return error.InvalidRecord;
-        var final_header = layout_header;
-        final_header.node_id_overflow_count = @intCast(overflow_records.items.len);
-        try final_header.validateShape();
-        final_header.encode(&header_bytes);
-        try file.writePositionalAll(store.io, &header_bytes, 0);
-        if (textOptionsNeedSync(store)) try file.sync(store.io);
-    }
-    try renameReplace(store.io, tmp_path, path);
-}
-
-fn writeTermsAndPostingsFiles(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    builder: *PersistentTermBuilder,
-    docs_view: *TextDocsFileView,
-    meta: PersistentTextMeta,
-) !PersistentTextCatalogStats {
-    std.mem.sort(PersistentTerm, builder.terms.items, {}, persistentTermLessThan);
-
-    var term_bytes_len: u64 = 0;
-    var posting_count: u64 = 0;
-    var postings_body_bytes: u64 = 0;
-    var previous_term: ?[]const u8 = null;
-    for (builder.terms.items, 0..) |*term, term_index| {
-        if (term.term.len == 0 or term.term.len > std.math.maxInt(u32)) return error.RecordTooLarge;
-        if (term.postings.len == 0 or term.postings.len > std.math.maxInt(u32)) return error.InvalidRecord;
-        const postings_payload = try termPostingPayloadOrBodyOffset(term.postings.items(), postings_body_bytes, meta.doc_count);
-        term.postings_offset = postings_payload.offset;
-        term.postings_offset_is_plain = postings_payload.is_plain;
-        term.postings_offset_is_dense_freq_stream = postings_payload.is_dense_freq_stream;
-        term_bytes_len = std.math.add(u64, term_bytes_len, try persistentTermFrontCodedLen(@intCast(term_index), previous_term, term.term)) catch return error.RecordTooLarge;
-        posting_count = std.math.add(u64, posting_count, term.postings.len) catch return error.RecordTooLarge;
-        postings_body_bytes = std.math.add(u64, postings_body_bytes, try publishedPostingBodyBytesForTerm(term.postings.items(), term.postings_offset, term.postings_offset_is_plain, term.postings_offset_is_dense_freq_stream)) catch return error.RecordTooLarge;
-        previous_term = term.term;
-    }
-
-    const postings_path = try textPostingsPath(allocator, store);
-    defer allocator.free(postings_path);
-    try writeTextPostingsFile(allocator, store, postings_path, builder.terms.items, posting_count, postings_body_bytes);
-
-    const blocks_path = try textPostingBlocksPath(allocator, store);
-    defer allocator.free(blocks_path);
-    try writeTextPostingBlocksFile(allocator, store, blocks_path, builder.terms.items, posting_count, persistent_posting_block_size);
-
-    const impacts_path = try textPostingBlockImpactsPath(allocator, store);
-    defer allocator.free(impacts_path);
-    try writeTextPostingBlockImpactsFile(allocator, store, impacts_path, builder.terms.items, persistent_posting_block_size, meta);
-
-    const top_hits_path = try textTermTopHitsPath(allocator, store);
-    defer allocator.free(top_hits_path);
-    try writeTextTermTopHitsFile(allocator, store, top_hits_path, builder.terms.items, docs_view, meta);
-
-    const terms_path = try textTermsPath(allocator, store);
-    defer allocator.free(terms_path);
-    try writeTextTermsFile(allocator, store, terms_path, builder.terms.items, term_bytes_len);
-    return .{
-        .term_count = @intCast(builder.terms.items.len),
-        .term_bytes = term_bytes_len,
-        .posting_count = posting_count,
-    };
-}
-
-fn writeEmptyTermsAndPostingsFiles(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    docs_view: *TextDocsFileView,
-    meta: PersistentTextMeta,
-) !PersistentTextCatalogStats {
-    if (meta.doc_count != 0) return error.InvalidRecord;
-    const terms: []const PersistentTerm = &.{};
-
-    const postings_path = try textPostingsPath(allocator, store);
-    defer allocator.free(postings_path);
-    try writeTextPostingsFile(allocator, store, postings_path, terms, 0, 0);
-
-    const blocks_path = try textPostingBlocksPath(allocator, store);
-    defer allocator.free(blocks_path);
-    try writeTextPostingBlocksFile(allocator, store, blocks_path, terms, 0, persistent_posting_block_size);
-
-    const impacts_path = try textPostingBlockImpactsPath(allocator, store);
-    defer allocator.free(impacts_path);
-    try writeTextPostingBlockImpactsFile(allocator, store, impacts_path, terms, persistent_posting_block_size, meta);
-
-    const top_hits_path = try textTermTopHitsPath(allocator, store);
-    defer allocator.free(top_hits_path);
-    try writeTextTermTopHitsFile(allocator, store, top_hits_path, terms, docs_view, meta);
-
-    const terms_path = try textTermsPath(allocator, store);
-    defer allocator.free(terms_path);
-    try writeTextTermsFile(allocator, store, terms_path, terms, 0);
-
-    return .{};
-}
-
-fn writeTermsAndPostingsFilesFromRuns(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    run_paths: []const []const u8,
-    summary_files: []const TextPostingRunSummaryFile,
-    synthetic_sources: []const TextPostingSyntheticRunSource,
-    run_paths_disjoint_term_ranges: bool,
-    docs_view: *TextDocsFileView,
-    meta: PersistentTextMeta,
-    deadline: core.QueryDeadline,
-    timings: ?*PersistentTextRebuildTimings,
-) !PersistentTextCatalogStats {
-    const summary_start = textMonotonicNs(store.io);
-    if ((run_paths.len == 0 and synthetic_sources.len == 0) or summary_files.len == 0) {
-        return try writeEmptyTermsAndPostingsFiles(allocator, store, docs_view, meta);
-    }
-    textBenchTrace("catalog_summary_stats_start");
-    const summary_stats = collectTextPostingRunTermSummaryStatsFromFiles(allocator, store.io, summary_files, meta.doc_count, deadline) catch |err| {
-        textBenchTrace("catalog_summary_stats_error");
-        return err;
-    };
-    textBenchTraceSummaryStats("catalog_summary_stats_done", summary_stats);
-    if (timings) |t| t.run_summary_ns = textElapsedNs(store.io, summary_start);
-    if (timings) |t| {
-        t.run_term_count = summary_stats.term_count;
-        t.run_block_count = summary_stats.block_count;
-        t.run_top_hit_term_count = summary_stats.top_hit_term_count;
-        t.run_top_hit_candidate_records = summary_stats.top_hit_candidate_postings;
-        t.run_top_hit_side_stream_candidate_records = summary_stats.top_hit_side_stream_candidates;
-        t.run_top_hit_local_side_stream_candidate_records = summary_stats.top_hit_local_side_stream_candidates;
-        t.run_virtual_all_docs_term_count = summary_stats.virtual_all_docs_term_count;
-        t.run_virtual_all_docs_candidate_records = summary_stats.virtual_all_docs_candidate_records;
-        t.run_dense_all_docs_freq_stream_term_count = summary_stats.dense_all_docs_freq_stream_term_count;
-        t.run_dense_all_docs_freq_stream_candidate_records = summary_stats.dense_all_docs_freq_stream_candidate_records;
-    }
-    if (deadline.expired()) return core.Error.BudgetExceeded;
-
-    const derived_start = textMonotonicNs(store.io);
-    textBenchTrace("catalog_derived_files_start");
-    writeTextRunCatalogFilesFromRuns(
-        allocator,
-        store,
-        run_paths,
-        summary_files,
-        synthetic_sources,
-        run_paths_disjoint_term_ranges,
-        summary_stats,
-        docs_view,
-        meta,
-        deadline,
-        timings,
-    ) catch |err| {
-        textBenchTraceSummaryStats("catalog_derived_files_error", summary_stats);
-        return err;
-    };
-    textBenchTrace("catalog_derived_files_done");
-    if (timings) |t| t.run_derived_ns = textElapsedNs(store.io, derived_start);
-    if (deadline.expired()) return core.Error.BudgetExceeded;
-
-    return .{
-        .term_count = summary_stats.term_count,
-        .term_bytes = summary_stats.term_bytes_len,
-        .posting_count = summary_stats.posting_count,
-    };
-}
-
-const DenseAllDocsTopHitCache = struct {
-    term: []const u8,
-    freqs: VariableAllDocsFreqSlice,
-    freq_top_doc_buckets: []DenseAllDocsFreqTopDocBucket = &.{},
-    hits: [persistent_term_top_hit_capacity_usize]TextTermTopHitRecord = undefined,
-    hit_count: usize = 0,
-    worst_index: ?usize = null,
-    upper_bound_skip_text_freq: u32 = 0,
-    skip_until_doc_index: u64 = 0,
-};
-
-const dense_all_docs_top_hit_bucket_max_freq: u32 = 512;
-const dense_all_docs_top_hit_bucket_min_events: u64 = if (builtin.is_test)
-    persistent_all_docs_synthesis_min_postings * 2
-else
-    32_000_000;
-
-const DenseAllDocsFreqTopDocBucket = struct {
-    docs: [persistent_term_top_hit_capacity_usize]TextTopHitDocStats = undefined,
-    count: usize = 0,
-    worst_index: ?usize = null,
-};
-
-fn denseAllDocsTopHitDocLessThan(lhs: TextTopHitDocStats, rhs: TextTopHitDocStats) bool {
-    if (lhs.doc_len != rhs.doc_len) return lhs.doc_len < rhs.doc_len;
-    return lhs.node_id < rhs.node_id;
-}
-
-fn findWorstDenseAllDocsTopHitDocIndex(docs: []const TextTopHitDocStats) usize {
-    var worst_index: usize = 0;
-    for (docs[1..], 1..) |candidate, i| {
-        if (denseAllDocsTopHitDocLessThan(docs[worst_index], candidate)) worst_index = i;
-    }
-    return worst_index;
-}
-
-fn insertDenseAllDocsFreqTopDoc(
-    bucket: *DenseAllDocsFreqTopDocBucket,
-    limit: usize,
-    doc: TextTopHitDocStats,
-) !void {
-    if (limit == 0 or limit > persistent_term_top_hit_capacity_usize) return error.RecordTooLarge;
-    if (bucket.count < limit) {
-        bucket.docs[bucket.count] = doc;
-        bucket.count += 1;
-        if (bucket.count == limit) bucket.worst_index = findWorstDenseAllDocsTopHitDocIndex(bucket.docs[0..bucket.count]);
-        return;
-    }
-    const slot = bucket.worst_index orelse findWorstDenseAllDocsTopHitDocIndex(bucket.docs[0..bucket.count]);
-    if (denseAllDocsTopHitDocLessThan(doc, bucket.docs[slot])) {
-        bucket.docs[slot] = doc;
-        bucket.worst_index = findWorstDenseAllDocsTopHitDocIndex(bucket.docs[0..bucket.count]);
-    } else {
-        bucket.worst_index = slot;
-    }
-}
-
-const StreamingRunDerivedFilesContext = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    postings_writer: *TextBufferedWriter,
-    blocks_offsets_writer: *TextBufferedWriter,
-    blocks_byte_offsets_writer: *TextBufferedWriter,
-    blocks_writer: *TextBufferedWriter,
-    impacts_writer: *TextBufferedWriter,
-    top_hits_index_writer: *TextBufferedWriter,
-    top_hits_writer: *TextBufferedWriter,
-    terms_entry_writer: *TextBufferedWriter,
-    terms_bytes_writer: *TextBufferedWriter,
-    terms_checkpoints_writer: *TextBufferedWriter,
-    terms_exception_rank_writer: *TextBufferedWriter,
-    terms_exception_membership_writer: *TextBufferedWriter,
-    terms_exception_payload_writer: *TextBufferedWriter,
-    terms_singleton_checkpoints_writer: *TextBufferedWriter,
-    terms_singleton_payload_writer: *TextBufferedWriter,
-    summary_reader: *TextPostingRunMergedSummaryReader,
-    summary_count: u64,
-    current_summary: TextPostingRunTermSummaryRecord = undefined,
-    docs_view: *TextDocsFileView,
-    meta: PersistentTextMeta,
-    avg_doc_len: f32,
-    block_size: u64,
-    summary_index: u64 = 0,
-    current_term: [default_max_token_bytes]u8 = [_]u8{0} ** default_max_token_bytes,
-    current_term_len: usize = 0,
-    current_term_front_prefix_len: u8 = 0,
-    have_term: bool = false,
-    previous_written_term: [default_max_token_bytes]u8 = [_]u8{0} ** default_max_token_bytes,
-    previous_written_term_len: usize = 0,
-    have_previous_written_term: bool = false,
-    previous_doc_id: u64 = 0,
-    term_postings_seen: u64 = 0,
-    current_block_postings: u64 = 0,
-    current_block: TextPostingBlockStats = undefined,
-    current_block_previous_doc_id: u64 = 0,
-    current_block_top_hit_postings: [persistent_posting_block_capacity]TextPostingRecord = undefined,
-    current_block_top_hit_count: usize = 0,
-    inline_singleton_posting: ?TextPostingRecord = null,
-    virtual_all_docs_text_freq: u32 = 0,
-    dense_all_docs_freq_stream: bool = false,
-    dense_freq_tags: [persistent_dense_all_docs_freq_group_size]u8 = undefined,
-    dense_freq_tag_count: usize = 0,
-    dense_freq_explicit: [persistent_dense_all_docs_freq_group_size * 10]u8 = undefined,
-    dense_freq_explicit_len: usize = 0,
-    dense_freq_buffering: bool = false,
-    dense_freq_stream_written_directly: bool = false,
-    collect_derived_shape_probes: bool = false,
-    derived_current_term_shape_counted: bool = false,
-    dense_freqs: std.ArrayList(u16) = .empty,
-    postings_written: u64 = 0,
-    postings_body_bytes_written: u64 = 0,
-    current_term_postings_offset: u64 = 0,
-    blocks_written: u64 = 0,
-    block_index_base: u64 = 0,
-    local_block_index: u64 = 0,
-    impacts: std.ArrayList(MemoryPostingBlockImpact) = .empty,
-    impacts_written: u64 = 0,
-    hits: [persistent_term_top_hit_capacity_usize]TextTermTopHitRecord = undefined,
-    hit_count: usize = 0,
-    worst_hit_index: ?usize = null,
-    global_doc_rank: std.ArrayList(TextDocRankEntry) = .empty,
-    global_doc_rank_ready: bool = false,
-    constant_top_hit_doc_bits: std.DynamicBitSetUnmanaged = .{},
-    virtual_all_docs_top_docs: [persistent_term_top_hit_capacity_usize]TextDocRankEntry = undefined,
-    virtual_all_docs_top_doc_count: usize = 0,
-    virtual_all_docs_top_docs_ready: bool = false,
-    virtual_all_docs_top_hit_cache_doc_scans: u64 = 0,
-    global_min_doc_len: f32 = std.math.inf(f32),
-    global_min_doc_len_ready: bool = false,
-    dense_all_docs_top_hit_caches: []DenseAllDocsTopHitCache = &.{},
-    hits_written: u64 = 0,
-    hit_terms_written: u64 = 0,
-    term_entries_written: u64 = 0,
-    term_exceptions_written: u64 = 0,
-    term_exception_rank_checkpoints_written: u64 = 0,
-    term_exception_membership_bytes_written: u64 = 0,
-    current_exception_membership_byte: u8 = 0,
-    current_exception_membership_bits: u8 = 0,
-    term_singletons_written: u64 = 0,
-    term_singleton_payload_bytes_written: u64 = 0,
-    term_singleton_checkpoints_written: u64 = 0,
-    previous_singleton_payload: u32 = 0,
-    term_bytes_written: u64 = 0,
-    term_byte_checkpoints_written: u64 = 0,
-    block_offset_checkpoints_written: u64 = 0,
-    block_byte_offset_checkpoints_written: u64 = 0,
-    derived_inline_singleton_terms: u64 = 0,
-    derived_virtual_terms: u64 = 0,
-    derived_dense_terms: u64 = 0,
-    derived_block_terms: u64 = 0,
-    derived_inline_singleton_records: u64 = 0,
-    derived_virtual_records: u64 = 0,
-    derived_dense_records: u64 = 0,
-    derived_block_records: u64 = 0,
-    top_hit_block_evals: u64 = 0,
-    top_hit_block_skips: u64 = 0,
-    top_hit_block_not_full_evals: u64 = 0,
-    top_hit_block_ready_evals: u64 = 0,
-    top_hit_block_upper_lt_2x_worst: u64 = 0,
-    top_hit_block_upper_lt_4x_worst: u64 = 0,
-    top_hit_block_upper_gte_4x_worst: u64 = 0,
-    top_hit_candidate_evals: u64 = 0,
-    top_hit_doc_reads: u64 = 0,
-    top_hit_regular_candidate_evals: u64 = 0,
-    top_hit_regular_doc_reads: u64 = 0,
-    top_hit_virtual_candidate_evals: u64 = 0,
-    top_hit_virtual_doc_reads: u64 = 0,
-    top_hit_dense_candidate_evals: u64 = 0,
-    top_hit_dense_doc_reads: u64 = 0,
-    top_hit_dense_scan_records: u64 = 0,
-    top_hit_dense_freq_bound_skips: u64 = 0,
-    top_hit_dense_freq_bound_skip_runs: u64 = 0,
-    current_top_hit_regular_block_evals: u64 = 0,
-    current_top_hit_regular_candidate_evals: u64 = 0,
-    current_top_hit_regular_doc_reads: u64 = 0,
-    current_top_hit_regular_constant_candidate: bool = false,
-    current_top_hit_regular_constant_resolved: bool = false,
-    current_top_hit_regular_constant_rank_doc_count: u64 = 0,
-    top_hit_regular_term_count: u64 = 0,
-    top_hit_regular_doc_read_term_count: u64 = 0,
-    top_hit_regular_doc_read_heavy_terms: [persistent_term_top_hit_regular_probe_capacity]TextTopHitRegularTermProbe = undefined,
-    top_hit_regular_doc_read_heavy_term_count: usize = 0,
-    top_hit_regular_candidate_heavy_terms: [persistent_term_top_hit_regular_probe_capacity]TextTopHitRegularTermProbe = undefined,
-    top_hit_regular_candidate_heavy_term_count: usize = 0,
-    top_hit_regular_constant_terms: u64 = 0,
-    top_hit_regular_constant_resolved_terms: u64 = 0,
-    top_hit_regular_constant_unresolved_terms: u64 = 0,
-    top_hit_regular_constant_candidate_evals: u64 = 0,
-    top_hit_regular_constant_doc_reads: u64 = 0,
-    top_hit_regular_nonconstant_candidate_evals: u64 = 0,
-    top_hit_regular_nonconstant_doc_reads: u64 = 0,
-    top_hit_regular_constant_resolved_candidate_skips: u64 = 0,
-    derived_next_sampled_ns: u128 = 0,
-    derived_next_reader_sampled_ns: u128 = 0,
-    derived_next_queue_sampled_ns: u128 = 0,
-    derived_next_child_probe_count: u64 = 0,
-    derived_next_queue_compare_count: u64 = 0,
-    derived_inline_singleton_next_sampled_ns: u128 = 0,
-    derived_inline_singleton_publish_sampled_ns: u128 = 0,
-    derived_next_probe_count: u64 = 0,
-    derived_encode_sampled_ns: u128 = 0,
-    derived_write_sampled_ns: u128 = 0,
-    derived_block_stats_sampled_ns: u128 = 0,
-    derived_top_hit_sampled_ns: u128 = 0,
-    derived_block_flush_sampled_ns: u128 = 0,
-    derived_global_doc_rank_ns: u128 = 0,
-    derived_virtual_top_docs_ns: u128 = 0,
-
-    fn deinit(self: *StreamingRunDerivedFilesContext) void {
-        self.impacts.deinit(self.allocator);
-        self.dense_freqs.deinit(self.allocator);
-        self.global_doc_rank.deinit(self.allocator);
-        self.constant_top_hit_doc_bits.deinit(self.allocator);
-        for (self.dense_all_docs_top_hit_caches) |*cache| {
-            self.allocator.free(cache.freq_top_doc_buckets);
-        }
-        self.allocator.free(self.dense_all_docs_top_hit_caches);
-    }
-};
-
-const streaming_run_derived_record_probe_stride: u64 = 65536;
-const streaming_run_derived_block_probe_stride: u64 = 64;
-const streaming_run_derived_next_child_probe_stride: u64 = 1048576;
-const streaming_run_derived_next_child_probe_offset: u64 = streaming_run_derived_record_probe_stride / 2;
-
-fn streamingRunDerivedSampleStart(
-    context: *const StreamingRunDerivedFilesContext,
-    ordinal: u64,
-    comptime stride: u64,
-) u128 {
-    comptime std.debug.assert(std.math.isPowerOfTwo(stride));
-    if (!context.collect_derived_shape_probes) return 0;
-    return if ((ordinal & (stride - 1)) == 0) textMonotonicNs(context.io) else 0;
-}
-
-fn addStreamingRunDerivedSampleNs(
-    context: *const StreamingRunDerivedFilesContext,
-    counter: *u128,
-    start_ns: u128,
-    comptime stride: u64,
-) void {
-    if (start_ns == 0) return;
-    counter.* += streamingRunDerivedSampleElapsedNs(context, start_ns, stride);
-}
-
-fn streamingRunDerivedSampleElapsedNs(
-    context: *const StreamingRunDerivedFilesContext,
-    start_ns: u128,
-    comptime stride: u64,
-) u128 {
-    if (start_ns == 0) return 0;
-    return textElapsedNs(context.io, start_ns) * stride;
-}
-
-fn streamingRunDerivedNextProbeOrdinal(context: *StreamingRunDerivedFilesContext) u64 {
-    defer context.derived_next_probe_count += 1;
-    return context.derived_next_probe_count;
-}
-
-fn streamingRunDerivedNextSampleStart(context: *const StreamingRunDerivedFilesContext, ordinal: u64) u128 {
-    return streamingRunDerivedSampleStart(context, ordinal, streaming_run_derived_record_probe_stride);
-}
-
-fn streamingRunDerivedNextChildProbeActive(context: *const StreamingRunDerivedFilesContext, ordinal: u64) bool {
-    comptime std.debug.assert(std.math.isPowerOfTwo(streaming_run_derived_next_child_probe_stride));
-    comptime std.debug.assert(streaming_run_derived_next_child_probe_offset < streaming_run_derived_next_child_probe_stride);
-    if (!context.collect_derived_shape_probes) return false;
-    return (ordinal & (streaming_run_derived_next_child_probe_stride - 1)) == streaming_run_derived_next_child_probe_offset;
-}
-
-fn addStreamingRunDerivedNextProbeNs(
-    context: *StreamingRunDerivedFilesContext,
-    active: bool,
-    probe: TextPostingRunMerger.NextProbe,
-) void {
-    if (!active) return;
-    context.derived_next_child_probe_count += 1;
-    context.derived_next_queue_compare_count += probe.queue_compare_count;
-    context.derived_next_reader_sampled_ns += probe.reader_ns * streaming_run_derived_next_child_probe_stride;
-    context.derived_next_queue_sampled_ns += probe.queue_ns * streaming_run_derived_next_child_probe_stride;
-}
-
-fn streamingRunDerivedPostingSampleStart(context: *const StreamingRunDerivedFilesContext) u128 {
-    return streamingRunDerivedSampleStart(context, context.postings_written, streaming_run_derived_record_probe_stride);
-}
-
-const streaming_run_derived_scratch_shrink_min_capacity: usize = 4096;
-const streaming_run_derived_scratch_shrink_ratio: usize = 4;
-
-fn streamingRunDerivedTermMatches(context: *const StreamingRunDerivedFilesContext, term: []const u8) bool {
-    return context.have_term and context.current_term_len == term.len and std.mem.eql(u8, context.current_term[0..context.current_term_len], term);
-}
-
-fn addStreamingRunDerivedProbe(collect: bool, counter: *u64, value: u64) !void {
-    if (!collect) return;
-    counter.* = std.math.add(u64, counter.*, value) catch return error.RecordTooLarge;
-}
-
-const TextTopHitRegularTermProbe = struct {
-    term_index: u64 = 0,
-    postings_count: u64 = 0,
-    block_evals: u64 = 0,
-    candidate_evals: u64 = 0,
-    doc_reads: u64 = 0,
-};
-
-fn topHitRegularTermProbeDocReadHeavier(lhs: TextTopHitRegularTermProbe, rhs: TextTopHitRegularTermProbe) bool {
-    if (lhs.doc_reads != rhs.doc_reads) return lhs.doc_reads > rhs.doc_reads;
-    if (lhs.candidate_evals != rhs.candidate_evals) return lhs.candidate_evals > rhs.candidate_evals;
-    if (lhs.block_evals != rhs.block_evals) return lhs.block_evals > rhs.block_evals;
-    if (lhs.postings_count != rhs.postings_count) return lhs.postings_count > rhs.postings_count;
-    return lhs.term_index < rhs.term_index;
-}
-
-fn topHitRegularTermProbeCandidateHeavier(lhs: TextTopHitRegularTermProbe, rhs: TextTopHitRegularTermProbe) bool {
-    if (lhs.candidate_evals != rhs.candidate_evals) return lhs.candidate_evals > rhs.candidate_evals;
-    if (lhs.doc_reads != rhs.doc_reads) return lhs.doc_reads > rhs.doc_reads;
-    if (lhs.block_evals != rhs.block_evals) return lhs.block_evals > rhs.block_evals;
-    if (lhs.postings_count != rhs.postings_count) return lhs.postings_count > rhs.postings_count;
-    return lhs.term_index < rhs.term_index;
-}
-
-fn insertTextTopHitRegularTermProbe(
-    top: *[persistent_term_top_hit_regular_probe_capacity]TextTopHitRegularTermProbe,
-    count: *usize,
-    probe: TextTopHitRegularTermProbe,
-    comptime heavier: fn (TextTopHitRegularTermProbe, TextTopHitRegularTermProbe) bool,
-) void {
-    var insert_at: usize = 0;
-    while (insert_at < count.* and !heavier(probe, top[insert_at])) : (insert_at += 1) {}
-    if (count.* == persistent_term_top_hit_regular_probe_capacity and insert_at == persistent_term_top_hit_regular_probe_capacity) return;
-
-    var target: usize = count.*;
-    if (count.* < persistent_term_top_hit_regular_probe_capacity) {
-        count.* += 1;
-    } else {
-        target = persistent_term_top_hit_regular_probe_capacity - 1;
-    }
-    while (target > insert_at) : (target -= 1) {
-        top[target] = top[target - 1];
-    }
-    top[insert_at] = probe;
-}
-
-fn textTopHitRegularProbeDocReadsSum(probes: []const TextTopHitRegularTermProbe, limit: usize) !u64 {
-    var total: u64 = 0;
-    for (probes[0..@min(limit, probes.len)]) |probe| {
-        total = std.math.add(u64, total, probe.doc_reads) catch return error.RecordTooLarge;
-    }
-    return total;
-}
-
-fn textTopHitRegularProbeCandidateEvalsSum(probes: []const TextTopHitRegularTermProbe, limit: usize) !u64 {
-    var total: u64 = 0;
-    for (probes[0..@min(limit, probes.len)]) |probe| {
-        total = std.math.add(u64, total, probe.candidate_evals) catch return error.RecordTooLarge;
-    }
-    return total;
-}
-
-fn resetStreamingRunDerivedImpactsScratch(context: *StreamingRunDerivedFilesContext, required_capacity: usize) !void {
-    context.impacts.clearRetainingCapacity();
-    if (context.impacts.capacity > streaming_run_derived_scratch_shrink_min_capacity and
-        required_capacity <= context.impacts.capacity / streaming_run_derived_scratch_shrink_ratio)
-    {
-        context.impacts.shrinkAndFree(context.allocator, 0);
-    }
-    try context.impacts.ensureTotalCapacityPrecise(context.allocator, required_capacity);
-}
-
-fn resetStreamingRunDerivedTermScratch(context: *StreamingRunDerivedFilesContext, summary: TextPostingRunTermSummaryRecord) !void {
-    context.current_block_postings = 0;
-    context.local_block_index = 0;
-    context.hit_count = 0;
-    context.worst_hit_index = null;
-    context.current_top_hit_regular_block_evals = 0;
-    context.current_top_hit_regular_candidate_evals = 0;
-    context.current_top_hit_regular_doc_reads = 0;
-    context.current_top_hit_regular_constant_candidate = false;
-    context.current_top_hit_regular_constant_resolved = false;
-    context.current_top_hit_regular_constant_rank_doc_count = 0;
-    context.dense_freq_tag_count = 0;
-    context.dense_freq_explicit_len = 0;
-    context.dense_freq_buffering = false;
-    context.dense_freq_stream_written_directly = false;
-    context.derived_current_term_shape_counted = false;
-    context.dense_freqs.clearRetainingCapacity();
-    try resetStreamingRunDerivedImpactsScratch(context, std.math.cast(usize, summary.block_count) orelse return error.RecordTooLarge);
-    if (summary.top_hit_count > persistent_term_top_hit_capacity) return error.RecordTooLarge;
-}
-
-fn startStreamingRunDerivedTerm(context: *StreamingRunDerivedFilesContext, term: []const u8) !void {
-    if (context.summary_index >= context.summary_count) return error.InvalidRecord;
-    const summary = (try context.summary_reader.nextRecord()) orelse return error.InvalidRecord;
-    if (!std.mem.eql(u8, summary.term(), term)) return error.InvalidRecord;
-    if (summary.postings_count > std.math.maxInt(u32)) return error.RecordTooLarge;
-    context.current_summary = summary;
-    context.summary_index += 1;
-
-    const term_index = context.summary_index - 1;
-    if (term_index % persistent_posting_block_offset_checkpoint_terms == 0) {
-        var offset_bytes: [persistent_posting_block_ordinal_len]u8 = undefined;
-        try encodePersistentBlockOrdinal(context.block_index_base, &offset_bytes);
-        try context.blocks_offsets_writer.append(&offset_bytes);
-        context.block_offset_checkpoints_written = std.math.add(u64, context.block_offset_checkpoints_written, 1) catch return error.RecordTooLarge;
-    }
-    if (term_index % persistent_term_byte_offset_checkpoint_terms == 0) {
-        if (context.term_bytes_written > persistent_term_bytes_max_offset) return error.RecordTooLarge;
-        var offset_bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &offset_bytes, @intCast(context.term_bytes_written), .little);
-        try context.terms_checkpoints_writer.append(&offset_bytes);
-        context.term_byte_checkpoints_written = std.math.add(u64, context.term_byte_checkpoints_written, 1) catch return error.RecordTooLarge;
-    }
-
-    const previous_term: ?[]const u8 = if (context.have_previous_written_term)
-        context.previous_written_term[0..context.previous_written_term_len]
-    else
-        null;
-    const front_prefix_len = try persistentTermFrontCodedPrefixLen(term_index, previous_term, term);
-    const encoded_term_len = try appendPersistentFrontCodedTerm(context.terms_bytes_writer, term_index, previous_term, term);
-    context.term_bytes_written = std.math.add(u64, context.term_bytes_written, encoded_term_len) catch return error.RecordTooLarge;
-    @memcpy(context.previous_written_term[0..term.len], term);
-    context.previous_written_term_len = term.len;
-    context.have_previous_written_term = true;
-
-    @memcpy(context.current_term[0..term.len], term);
-    context.current_term_len = term.len;
-    context.current_term_front_prefix_len = front_prefix_len;
-    context.have_term = true;
-    context.previous_doc_id = 0;
-    context.term_postings_seen = 0;
-    context.current_term_postings_offset = context.postings_body_bytes_written;
-    try resetStreamingRunDerivedTermScratch(context, summary);
-    context.inline_singleton_posting = null;
-    context.virtual_all_docs_text_freq = summary.virtualAllDocsTextFreq(context.meta.doc_count) orelse 0;
-    context.dense_all_docs_freq_stream = context.virtual_all_docs_text_freq == 0 and summary.denseAllDocsFreqStream(context.meta.doc_count);
-    if (context.virtual_all_docs_text_freq != 0) {
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.derived_virtual_terms, 1);
-        context.derived_current_term_shape_counted = true;
-    } else if (context.dense_all_docs_freq_stream) {
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.derived_dense_terms, 1);
-        context.derived_current_term_shape_counted = true;
-    }
-    context.current_top_hit_regular_constant_candidate = textPostingRunSummaryRegularConstantTopHitCandidate(summary, context.meta.doc_count);
-    if (context.current_top_hit_regular_constant_candidate) {
-        const doc_count = std.math.cast(usize, context.meta.doc_count) orelse return error.RecordTooLarge;
-        if (context.constant_top_hit_doc_bits.capacity() != doc_count) {
-            try context.constant_top_hit_doc_bits.resize(context.allocator, doc_count, false);
-        } else {
-            context.constant_top_hit_doc_bits.unsetAll();
-        }
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_regular_constant_terms, 1);
-    }
-    context.dense_freq_buffering = context.dense_all_docs_freq_stream;
-    if (context.dense_freq_buffering) {
-        context.dense_freqs.clearRetainingCapacity();
-    }
-}
-
-fn initStreamingRunDerivedBlock(context: *StreamingRunDerivedFilesContext) void {
-    context.current_block = .{
-        .posting_offset = context.postings_body_bytes_written,
-        .posting_count = 0,
-        .first_doc_id = 0,
-        .last_doc_id = 0,
-        .max_weighted_tf = 0,
-        .min_doc_len = std.math.inf(f32),
-    };
-    context.current_block_previous_doc_id = 0;
-    context.current_block_top_hit_count = 0;
-}
-
-fn streamingRunDerivedDocLenLowerBound(context: *const StreamingRunDerivedFilesContext) f32 {
-    return if (context.global_min_doc_len_ready) context.global_min_doc_len else persistentMinPossibleDocLen();
-}
-
-fn markStreamingRunDerivedConstantRankDoc(context: *StreamingRunDerivedFilesContext, doc_id: u64) !void {
-    if (!context.current_top_hit_regular_constant_candidate or context.current_top_hit_regular_constant_resolved) return;
-    if (doc_id == 0 or doc_id > context.meta.doc_count) return error.InvalidRecord;
-    const index = std.math.cast(usize, doc_id - 1) orelse return error.RecordTooLarge;
-    context.constant_top_hit_doc_bits.set(index);
-    context.current_top_hit_regular_constant_rank_doc_count = std.math.add(u64, context.current_top_hit_regular_constant_rank_doc_count, 1) catch return error.RecordTooLarge;
-}
-
-fn scoreStreamingRunDerivedTopHitBlock(context: *StreamingRunDerivedFilesContext, block_upper_score: f32) !void {
-    const summary = context.current_summary;
-    if (summary.top_hit_count == 0) {
-        if (context.current_block_top_hit_count != 0) return error.InvalidRecord;
-        return;
-    }
-    if (context.current_top_hit_regular_constant_resolved) {
-        if (context.current_block_top_hit_count != 0) return error.InvalidRecord;
-        return;
-    }
-    try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_block_evals, 1);
-    try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.current_top_hit_regular_block_evals, 1);
-    const block_postings = std.math.cast(usize, context.current_block_postings) orelse return error.RecordTooLarge;
-    if (context.current_block_top_hit_count != block_postings) return error.InvalidRecord;
-    const hit_limit = std.math.cast(usize, summary.top_hit_count) orelse return error.RecordTooLarge;
-    if (context.hit_count < hit_limit) {
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_block_not_full_evals, 1);
-    } else {
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_block_ready_evals, 1);
-        const worst_index = context.worst_hit_index orelse findWorstTextTermTopHitIndex(context.hits[0..context.hit_count]);
-        const worst_score = context.hits[worst_index].score;
-        if (!std.math.isFinite(worst_score) or worst_score < 0) return core.Error.Unsupported;
-        if (block_upper_score < worst_score) {
-            try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_block_skips, 1);
-            return;
-        }
-        if (block_upper_score < worst_score * 2.0) {
-            try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_block_upper_lt_2x_worst, 1);
-        } else if (block_upper_score < worst_score * 4.0) {
-            try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_block_upper_lt_4x_worst, 1);
-        } else {
-            try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_block_upper_gte_4x_worst, 1);
-        }
-    }
-    for (context.current_block_top_hit_postings[0..context.current_block_top_hit_count]) |posting| {
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_candidate_evals, 1);
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_regular_candidate_evals, 1);
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.current_top_hit_regular_candidate_evals, 1);
-        if (context.current_top_hit_regular_constant_candidate) {
-            try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_regular_constant_candidate_evals, 1);
-        } else {
-            try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_regular_nonconstant_candidate_evals, 1);
-        }
-        if (try textTermTopHitCandidateCannotBeatCurrentWorstWithDocLenFloor(
-            context.hits[0..context.hit_count],
-            context.worst_hit_index,
-            @intCast(summary.top_hit_count),
-            posting,
-            context.avg_doc_len,
-            context.meta.doc_count,
-            summary.postings_count,
-            streamingRunDerivedDocLenLowerBound(context),
-        )) continue;
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_doc_reads, 1);
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_regular_doc_reads, 1);
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.current_top_hit_regular_doc_reads, 1);
-        if (context.current_top_hit_regular_constant_candidate) {
-            try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_regular_constant_doc_reads, 1);
-        } else {
-            try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_regular_nonconstant_doc_reads, 1);
-        }
-        const doc = try context.docs_view.readTopHitDocStatsAt(posting.doc_id - 1);
-        if (doc.doc_id != posting.doc_id) return error.InvalidRecord;
-        const score = bm25WeightedTermScore(
-            persistentWeightedTf(posting),
-            doc.doc_len,
-            context.avg_doc_len,
-            context.meta.doc_count,
-            @intCast(summary.postings_count),
-            .{},
-        );
-        if (!std.math.isFinite(score)) return core.Error.Unsupported;
-        try appendTopTextTermHitBoundedInline(&context.hits, &context.hit_count, @intCast(summary.top_hit_count), &context.worst_hit_index, .{
-            .doc_id = doc.doc_id,
-            .text_freq = posting.text_freq,
-            .node_id = doc.node_id,
-            .score = score,
-        });
-    }
-}
-
-fn scoreStreamingRunDerivedVirtualTopHit(context: *StreamingRunDerivedFilesContext, posting: TextPostingRecord) !bool {
-    const summary = context.current_summary;
-    if (summary.top_hit_count == 0) return false;
-    try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_candidate_evals, 1);
-    if (context.dense_all_docs_freq_stream) {
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_dense_candidate_evals, 1);
-    } else {
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_virtual_candidate_evals, 1);
-    }
-    if (try textTermTopHitCandidateCannotBeatCurrentWorstWithDocLenFloor(
-        context.hits[0..context.hit_count],
-        context.worst_hit_index,
-        @intCast(summary.top_hit_count),
-        posting,
-        context.avg_doc_len,
-        context.meta.doc_count,
-        summary.postings_count,
-        streamingRunDerivedDocLenLowerBound(context),
-    )) return true;
-    try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_doc_reads, 1);
-    if (context.dense_all_docs_freq_stream) {
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_dense_doc_reads, 1);
-    } else {
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_virtual_doc_reads, 1);
-    }
-    const doc = try context.docs_view.readTopHitDocStatsAt(posting.doc_id - 1);
-    if (doc.doc_id != posting.doc_id) return error.InvalidRecord;
-    const score = bm25WeightedTermScore(
-        persistentWeightedTf(posting),
-        doc.doc_len,
-        context.avg_doc_len,
-        context.meta.doc_count,
-        @intCast(summary.postings_count),
-        .{},
-    );
-    if (!std.math.isFinite(score)) return core.Error.Unsupported;
-    try appendTopTextTermHitBoundedInline(&context.hits, &context.hit_count, @intCast(summary.top_hit_count), &context.worst_hit_index, .{
-        .doc_id = doc.doc_id,
-        .text_freq = posting.text_freq,
-        .node_id = doc.node_id,
-        .score = score,
-    });
-    return false;
-}
-
-fn findStreamingRunDerivedDenseAllDocsTopHitCache(
-    context: *StreamingRunDerivedFilesContext,
-    term: []const u8,
-) ?*DenseAllDocsTopHitCache {
-    for (context.dense_all_docs_top_hit_caches) |*cache| {
-        if (std.mem.eql(u8, cache.term, term)) return cache;
-    }
-    return null;
-}
-
-fn useStreamingRunDerivedDenseAllDocsTopHitCache(
-    context: *StreamingRunDerivedFilesContext,
-    term: []const u8,
-) !bool {
-    const cache = findStreamingRunDerivedDenseAllDocsTopHitCache(context, term) orelse return false;
-    const summary = context.current_summary;
-    const limit = std.math.cast(usize, summary.top_hit_count) orelse return error.RecordTooLarge;
-    if (limit == 0 or limit > persistent_term_top_hit_capacity_usize) return error.InvalidRecord;
-    if (cache.hit_count != limit) return error.InvalidRecord;
-    @memcpy(context.hits[0..limit], cache.hits[0..limit]);
-    context.hit_count = limit;
-    context.worst_hit_index = findWorstTextTermTopHitIndex(context.hits[0..limit]);
-    return true;
-}
-
-fn precomputeStreamingRunDerivedDenseAllDocsTopHits(
-    context: *StreamingRunDerivedFilesContext,
-    synthetic_sources: []const TextPostingSyntheticRunSource,
-    deadline: core.QueryDeadline,
-) !void {
-    const top_hit_count = persistentTermTopHitCountForPostingCount(context.meta.doc_count);
-    if (top_hit_count == 0) return;
-    const limit = std.math.cast(usize, top_hit_count) orelse return error.RecordTooLarge;
-    if (limit == 0 or limit > persistent_term_top_hit_capacity_usize) return error.InvalidRecord;
-
-    var dense_source_count: usize = 0;
-    for (synthetic_sources) |source| switch (source) {
-        .virtual_all_docs => {},
-        .variable_all_docs => |variable| {
-            if (@as(u64, @intCast(variable.freqs.len())) != context.meta.doc_count) return error.InvalidRecord;
-            dense_source_count += 1;
-        },
-    };
-    if (dense_source_count <= 1) return;
-    if (context.dense_all_docs_top_hit_caches.len != 0) return error.InvalidRecord;
-
-    context.dense_all_docs_top_hit_caches = try context.allocator.alloc(DenseAllDocsTopHitCache, dense_source_count);
-    var cache_index: usize = 0;
-    for (synthetic_sources) |source| switch (source) {
-        .virtual_all_docs => {},
-        .variable_all_docs => |variable| {
-            if (@as(u64, @intCast(variable.freqs.len())) != context.meta.doc_count) return error.InvalidRecord;
-            context.dense_all_docs_top_hit_caches[cache_index] = .{
-                .term = variable.term,
-                .freqs = variable.freqs.slice(),
-            };
-            cache_index += 1;
-        },
-    };
-    if (cache_index != dense_source_count) return error.InvalidRecord;
-
-    const dense_events = std.math.mul(u64, context.meta.doc_count, dense_source_count) catch return error.RecordTooLarge;
-    var bucket_eligible = dense_events >= dense_all_docs_top_hit_bucket_min_events;
-    for (context.dense_all_docs_top_hit_caches) |cache| {
-        if (cache.freqs.len() != @as(usize, @intCast(context.meta.doc_count))) return error.InvalidRecord;
-    }
-    for (synthetic_sources) |source| switch (source) {
-        .virtual_all_docs => {},
-        .variable_all_docs => |variable| {
-            if (variable.freq_stats.max_freq == 0 or variable.freq_stats.max_freq > dense_all_docs_top_hit_bucket_max_freq) {
-                bucket_eligible = false;
-                break;
-            }
-        },
-    };
-    if (bucket_eligible) {
-        try precomputeStreamingRunDerivedDenseAllDocsTopHitsByFreqBucket(context, limit, synthetic_sources, deadline);
-        return;
-    }
-    try precomputeStreamingRunDerivedDenseAllDocsTopHitsByScan(context, limit, deadline);
-}
-
-fn precomputeStreamingRunDerivedDenseAllDocsTopHitsByFreqBucket(
-    context: *StreamingRunDerivedFilesContext,
-    limit: usize,
-    synthetic_sources: []const TextPostingSyntheticRunSource,
-    deadline: core.QueryDeadline,
-) !void {
-    // For a dense all-doc term, documents with the same text frequency rank by
-    // document length and then node id. Any document outside the top-K shortest
-    // docs for its frequency cannot appear in the term's global top-K.
-    var cache_index: usize = 0;
-    for (synthetic_sources) |source| switch (source) {
-        .virtual_all_docs => {},
-        .variable_all_docs => |variable| {
-            const bucket_count = std.math.add(usize, std.math.cast(usize, variable.freq_stats.max_freq) orelse return error.RecordTooLarge, 1) catch return error.RecordTooLarge;
-            context.dense_all_docs_top_hit_caches[cache_index].freq_top_doc_buckets = try context.allocator.alloc(DenseAllDocsFreqTopDocBucket, bucket_count);
-            @memset(context.dense_all_docs_top_hit_caches[cache_index].freq_top_doc_buckets, .{});
-            cache_index += 1;
-        },
-    };
-    if (cache_index != context.dense_all_docs_top_hit_caches.len) return error.InvalidRecord;
-
-    var doc_index: u64 = 0;
-    while (doc_index < context.meta.doc_count) : (doc_index += 1) {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
-        const doc = try context.docs_view.readTopHitDocStatsAt(doc_index);
-        if (doc.doc_id != doc_index + 1) return error.InvalidRecord;
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_doc_reads, 1);
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_dense_doc_reads, 1);
-
-        for (context.dense_all_docs_top_hit_caches) |*cache| {
-            const text_freq = cache.freqs.at(@intCast(doc_index));
-            if (text_freq == 0 or text_freq >= cache.freq_top_doc_buckets.len) return error.InvalidRecord;
-            try insertDenseAllDocsFreqTopDoc(&cache.freq_top_doc_buckets[@intCast(text_freq)], limit, doc);
-        }
-    }
-
-    for (context.dense_all_docs_top_hit_caches) |*cache| {
-        for (cache.freq_top_doc_buckets, 0..) |bucket, text_freq| {
-            if (text_freq == 0) continue;
-            const posting_base = TextPostingRecord{
-                .doc_id = 0,
-                .text_freq = @intCast(text_freq),
-                .kind_freq = 0,
-            };
-            const weighted_tf = persistentWeightedTf(posting_base);
-            for (bucket.docs[0..bucket.count]) |doc| {
-                if (deadline.expired()) return core.Error.BudgetExceeded;
-                try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_candidate_evals, 1);
-                try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_dense_candidate_evals, 1);
-                const score = bm25WeightedTermScore(
-                    weighted_tf,
-                    doc.doc_len,
-                    context.avg_doc_len,
-                    context.meta.doc_count,
-                    context.meta.doc_count,
-                    .{},
-                );
-                if (!std.math.isFinite(score)) return core.Error.Unsupported;
-                try appendTopTextTermHitBoundedInline(
-                    &cache.hits,
-                    &cache.hit_count,
-                    limit,
-                    &cache.worst_index,
-                    .{
-                        .doc_id = doc.doc_id,
-                        .text_freq = @intCast(text_freq),
-                        .node_id = doc.node_id,
-                        .score = score,
-                    },
-                );
-            }
-        }
-        if (cache.hit_count != limit) return error.InvalidRecord;
-        std.mem.sort(TextTermTopHitRecord, cache.hits[0..cache.hit_count], {}, textTermTopHitLessThan);
-        cache.worst_index = findWorstTextTermTopHitIndex(cache.hits[0..cache.hit_count]);
-    }
-}
-
-fn precomputeStreamingRunDerivedDenseAllDocsTopHitsByScan(
-    context: *StreamingRunDerivedFilesContext,
-    limit: usize,
-    deadline: core.QueryDeadline,
-) !void {
-    var doc_index: u64 = 0;
-    while (doc_index < context.meta.doc_count) : (doc_index += 1) {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
-        const doc = try context.docs_view.readTopHitDocStatsAt(doc_index);
-        if (doc.doc_id != doc_index + 1) return error.InvalidRecord;
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_doc_reads, 1);
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_dense_doc_reads, 1);
-
-        for (context.dense_all_docs_top_hit_caches) |*cache| {
-            if (doc_index < cache.skip_until_doc_index) continue;
-            const text_freq = cache.freqs.at(@intCast(doc_index));
-            if (cache.hit_count >= limit and text_freq <= cache.upper_bound_skip_text_freq) {
-                const skip_count = cache.freqs.boundedRunLenLeq(
-                    @intCast(doc_index),
-                    cache.upper_bound_skip_text_freq,
-                    persistent_dense_all_docs_top_hit_skip_run_max,
-                );
-                if (skip_count == 0) return error.InvalidRecord;
-                cache.skip_until_doc_index = doc_index + @as(u64, @intCast(skip_count));
-                try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_dense_freq_bound_skips, @intCast(skip_count));
-                try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_dense_freq_bound_skip_runs, 1);
-                continue;
-            }
-            const posting = TextPostingRecord{
-                .doc_id = doc.doc_id,
-                .text_freq = text_freq,
-                .kind_freq = 0,
-            };
-            try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_candidate_evals, 1);
-            try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_dense_candidate_evals, 1);
-            if (try textTermTopHitCandidateCannotBeatCurrentWorstWithDocLenFloor(
-                cache.hits[0..cache.hit_count],
-                cache.worst_index,
-                limit,
-                posting,
-                context.avg_doc_len,
-                context.meta.doc_count,
-                context.meta.doc_count,
-                streamingRunDerivedDocLenLowerBound(context),
-            )) {
-                cache.upper_bound_skip_text_freq = @max(cache.upper_bound_skip_text_freq, text_freq);
-                continue;
-            }
-            const score = bm25WeightedTermScore(
-                persistentWeightedTf(posting),
-                doc.doc_len,
-                context.avg_doc_len,
-                context.meta.doc_count,
-                context.meta.doc_count,
-                .{},
-            );
-            if (!std.math.isFinite(score)) return core.Error.Unsupported;
-            try appendTopTextTermHitBoundedInline(
-                &cache.hits,
-                &cache.hit_count,
-                limit,
-                &cache.worst_index,
-                .{
-                    .doc_id = doc.doc_id,
-                    .text_freq = text_freq,
-                    .node_id = doc.node_id,
-                    .score = score,
-                },
-            );
-        }
-    }
-
-    for (context.dense_all_docs_top_hit_caches) |*cache| {
-        if (cache.hit_count != limit) return error.InvalidRecord;
-        std.mem.sort(TextTermTopHitRecord, cache.hits[0..cache.hit_count], {}, textTermTopHitLessThan);
-        cache.worst_index = findWorstTextTermTopHitIndex(cache.hits[0..cache.hit_count]);
-    }
-}
-
-fn virtualAllDocsTopDocLessThan(lhs: TextDocRankEntry, rhs: TextDocRankEntry) bool {
-    const lhs_len = lhs.docLen();
-    const rhs_len = rhs.docLen();
-    if (lhs_len != rhs_len) return lhs_len < rhs_len;
-    return lhs.node_id < rhs.node_id;
-}
-
-fn textDocRankLessThan(_: void, lhs: TextDocRankEntry, rhs: TextDocRankEntry) bool {
-    return virtualAllDocsTopDocLessThan(lhs, rhs);
-}
-
-fn findWorstVirtualAllDocsTopDocIndex(docs: []const TextDocRankEntry) usize {
-    var worst_index: usize = 0;
-    for (docs[1..], 1..) |candidate, i| {
-        if (virtualAllDocsTopDocLessThan(docs[worst_index], candidate)) worst_index = i;
-    }
-    return worst_index;
-}
-
-fn ensureStreamingRunDerivedVirtualAllDocsTopDocs(
-    context: *StreamingRunDerivedFilesContext,
-    deadline: core.QueryDeadline,
-) !void {
-    if (context.virtual_all_docs_top_docs_ready) return;
-    const start_ns = if (context.collect_derived_shape_probes) textMonotonicNs(context.io) else 0;
-    defer {
-        if (start_ns != 0) context.derived_virtual_top_docs_ns += textElapsedNs(context.io, start_ns);
-    }
-
-    if (context.global_doc_rank_ready) {
-        const limit = @min(persistent_term_top_hit_capacity_usize, context.global_doc_rank.items.len);
-        context.virtual_all_docs_top_doc_count = limit;
-        for (context.global_doc_rank.items[0..limit], 0..) |doc, index| {
-            context.virtual_all_docs_top_docs[index] = doc;
-        }
-        context.virtual_all_docs_top_docs_ready = true;
-        return;
-    }
-
-    const limit = @min(persistent_term_top_hit_capacity_usize, std.math.cast(usize, context.meta.doc_count) orelse persistent_term_top_hit_capacity_usize);
-    context.virtual_all_docs_top_doc_count = 0;
-    var worst_index: ?usize = null;
-
-    var doc_index: u64 = 0;
-    while (doc_index < context.meta.doc_count) : (doc_index += 1) {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
-        const doc = try context.docs_view.readDocAt(doc_index);
-        if (doc.doc_id != doc_index + 1) return error.InvalidRecord;
-        const rank_entry = try TextDocRankEntry.init(doc);
-        context.virtual_all_docs_top_hit_cache_doc_scans = std.math.add(u64, context.virtual_all_docs_top_hit_cache_doc_scans, 1) catch return error.RecordTooLarge;
-        context.global_min_doc_len = @min(context.global_min_doc_len, rank_entry.docLen());
-        if (context.virtual_all_docs_top_doc_count < limit) {
-            context.virtual_all_docs_top_docs[context.virtual_all_docs_top_doc_count] = rank_entry;
-            context.virtual_all_docs_top_doc_count += 1;
-            if (context.virtual_all_docs_top_doc_count == limit) {
-                worst_index = findWorstVirtualAllDocsTopDocIndex(context.virtual_all_docs_top_docs[0..context.virtual_all_docs_top_doc_count]);
-            }
-            continue;
-        }
-
-        const slot = worst_index orelse findWorstVirtualAllDocsTopDocIndex(context.virtual_all_docs_top_docs[0..context.virtual_all_docs_top_doc_count]);
-        if (virtualAllDocsTopDocLessThan(rank_entry, context.virtual_all_docs_top_docs[slot])) {
-            context.virtual_all_docs_top_docs[slot] = rank_entry;
-            worst_index = findWorstVirtualAllDocsTopDocIndex(context.virtual_all_docs_top_docs[0..context.virtual_all_docs_top_doc_count]);
-        } else {
-            worst_index = slot;
-        }
-    }
-
-    if (context.meta.doc_count == 0) {
-        context.global_min_doc_len = persistentMinPossibleDocLen();
-    } else if (!std.math.isFinite(context.global_min_doc_len) or context.global_min_doc_len <= 0) return error.InvalidRecord;
-    context.global_min_doc_len_ready = true;
-    context.virtual_all_docs_top_docs_ready = true;
-}
-
-fn ensureStreamingRunDerivedGlobalDocRank(
-    context: *StreamingRunDerivedFilesContext,
-    deadline: core.QueryDeadline,
-) !void {
-    if (context.global_doc_rank_ready) return;
-    const start_ns = if (context.collect_derived_shape_probes) textMonotonicNs(context.io) else 0;
-    defer {
-        if (start_ns != 0) context.derived_global_doc_rank_ns += textElapsedNs(context.io, start_ns);
-    }
-    const doc_count = std.math.cast(usize, context.meta.doc_count) orelse return error.RecordTooLarge;
-    context.global_doc_rank.clearRetainingCapacity();
-    try context.global_doc_rank.ensureTotalCapacityPrecise(context.allocator, doc_count);
-
-    context.global_min_doc_len = std.math.inf(f32);
-    var doc_index: u64 = 0;
-    while (doc_index < context.meta.doc_count) : (doc_index += 1) {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
-        const doc = try context.docs_view.readDocAt(doc_index);
-        if (doc.doc_id != doc_index + 1) return error.InvalidRecord;
-        const rank_entry = try TextDocRankEntry.init(doc);
-        context.virtual_all_docs_top_hit_cache_doc_scans = std.math.add(u64, context.virtual_all_docs_top_hit_cache_doc_scans, 1) catch return error.RecordTooLarge;
-        context.global_min_doc_len = @min(context.global_min_doc_len, rank_entry.docLen());
-        context.global_doc_rank.appendAssumeCapacity(rank_entry);
-    }
-
-    if (context.meta.doc_count == 0) {
-        context.global_min_doc_len = persistentMinPossibleDocLen();
-    } else if (!std.math.isFinite(context.global_min_doc_len) or context.global_min_doc_len <= 0) return error.InvalidRecord;
-    std.mem.sort(TextDocRankEntry, context.global_doc_rank.items, {}, textDocRankLessThan);
-    context.global_min_doc_len_ready = true;
-    context.global_doc_rank_ready = true;
-}
-
-fn resolveStreamingRunDerivedConstantRegularTopHitsFromRank(context: *StreamingRunDerivedFilesContext, deadline: core.QueryDeadline) !void {
-    if (!context.current_top_hit_regular_constant_candidate or context.current_top_hit_regular_constant_resolved) return;
-    const summary = context.current_summary;
-    const limit = std.math.cast(usize, summary.top_hit_count) orelse return error.RecordTooLarge;
-    if (limit == 0 or limit > persistent_term_top_hit_capacity_usize) return error.InvalidRecord;
-    if (context.current_top_hit_regular_constant_rank_doc_count != summary.postings_count) return error.InvalidRecord;
-
-    try ensureStreamingRunDerivedGlobalDocRank(context, deadline);
-    const text_freq = summary.constantTextFreq();
-    if (text_freq == 0) return error.InvalidRecord;
-    const posting_base = TextPostingRecord{
-        .doc_id = 0,
-        .text_freq = text_freq,
-        .kind_freq = 0,
-    };
-    const weighted_tf = persistentWeightedTf(posting_base);
-
-    context.hit_count = 0;
-    context.worst_hit_index = null;
-    for (context.global_doc_rank.items) |doc| {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
-        const bit_index = std.math.cast(usize, doc.doc_id - 1) orelse return error.RecordTooLarge;
-        if (!context.constant_top_hit_doc_bits.isSet(bit_index)) continue;
-        const score = bm25WeightedTermScore(
-            weighted_tf,
-            doc.docLen(),
-            context.avg_doc_len,
-            context.meta.doc_count,
-            @intCast(summary.postings_count),
-            .{},
-        );
-        if (!std.math.isFinite(score)) return core.Error.Unsupported;
-        try appendTopTextTermHitBoundedInline(&context.hits, &context.hit_count, limit, &context.worst_hit_index, .{
-            .doc_id = @as(u64, doc.doc_id),
-            .text_freq = text_freq,
-            .node_id = doc.node_id,
-            .score = score,
-        });
-        if (context.hit_count == limit) break;
-    }
-    if (context.hit_count != limit) return error.InvalidRecord;
-    context.current_top_hit_regular_constant_resolved = true;
-    try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_regular_constant_resolved_terms, 1);
-    try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_regular_constant_resolved_candidate_skips, summary.postings_count);
-}
-
-fn scoreStreamingRunDerivedVirtualAllDocsTopHits(
-    context: *StreamingRunDerivedFilesContext,
-    text_freq: u32,
-    deadline: core.QueryDeadline,
-) !void {
-    const summary = context.current_summary;
-    if (summary.top_hit_count == 0) return;
-    // With constant term frequency, BM25 order is doc length, then node id.
-    try ensureStreamingRunDerivedVirtualAllDocsTopDocs(context, deadline);
-
-    const limit = std.math.cast(usize, summary.top_hit_count) orelse return error.RecordTooLarge;
-    if (context.virtual_all_docs_top_doc_count < limit) return error.InvalidRecord;
-    const posting_base = TextPostingRecord{
-        .doc_id = 0,
-        .text_freq = text_freq,
-        .kind_freq = 0,
-    };
-    const weighted_tf = persistentWeightedTf(posting_base);
-    for (context.virtual_all_docs_top_docs[0..limit]) |doc| {
-        const score = bm25WeightedTermScore(
-            weighted_tf,
-            doc.docLen(),
-            context.avg_doc_len,
-            context.meta.doc_count,
-            @intCast(summary.postings_count),
-            .{},
-        );
-        if (!std.math.isFinite(score)) return core.Error.Unsupported;
-        try appendTopTextTermHitBoundedInline(&context.hits, &context.hit_count, limit, &context.worst_hit_index, .{
-            .doc_id = @as(u64, doc.doc_id),
-            .text_freq = text_freq,
-            .node_id = doc.node_id,
-            .score = score,
-        });
-    }
-}
-
-fn flushStreamingRunDerivedBlock(context: *StreamingRunDerivedFilesContext) !void {
-    if (context.current_block_postings == 0) return;
-    const flush_start = streamingRunDerivedSampleStart(context, context.blocks_written, streaming_run_derived_block_probe_stride);
-    defer addStreamingRunDerivedSampleNs(context, &context.derived_block_flush_sampled_ns, flush_start, streaming_run_derived_block_probe_stride);
-    const summary = context.current_summary;
-    context.current_block.posting_count = context.current_block_postings;
-
-    if (summary.block_count == 0) {
-        if (summary.top_hit_count != 0) return error.InvalidRecord;
-        if (summary.postings_count > context.block_size) return error.InvalidRecord;
-        context.current_block_postings = 0;
-        context.current_block_top_hit_count = 0;
-        return;
-    }
-
-    var block_bytes: [TextPostingBlockRecord.encoded_len]u8 = undefined;
-    try (try TextPostingBlockRecord.fromStats(context.current_block)).encode(&block_bytes);
-    try context.blocks_writer.append(&block_bytes);
-    if (context.blocks_written % persistent_posting_block_byte_offset_checkpoint_blocks == 0) {
-        if (context.current_block.posting_offset < context.current_term_postings_offset) return error.InvalidRecord;
-        const relative_offset = context.current_block.posting_offset - context.current_term_postings_offset;
-        if (relative_offset > std.math.maxInt(u32)) return error.RecordTooLarge;
-        var offset_bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &offset_bytes, @intCast(relative_offset), .little);
-        try context.blocks_byte_offsets_writer.append(&offset_bytes);
-        context.block_byte_offset_checkpoints_written = std.math.add(u64, context.block_byte_offset_checkpoints_written, 1) catch return error.RecordTooLarge;
-    }
-    context.blocks_written = std.math.add(u64, context.blocks_written, 1) catch return error.RecordTooLarge;
-
-    const stored_bounds = try quantizePersistentBlockScoreBounds(
-        context.current_block.max_weighted_tf,
-        context.current_block.min_doc_len,
-    );
-    const upper_score = bm25WeightedTermScore(
-        stored_bounds.max_weighted_tf,
-        stored_bounds.min_doc_len,
-        context.avg_doc_len,
-        context.meta.doc_count,
-        @intCast(summary.postings_count),
-        .{},
-    );
-    if (!std.math.isFinite(upper_score)) return core.Error.Unsupported;
-    const top_hit_start = streamingRunDerivedPostingSampleStart(context);
-    if (!context.current_top_hit_regular_constant_candidate) {
-        try scoreStreamingRunDerivedTopHitBlock(context, upper_score);
-    } else if (context.current_block_top_hit_count != 0) {
-        return error.InvalidRecord;
-    }
-    addStreamingRunDerivedSampleNs(context, &context.derived_top_hit_sampled_ns, top_hit_start, streaming_run_derived_record_probe_stride);
-    context.impacts.appendAssumeCapacity(.{
-        .local_block_index = context.local_block_index,
-        .max_weighted_tf = stored_bounds.max_weighted_tf,
-        .upper_score = upper_score,
-    });
-    context.local_block_index = std.math.add(u64, context.local_block_index, 1) catch return error.RecordTooLarge;
-    context.current_block_postings = 0;
-    context.current_block_top_hit_count = 0;
-}
-
-fn flushStreamingRunDenseAllDocsFreqGroup(context: *StreamingRunDerivedFilesContext) !void {
-    if (context.dense_freq_tag_count == 0) return;
-    const written = try appendDenseAllDocsFreqGroup(context.postings_writer, context.dense_freq_tags[0..context.dense_freq_tag_count], context.dense_freq_explicit[0..context.dense_freq_explicit_len]);
-    context.postings_body_bytes_written = std.math.add(u64, context.postings_body_bytes_written, written) catch return error.RecordTooLarge;
-    context.dense_freq_tag_count = 0;
-    context.dense_freq_explicit_len = 0;
-}
-
-fn appendStreamingRunDenseAllDocsFreqPosting(context: *StreamingRunDerivedFilesContext, posting: TextPostingRecord) !void {
-    if (context.dense_freq_buffering) {
-        if (context.dense_freq_stream_written_directly) return error.InvalidRecord;
-        if (posting.kind_freq != 0) return error.InvalidRecord;
-        const text_freq = try validateDenseAllDocsTextFreq(posting.text_freq);
-        const required_capacity = std.math.cast(usize, context.current_summary.postings_count) orelse return error.RecordTooLarge;
-        if (context.dense_freqs.capacity < required_capacity) {
-            try context.dense_freqs.ensureTotalCapacityPrecise(context.allocator, required_capacity);
-        }
-        try context.dense_freqs.append(context.allocator, @intCast(text_freq));
-        return;
-    }
-    if (context.term_postings_seen == 0 and context.dense_freq_tag_count == 0) {
-        try context.postings_writer.append(&.{persistent_dense_all_docs_freq_mode_packed});
-        context.postings_body_bytes_written = std.math.add(u64, context.postings_body_bytes_written, 1) catch return error.RecordTooLarge;
-    }
-    const field_tag = try compressedPostingFieldTag(posting);
-    context.dense_freq_tags[context.dense_freq_tag_count] = field_tag;
-    context.dense_freq_tag_count += 1;
-    if (compressedPostingTagTextExplicit(field_tag)) {
-        context.dense_freq_explicit_len += try encodePersistentVarint(posting.text_freq, context.dense_freq_explicit[context.dense_freq_explicit_len..]);
-    }
-    if (context.dense_freq_tag_count == persistent_dense_all_docs_freq_group_size) {
-        try flushStreamingRunDenseAllDocsFreqGroup(context);
-    }
-}
-
-fn appendStreamingRunSingletonPayload(context: *StreamingRunDerivedFilesContext, payload: u32) !void {
-    _ = try decodeInlineSingletonPostingPayload(payload);
-    if (context.term_singletons_written % persistent_term_singleton_payload_checkpoint_terms == 0) {
-        var checkpoint_bytes: [TextTermSingletonPayloadCheckpoint.encoded_len]u8 = undefined;
-        try (TextTermSingletonPayloadCheckpoint{
-            .stream_offset = context.term_singleton_payload_bytes_written,
-            .previous_payload = context.previous_singleton_payload,
-        }).encode(&checkpoint_bytes);
-        try context.terms_singleton_checkpoints_writer.append(&checkpoint_bytes);
-        context.term_singleton_checkpoints_written = std.math.add(u64, context.term_singleton_checkpoints_written, 1) catch return error.RecordTooLarge;
-    }
-    var delta_bytes: [10]u8 = undefined;
-    const encoded_delta = encodeZigZagI64(singletonPayloadDelta(context.previous_singleton_payload, payload));
-    const delta_len = try encodePersistentVarint(encoded_delta, &delta_bytes);
-    try context.terms_singleton_payload_writer.append(delta_bytes[0..delta_len]);
-    context.term_singleton_payload_bytes_written = std.math.add(u64, context.term_singleton_payload_bytes_written, delta_len) catch return error.RecordTooLarge;
-    context.previous_singleton_payload = payload;
-    context.term_singletons_written = std.math.add(u64, context.term_singletons_written, 1) catch return error.RecordTooLarge;
-}
-
-fn appendStreamingRunExceptionMembership(context: *StreamingRunDerivedFilesContext, term_index: u64, is_exception: bool) !void {
-    if (term_index % persistent_term_exception_rank_checkpoint_terms == 0) {
-        if (context.term_exceptions_written > std.math.maxInt(u32)) return error.RecordTooLarge;
-        var checkpoint_bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &checkpoint_bytes, @intCast(context.term_exceptions_written), .little);
-        try context.terms_exception_rank_writer.append(&checkpoint_bytes);
-        context.term_exception_rank_checkpoints_written = std.math.add(u64, context.term_exception_rank_checkpoints_written, 1) catch return error.RecordTooLarge;
-    }
-    if (is_exception) {
-        context.current_exception_membership_byte |= @as(u8, 1) << @as(u3, @intCast(context.current_exception_membership_bits));
-    }
-    context.current_exception_membership_bits += 1;
-    if (context.current_exception_membership_bits == 8) {
-        try context.terms_exception_membership_writer.append(&.{context.current_exception_membership_byte});
-        context.term_exception_membership_bytes_written = std.math.add(u64, context.term_exception_membership_bytes_written, 1) catch return error.RecordTooLarge;
-        context.current_exception_membership_byte = 0;
-        context.current_exception_membership_bits = 0;
-    }
-}
-
-fn finishStreamingRunExceptionMembership(context: *StreamingRunDerivedFilesContext) !void {
-    if (context.current_exception_membership_bits != 0) {
-        try context.terms_exception_membership_writer.append(&.{context.current_exception_membership_byte});
-        context.term_exception_membership_bytes_written = std.math.add(u64, context.term_exception_membership_bytes_written, 1) catch return error.RecordTooLarge;
-        context.current_exception_membership_byte = 0;
-        context.current_exception_membership_bits = 0;
-    }
-}
-
-fn collectStreamingRunDerivedTopHitRegularTermProbe(context: *StreamingRunDerivedFilesContext, summary: TextPostingRunTermSummaryRecord) !void {
-    if (!context.collect_derived_shape_probes) return;
-    if (summary.top_hit_count == 0) return;
-    if (context.virtual_all_docs_text_freq != 0 or context.dense_all_docs_freq_stream) return;
-
-    context.top_hit_regular_term_count = std.math.add(u64, context.top_hit_regular_term_count, 1) catch return error.RecordTooLarge;
-    if (context.current_top_hit_regular_constant_candidate and !context.current_top_hit_regular_constant_resolved) {
-        context.top_hit_regular_constant_unresolved_terms = std.math.add(u64, context.top_hit_regular_constant_unresolved_terms, 1) catch return error.RecordTooLarge;
-    }
-    if (context.current_top_hit_regular_doc_reads != 0) {
-        context.top_hit_regular_doc_read_term_count = std.math.add(u64, context.top_hit_regular_doc_read_term_count, 1) catch return error.RecordTooLarge;
-    }
-
-    const probe = TextTopHitRegularTermProbe{
-        .term_index = context.summary_index - 1,
-        .postings_count = summary.postings_count,
-        .block_evals = context.current_top_hit_regular_block_evals,
-        .candidate_evals = context.current_top_hit_regular_candidate_evals,
-        .doc_reads = context.current_top_hit_regular_doc_reads,
-    };
-    insertTextTopHitRegularTermProbe(
-        &context.top_hit_regular_doc_read_heavy_terms,
-        &context.top_hit_regular_doc_read_heavy_term_count,
-        probe,
-        topHitRegularTermProbeDocReadHeavier,
-    );
-    insertTextTopHitRegularTermProbe(
-        &context.top_hit_regular_candidate_heavy_terms,
-        &context.top_hit_regular_candidate_heavy_term_count,
-        probe,
-        topHitRegularTermProbeCandidateHeavier,
-    );
-}
-
-fn finishStreamingRunDerivedInlineSingletonTerm(context: *StreamingRunDerivedFilesContext) !bool {
-    const posting = context.inline_singleton_posting orelse return false;
-    const summary = context.current_summary;
-    if (summary.postings_count != 1 or summary.block_count != 0 or summary.top_hit_count != 0) return error.InvalidRecord;
-    if (context.term_postings_seen != 1 or context.previous_doc_id != posting.doc_id) return error.InvalidRecord;
-    if (context.current_block_postings != 0 or context.local_block_index != 0 or context.hit_count != 0) return error.InvalidRecord;
-    if (context.dense_freq_tag_count != 0 or context.dense_freq_explicit_len != 0) return error.InvalidRecord;
-    if (context.dense_freq_buffering or context.dense_freq_stream_written_directly or context.dense_freqs.items.len != 0) return error.InvalidRecord;
-    if (context.virtual_all_docs_text_freq != 0 or context.dense_all_docs_freq_stream) return error.InvalidRecord;
-
-    const posting_payload = try encodeInlineSingletonPostingPayload(posting);
-    const entry = TextTermEntry{
-        .term_len = @intCast(context.current_term_len),
-        .doc_freq = 1,
-        .postings_offset = posting_payload,
-        .postings_count = 1,
-        .front_prefix_len = context.current_term_front_prefix_len,
-    };
-    if (!termEntryHasInlinePosting(entry)) return error.InvalidRecord;
-    var entry_bytes: [TextTermEntry.encoded_len]u8 = undefined;
-    try entry.encode(&entry_bytes);
-    try context.terms_entry_writer.append(&entry_bytes);
-    context.term_entries_written = std.math.add(u64, context.term_entries_written, 1) catch return error.RecordTooLarge;
-    try appendStreamingRunExceptionMembership(context, context.term_entries_written - 1, false);
-    try appendStreamingRunSingletonPayload(context, @intCast(posting_payload));
-    context.have_term = false;
-    return true;
-}
-
-fn finishStreamingRunDerivedTerm(context: *StreamingRunDerivedFilesContext) !void {
-    if (!context.have_term) return;
-    if (try finishStreamingRunDerivedInlineSingletonTerm(context)) return;
-    flushStreamingRunDerivedBlock(context) catch |err| {
-        textBenchTraceDerivedContext("finish_term_flush_block_error", context);
-        return err;
-    };
-    flushStreamingRunDenseAllDocsFreqGroup(context) catch |err| {
-        textBenchTraceDerivedContext("finish_term_flush_dense_group_error", context);
-        return err;
-    };
-    const summary = context.current_summary;
-    if (context.term_postings_seen != summary.postings_count) {
-        textBenchTraceDerivedContext("finish_term_posting_count_mismatch", context);
-        return error.InvalidRecord;
-    }
-    resolveStreamingRunDerivedConstantRegularTopHitsFromRank(context, .none) catch |err| {
-        textBenchTraceDerivedContext("finish_term_constant_top_hits_error", context);
-        return err;
-    };
-    if (context.local_block_index != summary.block_count or context.hit_count != summary.top_hit_count) {
-        textBenchTraceDerivedContext("finish_term_block_or_hit_count_mismatch", context);
-        return error.InvalidRecord;
-    }
-    if (context.dense_freq_buffering) {
-        if (!context.dense_all_docs_freq_stream) {
-            textBenchTraceDerivedContext("finish_term_dense_buffer_without_dense_stream", context);
-            return error.InvalidRecord;
-        }
-        if (context.dense_freq_stream_written_directly) {
-            if (context.dense_freqs.items.len != 0) {
-                textBenchTraceDerivedContext("finish_term_dense_direct_with_buffered_freqs", context);
-                return error.InvalidRecord;
-            }
-        } else {
-            if (@as(u64, @intCast(context.dense_freqs.items.len)) != summary.postings_count) {
-                textBenchTraceDerivedContext("finish_term_dense_freq_count_mismatch", context);
-                return error.InvalidRecord;
-            }
-            const written = try appendDenseAllDocsFreqStreamFreqs(context.postings_writer, context.dense_freqs.items);
-            context.postings_body_bytes_written = std.math.add(u64, context.postings_body_bytes_written, written) catch return error.RecordTooLarge;
-        }
-    }
-
-    const posting_payload = if (context.inline_singleton_posting) |posting|
-        try encodeInlineSingletonPostingPayload(posting)
-    else if (context.virtual_all_docs_text_freq != 0)
-        try encodeVirtualAllDocsPostingPayload(context.virtual_all_docs_text_freq)
-    else if (context.dense_all_docs_freq_stream)
-        context.current_term_postings_offset
-    else
-        context.current_term_postings_offset;
-    const posting_payload_is_plain = context.inline_singleton_posting == null and
-        context.virtual_all_docs_text_freq == 0 and
-        !context.dense_all_docs_freq_stream;
-    const posting_payload_is_dense_freq_stream = context.inline_singleton_posting == null and
-        context.virtual_all_docs_text_freq == 0 and
-        context.dense_all_docs_freq_stream;
-    const entry = TextTermEntry{
-        .term_len = @intCast(context.current_term_len),
-        .doc_freq = @intCast(summary.postings_count),
-        .postings_offset = posting_payload,
-        .postings_count = @intCast(summary.postings_count),
-        .front_prefix_len = context.current_term_front_prefix_len,
-        .postings_offset_is_plain = posting_payload_is_plain,
-        .postings_offset_is_dense_freq_stream = posting_payload_is_dense_freq_stream,
-    };
-    var entry_bytes: [TextTermEntry.encoded_len]u8 = undefined;
-    try entry.encode(&entry_bytes);
-    try context.terms_entry_writer.append(&entry_bytes);
-    context.term_entries_written = std.math.add(u64, context.term_entries_written, 1) catch return error.RecordTooLarge;
-    if (termEntryHasInlinePosting(entry)) {
-        try appendStreamingRunExceptionMembership(context, context.term_entries_written - 1, false);
-        try appendStreamingRunSingletonPayload(context, @intCast(posting_payload));
-    } else {
-        try appendStreamingRunExceptionMembership(context, context.term_entries_written - 1, true);
-        var exception_bytes: [TextTermExceptionRecord.encoded_len]u8 = undefined;
-        try (TextTermExceptionRecord{
-            .doc_freq = @intCast(summary.postings_count),
-            .postings_offset = posting_payload,
-            .postings_offset_is_plain = posting_payload_is_plain,
-            .postings_offset_is_dense_freq_stream = posting_payload_is_dense_freq_stream,
-        }).encode(&exception_bytes);
-        try context.terms_exception_payload_writer.append(&exception_bytes);
-        context.term_exceptions_written = std.math.add(u64, context.term_exceptions_written, 1) catch return error.RecordTooLarge;
-    }
-
-    std.mem.sort(MemoryPostingBlockImpact, context.impacts.items, {}, memoryPostingBlockImpactLessThan);
-    var impact_bytes: [persistent_posting_block_ordinal_len]u8 = undefined;
-    for (context.impacts.items) |impact| {
-        const global_block_index = std.math.add(u64, context.block_index_base, impact.local_block_index) catch return error.RecordTooLarge;
-        try encodePersistentBlockOrdinal(global_block_index, &impact_bytes);
-        try context.impacts_writer.append(&impact_bytes);
-        context.impacts_written = std.math.add(u64, context.impacts_written, 1) catch return error.RecordTooLarge;
-    }
-
-    std.mem.sort(TextTermTopHitRecord, context.hits[0..context.hit_count], {}, textTermTopHitLessThan);
-    var hit_bytes: [TextTermTopHitRecord.encoded_len]u8 = undefined;
-    for (context.hits[0..context.hit_count]) |hit| {
-        try hit.encode(&hit_bytes);
-        try context.top_hits_writer.append(&hit_bytes);
-        context.hits_written = std.math.add(u64, context.hits_written, 1) catch return error.RecordTooLarge;
-    }
-    if (summary.top_hit_count != 0) {
-        const term_index = context.summary_index - 1;
-        var hit_term_bytes: [TextTermTopHitTermRecord.encoded_len]u8 = undefined;
-        try (TextTermTopHitTermRecord{
-            .term_index = term_index,
-            .hit_offset = context.hits_written - summary.top_hit_count,
-            .hit_count = summary.top_hit_count,
-        }).encode(&hit_term_bytes);
-        try context.top_hits_index_writer.append(&hit_term_bytes);
-        context.hit_terms_written = std.math.add(u64, context.hit_terms_written, 1) catch return error.RecordTooLarge;
-    }
-    try collectStreamingRunDerivedTopHitRegularTermProbe(context, summary);
-
-    context.block_index_base = std.math.add(u64, context.block_index_base, summary.block_count) catch return error.RecordTooLarge;
-    context.have_term = false;
-}
-
-fn writeTextRunDerivedRecordFromRun(context: *StreamingRunDerivedFilesContext, record: *const TextPostingRunRecord) !bool {
-    if (!streamingRunDerivedTermMatches(context, record.*.term())) {
-        finishStreamingRunDerivedTerm(context) catch |err| {
-            textBenchTraceDerivedRecord("record_finish_previous_term_error", context, record.*);
-            return err;
-        };
-        startStreamingRunDerivedTerm(context, record.*.term()) catch |err| {
-            textBenchTraceDerivedRecord("record_start_term_error", context, record.*);
-            return err;
-        };
-    }
-
-    const summary = context.current_summary;
-    const posting = record.*.toPostingAssumeValid();
-
-    if (context.virtual_all_docs_text_freq != 0) {
-        if (summary.postings_count != context.meta.doc_count or summary.block_count != 0) {
-            textBenchTraceDerivedRecord("record_virtual_summary_shape_error", context, record.*);
-            return error.InvalidRecord;
-        }
-        if (posting.text_freq != context.virtual_all_docs_text_freq or posting.kind_freq != 0) {
-            textBenchTraceDerivedRecord("record_virtual_freq_error", context, record.*);
-            return error.InvalidRecord;
-        }
-        if (posting.doc_id != context.term_postings_seen + 1) {
-            textBenchTraceDerivedRecord("record_virtual_doc_order_error", context, record.*);
-            return error.InvalidRecord;
-        }
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.derived_virtual_records, 1);
-        context.previous_doc_id = posting.doc_id;
-        const top_hit_start = streamingRunDerivedPostingSampleStart(context);
-        _ = try scoreStreamingRunDerivedVirtualTopHit(context, posting);
-        addStreamingRunDerivedSampleNs(context, &context.derived_top_hit_sampled_ns, top_hit_start, streaming_run_derived_record_probe_stride);
-        context.term_postings_seen += 1;
-        context.postings_written = std.math.add(u64, context.postings_written, 1) catch return error.RecordTooLarge;
-        return false;
-    }
-
-    if (summary.postings_count == 1 and canInlineSingletonPosting(posting)) {
-        const inline_start = streamingRunDerivedPostingSampleStart(context);
-        defer addStreamingRunDerivedSampleNs(context, &context.derived_inline_singleton_publish_sampled_ns, inline_start, streaming_run_derived_record_probe_stride);
-        if (context.term_postings_seen != 0 or context.inline_singleton_posting != null) {
-            textBenchTraceDerivedRecord("record_inline_singleton_duplicate_error", context, record.*);
-            return error.InvalidRecord;
-        }
-        if (posting.doc_id <= context.previous_doc_id) {
-            textBenchTraceDerivedRecord("record_inline_singleton_doc_order_error", context, record.*);
-            return error.InvalidRecord;
-        }
-        if (!context.derived_current_term_shape_counted) {
-            try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.derived_inline_singleton_terms, 1);
-            context.derived_current_term_shape_counted = true;
-        }
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.derived_inline_singleton_records, 1);
-        context.previous_doc_id = posting.doc_id;
-        context.inline_singleton_posting = posting;
-        context.term_postings_seen += 1;
-        context.postings_written = std.math.add(u64, context.postings_written, 1) catch return error.RecordTooLarge;
-        return true;
-    }
-
-    if (context.dense_all_docs_freq_stream) {
-        if (summary.postings_count != context.meta.doc_count or summary.block_count != 0) {
-            textBenchTraceDerivedRecord("record_dense_summary_shape_error", context, record.*);
-            return error.InvalidRecord;
-        }
-        if (posting.doc_id != context.term_postings_seen + 1) {
-            textBenchTraceDerivedRecord("record_dense_doc_order_error", context, record.*);
-            return error.InvalidRecord;
-        }
-        if (posting.text_freq == 0 or posting.kind_freq != 0) {
-            textBenchTraceDerivedRecord("record_dense_freq_error", context, record.*);
-            return error.InvalidRecord;
-        }
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.derived_dense_records, 1);
-        context.previous_doc_id = posting.doc_id;
-        try appendStreamingRunDenseAllDocsFreqPosting(context, posting);
-        const top_hit_start = streamingRunDerivedPostingSampleStart(context);
-        _ = try scoreStreamingRunDerivedVirtualTopHit(context, posting);
-        addStreamingRunDerivedSampleNs(context, &context.derived_top_hit_sampled_ns, top_hit_start, streaming_run_derived_record_probe_stride);
-        context.term_postings_seen += 1;
-        context.postings_written = std.math.add(u64, context.postings_written, 1) catch return error.RecordTooLarge;
-        return false;
-    }
-
-    if (context.current_block_postings == 0) initStreamingRunDerivedBlock(context);
-    if (!context.derived_current_term_shape_counted) {
-        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.derived_block_terms, 1);
-        context.derived_current_term_shape_counted = true;
-    }
-    try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.derived_block_records, 1);
-    var posting_bytes: [compressed_posting_max_encoded_len]u8 = undefined;
-    const encode_start = streamingRunDerivedPostingSampleStart(context);
-    const encoded_len = encodeCompressedTextPosting(posting, context.current_block_previous_doc_id, &posting_bytes) catch |err| {
-        textBenchTraceDerivedRecord("record_encode_error", context, record.*);
-        return err;
-    };
-    addStreamingRunDerivedSampleNs(context, &context.derived_encode_sampled_ns, encode_start, streaming_run_derived_record_probe_stride);
-    const write_start = streamingRunDerivedPostingSampleStart(context);
-    try context.postings_writer.append(posting_bytes[0..encoded_len]);
-    addStreamingRunDerivedSampleNs(context, &context.derived_write_sampled_ns, write_start, streaming_run_derived_record_probe_stride);
-    context.current_block_previous_doc_id = posting.doc_id;
-
-    const block_stats_start = streamingRunDerivedPostingSampleStart(context);
-    addPostingToBlockStats(posting, &context.previous_doc_id, context.meta.doc_count, &context.current_block) catch |err| {
-        textBenchTraceDerivedRecord("record_block_stats_error", context, record.*);
-        return err;
-    };
-    addStreamingRunDerivedSampleNs(context, &context.derived_block_stats_sampled_ns, block_stats_start, streaming_run_derived_record_probe_stride);
-    context.current_block_postings += 1;
-    context.term_postings_seen += 1;
-    context.postings_written = std.math.add(u64, context.postings_written, 1) catch return error.RecordTooLarge;
-    context.postings_body_bytes_written = std.math.add(u64, context.postings_body_bytes_written, encoded_len) catch return error.RecordTooLarge;
-    if (summary.top_hit_count != 0) {
-        const top_hit_start = streamingRunDerivedPostingSampleStart(context);
-        defer addStreamingRunDerivedSampleNs(context, &context.derived_top_hit_sampled_ns, top_hit_start, streaming_run_derived_record_probe_stride);
-        if (context.current_top_hit_regular_constant_candidate) {
-            markStreamingRunDerivedConstantRankDoc(context, posting.doc_id) catch |err| {
-                textBenchTraceDerivedRecord("record_constant_rank_doc_error", context, record.*);
-                return err;
-            };
-        } else {
-            if (context.current_block_top_hit_count >= persistent_posting_block_capacity) {
-                textBenchTraceDerivedRecord("record_top_hit_block_overflow", context, record.*);
-                return error.InvalidRecord;
-            }
-            context.current_block_top_hit_postings[context.current_block_top_hit_count] = posting;
-            context.current_block_top_hit_count += 1;
-        }
-    }
-    if (context.current_block_postings == context.block_size) {
-        flushStreamingRunDerivedBlock(context) catch |err| {
-            textBenchTraceDerivedRecord("record_flush_block_error", context, record.*);
-            return err;
-        };
-    }
-    return false;
-}
-
-fn writeTextRunDerivedSyntheticSourceAsRecords(
-    context: *StreamingRunDerivedFilesContext,
-    source: TextPostingSyntheticRunSource,
-    doc_count: u64,
-    deadline: core.QueryDeadline,
-) !void {
-    var doc_index: u64 = 0;
-    while (doc_index < doc_count) : (doc_index += 1) {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
-        const doc_id = doc_index + 1;
-        const record = switch (source) {
-            .virtual_all_docs => |virtual| try TextPostingRunRecord.init(virtual.term, .{
-                .doc_id = doc_id,
-                .text_freq = virtual.text_freq,
-                .kind_freq = 0,
-            }),
-            .variable_all_docs => |variable| blk: {
-                if (@as(u64, @intCast(variable.freqs.len())) != doc_count) return error.InvalidRecord;
-                break :blk try TextPostingRunRecord.init(variable.term, .{
-                    .doc_id = doc_id,
-                    .text_freq = variable.freqs.at(@intCast(doc_index)),
-                    .kind_freq = 0,
-                });
-            },
-        };
-        _ = try writeTextRunDerivedRecordFromRun(context, &record);
-    }
-}
-
-fn writeTextRunDerivedSyntheticSourceTerm(
-    context: *StreamingRunDerivedFilesContext,
-    source: TextPostingSyntheticRunSource,
-    doc_count: u64,
-    deadline: core.QueryDeadline,
-) !void {
-    try finishStreamingRunDerivedTerm(context);
-    try startStreamingRunDerivedTerm(context, source.term());
-
-    const summary = context.current_summary;
-    switch (source) {
-        .virtual_all_docs => |virtual| {
-            if (context.virtual_all_docs_text_freq != virtual.text_freq) {
-                try writeTextRunDerivedSyntheticSourceAsRecords(context, source, doc_count, deadline);
-                try finishStreamingRunDerivedTerm(context);
-                return;
-            }
-            if (summary.postings_count != doc_count or summary.block_count != 0) return error.InvalidRecord;
-            if (context.term_postings_seen != 0 or context.previous_doc_id != 0) return error.InvalidRecord;
-            try scoreStreamingRunDerivedVirtualAllDocsTopHits(context, virtual.text_freq, deadline);
-            context.previous_doc_id = doc_count;
-            context.term_postings_seen = doc_count;
-            try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.derived_virtual_records, doc_count);
-            context.postings_written = std.math.add(u64, context.postings_written, doc_count) catch return error.RecordTooLarge;
-        },
-        .variable_all_docs => |variable| {
-            if (@as(u64, @intCast(variable.freqs.len())) != doc_count) return error.InvalidRecord;
-            if (!context.dense_all_docs_freq_stream) {
-                try writeTextRunDerivedSyntheticSourceAsRecords(context, source, doc_count, deadline);
-                try finishStreamingRunDerivedTerm(context);
-                return;
-            }
-            if (summary.postings_count != doc_count or summary.block_count != 0) return error.InvalidRecord;
-            if (deadline.expired()) return core.Error.BudgetExceeded;
-            if (context.dense_freqs.items.len != 0) return error.InvalidRecord;
-            context.dense_freq_stream_written_directly = true;
-            const written = try variable.freqs.slice().appendDenseAllDocsFreqStreamWithStats(context.postings_writer, variable.freq_stats);
-            context.postings_body_bytes_written = std.math.add(u64, context.postings_body_bytes_written, written) catch return error.RecordTooLarge;
-            if (summary.top_hit_count == 0) {
-                context.previous_doc_id = doc_count;
-                context.term_postings_seen = doc_count;
-                try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.derived_dense_records, doc_count);
-                context.postings_written = std.math.add(u64, context.postings_written, doc_count) catch return error.RecordTooLarge;
-            } else {
-                const freq_slice = variable.freqs.slice();
-                if (try useStreamingRunDerivedDenseAllDocsTopHitCache(context, variable.term)) {
-                    context.previous_doc_id = doc_count;
-                    try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_dense_scan_records, doc_count);
-                    try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.derived_dense_records, doc_count);
-                    context.term_postings_seen = std.math.add(u64, context.term_postings_seen, doc_count) catch return error.RecordTooLarge;
-                    context.postings_written = std.math.add(u64, context.postings_written, doc_count) catch return error.RecordTooLarge;
-                } else {
-                    var index: usize = 0;
-                    var upper_bound_skip_text_freq: u32 = 0;
-                    while (index < freq_slice.len()) {
-                        if (deadline.expired()) return core.Error.BudgetExceeded;
-                        const text_freq = freq_slice.at(index);
-                        if (context.hit_count >= summary.top_hit_count and text_freq <= upper_bound_skip_text_freq) {
-                            // BM25 upper bounds are monotonic in term frequency. Once a
-                            // frequency cannot beat the current worst top hit, lower or
-                            // equal frequencies cannot become candidates later.
-                            const skip_count = freq_slice.boundedRunLenLeq(index, upper_bound_skip_text_freq, persistent_dense_all_docs_top_hit_skip_run_max);
-                            if (skip_count == 0) return error.InvalidRecord;
-                            context.previous_doc_id = @intCast(index + skip_count);
-                            try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_dense_scan_records, @intCast(skip_count));
-                            try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_dense_freq_bound_skips, @intCast(skip_count));
-                            try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_dense_freq_bound_skip_runs, 1);
-                            try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.derived_dense_records, @intCast(skip_count));
-                            context.term_postings_seen = std.math.add(u64, context.term_postings_seen, @intCast(skip_count)) catch return error.RecordTooLarge;
-                            context.postings_written = std.math.add(u64, context.postings_written, @intCast(skip_count)) catch return error.RecordTooLarge;
-                            index += skip_count;
-                            continue;
-                        }
-                        const posting = TextPostingRecord{
-                            .doc_id = @intCast(index + 1),
-                            .text_freq = text_freq,
-                            .kind_freq = 0,
-                        };
-                        context.previous_doc_id = posting.doc_id;
-                        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.top_hit_dense_scan_records, 1);
-                        if (try scoreStreamingRunDerivedVirtualTopHit(context, posting)) {
-                            upper_bound_skip_text_freq = @max(upper_bound_skip_text_freq, text_freq);
-                        }
-                        try addStreamingRunDerivedProbe(context.collect_derived_shape_probes, &context.derived_dense_records, 1);
-                        context.term_postings_seen = std.math.add(u64, context.term_postings_seen, 1) catch return error.RecordTooLarge;
-                        context.postings_written = std.math.add(u64, context.postings_written, 1) catch return error.RecordTooLarge;
-                        index += 1;
-                    }
-                }
-            }
-        },
-    }
-    try finishStreamingRunDerivedTerm(context);
-}
-
-fn recordTextRunDerivedSyntheticTiming(timings: *PersistentTextRebuildTimings, source: TextPostingSyntheticRunSource, elapsed: u128) void {
-    switch (source) {
-        .virtual_all_docs => {
-            timings.run_derived_virtual_ns += elapsed;
-            timings.run_derived_virtual_source_terms += 1;
-        },
-        .variable_all_docs => {
-            timings.run_derived_dense_ns += elapsed;
-            timings.run_derived_dense_source_terms += 1;
-        },
-    }
-}
-
-fn writeTextRunDerivedRecordsAndSyntheticTermsFromSingleRun(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    run_path: []const u8,
-    synthetic_sources: []const TextPostingSyntheticRunSource,
-    doc_count: u64,
-    deadline: core.QueryDeadline,
-    context: *StreamingRunDerivedFilesContext,
-    timings: ?*PersistentTextRebuildTimings,
-) !void {
-    const records_start = if (timings != null) textMonotonicNs(io) else 0;
-    var synthetic_ns: u128 = 0;
-
-    var file = try std.Io.Dir.cwd().openFile(io, run_path, .{});
-    const stat = try file.stat(io);
-    if (stat.kind != .file) {
-        file.close(io);
-        return error.InvalidRecord;
-    }
-    var reader = TextPostingRunReader.init(allocator, io, file, stat.size) catch |err| {
-        file.close(io);
-        return err;
-    };
-    defer reader.deinit();
-
-    var record_storage: TextPostingRunRecord = undefined;
-    const first_next_ordinal = streamingRunDerivedNextProbeOrdinal(context);
-    const first_next_start = streamingRunDerivedNextSampleStart(context, first_next_ordinal);
-    var have_next_run_record = try reader.nextRecordInto(&record_storage);
-    var next_run_record_sampled_ns = streamingRunDerivedSampleElapsedNs(context, first_next_start, streaming_run_derived_record_probe_stride);
-    context.derived_next_sampled_ns += next_run_record_sampled_ns;
-
-    var source_index: usize = 0;
-    while (have_next_run_record or source_index < synthetic_sources.len) {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
-
-        if (source_index < synthetic_sources.len) {
-            const source = synthetic_sources[source_index];
-            if (have_next_run_record) {
-                switch (std.mem.order(u8, source.term(), record_storage.term())) {
-                    .lt => {
-                        const synthetic_start = if (timings != null) textMonotonicNs(io) else 0;
-                        try writeTextRunDerivedSyntheticSourceTerm(context, source, doc_count, deadline);
-                        if (timings) |t| {
-                            const elapsed = textElapsedNs(io, synthetic_start);
-                            synthetic_ns += elapsed;
-                            recordTextRunDerivedSyntheticTiming(t, source, elapsed);
-                        }
-                        source_index += 1;
-                        continue;
-                    },
-                    .eq => return error.InvalidRecord,
-                    .gt => {},
-                }
-            } else {
-                const synthetic_start = if (timings != null) textMonotonicNs(io) else 0;
-                try writeTextRunDerivedSyntheticSourceTerm(context, source, doc_count, deadline);
-                if (timings) |t| {
-                    const elapsed = textElapsedNs(io, synthetic_start);
-                    synthetic_ns += elapsed;
-                    recordTextRunDerivedSyntheticTiming(t, source, elapsed);
-                }
-                source_index += 1;
-                continue;
-            }
-        }
-
-        if (!have_next_run_record) return error.InvalidRecord;
-        const inline_singleton = try writeTextRunDerivedRecordFromRun(context, &record_storage);
-        if (inline_singleton) {
-            context.derived_inline_singleton_next_sampled_ns += next_run_record_sampled_ns;
-        }
-        const next_ordinal = streamingRunDerivedNextProbeOrdinal(context);
-        const next_start = streamingRunDerivedNextSampleStart(context, next_ordinal);
-        have_next_run_record = try reader.nextRecordInto(&record_storage);
-        next_run_record_sampled_ns = streamingRunDerivedSampleElapsedNs(context, next_start, streaming_run_derived_record_probe_stride);
-        context.derived_next_sampled_ns += next_run_record_sampled_ns;
-    }
-    if (timings) |t| {
-        const elapsed = textElapsedNs(io, records_start);
-        t.run_derived_regular_ns += if (elapsed >= synthetic_ns) elapsed - synthetic_ns else 0;
-    }
-}
-
-fn writeTextRunDerivedRecordsAndSyntheticTermsFromDisjointRuns(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    run_paths: []const []const u8,
-    synthetic_sources: []const TextPostingSyntheticRunSource,
-    doc_count: u64,
-    deadline: core.QueryDeadline,
-    context: *StreamingRunDerivedFilesContext,
-    timings: ?*PersistentTextRebuildTimings,
-) !void {
-    const records_start = if (timings != null) textMonotonicNs(io) else 0;
-    var synthetic_ns: u128 = 0;
-    var source_index: usize = 0;
-
-    for (run_paths) |run_path| {
-        var file = try std.Io.Dir.cwd().openFile(io, run_path, .{});
-        const stat = try file.stat(io);
-        if (stat.kind != .file) {
-            file.close(io);
-            return error.InvalidRecord;
-        }
-        var reader = TextPostingRunReader.init(allocator, io, file, stat.size) catch |err| {
-            file.close(io);
-            return err;
-        };
-        defer reader.deinit();
-
-        var record_storage: TextPostingRunRecord = undefined;
-        var have_next_run_record = true;
-        while (true) {
-            const next_ordinal = streamingRunDerivedNextProbeOrdinal(context);
-            const next_start = streamingRunDerivedNextSampleStart(context, next_ordinal);
-            have_next_run_record = try reader.nextRecordInto(&record_storage);
-            const next_run_record_sampled_ns = streamingRunDerivedSampleElapsedNs(context, next_start, streaming_run_derived_record_probe_stride);
-            context.derived_next_sampled_ns += next_run_record_sampled_ns;
-            if (!have_next_run_record) break;
-
-            while (source_index < synthetic_sources.len) {
-                const source = synthetic_sources[source_index];
-                switch (std.mem.order(u8, source.term(), record_storage.term())) {
-                    .lt => {
-                        const synthetic_start = if (timings != null) textMonotonicNs(io) else 0;
-                        try writeTextRunDerivedSyntheticSourceTerm(context, source, doc_count, deadline);
-                        if (timings) |t| {
-                            const elapsed = textElapsedNs(io, synthetic_start);
-                            synthetic_ns += elapsed;
-                            recordTextRunDerivedSyntheticTiming(t, source, elapsed);
-                        }
-                        source_index += 1;
-                        continue;
-                    },
-                    .eq => return error.InvalidRecord,
-                    .gt => break,
-                }
-            }
-
-            if (deadline.expired()) return core.Error.BudgetExceeded;
-            const inline_singleton = try writeTextRunDerivedRecordFromRun(context, &record_storage);
-            if (inline_singleton) {
-                context.derived_inline_singleton_next_sampled_ns += next_run_record_sampled_ns;
-            }
-        }
-    }
-
-    while (source_index < synthetic_sources.len) {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
-        const source = synthetic_sources[source_index];
-        const synthetic_start = if (timings != null) textMonotonicNs(io) else 0;
-        try writeTextRunDerivedSyntheticSourceTerm(context, source, doc_count, deadline);
-        if (timings) |t| {
-            const elapsed = textElapsedNs(io, synthetic_start);
-            synthetic_ns += elapsed;
-            recordTextRunDerivedSyntheticTiming(t, source, elapsed);
-        }
-        source_index += 1;
-    }
-
-    if (timings) |t| {
-        const elapsed = textElapsedNs(io, records_start);
-        t.run_derived_regular_ns += if (elapsed >= synthetic_ns) elapsed - synthetic_ns else 0;
-    }
-}
-
-fn writeTextRunDerivedRecordsAndSyntheticTerms(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    run_paths: []const []const u8,
-    synthetic_sources: []const TextPostingSyntheticRunSource,
-    run_paths_disjoint_term_ranges: bool,
-    doc_count: u64,
-    deadline: core.QueryDeadline,
-    context: *StreamingRunDerivedFilesContext,
-    timings: ?*PersistentTextRebuildTimings,
-) !void {
-    if (run_paths.len == 1) {
-        return try writeTextRunDerivedRecordsAndSyntheticTermsFromSingleRun(
-            allocator,
-            io,
-            run_paths[0],
-            synthetic_sources,
-            doc_count,
-            deadline,
-            context,
-            timings,
-        );
-    }
-    if (run_paths_disjoint_term_ranges and run_paths.len > 1) {
-        return try writeTextRunDerivedRecordsAndSyntheticTermsFromDisjointRuns(
-            allocator,
-            io,
-            run_paths,
-            synthetic_sources,
-            doc_count,
-            deadline,
-            context,
-            timings,
-        );
-    }
-
-    const records_start = if (timings != null) textMonotonicNs(io) else 0;
-    var synthetic_ns: u128 = 0;
-    var merger = try TextPostingRunMerger.init(allocator, io, run_paths);
-    defer merger.deinit();
-
-    const first_next_ordinal = streamingRunDerivedNextProbeOrdinal(context);
-    const first_next_start = streamingRunDerivedNextSampleStart(context, first_next_ordinal);
-    const first_next_child_probe_active = streamingRunDerivedNextChildProbeActive(context, first_next_ordinal);
-    var first_next_probe = TextPostingRunMerger.NextProbe{};
-    var next_run_record = try merger.nextWithProbe(if (first_next_child_probe_active) &first_next_probe else null);
-    var next_run_record_sampled_ns = streamingRunDerivedSampleElapsedNs(context, first_next_start, streaming_run_derived_record_probe_stride);
-    context.derived_next_sampled_ns += next_run_record_sampled_ns;
-    addStreamingRunDerivedNextProbeNs(context, first_next_child_probe_active, first_next_probe);
-    var source_index: usize = 0;
-    while (next_run_record != null or source_index < synthetic_sources.len) {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
-
-        if (source_index < synthetic_sources.len) {
-            const source = synthetic_sources[source_index];
-            if (next_run_record) |run_record| {
-                switch (std.mem.order(u8, source.term(), run_record.term())) {
-                    .lt => {
-                        const synthetic_start = if (timings != null) textMonotonicNs(io) else 0;
-                        try writeTextRunDerivedSyntheticSourceTerm(context, source, doc_count, deadline);
-                        if (timings) |t| {
-                            const elapsed = textElapsedNs(io, synthetic_start);
-                            synthetic_ns += elapsed;
-                            recordTextRunDerivedSyntheticTiming(t, source, elapsed);
-                        }
-                        source_index += 1;
-                        continue;
-                    },
-                    .eq => return error.InvalidRecord,
-                    .gt => {},
-                }
-            } else {
-                const synthetic_start = if (timings != null) textMonotonicNs(io) else 0;
-                try writeTextRunDerivedSyntheticSourceTerm(context, source, doc_count, deadline);
-                if (timings) |t| {
-                    const elapsed = textElapsedNs(io, synthetic_start);
-                    synthetic_ns += elapsed;
-                    recordTextRunDerivedSyntheticTiming(t, source, elapsed);
-                }
-                source_index += 1;
-                continue;
-            }
-        }
-
-        const record = next_run_record orelse return error.InvalidRecord;
-        const inline_singleton = try writeTextRunDerivedRecordFromRun(context, &record);
-        if (inline_singleton) {
-            context.derived_inline_singleton_next_sampled_ns += next_run_record_sampled_ns;
-        }
-        const next_ordinal = streamingRunDerivedNextProbeOrdinal(context);
-        const next_start = streamingRunDerivedNextSampleStart(context, next_ordinal);
-        const next_child_probe_active = streamingRunDerivedNextChildProbeActive(context, next_ordinal);
-        var next_probe = TextPostingRunMerger.NextProbe{};
-        next_run_record = try merger.nextWithProbe(if (next_child_probe_active) &next_probe else null);
-        next_run_record_sampled_ns = streamingRunDerivedSampleElapsedNs(context, next_start, streaming_run_derived_record_probe_stride);
-        context.derived_next_sampled_ns += next_run_record_sampled_ns;
-        addStreamingRunDerivedNextProbeNs(context, next_child_probe_active, next_probe);
-    }
-    if (timings) |t| {
-        const elapsed = textElapsedNs(io, records_start);
-        t.run_derived_regular_ns += if (elapsed >= synthetic_ns) elapsed - synthetic_ns else 0;
-    }
-}
-
-fn writeTextRunCatalogFilesFromRuns(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    run_paths: []const []const u8,
-    summary_files: []const TextPostingRunSummaryFile,
-    synthetic_sources: []const TextPostingSyntheticRunSource,
-    run_paths_disjoint_term_ranges: bool,
-    summary_stats: TextPostingRunSummaryStats,
-    docs_view: *TextDocsFileView,
-    meta: PersistentTextMeta,
-    deadline: core.QueryDeadline,
-    timings: ?*PersistentTextRebuildTimings,
-) !void {
-    const postings_path = try textPostingsPath(allocator, store);
-    defer allocator.free(postings_path);
-    const blocks_path = try textPostingBlocksPath(allocator, store);
-    defer allocator.free(blocks_path);
-    const impacts_path = try textPostingBlockImpactsPath(allocator, store);
-    defer allocator.free(impacts_path);
-    const top_hits_path = try textTermTopHitsPath(allocator, store);
-    defer allocator.free(top_hits_path);
-    const terms_path = try textTermsPath(allocator, store);
-    defer allocator.free(terms_path);
-
-    const postings_tmp_path = try tmpPathFor(allocator, postings_path);
-    defer allocator.free(postings_tmp_path);
-    const blocks_tmp_path = try tmpPathFor(allocator, blocks_path);
-    defer allocator.free(blocks_tmp_path);
-    const impacts_tmp_path = try tmpPathFor(allocator, impacts_path);
-    defer allocator.free(impacts_tmp_path);
-    const top_hits_tmp_path = try tmpPathFor(allocator, top_hits_path);
-    defer allocator.free(top_hits_tmp_path);
-    const terms_tmp_path = try tmpPathFor(allocator, terms_path);
-    defer allocator.free(terms_tmp_path);
-    errdefer std.Io.Dir.cwd().deleteFile(store.io, postings_tmp_path) catch {};
-    errdefer std.Io.Dir.cwd().deleteFile(store.io, blocks_tmp_path) catch {};
-    errdefer std.Io.Dir.cwd().deleteFile(store.io, impacts_tmp_path) catch {};
-    errdefer std.Io.Dir.cwd().deleteFile(store.io, top_hits_tmp_path) catch {};
-    errdefer std.Io.Dir.cwd().deleteFile(store.io, terms_tmp_path) catch {};
-
-    {
-        var postings_file = try std.Io.Dir.cwd().createFile(store.io, postings_tmp_path, .{ .read = true, .truncate = true });
-        defer postings_file.close(store.io);
-        var blocks_file = try std.Io.Dir.cwd().createFile(store.io, blocks_tmp_path, .{ .read = true, .truncate = true });
-        defer blocks_file.close(store.io);
-        var impacts_file = try std.Io.Dir.cwd().createFile(store.io, impacts_tmp_path, .{ .read = true, .truncate = true });
-        defer impacts_file.close(store.io);
-        var top_hits_file = try std.Io.Dir.cwd().createFile(store.io, top_hits_tmp_path, .{ .read = true, .truncate = true });
-        defer top_hits_file.close(store.io);
-        var terms_file = try std.Io.Dir.cwd().createFile(store.io, terms_tmp_path, .{ .read = true, .truncate = true });
-        defer terms_file.close(store.io);
-
-        const max_postings_body_bytes = std.math.mul(u64, summary_stats.posting_count, TextPostingRecord.encoded_len) catch return error.RecordTooLarge;
-        var postings_writer = try TextBufferedWriter.init(allocator, store.io, postings_file, try textWriteBufferCapacity(try textPostingsFileSize(max_postings_body_bytes)));
-        defer postings_writer.deinit();
-        const blocks_records_offset = try textPostingBlockRecordOffset(summary_stats.term_count, 0);
-        const blocks_file_size = try textPostingBlocksFileSize(@intCast(summary_stats.term_count), summary_stats.block_count);
-        const blocks_offsets_offset = try textPostingBlockCheckpointTableOffset(summary_stats.block_count);
-        const blocks_byte_offsets_offset = try textPostingBlockByteOffsetCheckpointTableOffset(summary_stats.term_count, summary_stats.block_count);
-        var blocks_offsets_writer = try TextBufferedWriter.initAtOffset(allocator, store.io, blocks_file, try textWriteBufferCapacity(@max(@as(u64, 1), blocks_byte_offsets_offset - blocks_offsets_offset)), blocks_offsets_offset);
-        defer blocks_offsets_writer.deinit();
-        var blocks_writer = try TextBufferedWriter.initAtOffset(allocator, store.io, blocks_file, try textWriteBufferCapacity(@max(@as(u64, 1), blocks_offsets_offset - blocks_records_offset)), blocks_records_offset);
-        defer blocks_writer.deinit();
-        var blocks_byte_offsets_writer = try TextBufferedWriter.initAtOffset(allocator, store.io, blocks_file, try textWriteBufferCapacity(@max(@as(u64, 1), blocks_file_size - blocks_byte_offsets_offset)), blocks_byte_offsets_offset);
-        defer blocks_byte_offsets_writer.deinit();
-
-        const impacts_records_offset = try textPostingBlockImpactRecordOffset(summary_stats.term_count, 0);
-        const impacts_file_size = try textPostingBlockImpactsFileSize(@intCast(summary_stats.term_count), summary_stats.block_count);
-        var impacts_writer = try TextBufferedWriter.initAtOffset(allocator, store.io, impacts_file, try textWriteBufferCapacity(@max(@as(u64, 1), impacts_file_size - impacts_records_offset)), impacts_records_offset);
-        defer impacts_writer.deinit();
-
-        const top_hits_records_offset = try textTermTopHitRecordOffset(0);
-        const top_hits_file_size = try textTermTopHitsFileSize(summary_stats.hit_count, summary_stats.top_hit_term_count);
-        const top_hits_index_offset = try textTermTopHitTermIndexOffset(summary_stats.hit_count);
-        var top_hits_index_writer = try TextBufferedWriter.initAtOffset(allocator, store.io, top_hits_file, try textWriteBufferCapacity(@max(@as(u64, 1), top_hits_file_size - top_hits_index_offset)), top_hits_index_offset);
-        defer top_hits_index_writer.deinit();
-        var top_hits_writer = try TextBufferedWriter.initAtOffset(allocator, store.io, top_hits_file, try textWriteBufferCapacity(@max(@as(u64, 1), top_hits_index_offset - top_hits_records_offset)), top_hits_records_offset);
-        defer top_hits_writer.deinit();
-
-        const terms_bytes_offset = try textTermsBytesOffset(@intCast(summary_stats.term_count));
-        var terms_entry_writer = try TextBufferedWriter.init(allocator, store.io, terms_file, try textWriteBufferCapacity(terms_bytes_offset));
-        defer terms_entry_writer.deinit();
-        const term_bytes_buffer_size = @max(@as(u64, 1), summary_stats.term_bytes_len);
-        var terms_bytes_writer = try TextBufferedWriter.initAtOffset(allocator, store.io, terms_file, try textWriteBufferCapacity(term_bytes_buffer_size), terms_bytes_offset);
-        defer terms_bytes_writer.deinit();
-        const terms_checkpoints_offset = try textTermByteOffsetCheckpointTableOffset(@intCast(summary_stats.term_count), summary_stats.term_bytes_len);
-        const term_checkpoint_buffer_size = @max(@as(u64, 1), try textTermByteOffsetCheckpointTableBytes(summary_stats.term_count));
-        var terms_checkpoints_writer = try TextBufferedWriter.initAtOffset(allocator, store.io, terms_file, try textWriteBufferCapacity(term_checkpoint_buffer_size), terms_checkpoints_offset);
-        defer terms_checkpoints_writer.deinit();
-        const terms_exception_rank_offset = try textTermExceptionRankCheckpointTableOffset(@intCast(summary_stats.term_count), summary_stats.term_bytes_len);
-        const terms_exception_rank_buffer_size = @max(@as(u64, 1), try textTermExceptionRankCheckpointTableBytes(summary_stats.term_count));
-        var terms_exception_rank_writer = try TextBufferedWriter.initAtOffset(allocator, store.io, terms_file, try textWriteBufferCapacity(terms_exception_rank_buffer_size), terms_exception_rank_offset);
-        defer terms_exception_rank_writer.deinit();
-        const terms_exception_membership_offset = try textTermExceptionMembershipBitsetOffset(@intCast(summary_stats.term_count), summary_stats.term_bytes_len);
-        const terms_exception_membership_buffer_size = @max(@as(u64, 1), try textTermExceptionMembershipBytes(summary_stats.term_count));
-        var terms_exception_membership_writer = try TextBufferedWriter.initAtOffset(allocator, store.io, terms_file, try textWriteBufferCapacity(terms_exception_membership_buffer_size), terms_exception_membership_offset);
-        defer terms_exception_membership_writer.deinit();
-        const terms_exception_payload_offset = try textTermExceptionPayloadTableOffset(@intCast(summary_stats.term_count), summary_stats.term_bytes_len);
-        const terms_exception_payload_buffer_size = @max(@as(u64, 1), try textTermExceptionPayloadTableBytes(summary_stats.term_exception_count));
-        var terms_exception_payload_writer = try TextBufferedWriter.initAtOffset(allocator, store.io, terms_file, try textWriteBufferCapacity(terms_exception_payload_buffer_size), terms_exception_payload_offset);
-        defer terms_exception_payload_writer.deinit();
-        const terms_singleton_count = try textTermSingletonPayloadCount(summary_stats.term_count, summary_stats.term_exception_count);
-        const terms_singleton_checkpoints_offset = try textTermSingletonPayloadCheckpointTableOffset(@intCast(summary_stats.term_count), summary_stats.term_bytes_len, summary_stats.term_exception_count);
-        const terms_singleton_checkpoint_buffer_size = @max(@as(u64, 1), try textTermSingletonPayloadCheckpointTableBytes(terms_singleton_count));
-        var terms_singleton_checkpoints_writer = try TextBufferedWriter.initAtOffset(allocator, store.io, terms_file, try textWriteBufferCapacity(terms_singleton_checkpoint_buffer_size), terms_singleton_checkpoints_offset);
-        defer terms_singleton_checkpoints_writer.deinit();
-        const terms_singleton_payload_offset = try textTermSingletonPayloadStreamOffset(@intCast(summary_stats.term_count), summary_stats.term_bytes_len, summary_stats.term_exception_count);
-        const terms_singleton_payload_max_bytes = std.math.mul(u64, terms_singleton_count, 5) catch return error.RecordTooLarge;
-        var terms_singleton_payload_writer = try TextBufferedWriter.initAtOffset(allocator, store.io, terms_file, try textWriteBufferCapacity(@max(@as(u64, 1), terms_singleton_payload_max_bytes)), terms_singleton_payload_offset);
-        defer terms_singleton_payload_writer.deinit();
-
-        var postings_header_bytes: [TextPostingsHeader.encoded_len]u8 = undefined;
-        (TextPostingsHeader{ .posting_count = summary_stats.posting_count, .body_bytes = 0 }).encode(&postings_header_bytes);
-        try postings_writer.append(&postings_header_bytes);
-
-        var blocks_header_bytes: [TextPostingBlocksHeader.encoded_len]u8 = undefined;
-        (TextPostingBlocksHeader{
-            .term_count = @intCast(summary_stats.term_count),
-            .posting_count = summary_stats.posting_count,
-            .block_count = summary_stats.block_count,
-            .block_size = persistent_posting_block_size,
-        }).encode(&blocks_header_bytes);
-        try blocks_file.writePositionalAll(store.io, &blocks_header_bytes, 0);
-
-        var impacts_header_bytes: [TextPostingBlockImpactsHeader.encoded_len]u8 = undefined;
-        (TextPostingBlockImpactsHeader{
-            .term_count = @intCast(summary_stats.term_count),
-            .block_count = summary_stats.block_count,
-        }).encode(&impacts_header_bytes);
-        try impacts_file.writePositionalAll(store.io, &impacts_header_bytes, 0);
-
-        var top_hits_header_bytes: [TextTermTopHitsHeader.encoded_len]u8 = undefined;
-        (TextTermTopHitsHeader{
-            .term_count = @intCast(summary_stats.term_count),
-            .hit_count = summary_stats.hit_count,
-            .hit_term_count = summary_stats.top_hit_term_count,
-            .capacity = persistent_term_top_hit_capacity,
-        }).encode(&top_hits_header_bytes);
-        try top_hits_file.writePositionalAll(store.io, &top_hits_header_bytes, 0);
-
-        var terms_header_bytes: [TextTermsHeader.encoded_len]u8 = undefined;
-        (TextTermsHeader{
-            .term_count = @intCast(summary_stats.term_count),
-            .term_bytes = summary_stats.term_bytes_len,
-            .term_exception_count = summary_stats.term_exception_count,
-            .singleton_payload_bytes = 0,
-        }).encode(&terms_header_bytes);
-        try terms_entry_writer.append(&terms_header_bytes);
-
-        textBenchTrace("catalog_summary_reader_init_start");
-        var summary_reader = TextPostingRunMergedSummaryReader.init(allocator, store.io, summary_files, meta.doc_count) catch |err| {
-            textBenchTrace("catalog_summary_reader_init_error");
-            return err;
-        };
-        defer summary_reader.deinit();
-
-        var context = StreamingRunDerivedFilesContext{
-            .allocator = allocator,
-            .io = store.io,
-            .postings_writer = &postings_writer,
-            .blocks_offsets_writer = &blocks_offsets_writer,
-            .blocks_byte_offsets_writer = &blocks_byte_offsets_writer,
-            .blocks_writer = &blocks_writer,
-            .impacts_writer = &impacts_writer,
-            .top_hits_index_writer = &top_hits_index_writer,
-            .top_hits_writer = &top_hits_writer,
-            .terms_entry_writer = &terms_entry_writer,
-            .terms_bytes_writer = &terms_bytes_writer,
-            .terms_checkpoints_writer = &terms_checkpoints_writer,
-            .terms_exception_rank_writer = &terms_exception_rank_writer,
-            .terms_exception_membership_writer = &terms_exception_membership_writer,
-            .terms_exception_payload_writer = &terms_exception_payload_writer,
-            .terms_singleton_checkpoints_writer = &terms_singleton_checkpoints_writer,
-            .terms_singleton_payload_writer = &terms_singleton_payload_writer,
-            .summary_reader = &summary_reader,
-            .summary_count = summary_stats.term_count,
-            .docs_view = docs_view,
-            .meta = meta,
-            .avg_doc_len = persistentAvgDocLen(meta),
-            .block_size = persistent_posting_block_size,
-            .collect_derived_shape_probes = timings != null,
-        };
-        defer context.deinit();
-        if (summary_stats.regular_constant_top_hit_term_count != 0) {
-            textBenchTrace("catalog_global_doc_rank_start");
-            ensureStreamingRunDerivedGlobalDocRank(&context, deadline) catch |err| {
-                textBenchTrace("catalog_global_doc_rank_error");
-                return err;
-            };
-            textBenchTrace("catalog_global_doc_rank_done");
-        } else if (summary_stats.top_hit_term_count != 0) {
-            textBenchTrace("catalog_virtual_top_docs_start");
-            ensureStreamingRunDerivedVirtualAllDocsTopDocs(&context, deadline) catch |err| {
-                textBenchTrace("catalog_virtual_top_docs_error");
-                return err;
-            };
-            textBenchTrace("catalog_virtual_top_docs_done");
-        }
-        const dense_top_hit_precompute_start = if (timings != null) textMonotonicNs(store.io) else 0;
-        textBenchTrace("catalog_dense_precompute_start");
-        precomputeStreamingRunDerivedDenseAllDocsTopHits(&context, synthetic_sources, deadline) catch |err| {
-            textBenchTrace("catalog_dense_precompute_error");
-            return err;
-        };
-        if (timings) |t| {
-            t.run_derived_dense_ns += textElapsedNs(store.io, dense_top_hit_precompute_start);
-        }
-        textBenchTrace("catalog_records_start");
-        writeTextRunDerivedRecordsAndSyntheticTerms(allocator, store.io, run_paths, synthetic_sources, run_paths_disjoint_term_ranges, meta.doc_count, deadline, &context, timings) catch |err| {
-            textBenchTrace("catalog_records_error");
-            return err;
-        };
-        textBenchTrace("catalog_finish_term_start");
-        finishStreamingRunDerivedTerm(&context) catch |err| {
-            textBenchTrace("catalog_finish_term_error");
-            return err;
-        };
-        textBenchTrace("catalog_finish_exception_membership_start");
-        finishStreamingRunExceptionMembership(&context) catch |err| {
-            textBenchTrace("catalog_finish_exception_membership_error");
-            return err;
-        };
-        textBenchTrace("catalog_summary_reader_drain_start");
-        if ((summary_reader.nextRecord() catch |err| {
-            textBenchTrace("catalog_summary_reader_drain_error");
-            return err;
-        }) != null) {
-            textBenchTrace("catalog_summary_reader_drain_extra_record");
-            return error.InvalidRecord;
-        }
-        textBenchTrace("catalog_summary_reader_drain_done");
-        if (timings) |t| {
-            t.run_derived_next_sampled_ns = context.derived_next_sampled_ns;
-            t.run_derived_next_reader_sampled_ns = context.derived_next_reader_sampled_ns;
-            t.run_derived_next_queue_sampled_ns = context.derived_next_queue_sampled_ns;
-            t.run_derived_next_child_probe_count = context.derived_next_child_probe_count;
-            t.run_derived_next_queue_compare_count = context.derived_next_queue_compare_count;
-            t.run_derived_inline_singleton_next_sampled_ns = context.derived_inline_singleton_next_sampled_ns;
-            t.run_derived_inline_singleton_publish_sampled_ns = context.derived_inline_singleton_publish_sampled_ns;
-            t.run_derived_encode_sampled_ns = context.derived_encode_sampled_ns;
-            t.run_derived_write_sampled_ns = context.derived_write_sampled_ns;
-            t.run_derived_block_stats_sampled_ns = context.derived_block_stats_sampled_ns;
-            t.run_derived_top_hit_sampled_ns = context.derived_top_hit_sampled_ns;
-            t.run_derived_block_flush_sampled_ns = context.derived_block_flush_sampled_ns;
-            t.run_derived_global_doc_rank_ns = context.derived_global_doc_rank_ns;
-            t.run_derived_virtual_top_docs_ns = context.derived_virtual_top_docs_ns;
-            t.run_virtual_all_docs_top_hit_cache_doc_scans = context.virtual_all_docs_top_hit_cache_doc_scans;
-            t.run_derived_inline_singleton_terms = context.derived_inline_singleton_terms;
-            t.run_derived_virtual_terms = context.derived_virtual_terms;
-            t.run_derived_dense_terms = context.derived_dense_terms;
-            t.run_derived_block_terms = context.derived_block_terms;
-            t.run_derived_inline_singleton_records = context.derived_inline_singleton_records;
-            t.run_derived_virtual_records = context.derived_virtual_records;
-            t.run_derived_dense_records = context.derived_dense_records;
-            t.run_derived_block_records = context.derived_block_records;
-            t.run_derived_top_hit_block_evals = context.top_hit_block_evals;
-            t.run_derived_top_hit_block_skips = context.top_hit_block_skips;
-            t.run_derived_top_hit_block_not_full_evals = context.top_hit_block_not_full_evals;
-            t.run_derived_top_hit_block_ready_evals = context.top_hit_block_ready_evals;
-            t.run_derived_top_hit_block_upper_lt_2x_worst = context.top_hit_block_upper_lt_2x_worst;
-            t.run_derived_top_hit_block_upper_lt_4x_worst = context.top_hit_block_upper_lt_4x_worst;
-            t.run_derived_top_hit_block_upper_gte_4x_worst = context.top_hit_block_upper_gte_4x_worst;
-            t.run_derived_top_hit_candidate_evals = context.top_hit_candidate_evals;
-            t.run_derived_top_hit_doc_reads = context.top_hit_doc_reads;
-            t.run_derived_top_hit_regular_candidate_evals = context.top_hit_regular_candidate_evals;
-            t.run_derived_top_hit_regular_doc_reads = context.top_hit_regular_doc_reads;
-            t.run_derived_top_hit_virtual_candidate_evals = context.top_hit_virtual_candidate_evals;
-            t.run_derived_top_hit_virtual_doc_reads = context.top_hit_virtual_doc_reads;
-            t.run_derived_top_hit_dense_candidate_evals = context.top_hit_dense_candidate_evals;
-            t.run_derived_top_hit_dense_doc_reads = context.top_hit_dense_doc_reads;
-            t.run_derived_top_hit_dense_scan_records = context.top_hit_dense_scan_records;
-            t.run_derived_top_hit_dense_freq_bound_skips = context.top_hit_dense_freq_bound_skips;
-            t.run_derived_top_hit_dense_freq_bound_skip_runs = context.top_hit_dense_freq_bound_skip_runs;
-            t.run_derived_top_hit_regular_term_count = context.top_hit_regular_term_count;
-            t.run_derived_top_hit_regular_doc_read_term_count = context.top_hit_regular_doc_read_term_count;
-            const doc_read_heavy_terms = context.top_hit_regular_doc_read_heavy_terms[0..context.top_hit_regular_doc_read_heavy_term_count];
-            const candidate_heavy_terms = context.top_hit_regular_candidate_heavy_terms[0..context.top_hit_regular_candidate_heavy_term_count];
-            t.run_derived_top_hit_regular_top1_doc_reads = try textTopHitRegularProbeDocReadsSum(doc_read_heavy_terms, 1);
-            t.run_derived_top_hit_regular_top4_doc_reads = try textTopHitRegularProbeDocReadsSum(doc_read_heavy_terms, 4);
-            t.run_derived_top_hit_regular_top8_doc_reads = try textTopHitRegularProbeDocReadsSum(doc_read_heavy_terms, 8);
-            t.run_derived_top_hit_regular_top1_candidate_evals = try textTopHitRegularProbeCandidateEvalsSum(candidate_heavy_terms, 1);
-            t.run_derived_top_hit_regular_top4_candidate_evals = try textTopHitRegularProbeCandidateEvalsSum(candidate_heavy_terms, 4);
-            t.run_derived_top_hit_regular_top8_candidate_evals = try textTopHitRegularProbeCandidateEvalsSum(candidate_heavy_terms, 8);
-            if (doc_read_heavy_terms.len != 0) {
-                t.run_derived_top_hit_regular_heaviest_doc_read_term_postings = doc_read_heavy_terms[0].postings_count;
-                t.run_derived_top_hit_regular_heaviest_doc_read_term_block_evals = doc_read_heavy_terms[0].block_evals;
-                t.run_derived_top_hit_regular_heaviest_doc_read_term_candidate_evals = doc_read_heavy_terms[0].candidate_evals;
-            }
-            t.run_derived_top_hit_regular_constant_terms = context.top_hit_regular_constant_terms;
-            t.run_derived_top_hit_regular_constant_resolved_terms = context.top_hit_regular_constant_resolved_terms;
-            t.run_derived_top_hit_regular_constant_unresolved_terms = context.top_hit_regular_constant_unresolved_terms;
-            t.run_derived_top_hit_regular_constant_candidate_evals = context.top_hit_regular_constant_candidate_evals;
-            t.run_derived_top_hit_regular_constant_doc_reads = context.top_hit_regular_constant_doc_reads;
-            t.run_derived_top_hit_regular_nonconstant_candidate_evals = context.top_hit_regular_nonconstant_candidate_evals;
-            t.run_derived_top_hit_regular_nonconstant_doc_reads = context.top_hit_regular_nonconstant_doc_reads;
-            t.run_derived_top_hit_regular_constant_resolved_candidate_skips = context.top_hit_regular_constant_resolved_candidate_skips;
-        }
-        if (context.summary_index != summary_stats.term_count or
-            context.postings_written != summary_stats.posting_count or
-            context.blocks_written != summary_stats.block_count or
-            context.block_index_base != summary_stats.block_count or
-            context.impacts_written != summary_stats.block_count or
-            context.hits_written != summary_stats.hit_count or
-            context.hit_terms_written != summary_stats.top_hit_term_count or
-            context.term_entries_written != summary_stats.term_count or
-            context.term_exceptions_written != summary_stats.term_exception_count or
-            context.term_exception_rank_checkpoints_written != (try textTermExceptionRankCheckpointCount(summary_stats.term_count)) or
-            context.term_exception_membership_bytes_written != (try textTermExceptionMembershipBytes(summary_stats.term_count)) or
-            context.term_singletons_written != terms_singleton_count or
-            context.term_bytes_written != summary_stats.term_bytes_len or
-            context.term_byte_checkpoints_written != (try textTermByteOffsetCheckpointCount(summary_stats.term_count)) or
-            context.term_singleton_checkpoints_written != (try textTermSingletonPayloadCheckpointCount(terms_singleton_count)) or
-            context.block_offset_checkpoints_written != (try textPostingBlockCheckpointCount(summary_stats.term_count)) or
-            context.block_byte_offset_checkpoints_written != (try textPostingBlockByteOffsetCheckpointCount(summary_stats.block_count)))
-        {
-            if (textBenchTraceEnabled()) {
-                std.debug.print(
-                    "text_trace=catalog_counter_mismatch_a summary_index={}/{} postings={}/{} blocks={}/{} block_index_base={} impacts={}/{} hits={}/{} hit_terms={}/{} term_entries={}/{} term_exceptions={}/{}\n",
-                    .{
-                        context.summary_index,
-                        summary_stats.term_count,
-                        context.postings_written,
-                        summary_stats.posting_count,
-                        context.blocks_written,
-                        summary_stats.block_count,
-                        context.block_index_base,
-                        context.impacts_written,
-                        summary_stats.block_count,
-                        context.hits_written,
-                        summary_stats.hit_count,
-                        context.hit_terms_written,
-                        summary_stats.top_hit_term_count,
-                        context.term_entries_written,
-                        summary_stats.term_count,
-                        context.term_exceptions_written,
-                        summary_stats.term_exception_count,
-                    },
-                );
-                std.debug.print(
-                    "text_trace=catalog_counter_mismatch_b exception_rank_checkpoints={}/{} exception_membership_bytes={}/{} term_singletons={}/{} term_bytes={}/{} term_byte_checkpoints={}/{} singleton_checkpoints={}/{} block_offset_checkpoints={}/{} block_byte_offset_checkpoints={}/{}\n",
-                    .{
-                        context.term_exception_rank_checkpoints_written,
-                        try textTermExceptionRankCheckpointCount(summary_stats.term_count),
-                        context.term_exception_membership_bytes_written,
-                        try textTermExceptionMembershipBytes(summary_stats.term_count),
-                        context.term_singletons_written,
-                        terms_singleton_count,
-                        context.term_bytes_written,
-                        summary_stats.term_bytes_len,
-                        context.term_byte_checkpoints_written,
-                        try textTermByteOffsetCheckpointCount(summary_stats.term_count),
-                        context.term_singleton_checkpoints_written,
-                        try textTermSingletonPayloadCheckpointCount(terms_singleton_count),
-                        context.block_offset_checkpoints_written,
-                        try textPostingBlockCheckpointCount(summary_stats.term_count),
-                        context.block_byte_offset_checkpoints_written,
-                        try textPostingBlockByteOffsetCheckpointCount(summary_stats.block_count),
-                    },
-                );
-            }
-            return error.InvalidRecord;
-        }
-
-        const flush_start = if (timings != null) textMonotonicNs(store.io) else 0;
-        textBenchTrace("catalog_flush_start");
-        try postings_writer.flush();
-        (TextPostingsHeader{ .posting_count = summary_stats.posting_count, .body_bytes = context.postings_body_bytes_written }).encode(&postings_header_bytes);
-        try postings_file.writePositionalAll(store.io, &postings_header_bytes, 0);
-        try blocks_offsets_writer.flush();
-        try blocks_writer.flush();
-        try blocks_byte_offsets_writer.flush();
-        try impacts_writer.flush();
-        try top_hits_index_writer.flush();
-        try top_hits_writer.flush();
-        try terms_entry_writer.flush();
-        try terms_bytes_writer.flush();
-        try terms_checkpoints_writer.flush();
-        try terms_exception_rank_writer.flush();
-        try terms_exception_membership_writer.flush();
-        try terms_exception_payload_writer.flush();
-        try terms_singleton_checkpoints_writer.flush();
-        try terms_singleton_payload_writer.flush();
-        (TextTermsHeader{
-            .term_count = @intCast(summary_stats.term_count),
-            .term_bytes = summary_stats.term_bytes_len,
-            .term_exception_count = summary_stats.term_exception_count,
-            .singleton_payload_bytes = context.term_singleton_payload_bytes_written,
-        }).encode(&terms_header_bytes);
-        try terms_file.writePositionalAll(store.io, &terms_header_bytes, 0);
-        if (timings) |t| {
-            t.run_derived_tmp_postings_bytes = try regularFileSize(store, postings_file);
-            t.run_derived_tmp_terms_bytes = try regularFileSize(store, terms_file);
-            t.run_derived_tmp_blocks_bytes = try regularFileSize(store, blocks_file);
-            t.run_derived_tmp_impacts_bytes = try regularFileSize(store, impacts_file);
-            t.run_derived_tmp_top_hits_bytes = try regularFileSize(store, top_hits_file);
-            var tmp_total = t.run_derived_tmp_postings_bytes;
-            tmp_total = std.math.add(u64, tmp_total, t.run_derived_tmp_terms_bytes) catch return error.RecordTooLarge;
-            tmp_total = std.math.add(u64, tmp_total, t.run_derived_tmp_blocks_bytes) catch return error.RecordTooLarge;
-            tmp_total = std.math.add(u64, tmp_total, t.run_derived_tmp_impacts_bytes) catch return error.RecordTooLarge;
-            tmp_total = std.math.add(u64, tmp_total, t.run_derived_tmp_top_hits_bytes) catch return error.RecordTooLarge;
-            t.run_derived_tmp_total_bytes = tmp_total;
-        }
-        if (textOptionsNeedSync(store)) {
-            try postings_file.sync(store.io);
-            try blocks_file.sync(store.io);
-            try impacts_file.sync(store.io);
-            try top_hits_file.sync(store.io);
-            try terms_file.sync(store.io);
-        }
-        if (timings) |t| t.run_derived_flush_ns += textElapsedNs(store.io, flush_start);
-    }
-
-    const rename_start = if (timings != null) textMonotonicNs(store.io) else 0;
-    try renameReplace(store.io, postings_tmp_path, postings_path);
-    try renameReplace(store.io, blocks_tmp_path, blocks_path);
-    try renameReplace(store.io, impacts_tmp_path, impacts_path);
-    try renameReplace(store.io, top_hits_tmp_path, top_hits_path);
-    try renameReplace(store.io, terms_tmp_path, terms_path);
-    if (timings) |t| t.run_derived_rename_ns += textElapsedNs(store.io, rename_start);
-}
 
 fn appendDenseAllDocsFreqGroup(writer: *TextBufferedWriter, tags: []const u8, explicit_freqs: []const u8) !u64 {
     var tag_bytes_buf: [3]u8 = undefined;
@@ -15696,591 +8191,6 @@ fn appendDenseAllDocsFreqStreamPostings(writer: *TextBufferedWriter, postings: [
     return appendDenseAllDocsFreqBitpackedPostings(writer, postings, max_freq);
 }
 
-fn writeTextPostingsFile(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    path: []const u8,
-    terms: []const PersistentTerm,
-    posting_count: u64,
-    body_bytes: u64,
-) !void {
-    const tmp_path = try tmpPathFor(allocator, path);
-    defer allocator.free(tmp_path);
-    errdefer std.Io.Dir.cwd().deleteFile(store.io, tmp_path) catch {};
-    {
-        var file = try std.Io.Dir.cwd().createFile(store.io, tmp_path, .{ .read = true, .truncate = true });
-        defer file.close(store.io);
-        var writer = try TextBufferedWriter.init(allocator, store.io, file, try textWriteBufferCapacity(try textPostingsFileSize(body_bytes)));
-        defer writer.deinit();
-
-        var header_bytes: [TextPostingsHeader.encoded_len]u8 = undefined;
-        const header = TextPostingsHeader{ .posting_count = posting_count, .body_bytes = body_bytes };
-        header.encode(&header_bytes);
-        try writer.append(&header_bytes);
-        var record_bytes: [compressed_posting_max_encoded_len]u8 = undefined;
-        var written_body_bytes: u64 = 0;
-        for (terms) |term| {
-            const entry = textTermEntryFromPersistentTerm(term, null);
-            if (termEntryHasInlinePosting(entry)) continue;
-            if (termEntryDenseAllDocsFreqStreamOffset(entry)) |offset| {
-                if (offset != written_body_bytes) return error.InvalidRecord;
-                written_body_bytes = std.math.add(u64, written_body_bytes, try appendDenseAllDocsFreqStreamPostings(&writer, term.postings.items())) catch return error.RecordTooLarge;
-                continue;
-            }
-            if (!term.postings_offset_is_plain and !term.postings_offset_is_dense_freq_stream and (term.postings_offset & persistent_term_inline_posting_marker) != 0 and term.postings.len > 1) continue;
-            if (term.postings_offset != written_body_bytes) return error.InvalidRecord;
-            var previous_doc_id: u64 = 0;
-            for (term.postings.items(), 0..) |posting, posting_index| {
-                if (posting_index % persistent_posting_block_capacity == 0) previous_doc_id = 0;
-                const encoded_len = try encodeCompressedTextPosting(posting, previous_doc_id, &record_bytes);
-                try writer.append(record_bytes[0..encoded_len]);
-                written_body_bytes = std.math.add(u64, written_body_bytes, encoded_len) catch return error.RecordTooLarge;
-                previous_doc_id = posting.doc_id;
-            }
-        }
-        if (written_body_bytes != body_bytes) return error.InvalidRecord;
-        try writer.flush();
-        if (textOptionsNeedSync(store)) try file.sync(store.io);
-    }
-    try renameReplace(store.io, tmp_path, path);
-}
-
-fn writeTextPostingBlocksFile(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    path: []const u8,
-    terms: []const PersistentTerm,
-    posting_count: u64,
-    block_size: u64,
-) !void {
-    if (block_size == 0) return error.InvalidRecord;
-    const block_count = try postingBlockCountForTerms(terms, block_size);
-    const tmp_path = try tmpPathFor(allocator, path);
-    defer allocator.free(tmp_path);
-    errdefer std.Io.Dir.cwd().deleteFile(store.io, tmp_path) catch {};
-    {
-        var file = try std.Io.Dir.cwd().createFile(store.io, tmp_path, .{ .read = true, .truncate = true });
-        defer file.close(store.io);
-        var writer = try TextBufferedWriter.init(allocator, store.io, file, try textWriteBufferCapacity(try textPostingBlocksFileSize(@intCast(terms.len), block_count)));
-        defer writer.deinit();
-
-        var header_bytes: [TextPostingBlocksHeader.encoded_len]u8 = undefined;
-        const header = TextPostingBlocksHeader{
-            .term_count = @intCast(terms.len),
-            .posting_count = posting_count,
-            .block_count = block_count,
-            .block_size = block_size,
-        };
-        header.encode(&header_bytes);
-        try writer.append(&header_bytes);
-
-        var record_bytes: [TextPostingBlockRecord.encoded_len]u8 = undefined;
-        var term_block_offset: u64 = 0;
-        var term_offset_bytes: [persistent_posting_block_ordinal_len]u8 = undefined;
-        const block_len = std.math.cast(usize, block_size) orelse return error.RecordTooLarge;
-        for (terms) |term| {
-            const postings = term.postings.items();
-            const term_blocks = try publishedPostingBlockCountForPayload(postings.len, term.postings_offset, term.postings_offset_is_plain, term.postings_offset_is_dense_freq_stream, block_size);
-            if (term_blocks == 0) continue;
-            var pos: usize = 0;
-            var block_posting_offset = term.postings_offset;
-            while (pos < postings.len) {
-                const current_block_count = @min(postings.len - pos, block_len);
-                const block_postings = postings[pos..][0..current_block_count];
-                const stats = try postingBlockStatsFromMemory(
-                    block_postings,
-                    block_posting_offset,
-                );
-                try (try TextPostingBlockRecord.fromStats(stats)).encode(&record_bytes);
-                try writer.append(&record_bytes);
-                const range_bytes = try compressedTextPostingBytesForRange(block_postings, 0);
-                block_posting_offset = std.math.add(u64, block_posting_offset, range_bytes.bytes) catch return error.RecordTooLarge;
-                pos += current_block_count;
-            }
-        }
-        for (terms, 0..) |term, term_index| {
-            if (@as(u64, @intCast(term_index)) % persistent_posting_block_offset_checkpoint_terms == 0) {
-                try encodePersistentBlockOrdinal(term_block_offset, &term_offset_bytes);
-                try writer.append(&term_offset_bytes);
-            }
-            const term_blocks = try publishedPostingBlockCountForPayload(term.postings.len, term.postings_offset, term.postings_offset_is_plain, term.postings_offset_is_dense_freq_stream, block_size);
-            term_block_offset = std.math.add(u64, term_block_offset, term_blocks) catch return error.RecordTooLarge;
-        }
-        if (term_block_offset != block_count) return error.InvalidRecord;
-        var global_block_index: u64 = 0;
-        for (terms) |term| {
-            const postings = term.postings.items();
-            const term_blocks = try publishedPostingBlockCountForPayload(postings.len, term.postings_offset, term.postings_offset_is_plain, term.postings_offset_is_dense_freq_stream, block_size);
-            if (term_blocks == 0) continue;
-            var pos: usize = 0;
-            var block_posting_offset = term.postings_offset;
-            while (pos < postings.len) {
-                if (global_block_index % persistent_posting_block_byte_offset_checkpoint_blocks == 0) {
-                    if (block_posting_offset < term.postings_offset) return error.InvalidRecord;
-                    const relative_offset = block_posting_offset - term.postings_offset;
-                    if (relative_offset > std.math.maxInt(u32)) return error.RecordTooLarge;
-                    var offset_bytes: [4]u8 = undefined;
-                    std.mem.writeInt(u32, &offset_bytes, @intCast(relative_offset), .little);
-                    try writer.append(&offset_bytes);
-                }
-                const current_block_count = @min(postings.len - pos, block_len);
-                const range_bytes = try compressedTextPostingBytesForRange(postings[pos..][0..current_block_count], 0);
-                block_posting_offset = std.math.add(u64, block_posting_offset, range_bytes.bytes) catch return error.RecordTooLarge;
-                pos += current_block_count;
-                global_block_index = std.math.add(u64, global_block_index, 1) catch return error.RecordTooLarge;
-            }
-        }
-        if (global_block_index != block_count) return error.InvalidRecord;
-        try writer.flush();
-        if (textOptionsNeedSync(store)) try file.sync(store.io);
-    }
-    try renameReplace(store.io, tmp_path, path);
-}
-
-const MemoryPostingBlockImpact = struct {
-    local_block_index: u64,
-    max_weighted_tf: f32,
-    upper_score: f32,
-};
-
-fn memoryPostingBlockImpactLessThan(_: void, lhs: MemoryPostingBlockImpact, rhs: MemoryPostingBlockImpact) bool {
-    if (lhs.upper_score != rhs.upper_score) return lhs.upper_score > rhs.upper_score;
-    if (lhs.max_weighted_tf != rhs.max_weighted_tf) return lhs.max_weighted_tf > rhs.max_weighted_tf;
-    return lhs.local_block_index < rhs.local_block_index;
-}
-
-fn writeTextPostingBlockImpactsFile(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    path: []const u8,
-    terms: []const PersistentTerm,
-    block_size: u64,
-    meta: PersistentTextMeta,
-) !void {
-    if (block_size == 0) return error.InvalidRecord;
-    const block_count = try postingBlockCountForTerms(terms, block_size);
-    const tmp_path = try tmpPathFor(allocator, path);
-    defer allocator.free(tmp_path);
-    errdefer std.Io.Dir.cwd().deleteFile(store.io, tmp_path) catch {};
-    {
-        var file = try std.Io.Dir.cwd().createFile(store.io, tmp_path, .{ .read = true, .truncate = true });
-        defer file.close(store.io);
-        var writer = try TextBufferedWriter.init(allocator, store.io, file, try textWriteBufferCapacity(try textPostingBlockImpactsFileSize(@intCast(terms.len), block_count)));
-        defer writer.deinit();
-
-        var header_bytes: [TextPostingBlockImpactsHeader.encoded_len]u8 = undefined;
-        const header = TextPostingBlockImpactsHeader{
-            .term_count = @intCast(terms.len),
-            .block_count = block_count,
-        };
-        header.encode(&header_bytes);
-        try writer.append(&header_bytes);
-
-        var block_index_base: u64 = 0;
-        const block_len = std.math.cast(usize, block_size) orelse return error.RecordTooLarge;
-        const avg_doc_len = persistentAvgDocLen(meta);
-        var impact_bytes: [persistent_posting_block_ordinal_len]u8 = undefined;
-        for (terms) |term| {
-            const postings = term.postings.items();
-            var impacts = std.ArrayList(MemoryPostingBlockImpact).empty;
-            defer impacts.deinit(allocator);
-            const term_block_count = try publishedPostingBlockCountForPayload(postings.len, term.postings_offset, term.postings_offset_is_plain, term.postings_offset_is_dense_freq_stream, block_size);
-            if (term_block_count == 0) continue;
-            try impacts.ensureTotalCapacityPrecise(allocator, std.math.cast(usize, term_block_count) orelse return error.RecordTooLarge);
-            var pos: usize = 0;
-            var local_block_index: u64 = 0;
-            while (pos < postings.len) : (local_block_index += 1) {
-                const current_block_count = @min(postings.len - pos, block_len);
-                const stats = try postingBlockStatsFromMemory(
-                    postings[pos..][0..current_block_count],
-                    std.math.add(u64, block_index_base, local_block_index) catch return error.RecordTooLarge,
-                );
-                const stored_bounds = try quantizePersistentBlockScoreBounds(stats.max_weighted_tf, stats.min_doc_len);
-                const upper_score = bm25WeightedTermScore(
-                    stored_bounds.max_weighted_tf,
-                    stored_bounds.min_doc_len,
-                    avg_doc_len,
-                    meta.doc_count,
-                    @intCast(postings.len),
-                    .{},
-                );
-                if (!std.math.isFinite(upper_score)) return core.Error.Unsupported;
-                impacts.appendAssumeCapacity(.{
-                    .local_block_index = local_block_index,
-                    .max_weighted_tf = stored_bounds.max_weighted_tf,
-                    .upper_score = upper_score,
-                });
-                pos += current_block_count;
-            }
-            std.mem.sort(MemoryPostingBlockImpact, impacts.items, {}, memoryPostingBlockImpactLessThan);
-            for (impacts.items) |impact| {
-                const global_block_index = std.math.add(u64, block_index_base, impact.local_block_index) catch return error.RecordTooLarge;
-                try encodePersistentBlockOrdinal(global_block_index, &impact_bytes);
-                try writer.append(&impact_bytes);
-            }
-            block_index_base = std.math.add(u64, block_index_base, term_block_count) catch return error.RecordTooLarge;
-        }
-        if (block_index_base != block_count) return error.InvalidRecord;
-        try writer.flush();
-        if (textOptionsNeedSync(store)) try file.sync(store.io);
-    }
-    try renameReplace(store.io, tmp_path, path);
-}
-
-fn writeTextTermTopHitsFile(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    path: []const u8,
-    terms: []const PersistentTerm,
-    docs_view: *TextDocsFileView,
-    meta: PersistentTextMeta,
-) !void {
-    const hit_count = try textTermTopHitCount(terms);
-    const hit_term_count = try textTermTopHitTermCount(terms);
-    const tmp_path = try tmpPathFor(allocator, path);
-    defer allocator.free(tmp_path);
-    errdefer std.Io.Dir.cwd().deleteFile(store.io, tmp_path) catch {};
-    {
-        var file = try std.Io.Dir.cwd().createFile(store.io, tmp_path, .{ .read = true, .truncate = true });
-        defer file.close(store.io);
-        var writer = try TextBufferedWriter.init(allocator, store.io, file, try textWriteBufferCapacity(try textTermTopHitsFileSize(hit_count, hit_term_count)));
-        defer writer.deinit();
-
-        var header_bytes: [TextTermTopHitsHeader.encoded_len]u8 = undefined;
-        const header = TextTermTopHitsHeader{
-            .term_count = @intCast(terms.len),
-            .hit_count = hit_count,
-            .hit_term_count = hit_term_count,
-            .capacity = persistent_term_top_hit_capacity,
-        };
-        header.encode(&header_bytes);
-        try writer.append(&header_bytes);
-
-        const avg_doc_len = persistentAvgDocLen(meta);
-        var record_bytes: [TextTermTopHitRecord.encoded_len]u8 = undefined;
-        for (terms) |term| {
-            const postings = term.postings.items();
-            const term_hit_count = persistentTermTopHitCountForTerm(term);
-            if (term_hit_count == 0) continue;
-            var hits = std.ArrayList(TextTermTopHitRecord).empty;
-            defer hits.deinit(allocator);
-            try hits.ensureTotalCapacityPrecise(allocator, @intCast(term_hit_count));
-            var worst_hit_index: ?usize = null;
-            for (postings) |posting| {
-                if (posting.doc_id == 0 or posting.doc_id > meta.doc_count) return error.InvalidRecord;
-                if (try textTermTopHitCandidateCannotBeatCurrentWorst(
-                    hits.items,
-                    worst_hit_index,
-                    @intCast(term_hit_count),
-                    posting,
-                    avg_doc_len,
-                    meta.doc_count,
-                    @intCast(postings.len),
-                )) continue;
-                const doc = try docs_view.readTopHitDocStatsAt(posting.doc_id - 1);
-                if (doc.doc_id != posting.doc_id) return error.InvalidRecord;
-                const score = bm25WeightedTermScore(
-                    persistentWeightedTf(posting),
-                    doc.doc_len,
-                    avg_doc_len,
-                    meta.doc_count,
-                    @intCast(postings.len),
-                    .{},
-                );
-                if (!std.math.isFinite(score)) return core.Error.Unsupported;
-                try appendTopTextTermHitBoundedCachedWorst(allocator, &hits, @intCast(persistent_term_top_hit_capacity), &worst_hit_index, .{
-                    .doc_id = doc.doc_id,
-                    .text_freq = posting.text_freq,
-                    .node_id = doc.node_id,
-                    .score = score,
-                });
-            }
-            std.mem.sort(TextTermTopHitRecord, hits.items, {}, textTermTopHitLessThan);
-            for (hits.items) |hit| {
-                try hit.encode(&record_bytes);
-                try writer.append(&record_bytes);
-            }
-        }
-        var term_hit_offset: u64 = 0;
-        var hit_terms_written: u64 = 0;
-        var term_header_bytes: [TextTermTopHitTermRecord.encoded_len]u8 = undefined;
-        for (terms, 0..) |term, term_index| {
-            const term_hit_count = persistentTermTopHitCountForTerm(term);
-            if (term_hit_count == 0) continue;
-            try (TextTermTopHitTermRecord{
-                .term_index = @intCast(term_index),
-                .hit_offset = term_hit_offset,
-                .hit_count = term_hit_count,
-            }).encode(&term_header_bytes);
-            try writer.append(&term_header_bytes);
-            hit_terms_written = std.math.add(u64, hit_terms_written, 1) catch return error.RecordTooLarge;
-            term_hit_offset = std.math.add(u64, term_hit_offset, term_hit_count) catch return error.RecordTooLarge;
-        }
-        if (term_hit_offset != hit_count) return error.InvalidRecord;
-        if (hit_terms_written != hit_term_count) return error.InvalidRecord;
-        try writer.flush();
-        if (textOptionsNeedSync(store)) try file.sync(store.io);
-    }
-    try renameReplace(store.io, tmp_path, path);
-}
-
-fn textTermTopHitCount(terms: []const PersistentTerm) !u64 {
-    var hit_count: u64 = 0;
-    for (terms) |term| {
-        hit_count = std.math.add(u64, hit_count, persistentTermTopHitCountForTerm(term)) catch return error.RecordTooLarge;
-    }
-    return hit_count;
-}
-
-fn textTermTopHitTermCount(terms: []const PersistentTerm) !u64 {
-    var hit_term_count: u64 = 0;
-    for (terms) |term| {
-        if (persistentTermTopHitCountForTerm(term) != 0) {
-            hit_term_count = std.math.add(u64, hit_term_count, 1) catch return error.RecordTooLarge;
-        }
-    }
-    return hit_term_count;
-}
-
-fn persistentTermTopHitCountForTerm(term: PersistentTerm) u64 {
-    return persistentTermTopHitCountForPostingCount(@intCast(term.postings.len));
-}
-
-fn persistentTermTopHitCountForPostingCount(postings_len: u64) u64 {
-    if (postings_len < persistent_term_top_hit_min_postings) return 0;
-    return @min(postings_len, persistent_term_top_hit_capacity);
-}
-
-fn postingBlockCountForTerms(terms: []const PersistentTerm, block_size: u64) !u64 {
-    if (block_size == 0) return error.InvalidRecord;
-    var block_count: u64 = 0;
-    for (terms) |term| {
-        block_count = std.math.add(u64, block_count, try publishedPostingBlockCountForPayload(term.postings.len, term.postings_offset, term.postings_offset_is_plain, term.postings_offset_is_dense_freq_stream, block_size)) catch return error.RecordTooLarge;
-    }
-    return block_count;
-}
-
-fn publishedPostingBlockCountForEntry(entry: TextTermEntry, block_size: u64) !u64 {
-    if (termEntryVirtualAllDocsTextFreq(entry) != null) return 0;
-    if (termEntryDenseAllDocsFreqStreamOffset(entry) != null) return 0;
-    return publishedPostingBlockCount(std.math.cast(usize, entry.postings_count) orelse return error.RecordTooLarge, block_size);
-}
-
-fn publishedPostingBlockCountForPayload(postings_len: usize, postings_offset: u64, postings_offset_is_plain: bool, postings_offset_is_dense_freq_stream: bool, block_size: u64) !u64 {
-    if (postings_offset_is_dense_freq_stream) return 0;
-    if (!postings_offset_is_plain and postings_len > 1 and (postings_offset & persistent_term_inline_posting_marker) != 0) return 0;
-    return publishedPostingBlockCount(postings_len, block_size);
-}
-
-fn publishedPostingBlockCount(postings_len: usize, block_size: u64) !u64 {
-    const natural_count = try postingBlockCount(postings_len, block_size);
-    if (natural_count <= 1) return 0;
-    return natural_count;
-}
-
-fn postingBlockCount(postings_len: usize, block_size: u64) !u64 {
-    if (block_size == 0) return error.InvalidRecord;
-    const len: u64 = @intCast(postings_len);
-    const with_rounding = std.math.add(u64, len, block_size - 1) catch return error.RecordTooLarge;
-    return with_rounding / block_size;
-}
-
-fn postingBlockStatsFromMemory(postings: []const TextPostingRecord, posting_offset: u64) !TextPostingBlockStats {
-    if (postings.len == 0) return error.InvalidRecord;
-    var previous_doc_id: u64 = 0;
-    var stats = TextPostingBlockStats{
-        .posting_offset = posting_offset,
-        .posting_count = @intCast(postings.len),
-        .first_doc_id = 0,
-        .last_doc_id = 0,
-        .max_weighted_tf = 0,
-        .min_doc_len = std.math.inf(f32),
-    };
-    for (postings) |posting| {
-        try addPostingToBlockStats(posting, &previous_doc_id, std.math.maxInt(u64), &stats);
-    }
-    return stats;
-}
-
-fn persistentTermExceptionCount(terms: []const PersistentTerm) !u64 {
-    var count: u64 = 0;
-    for (terms) |term| {
-        const entry = textTermEntryFromPersistentTerm(term, null);
-        if (!termEntryHasInlinePosting(entry)) {
-            count = std.math.add(u64, count, 1) catch return error.RecordTooLarge;
-        }
-    }
-    return count;
-}
-
-const SingletonPayloadBytes = struct {
-    checkpoints: std.ArrayList(u8) = .empty,
-    payloads: std.ArrayList(u8) = .empty,
-    count: u64 = 0,
-
-    fn deinit(self: *SingletonPayloadBytes, allocator: std.mem.Allocator) void {
-        self.payloads.deinit(allocator);
-        self.checkpoints.deinit(allocator);
-    }
-};
-
-fn appendSingletonPayloadBytes(
-    allocator: std.mem.Allocator,
-    out: *SingletonPayloadBytes,
-    previous_payload: *u32,
-    payload: u32,
-) !void {
-    _ = try decodeInlineSingletonPostingPayload(payload);
-    if (out.count % persistent_term_singleton_payload_checkpoint_terms == 0) {
-        var checkpoint_bytes: [TextTermSingletonPayloadCheckpoint.encoded_len]u8 = undefined;
-        try (TextTermSingletonPayloadCheckpoint{
-            .stream_offset = @intCast(out.payloads.items.len),
-            .previous_payload = previous_payload.*,
-        }).encode(&checkpoint_bytes);
-        try out.checkpoints.appendSlice(allocator, &checkpoint_bytes);
-    }
-    var delta_bytes: [10]u8 = undefined;
-    const encoded_delta = encodeZigZagI64(singletonPayloadDelta(previous_payload.*, payload));
-    const delta_len = try encodePersistentVarint(encoded_delta, &delta_bytes);
-    try out.payloads.appendSlice(allocator, delta_bytes[0..delta_len]);
-    previous_payload.* = payload;
-    out.count = std.math.add(u64, out.count, 1) catch return error.RecordTooLarge;
-}
-
-fn buildSingletonPayloadBytes(allocator: std.mem.Allocator, terms: []const PersistentTerm) !SingletonPayloadBytes {
-    var out = SingletonPayloadBytes{};
-    errdefer out.deinit(allocator);
-    var previous_payload: u32 = 0;
-    for (terms) |term| {
-        const entry = textTermEntryFromPersistentTerm(term, null);
-        if (!termEntryHasInlinePosting(entry)) continue;
-        try appendSingletonPayloadBytes(allocator, &out, &previous_payload, @intCast(entry.postings_offset));
-    }
-    const expected_checkpoint_bytes = try textTermSingletonPayloadCheckpointTableBytes(out.count);
-    if (out.checkpoints.items.len != expected_checkpoint_bytes) return error.InvalidRecord;
-    return out;
-}
-
-fn writeTextTermsFile(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    path: []const u8,
-    terms: []const PersistentTerm,
-    term_bytes_len: u64,
-) !void {
-    const tmp_path = try tmpPathFor(allocator, path);
-    defer allocator.free(tmp_path);
-    errdefer std.Io.Dir.cwd().deleteFile(store.io, tmp_path) catch {};
-    {
-        var file = try std.Io.Dir.cwd().createFile(store.io, tmp_path, .{ .read = true, .truncate = true });
-        defer file.close(store.io);
-        const term_exception_count = try persistentTermExceptionCount(terms);
-        var singleton_payloads = try buildSingletonPayloadBytes(allocator, terms);
-        defer singleton_payloads.deinit(allocator);
-        const singleton_count = try textTermSingletonPayloadCount(@intCast(terms.len), term_exception_count);
-        if (singleton_payloads.count != singleton_count) return error.InvalidRecord;
-        var writer = try TextBufferedWriter.init(allocator, store.io, file, try textWriteBufferCapacity(try textTermsFileSize(@intCast(terms.len), term_bytes_len, term_exception_count, @intCast(singleton_payloads.payloads.items.len))));
-        defer writer.deinit();
-
-        var header_bytes: [TextTermsHeader.encoded_len]u8 = undefined;
-        const header = TextTermsHeader{
-            .term_count = @intCast(terms.len),
-            .term_bytes = term_bytes_len,
-            .term_exception_count = term_exception_count,
-            .singleton_payload_bytes = @intCast(singleton_payloads.payloads.items.len),
-        };
-        header.encode(&header_bytes);
-        try writer.append(&header_bytes);
-
-        var entry_bytes: [TextTermEntry.encoded_len]u8 = undefined;
-        var previous_entry_term: ?[]const u8 = null;
-        for (terms, 0..) |term, term_index| {
-            const front_prefix_len = try persistentTermFrontCodedPrefixLen(@intCast(term_index), previous_entry_term, term.term);
-            const entry = textTermEntryFromPersistentTerm(term, front_prefix_len);
-            try entry.encode(&entry_bytes);
-            try writer.append(&entry_bytes);
-            previous_entry_term = term.term;
-        }
-        var checkpoint_bytes = std.ArrayList(u8).empty;
-        defer checkpoint_bytes.deinit(allocator);
-        try checkpoint_bytes.ensureTotalCapacityPrecise(allocator, std.math.cast(usize, try textTermByteOffsetCheckpointTableBytes(@intCast(terms.len))) orelse return error.RecordTooLarge);
-
-        var term_offset: u64 = 0;
-        var previous_term: ?[]const u8 = null;
-        for (terms, 0..) |term, term_index| {
-            if (@as(u64, @intCast(term_index)) % persistent_term_byte_offset_checkpoint_terms == 0) {
-                if (term_offset > persistent_term_bytes_max_offset) return error.RecordTooLarge;
-                var offset_bytes: [4]u8 = undefined;
-                std.mem.writeInt(u32, &offset_bytes, @intCast(term_offset), .little);
-                try checkpoint_bytes.appendSlice(allocator, &offset_bytes);
-            }
-            const encoded_term_len = try appendPersistentFrontCodedTerm(&writer, @intCast(term_index), previous_term, term.term);
-            term_offset = std.math.add(u64, term_offset, encoded_term_len) catch return error.RecordTooLarge;
-            previous_term = term.term;
-        }
-        if (term_offset != term_bytes_len) return error.InvalidRecord;
-        if (checkpoint_bytes.items.len != (try textTermByteOffsetCheckpointTableBytes(@intCast(terms.len)))) return error.InvalidRecord;
-        try writer.append(checkpoint_bytes.items);
-
-        var exception_rank_checkpoints_written: u64 = 0;
-        var exception_membership_bytes_written: u64 = 0;
-        var exception_membership_byte: u8 = 0;
-        var exception_membership_bits: u8 = 0;
-        var exceptions_written: u64 = 0;
-        for (terms, 0..) |term, term_index| {
-            const term_index_u64: u64 = @intCast(term_index);
-            if (term_index_u64 % persistent_term_exception_rank_checkpoint_terms == 0) {
-                if (exceptions_written > std.math.maxInt(u32)) return error.RecordTooLarge;
-                var rank_bytes: [4]u8 = undefined;
-                std.mem.writeInt(u32, &rank_bytes, @intCast(exceptions_written), .little);
-                try writer.append(&rank_bytes);
-                exception_rank_checkpoints_written = std.math.add(u64, exception_rank_checkpoints_written, 1) catch return error.RecordTooLarge;
-            }
-            const entry = textTermEntryFromPersistentTerm(term, null);
-            if (!termEntryHasInlinePosting(entry)) {
-                exception_membership_byte |= @as(u8, 1) << @as(u3, @intCast(exception_membership_bits));
-                exceptions_written = std.math.add(u64, exceptions_written, 1) catch return error.RecordTooLarge;
-            }
-            exception_membership_bits += 1;
-            if (exception_membership_bits == 8) {
-                try writer.append(&.{exception_membership_byte});
-                exception_membership_bytes_written = std.math.add(u64, exception_membership_bytes_written, 1) catch return error.RecordTooLarge;
-                exception_membership_byte = 0;
-                exception_membership_bits = 0;
-            }
-        }
-        if (exception_membership_bits != 0) {
-            try writer.append(&.{exception_membership_byte});
-            exception_membership_bytes_written = std.math.add(u64, exception_membership_bytes_written, 1) catch return error.RecordTooLarge;
-        }
-        if (exception_rank_checkpoints_written != (try textTermExceptionRankCheckpointCount(@intCast(terms.len)))) return error.InvalidRecord;
-        if (exception_membership_bytes_written != (try textTermExceptionMembershipBytes(@intCast(terms.len)))) return error.InvalidRecord;
-        if (exceptions_written != term_exception_count) return error.InvalidRecord;
-
-        var exception_record_bytes: [TextTermExceptionRecord.encoded_len]u8 = undefined;
-        exceptions_written = 0;
-        for (terms, 0..) |term, term_index| {
-            const entry = textTermEntryFromPersistentTerm(term, null);
-            if (termEntryHasInlinePosting(entry)) continue;
-            _ = term_index;
-            try (TextTermExceptionRecord{
-                .doc_freq = @intCast(term.postings.len),
-                .postings_offset = term.postings_offset,
-                .postings_offset_is_plain = term.postings_offset_is_plain,
-                .postings_offset_is_dense_freq_stream = term.postings_offset_is_dense_freq_stream,
-            }).encode(&exception_record_bytes);
-            try writer.append(&exception_record_bytes);
-            exceptions_written = std.math.add(u64, exceptions_written, 1) catch return error.RecordTooLarge;
-        }
-        if (exceptions_written != term_exception_count) return error.InvalidRecord;
-        try writer.append(singleton_payloads.checkpoints.items);
-        try writer.append(singleton_payloads.payloads.items);
-        try writer.flush();
-        if (textOptionsNeedSync(store)) try file.sync(store.io);
-    }
-    try renameReplace(store.io, tmp_path, path);
-}
-
 fn readTextDocsHeaderFromFile(store: storage_mod.Store, file: std.Io.File) !TextDocsHeader {
     var bytes: [TextDocsHeader.encoded_len]u8 = undefined;
     const n = try file.readPositionalAll(store.io, &bytes, 0);
@@ -16292,14 +8202,14 @@ fn readTextTermsHeaderFromFile(store: storage_mod.Store, file: std.Io.File) !Tex
     var bytes: [TextTermsHeader.encoded_len]u8 = undefined;
     const n = try file.readPositionalAll(store.io, &bytes, 0);
     if (n != bytes.len) return error.InvalidRecord;
-    return TextTermsHeader.decode(&bytes);
+    return decodeTextTermsHeader(&bytes);
 }
 
 fn readPackedTextTermEntryAt(store: storage_mod.Store, file: std.Io.File, index: u64) !TextTermEntry {
     var bytes: [TextTermEntry.encoded_len]u8 = undefined;
     const n = try file.readPositionalAll(store.io, &bytes, try textTermEntryOffset(index));
     if (n != bytes.len) return error.InvalidRecord;
-    return TextTermEntry.decode(&bytes);
+    return decodeTextTermEntry(&bytes);
 }
 
 fn readTextTermExceptionRecordAt(store: storage_mod.Store, file: std.Io.File, header: TextTermsHeader, exception_index: u64) !TextTermExceptionRecord {
@@ -16307,7 +8217,7 @@ fn readTextTermExceptionRecordAt(store: storage_mod.Store, file: std.Io.File, he
     var bytes: [TextTermExceptionRecord.encoded_len]u8 = undefined;
     const n = try file.readPositionalAll(store.io, &bytes, try textTermExceptionRecordOffset(header.term_count, header.term_bytes, exception_index));
     if (n != bytes.len) return error.InvalidRecord;
-    return TextTermExceptionRecord.decode(&bytes);
+    return decodeTextTermExceptionRecord(&bytes);
 }
 
 fn readTextTermExceptionRankCheckpointAt(store: storage_mod.Store, file: std.Io.File, header: TextTermsHeader, checkpoint_index: u64) !u64 {
@@ -16376,7 +8286,7 @@ fn readTextTermSingletonPayloadCheckpointAt(store: storage_mod.Store, file: std.
     var bytes: [TextTermSingletonPayloadCheckpoint.encoded_len]u8 = undefined;
     const n = try file.readPositionalAll(store.io, &bytes, try textTermSingletonPayloadCheckpointOffset(header.term_count, header.term_bytes, header.term_exception_count, checkpoint_index));
     if (n != bytes.len) return error.InvalidRecord;
-    return TextTermSingletonPayloadCheckpoint.decode(&bytes);
+    return decodeTextTermSingletonPayloadCheckpoint(&bytes);
 }
 
 fn readTextTermByteAt(store: storage_mod.Store, file: std.Io.File, offset: u64) !u8 {
@@ -16443,28 +8353,28 @@ fn readTextPostingsHeaderFromFile(store: storage_mod.Store, file: std.Io.File) !
     var bytes: [TextPostingsHeader.encoded_len]u8 = undefined;
     const n = try file.readPositionalAll(store.io, &bytes, 0);
     if (n != bytes.len) return error.InvalidRecord;
-    return TextPostingsHeader.decode(&bytes);
+    return decodeTextPostingsHeader(&bytes);
 }
 
 fn readTextPostingBlocksHeaderFromFile(store: storage_mod.Store, file: std.Io.File) !TextPostingBlocksHeader {
     var bytes: [TextPostingBlocksHeader.encoded_len]u8 = undefined;
     const n = try file.readPositionalAll(store.io, &bytes, 0);
     if (n != bytes.len) return error.InvalidRecord;
-    return TextPostingBlocksHeader.decode(&bytes);
+    return decodeTextPostingBlocksHeader(&bytes);
 }
 
 fn readTextPostingBlockImpactsHeaderFromFile(store: storage_mod.Store, file: std.Io.File) !TextPostingBlockImpactsHeader {
     var bytes: [TextPostingBlockImpactsHeader.encoded_len]u8 = undefined;
     const n = try file.readPositionalAll(store.io, &bytes, 0);
     if (n != bytes.len) return error.InvalidRecord;
-    return TextPostingBlockImpactsHeader.decode(&bytes);
+    return decodeTextPostingBlockImpactsHeader(&bytes);
 }
 
 fn readTextTermTopHitsHeaderFromFile(store: storage_mod.Store, file: std.Io.File) !TextTermTopHitsHeader {
     var bytes: [TextTermTopHitsHeader.encoded_len]u8 = undefined;
     const n = try file.readPositionalAll(store.io, &bytes, 0);
     if (n != bytes.len) return error.InvalidRecord;
-    return TextTermTopHitsHeader.decode(&bytes);
+    return decodeTextTermTopHitsHeader(&bytes);
 }
 
 fn readTextTermTopHitTermRecordAt(store: storage_mod.Store, file: std.Io.File, header: TextTermTopHitsHeader, index: u64) !TextTermTopHitTermRecord {
@@ -16473,7 +8383,7 @@ fn readTextTermTopHitTermRecordAt(store: storage_mod.Store, file: std.Io.File, h
     var bytes: [TextTermTopHitTermRecord.encoded_len]u8 = undefined;
     const n = try file.readPositionalAll(store.io, &bytes, offset);
     if (n != bytes.len) return error.InvalidRecord;
-    return TextTermTopHitTermRecord.decode(&bytes, index, header.capacity);
+    return decodeTextTermTopHitTermRecord(&bytes, index, header.capacity);
 }
 
 fn readTextTermTopHitTermAt(store: storage_mod.Store, file: std.Io.File, header: TextTermTopHitsHeader, term_index: u64) !?TextTermTopHitTermRecord {
@@ -16496,7 +8406,7 @@ fn readTextTermTopHitRecordAt(store: storage_mod.Store, file: std.Io.File, index
     var bytes: [TextTermTopHitRecord.encoded_len]u8 = undefined;
     const n = try file.readPositionalAll(store.io, &bytes, try textTermTopHitRecordOffset(index));
     if (n != bytes.len) return error.InvalidRecord;
-    return TextTermTopHitRecord.decode(&bytes);
+    return decodeTextTermTopHitRecord(&bytes);
 }
 
 fn readTextPostingBlockOffsetCheckpointAt(store: storage_mod.Store, file: std.Io.File, block_count: u64, checkpoint_index: u64) !u64 {
@@ -16519,7 +8429,7 @@ fn readTextPostingBlockRecordAt(store: storage_mod.Store, file: std.Io.File, ter
     var bytes: [TextPostingBlockRecord.encoded_len]u8 = undefined;
     const n = try file.readPositionalAll(store.io, &bytes, try textPostingBlockRecordOffset(term_count, index));
     if (n != bytes.len) return error.InvalidRecord;
-    return TextPostingBlockRecord.decode(&bytes);
+    return decodeTextPostingBlockRecord(&bytes);
 }
 
 fn readTextPostingImpactBlockIndexAt(store: storage_mod.Store, file: std.Io.File, term_count: u64, index: u64) !u64 {
@@ -16816,152 +8726,6 @@ fn textDocsFileSize(doc_count: u64, node_id_overflow_count: u64) !u64 {
     return textDocsFileSizeForHeader(.{ .doc_count = doc_count, .node_id_overflow_count = node_id_overflow_count });
 }
 
-fn textTermEntryOffset(index: u64) !u64 {
-    const bytes = std.math.mul(u64, index, TextTermEntry.encoded_len) catch return error.RecordTooLarge;
-    return std.math.add(u64, TextTermsHeader.encoded_len, bytes) catch return error.RecordTooLarge;
-}
-
-fn textTermsBytesOffset(term_count: u64) !u64 {
-    const bytes = std.math.mul(u64, term_count, TextTermEntry.encoded_len) catch return error.RecordTooLarge;
-    return std.math.add(u64, TextTermsHeader.encoded_len, bytes) catch return error.RecordTooLarge;
-}
-
-fn textTermByteOffsetCheckpointCount(term_count: u64) !u64 {
-    return std.math.divCeil(u64, term_count, persistent_term_byte_offset_checkpoint_terms) catch return error.RecordTooLarge;
-}
-
-fn textTermByteOffsetCheckpointTableBytes(term_count: u64) !u64 {
-    const checkpoint_count = try textTermByteOffsetCheckpointCount(term_count);
-    return std.math.mul(u64, checkpoint_count, 4) catch return error.RecordTooLarge;
-}
-
-fn textTermByteOffsetCheckpointTableOffset(term_count: u64, term_bytes: u64) !u64 {
-    if (term_bytes > persistent_term_bytes_max_offset) return error.RecordTooLarge;
-    const bytes_offset = try textTermsBytesOffset(term_count);
-    return std.math.add(u64, bytes_offset, term_bytes) catch return error.RecordTooLarge;
-}
-
-fn textTermByteOffsetCheckpointOffset(term_count: u64, term_bytes: u64, checkpoint_index: u64) !u64 {
-    const checkpoint_count = try textTermByteOffsetCheckpointCount(term_count);
-    if (checkpoint_index >= checkpoint_count) return error.InvalidRecord;
-    const table_offset = try textTermByteOffsetCheckpointTableOffset(term_count, term_bytes);
-    const checkpoint_bytes = std.math.mul(u64, checkpoint_index, 4) catch return error.RecordTooLarge;
-    return std.math.add(u64, table_offset, checkpoint_bytes) catch return error.RecordTooLarge;
-}
-
-fn textTermExceptionRankCheckpointCount(term_count: u64) !u64 {
-    return std.math.divCeil(u64, term_count, persistent_term_exception_rank_checkpoint_terms) catch return error.RecordTooLarge;
-}
-
-fn textTermExceptionRankCheckpointTableBytes(term_count: u64) !u64 {
-    const checkpoint_count = try textTermExceptionRankCheckpointCount(term_count);
-    return std.math.mul(u64, checkpoint_count, 4) catch return error.RecordTooLarge;
-}
-
-fn textTermExceptionMembershipBytes(term_count: u64) !u64 {
-    return std.math.divCeil(u64, term_count, 8) catch return error.RecordTooLarge;
-}
-
-fn textTermExceptionPayloadTableBytes(exception_count: u64) !u64 {
-    return std.math.mul(u64, exception_count, TextTermExceptionRecord.encoded_len) catch return error.RecordTooLarge;
-}
-
-fn textTermExceptionTableBytes(term_count: u64, exception_count: u64) !u64 {
-    var total = try textTermExceptionRankCheckpointTableBytes(term_count);
-    total = std.math.add(u64, total, try textTermExceptionMembershipBytes(term_count)) catch return error.RecordTooLarge;
-    total = std.math.add(u64, total, try textTermExceptionPayloadTableBytes(exception_count)) catch return error.RecordTooLarge;
-    return total;
-}
-
-fn textTermExceptionTableOffset(term_count: u64, term_bytes: u64) !u64 {
-    const checkpoint_table_offset = try textTermByteOffsetCheckpointTableOffset(term_count, term_bytes);
-    const checkpoint_table_bytes = try textTermByteOffsetCheckpointTableBytes(term_count);
-    return std.math.add(u64, checkpoint_table_offset, checkpoint_table_bytes) catch return error.RecordTooLarge;
-}
-
-fn textTermExceptionRankCheckpointTableOffset(term_count: u64, term_bytes: u64) !u64 {
-    return textTermExceptionTableOffset(term_count, term_bytes);
-}
-
-fn textTermExceptionRankCheckpointOffset(term_count: u64, term_bytes: u64, checkpoint_index: u64) !u64 {
-    const checkpoint_count = try textTermExceptionRankCheckpointCount(term_count);
-    if (checkpoint_index >= checkpoint_count) return error.InvalidRecord;
-    const table_offset = try textTermExceptionRankCheckpointTableOffset(term_count, term_bytes);
-    const bytes = std.math.mul(u64, checkpoint_index, 4) catch return error.RecordTooLarge;
-    return std.math.add(u64, table_offset, bytes) catch return error.RecordTooLarge;
-}
-
-fn textTermExceptionMembershipBitsetOffset(term_count: u64, term_bytes: u64) !u64 {
-    const checkpoint_table_offset = try textTermExceptionRankCheckpointTableOffset(term_count, term_bytes);
-    const checkpoint_table_bytes = try textTermExceptionRankCheckpointTableBytes(term_count);
-    return std.math.add(u64, checkpoint_table_offset, checkpoint_table_bytes) catch return error.RecordTooLarge;
-}
-
-fn textTermExceptionMembershipByteOffset(term_count: u64, term_bytes: u64, byte_index: u64) !u64 {
-    const byte_count = try textTermExceptionMembershipBytes(term_count);
-    if (byte_index >= byte_count) return error.InvalidRecord;
-    const bitset_offset = try textTermExceptionMembershipBitsetOffset(term_count, term_bytes);
-    return std.math.add(u64, bitset_offset, byte_index) catch return error.RecordTooLarge;
-}
-
-fn textTermExceptionPayloadTableOffset(term_count: u64, term_bytes: u64) !u64 {
-    const bitset_offset = try textTermExceptionMembershipBitsetOffset(term_count, term_bytes);
-    const bitset_bytes = try textTermExceptionMembershipBytes(term_count);
-    return std.math.add(u64, bitset_offset, bitset_bytes) catch return error.RecordTooLarge;
-}
-
-fn textTermExceptionRecordOffset(term_count: u64, term_bytes: u64, exception_index: u64) !u64 {
-    const table_offset = try textTermExceptionPayloadTableOffset(term_count, term_bytes);
-    const bytes = std.math.mul(u64, exception_index, TextTermExceptionRecord.encoded_len) catch return error.RecordTooLarge;
-    return std.math.add(u64, table_offset, bytes) catch return error.RecordTooLarge;
-}
-
-fn textTermSingletonPayloadCount(term_count: u64, term_exception_count: u64) !u64 {
-    if (term_exception_count > term_count) return error.InvalidRecord;
-    return term_count - term_exception_count;
-}
-
-fn textTermSingletonPayloadCheckpointCount(singleton_count: u64) !u64 {
-    return std.math.divCeil(u64, singleton_count, persistent_term_singleton_payload_checkpoint_terms) catch return error.RecordTooLarge;
-}
-
-fn textTermSingletonPayloadCheckpointTableBytes(singleton_count: u64) !u64 {
-    const checkpoint_count = try textTermSingletonPayloadCheckpointCount(singleton_count);
-    return std.math.mul(u64, checkpoint_count, TextTermSingletonPayloadCheckpoint.encoded_len) catch return error.RecordTooLarge;
-}
-
-fn textTermSingletonPayloadCheckpointTableOffset(term_count: u64, term_bytes: u64, term_exception_count: u64) !u64 {
-    const exception_table_offset = try textTermExceptionTableOffset(term_count, term_bytes);
-    const exception_table_bytes = try textTermExceptionTableBytes(term_count, term_exception_count);
-    return std.math.add(u64, exception_table_offset, exception_table_bytes) catch return error.RecordTooLarge;
-}
-
-fn textTermSingletonPayloadCheckpointOffset(term_count: u64, term_bytes: u64, term_exception_count: u64, checkpoint_index: u64) !u64 {
-    const singleton_count = try textTermSingletonPayloadCount(term_count, term_exception_count);
-    const checkpoint_count = try textTermSingletonPayloadCheckpointCount(singleton_count);
-    if (checkpoint_index >= checkpoint_count) return error.InvalidRecord;
-    const table_offset = try textTermSingletonPayloadCheckpointTableOffset(term_count, term_bytes, term_exception_count);
-    const bytes = std.math.mul(u64, checkpoint_index, TextTermSingletonPayloadCheckpoint.encoded_len) catch return error.RecordTooLarge;
-    return std.math.add(u64, table_offset, bytes) catch return error.RecordTooLarge;
-}
-
-fn textTermSingletonPayloadStreamOffset(term_count: u64, term_bytes: u64, term_exception_count: u64) !u64 {
-    const singleton_count = try textTermSingletonPayloadCount(term_count, term_exception_count);
-    const checkpoint_table_offset = try textTermSingletonPayloadCheckpointTableOffset(term_count, term_bytes, term_exception_count);
-    const checkpoint_table_bytes = try textTermSingletonPayloadCheckpointTableBytes(singleton_count);
-    return std.math.add(u64, checkpoint_table_offset, checkpoint_table_bytes) catch return error.RecordTooLarge;
-}
-
-fn textTermsFileSize(term_count: u64, term_bytes: u64, term_exception_count: u64, singleton_payload_bytes: u64) !u64 {
-    const singleton_payload_offset = try textTermSingletonPayloadStreamOffset(term_count, term_bytes, term_exception_count);
-    return std.math.add(u64, singleton_payload_offset, singleton_payload_bytes) catch return error.RecordTooLarge;
-}
-
-fn textTermsFileSizeForHeader(header: TextTermsHeader) !u64 {
-    try header.validateShape();
-    return textTermsFileSize(header.term_count, header.term_bytes, header.term_exception_count, header.singleton_payload_bytes);
-}
-
 fn textPostingBodyOffset(posting_offset: u64) !u64 {
     return std.math.add(u64, TextPostingsHeader.encoded_len, posting_offset) catch return error.RecordTooLarge;
 }
@@ -17093,408 +8857,6 @@ fn regularFileSize(store: storage_mod.Store, file: std.Io.File) !u64 {
     return stat.size;
 }
 
-fn persistentTermsOrPostingsStale(allocator: std.mem.Allocator, store: storage_mod.Store, meta: PersistentTextMeta, deadline: core.QueryDeadline) !bool {
-    if (deadline.expired()) return core.Error.BudgetExceeded;
-    const terms_path = try textTermsPath(allocator, store);
-    defer allocator.free(terms_path);
-    var terms_file = try std.Io.Dir.cwd().openFile(store.io, terms_path, .{});
-    defer terms_file.close(store.io);
-    const terms_size = try regularFileSize(store, terms_file);
-    const terms_header = try readTextTermsHeaderFromFile(store, terms_file);
-    if (terms_header.term_count != meta.term_count) return true;
-    if (terms_header.term_bytes != meta.term_bytes) return true;
-    const expected_terms_size = textTermsFileSizeForHeader(terms_header) catch |err| switch (err) {
-        error.RecordTooLarge => return true,
-        else => |e| return e,
-    };
-    if (terms_size != expected_terms_size) return true;
-    if (try textTermExceptionTableInvalid(store, terms_file, terms_header)) return true;
-
-    const postings_path = try textPostingsPath(allocator, store);
-    defer allocator.free(postings_path);
-    var postings_view = try TextPostingsFileView.open(store, postings_path);
-    defer postings_view.deinit();
-    const postings_size = postings_view.size;
-    const postings_header = try postings_view.readHeader();
-    if (postings_header.posting_count != meta.posting_count) return true;
-    const expected_postings_size = textPostingsFileSize(postings_header.body_bytes) catch |err| switch (err) {
-        error.RecordTooLarge => return true,
-        else => |e| return e,
-    };
-    if (postings_size != expected_postings_size) return true;
-
-    const blocks_path = try textPostingBlocksPath(allocator, store);
-    defer allocator.free(blocks_path);
-    var blocks_file = try std.Io.Dir.cwd().openFile(store.io, blocks_path, .{});
-    defer blocks_file.close(store.io);
-    const blocks_size = try regularFileSize(store, blocks_file);
-    const blocks_header = try readTextPostingBlocksHeaderFromFile(store, blocks_file);
-    if (blocks_header.term_count != terms_header.term_count) return true;
-    if (blocks_header.posting_count != postings_header.posting_count) return true;
-    if (blocks_header.block_size != persistent_posting_block_size) return true;
-    const expected_blocks_size = textPostingBlocksFileSize(blocks_header.term_count, blocks_header.block_count) catch |err| switch (err) {
-        error.RecordTooLarge => return true,
-        else => |e| return e,
-    };
-    if (blocks_size != expected_blocks_size) return true;
-
-    const impacts_path = try textPostingBlockImpactsPath(allocator, store);
-    defer allocator.free(impacts_path);
-    var impacts_file = try std.Io.Dir.cwd().openFile(store.io, impacts_path, .{});
-    defer impacts_file.close(store.io);
-    const impacts_size = try regularFileSize(store, impacts_file);
-    const impacts_header = try readTextPostingBlockImpactsHeaderFromFile(store, impacts_file);
-    if (impacts_header.term_count != terms_header.term_count) return true;
-    if (impacts_header.block_count != blocks_header.block_count) return true;
-    const expected_impacts_size = textPostingBlockImpactsFileSize(impacts_header.term_count, impacts_header.block_count) catch |err| switch (err) {
-        error.RecordTooLarge => return true,
-        else => |e| return e,
-    };
-    if (impacts_size != expected_impacts_size) return true;
-
-    const invalid_terms = persistentTermDictionaryInvalid(allocator, store, terms_file, terms_header, &postings_view, postings_header, blocks_file, blocks_header, impacts_file, impacts_header, persistentAvgDocLen(meta), meta.doc_count, deadline) catch |err| switch (err) {
-        error.InvalidRecord, error.RecordTooLarge => return true,
-        else => |e| return e,
-    };
-    if (invalid_terms) return true;
-    return false;
-}
-
-fn persistentTermsOrPostingsHeaderStale(allocator: std.mem.Allocator, store: storage_mod.Store, meta: PersistentTextMeta) !bool {
-    const terms_path = try textTermsPath(allocator, store);
-    defer allocator.free(terms_path);
-    var terms_file = try std.Io.Dir.cwd().openFile(store.io, terms_path, .{});
-    defer terms_file.close(store.io);
-    const terms_size = try regularFileSize(store, terms_file);
-    const terms_header = try readTextTermsHeaderFromFile(store, terms_file);
-    if (terms_header.term_count != meta.term_count) return true;
-    if (terms_header.term_bytes != meta.term_bytes) return true;
-    const expected_terms_size = textTermsFileSizeForHeader(terms_header) catch |err| switch (err) {
-        error.RecordTooLarge => return true,
-        else => |e| return e,
-    };
-    if (terms_size != expected_terms_size) return true;
-    // Keep the warm-query quick-stale path bounded by headers and file sizes.
-    // Full validation owns O(term_count) exception-table and dictionary scans.
-
-    const postings_path = try textPostingsPath(allocator, store);
-    defer allocator.free(postings_path);
-    var postings_file = try std.Io.Dir.cwd().openFile(store.io, postings_path, .{});
-    defer postings_file.close(store.io);
-    const postings_size = try regularFileSize(store, postings_file);
-    const postings_header = try readTextPostingsHeaderFromFile(store, postings_file);
-    if (postings_header.posting_count != meta.posting_count) return true;
-    const expected_postings_size = textPostingsFileSize(postings_header.body_bytes) catch |err| switch (err) {
-        error.RecordTooLarge => return true,
-        else => |e| return e,
-    };
-    if (postings_size != expected_postings_size) return true;
-
-    const blocks_path = try textPostingBlocksPath(allocator, store);
-    defer allocator.free(blocks_path);
-    var blocks_file = try std.Io.Dir.cwd().openFile(store.io, blocks_path, .{});
-    defer blocks_file.close(store.io);
-    const blocks_size = try regularFileSize(store, blocks_file);
-    const blocks_header = try readTextPostingBlocksHeaderFromFile(store, blocks_file);
-    if (blocks_header.term_count != terms_header.term_count) return true;
-    if (blocks_header.posting_count != postings_header.posting_count) return true;
-    if (blocks_header.block_size != persistent_posting_block_size) return true;
-    const expected_blocks_size = textPostingBlocksFileSize(blocks_header.term_count, blocks_header.block_count) catch |err| switch (err) {
-        error.RecordTooLarge => return true,
-        else => |e| return e,
-    };
-    if (blocks_size != expected_blocks_size) return true;
-
-    const impacts_path = try textPostingBlockImpactsPath(allocator, store);
-    defer allocator.free(impacts_path);
-    var impacts_file = try std.Io.Dir.cwd().openFile(store.io, impacts_path, .{});
-    defer impacts_file.close(store.io);
-    const impacts_size = try regularFileSize(store, impacts_file);
-    const impacts_header = try readTextPostingBlockImpactsHeaderFromFile(store, impacts_file);
-    if (impacts_header.term_count != terms_header.term_count) return true;
-    if (impacts_header.block_count != blocks_header.block_count) return true;
-    const expected_impacts_size = textPostingBlockImpactsFileSize(impacts_header.term_count, impacts_header.block_count) catch |err| switch (err) {
-        error.RecordTooLarge => return true,
-        else => |e| return e,
-    };
-    if (impacts_size != expected_impacts_size) return true;
-
-    const top_hits_path = try textTermTopHitsPath(allocator, store);
-    defer allocator.free(top_hits_path);
-    var top_hits_file = try std.Io.Dir.cwd().openFile(store.io, top_hits_path, .{});
-    defer top_hits_file.close(store.io);
-    const top_hits_size = try regularFileSize(store, top_hits_file);
-    const top_hits_header = try readTextTermTopHitsHeaderFromFile(store, top_hits_file);
-    if (top_hits_header.term_count != terms_header.term_count) return true;
-    if (top_hits_header.capacity != persistent_term_top_hit_capacity) return true;
-    const expected_top_hits_size = textTermTopHitsFileSize(top_hits_header.hit_count, top_hits_header.hit_term_count) catch |err| switch (err) {
-        error.RecordTooLarge => return true,
-        else => |e| return e,
-    };
-    if (top_hits_size != expected_top_hits_size) return true;
-    return try persistentTermTopHitsSparseIndexInvalid(store, top_hits_file, top_hits_header);
-}
-
-fn persistentTermTopHitsSparseIndexInvalid(store: storage_mod.Store, file: std.Io.File, header: TextTermTopHitsHeader) !bool {
-    var previous_term_index: ?u64 = null;
-    var expected_hit_offset: u64 = 0;
-    var pos: u64 = 0;
-    while (pos < header.hit_term_count) : (pos += 1) {
-        const record = readTextTermTopHitTermRecordAt(store, file, header, pos) catch return true;
-        if (record.term_index >= header.term_count) return true;
-        if (previous_term_index) |previous| {
-            if (record.term_index <= previous) return true;
-        }
-        previous_term_index = record.term_index;
-        if (record.hit_count > header.capacity) return true;
-        if (record.hit_offset != expected_hit_offset) return true;
-        expected_hit_offset = std.math.add(u64, expected_hit_offset, record.hit_count) catch return true;
-    }
-    return expected_hit_offset != header.hit_count;
-}
-
-fn persistentTermDictionaryInvalid(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    terms_file: std.Io.File,
-    terms_header: TextTermsHeader,
-    postings_view: *TextPostingsFileView,
-    postings_header: TextPostingsHeader,
-    blocks_file: std.Io.File,
-    blocks_header: TextPostingBlocksHeader,
-    impacts_file: std.Io.File,
-    impacts_header: TextPostingBlockImpactsHeader,
-    avg_doc_len: f32,
-    doc_count: u64,
-    deadline: core.QueryDeadline,
-) !bool {
-    if (try textTermExceptionTableInvalid(store, terms_file, terms_header)) return true;
-    var previous_term: ?[]u8 = null;
-    defer if (previous_term) |term| allocator.free(term);
-    var expected_term_offset: u64 = 0;
-    var expected_postings_offset: u64 = 0;
-    var expected_block_offset: u64 = 0;
-
-    var pos: u64 = 0;
-    while (pos < terms_header.term_count) : (pos += 1) {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
-        const entry = try readTextTermEntryAt(store, terms_file, terms_header, pos);
-        if (termEntryHasInlinePosting(entry)) {
-            if (entry.postings_count != 1) return true;
-        } else if (termEntryVirtualAllDocsTextFreq(entry) != null) {
-            if (entry.postings_count != doc_count) return true;
-        } else if (termEntryDenseAllDocsFreqStreamOffset(entry)) |posting_offset| {
-            if (entry.postings_count != doc_count) return true;
-            if (posting_offset != expected_postings_offset) return true;
-            if (posting_offset > postings_header.body_bytes) return true;
-        } else {
-            if (entry.postings_offset != expected_postings_offset) return true;
-            if (entry.postings_offset > postings_header.body_bytes) return true;
-        }
-
-        if (pos % persistent_term_byte_offset_checkpoint_terms == 0) {
-            const checkpoint_index = pos / persistent_term_byte_offset_checkpoint_terms;
-            const stored_term_offset = readTextTermByteOffsetCheckpointAt(store, terms_file, terms_header, checkpoint_index) catch |err| switch (err) {
-                error.InvalidRecord, error.RecordTooLarge => return true,
-                else => |e| return e,
-            };
-            if (stored_term_offset != expected_term_offset) return true;
-        }
-
-        const term_result = try readFrontCodedTermAtOffset(allocator, store, terms_file, terms_header, pos, expected_term_offset, entry, previous_term);
-        const term = term_result.term;
-        if (previous_term) |prev| {
-            if (std.mem.order(u8, prev, term) != .lt) {
-                allocator.free(term);
-                return true;
-            }
-            allocator.free(prev);
-        }
-        previous_term = term;
-
-        if (pos % persistent_posting_block_offset_checkpoint_terms == 0) {
-            const checkpoint_index = pos / persistent_posting_block_offset_checkpoint_terms;
-            const stored_term_block_offset = readTextPostingBlockOffsetCheckpointAt(store, blocks_file, blocks_header.block_count, checkpoint_index) catch |err| switch (err) {
-                error.InvalidRecord => return true,
-                else => |e| return e,
-            };
-            if (stored_term_block_offset != expected_block_offset) return true;
-        }
-
-        var block_context = ValidatePostingBlocksContext{
-            .allocator = allocator,
-            .store = store,
-            .blocks_file = blocks_file,
-            .blocks_header = blocks_header,
-            .impacts_file = impacts_file,
-            .impacts_header = impacts_header,
-            .expected_block_offset = &expected_block_offset,
-            .avg_doc_len = avg_doc_len,
-            .doc_count = doc_count,
-            .doc_freq = entry.postings_count,
-        };
-        const term_block_count = publishedPostingBlockCountForEntry(entry, blocks_header.block_size) catch return true;
-        if (term_block_count == 0) {
-            var skip_context = SkipTextPostingContext{};
-            const next_postings_offset = scanPersistentTermPostings(postings_view, entry, doc_count, .{ .deadline = deadline }, &skip_context, skipTextPosting) catch |err| switch (err) {
-                error.InvalidRecord, error.RecordTooLarge => return true,
-                else => |e| return e,
-            };
-            if (!termEntryHasInlinePosting(entry) and termEntryVirtualAllDocsTextFreq(entry) == null) expected_postings_offset = next_postings_offset;
-        } else {
-            if (termEntryHasInlinePosting(entry)) return true;
-            try block_context.beginTerm(entry.postings_offset, expected_block_offset, term_block_count);
-            defer block_context.endTerm();
-            expected_postings_offset = scanPersistentPostingBlocks(
-                postings_view,
-                entry.postings_offset,
-                entry.postings_count,
-                doc_count,
-                blocks_header.block_size,
-                .{ .deadline = deadline },
-                &block_context,
-                validatePostingBlockRecord,
-            ) catch |err| switch (err) {
-                error.InvalidRecord, error.RecordTooLarge => return true,
-                else => |e| return e,
-            };
-            if (!try block_context.validateImpacts()) return true;
-        }
-
-        expected_term_offset = std.math.add(u64, expected_term_offset, term_result.encoded_len) catch return true;
-    }
-
-    return expected_term_offset != terms_header.term_bytes or
-        expected_postings_offset != postings_header.body_bytes or
-        expected_block_offset != blocks_header.block_count;
-}
-
-fn textTermExceptionTableInvalid(store: storage_mod.Store, terms_file: std.Io.File, terms_header: TextTermsHeader) !bool {
-    if (terms_header.term_exception_count > terms_header.term_count) return true;
-    var exceptions_seen: u64 = 0;
-    var term_index: u64 = 0;
-    var byte_index: u64 = 0;
-    while (byte_index < (try textTermExceptionMembershipBytes(terms_header.term_count))) : (byte_index += 1) {
-        const membership_byte = readTextTermExceptionMembershipByteAt(store, terms_file, terms_header, byte_index) catch |err| switch (err) {
-            error.InvalidRecord, error.RecordTooLarge => return true,
-            else => |e| return e,
-        };
-        var bit: u8 = 0;
-        while (bit < 8 and term_index < terms_header.term_count) : ({
-            bit += 1;
-            term_index += 1;
-        }) {
-            if (term_index % persistent_term_exception_rank_checkpoint_terms == 0) {
-                const checkpoint = readTextTermExceptionRankCheckpointAt(store, terms_file, terms_header, term_index / persistent_term_exception_rank_checkpoint_terms) catch |err| switch (err) {
-                    error.InvalidRecord, error.RecordTooLarge => return true,
-                    else => |e| return e,
-                };
-                if (checkpoint != exceptions_seen) return true;
-            }
-            if ((membership_byte & (@as(u8, 1) << @as(u3, @intCast(bit)))) == 0) continue;
-            _ = readTextTermExceptionRecordAt(store, terms_file, terms_header, exceptions_seen) catch |err| switch (err) {
-                error.InvalidRecord, error.RecordTooLarge => return true,
-                else => |e| return e,
-            };
-            exceptions_seen = std.math.add(u64, exceptions_seen, 1) catch return true;
-            if (exceptions_seen > terms_header.term_exception_count) return true;
-        }
-    }
-    if (exceptions_seen != terms_header.term_exception_count) return true;
-    if (terms_header.term_count != 0 and (terms_header.term_count & 7) != 0) {
-        const last_byte = readTextTermExceptionMembershipByteAt(store, terms_file, terms_header, (terms_header.term_count - 1) / 8) catch |err| switch (err) {
-            error.InvalidRecord, error.RecordTooLarge => return true,
-            else => |e| return e,
-        };
-        const used_bits: u3 = @intCast(terms_header.term_count & 7);
-        const padding_mask = ~((@as(u8, 1) << used_bits) - 1);
-        if ((last_byte & padding_mask) != 0) return true;
-    }
-    return false;
-}
-
-const ValidatePostingBlocksContext = struct {
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    blocks_file: std.Io.File,
-    blocks_header: TextPostingBlocksHeader,
-    impacts_file: std.Io.File,
-    impacts_header: TextPostingBlockImpactsHeader,
-    expected_block_offset: *u64,
-    avg_doc_len: f32,
-    doc_count: u64,
-    doc_freq: u64,
-    term_posting_offset: u64 = 0,
-    term_block_start: u64 = 0,
-    term_block_count: u64 = 0,
-    impact_seen: std.DynamicBitSetUnmanaged = .{},
-
-    fn beginTerm(self: *ValidatePostingBlocksContext, term_posting_offset: u64, term_block_start: u64, term_block_count: u64) !void {
-        self.term_posting_offset = term_posting_offset;
-        self.term_block_start = term_block_start;
-        self.term_block_count = term_block_count;
-        self.impact_seen = try std.DynamicBitSetUnmanaged.initEmpty(self.allocator, std.math.cast(usize, term_block_count) orelse return error.RecordTooLarge);
-    }
-
-    fn endTerm(self: *ValidatePostingBlocksContext) void {
-        self.impact_seen.deinit(self.allocator);
-        self.impact_seen = .{};
-    }
-
-    fn validateImpacts(self: *ValidatePostingBlocksContext) !bool {
-        if (self.term_block_start > self.impacts_header.block_count) return false;
-        if (self.term_block_count > self.impacts_header.block_count - self.term_block_start) return false;
-        var previous_upper: ?f32 = null;
-        var pos: u64 = 0;
-        while (pos < self.term_block_count) : (pos += 1) {
-            const global_pos = std.math.add(u64, self.term_block_start, pos) catch return false;
-            const block_index = readTextPostingImpactBlockIndexAt(self.store, self.impacts_file, self.impacts_header.term_count, global_pos) catch |err| switch (err) {
-                error.InvalidRecord, error.RecordTooLarge => return false,
-                else => |e| return e,
-            };
-            if (block_index < self.term_block_start) return false;
-            const local_index = block_index - self.term_block_start;
-            if (local_index >= self.term_block_count) return false;
-            const local_usize = std.math.cast(usize, local_index) orelse return false;
-            if (self.impact_seen.isSet(local_usize)) return false;
-            self.impact_seen.set(local_usize);
-
-            const block = readTextPostingBlockRecordAt(self.store, self.blocks_file, self.blocks_header.term_count, block_index) catch |err| switch (err) {
-                error.InvalidRecord, error.RecordTooLarge => return false,
-                else => |e| return e,
-            };
-            const upper = bm25WeightedTermScore(
-                block.max_weighted_tf,
-                block.min_doc_len,
-                self.avg_doc_len,
-                self.doc_count,
-                self.doc_freq,
-                .{},
-            );
-            if (!std.math.isFinite(upper)) return false;
-            if (previous_upper) |prev| {
-                if (prev < upper) return false;
-            }
-            previous_upper = upper;
-        }
-        return self.impact_seen.count() == self.term_block_count;
-    }
-};
-
-fn validatePostingBlockRecord(context: *ValidatePostingBlocksContext, stats: TextPostingBlockStats) !void {
-    if (context.expected_block_offset.* >= context.blocks_header.block_count) return error.InvalidRecord;
-    const stored = try readTextPostingBlockRecordAt(context.store, context.blocks_file, context.blocks_header.term_count, context.expected_block_offset.*);
-    if (!stored.conservativelyMatches(try TextPostingBlockRecord.fromStats(stats))) return error.InvalidRecord;
-    if (context.expected_block_offset.* % persistent_posting_block_byte_offset_checkpoint_blocks == 0) {
-        if (stats.posting_offset < context.term_posting_offset) return error.InvalidRecord;
-        const relative_posting_offset = stats.posting_offset - context.term_posting_offset;
-        const checkpoint_index = context.expected_block_offset.* / persistent_posting_block_byte_offset_checkpoint_blocks;
-        const stored_relative_posting_offset = try readTextPostingBlockByteOffsetCheckpointAt(context.store, context.blocks_file, context.blocks_header.term_count, context.blocks_header.block_count, checkpoint_index);
-        if (stored_relative_posting_offset != relative_posting_offset) return error.InvalidRecord;
-    }
-    context.expected_block_offset.* = std.math.add(u64, context.expected_block_offset.*, 1) catch return error.RecordTooLarge;
-}
-
 fn readTextTermByteOffsetCheckpointAt(
     store: storage_mod.Store,
     file: std.Io.File,
@@ -17540,7 +8902,7 @@ fn readFrontCodedTermPrefixAtOffset(
     previous_term_len: usize,
     entry: TextTermEntry,
 ) !u8 {
-    if (entry.frontPrefixLen()) |prefix_len| {
+    if (textTermEntryFrontPrefixLen(entry)) |prefix_len| {
         if (term_index % persistent_term_byte_offset_checkpoint_terms == 0 and prefix_len != 0) return error.InvalidRecord;
         if (prefix_len > previous_term_len or prefix_len > entry.term_len) return error.InvalidRecord;
         return prefix_len;
@@ -18077,38 +9439,6 @@ fn persistentAvgDocLen(meta: PersistentTextMeta) f32 {
     return (text_len * weights.text) / count;
 }
 
-fn persistentTermCommonPrefixLen(lhs: []const u8, rhs: []const u8) u8 {
-    const n = @min(lhs.len, rhs.len);
-    var index: usize = 0;
-    while (index < n and lhs[index] == rhs[index]) : (index += 1) {}
-    return @intCast(index);
-}
-
-fn persistentTermFrontCodedPrefixLen(term_index: u64, previous_term: ?[]const u8, term: []const u8) !u8 {
-    if (term.len == 0 or term.len > persistent_term_max_len) return error.InvalidRecord;
-    if (term_index % persistent_term_byte_offset_checkpoint_terms == 0) return 0;
-    const previous = previous_term orelse return error.InvalidRecord;
-    return persistentTermCommonPrefixLen(previous, term);
-}
-
-fn frontCodedPrefixInlineable(prefix_len: u8, suffix_len: u8) bool {
-    return prefix_len <= 7 and suffix_len >= 1 and suffix_len <= 15;
-}
-
-fn frontCodedPrefixByteCount(entry: TextTermEntry, prefix_len: u8) u64 {
-    const stored_prefix = entry.frontPrefixLen() orelse return 1;
-    if (stored_prefix != prefix_len) return 1;
-    if (prefix_len > entry.term_len) return 1;
-    const suffix_len = entry.term_len - prefix_len;
-    if (suffix_len > std.math.maxInt(u8)) return 1;
-    return if (frontCodedPrefixInlineable(prefix_len, @intCast(suffix_len))) 0 else 1;
-}
-
-fn frontCodedEncodedLen(entry: TextTermEntry, prefix_len: u8) !u64 {
-    const suffix_len = try entry.frontSuffixLen(prefix_len);
-    return frontCodedPrefixByteCount(entry, prefix_len) + suffix_len;
-}
-
 fn persistentTermFrontCodedLen(term_index: u64, previous_term: ?[]const u8, term: []const u8) !u64 {
     const prefix_len = try persistentTermFrontCodedPrefixLen(term_index, previous_term, term);
     if (prefix_len > term.len) return error.InvalidRecord;
@@ -18156,24 +9486,6 @@ fn termHash(term: []const u8) u64 {
     return std.hash.Wyhash.hash(0x544B_4754, term);
 }
 
-fn countTokens(allocator: std.mem.Allocator, input: []const u8, options: TokenizerOptions) !u64 {
-    var tokens = try tokenize(allocator, input, options);
-    defer tokens.deinit();
-    return @intCast(tokens.items.items.len);
-}
-
-fn countTermInText(allocator: std.mem.Allocator, input: []const u8, term: []const u8) !u32 {
-    var tokens = try tokenize(allocator, input, .{});
-    defer tokens.deinit();
-    var count: u32 = 0;
-    for (tokens.items.items) |token| {
-        if (std.mem.eql(u8, token, term)) {
-            count = std.math.add(u32, count, 1) catch return error.RecordTooLarge;
-        }
-    }
-    return count;
-}
-
 fn allZero(bytes: []const u8) bool {
     for (bytes) |byte| {
         if (byte != 0) return false;
@@ -18200,967 +9512,6 @@ const TestPostingBlockContext = struct {
 
 fn collectPostingBlock(context: *TestPostingBlockContext, stats: TextPostingBlockStats) !void {
     try context.blocks.append(context.allocator, stats);
-}
-
-fn nodeKindFromInt(value: u16) ?core.NodeKind {
-    inline for (@typeInfo(core.NodeKind).@"enum".fields) |field| {
-        if (field.value == value) return @enumFromInt(value);
-    }
-    return null;
-}
-
-const Decoded = struct {
-    codepoint: u21,
-    len: usize,
-};
-
-fn decodeUtf8(bytes: []const u8, offset: usize) Decoded {
-    const first = bytes[offset];
-    if (first < 0x80) return .{ .codepoint = first, .len = 1 };
-    if ((first & 0xe0) == 0xc0 and offset + 1 < bytes.len and isUtf8Continuation(bytes[offset + 1])) {
-        const cp = (@as(u21, first & 0x1f) << 6) | @as(u21, bytes[offset + 1] & 0x3f);
-        if (cp >= 0x80) return .{ .codepoint = cp, .len = 2 };
-    }
-    if ((first & 0xf0) == 0xe0 and offset + 2 < bytes.len and isUtf8Continuation(bytes[offset + 1]) and isUtf8Continuation(bytes[offset + 2])) {
-        const cp = (@as(u21, first & 0x0f) << 12) |
-            (@as(u21, bytes[offset + 1] & 0x3f) << 6) |
-            @as(u21, bytes[offset + 2] & 0x3f);
-        if (cp >= 0x800 and !(cp >= 0xd800 and cp <= 0xdfff)) return .{ .codepoint = cp, .len = 3 };
-    }
-    if ((first & 0xf8) == 0xf0 and offset + 3 < bytes.len and isUtf8Continuation(bytes[offset + 1]) and isUtf8Continuation(bytes[offset + 2]) and isUtf8Continuation(bytes[offset + 3])) {
-        const cp = (@as(u21, first & 0x07) << 18) |
-            (@as(u21, bytes[offset + 1] & 0x3f) << 12) |
-            (@as(u21, bytes[offset + 2] & 0x3f) << 6) |
-            @as(u21, bytes[offset + 3] & 0x3f);
-        if (cp >= 0x10000 and cp <= 0x10ffff) return .{ .codepoint = cp, .len = 4 };
-    }
-    return .{ .codepoint = first, .len = 1 };
-}
-
-fn isUtf8Continuation(byte: u8) bool {
-    return (byte & 0xc0) == 0x80;
-}
-
-fn isCjk(cp: u21) bool {
-    if (isCjkJoiner(cp)) return false;
-    return (cp >= 0x4e00 and cp <= 0x9fff) or
-        (cp >= 0x3400 and cp <= 0x4dbf) or
-        (cp >= 0x20000 and cp <= 0x323af) or
-        (cp >= 0xf900 and cp <= 0xfaff) or
-        (cp >= 0x2f800 and cp <= 0x2fa1f) or
-        (cp >= 0x3100 and cp <= 0x312f) or
-        (cp >= 0x31a0 and cp <= 0x31bf) or
-        (cp >= 0x3040 and cp <= 0x309f) or
-        (cp >= 0x30a0 and cp <= 0x30ff) or
-        (cp >= 0x31f0 and cp <= 0x31ff) or
-        (cp >= 0xff66 and cp <= 0xff9f) or
-        (cp >= 0xffa0 and cp <= 0xffdc) or
-        (cp >= 0x1100 and cp <= 0x11ff) or
-        (cp >= 0xa960 and cp <= 0xa97f) or
-        (cp >= 0x3130 and cp <= 0x318f) or
-        (cp >= 0xac00 and cp <= 0xd7af) or
-        (cp >= 0xd7b0 and cp <= 0xd7ff);
-}
-
-fn isCjkJoiner(cp: u21) bool {
-    return cp == '-' or
-        cp == 0x00b7 or
-        (cp >= 0xfe00 and cp <= 0xfe0f) or
-        cp == 0x2010 or
-        cp == 0x2011 or
-        cp == 0x2012 or
-        cp == 0x2013 or
-        cp == 0x2014 or
-        cp == 0x2015 or
-        cp == 0x2212 or
-        cp == 0x30a0 or
-        cp == 0x30fb or
-        (cp >= 0xe0100 and cp <= 0xe01ef) or
-        cp == 0xff0d or
-        cp == 0xff65;
-}
-
-fn isCjkMultiCodepointTerm(term: []const u8) bool {
-    var i: usize = 0;
-    var count: usize = 0;
-    while (i < term.len) {
-        const decoded = decodeUtf8(term, i);
-        if (!isCjk(decoded.codepoint)) return false;
-        count += 1;
-        i += decoded.len;
-    }
-    return count >= 2;
-}
-
-/// term 是否含非 CJK 码点(Latin/ASCII/数字)。用于判断 query 是否为混合语言:
-/// 混合 query(如中文 + 英文关键词,LLM query 扩展/双语语料场景)含 ASCII 词提供独立召回信号,
-/// 此时应**跳过 CJK bigram 覆盖门**——否则纯英文文档(命中 ASCII 词但 0 个 CJK bigram)会被门排除。
-fn termHasNonCjkCodepoint(term: []const u8) bool {
-    var i: usize = 0;
-    while (i < term.len) {
-        const decoded = decodeUtf8(term, i);
-        if (!isCjk(decoded.codepoint)) return true;
-        i += decoded.len;
-    }
-    return false;
-}
-
-fn countQueryTermOccurrences(query_terms: []const []u8, needle: []const u8) !u32 {
-    var count: u32 = 0;
-    for (query_terms) |term| {
-        if (std.mem.eql(u8, term, needle)) {
-            count = std.math.add(u32, count, 1) catch return error.RecordTooLarge;
-        }
-    }
-    return count;
-}
-
-fn normalizedRunByte(cp: u21) ?u8 {
-    if (cp < 0x80) {
-        const byte: u8 = @intCast(cp);
-        return if (isRunByte(byte)) byte else null;
-    }
-    if (cp >= 0xff01 and cp <= 0xff5e) {
-        const byte: u8 = @intCast(cp - 0xfee0);
-        return if (isRunByte(byte)) byte else null;
-    }
-    return null;
-}
-
-fn isRunByte(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-' or byte == '.' or byte == '/';
-}
-
-fn appendRunTokens(tokens: *TokenList, run: []const u8, options: TokenizerOptions) !void {
-    if (options.emit_original_compound and shouldEmitOriginal(run)) {
-        try tokens.appendLowerAscii(run, options.max_token_bytes);
-    }
-
-    var part_start: ?usize = null;
-    for (run, 0..) |byte, i| {
-        if (std.ascii.isAlphanumeric(byte)) {
-            if (part_start == null) part_start = i;
-        } else if (part_start) |start| {
-            try appendIdentifierParts(tokens, run[start..i], options.max_token_bytes);
-            part_start = null;
-        }
-    }
-    if (part_start) |start| try appendIdentifierParts(tokens, run[start..], options.max_token_bytes);
-}
-
-fn shouldEmitOriginal(run: []const u8) bool {
-    var has_compound_separator = false;
-    var has_alpha = false;
-    for (run) |byte| {
-        has_compound_separator = has_compound_separator or byte == '_' or byte == '-' or byte == '.' or byte == '/';
-        has_alpha = has_alpha or std.ascii.isAlphabetic(byte);
-    }
-    return has_alpha and (has_compound_separator or containsCamelBoundary(run));
-}
-
-fn containsCamelBoundary(run: []const u8) bool {
-    if (run.len < 2) return false;
-    for (run[1..], 1..) |byte, i| {
-        const prev = run[i - 1];
-        if (std.ascii.isUpper(byte) and (std.ascii.isLower(prev) or std.ascii.isDigit(prev))) return true;
-        if (i + 1 < run.len and std.ascii.isUpper(prev) and std.ascii.isUpper(byte) and std.ascii.isLower(run[i + 1])) return true;
-    }
-    return false;
-}
-
-fn appendIdentifierParts(tokens: *TokenList, ident: []const u8, max_token_bytes: usize) !void {
-    if (ident.len == 0) return;
-    if (containsCamelBoundary(ident)) try tokens.appendLowerAscii(ident, max_token_bytes);
-
-    var start: usize = 0;
-    var i: usize = 1;
-    while (i < ident.len) : (i += 1) {
-        if (isCamelSplit(ident, i)) {
-            try tokens.appendLowerAscii(ident[start..i], max_token_bytes);
-            start = i;
-        }
-    }
-    try tokens.appendLowerAscii(ident[start..], max_token_bytes);
-}
-
-fn isCamelSplit(bytes: []const u8, index: usize) bool {
-    const current = bytes[index];
-    const prev = bytes[index - 1];
-    if (std.ascii.isUpper(current) and (std.ascii.isLower(prev) or std.ascii.isDigit(prev))) return true;
-    if (index + 1 < bytes.len and std.ascii.isUpper(prev) and std.ascii.isUpper(current) and std.ascii.isLower(bytes[index + 1])) return true;
-    return false;
-}
-
-fn appendNormalizedCjkCodepoint(out: *std.ArrayList(u8), allocator: std.mem.Allocator, input: []const u8, offset: *usize, decoded: Decoded) !void {
-    var cp = normalizeHalfwidthHangulJamo(normalizeHalfwidthKatakana(decoded.codepoint));
-    offset.* += decoded.len;
-    if (composeHangulSyllable(input, offset.*, cp)) |composed| {
-        cp = composed.codepoint;
-        offset.* = composed.next_offset;
-        try appendUtf8(out, allocator, cp);
-        return;
-    }
-    if (isJapaneseVoiceMark(decoded.codepoint)) return;
-
-    if (offset.* < input.len and isJapaneseVoiceBase(cp)) {
-        const next = decodeUtf8(input, offset.*);
-        if (isJapaneseVoiceMark(next.codepoint)) {
-            if (applyJapaneseVoiceMark(cp, next.codepoint)) |voiced| {
-                cp = voiced;
-                offset.* += next.len;
-            }
-        }
-    }
-    cp = normalizeHiraganaToKatakana(cp);
-    try appendUtf8(out, allocator, cp);
-}
-
-const HangulComposition = struct {
-    codepoint: u21,
-    next_offset: usize,
-};
-
-fn composeHangulSyllable(input: []const u8, offset: usize, leading: u21) ?HangulComposition {
-    const l_index = hangulLeadingIndex(leading) orelse return null;
-    if (offset >= input.len) return null;
-    const vowel = decodeUtf8(input, offset);
-    const vowel_cp = normalizeHalfwidthHangulJamo(vowel.codepoint);
-    const v_index = hangulVowelIndex(vowel_cp) orelse return null;
-
-    var next_offset = offset + vowel.len;
-    var t_index: u21 = 0;
-    if (next_offset < input.len) {
-        const trailing = decodeUtf8(input, next_offset);
-        const trailing_cp = normalizeHalfwidthHangulJamo(trailing.codepoint);
-        if (hangulTrailingIndex(trailing_cp)) |idx| {
-            const after_trailing = next_offset + trailing.len;
-            const compatibility_consonant_starts_next_syllable =
-                hangulLeadingIndex(trailing_cp) != null and
-                after_trailing < input.len and
-                hangulVowelIndex(normalizeHalfwidthHangulJamo(decodeUtf8(input, after_trailing).codepoint)) != null;
-            if (!compatibility_consonant_starts_next_syllable) {
-                t_index = idx;
-                next_offset = after_trailing;
-            }
-        }
-    }
-
-    const syllable = 0xac00 + ((l_index * 21 + v_index) * 28) + t_index;
-    return .{ .codepoint = syllable, .next_offset = next_offset };
-}
-
-fn hangulLeadingIndex(cp: u21) ?u21 {
-    return switch (cp) {
-        0x1100 => 0,
-        0x3131 => 0,
-        0x1101 => 1,
-        0x3132 => 1,
-        0x1102 => 2,
-        0x3134 => 2,
-        0x1103 => 3,
-        0x3137 => 3,
-        0x1104 => 4,
-        0x3138 => 4,
-        0x1105 => 5,
-        0x3139 => 5,
-        0x1106 => 6,
-        0x3141 => 6,
-        0x1107 => 7,
-        0x3142 => 7,
-        0x1108 => 8,
-        0x3143 => 8,
-        0x1109 => 9,
-        0x3145 => 9,
-        0x110a => 10,
-        0x3146 => 10,
-        0x110b => 11,
-        0x3147 => 11,
-        0x110c => 12,
-        0x3148 => 12,
-        0x110d => 13,
-        0x3149 => 13,
-        0x110e => 14,
-        0x314a => 14,
-        0x110f => 15,
-        0x314b => 15,
-        0x1110 => 16,
-        0x314c => 16,
-        0x1111 => 17,
-        0x314d => 17,
-        0x1112 => 18,
-        0x314e => 18,
-        else => null,
-    };
-}
-
-fn hangulVowelIndex(cp: u21) ?u21 {
-    return switch (cp) {
-        0x1161 => 0,
-        0x314f => 0,
-        0x1162 => 1,
-        0x3150 => 1,
-        0x1163 => 2,
-        0x3151 => 2,
-        0x1164 => 3,
-        0x3152 => 3,
-        0x1165 => 4,
-        0x3153 => 4,
-        0x1166 => 5,
-        0x3154 => 5,
-        0x1167 => 6,
-        0x3155 => 6,
-        0x1168 => 7,
-        0x3156 => 7,
-        0x1169 => 8,
-        0x3157 => 8,
-        0x116a => 9,
-        0x3158 => 9,
-        0x116b => 10,
-        0x3159 => 10,
-        0x116c => 11,
-        0x315a => 11,
-        0x116d => 12,
-        0x315b => 12,
-        0x116e => 13,
-        0x315c => 13,
-        0x116f => 14,
-        0x315d => 14,
-        0x1170 => 15,
-        0x315e => 15,
-        0x1171 => 16,
-        0x315f => 16,
-        0x1172 => 17,
-        0x3160 => 17,
-        0x1173 => 18,
-        0x3161 => 18,
-        0x1174 => 19,
-        0x3162 => 19,
-        0x1175 => 20,
-        0x3163 => 20,
-        else => null,
-    };
-}
-
-fn hangulTrailingIndex(cp: u21) ?u21 {
-    return switch (cp) {
-        0x1100 => 1,
-        0x11a8 => 1,
-        0x3131 => 1,
-        0x1101 => 2,
-        0x11a9 => 2,
-        0x3132 => 2,
-        0x11aa => 3,
-        0x3133 => 3,
-        0x1102 => 4,
-        0x11ab => 4,
-        0x3134 => 4,
-        0x11ac => 5,
-        0x3135 => 5,
-        0x11ad => 6,
-        0x3136 => 6,
-        0x1103 => 7,
-        0x11ae => 7,
-        0x3137 => 7,
-        0x1105 => 8,
-        0x11af => 8,
-        0x3139 => 8,
-        0x11b0 => 9,
-        0x313a => 9,
-        0x11b1 => 10,
-        0x313b => 10,
-        0x11b2 => 11,
-        0x313c => 11,
-        0x11b3 => 12,
-        0x313d => 12,
-        0x11b4 => 13,
-        0x313e => 13,
-        0x11b5 => 14,
-        0x313f => 14,
-        0x11b6 => 15,
-        0x3140 => 15,
-        0x1106 => 16,
-        0x11b7 => 16,
-        0x3141 => 16,
-        0x1107 => 17,
-        0x11b8 => 17,
-        0x3142 => 17,
-        0x11b9 => 18,
-        0x3144 => 18,
-        0x1109 => 19,
-        0x11ba => 19,
-        0x3145 => 19,
-        0x110a => 20,
-        0x11bb => 20,
-        0x3146 => 20,
-        0x110b => 21,
-        0x11bc => 21,
-        0x3147 => 21,
-        0x110c => 22,
-        0x11bd => 22,
-        0x3148 => 22,
-        0x110e => 23,
-        0x11be => 23,
-        0x314a => 23,
-        0x110f => 24,
-        0x11bf => 24,
-        0x314b => 24,
-        0x1110 => 25,
-        0x11c0 => 25,
-        0x314c => 25,
-        0x1111 => 26,
-        0x11c1 => 26,
-        0x314d => 26,
-        0x1112 => 27,
-        0x11c2 => 27,
-        0x314e => 27,
-        else => null,
-    };
-}
-
-fn appendUtf8(out: *std.ArrayList(u8), allocator: std.mem.Allocator, cp: u21) !void {
-    if (cp < 0x80) {
-        try out.append(allocator, @intCast(cp));
-    } else if (cp < 0x800) {
-        try out.append(allocator, @intCast(0xc0 | (cp >> 6)));
-        try out.append(allocator, @intCast(0x80 | (cp & 0x3f)));
-    } else if (cp < 0x10000) {
-        try out.append(allocator, @intCast(0xe0 | (cp >> 12)));
-        try out.append(allocator, @intCast(0x80 | ((cp >> 6) & 0x3f)));
-        try out.append(allocator, @intCast(0x80 | (cp & 0x3f)));
-    } else {
-        try out.append(allocator, @intCast(0xf0 | (cp >> 18)));
-        try out.append(allocator, @intCast(0x80 | ((cp >> 12) & 0x3f)));
-        try out.append(allocator, @intCast(0x80 | ((cp >> 6) & 0x3f)));
-        try out.append(allocator, @intCast(0x80 | (cp & 0x3f)));
-    }
-}
-
-fn isHalfwidthKatakana(cp: u21) bool {
-    return cp >= 0xff66 and cp <= 0xff9d;
-}
-
-fn isJapaneseVoiceMark(cp: u21) bool {
-    return cp == 0xff9e or cp == 0xff9f or cp == 0x3099 or cp == 0x309a or cp == 0x309b or cp == 0x309c;
-}
-
-fn isJapaneseHandakutenMark(cp: u21) bool {
-    return cp == 0xff9f or cp == 0x309a or cp == 0x309c;
-}
-
-fn isJapaneseVoiceBase(cp: u21) bool {
-    return isHalfwidthKatakana(cp) or (cp >= 0x3040 and cp <= 0x30ff);
-}
-
-fn normalizeHalfwidthKatakana(cp: u21) u21 {
-    return switch (cp) {
-        0xff66 => 0x30f2,
-        0xff67 => 0x30a1,
-        0xff68 => 0x30a3,
-        0xff69 => 0x30a5,
-        0xff6a => 0x30a7,
-        0xff6b => 0x30a9,
-        0xff6c => 0x30e3,
-        0xff6d => 0x30e5,
-        0xff6e => 0x30e7,
-        0xff6f => 0x30c3,
-        0xff70 => 0x30fc,
-        0xff71 => 0x30a2,
-        0xff72 => 0x30a4,
-        0xff73 => 0x30a6,
-        0xff74 => 0x30a8,
-        0xff75 => 0x30aa,
-        0xff76 => 0x30ab,
-        0xff77 => 0x30ad,
-        0xff78 => 0x30af,
-        0xff79 => 0x30b1,
-        0xff7a => 0x30b3,
-        0xff7b => 0x30b5,
-        0xff7c => 0x30b7,
-        0xff7d => 0x30b9,
-        0xff7e => 0x30bb,
-        0xff7f => 0x30bd,
-        0xff80 => 0x30bf,
-        0xff81 => 0x30c1,
-        0xff82 => 0x30c4,
-        0xff83 => 0x30c6,
-        0xff84 => 0x30c8,
-        0xff85 => 0x30ca,
-        0xff86 => 0x30cb,
-        0xff87 => 0x30cc,
-        0xff88 => 0x30cd,
-        0xff89 => 0x30ce,
-        0xff8a => 0x30cf,
-        0xff8b => 0x30d2,
-        0xff8c => 0x30d5,
-        0xff8d => 0x30d8,
-        0xff8e => 0x30db,
-        0xff8f => 0x30de,
-        0xff90 => 0x30df,
-        0xff91 => 0x30e0,
-        0xff92 => 0x30e1,
-        0xff93 => 0x30e2,
-        0xff94 => 0x30e4,
-        0xff95 => 0x30e6,
-        0xff96 => 0x30e8,
-        0xff97 => 0x30e9,
-        0xff98 => 0x30ea,
-        0xff99 => 0x30eb,
-        0xff9a => 0x30ec,
-        0xff9b => 0x30ed,
-        0xff9c => 0x30ef,
-        0xff9d => 0x30f3,
-        else => cp,
-    };
-}
-
-fn normalizeHalfwidthHangulJamo(cp: u21) u21 {
-    return switch (cp) {
-        0xffa0 => 0x1160,
-        0xffa1 => 0x1100,
-        0xffa2 => 0x1101,
-        0xffa3 => 0x11aa,
-        0xffa4 => 0x1102,
-        0xffa5 => 0x11ac,
-        0xffa6 => 0x11ad,
-        0xffa7 => 0x1103,
-        0xffa8 => 0x1104,
-        0xffa9 => 0x1105,
-        0xffaa => 0x11b0,
-        0xffab => 0x11b1,
-        0xffac => 0x11b2,
-        0xffad => 0x11b3,
-        0xffae => 0x11b4,
-        0xffaf => 0x11b5,
-        0xffb0 => 0x111a,
-        0xffb1 => 0x1106,
-        0xffb2 => 0x1107,
-        0xffb3 => 0x1108,
-        0xffb4 => 0x1121,
-        0xffb5 => 0x1109,
-        0xffb6 => 0x110a,
-        0xffb7 => 0x110b,
-        0xffb8 => 0x110c,
-        0xffb9 => 0x110d,
-        0xffba => 0x110e,
-        0xffbb => 0x110f,
-        0xffbc => 0x1110,
-        0xffbd => 0x1111,
-        0xffbe => 0x1112,
-        0xffc2 => 0x1161,
-        0xffc3 => 0x1162,
-        0xffc4 => 0x1163,
-        0xffc5 => 0x1164,
-        0xffc6 => 0x1165,
-        0xffc7 => 0x1166,
-        0xffca => 0x1167,
-        0xffcb => 0x1168,
-        0xffcc => 0x1169,
-        0xffcd => 0x116a,
-        0xffce => 0x116b,
-        0xffcf => 0x116c,
-        0xffd2 => 0x116d,
-        0xffd3 => 0x116e,
-        0xffd4 => 0x116f,
-        0xffd5 => 0x1170,
-        0xffd6 => 0x1171,
-        0xffd7 => 0x1172,
-        0xffda => 0x1173,
-        0xffdb => 0x1174,
-        0xffdc => 0x1175,
-        else => cp,
-    };
-}
-
-fn normalizeHiraganaToKatakana(cp: u21) u21 {
-    return if (cp >= 0x3041 and cp <= 0x3096) cp + 0x60 else cp;
-}
-
-fn applyJapaneseVoiceMark(cp: u21, mark: u21) ?u21 {
-    if (isJapaneseHandakutenMark(mark)) {
-        return switch (cp) {
-            0x306f => 0x3071,
-            0x3072 => 0x3074,
-            0x3075 => 0x3077,
-            0x3078 => 0x307a,
-            0x307b => 0x307d,
-            0x30cf => 0x30d1,
-            0x30d2 => 0x30d4,
-            0x30d5 => 0x30d7,
-            0x30d8 => 0x30da,
-            0x30db => 0x30dd,
-            else => null,
-        };
-    }
-    return switch (cp) {
-        0x3046 => 0x3094,
-        0x304b => 0x304c,
-        0x304d => 0x304e,
-        0x304f => 0x3050,
-        0x3051 => 0x3052,
-        0x3053 => 0x3054,
-        0x3055 => 0x3056,
-        0x3057 => 0x3058,
-        0x3059 => 0x305a,
-        0x305b => 0x305c,
-        0x305d => 0x305e,
-        0x305f => 0x3060,
-        0x3061 => 0x3062,
-        0x3064 => 0x3065,
-        0x3066 => 0x3067,
-        0x3068 => 0x3069,
-        0x306f => 0x3070,
-        0x3072 => 0x3073,
-        0x3075 => 0x3076,
-        0x3078 => 0x3079,
-        0x307b => 0x307c,
-        0x30a6 => 0x30f4,
-        0x30ab => 0x30ac,
-        0x30ad => 0x30ae,
-        0x30af => 0x30b0,
-        0x30b1 => 0x30b2,
-        0x30b3 => 0x30b4,
-        0x30b5 => 0x30b6,
-        0x30b7 => 0x30b8,
-        0x30b9 => 0x30ba,
-        0x30bb => 0x30bc,
-        0x30bd => 0x30be,
-        0x30bf => 0x30c0,
-        0x30c1 => 0x30c2,
-        0x30c4 => 0x30c5,
-        0x30c6 => 0x30c7,
-        0x30c8 => 0x30c9,
-        0x30cf => 0x30d0,
-        0x30d2 => 0x30d3,
-        0x30d5 => 0x30d6,
-        0x30d8 => 0x30d9,
-        0x30db => 0x30dc,
-        0x30ef => 0x30f7,
-        0x30f0 => 0x30f8,
-        0x30f1 => 0x30f9,
-        0x30f2 => 0x30fa,
-        else => null,
-    };
-}
-
-fn appendCjkTokens(tokens: *TokenList, bytes: []const u8, options: TokenizerOptions) !void {
-    var offsets = std.ArrayList(usize).empty;
-    defer offsets.deinit(tokens.allocator);
-
-    var i: usize = 0;
-    while (i < bytes.len) {
-        try offsets.append(tokens.allocator, i);
-        i += decodeUtf8(bytes, i).len;
-    }
-
-    if (options.emit_cjk_unigrams) {
-        for (0..offsets.items.len) |idx| {
-            const start = offsets.items[idx];
-            const end = if (idx + 1 < offsets.items.len) offsets.items[idx + 1] else bytes.len;
-            const token = try tokens.allocator.dupe(u8, bytes[start..end]);
-            try tokens.appendOwned(token, options.max_token_bytes);
-        }
-    }
-
-    if (options.emit_cjk_bigrams and offsets.items.len >= 2) {
-        for (0..offsets.items.len - 1) |idx| {
-            const start = offsets.items[idx];
-            const end = if (idx + 2 < offsets.items.len) offsets.items[idx + 2] else bytes.len;
-            const token = try tokens.allocator.dupe(u8, bytes[start..end]);
-            try tokens.appendOwned(token, options.max_token_bytes);
-        }
-    }
-}
-
-test "tokenizer splits code paths and preserves full path token" {
-    var tokens = try tokenize(std.testing.allocator, "src/ql/executor.zig", .{});
-    defer tokens.deinit();
-
-    try std.testing.expect(tokens.contains("src/ql/executor.zig"));
-    try std.testing.expect(tokens.contains("src"));
-    try std.testing.expect(tokens.contains("ql"));
-    try std.testing.expect(tokens.contains("executor"));
-    try std.testing.expect(tokens.contains("zig"));
-}
-
-test "tokenizer splits camel identifiers and preserves normalized identifier" {
-    var tokens = try tokenize(std.testing.allocator, "readEdgeIndexRecordsByNode", .{});
-    defer tokens.deinit();
-
-    try std.testing.expect(tokens.contains("readedgeindexrecordsbynode"));
-    try std.testing.expect(tokens.contains("read"));
-    try std.testing.expect(tokens.contains("edge"));
-    try std.testing.expect(tokens.contains("index"));
-    try std.testing.expect(tokens.contains("records"));
-    try std.testing.expect(tokens.contains("by"));
-    try std.testing.expect(tokens.contains("node"));
-}
-
-test "tokenizer handles dotted Zig symbols with whole and part terms" {
-    var tokens = try tokenize(std.testing.allocator, "std.mem.Allocator", .{});
-    defer tokens.deinit();
-
-    try std.testing.expect(tokens.contains("std.mem.allocator"));
-    try std.testing.expect(tokens.contains("std"));
-    try std.testing.expect(tokens.contains("mem"));
-    try std.testing.expect(tokens.contains("allocator"));
-}
-
-test "tokenizer caps adversarially long tokens" {
-    var tokens = try tokenize(std.testing.allocator, "short aaaaaaaaaaaaaaaaaaaa", .{ .max_token_bytes = 8 });
-    defer tokens.deinit();
-
-    try std.testing.expect(tokens.contains("short"));
-    try std.testing.expect(!tokens.contains("aaaaaaaaaaaaaaaaaaaa"));
-}
-
-test "tokenizer rejects options that cannot preserve CJK fallback terms" {
-    try std.testing.expectError(core.Error.Unsupported, tokenize(std.testing.allocator, "short", .{ .max_token_bytes = 0 }));
-    try std.testing.expectError(core.Error.Unsupported, tokenize(std.testing.allocator, "错误", .{ .max_token_bytes = 3 }));
-    try std.testing.expectError(core.Error.Unsupported, tokenize(std.testing.allocator, "错误", .{ .max_token_bytes = 7 }));
-
-    var unigram_only = try tokenize(std.testing.allocator, "错误", .{ .max_token_bytes = 4, .emit_cjk_bigrams = false });
-    defer unigram_only.deinit();
-    try std.testing.expect(unigram_only.contains("错"));
-    try std.testing.expect(!unigram_only.contains("错误"));
-}
-
-test "tokenizer emits CJK unigrams and bigrams" {
-    var tokens = try tokenize(std.testing.allocator, "错误记录", .{});
-    defer tokens.deinit();
-
-    try std.testing.expect(tokens.contains("错"));
-    try std.testing.expect(tokens.contains("误"));
-    try std.testing.expect(tokens.contains("错误"));
-    try std.testing.expect(tokens.contains("误记"));
-    try std.testing.expect(tokens.contains("记录"));
-}
-
-test "tokenizer bridges narrow CJK joiners" {
-    var chinese = try tokenize(std.testing.allocator, "错误-记录", .{});
-    defer chinese.deinit();
-    try std.testing.expect(chinese.contains("错误"));
-    try std.testing.expect(chinese.contains("误记"));
-    try std.testing.expect(chinese.contains("记录"));
-    try std.testing.expect(!chinese.contains("-"));
-
-    var japanese = try tokenize(std.testing.allocator, "エラー・解析", .{});
-    defer japanese.deinit();
-    try std.testing.expect(japanese.contains("ラー"));
-    try std.testing.expect(japanese.contains("ー解"));
-    try std.testing.expect(japanese.contains("解析"));
-    try std.testing.expect(!japanese.contains("・"));
-
-    var separated = try tokenize(std.testing.allocator, "错误 记录", .{});
-    defer separated.deinit();
-    try std.testing.expect(separated.contains("错误"));
-    try std.testing.expect(separated.contains("记录"));
-    try std.testing.expect(!separated.contains("误记"));
-}
-
-test "tokenizer bridges CJK variation selectors" {
-    var bmp_selector = try tokenize(std.testing.allocator, "禰\u{fe00}豆子", .{});
-    defer bmp_selector.deinit();
-    try std.testing.expect(bmp_selector.contains("禰"));
-    try std.testing.expect(bmp_selector.contains("禰豆"));
-    try std.testing.expect(bmp_selector.contains("豆子"));
-    try std.testing.expect(!bmp_selector.contains("\u{fe00}"));
-
-    var supplementary_selector = try tokenize(std.testing.allocator, "禰\u{e0100}豆子", .{});
-    defer supplementary_selector.deinit();
-    try std.testing.expect(supplementary_selector.contains("禰"));
-    try std.testing.expect(supplementary_selector.contains("禰豆"));
-    try std.testing.expect(supplementary_selector.contains("豆子"));
-    try std.testing.expect(!supplementary_selector.contains("\u{e0100}"));
-}
-
-test "tokenizer covers Japanese kana and Korean hangul fallback" {
-    var japanese = try tokenize(std.testing.allocator, "解析エラー", .{});
-    defer japanese.deinit();
-    try std.testing.expect(japanese.contains("解析"));
-    try std.testing.expect(japanese.contains("エラ"));
-    try std.testing.expect(japanese.contains("ー"));
-
-    var korean = try tokenize(std.testing.allocator, "오류기록", .{});
-    defer korean.deinit();
-    try std.testing.expect(korean.contains("오"));
-    try std.testing.expect(korean.contains("오류"));
-    try std.testing.expect(korean.contains("기록"));
-}
-
-test "tokenizer covers CJK compatibility, halfwidth kana folding, and Hangul extensions" {
-    var bopomofo = try tokenize(std.testing.allocator, "ㄅㄆ索引", .{});
-    defer bopomofo.deinit();
-    try std.testing.expect(bopomofo.contains("ㄅ"));
-    try std.testing.expect(bopomofo.contains("ㄅㄆ"));
-    try std.testing.expect(bopomofo.contains("索引"));
-
-    var halfwidth_kana = try tokenize(std.testing.allocator, "ｴﾗｰ解析", .{});
-    defer halfwidth_kana.deinit();
-    try std.testing.expect(halfwidth_kana.contains("エ"));
-    try std.testing.expect(halfwidth_kana.contains("エラ"));
-    try std.testing.expect(halfwidth_kana.contains("ラー"));
-    try std.testing.expect(halfwidth_kana.contains("解析"));
-
-    var voiced_kana = try tokenize(std.testing.allocator, "ｶﾞｲﾄﾞﾊﾟｽ", .{});
-    defer voiced_kana.deinit();
-    try std.testing.expect(voiced_kana.contains("ガ"));
-    try std.testing.expect(voiced_kana.contains("ガイ"));
-    try std.testing.expect(voiced_kana.contains("ドパ"));
-    try std.testing.expect(voiced_kana.contains("パ"));
-
-    var decomposed_kana = try tokenize(std.testing.allocator, "カ\u{3099}イド は\u{309a}す", .{});
-    defer decomposed_kana.deinit();
-    try std.testing.expect(decomposed_kana.contains("ガ"));
-    try std.testing.expect(decomposed_kana.contains("ガイ"));
-    try std.testing.expect(decomposed_kana.contains("パ"));
-    try std.testing.expect(decomposed_kana.contains("パス"));
-    try std.testing.expect(!decomposed_kana.contains("ぱ"));
-    try std.testing.expect(!decomposed_kana.contains("ぱす"));
-    try std.testing.expect(!decomposed_kana.contains("\u{3099}"));
-    try std.testing.expect(!decomposed_kana.contains("\u{309a}"));
-
-    var hiragana = try tokenize(std.testing.allocator, "えらーぱす", .{});
-    defer hiragana.deinit();
-    try std.testing.expect(hiragana.contains("エ"));
-    try std.testing.expect(hiragana.contains("エラ"));
-    try std.testing.expect(hiragana.contains("ラー"));
-    try std.testing.expect(hiragana.contains("パス"));
-    try std.testing.expect(!hiragana.contains("え"));
-    try std.testing.expect(!hiragana.contains("えら"));
-
-    var hangul_jamo = try tokenize(std.testing.allocator, "ꥠힰ", .{});
-    defer hangul_jamo.deinit();
-    try std.testing.expect(hangul_jamo.contains("ꥠ"));
-    try std.testing.expect(hangul_jamo.contains("ꥠힰ"));
-
-    var decomposed_hangul = try tokenize(std.testing.allocator, "오류기록", .{});
-    defer decomposed_hangul.deinit();
-    try std.testing.expect(decomposed_hangul.contains("오"));
-    try std.testing.expect(decomposed_hangul.contains("오류"));
-    try std.testing.expect(decomposed_hangul.contains("기록"));
-    try std.testing.expect(!decomposed_hangul.contains("ᄋ"));
-    try std.testing.expect(!decomposed_hangul.contains("오"));
-
-    var compatibility_hangul = try tokenize(std.testing.allocator, "ㅇㅗㄹㅠㄱㅣㄹㅗㄱ", .{});
-    defer compatibility_hangul.deinit();
-    try std.testing.expect(compatibility_hangul.contains("오"));
-    try std.testing.expect(compatibility_hangul.contains("오류"));
-    try std.testing.expect(compatibility_hangul.contains("기록"));
-    try std.testing.expect(!compatibility_hangul.contains("ㅇ"));
-    try std.testing.expect(!compatibility_hangul.contains("ㅇㅗ"));
-
-    var compatibility_hangul_final = try tokenize(std.testing.allocator, "ㄱㅏㄱ", .{});
-    defer compatibility_hangul_final.deinit();
-    try std.testing.expect(compatibility_hangul_final.contains("각"));
-    try std.testing.expect(!compatibility_hangul_final.contains("가"));
-
-    var halfwidth_hangul = try tokenize(std.testing.allocator, "\u{ffb7}\u{ffcc}\u{ffa9}\u{ffd7}\u{ffa1}\u{ffdc}\u{ffa9}\u{ffcc}\u{ffa1}", .{});
-    defer halfwidth_hangul.deinit();
-    try std.testing.expect(halfwidth_hangul.contains("오"));
-    try std.testing.expect(halfwidth_hangul.contains("오류"));
-    try std.testing.expect(halfwidth_hangul.contains("기록"));
-    try std.testing.expect(!halfwidth_hangul.contains("\u{ffb7}"));
-    try std.testing.expect(!halfwidth_hangul.contains("\u{ffb7}\u{ffcc}"));
-
-    var extension_i = try tokenize(std.testing.allocator, "\u{2ebf0}索引", .{});
-    defer extension_i.deinit();
-    try std.testing.expect(extension_i.contains("\u{2ebf0}"));
-    try std.testing.expect(extension_i.contains("\u{2ebf0}索"));
-}
-
-test "tokenizer folds fullwidth ASCII code text" {
-    var symbol = try tokenize(std.testing.allocator, "ＩｎｖａｌｉｄＲｅｃｏｒｄ", .{});
-    defer symbol.deinit();
-    try std.testing.expect(symbol.contains("invalidrecord"));
-    try std.testing.expect(symbol.contains("invalid"));
-    try std.testing.expect(symbol.contains("record"));
-
-    var path = try tokenize(std.testing.allocator, "ｓｒｃ／ｍａｉｎ．ｚｉｇ", .{});
-    defer path.deinit();
-    try std.testing.expect(path.contains("src/main.zig"));
-    try std.testing.expect(path.contains("src"));
-    try std.testing.expect(path.contains("main"));
-    try std.testing.expect(path.contains("zig"));
-}
-
-test "tokenizer separates mixed code identifiers and CJK text" {
-    var tokens = try tokenize(std.testing.allocator, "parse错误InvalidRecord", .{});
-    defer tokens.deinit();
-
-    try std.testing.expect(tokens.contains("parse"));
-    try std.testing.expect(tokens.contains("错误"));
-    try std.testing.expect(tokens.contains("invalidrecord"));
-    try std.testing.expect(tokens.contains("invalid"));
-    try std.testing.expect(tokens.contains("record"));
-    try std.testing.expect(!tokens.contains("parse错误"));
-    try std.testing.expect(!tokens.contains("误invalid"));
-}
-
-test "tokenizer treats invalid utf8 bytes as separators for CJK runs" {
-    var tokens = try tokenize(std.testing.allocator, "错误\xc0\x80记录", .{});
-    defer tokens.deinit();
-
-    try std.testing.expect(tokens.contains("错误"));
-    try std.testing.expect(tokens.contains("记录"));
-    try std.testing.expect(!tokens.contains("误记"));
-}
-
-fn tokenizerAllocationFailure(allocator: std.mem.Allocator) !void {
-    var tokens = try tokenize(allocator, "parse错误InvalidRecord std.mem.Allocator", .{});
-    defer tokens.deinit();
-    try std.testing.expect(tokens.contains("错误"));
-    try std.testing.expect(tokens.contains("invalidrecord"));
-    try std.testing.expect(tokens.contains("std.mem.allocator"));
-}
-
-test "tokenizer rolls back allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, tokenizerAllocationFailure, .{});
-}
-
-test "bm25 scores increase with term frequency and rarity" {
-    const params = Bm25Params{};
-    const one_hit = bm25TermScore(1, 10, 10.0, 1000, 10, params);
-    const two_hits = bm25TermScore(2, 10, 10.0, 1000, 10, params);
-    const common = bm25TermScore(1, 10, 10.0, 1000, 500, params);
-
-    try std.testing.expect(two_hits > one_hit);
-    try std.testing.expect(one_hit > common);
-}
-
-test "bm25 scoring rejects non-finite and out-of-range parameters" {
-    try std.testing.expectEqual(@as(f32, 0), bm25TermScore(1, 10, 10.0, 1000, 10, .{ .k1 = std.math.nan(f32) }));
-    try std.testing.expectEqual(@as(f32, 0), bm25WeightedTermScore(1.0, 10.0, 10.0, 1000, 10, .{ .b = std.math.inf(f32) }));
-    try std.testing.expectEqual(@as(f32, 0), bm25WeightedTermScore(1.0, 10.0, 10.0, 1000, 10, .{ .b = -0.1 }));
-    try std.testing.expectEqual(@as(f32, 0), bm25WeightedTermScore(1.0, 10.0, 10.0, 1000, 10, .{ .b = 1.1 }));
-}
-
-test "bm25 scoring rejects non-finite scoring inputs" {
-    try std.testing.expectEqual(@as(f32, 0), bm25TermScore(1, 10, std.math.nan(f32), 1000, 10, .{}));
-    try std.testing.expectEqual(@as(f32, 0), bm25WeightedTermScore(std.math.inf(f32), 10.0, 10.0, 1000, 10, .{}));
-    try std.testing.expectEqual(@as(f32, 0), bm25WeightedTermScore(1.0, std.math.inf(f32), 10.0, 1000, 10, .{}));
-    try std.testing.expectEqual(@as(f32, 0), bm25WeightedTermScore(1.0, 10.0, std.math.nan(f32), 1000, 10, .{}));
-}
-
-test "bm25 scoring rejects finite inputs that overflow intermediate score math" {
-    const score = bm25WeightedTermScore(std.math.floatMax(f32), 1.0, std.math.floatMin(f32), 1000, 10, .{});
-    try std.testing.expectEqual(@as(f32, 0), score);
-}
-
-test "bm25 same-term ordering can depend on final average document length" {
-    const doc_count: u64 = 1000;
-    const doc_freq: u64 = 100;
-    const high_tf_long_doc_tf: f32 = 8.0;
-    const high_tf_long_doc_len: f32 = 100.0;
-    const low_tf_short_doc_tf: f32 = 4.0;
-    const low_tf_short_doc_len: f32 = 10.0;
-
-    const low_avg_high_tf_long = bm25WeightedTermScore(high_tf_long_doc_tf, high_tf_long_doc_len, 10.0, doc_count, doc_freq, .{});
-    const low_avg_low_tf_short = bm25WeightedTermScore(low_tf_short_doc_tf, low_tf_short_doc_len, 10.0, doc_count, doc_freq, .{});
-    try std.testing.expect(low_avg_low_tf_short > low_avg_high_tf_long);
-
-    const high_avg_high_tf_long = bm25WeightedTermScore(high_tf_long_doc_tf, high_tf_long_doc_len, 1000.0, doc_count, doc_freq, .{});
-    const high_avg_low_tf_short = bm25WeightedTermScore(low_tf_short_doc_tf, low_tf_short_doc_len, 1000.0, doc_count, doc_freq, .{});
-    try std.testing.expect(high_avg_high_tf_long > high_avg_low_tf_short);
 }
 
 test "text index searches graph node texts with code-aware terms" {
@@ -19367,27 +9718,6 @@ test "persistent term builder add document leaves no partial state on allocation
     try std.testing.expect(saw_failure);
 }
 
-test "persistent text doc id allocation rejects overflow" {
-    try std.testing.expectEqual(@as(u64, 1), try nextPersistentTextDocId(0));
-    try std.testing.expectEqual(std.math.maxInt(u64), try nextPersistentTextDocId(std.math.maxInt(u64) - 1));
-    try std.testing.expectError(error.RecordTooLarge, nextPersistentTextDocId(std.math.maxInt(u64)));
-}
-
-test "persistent text docs header rejects dirty padding" {
-    var bytes: [TextDocsHeader.encoded_len]u8 = undefined;
-    (TextDocsHeader{ .doc_count = 7, .node_id_overflow_count = 2 }).encode(&bytes);
-    try std.testing.expect(allZero(bytes[24..32]));
-    const decoded = try TextDocsHeader.decode(&bytes);
-    try std.testing.expectEqual(@as(u64, 7), decoded.doc_count);
-    try std.testing.expectEqual(@as(u64, 2), decoded.node_id_overflow_count);
-
-    bytes[31] = 1;
-    try std.testing.expectError(error.InvalidRecord, TextDocsHeader.decode(&bytes));
-    bytes[31] = 0;
-    std.mem.writeInt(u64, bytes[16..24], 8, .little);
-    try std.testing.expectError(error.InvalidRecord, TextDocsHeader.decode(&bytes));
-}
-
 test "persistent text offset helpers reject arithmetic overflow" {
     try std.testing.expectEqual(@as(usize, 88), PersistentTextMeta.encoded_len);
     try std.testing.expectEqual(@as(usize, 8), TextDocRecord.encoded_len);
@@ -19442,17 +9772,17 @@ test "persistent text offset helpers reject arithmetic overflow" {
     try std.testing.expectError(error.InvalidRecord, persistentBlockPostingCount(64, 1, 64));
     try std.testing.expectError(error.RecordTooLarge, persistentBlockPostingCount(std.math.maxInt(u64), std.math.maxInt(u64), 2));
     var posting_bytes: [TextPostingRecord.encoded_len]u8 = undefined;
-    try (TextPostingRecord{ .doc_id = persistent_posting_max_doc_id, .text_freq = persistent_posting_max_field_freq, .kind_freq = 0 }).encode(&posting_bytes);
-    try (TextPostingRecord{ .doc_id = persistent_posting_max_doc_id, .text_freq = 1, .kind_freq = persistent_posting_max_kind_freq }).encode(&posting_bytes);
+    try encodeTextPostingRecord(.{ .doc_id = persistent_posting_max_doc_id, .text_freq = persistent_posting_max_field_freq, .kind_freq = 0 }, &posting_bytes);
+    try encodeTextPostingRecord(.{ .doc_id = persistent_posting_max_doc_id, .text_freq = 1, .kind_freq = persistent_posting_max_kind_freq }, &posting_bytes);
     const max_posting = TextPostingRecord{ .doc_id = persistent_posting_max_doc_id, .text_freq = persistent_posting_max_field_freq, .kind_freq = persistent_posting_max_kind_freq };
-    try max_posting.encode(&posting_bytes);
-    const decoded_max_posting = try TextPostingRecord.decode(&posting_bytes);
+    try encodeTextPostingRecord(max_posting, &posting_bytes);
+    const decoded_max_posting = try decodeTextPostingRecord(&posting_bytes);
     try std.testing.expectEqual(max_posting.doc_id, decoded_max_posting.doc_id);
     try std.testing.expectEqual(max_posting.text_freq, decoded_max_posting.text_freq);
     try std.testing.expectEqual(max_posting.kind_freq, decoded_max_posting.kind_freq);
-    try std.testing.expectError(error.RecordTooLarge, (TextPostingRecord{ .doc_id = persistent_posting_max_doc_id + 1, .text_freq = 1, .kind_freq = 0 }).encode(&posting_bytes));
-    try std.testing.expectError(error.RecordTooLarge, (TextPostingRecord{ .doc_id = 1, .text_freq = persistent_posting_max_field_freq + 1, .kind_freq = 0 }).encode(&posting_bytes));
-    try std.testing.expectError(error.RecordTooLarge, (TextPostingRecord{ .doc_id = 1, .text_freq = 0, .kind_freq = persistent_posting_max_kind_freq + 1 }).encode(&posting_bytes));
+    try std.testing.expectError(error.RecordTooLarge, encodeTextPostingRecord(.{ .doc_id = persistent_posting_max_doc_id + 1, .text_freq = 1, .kind_freq = 0 }, &posting_bytes));
+    try std.testing.expectError(error.RecordTooLarge, encodeTextPostingRecord(.{ .doc_id = 1, .text_freq = persistent_posting_max_field_freq + 1, .kind_freq = 0 }, &posting_bytes));
+    try std.testing.expectError(error.RecordTooLarge, encodeTextPostingRecord(.{ .doc_id = 1, .text_freq = 0, .kind_freq = persistent_posting_max_kind_freq + 1 }, &posting_bytes));
     var term_entry_bytes: [TextTermEntry.encoded_len]u8 = undefined;
     const max_term_entry_payload = try encodeInlineSingletonPostingPayload(.{ .doc_id = persistent_inline_posting_max_doc_id, .text_freq = 3, .kind_freq = 0 });
     const max_term_entry = TextTermEntry{
@@ -19461,8 +9791,8 @@ test "persistent text offset helpers reject arithmetic overflow" {
         .postings_offset = max_term_entry_payload,
         .postings_count = 1,
     };
-    try max_term_entry.encode(&term_entry_bytes);
-    const decoded_max_term_entry = try TextTermEntry.decode(&term_entry_bytes);
+    try encodeTextTermEntry(max_term_entry, &term_entry_bytes);
+    const decoded_max_term_entry = try decodeTextTermEntry(&term_entry_bytes);
     try std.testing.expectEqual(max_term_entry.term_len, decoded_max_term_entry.term_len);
     try std.testing.expectEqual(@as(u32, 0), decoded_max_term_entry.doc_freq);
     try std.testing.expectEqual(@as(u64, 0), decoded_max_term_entry.postings_offset);
@@ -19474,8 +9804,8 @@ test "persistent text offset helpers reject arithmetic overflow" {
         .postings_count = 1,
         .front_prefix_len = 3,
     };
-    try packed_front_prefix_entry.encode(&term_entry_bytes);
-    const decoded_packed_front_prefix = try TextTermEntry.decode(&term_entry_bytes);
+    try encodeTextTermEntry(packed_front_prefix_entry, &term_entry_bytes);
+    const decoded_packed_front_prefix = try decodeTextTermEntry(&term_entry_bytes);
     try std.testing.expectEqual(@as(u32, 10), decoded_packed_front_prefix.term_len);
     try std.testing.expectEqual(@as(u8, 3), decoded_packed_front_prefix.front_prefix_len.?);
     const exception_marker_entry = TextTermEntry{
@@ -19484,58 +9814,58 @@ test "persistent text offset helpers reject arithmetic overflow" {
         .postings_offset = persistent_postings_body_max_offset,
         .postings_count = 2,
     };
-    try exception_marker_entry.encode(&term_entry_bytes);
-    const decoded_exception_marker = try TextTermEntry.decode(&term_entry_bytes);
+    try encodeTextTermEntry(exception_marker_entry, &term_entry_bytes);
+    const decoded_exception_marker = try decodeTextTermEntry(&term_entry_bytes);
     try std.testing.expectEqual(@as(u32, 0), decoded_exception_marker.doc_freq);
     try std.testing.expectEqual(@as(u64, 0), decoded_exception_marker.postings_count);
     var exception_record_bytes: [TextTermExceptionRecord.encoded_len]u8 = undefined;
     const exception_record = TextTermExceptionRecord{ .doc_freq = @intCast(persistent_term_max_doc_freq), .postings_offset = persistent_postings_body_max_offset };
-    try exception_record.encode(&exception_record_bytes);
-    const decoded_exception_record = try TextTermExceptionRecord.decode(&exception_record_bytes);
+    try encodeTextTermExceptionRecord(exception_record, &exception_record_bytes);
+    const decoded_exception_record = try decodeTextTermExceptionRecord(&exception_record_bytes);
     try std.testing.expectEqual(exception_record.doc_freq, decoded_exception_record.doc_freq);
     try std.testing.expectEqual(exception_record.postings_offset, decoded_exception_record.postings_offset);
     const non_inline_singleton_exception = TextTermExceptionRecord{ .doc_freq = 1, .postings_offset = 0 };
-    try non_inline_singleton_exception.encode(&exception_record_bytes);
+    try encodeTextTermExceptionRecord(non_inline_singleton_exception, &exception_record_bytes);
     const inline_singleton_exception = TextTermExceptionRecord{ .doc_freq = 1, .postings_offset = max_term_entry_payload };
-    try std.testing.expectError(error.InvalidRecord, inline_singleton_exception.encode(&exception_record_bytes));
-    try std.testing.expectError(error.RecordTooLarge, (TextTermEntry{ .term_len = persistent_term_max_len + 1, .doc_freq = 1, .postings_offset = 0, .postings_count = 1 }).encode(&term_entry_bytes));
+    try std.testing.expectError(error.InvalidRecord, encodeTextTermExceptionRecord(inline_singleton_exception, &exception_record_bytes));
+    try std.testing.expectError(error.RecordTooLarge, encodeTextTermEntry(.{ .term_len = persistent_term_max_len + 1, .doc_freq = 1, .postings_offset = 0, .postings_count = 1 }, &term_entry_bytes));
     var block_record_bytes: [TextPostingBlockRecord.encoded_len]u8 = undefined;
     const max_block_record = TextPostingBlockRecord{ .max_weighted_tf = 1, .min_doc_len = 1, .last_doc_id = persistent_posting_max_doc_id };
-    try max_block_record.encode(&block_record_bytes);
-    const decoded_max_block_record = try TextPostingBlockRecord.decode(&block_record_bytes);
-    try std.testing.expect(decoded_max_block_record.conservativelyMatches(max_block_record));
+    try encodeTextPostingBlockRecord(max_block_record, &block_record_bytes);
+    const decoded_max_block_record = try decodeTextPostingBlockRecord(&block_record_bytes);
+    try std.testing.expect(textPostingBlockRecordConservativelyMatches(decoded_max_block_record, max_block_record));
     const quantized_block_record = TextPostingBlockRecord{ .max_weighted_tf = 1.1, .min_doc_len = 9.9, .last_doc_id = 42 };
-    try quantized_block_record.encode(&block_record_bytes);
-    const decoded_quantized_block_record = try TextPostingBlockRecord.decode(&block_record_bytes);
-    try std.testing.expect(decoded_quantized_block_record.conservativelyMatches(quantized_block_record));
+    try encodeTextPostingBlockRecord(quantized_block_record, &block_record_bytes);
+    const decoded_quantized_block_record = try decodeTextPostingBlockRecord(&block_record_bytes);
+    try std.testing.expect(textPostingBlockRecordConservativelyMatches(decoded_quantized_block_record, quantized_block_record));
     try std.testing.expect(decoded_quantized_block_record.max_weighted_tf >= quantized_block_record.max_weighted_tf);
     try std.testing.expect(decoded_quantized_block_record.min_doc_len <= quantized_block_record.min_doc_len);
     try std.testing.expectEqual(quantized_block_record.last_doc_id, decoded_quantized_block_record.last_doc_id);
-    try std.testing.expectError(error.RecordTooLarge, (TextPostingBlockRecord{ .max_weighted_tf = persistent_block_score_f16_max * 2.0, .min_doc_len = 1, .last_doc_id = 1 }).encode(&block_record_bytes));
-    try std.testing.expectError(error.RecordTooLarge, (TextPostingBlockRecord{ .max_weighted_tf = 1, .min_doc_len = 1, .last_doc_id = 0 }).encode(&block_record_bytes));
+    try std.testing.expectError(error.RecordTooLarge, encodeTextPostingBlockRecord(.{ .max_weighted_tf = persistent_block_score_f16_max * 2.0, .min_doc_len = 1, .last_doc_id = 1 }, &block_record_bytes));
+    try std.testing.expectError(error.RecordTooLarge, encodeTextPostingBlockRecord(.{ .max_weighted_tf = 1, .min_doc_len = 1, .last_doc_id = 0 }, &block_record_bytes));
     var top_hit_bytes: [TextTermTopHitRecord.encoded_len]u8 = undefined;
     const max_top_hit = TextTermTopHitRecord{ .doc_id = persistent_posting_max_doc_id, .text_freq = persistent_posting_max_field_freq, .node_id = std.math.maxInt(u64) - 1, .score = 1.5 };
-    try max_top_hit.encode(&top_hit_bytes);
-    const decoded_top_hit = try TextTermTopHitRecord.decode(&top_hit_bytes);
+    try encodeTextTermTopHitRecord(max_top_hit, &top_hit_bytes);
+    const decoded_top_hit = try decodeTextTermTopHitRecord(&top_hit_bytes);
     try std.testing.expectEqual(max_top_hit.doc_id, decoded_top_hit.doc_id);
     try std.testing.expectEqual(max_top_hit.text_freq, decoded_top_hit.text_freq);
     try std.testing.expectEqual(@as(u64, 0), decoded_top_hit.node_id);
     try std.testing.expectEqual(@as(f32, 0), decoded_top_hit.score);
-    try std.testing.expectError(error.RecordTooLarge, (TextTermTopHitRecord{ .doc_id = persistent_posting_max_doc_id + 1, .text_freq = 1, .score = 1 }).encode(&top_hit_bytes));
-    try std.testing.expectError(error.InvalidRecord, (TextTermTopHitRecord{ .doc_id = 1, .text_freq = 0, .score = 1 }).encode(&top_hit_bytes));
-    try std.testing.expectError(error.RecordTooLarge, (TextTermTopHitRecord{ .doc_id = 1, .text_freq = persistent_posting_max_field_freq + 1, .score = 1 }).encode(&top_hit_bytes));
-    try std.testing.expectError(error.InvalidRecord, (TextTermTopHitRecord{ .doc_id = 1, .text_freq = 1, .node_id = std.math.maxInt(u64), .score = 1 }).encode(&top_hit_bytes));
-    try std.testing.expectError(error.InvalidRecord, (TextTermTopHitRecord{ .doc_id = 1, .text_freq = 1, .score = std.math.nan(f32) }).encode(&top_hit_bytes));
+    try std.testing.expectError(error.RecordTooLarge, encodeTextTermTopHitRecord(.{ .doc_id = persistent_posting_max_doc_id + 1, .text_freq = 1, .score = 1 }, &top_hit_bytes));
+    try std.testing.expectError(error.InvalidRecord, encodeTextTermTopHitRecord(.{ .doc_id = 1, .text_freq = 0, .score = 1 }, &top_hit_bytes));
+    try std.testing.expectError(error.RecordTooLarge, encodeTextTermTopHitRecord(.{ .doc_id = 1, .text_freq = persistent_posting_max_field_freq + 1, .score = 1 }, &top_hit_bytes));
+    try std.testing.expectError(error.InvalidRecord, encodeTextTermTopHitRecord(.{ .doc_id = 1, .text_freq = 1, .node_id = std.math.maxInt(u64), .score = 1 }, &top_hit_bytes));
+    try std.testing.expectError(error.InvalidRecord, encodeTextTermTopHitRecord(.{ .doc_id = 1, .text_freq = 1, .score = std.math.nan(f32) }, &top_hit_bytes));
     var top_hit_term_bytes: [TextTermTopHitTermRecord.encoded_len]u8 = undefined;
     const max_top_hit_term = TextTermTopHitTermRecord{ .term_index = std.math.maxInt(u32), .hit_offset = 0, .hit_count = persistent_term_top_hit_capacity };
-    try max_top_hit_term.encode(&top_hit_term_bytes);
-    const decoded_top_hit_term = try TextTermTopHitTermRecord.decode(&top_hit_term_bytes, 7, persistent_term_top_hit_capacity);
+    try encodeTextTermTopHitTermRecord(max_top_hit_term, &top_hit_term_bytes);
+    const decoded_top_hit_term = try decodeTextTermTopHitTermRecord(&top_hit_term_bytes, 7, persistent_term_top_hit_capacity);
     try std.testing.expectEqual(max_top_hit_term.term_index, decoded_top_hit_term.term_index);
     try std.testing.expectEqual(@as(u64, 7 * persistent_term_top_hit_capacity), decoded_top_hit_term.hit_offset);
     try std.testing.expectEqual(max_top_hit_term.hit_count, decoded_top_hit_term.hit_count);
-    try std.testing.expectError(error.RecordTooLarge, (TextTermTopHitTermRecord{ .term_index = @as(u64, std.math.maxInt(u32)) + 1, .hit_offset = 0, .hit_count = 1 }).encode(&top_hit_term_bytes));
-    try std.testing.expectError(error.InvalidRecord, (TextTermTopHitTermRecord{ .term_index = 0, .hit_offset = 0, .hit_count = 0 }).encode(&top_hit_term_bytes));
-    try std.testing.expectError(error.InvalidRecord, TextTermTopHitTermRecord.decode(&top_hit_term_bytes, 0, 0));
+    try std.testing.expectError(error.RecordTooLarge, encodeTextTermTopHitTermRecord(.{ .term_index = @as(u64, std.math.maxInt(u32)) + 1, .hit_offset = 0, .hit_count = 1 }, &top_hit_term_bytes));
+    try std.testing.expectError(error.InvalidRecord, encodeTextTermTopHitTermRecord(.{ .term_index = 0, .hit_offset = 0, .hit_count = 0 }, &top_hit_term_bytes));
+    try std.testing.expectError(error.InvalidRecord, decodeTextTermTopHitTermRecord(&top_hit_term_bytes, 0, 0));
 }
 
 test "persistent text terms byte stats split physical lanes" {
@@ -19557,7 +9887,7 @@ test "persistent text terms byte stats split physical lanes" {
     var bytes = try std.testing.allocator.alloc(u8, std.math.cast(usize, size) orelse return error.RecordTooLarge);
     defer std.testing.allocator.free(bytes);
     @memset(bytes, 0);
-    header.encode(bytes[0..TextTermsHeader.encoded_len]);
+    encodeTextTermsHeader(header, bytes[0..TextTermsHeader.encoded_len]);
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "text_terms.idx",
         .data = bytes,
@@ -19606,16 +9936,16 @@ test "persistent text term exception sidecar resolves non-singleton payload" {
         defer file.close(std.testing.io);
 
         var header_bytes: [TextTermsHeader.encoded_len]u8 = undefined;
-        header.encode(&header_bytes);
+        encodeTextTermsHeader(header, &header_bytes);
         try file.writePositionalAll(std.testing.io, &header_bytes, 0);
 
         var entry_bytes: [TextTermEntry.encoded_len]u8 = undefined;
-        try (TextTermEntry{
+        try encodeTextTermEntry(.{
             .term_len = 3,
             .doc_freq = 70_000,
             .postings_offset = 0,
             .postings_count = 70_000,
-        }).encode(&entry_bytes);
+        }, &entry_bytes);
         try file.writePositionalAll(std.testing.io, &entry_bytes, try textTermEntryOffset(0));
 
         const term_bytes = [_]u8{ 0, 'h', 'o', 't' };
@@ -19629,7 +9959,7 @@ test "persistent text term exception sidecar resolves non-singleton payload" {
         try file.writePositionalAll(std.testing.io, &membership_byte, try textTermExceptionMembershipByteOffset(1, 4, 0));
 
         var exception_bytes: [TextTermExceptionRecord.encoded_len]u8 = undefined;
-        try (TextTermExceptionRecord{ .doc_freq = 70_000, .postings_offset = 0 }).encode(&exception_bytes);
+        try encodeTextTermExceptionRecord(.{ .doc_freq = 70_000, .postings_offset = 0 }, &exception_bytes);
         try file.writePositionalAll(std.testing.io, &exception_bytes, try textTermExceptionRecordOffset(1, 4, 0));
     }
 
@@ -19702,7 +10032,15 @@ test "persistent text doc rank entry stays compact and preserves ranking order" 
         }),
     };
 
-    std.mem.sort(TextDocRankEntry, &entries, {}, textDocRankLessThan);
+    const lessThan = struct {
+        fn call(_: void, lhs: TextDocRankEntry, rhs: TextDocRankEntry) bool {
+            const lhs_len = lhs.docLen();
+            const rhs_len = rhs.docLen();
+            if (lhs_len != rhs_len) return lhs_len < rhs_len;
+            return lhs.node_id < rhs.node_id;
+        }
+    }.call;
+    std.mem.sort(TextDocRankEntry, &entries, {}, lessThan);
 
     try std.testing.expectEqual(@as(u32, 3), entries[0].doc_id);
     try std.testing.expectEqual(@as(u32, 2), entries[1].doc_id);
@@ -20593,26 +10931,6 @@ test "text index enforces postings scan budget" {
     try std.testing.expectEqual(@as(usize, 2), hits.items.len);
 }
 
-test "text search options use bounded postings scan default" {
-    const options = TextSearchOptions{};
-    try std.testing.expectEqual(core.default_max_text_postings_scanned, options.max_postings_scanned);
-}
-
-test "text search bounded hit collector keeps best limited hits" {
-    var hits = std.ArrayList(TextSearchHit).empty;
-    defer hits.deinit(std.testing.allocator);
-
-    try appendTopTextHitBounded(std.testing.allocator, &hits, 2, .{ .node_id = .fromInt(3), .kind = .observation, .score = 1.0 });
-    try appendTopTextHitBounded(std.testing.allocator, &hits, 2, .{ .node_id = .fromInt(2), .kind = .observation, .score = 3.0 });
-    try appendTopTextHitBounded(std.testing.allocator, &hits, 2, .{ .node_id = .fromInt(1), .kind = .observation, .score = 3.0 });
-    try appendTopTextHitBounded(std.testing.allocator, &hits, 2, .{ .node_id = .fromInt(4), .kind = .observation, .score = 0.5 });
-
-    std.mem.sort(TextSearchHit, hits.items, {}, textSearchHitLessThan);
-    try std.testing.expectEqual(@as(usize, 2), hits.items.len);
-    try std.testing.expectEqual(@as(u64, 1), hits.items[0].node_id.toInt());
-    try std.testing.expectEqual(@as(u64, 2), hits.items[1].node_id.toInt());
-}
-
 test "text term top-hit collector caches worst slot without changing ordering" {
     var hits = std.ArrayList(TextTermTopHitRecord).empty;
     defer hits.deinit(std.testing.allocator);
@@ -20747,34 +11065,6 @@ test "text term top-hit block upper bound skips hopeless blocks" {
     try std.testing.expect(!textTermTopHitBlockCannotBeatCurrentWorst(hits.items, worst_index, 2, 2.5));
 }
 
-test "top-hit regular term probes keep heaviest fixed window" {
-    var by_doc_reads: [persistent_term_top_hit_regular_probe_capacity]TextTopHitRegularTermProbe = undefined;
-    var by_candidates: [persistent_term_top_hit_regular_probe_capacity]TextTopHitRegularTermProbe = undefined;
-    var doc_read_count: usize = 0;
-    var candidate_count: usize = 0;
-
-    var index: u64 = 0;
-    while (index < persistent_term_top_hit_regular_probe_capacity + 3) : (index += 1) {
-        const probe = TextTopHitRegularTermProbe{
-            .term_index = index,
-            .postings_count = 100 + index,
-            .block_evals = index + 1,
-            .candidate_evals = if (index == 2) 1000 else index * 10,
-            .doc_reads = if (index == 1) 900 else index,
-        };
-        insertTextTopHitRegularTermProbe(&by_doc_reads, &doc_read_count, probe, topHitRegularTermProbeDocReadHeavier);
-        insertTextTopHitRegularTermProbe(&by_candidates, &candidate_count, probe, topHitRegularTermProbeCandidateHeavier);
-    }
-
-    try std.testing.expectEqual(persistent_term_top_hit_regular_probe_capacity, doc_read_count);
-    try std.testing.expectEqual(persistent_term_top_hit_regular_probe_capacity, candidate_count);
-    try std.testing.expectEqual(@as(u64, 1), by_doc_reads[0].term_index);
-    try std.testing.expectEqual(@as(u64, 2), by_candidates[0].term_index);
-    try std.testing.expectEqual(@as(u64, 900), try textTopHitRegularProbeDocReadsSum(by_doc_reads[0..doc_read_count], 1));
-    try std.testing.expectEqual(@as(u64, 1000), try textTopHitRegularProbeCandidateEvalsSum(by_candidates[0..candidate_count], 1));
-    try std.testing.expect((try textTopHitRegularProbeDocReadsSum(by_doc_reads[0..doc_read_count], 4)) > 900);
-}
-
 test "persistent text resolves constant near-all top hits from global top docs" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -20846,87 +11136,6 @@ test "persistent text resolves constant subset top hits from global doc rank" {
     defer hits.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 8), hits.items.len);
     try std.testing.expectEqual(core.NodeId.fromInt(2), hits.items[0].node_id);
-}
-
-test "streaming run derived term scratch uses exact summary capacity" {
-    var context = StreamingRunDerivedFilesContext{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-        .postings_writer = undefined,
-        .blocks_offsets_writer = undefined,
-        .blocks_byte_offsets_writer = undefined,
-        .blocks_writer = undefined,
-        .impacts_writer = undefined,
-        .top_hits_index_writer = undefined,
-        .top_hits_writer = undefined,
-        .terms_entry_writer = undefined,
-        .terms_bytes_writer = undefined,
-        .terms_checkpoints_writer = undefined,
-        .terms_exception_rank_writer = undefined,
-        .terms_exception_membership_writer = undefined,
-        .terms_exception_payload_writer = undefined,
-        .terms_singleton_checkpoints_writer = undefined,
-        .terms_singleton_payload_writer = undefined,
-        .summary_reader = undefined,
-        .summary_count = 0,
-        .docs_view = undefined,
-        .meta = undefined,
-        .avg_doc_len = 0,
-        .block_size = persistent_posting_block_size,
-    };
-    defer context.deinit();
-
-    context.current_block_postings = 7;
-    context.local_block_index = 3;
-    context.hit_count = 2;
-    context.worst_hit_index = 0;
-    const summary = try TextPostingRunTermSummaryRecord.init("common", persistent_term_top_hit_min_postings);
-
-    try resetStreamingRunDerivedTermScratch(&context, summary);
-
-    try std.testing.expectEqual(@as(u64, 0), context.current_block_postings);
-    try std.testing.expectEqual(@as(u64, 0), context.local_block_index);
-    try std.testing.expectEqual(@as(usize, 0), context.hit_count);
-    try std.testing.expectEqual(@as(?usize, null), context.worst_hit_index);
-    try std.testing.expectEqual(std.math.cast(usize, summary.block_count).?, context.impacts.capacity);
-}
-
-test "streaming run derived term scratch releases large impact high-water" {
-    var context = StreamingRunDerivedFilesContext{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-        .postings_writer = undefined,
-        .blocks_offsets_writer = undefined,
-        .blocks_byte_offsets_writer = undefined,
-        .blocks_writer = undefined,
-        .impacts_writer = undefined,
-        .top_hits_index_writer = undefined,
-        .top_hits_writer = undefined,
-        .terms_entry_writer = undefined,
-        .terms_bytes_writer = undefined,
-        .terms_checkpoints_writer = undefined,
-        .terms_exception_rank_writer = undefined,
-        .terms_exception_membership_writer = undefined,
-        .terms_exception_payload_writer = undefined,
-        .terms_singleton_checkpoints_writer = undefined,
-        .terms_singleton_payload_writer = undefined,
-        .summary_reader = undefined,
-        .summary_count = 0,
-        .docs_view = undefined,
-        .meta = undefined,
-        .avg_doc_len = 0,
-        .block_size = persistent_posting_block_size,
-    };
-    defer context.deinit();
-
-    const large_postings = persistent_posting_block_size * (streaming_run_derived_scratch_shrink_min_capacity * 2);
-    const large = try TextPostingRunTermSummaryRecord.init("common", large_postings);
-    try resetStreamingRunDerivedTermScratch(&context, large);
-    try std.testing.expectEqual(streaming_run_derived_scratch_shrink_min_capacity * 2, context.impacts.capacity);
-
-    const small = try TextPostingRunTermSummaryRecord.init("rare", 1);
-    try resetStreamingRunDerivedTermScratch(&context, small);
-    try std.testing.expectEqual(@as(usize, 0), context.impacts.capacity);
 }
 
 fn appendRepeatedTextTestNodes(
@@ -21245,22 +11454,6 @@ test "text index tie-breaks equal scores by node id" {
     try std.testing.expectEqual(@as(usize, 2), hits.items.len);
     try std.testing.expectEqual(second, hits.items[0].node_id);
     try std.testing.expectEqual(first, hits.items[1].node_id);
-}
-
-test "text search hit ordering handles non-finite scores deterministically" {
-    var hits = [_]TextSearchHit{
-        .{ .node_id = .fromInt(4), .kind = .observation, .score = std.math.nan(f32) },
-        .{ .node_id = .fromInt(3), .kind = .observation, .score = 1.0 },
-        .{ .node_id = .fromInt(2), .kind = .observation, .score = std.math.inf(f32) },
-        .{ .node_id = .fromInt(1), .kind = .observation, .score = 1.0 },
-    };
-
-    std.mem.sort(TextSearchHit, &hits, {}, textSearchHitLessThan);
-
-    try std.testing.expectEqual(core.NodeId.fromInt(1), hits[0].node_id);
-    try std.testing.expectEqual(core.NodeId.fromInt(3), hits[1].node_id);
-    try std.testing.expectEqual(core.NodeId.fromInt(2), hits[2].node_id);
-    try std.testing.expectEqual(core.NodeId.fromInt(4), hits[3].node_id);
 }
 
 test "text index build and search enforce immediate deadline" {
@@ -22671,13 +12864,13 @@ test "persistent text top-hit sparse index rejects unsorted term entries" {
         .capacity = persistent_term_top_hit_capacity,
     };
     var header_bytes: [TextTermTopHitsHeader.encoded_len]u8 = undefined;
-    header.encode(&header_bytes);
+    encodeTextTermTopHitsHeader(header, &header_bytes);
     try file.writePositionalAll(std.testing.io, &header_bytes, 0);
 
     var sparse_bytes: [TextTermTopHitTermRecord.encoded_len]u8 = undefined;
-    try (TextTermTopHitTermRecord{ .term_index = 5, .hit_offset = 0, .hit_count = persistent_term_top_hit_capacity }).encode(&sparse_bytes);
+    try encodeTextTermTopHitTermRecord(.{ .term_index = 5, .hit_offset = 0, .hit_count = persistent_term_top_hit_capacity }, &sparse_bytes);
     try file.writePositionalAll(std.testing.io, &sparse_bytes, try textTermTopHitTermRecordOffset(header.hit_count, 0));
-    try (TextTermTopHitTermRecord{ .term_index = 3, .hit_offset = persistent_term_top_hit_capacity, .hit_count = persistent_term_top_hit_capacity }).encode(&sparse_bytes);
+    try encodeTextTermTopHitTermRecord(.{ .term_index = 3, .hit_offset = persistent_term_top_hit_capacity, .hit_count = persistent_term_top_hit_capacity }, &sparse_bytes);
     try file.writePositionalAll(std.testing.io, &sparse_bytes, try textTermTopHitTermRecordOffset(header.hit_count, 1));
 
     try std.testing.expect(try persistentTermTopHitsSparseIndexInvalid(store, file, header));
@@ -23351,7 +13544,7 @@ test "persistent text catalog rejects self-consistent incomplete term and postin
     const terms_path = try textTermsPath(std.testing.allocator, store);
     defer std.testing.allocator.free(terms_path);
     var terms_header_bytes: [TextTermsHeader.encoded_len]u8 = undefined;
-    (TextTermsHeader{ .term_count = 0, .term_bytes = 0 }).encode(&terms_header_bytes);
+    encodeTextTermsHeader(.{ .term_count = 0, .term_bytes = 0 }, &terms_header_bytes);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = terms_path,
         .data = &terms_header_bytes,
@@ -23361,7 +13554,7 @@ test "persistent text catalog rejects self-consistent incomplete term and postin
     const postings_path = try textPostingsPath(std.testing.allocator, store);
     defer std.testing.allocator.free(postings_path);
     var postings_header_bytes: [TextPostingsHeader.encoded_len]u8 = undefined;
-    (TextPostingsHeader{ .posting_count = 0, .body_bytes = 0 }).encode(&postings_header_bytes);
+    encodeTextPostingsHeader(.{ .posting_count = 0, .body_bytes = 0 }, &postings_header_bytes);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = postings_path,
         .data = &postings_header_bytes,
@@ -23465,7 +13658,7 @@ test "searchText repairs text terms header whose declared size overflows" {
     var terms_header = try readTextTermsHeaderFromFile(store, terms_file);
     terms_header.term_count = std.math.maxInt(u64);
     var header_bytes: [TextTermsHeader.encoded_len]u8 = undefined;
-    terms_header.encode(&header_bytes);
+    encodeTextTermsHeader(terms_header, &header_bytes);
     try terms_file.writePositionalAll(std.testing.io, &header_bytes, 0);
 
     try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
@@ -23503,7 +13696,7 @@ test "searchText repairs text postings header whose declared size overflows" {
     var postings_header = try readTextPostingsHeaderFromFile(store, postings_file);
     postings_header.posting_count = std.math.maxInt(u64);
     var header_bytes: [TextPostingsHeader.encoded_len]u8 = undefined;
-    postings_header.encode(&header_bytes);
+    encodeTextPostingsHeader(postings_header, &header_bytes);
     try postings_file.writePositionalAll(std.testing.io, &header_bytes, 0);
 
     try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
@@ -23641,8 +13834,8 @@ test "persistent text catalog rejects corrupt posting block metadata" {
         const blocks_header = try readTextPostingBlocksHeaderFromFile(store, blocks_file);
         const record = try readTextPostingBlockRecordAt(store, blocks_file, blocks_header.term_count, 0);
         var record_bytes: [TextPostingBlockRecord.encoded_len]u8 = undefined;
-        try record.encode(&record_bytes);
-        std.mem.writeInt(u16, record_bytes[TextPostingBlockRecord.max_tf_offset..TextPostingBlockRecord.min_doc_len_offset], @as(u16, @bitCast(std.math.nan(f16))), .little);
+        try encodeTextPostingBlockRecord(record, &record_bytes);
+        std.mem.writeInt(u16, record_bytes[search_acceleration_format.Internal.block_record_max_tf_offset..search_acceleration_format.Internal.block_record_min_doc_len_offset], @as(u16, @bitCast(std.math.nan(f16))), .little);
         try blocks_file.writePositionalAll(std.testing.io, &record_bytes, try textPostingBlockRecordOffset(blocks_header.term_count, 0));
     }
     try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
@@ -23717,7 +13910,7 @@ test "persistent text catalog rejects invalid term entry length" {
         const header = try readTextTermsHeaderFromFile(store, terms_file);
         const entry = try readTextTermEntryAt(store, terms_file, header, 0);
         var entry_bytes: [TextTermEntry.encoded_len]u8 = undefined;
-        try entry.encode(&entry_bytes);
+        try encodeTextTermEntry(entry, &entry_bytes);
         entry_bytes[0] = front_coded_entry_prefix_marker;
         try terms_file.writePositionalAll(std.testing.io, &entry_bytes, try textTermEntryOffset(0));
         try terms_file.sync(std.testing.io);
@@ -23766,7 +13959,7 @@ test "searchText falls back without repairing term exception sidecar membership 
 
         terms_header.term_exception_count = 1;
         var header_bytes: [TextTermsHeader.encoded_len]u8 = undefined;
-        terms_header.encode(&header_bytes);
+        encodeTextTermsHeader(terms_header, &header_bytes);
         try terms_file.writePositionalAll(std.testing.io, &header_bytes, 0);
 
         var rank_bytes: [4]u8 = undefined;
@@ -23776,7 +13969,7 @@ test "searchText falls back without repairing term exception sidecar membership 
         try terms_file.writePositionalAll(std.testing.io, &empty_membership, try textTermExceptionMembershipByteOffset(terms_header.term_count, terms_header.term_bytes, 0));
 
         var exception_bytes: [TextTermExceptionRecord.encoded_len]u8 = undefined;
-        try (TextTermExceptionRecord{ .doc_freq = 70_000, .postings_offset = 0 }).encode(&exception_bytes);
+        try encodeTextTermExceptionRecord(.{ .doc_freq = 70_000, .postings_offset = 0 }, &exception_bytes);
         try terms_file.writePositionalAll(std.testing.io, &exception_bytes, try textTermExceptionRecordOffset(terms_header.term_count, terms_header.term_bytes, 0));
         try terms_file.sync(std.testing.io);
     }
@@ -23825,7 +14018,7 @@ test "searchText repairs corrupt term posting offset encountered during query" {
         if (!try termEntryMatches(store, terms_file, terms_header, pos, entry, "edge")) continue;
         entry.postings_offset = corrupt_postings_offset;
         var entry_bytes: [TextTermEntry.encoded_len]u8 = undefined;
-        try entry.encode(&entry_bytes);
+        try encodeTextTermEntry(entry, &entry_bytes);
         try terms_file.writePositionalAll(std.testing.io, &entry_bytes, try textTermEntryOffset(pos));
         corrupted = true;
         break;
@@ -23879,7 +14072,7 @@ test "searchText falls back without repairing corrupt posting frequencies" {
             var posting = try readTextPostingRecordAt(store, postings_file, entry.postings_offset);
             posting.text_freq = 99;
             var bytes: [TextPostingRecord.encoded_len]u8 = undefined;
-            try posting.encode(&bytes);
+            try encodeTextPostingRecord(posting, &bytes);
             try postings_file.writePositionalAll(std.testing.io, &bytes, try textPostingRecordOffset(entry.postings_offset));
             try postings_file.sync(std.testing.io);
             corrupted = true;
@@ -23980,7 +14173,7 @@ test "persistent text stale detection rejects postings outside doc catalog" {
         var posting = try readTextPostingRecordAt(store, postings_file, entry.postings_offset);
         posting.doc_id = 3;
         var bytes: [TextPostingRecord.encoded_len]u8 = undefined;
-        try posting.encode(&bytes);
+        try encodeTextPostingRecord(posting, &bytes);
         try postings_file.writePositionalAll(std.testing.io, &bytes, try textPostingRecordOffset(entry.postings_offset));
         corrupted = true;
         break;
