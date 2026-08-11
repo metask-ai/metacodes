@@ -27,6 +27,8 @@ _ADAPTER_PATH = Path("src/workbuddy_bench/runner/harness_adapters.py")
 _RESOLVER_PATH = Path("src/workbuddy_bench/runner/resolve_manifest.py")
 _AGENT_PATH = Path("src/workbuddy_bench/agents/metacodes_agent.py")
 _TRACE_PATH = Path("src/workbuddy_bench/agents/_metacodes_trace.py")
+_KEY_FD_PATH = Path("src/workbuddy_bench/proxy/_metacodes_key_fd.py")
+_PROXY_CONFIG_PATH = Path("src/workbuddy_bench/proxy/config.py")
 _ARTIFACT_PREFIX = "configs/harnesses/metacodes/docker/artifacts/"
 
 
@@ -117,6 +119,14 @@ _METACODES_RUNTIME_BUILDER = '''def _build_metacodes_runtime_config(
 '''
 
 
+_PROXY_IMPORT_ANCHOR = "import yaml\n"
+_PROXY_IMPORT = (
+    "\nfrom workbuddy_bench.proxy._metacodes_key_fd import resolve_secret_env\n"
+)
+_PROXY_KEY_OLD = '        key = _resolve_env(backend_raw.get("key", ""), backend_raw.get("key_env", ""))\n'
+_PROXY_KEY_NEW = '        key = resolve_secret_env(backend_raw.get("key", ""), backend_raw.get("key_env", ""))\n'
+
+
 def _run(repo: Path, *args: str) -> str:
     try:
         return subprocess.run(
@@ -159,16 +169,31 @@ def _patched_upstream(repo: Path) -> Dict[Path, bytes]:
     resolver = resolver.replace(
         _GENERIC_ANCHOR, _METACODES_RUNTIME_BUILDER + _GENERIC_ANCHOR, 1
     )
+
+    proxy_config = _head_file(repo, _PROXY_CONFIG_PATH).decode("utf-8")
+    if proxy_config.count(_PROXY_IMPORT_ANCHOR) != 1:
+        raise OverlayError("WorkBuddy proxy import anchor drifted")
+    if proxy_config.count(_PROXY_KEY_OLD) != 1:
+        raise OverlayError("WorkBuddy proxy credential resolver anchor drifted")
+    proxy_config = proxy_config.replace(
+        _PROXY_IMPORT_ANCHOR,
+        _PROXY_IMPORT_ANCHOR + _PROXY_IMPORT,
+        1,
+    ).replace(_PROXY_KEY_OLD, _PROXY_KEY_NEW, 1)
     return {
         _ADAPTER_PATH: adapter.encode("utf-8"),
         _RESOLVER_PATH: resolver.encode("utf-8"),
+        _PROXY_CONFIG_PATH: proxy_config.encode("utf-8"),
     }
 
 
 def _overlay_sources() -> List[Tuple[Path, bytes]]:
     root = Path(__file__).resolve().parent
     overlay = root / "overlay"
-    rows: List[Tuple[Path, bytes]] = [(_TRACE_PATH, (root / "trace.py").read_bytes())]
+    rows: List[Tuple[Path, bytes]] = [
+        (_TRACE_PATH, (root / "trace.py").read_bytes()),
+        (_KEY_FD_PATH, (root / "key_fd.py").read_bytes()),
+    ]
     for source in sorted(overlay.rglob("*")):
         if source.is_file():
             rows.append((source.relative_to(overlay), source.read_bytes()))

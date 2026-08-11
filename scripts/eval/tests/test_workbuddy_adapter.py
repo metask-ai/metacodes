@@ -1,10 +1,12 @@
 import json
 import hashlib
 import io
+import os
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.eval.workbuddy.cohort_manifest import (
     CohortError,
@@ -13,6 +15,11 @@ from scripts.eval.workbuddy.cohort_manifest import (
 )
 from scripts.eval.workbuddy.stage_artifacts import StageError, stage
 from scripts.eval.workbuddy.install_overlay import _digest
+from scripts.eval.workbuddy.key_fd import (
+    CredentialFdError,
+    _SECRET_CACHE,
+    resolve_secret_env,
+)
 from scripts.eval.workbuddy.trace import (
     TraceError,
     final_result,
@@ -239,6 +246,49 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         config = (task / "task.toml").read_text(encoding="utf-8")
         self.assertIn("network_mode: none", compose)
         self.assertEqual(config.count('network_mode = "public"'), 3)
+
+
+class WorkBuddyCredentialFdTest(unittest.TestCase):
+    def setUp(self):
+        _SECRET_CACHE.clear()
+
+    def tearDown(self):
+        _SECRET_CACHE.clear()
+
+    def test_fd_reference_consumes_once_clears_environment_and_supports_shared_routes(self):
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"private-test-key")
+        os.close(write_fd)
+        with mock.patch.dict(os.environ, {"WB_TEST_KEY": f"fd://{read_fd}"}, clear=False):
+            first = resolve_secret_env("", "WB_TEST_KEY")
+            second = resolve_secret_env("", "WB_TEST_KEY")
+            self.assertEqual(first, "private-test-key")
+            self.assertEqual(second, first)
+            self.assertNotIn("WB_TEST_KEY", os.environ)
+            with self.assertRaises(OSError):
+                os.fstat(read_fd)
+
+    def test_normal_workbuddy_environment_key_remains_compatible(self):
+        with mock.patch.dict(os.environ, {"WB_TEST_PLAIN": "ordinary-test-key"}):
+            self.assertEqual(resolve_secret_env("", "WB_TEST_PLAIN"), "ordinary-test-key")
+        with mock.patch.dict(
+            os.environ,
+            {"METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF": "raw-key-is-forbidden"},
+        ):
+            with self.assertRaisesRegex(CredentialFdError, "requires an anonymous"):
+                resolve_secret_env("", "METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF")
+
+    def test_invalid_or_oversized_descriptor_fails_closed(self):
+        with mock.patch.dict(os.environ, {"WB_TEST_BAD": "fd://not-a-number"}):
+            with self.assertRaisesRegex(CredentialFdError, "invalid"):
+                resolve_secret_env("", "WB_TEST_BAD")
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "oversized-key"
+            source.write_bytes(b"x" * (16 * 1024 + 1))
+            read_fd = os.open(source, os.O_RDONLY)
+            with mock.patch.dict(os.environ, {"WB_TEST_LARGE": f"fd://{read_fd}"}):
+                with self.assertRaisesRegex(CredentialFdError, "exceeds"):
+                    resolve_secret_env("", "WB_TEST_LARGE")
 
 
 class WorkBuddyCohortManifestTest(unittest.TestCase):

@@ -47,6 +47,15 @@ cohort contains the exact `task_selection: {mode: name, names: [...]}` mapping
 accepted by WorkBuddy jobs. Commit the generator before obtaining official task
 slugs; keep the resulting manifest immutable and bind it into every paid run.
 
+Paid WorkBuddy model configs must name
+`METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF` as `backend_key_env`. The launch gate
+sets that variable to an `fd://N` reference only after durable budget
+authorization. The patched host proxy consumes and closes the anonymous
+descriptor; a raw secret in this dedicated environment variable is rejected.
+Normal upstream WorkBuddy model configs keep their existing environment-key
+behavior. Production metacodes pilots must not use the shared proxy because its
+long-lived credential lifecycle is outside the single-run budget transaction.
+
 W0 uses a static synthetic ELF, Docker `network_mode: none`, `n_attempts=1`,
 and concurrency 1. The ELF also asserts at runtime that its namespace has no
 non-loopback interface. This native compose rule works on Docker Desktop where
