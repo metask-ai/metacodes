@@ -298,7 +298,8 @@ test "L2 回归: subagent 单轮多 TaskCreate 不熔断,正常完成(治 tasks=
         const r = try cc.task_output_tool.execute(&ctx, query);
         defer a.free(r);
         if (std.mem.indexOf(u8, r, "\"status\":\"done\"") != null) {
-            // 核心断言:subagent 走完两轮正常 end_turn,**不是** tool_loop 熔断。
+            // dead variant 断言:tool_loop 不再生产(对齐 codex 无主动熔断),
+            // 此断言守护 enum 保留契约——若有人误删 .tool_loop 变体,exhaustive switch 会编译失败。
             try std.testing.expect(std.mem.indexOf(u8, r, "\"stop_reason\":\"tool_loop\"") == null);
             try std.testing.expect(std.mem.indexOf(u8, r, "\"stop_reason\":\"end_turn\"") != null);
             // 干完了活(走到第 2 轮的收尾文本),不是 turns=1 卡死。
@@ -337,7 +338,7 @@ test "L2 接线: subagent 调 TaskCreate 真成功(独立 store 接通,计数=3)
 
     // 接线证明:3 个 TaskCreate 全部成功落进 subagent 独立 store。tasks=null 时此值=0。
     try std.testing.expectEqual(@as(u32, 3), result.subagent_tasks_created);
-    // 顺带:不熔断、走到收尾。
+    // dead variant 断言:tool_loop 不再生产,守护 enum 保留契约。
     try std.testing.expect(result.stop_reason != .tool_loop);
 }
 
