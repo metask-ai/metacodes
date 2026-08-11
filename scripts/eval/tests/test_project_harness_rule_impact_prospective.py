@@ -57,6 +57,12 @@ class _FakeBudget:
 
 
 class ProjectHarnessRuleImpactProspectiveTest(unittest.TestCase):
+    def test_local_median_is_stable_for_direct_script_execution(self) -> None:
+        self.assertEqual(3, prospective._median([5, 1, 3]))
+        self.assertEqual(2.5, prospective._median([4, 1, 3, 2]))
+        with self.assertRaises(ValueError):
+            prospective._median([])
+
     def test_freshness_and_frozen_balanced_schedule(self) -> None:
         self.assertEqual(4, len(CALIBRATION_CASES))
         self.assertEqual(8, len(HELDOUT_CASES))

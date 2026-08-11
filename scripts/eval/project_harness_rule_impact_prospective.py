@@ -14,7 +14,6 @@ import json
 import math
 import os
 from pathlib import Path
-import statistics
 import subprocess
 import tempfile
 from typing import Any, Dict, List, Mapping, Sequence
@@ -1510,14 +1509,31 @@ def _arm_summary(rows: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
         "cache_write_tokens": sum(int(row["usage"]["cache_write_tokens"]) for row in rows),
         "cost_usd": sum(float(row["usage"]["cost_usd"]) for row in rows),
         "wall_time_ms": sum(wall),
-        "wall_time_ms_median": statistics.median(wall),
+        "wall_time_ms_median": _median(wall),
         "model_request_time_ms": sum(model),
         "tool_time_ms": sum(tool),
         "harness_time_ms": sum(harness),
         "checker_elapsed_ns": sum(checker),
-        "checker_elapsed_ns_median": statistics.median(checker) if checker else 0,
+        "checker_elapsed_ns_median": _median(checker) if checker else 0,
         "safe_stop_rollouts": len(rows),
     }
+
+
+def _median(values: Sequence[int]) -> int | float:
+    """Return a deterministic median without importing the sibling statistics module.
+
+    When this file is executed directly, its directory is first on ``sys.path``;
+    importing ``statistics`` would therefore resolve to
+    ``scripts/eval/statistics.py`` instead of the Python standard library.
+    """
+
+    if not values:
+        raise ValueError("median requires at least one value")
+    ordered = sorted(values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) / 2
 
 
 def _paired(
