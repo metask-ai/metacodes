@@ -76,5 +76,6 @@ test {
     _ = @import("component/swarm_dag_test.zig");
     _ = @import("component/swarm_security_test.zig");
     _ = @import("component/swarm_process_test.zig");
+    _ = @import("component/swarm_kg_degraded_test.zig");
     _ = @import("component/add_dir_test.zig");
 }

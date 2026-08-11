@@ -9,10 +9,15 @@
 //! - ID 用单调递增 u64 字符串化（"1", "2", ...），稳定且无 UUID 依赖。
 //! - status 枚举：pending / in_progress / completed / deleted。
 //! - blocks/blockedBy：task ID 列表，模型自行维护依赖图。
+//! - **文件镜像**（KG 降级时 swarm 共享后备）：mirror_path 非 null 时,每次写操作
+//!   best-effort 持久化到 JSON 文件;loadFromMirror 把别的进程/线程写的任务合并进来。
+//!   用途:KG 降级 → TaskCreate 退内存 store(进程隔离) → swarm teammate 看不到 lead 任务;
+//!   镜像文件让 teammate 通过读 mirror 看到 lead 任务。KG 可用时不启用(tinykg store 已共享)。
 
 const std = @import("std");
 const util_time = @import("../util/time.zig");
 const sync = @import("platform").sync;
+const log = @import("../util/log.zig");
 
 pub const TaskStatus = enum {
     pending,
@@ -72,9 +77,24 @@ pub const TaskStore = struct {
     /// grow-during-iterate 悬挂 / torn 读 task 内容。所有**改 tasks / 改 task 内容**的公开方法锁内跑;
     /// get() 无锁(driver 内部/单线程用 + 被上锁方法内部调,不能重入)。snapshotTasks 锁内 dup 值语义。
     mutex: sync.Mutex = .{},
+    /// **文件镜像路径**(owned;null = 关闭镜像,向后兼容)。KG 降级时 swarm teammate 共享
+    /// 后备:lead 写 → 持久化 mirror;teammate loadFromMirror → 内存合并。mirror_path 不可变
+    /// (setMirror 后);写操作 best-effort 持久化(失败不 brick,只 log.warn)。
+    mirror_path: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator) TaskStore {
         return .{ .allocator = allocator, .tasks = .empty };
+    }
+
+    /// 配置 mirror 路径(owned dupe)。传入空串等价关闭。仅调用一次(初始化期);
+    /// 重复调用 free 旧 path 再 dupe 新的。线程模型:driver 单线程设置期,无并发。
+    pub fn setMirror(self: *TaskStore, mirror_path: []const u8) void {
+        if (self.mirror_path) |p| self.allocator.free(p);
+        if (mirror_path.len == 0) {
+            self.mirror_path = null;
+            return;
+        }
+        self.mirror_path = self.allocator.dupe(u8, mirror_path) catch null;
     }
 
     /// **task#19 跨线程读**:锁内把当前任务快照成 owned 值(id/subject/status),供 attach 快照。
@@ -107,6 +127,222 @@ pub const TaskStore = struct {
             self.allocator.destroy(t);
         }
         self.tasks.deinit(self.allocator);
+        if (self.mirror_path) |p| self.allocator.free(p);
+    }
+
+    /// **镜像持久化**(best-effort):把当前所有任务写进 mirror_path JSON 文件。
+    /// 调用方约定:已持有 mutex(从写方法末尾调)。失败只 log.warn,不 brick(任务是
+    /// 增强非依赖,对齐 KG 降级原则)。文件格式:JSON 数组,每元素 {id,subject,
+    /// description,status,active_form?,owner?,blocks?,blocked_by?}。
+    /// 用 std.c fopen/fwrite/fclose + rename(对齐 inject.zig 的 fs API 模式,Zig 0.17 std.fs.cwd 移除)。
+    /// 用 std.Io.Writer.Allocating 缓冲写(对齐 task_batch.zig:382 模式)。
+    fn mirrorToFileLocked(self: *TaskStore) void {
+        const path = self.mirror_path orelse return;
+        // 写到临时文件 + rename 原子替换(防读到半截写)
+        var tmp_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        _ = std.fmt.bufPrint(&tmp_buf, "{s}.tmp\x00", .{path}) catch return;
+
+        const f = std.c.fopen(@ptrCast(&tmp_buf), "w") orelse return;
+
+        var w: std.Io.Writer.Allocating = .init(self.allocator);
+        defer w.deinit();
+        w.writer.writeByte('[') catch {
+            _ = std.c.fclose(f);
+            return;
+        };
+        var first = true;
+        for (self.tasks.items) |t| {
+            // deleted 已从 items 移除,不写
+            if (!first) w.writer.writeByte(',') catch break;
+            first = false;
+            self.appendTaskJson(&w, t) catch break;
+        }
+        w.writer.writeByte(']') catch {};
+        const written = w.toOwnedSlice() catch {
+            _ = std.c.fclose(f);
+            return;
+        };
+        defer self.allocator.free(written);
+        _ = std.c.fwrite(written.ptr, 1, written.len, f);
+        // 显式 fclose(flush 缓冲)再 rename——rename 在 fclose 之前会让 rename 看到未 flush 的文件
+        _ = std.c.fclose(f);
+        // path 也需要 null-terminated
+        var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        if (path.len >= path_buf.len) return;
+        @memcpy(path_buf[0..path.len], path);
+        path_buf[path.len] = 0;
+        _ = std.c.rename(@ptrCast(&tmp_buf), @ptrCast(&path_buf));
+    }
+
+    /// 单个 task 序列化成 JSON 对象,append 到 writer。
+    fn appendTaskJson(self: *TaskStore, w: *std.Io.Writer.Allocating, t: *const Task) !void {
+        _ = self; // 仅用于命名空间;无字段访问(状态全在 t)
+        try w.writer.writeAll("{\"id\":");
+        try std.json.Stringify.encodeJsonString(t.id, .{}, &w.writer);
+        try w.writer.writeAll(",\"subject\":");
+        try std.json.Stringify.encodeJsonString(t.subject, .{}, &w.writer);
+        try w.writer.writeAll(",\"description\":");
+        try std.json.Stringify.encodeJsonString(t.description, .{}, &w.writer);
+        try w.writer.writeAll(",\"status\":\"");
+        try w.writer.writeAll(t.status.toString());
+        try w.writer.writeAll("\"");
+        if (t.active_form) |af| {
+            try w.writer.writeAll(",\"active_form\":");
+            try std.json.Stringify.encodeJsonString(af, .{}, &w.writer);
+        }
+        if (t.owner) |o| {
+            try w.writer.writeAll(",\"owner\":");
+            try std.json.Stringify.encodeJsonString(o, .{}, &w.writer);
+        }
+        if (t.blocks.items.len > 0) {
+            try w.writer.writeAll(",\"blocks\":[");
+            var first_b = true;
+            for (t.blocks.items) |b| {
+                if (!first_b) try w.writer.writeAll(",");
+                first_b = false;
+                try std.json.Stringify.encodeJsonString(b, .{}, &w.writer);
+            }
+            try w.writer.writeAll("]");
+        }
+        if (t.blocked_by.items.len > 0) {
+            try w.writer.writeAll(",\"blocked_by\":[");
+            var first_bb = true;
+            for (t.blocked_by.items) |b| {
+                if (!first_bb) try w.writer.writeAll(",");
+                first_bb = false;
+                try std.json.Stringify.encodeJsonString(b, .{}, &w.writer);
+            }
+            try w.writer.writeAll("]");
+        }
+        try w.writer.writeAll("}");
+    }
+
+    /// **从镜像加载**(teammate 启动时调):读 mirror_path JSON,合并进内存 store。
+    /// 合并语义:按 id 去重(已存在则跳过,保留内存版本——lead 的内存是真相,mirror 是补充)。
+    /// best-effort:文件不存在/解析失败 → 静默返回(KG 降级镜像未写过)。线程模型:driver
+    /// 单线程初始化期调,无并发。
+    pub fn loadFromMirror(self: *TaskStore) void {
+        const path = self.mirror_path orelse return;
+        // null-terminate path for std.c.fopen
+        var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        if (path.len >= path_buf.len) return;
+        @memcpy(path_buf[0..path.len], path);
+        path_buf[path.len] = 0;
+        const f = std.c.fopen(@ptrCast(&path_buf), "r") orelse return; // 不存在 = 无镜像
+        defer _ = std.c.fclose(f);
+
+        // 读文件:用固定大小缓冲(任务文件应很小,4MB 上限足够)
+        var read_buf: [4 * 1024 * 1024]u8 = undefined;
+        const n = std.c.fread(&read_buf, 1, read_buf.len - 1, f);
+        if (n == 0) return;
+        const bytes = read_buf[0..n];
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, bytes, .{}) catch |e| {
+            log.warn("taskstore", "mirror parse failed {s}: {s}", .{ path, @errorName(e) });
+            return;
+        };
+        defer parsed.deinit();
+
+        const arr = switch (parsed.value) {
+            .array => |a| a.items,
+            else => return,
+        };
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
+        for (arr) |item| {
+            const obj = switch (item) {
+                .object => |o| o,
+                else => continue,
+            };
+            const id = jsonFieldStr(self.allocator, obj, "id") orelse continue;
+            // id 去重:已存在跳过(lead 内存真相优先)
+            if (self.get(id) != null) {
+                self.allocator.free(id);
+                continue;
+            }
+            const subject = jsonFieldStr(self.allocator, obj, "subject") orelse {
+                self.allocator.free(id);
+                continue;
+            };
+            const description = jsonFieldStr(self.allocator, obj, "description") orelse {
+                self.allocator.free(id);
+                self.allocator.free(subject);
+                continue;
+            };
+            const status_str = jsonFieldStr(self.allocator, obj, "status") orelse {
+                // 默认 pending;不 free 字面量(无 alloc)
+                if (self.appendLoadedTask(id, subject, description, null, null, .pending)) |_| {
+                    continue; // append 成功,处理下一个 item
+                } else |_| {
+                    self.freeLoadedFields(id, subject, description, null, null);
+                }
+                continue;
+            };
+            defer self.allocator.free(status_str);
+            const status = TaskStatus.fromString(status_str) orelse .pending;
+            const active_form = jsonFieldStr(self.allocator, obj, "active_form");
+            const owner = jsonFieldStr(self.allocator, obj, "owner");
+            if (self.appendLoadedTask(id, subject, description, active_form, owner, status)) |_| {
+                continue;
+            } else |_| {
+                self.freeLoadedFields(id, subject, description, active_form, owner);
+                continue;
+            }
+        }
+    }
+
+    /// helper:appendLoadedTask 把已 dupe 的 owned fields 组装成 Task 加入 items。
+    /// 成功后所有权转移到 store;失败由调用方 free(见 freeLoadedFields)。
+    fn appendLoadedTask(
+        self: *TaskStore,
+        id: []u8,
+        subject: []u8,
+        description: []u8,
+        active_form: ?[]u8,
+        owner: ?[]u8,
+        status: TaskStatus,
+    ) !void {
+        const t = try self.allocator.create(Task);
+        t.* = .{
+            .id = id,
+            .subject = subject,
+            .description = description,
+            .active_form = active_form,
+            .owner = owner,
+            .status = status,
+        };
+        // blocks / blocked_by 可选,暂不加载(swarm 自领用不到依赖图)
+        self.tasks.append(self.allocator, t) catch |e| {
+            self.allocator.destroy(t);
+            return e;
+        };
+    }
+
+    /// helper:appendLoadedTask 失败时释放 owned fields(防止 leak)。
+    /// fields 由 self.allocator(jsonFieldStr 里)dupe,故用 self.allocator free。
+    fn freeLoadedFields(
+        self: *TaskStore,
+        id: []u8,
+        subject: []u8,
+        description: []u8,
+        active_form: ?[]u8,
+        owner: ?[]u8,
+    ) void {
+        self.allocator.free(id);
+        self.allocator.free(subject);
+        self.allocator.free(description);
+        if (active_form) |s| self.allocator.free(s);
+        if (owner) |s| self.allocator.free(s);
+    }
+
+    /// helper:json object 取 string 字段(owned dupe)。失败返 null。
+    fn jsonFieldStr(allocator: std.mem.Allocator, obj: std.json.ObjectMap, name: []const u8) ?[]u8 {
+        const v = obj.get(name) orelse return null;
+        const s = switch (v) {
+            .string => |str| str,
+            else => return null,
+        };
+        return allocator.dupe(u8, s) catch null;
     }
 
     /// 创建任务，返回刚创建的 task 指针（借，调用方不 free）。
@@ -137,6 +373,7 @@ pub const TaskStore = struct {
 
         try self.tasks.append(self.allocator, t);
         self.next_id += 1;
+        self.mirrorToFileLocked();
         return t;
     }
 
@@ -163,6 +400,7 @@ pub const TaskStore = struct {
         errdefer self.allocator.free(desc);
         t.* = .{ .id = id_owned, .subject = subj, .description = desc, .active_form = null, .status = status };
         try self.tasks.append(self.allocator, t);
+        self.mirrorToFileLocked();
     }
 
     /// 按 id 查找。返回指针（借），找不到 null。
@@ -200,6 +438,7 @@ pub const TaskStore = struct {
                 t.deinit(self.allocator);
                 self.allocator.destroy(t);
                 _ = self.tasks.orderedRemove(i);
+                self.mirrorToFileLocked();
                 return;
             }
             t.status = status;
@@ -209,6 +448,7 @@ pub const TaskStore = struct {
             } else {
                 t.completed_ms = 0;
             }
+            self.mirrorToFileLocked();
             return;
         }
         return error.TaskNotFound;
@@ -270,6 +510,7 @@ pub const TaskStore = struct {
             t.owner = s;
             owner = null;
         }
+        self.mirrorToFileLocked();
     }
 
     /// 添加 blocks/blockedBy 依赖（深拷贝 ID）。
@@ -282,6 +523,7 @@ pub const TaskStore = struct {
             errdefer self.allocator.free(s);
             try t.blocks.append(self.allocator, s);
         }
+        self.mirrorToFileLocked();
     }
 
     pub fn addBlockedBy(self: *TaskStore, id: []const u8, blocker_ids: []const []const u8) !void {
@@ -293,6 +535,7 @@ pub const TaskStore = struct {
             errdefer self.allocator.free(s);
             try t.blocked_by.append(self.allocator, s);
         }
+        self.mirrorToFileLocked();
     }
 };
 

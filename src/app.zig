@@ -1008,6 +1008,20 @@ pub const App = struct {
             // 让上次会话建的持久任务重启后仍在面板/TaskList 可见(PM P0-A:图为真相,
             // store 为显示缓存;不重建 → 重启后面板空、跨会话连续性只在图里用户看不见)。
             rebuildInboxMirror(app);
+        } else {
+            // KG 降级:启用 TaskStore 文件镜像,让 swarm teammate 看到 lead 的任务
+            // (Bug ② 修复:KG 降级时 TaskCreate 退内存 store,而内存 store 进程隔离 →
+            // teammate 永远看不到 lead 任务。mirror 文件作 KG 降级时的共享后备)。
+            // 路径与 kg_projects_dir 同目录,文件名 tasks.json。
+            const mirror_path = std.fmt.allocPrint(
+                app.allocator,
+                "{s}/tasks.json",
+                .{app.kg_projects_dir},
+            ) catch return;
+            defer app.allocator.free(mirror_path);
+            app.tasks.setMirror(mirror_path);
+            // 启动时合并已有 mirror(承接上次会话的内存任务)
+            app.tasks.loadFromMirror();
         }
     }
 

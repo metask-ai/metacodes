@@ -975,6 +975,19 @@ fn teammateThreadMain(input: *TeammateInput) void {
     };
     var sub_tasks = TaskStore.init(a);
     defer sub_tasks.deinit();
+    // Bug ② 修复:KG 降级时 lead 的 TaskStore 用文件镜像({kg_projects_dir}/tasks.json),
+    // teammate 也设同一 mirror 路径 + 启动时 loadFromMirror,这样 teammate 的 TaskList
+    // 在 KG 降级路径(无 kg_inbox 指针 → hasLiveKgFrontier false → 只看内存 store)能看到
+    // lead 创建的任务。KG 可用时 lead 不启用 mirror(mirror_path=null),这里 setMirror
+    // 也无副作用——loadFromMirror 找不到文件静默返回。
+    if (input.kg_projects_dir.len > 0) {
+        const mirror_path = std.fmt.allocPrint(a, "{s}/tasks.json", .{input.kg_projects_dir}) catch null;
+        if (mirror_path) |mp| {
+            defer a.free(mp);
+            sub_tasks.setMirror(mp);
+            sub_tasks.loadFromMirror();
+        }
+    }
 
     // Linus SW3 H1:每 teammate 一个**独立 KgClient**(c_allocator),不共享 App arena 客户端
     // (多线程定时 poll frontier/claim 会在非线程安全 arena 上并发 alloc/free → 堆损坏)。
@@ -1014,6 +1027,9 @@ fn teammateThreadMain(input: *TeammateInput) void {
     };
 
     while (true) {
+        // Bug ② 修复:每 turn 开始前 reload mirror——lead 可能在此前 idle 期间又写了新任务。
+        // loadFromMirror 是 best-effort + id 去重(已有任务跳过),不会重复加载。
+        sub_tasks.loadFromMirror();
         e.setStatus(.working);
         // 首轮此写与 spawn 的 addMember(is_active=true)重复,曾试图"只在值变化时写"去重——
         // 撤销(2026-07-18 实测):这次写恰好是 turn 前的天然停顿,满编 spawn 时把线程拖到
