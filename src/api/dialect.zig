@@ -104,6 +104,20 @@ pub const Dialect = struct {
         allocator: std.mem.Allocator,
     ) anyerror!bool = defaultSerializeToolChoice,
 
+    /// 请求侧:把中立 ResponseFormat(json_object/json_schema)翻译成厂商 wire,追加到 `out`。
+    /// 返回是否追加了内容。default = 不发(不支持 JSON mode 的 dialect / null 入参)。
+    /// - OpenAI dialect:`,\"response_format\":{\"type\":\"json_object\"}` 或
+    ///   `{\"type\":\"json_schema\",\"json_schema\":{schema}}`。GLM-5 仅 json_object(降级 schema→object)。
+    /// - Gemini dialect:`,\"generation_config\":{\"response_mime_type\":\"application/json\"}`(留位)。
+    /// - Anthropic dialect:不发(用 system prompt 指示 JSON)。
+    serializeResponseFormatFn: *const fn (
+        ctx: *anyopaque,
+        profile: ModelProfile,
+        rf: ?ResponseFormatRequest,
+        out: *std.ArrayList(u8),
+        allocator: std.mem.Allocator,
+    ) anyerror!bool = defaultSerializeResponseFormat,
+
     /// 暴露纯数据 profile 供 UI/agent_loop 快速问能力。单一真相源收口(step 8 后)。
     /// default = 返回 profileFor 的结果。
     profileFn: *const fn (ctx: *anyopaque, kind: ProviderKind, model: []const u8) ModelProfile = defaultProfile,
@@ -127,6 +141,9 @@ pub const Dialect = struct {
     pub fn serializeToolChoice(self: Dialect, p: ModelProfile, tc: ?ToolChoice, out: *std.ArrayList(u8), a: std.mem.Allocator) !bool {
         return try self.serializeToolChoiceFn(self.ctx, p, tc, out, a);
     }
+    pub fn serializeResponseFormat(self: Dialect, p: ModelProfile, rf: ?ResponseFormatRequest, out: *std.ArrayList(u8), a: std.mem.Allocator) !bool {
+        return try self.serializeResponseFormatFn(self.ctx, p, rf, out, a);
+    }
     pub fn profileFor(self: Dialect, kind: ProviderKind, model: []const u8) ModelProfile {
         return self.profileFn(self.ctx, kind, model);
     }
@@ -149,6 +166,16 @@ pub const ToolChoice = struct {
     type: []const u8 = "auto",
     /// type=="tool" 时指定工具名;否则 null
     name: ?[]const u8 = null,
+};
+
+/// 中立 ResponseFormat 请求(JSON mode)。dialect.serializeResponseFormat 翻译成各家 wire。
+/// - json_object:要求模型输出合法 JSON(不指定 schema)
+/// - json_schema:要求模型输出符合 schema 的 JSON(OpenAI structured output)
+pub const ResponseFormatRequest = struct {
+    kind: ResponseFormatKind,
+    /// kind==json_schema 时的 JSON schema 字符串(已 JSON 字符串,直接内联)。
+    /// null + json_schema → 退化为 json_object(能力降级,如 GLM-5)。
+    schema: ?[]const u8 = null,
 };
 
 // ── default 实现(未覆盖方法的兜底)──────────────────────────────────────────
@@ -201,6 +228,15 @@ fn defaultSerializeToolChoice(ctx: *anyopaque, p: ModelProfile, tc: ?ToolChoice,
     _ = out;
     _ = a;
     // no-op:default 不发 tool_choice(由 Provider 自己处理,如 Anthropic request.zig 既有路径)。
+    return false;
+}
+
+fn defaultSerializeResponseFormat(ctx: *anyopaque, p: ModelProfile, rf: ?ResponseFormatRequest, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
+    _ = ctx;
+    _ = p;
+    _ = rf;
+    _ = out;
+    _ = a;
     return false;
 }
 
@@ -319,4 +355,97 @@ test "DialectRegistry: register + lookup" {
     try std.testing.expect(found != null);
     try std.testing.expectEqual(@as(usize, 0x2), @intFromPtr(found.?.ctx));
     try std.testing.expect(reg.lookup(.openai, "other-model") == null);
+}
+
+// ── M4:response_format 端到端字节断言(声明=接线=测试 DoD)──────────────────────
+
+test "M4 OpenAI dialect: response_format json_object 发 wire" {
+    const a = std.testing.allocator;
+    const d = dialectFor(.openai, "gpt-4o");
+    const p = d.profileFor(.openai, "gpt-4o");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializeResponseFormat(p, .{ .kind = .json_object }, &out, a);
+    try std.testing.expect(got);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"response_format\":{\"type\":\"json_object\"}") != null);
+}
+
+test "M4 OpenAI dialect: response_format json_schema + schema 发完整 wire" {
+    const a = std.testing.allocator;
+    const d = dialectFor(.openai, "gpt-4o");
+    const p = d.profileFor(.openai, "gpt-4o");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializeResponseFormat(p, .{ .kind = .json_schema, .schema = "{\"type\":\"object\"}" }, &out, a);
+    try std.testing.expect(got);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"schema\":{\"type\":\"object\"}}}") != null);
+}
+
+test "M4 OpenAI dialect: GLM-5 json_schema 降级为 json_object(能力守门)" {
+    // 声明=接线=测试:GLM-5 profile.response_format_support==.json_object_only,
+    // json_schema 必须降级为 json_object。不降级 → 服务端 400。
+    const a = std.testing.allocator;
+    const d = dialectFor(.openai, "glm-5.2");
+    const p = d.profileFor(.openai, "glm-5.2");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializeResponseFormat(p, .{ .kind = .json_schema, .schema = "{\"type\":\"object\"}" }, &out, a);
+    try std.testing.expect(got);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"response_format\":{\"type\":\"json_object\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "json_schema") == null);
+}
+
+test "M4 OpenAI dialect: response_format null 不发" {
+    const a = std.testing.allocator;
+    const d = dialectFor(.openai, "gpt-4o");
+    const p = d.profileFor(.openai, "gpt-4o");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializeResponseFormat(p, null, &out, a);
+    try std.testing.expect(!got);
+    try std.testing.expect(out.items.len == 0);
+}
+
+test "M4 OpenAI dialect: response_format none 不发" {
+    const a = std.testing.allocator;
+    const d = dialectFor(.openai, "gpt-4o");
+    const p = d.profileFor(.openai, "gpt-4o");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializeResponseFormat(p, .{ .kind = .none }, &out, a);
+    try std.testing.expect(!got);
+    try std.testing.expect(out.items.len == 0);
+}
+
+test "M4 OpenAI dialect: json_schema 缺 schema 退到 json_object" {
+    const a = std.testing.allocator;
+    const d = dialectFor(.openai, "gpt-4o");
+    const p = d.profileFor(.openai, "gpt-4o");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializeResponseFormat(p, .{ .kind = .json_schema, .schema = null }, &out, a);
+    try std.testing.expect(got);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"response_format\":{\"type\":\"json_object\"}") != null);
+}
+
+test "M4 Gemini dialect: response_format json_object → response_mime_type" {
+    const a = std.testing.allocator;
+    const d = dialectFor(.gemini, "gemini-2.5-pro");
+    const p = d.profileFor(.gemini, "gemini-2.5-pro");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializeResponseFormat(p, .{ .kind = .json_object }, &out, a);
+    try std.testing.expect(got);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"generation_config\":{\"response_mime_type\":\"application/json\"}") != null);
+}
+
+test "M4 Claude dialect: response_format 不发(用 system prompt 指示 JSON)" {
+    const a = std.testing.allocator;
+    const d = dialectFor(.anthropic, "claude-opus-4");
+    const p = d.profileFor(.anthropic, "claude-opus-4");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializeResponseFormat(p, .{ .kind = .json_object }, &out, a);
+    try std.testing.expect(!got);
+    try std.testing.expect(out.items.len == 0);
 }

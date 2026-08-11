@@ -14,6 +14,7 @@ const Dialect = dialect_mod.Dialect;
 const ModelProfile = model_adapter.ModelProfile;
 const ReasoningEffort = types.ReasoningEffort;
 const ToolChoice = dialect_mod.ToolChoice;
+const ResponseFormatRequest = dialect_mod.ResponseFormatRequest;
 
 const Stateless = struct {};
 var stateless: Stateless = .{};
@@ -72,10 +73,24 @@ const Gemini = struct {
         return true;
     }
 
+    /// Gemini:response_format → generation_config.response_mime_type=application/json
+    /// (Gemini 不支持 json_schema 单独字段,schema 进 generation_config.response_schema,
+    /// 当前只接 json_object,留位 schema 待消费方需要时再扩)。
+    fn serializeResponseFormat(ctx: *anyopaque, p: ModelProfile, rf: ?ResponseFormatRequest, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
+        _ = ctx;
+        _ = p;
+        const r = rf orelse return false;
+        if (r.kind == .none) return false;
+        // json_object 或 json_schema(降级为 json_object,Gemini 当前只接 mime_type)
+        try out.appendSlice(a, ",\"generation_config\":{\"response_mime_type\":\"application/json\"}");
+        return true;
+    }
+
     const dialect = Dialect{
         .ctx = undefined,
         .serializeThinkingFn = serializeThinking,
         .serializeToolChoiceFn = serializeToolChoice,
+        .serializeResponseFormatFn = serializeResponseFormat,
     };
 };
 

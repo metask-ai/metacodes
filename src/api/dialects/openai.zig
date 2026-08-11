@@ -18,6 +18,7 @@ const Dialect = dialect_mod.Dialect;
 const ModelProfile = model_adapter.ModelProfile;
 const ReasoningEffort = types.ReasoningEffort;
 const ToolChoice = dialect_mod.ToolChoice;
+const ResponseFormatRequest = dialect_mod.ResponseFormatRequest;
 
 // ── 公共 helper ──────────────────────────────────────────────────────────────
 
@@ -75,6 +76,38 @@ fn openaiSerializeToolChoice(ctx: *anyopaque, p: ModelProfile, tc: ?ToolChoice, 
     return false;
 }
 
+// ── 共享:response_format 序列化(所有 OpenAI-compatible dialect 同 wire 格式)─────────
+//
+// 中立 ResponseFormatRequest → OpenAI chat/completions wire:
+//   json_object → ",\"response_format\":{\"type\":\"json_object\"}"
+//   json_schema → ",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"schema\":<schema>}}"
+//
+// 能力降级:GLM-5 profile.response_format_support==.json_object_only,json_schema 降级为
+// json_object(服务端拒 json_schema,静默降级保请求成功)。
+fn openaiSerializeResponseFormat(ctx: *anyopaque, p: ModelProfile, rf: ?ResponseFormatRequest, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
+    _ = ctx;
+    const r = rf orelse return false;
+    if (r.kind == .none) return false;
+    // GLM-5 仅 json_object:json_schema 降级
+    const kind: ResponseFormatRequest = if (p.response_format_support == .json_object_only and r.kind == .json_schema) .{ .kind = .json_object } else r;
+    if (kind.kind == .json_object) {
+        try out.appendSlice(a, ",\"response_format\":{\"type\":\"json_object\"}");
+        return true;
+    }
+    if (kind.kind == .json_schema) {
+        if (kind.schema) |s| {
+            try out.appendSlice(a, ",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"schema\":");
+            try out.appendSlice(a, s);
+            try out.appendSlice(a, "}}");
+            return true;
+        }
+        // schema 缺失:退到 json_object
+        try out.appendSlice(a, ",\"response_format\":{\"type\":\"json_object\"}");
+        return true;
+    }
+    return false;
+}
+
 // ── OpenAI 原生(GPT-4o / GPT-5 / o1 / o3)──────────────────────────────────
 const OpenAINative = struct {
     fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
@@ -100,6 +133,7 @@ const OpenAINative = struct {
         .serializeThinkingFn = serializeThinking,
         .extractThinkingDeltaFn = extractThinkingDelta,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
+        .serializeResponseFormatFn = openaiSerializeResponseFormat,
         // injectSystemMods / supportsToolChoice / supportsResponseFormat / profile 走 default
     };
 };
@@ -148,6 +182,7 @@ const Glm = struct {
         .injectSystemModsFn = injectSystemMods,
         .extractThinkingDeltaFn = extractThinkingDelta,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
+        .serializeResponseFormatFn = openaiSerializeResponseFormat,
     };
 };
 
@@ -183,6 +218,7 @@ const Kimi = struct {
         .serializeThinkingFn = serializeThinking,
         .extractThinkingDeltaFn = extractThinkingDelta,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
+        .serializeResponseFormatFn = openaiSerializeResponseFormat,
     };
 };
 
@@ -214,6 +250,7 @@ const DeepSeek = struct {
         .serializeThinkingFn = serializeThinking,
         .extractThinkingDeltaFn = extractThinkingDelta,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
+        .serializeResponseFormatFn = openaiSerializeResponseFormat,
     };
 };
 
@@ -242,6 +279,7 @@ const Qwen = struct {
         .serializeThinkingFn = serializeThinking,
         .extractThinkingDeltaFn = extractThinkingDelta,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
+        .serializeResponseFormatFn = openaiSerializeResponseFormat,
     };
 };
 
@@ -259,6 +297,7 @@ const Mistral = struct {
         .ctx = undefined,
         .extractThinkingDeltaFn = extractThinkingDelta,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
+        .serializeResponseFormatFn = openaiSerializeResponseFormat,
     };
 };
 
