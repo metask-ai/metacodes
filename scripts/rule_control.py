@@ -2824,6 +2824,8 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
         "agent_tests": "scripts/eval/tests/test_memory_agent_runtime.py",
         "multi_tests": "scripts/eval/tests/test_experiment.py",
         "multi_fd_tests": "scripts/eval/tests/test_paid_multi_arm_fd.py",
+        "workbuddy_launch": "scripts/eval/workbuddy/launch_gate.py",
+        "workbuddy_launch_tests": "scripts/eval/tests/test_workbuddy_launch_gate.py",
         "e2e_lib": "tests/e2e/lib.sh",
         "retry_test": "tests/component/stream_retry_test.zig",
     }
@@ -2961,6 +2963,8 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
     schedule_lines = call_lines(pilot, "run_memory_agent_schedule")
     runner_calls = call_names(runner)
     multi_runner_calls = call_names(multi_locked)
+    workbuddy_launch = top_function("workbuddy_launch", "execute_launch")
+    workbuddy_launch_source = node_source("workbuddy_launch", workbuddy_launch)
     alternate_launchers = {
         name
         for name in runner_calls
@@ -3182,6 +3186,32 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                 < multi_locked_source.find("budget_journal.commit(")
             ),
             "multi-arm provider path has no alternate launcher": not multi_alternate_launchers,
+            "WorkBuddy provider seam is behind the same durable permit": (
+                all(
+                    marker in workbuddy_launch_source
+                    for marker in (
+                        "journal.authorize_request(",
+                        "_read_credential(credential_fd)",
+                        "subprocess.run(",
+                        "pass_fds=(read_fd,)",
+                        '"WBBENCH_PROXY_MAX_RETRIES": "0"',
+                        '"SHARED_PROXY": "0"',
+                    )
+                )
+                and workbuddy_launch_source.find("journal.authorize_request(")
+                < workbuddy_launch_source.find("_read_credential(credential_fd)")
+                < workbuddy_launch_source.find("subprocess.run(")
+                and all(
+                    marker in sources["workbuddy_launch_tests"]
+                    for marker in (
+                        "validate_checkpoint_payload",
+                        "self.assertEqual(provider.requests, 1)",
+                        '"after_request_authorized"',
+                        "retry is forbidden",
+                        "cacheable_first_request_sha256",
+                    )
+                )
+            ),
             "authorization receipt is marked before subprocess": (
                 runner_source.find("budget_request_authorized = True")
                 > runner_source.find("budget_journal.authorize_request(")
@@ -3479,6 +3509,7 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
             {"unittest": "scripts.eval.tests.test_memory_agent_runtime"},
             {"unittest": "scripts.eval.tests.test_experiment"},
             {"unittest": "scripts.eval.tests.test_paid_multi_arm_fd"},
+            {"unittest": "scripts.eval.tests.test_workbuddy_launch_gate"},
             {"step": "test:new", "filter": "L2 evaluation gate makes one physical provider attempt"},
         ],
         errors=errors,

@@ -600,11 +600,11 @@
     },
     {
       "id": "eval.paid-budget-journal-authorization.l2",
-      "title": "Paid memory pilots require durable local authorization before provider access",
+      "title": "Paid single-machine evaluations require durable local authorization before provider access",
       "target": {
         "metric": "paid_budget_journal_obligations_minus_observed",
         "setpoint": 0,
-        "goal": "Every single-machine production-memory request is covered by the exclusive local journal, a complete transaction identity, two-dimensional budget authority, a durably persisted request_authorized transition before provider execution, conservative crash recovery, exact commit idempotency, and checkpoint-bound receipts; a paid schedule resumes only from a fully validated contiguous rollout prefix whose journal revision/head still match exactly, while dry runs, rejected resumes, and preauthorization failures remain zero-network."
+        "goal": "Every single-machine production-memory or WorkBuddy request is covered by the exclusive local journal, a complete transaction identity, two-dimensional budget authority, a durably persisted request_authorized transition before provider execution, conservative crash recovery, exact commit idempotency, and checkpoint-bound receipts; a paid schedule resumes only from a fully validated contiguous rollout prefix whose journal revision/head still match exactly, while dry runs, rejected resumes, and preauthorization failures remain zero-network."
       },
       "sensor": {
         "adapter": "paid_budget_journal",
@@ -666,6 +666,7 @@
             "scripts.eval.tests.test_memory_agent_runtime",
             "scripts.eval.tests.test_experiment",
             "scripts.eval.tests.test_paid_multi_arm_fd",
+            "scripts.eval.tests.test_workbuddy_launch_gate",
             "-v"
           ],
           [

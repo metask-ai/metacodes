@@ -56,6 +56,26 @@ Normal upstream WorkBuddy model configs keep their existing environment-key
 behavior. Production metacodes pilots must not use the shared proxy because its
 long-lived credential lifecycle is outside the single-run budget transaction.
 
+The paid launch gate is separate from the normal WorkBuddy runner. `create`
+performs a side-effect-free plan and binds the cohort, WorkBuddy commit/overlay,
+Linux split-mount hashes, job/model configs, caps and cache policy. `run`
+re-observes those identities, appends `request_authorized` to the external
+journal, then starts the fixed WorkBuddy command with the anonymous credential
+FD. It commits only after every selected trajectory has a request audit, usage
+and cache-prefix hash. A failed or interrupted authorized run is not
+automatically retried.
+
+```bash
+python3 -m scripts.eval.workbuddy.launch_gate create ... --output launch.json
+python3 -m scripts.eval.workbuddy.launch_gate run \
+  --manifest launch.json --budget-journal /private/budget.json \
+  --receipt /private/receipts/run.json --credential-fd 9
+```
+
+The command above is a protocol sketch; no real paid run is authorized until
+the production split mount, launch-gate L2, and the phase-specific manifest
+have all passed.
+
 W0 uses a static synthetic ELF, Docker `network_mode: none`, `n_attempts=1`,
 and concurrency 1. The ELF also asserts at runtime that its namespace has no
 non-loopback interface. This native compose rule works on Docker Desktop where

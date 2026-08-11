@@ -1383,6 +1383,8 @@ class PaidBudgetJournalSensorTests(unittest.TestCase):
         "scripts/eval/tests/test_memory_agent_runtime.py",
         "scripts/eval/tests/test_experiment.py",
         "scripts/eval/tests/test_paid_multi_arm_fd.py",
+        "scripts/eval/workbuddy/launch_gate.py",
+        "scripts/eval/tests/test_workbuddy_launch_gate.py",
         "tests/e2e/lib.sh",
         "tests/component/stream_retry_test.zig",
     )
@@ -1404,7 +1406,7 @@ class PaidBudgetJournalSensorTests(unittest.TestCase):
         self.assertTrue(observation.sensor_ok, observation.errors)
         self.assertEqual(9, observation.declared)
         self.assertEqual(9, observation.covered)
-        self.assertEqual(7, len(observation.feedback_bindings))
+        self.assertEqual(8, len(observation.feedback_bindings))
 
     def test_spawn_without_real_authorization_predecessor_is_observed(self) -> None:
         temporary, root = self.make_repo()
@@ -1413,6 +1415,23 @@ class PaidBudgetJournalSensorTests(unittest.TestCase):
         runner.write_text(
             runner.read_text(encoding="utf-8").replace(
                 "budget_journal.authorize_request(", "trust_unpersisted_authorization(", 1
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "real_runner_provider_requires_durable_authorization",
+            observation.missing_declarations,
+        )
+
+    def test_workbuddy_provider_cannot_bypass_durable_authorization(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        launcher = root / "scripts/eval/workbuddy/launch_gate.py"
+        launcher.write_text(
+            launcher.read_text(encoding="utf-8").replace(
+                "journal.authorize_request(", "trust_unpersisted_workbuddy_request(", 1
             ),
             encoding="utf-8",
         )
@@ -2085,6 +2104,7 @@ class TopologyTests(unittest.TestCase):
                     "scripts.eval.tests.test_memory_agent_runtime",
                     "scripts.eval.tests.test_experiment",
                     "scripts.eval.tests.test_paid_multi_arm_fd",
+                    "scripts.eval.tests.test_workbuddy_launch_gate",
                 ],
                 [
                     "zig",
