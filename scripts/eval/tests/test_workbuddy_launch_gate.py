@@ -15,8 +15,11 @@ from scripts.eval.workbuddy.launch_gate import (
     LaunchError,
     PROVIDER_KEY_ENV,
     SCHEMA_VERSION,
+    HOST_CONTROL_PLANE_MODULES,
     _paid_host_guard,
     _official_task_identity,
+    _collect_usage,
+    _reobserve_host_control_plane,
     _reobserve_launch_inputs,
     execute_launch,
     validate_launch_manifest,
@@ -120,6 +123,14 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
                 "fingerprint": digest("model"),
             },
             "harness_fingerprint": digest("harness"),
+            "host_control_plane": {
+                name: {
+                    "path": f"/fixture/{name}.py",
+                    "bytes": 1,
+                    "sha256": digest(name),
+                }
+                for name in HOST_CONTROL_PLANE_MODULES
+            },
             "budget": {
                 "total_cost_microusd": 1_000_000,
                 "total_metered_tokens": 100_000,
@@ -239,15 +250,48 @@ record = {"request": {"body": {"model": "volatile-route", "system": "stable", "m
             self.assertFalse(result["quality_evidence"])
             self.assertEqual(result["budget_transaction"]["state"], "committed")
             self.assertEqual(result["usage"]["cost_microusd"], 10_000)
-            self.assertEqual(result["usage"]["metered_tokens"], 150)
+            self.assertEqual(result["usage"]["metered_tokens"], 240)
             self.assertEqual(result["usage"]["provider_requests"], 1)
             task = result["usage"]["tasks"]["code-task-a"]
             self.assertEqual(task["cache_read_input_tokens"], 80)
             self.assertEqual(task["cache_creation_input_tokens"], 10)
+            self.assertEqual(task["metered_tokens"], 240)
             self.assertEqual(len(task["cacheable_first_request_sha256"]), 64)
             self.assertTrue(receipt.is_file())
             self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
             self.assertNotIn("private-workbuddy-test-key", receipt.read_text())
+
+    def test_usage_rejects_boolean_token_counts(self):
+        for field, value in (
+            ("total_prompt_tokens", False),
+            ("total_cached_tokens", False),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                agent = root / "results/job/run/code-task-a__1/agent"
+                agent.mkdir(parents=True)
+                metrics = {
+                    "total_prompt_tokens": 1,
+                    "total_completion_tokens": 1,
+                    "total_cached_tokens": 1,
+                    "total_cost_usd": 0.0,
+                    "extra": {"cache_creation_input_tokens": 1},
+                }
+                metrics[field] = value
+                (agent / "trajectory.json").write_text(
+                    json.dumps({"final_metrics": metrics}) + "\n", encoding="utf-8"
+                )
+                (agent / "requests.jsonl").write_text(
+                    json.dumps({"request": {"body": {"model": "route"}}}) + "\n",
+                    encoding="utf-8",
+                )
+                manifest = {
+                    "workbuddy": {"checkout": str(root)},
+                    "job": {"slug": "job"},
+                    "cohort": {"selected_tasks": ["code-task-a"]},
+                }
+                with self.assertRaisesRegex(LaunchError, "invalid .*token usage"):
+                    _collect_usage(manifest, started_ns=0, official_runner=False)
 
     def test_authorization_crash_consumes_maximum_and_same_run_cannot_retry(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -318,6 +362,22 @@ record = {"request": {"body": {"model": "volatile-route", "system": "stable", "m
                 with self.assertRaisesRegex(LaunchError, "shadows"):
                     _paid_host_guard(root, preflight)
 
+    def test_host_control_plane_source_drift_fails_closed(self):
+        bound = {
+            name: {
+                "path": f"/fixture/{name}.py",
+                "bytes": 1,
+                "sha256": digest(name),
+            }
+            for name in HOST_CONTROL_PLANE_MODULES
+        }
+        with mock.patch(
+            "scripts.eval.workbuddy.launch_gate._host_control_plane",
+            return_value={**bound, "launch_gate": {**bound["launch_gate"], "bytes": 2}},
+        ):
+            with self.assertRaisesRegex(LaunchError, "host control plane changed"):
+                _reobserve_host_control_plane({"host_control_plane": bound})
+
     def test_real_reobserve_rejects_installed_overlay_tamper_before_authorization(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -352,6 +412,8 @@ record = {"request": {"body": {"model": "volatile-route", "system": "stable", "m
                 }
             }
             with mock.patch(
+                "scripts.eval.workbuddy.launch_gate._reobserve_host_control_plane"
+            ), mock.patch(
                 "scripts.eval.workbuddy.launch_gate._git",
                 side_effect=[WORKBUDDY_PINNED_COMMIT, "https://github.com/Tencent/WorkBuddy-Bench"],
             ):

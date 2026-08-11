@@ -80,12 +80,18 @@ python3 -m scripts.eval.workbuddy.environment_preflight \
 ```
 
 The launch manifest requires that receipt plus absolute, hashed GNU Bash 4+
-and `uv` executables. `run` re-observes those identities and the cached
-linux/amd64 images, sets `DOCKER_DEFAULT_PLATFORM=linux/amd64`, appends
+and `uv` executables. It also binds the Python launcher, journal, preflight,
+overlay, stager, credential-FD and model helpers. `run` re-observes those
+identities and the cached linux/amd64 images, sets
+`DOCKER_DEFAULT_PLATFORM=linux/amd64`, appends
 `request_authorized` to the external journal, then starts the fixed WorkBuddy
 command with the anonymous credential FD. It commits only after every selected
 trajectory has a request audit, usage and cache-prefix hash. A failed or
 interrupted authorized run is not automatically retried.
+
+Committed token usage includes uncached prompt, completion, cache-read and
+cache-creation tokens. Cache accounting is not allowed to disappear merely
+because the provider reports those fields separately.
 
 The overlay also keeps the opaque local-proxy route free of Harbor's ``__``
 eval-group delimiter. Otherwise a completed multi-task job can fail only while

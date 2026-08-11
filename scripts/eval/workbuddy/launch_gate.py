@@ -48,6 +48,15 @@ PROVIDER_KEY_ENV = "METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF"
 MAX_USER_AUTHORITY_MICROUSD = 1000 * 1_000_000
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$")
 FaultHook = Callable[[str, Mapping[str, Any]], None]
+HOST_CONTROL_PLANE_MODULES = {
+    "environment_preflight": Path(__file__).with_name("environment_preflight.py"),
+    "install_overlay": Path(__file__).with_name("install_overlay.py"),
+    "key_fd": Path(__file__).with_name("key_fd.py"),
+    "launch_gate": Path(__file__),
+    "memory_budget_journal": Path(__file__).parents[1] / "memory_budget_journal.py",
+    "model": Path(__file__).parents[1] / "model.py",
+    "stage_artifacts": Path(__file__).with_name("stage_artifacts.py"),
+}
 
 
 class LaunchError(ValidationError):
@@ -174,6 +183,13 @@ def _runner_tool(path: Path, version_args: Sequence[str], *, bash: bool = False)
         **_identity(resolved, maximum=128 * 1024 * 1024),
         "version_sha256": _sha256_bytes(version.encode("utf-8")),
         "version_first_line": version.splitlines()[0],
+    }
+
+
+def _host_control_plane() -> Dict[str, object]:
+    return {
+        name: _identity(path.resolve(), maximum=16 * 1024 * 1024)
+        for name, path in sorted(HOST_CONTROL_PLANE_MODULES.items())
     }
 
 
@@ -307,6 +323,7 @@ def build_launch_manifest(
         raise LaunchError(str(exc)) from exc
     bash_tool = _runner_tool(runner_bash, ("--version",), bash=True)
     uv_tool = _runner_tool(runner_uv, ("--version",))
+    host_control_plane = _host_control_plane()
     expected_selection = {"mode": "name", "names": selected}
     if job.get("dataset") != cohort_row["dataset"] or job.get("task_selection") != expected_selection:
         raise LaunchError("WorkBuddy job dataset/task_selection differs from frozen cohort")
@@ -363,6 +380,7 @@ def build_launch_manifest(
             "environment_preflight": environment_preflight["content_sha256"],
             "job": job_identity,
             "runner_tools": {"bash": bash_tool, "uv": uv_tool},
+            "host_control_plane": host_control_plane,
             "target_platform": TARGET_PLATFORM,
         }
     )
@@ -401,6 +419,7 @@ def build_launch_manifest(
             "backend_url_sha256": _sha256_bytes(backend_url.encode("utf-8")),
         },
         "harness_fingerprint": harness_fingerprint,
+        "host_control_plane": host_control_plane,
         "budget": {
             "total_cost_microusd": total_cost_microusd,
             "total_metered_tokens": total_metered_tokens,
@@ -461,6 +480,21 @@ def validate_launch_manifest(path: Path) -> Dict[str, Any]:
         str(manifest.get("workbuddy", {}).get("overlay_content_sha256", "")),
     ):
         raise LaunchError("paid launch installed-overlay identity is incomplete")
+    host_control_plane = manifest.get("host_control_plane")
+    if (
+        not isinstance(host_control_plane, dict)
+        or set(host_control_plane) != set(HOST_CONTROL_PLANE_MODULES)
+        or any(
+            not isinstance(row, dict)
+            or not isinstance(row.get("path"), str)
+            or not Path(row["path"]).is_absolute()
+            or not isinstance(row.get("bytes"), int)
+            or row["bytes"] <= 0
+            or not re.fullmatch(r"[0-9a-f]{64}", str(row.get("sha256", "")))
+            for row in host_control_plane.values()
+        )
+    ):
+        raise LaunchError("paid launch host control-plane identity is incomplete")
     selected = manifest.get("cohort", {}).get("selected_tasks")
     if not isinstance(selected, list) or not selected or len(selected) != len(set(selected)):
         raise LaunchError("paid launch selected task set is empty or duplicated")
@@ -585,7 +619,13 @@ def _paid_host_guard(workbuddy: Path, preflight: Mapping[str, Any]) -> None:
             raise LaunchError("WorkBuddy uv environment shadows the preflight-bound docker")
 
 
+def _reobserve_host_control_plane(manifest: Mapping[str, Any]) -> None:
+    if _host_control_plane() != manifest.get("host_control_plane"):
+        raise LaunchError("WorkBuddy host control plane changed after manifest creation")
+
+
 def _reobserve_launch_inputs(manifest: Mapping[str, Any]) -> None:
+    _reobserve_host_control_plane(manifest)
     workbuddy = Path(manifest["workbuddy"]["checkout"])
     if _git(workbuddy, "rev-parse", "HEAD") != WORKBUDDY_PINNED_COMMIT:
         raise LaunchError("WorkBuddy checkout changed after launch manifest creation")
@@ -852,7 +892,14 @@ def _collect_usage(
         completion = final.get("total_completion_tokens")
         if not isinstance(cost, (int, float)) or isinstance(cost, bool) or not math.isfinite(cost) or cost < 0:
             raise LaunchError(f"trajectory has invalid cost: {trajectory_path}")
-        if not isinstance(prompt, int) or not isinstance(completion, int) or prompt < 0 or completion < 0:
+        if (
+            not isinstance(prompt, int)
+            or isinstance(prompt, bool)
+            or not isinstance(completion, int)
+            or isinstance(completion, bool)
+            or prompt < 0
+            or completion < 0
+        ):
             raise LaunchError(f"trajectory has invalid token usage: {trajectory_path}")
         request_log = trajectory_path.parent / "requests.jsonl"
         request_lines = [
@@ -868,10 +915,24 @@ def _collect_usage(
             raise LaunchError(f"invalid first request audit for {trajectory_path}: {exc}") from exc
         first_body.pop("model", None)
         prefix_hash = _canonical_sha256(first_body)
-        cache_read = int(final.get("total_cached_tokens") or 0)
-        cache_create = int(extra.get("cache_creation_input_tokens") or 0)
+        cache_read = final.get("total_cached_tokens", 0)
+        cache_create = extra.get("cache_creation_input_tokens", 0)
+        if cache_read is None:
+            cache_read = 0
+        if cache_create is None:
+            cache_create = 0
+        if (
+            not isinstance(cache_read, int)
+            or isinstance(cache_read, bool)
+            or cache_read < 0
+            or not isinstance(cache_create, int)
+            or isinstance(cache_create, bool)
+            or cache_create < 0
+        ):
+            raise LaunchError(f"trajectory has invalid cache token usage: {trajectory_path}")
+        metered_tokens = prompt + completion + cache_read + cache_create
         total_cost += float(cost)
-        total_tokens += prompt + completion
+        total_tokens += metered_tokens
         total_cache_read += cache_read
         total_cache_create += cache_create
         total_requests += len(request_lines)
@@ -882,6 +943,7 @@ def _collect_usage(
             "cacheable_first_request_sha256": prefix_hash,
             "prompt_tokens": prompt,
             "completion_tokens": completion,
+            "metered_tokens": metered_tokens,
             "cache_read_input_tokens": cache_read,
             "cache_creation_input_tokens": cache_create,
             "cost_usd": float(cost),

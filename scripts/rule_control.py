@@ -3222,6 +3222,7 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                 and all(
                     marker in workbuddy_reobserve_source
                     for marker in (
+                        "_reobserve_host_control_plane(manifest)",
                         "validate_installed_overlay(workbuddy)",
                         "installed WorkBuddy overlay identity drifted",
                         "validate_environment_preflight(",
@@ -3247,6 +3248,7 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                         "retry is forbidden",
                         "cacheable_first_request_sha256",
                         "test_paid_host_rejects_dotenv_and_uv_docker_shadow",
+                        "test_host_control_plane_source_drift_fails_closed",
                         "test_real_reobserve_rejects_installed_overlay_tamper_before_authorization",
                     )
                 )
