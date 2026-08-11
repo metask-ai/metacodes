@@ -143,6 +143,7 @@ def _harness_fingerprint(
     arm: str,
     templates: Mapping[str, Any],
     ripgrep_sha256: str,
+    run_authorization: Mapping[str, Any] | None = None,
 ) -> str:
     """Canonical host/runtime identity shared by execution and replay."""
 
@@ -150,27 +151,28 @@ def _harness_fingerprint(
     flavor = config["rule_flavor"]
     template = templates["templates"].get(flavor) if flavor is not None else None
     binary = manifest["artifacts"][config["binary"]]
-    return _canonical_sha256(
-        {
-            "manifest_id": manifest["manifest_id"],
-            "arm": arm,
-            "binary_sha256": binary["sha256"],
-            "actuation": config["actuation"],
-            "rule_flavor": flavor,
-            "bundle_sha256": template["bundle_sha256"] if template else None,
-            "candidate_id": template["candidate_id"] if template else None,
-            "kernel_sha256": manifest["artifacts"]["kernel"]["sha256"],
-            "allowed_tools": list(E3_ALLOWED_TOOLS),
-            "disallowed_tools": list(E3_DISALLOWED_TOOLS),
-            "ripgrep_sha256": ripgrep_sha256,
-            "auto_memory_policy": E3_AUTO_MEMORY_POLICY,
-            "long_horizon_arm": E3_LONG_HORIZON_ARM,
-            "rollout_timeout_seconds": manifest["execution"][
-                "rollout_timeout_seconds"
-            ],
-            "repository": manifest["repository"],
-        }
-    )
+    identity: Dict[str, Any] = {
+        "manifest_id": manifest["manifest_id"],
+        "arm": arm,
+        "binary_sha256": binary["sha256"],
+        "actuation": config["actuation"],
+        "rule_flavor": flavor,
+        "bundle_sha256": template["bundle_sha256"] if template else None,
+        "candidate_id": template["candidate_id"] if template else None,
+        "kernel_sha256": manifest["artifacts"]["kernel"]["sha256"],
+        "allowed_tools": list(E3_ALLOWED_TOOLS),
+        "disallowed_tools": list(E3_DISALLOWED_TOOLS),
+        "ripgrep_sha256": ripgrep_sha256,
+        "auto_memory_policy": E3_AUTO_MEMORY_POLICY,
+        "long_horizon_arm": E3_LONG_HORIZON_ARM,
+        "rollout_timeout_seconds": manifest["execution"][
+            "rollout_timeout_seconds"
+        ],
+        "repository": manifest["repository"],
+    }
+    if run_authorization is not None:
+        identity["run_authorization"] = dict(run_authorization)
+    return _canonical_sha256(identity)
 
 
 def _is_sha256(value: Any) -> bool:
@@ -1782,6 +1784,7 @@ def _reopen_rollout_receipt(
     path: Path,
     expected_rollout_schema: str | None = None,
     arm_config: Mapping[str, Mapping[str, Any]] = ARM_CONFIG,
+    expected_run_authorization: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     try:
         resolved_receipt = path.resolve(strict=True)
@@ -1819,6 +1822,7 @@ def _reopen_rollout_receipt(
         arm,
         templates,
         str(manifest["artifacts"]["ripgrep"]["sha256"]),
+        expected_run_authorization,
     )
     if (
         row.get("oracle_class") != case["oracle_class"]
@@ -1836,6 +1840,7 @@ def _reopen_rollout_receipt(
         )
         or row.get("auto_memory_policy") != manifest["execution"]["auto_memory_policy"]
         or row.get("long_horizon_arm") != manifest["execution"]["long_horizon_arm"]
+        or row.get("run_authorization") != expected_run_authorization
     ):
         raise E3Error("E3 rollout treatment identity drift")
 

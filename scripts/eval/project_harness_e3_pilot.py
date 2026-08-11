@@ -400,6 +400,7 @@ def _run_one(
     timeout_seconds: int,
     test_base_url: str | None = None,
     receipt_schema: str | None = None,
+    run_authorization: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     sequence = int(schedule["sequence"])
     arm = str(schedule["arm"])
@@ -486,7 +487,13 @@ def _run_one(
     )
     _assert_production_sandbox_identity(sandbox, evidence_path)
 
-    harness_fingerprint = _harness_fingerprint(manifest, arm, templates, ripgrep_sha256)
+    harness_fingerprint = _harness_fingerprint(
+        manifest,
+        arm,
+        templates,
+        ripgrep_sha256,
+        run_authorization,
+    )
     run_id = f"{manifest['manifest_id']}:{sequence}:{case['id']}:{arm}"
     events = artifact_dir / "native-events.jsonl"
     metadata_path = artifact_dir / "runtime-metadata.json"
@@ -822,6 +829,8 @@ def _run_one(
     }
     if "phase" in schedule:
         receipt = {**receipt, "phase": schedule["phase"]}
+    if run_authorization is not None:
+        receipt = {**receipt, "run_authorization": dict(run_authorization)}
     receipt_path = artifact_dir / "rollout-receipt.json"
     _write_new(receipt_path, (stable_json(receipt) + "\n").encode("utf-8"))
     _assert_production_secret_absent(root, api_key)

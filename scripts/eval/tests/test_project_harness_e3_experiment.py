@@ -66,7 +66,7 @@ def _record(sequence: int, event: dict) -> bytes:
 
 
 class ProjectHarnessE3ExperimentTest(unittest.TestCase):
-    def test_harness_fingerprint_binds_frozen_timeout_and_treatment(self) -> None:
+    def test_harness_fingerprint_binds_timeout_treatment_and_run_authorization(self) -> None:
         templates = {
             "templates": {
                 "evolved": {"bundle_sha256": "4" * 64, "candidate_id": "5" * 64}
@@ -105,6 +105,28 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
                 "evolved_enforced",
                 templates,
                 "7" * 64,
+            ),
+        )
+        authorization = {
+            "schema_version": "metacodes-rule-impact-run-authorization-v1",
+            "promotion_receipt_id": "8" * 64,
+        }
+        authorized = _harness_fingerprint(
+            manifest,
+            "evolved_enforced",
+            templates,
+            "7" * 64,
+            authorization,
+        )
+        self.assertNotEqual(baseline, authorized)
+        self.assertNotEqual(
+            authorized,
+            _harness_fingerprint(
+                manifest,
+                "evolved_enforced",
+                templates,
+                "7" * 64,
+                {**authorization, "promotion_receipt_id": "9" * 64},
             ),
         )
 
