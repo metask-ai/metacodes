@@ -11,7 +11,7 @@ const std = @import("std");
 const journal_mod = @import("tool_observation_journal.zig");
 const observation = @import("../tools/observation.zig");
 
-pub const SCHEMA_VERSION = "metacodes-rule-impact-observation-v3";
+pub const SCHEMA_VERSION = "metacodes-rule-impact-observation-v4";
 
 pub const OutcomeSource = enum {
     unknown,
@@ -30,15 +30,42 @@ pub const RunLabels = struct {
     drift_detected: ?bool = null,
     cost_microusd: ?u64 = null,
     metered_tokens: ?u64 = null,
+    provider_requests: ?u64 = null,
+    input_tokens: ?u64 = null,
+    output_tokens: ?u64 = null,
+    cache_read_tokens: ?u64 = null,
+    cache_write_tokens: ?u64 = null,
+    wall_elapsed_ns: ?u64 = null,
+    false_interventions: ?u64 = null,
+    regressions: ?u64 = null,
 
     pub fn valid(self: RunLabels) bool {
         if (self.outcome_source == .unknown and
             (self.task_success != null or self.trustworthy_success != null or
-                self.drift_detected != null)) return false;
+                self.drift_detected != null or self.false_interventions != null or
+                self.regressions != null)) return false;
         if (self.trustworthy_success == true and self.task_success != true)
             return false;
+        const usage_present = self.cost_microusd != null or self.metered_tokens != null or
+            self.provider_requests != null or self.input_tokens != null or
+            self.output_tokens != null or self.cache_read_tokens != null or
+            self.cache_write_tokens != null or self.wall_elapsed_ns != null;
+        if (usage_present and (self.cost_microusd == null or self.metered_tokens == null or
+            self.provider_requests == null or self.input_tokens == null or
+            self.output_tokens == null or self.cache_read_tokens == null or
+            self.cache_write_tokens == null or self.wall_elapsed_ns == null)) return false;
         return true;
     }
+};
+
+/// Cryptographic identities for the host evidence that supplied semantic and
+/// usage labels.  Zero values mean the legacy caller-only observation path;
+/// governance transitions must require `authenticated` plus all three hashes.
+pub const EvidenceBinding = struct {
+    authenticated: bool = false,
+    label_receipt_sha256: [64]u8 = [_]u8{'0'} ** 64,
+    outcome_evidence_sha256: [64]u8 = [_]u8{'0'} ** 64,
+    usage_evidence_sha256: [64]u8 = [_]u8{'0'} ** 64,
 };
 
 pub const RuleIdentity = struct {
@@ -96,6 +123,7 @@ pub const Snapshot = struct {
     shadow_pre_faults_followed_by_dispatch: u64 = 0,
     subsequent_authoritative_successes: u64 = 0,
     labels: RunLabels,
+    evidence: EvidenceBinding = .{},
     rules: []RuleStats,
 
     pub fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
@@ -157,10 +185,20 @@ pub fn derive(
     run: *const journal_mod.LoadedRunDispatches,
     labels: RunLabels,
 ) !Snapshot {
+    return deriveBound(allocator, run, labels, .{});
+}
+
+pub fn deriveBound(
+    allocator: std.mem.Allocator,
+    run: *const journal_mod.LoadedRunDispatches,
+    labels: RunLabels,
+    evidence: EvidenceBinding,
+) !Snapshot {
     if (!labels.valid()) return error.InvalidRunLabels;
     var snapshot = Snapshot{
         .source_interval_sha256 = run.interval_sha256,
         .labels = labels,
+        .evidence = evidence,
         .rules = &.{},
     };
     errdefer if (snapshot.rules.len != 0) allocator.free(snapshot.rules);
@@ -349,5 +387,14 @@ test "rule impact labels preserve unknown instead of guessing success" {
         .drift_detected = false,
         .cost_microusd = 123,
         .metered_tokens = 456,
+        .provider_requests = 1,
+        .input_tokens = 100,
+        .output_tokens = 50,
+        .cache_read_tokens = 300,
+        .cache_write_tokens = 6,
+        .wall_elapsed_ns = 789,
+        .false_interventions = 0,
+        .regressions = 0,
     }).valid());
+    try std.testing.expect(!((RunLabels{ .cost_microusd = 1 }).valid()));
 }

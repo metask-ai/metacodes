@@ -157,10 +157,15 @@ folds a completed, hash-bound journal interval into integer sufficient
 statistics for authoritative/speculative dispatch, outcome, realized effect,
 re-observation failure, per-rule admit/block/fault, shadow divergence,
 post-block progress, physical checker calls and checker time. External
-grader/user/task-audit labels may add task/trustworthy success, drift, cost and
-metered tokens without pretending that `end_turn` means success. Provider
-request count, wall time and cache read/write usage should enter through the
-same authenticated Run usage receipt; they do not justify re-reading the full
+grader/user/task-audit labels add task/trustworthy success, drift,
+false-intervention and regression observations without pretending that
+`end_turn` means success. A separate provider-usage artifact carries request
+count, input/output/cache-read/cache-write tokens, cost and wall time. Both are
+strict canonical JSON, bind project/issuer/session/run/sequence interval and
+interval hash, reject unknown, missing, duplicate or reordered fields, and are
+reopened before governance. The host-issued receipt accepts only their file
+names; every metric is parsed from the hashed artifacts rather than repeated by
+the caller. These bounded artifacts do not justify re-reading the full
 Conversation.
 
 The cheap path remains entirely local:
@@ -183,6 +188,21 @@ closed before authoring; if measured avoided rework does not repay authoring,
 review and runtime overhead, the controller reduces frequency or disables
 automatic authoring. A cheaper independent provider is therefore preferred
 when it preserves candidate quality and independence.
+
+The first RuleImpact governance slice is intentionally one-Run only. The Zig
+adapter accepts a session directory and content-addressed label-receipt id,
+revalidates the completed journal and both artifacts, derives the candidate row,
+requires the receipt issuer to match the host-configured expected issuer, then
+calls the same hash-pinned Lean kernel. The issuer and both evidence hashes are
+echoed in the checked verdict rather than existing as decorative receipt fields.
+The fixed kernel checks evidence
+binding, exact admit/block/fault accounting, cache-inclusive token accounting,
+checker/wall time, lifecycle, shadow divergence, regressions, false
+interventions and bounded cost before returning an explicit
+`promote | demote | quarantine` verdict. Missing or changed evidence fails
+before checker execution. This stage does not claim cross-window deduplication
+or commit the lifecycle mutation: a future deterministic aggregate receipt and
+revision-CAS actuator must close those boundaries.
 
 Task-direction control should also start with a small typed actuator set such
 as `continue`, `replan`, `branch`, `stop`, `escalate`, or `reject_side_effect`.
@@ -812,9 +832,10 @@ sandbox, and does not claim resistance to a hostile concurrent replacement of
 an ancestor directory.
 
 The checker executable is not accepted by path and hash alone. E3 template
-setup requires the adjacent `metacodes-project-kernel-artifact-v4` provenance
+setup requires the adjacent `metacodes-project-kernel-artifact-v5` provenance
 record, verifies its binary size/hash, native and axiom-audit gates, and binds
-all four Lean source hashes to the clean repository under study. The paid
+the project, rule, impact, shared-kernel, entrypoint and axiom-audit Lean source
+hashes to the clean repository under study. The paid
 manifest freezes both the checker and provenance artifact identities. This
 prevents an executable but stale same-protocol kernel from silently becoming
 the experiment's formal authority.

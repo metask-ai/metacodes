@@ -1,4 +1,5 @@
 import MetaCodesControl.ProjectHarness
+import MetaCodesControl.RuleImpactGovernance
 
 open MetaCodesControl.ProjectHarness
 
@@ -37,5 +38,10 @@ def main (args : List String) : IO UInt32 := do
             IO.println (verdictJson request)
             pure 0
         | .error message =>
-            IO.eprintln s!"invalid project harness request: {message}; batch: {batchMessage}"
-            pure 64
+            match MetaCodesControl.RuleImpactGovernance.decodeCanonicalRequest input with
+            | .ok request =>
+                IO.println (MetaCodesControl.RuleImpactGovernance.verdictJson request)
+                pure 0
+            | .error impactMessage =>
+                IO.eprintln s!"invalid project harness request: {message}; batch: {batchMessage}; impact: {impactMessage}"
+                pure 64

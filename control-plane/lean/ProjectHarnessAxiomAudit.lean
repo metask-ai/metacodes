@@ -1,4 +1,5 @@
 import MetaCodesControl.ProjectHarness
+import MetaCodesControl.RuleImpactGovernance
 
 #print axioms MetaCodesControl.ProjectHarness.safePromotion_sound
 #print axioms MetaCodesControl.ProjectHarness.correction_promotion_requires_receipt
@@ -10,3 +11,7 @@ import MetaCodesControl.ProjectHarness
 #print axioms MetaCodesControl.ProjectRule.exact_edit_recovery_post_sound
 #print axioms MetaCodesControl.ProjectRule.exact_edit_recovery_failed_mutation_sound
 #print axioms MetaCodesControl.ProjectHarness.decideBatch_sound
+#print axioms MetaCodesControl.RuleImpactGovernance.safeTransition_sound
+#print axioms MetaCodesControl.RuleImpactGovernance.unauthenticated_evidence_cannot_transition
+#print axioms MetaCodesControl.RuleImpactGovernance.duplicate_window_cannot_transition
+#print axioms MetaCodesControl.RuleImpactGovernance.unmetered_cache_cannot_transition
