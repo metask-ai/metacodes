@@ -178,6 +178,17 @@ pub fn extractTextDelta(data: []const u8, allocator: std.mem.Allocator) !?[]u8 {
     return try util_json.unescapeString(raw_text, allocator);
 }
 
+/// 从 content_block_delta 中提取 thinking 增量(Anthropic thinking_delta)。
+/// 返回反转义后的 owned bytes(caller free)。非 thinking_delta → null。
+pub fn extractThinkingDelta(data: []const u8, allocator: std.mem.Allocator) !?[]u8 {
+    if (parseEventType(data) != .content_block_delta) return null;
+    const delta_obj = findTopLevelObjectField(data, "delta") orelse return null;
+    const delta_type = findTopLevelStringField(delta_obj, "type") orelse return null;
+    if (!std.mem.eql(u8, delta_type, "thinking_delta")) return null;
+    const raw = findTopLevelStringField(delta_obj, "thinking") orelse return null;
+    return try util_json.unescapeString(raw, allocator);
+}
+
 /// 从 content_block_delta 中提取 tool_use 的 input_json_delta.partial_json 片段。
 /// partial_json 是 JSON 字符串内部的原始转义形态（可能半个 key / 半个 value）；返回
 /// 借 data 的 slice（不 allocate，不 unescape）；调用方累加到 buffer 最后再一起反转义/解析。
@@ -651,6 +662,8 @@ test "extractToolUse preserves input JSON structure" {
 pub const Event = union(enum) {
     /// 来自 content_block_delta 的文本增量；owned bytes（caller free）
     text_delta: []u8,
+    /// 来自 content_block_delta 的思考增量(Anthropic thinking_delta);owned bytes(caller free)
+    thinking_delta: []u8,
     /// 来自 content_block_start 的工具调用初始信息；内部字段借用自 reader buffer
     /// —— 调用方若要跨 next() 保留，必须 dupe
     tool_use_start: ToolUseResult,
@@ -671,7 +684,7 @@ pub const Event = union(enum) {
 
     pub fn deinit(self: Event, allocator: std.mem.Allocator) void {
         switch (self) {
-            .text_delta => |b| allocator.free(b),
+            .text_delta, .thinking_delta => |b| allocator.free(b),
             .tool_use_start => |tu| {
                 allocator.free(tu.id);
                 allocator.free(tu.name);
@@ -745,6 +758,9 @@ pub const StopReason = enum {
 /// 注:与内部 Event 同形,差别仅 text 字段名(StreamResponse.next 做 text_delta→text 映射)。
 pub const StreamEvent = union(enum) {
     text: []u8,
+    /// 思考过程内容(Anthropic thinking_delta / OpenAI reasoning_content)。
+    /// 与 text 分离:不混入最终回答,UI 可折叠显示;多轮 preserved thinking 回传需要它。
+    thinking: []u8,
     tool_use_start: ToolUseResult,
     web_search_result: WebSearchResultEvent,
     web_search_query: []u8,
@@ -1040,6 +1056,10 @@ pub const EventIterator = struct {
                     if (try extractTextDelta(data, allocator)) |text| {
                         self.logDebug("text_delta bytes={d}", .{text.len});
                         return Event{ .text_delta = text };
+                    }
+                    if (try extractThinkingDelta(data, allocator)) |think| {
+                        self.logDebug("thinking_delta bytes={d}", .{think.len});
+                        return Event{ .thinking_delta = think };
                     }
                     continue;
                 },
@@ -1670,4 +1690,60 @@ test "EventIterator records last_stop_reason from message_delta" {
         ev.deinit(a);
     }
     try std.testing.expect(it.last_stop_reason == .max_tokens);
+}
+
+test "extractThinkingDelta: 从 thinking_delta 事件提取 thinking 内容" {
+    const a = std.testing.allocator;
+    const sse =
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"let me think\"}}\n\n";
+    var reader = std.Io.Reader.fixed(sse);
+    var it = EventIterator.init(&reader);
+    defer it.deinit(a);
+    var got: ?[]u8 = null;
+    if (try it.next(a)) |ev| {
+        switch (ev) {
+            .thinking_delta => |t| got = t,
+            else => ev.deinit(a),
+        }
+    }
+    defer if (got) |g| a.free(g);
+    try std.testing.expect(got != null);
+    try std.testing.expectEqualStrings("let me think", got.?);
+}
+
+test "extractThinkingDelta: 非 thinking_delta 事件返回 null" {
+    const a = std.testing.allocator;
+    const sse =
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n";
+    var reader = std.Io.Reader.fixed(sse);
+    var it = EventIterator.init(&reader);
+    defer it.deinit(a);
+    if (try it.next(a)) |ev| {
+        switch (ev) {
+            .thinking_delta => |t| {
+                a.free(t);
+                return error.UnexpectedThinking;
+            },
+            else => ev.deinit(a),
+        }
+    }
+}
+
+test "extractThinkingDelta: unescape 转义内容" {
+    const a = std.testing.allocator;
+    const sse =
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"line1\\nline2\"}}\n\n";
+    var reader = std.Io.Reader.fixed(sse);
+    var it = EventIterator.init(&reader);
+    defer it.deinit(a);
+    var got: ?[]u8 = null;
+    if (try it.next(a)) |ev| {
+        switch (ev) {
+            .thinking_delta => |t| got = t,
+            else => ev.deinit(a),
+        }
+    }
+    defer if (got) |g| a.free(g);
+    try std.testing.expect(got != null);
+    try std.testing.expectEqualStrings("line1\nline2", got.?);
 }

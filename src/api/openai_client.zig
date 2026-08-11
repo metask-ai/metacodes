@@ -336,6 +336,14 @@ const OpenAIStream = struct {
                 return StreamEvent{ .text = owned };
             }
         }
+        // delta.reasoning_content → thinking(DeepSeek/Kimi/Qwen/GLM-5)。
+        // OpenAI 原生不返回此字段(仅 reasoning_tokens 计数);兼容端点把它作为平级字符串返回。
+        if (extractDeltaReasoning(data)) |reasoning| {
+            if (reasoning.len > 0) {
+                const owned = try self.allocator.dupe(u8, reasoning);
+                return StreamEvent{ .thinking = owned };
+            }
+        }
         // delta.tool_calls 增量(P0.1 并行):按 `index` 分槽累积。OpenAI 流式对每个并行 tool_call
         // 用独立 index;同一 chunk 的 tool_calls array 可含多个元素,元素跨 chunk 续拼 arguments。
         // 逐元素定位/新建对应 index 的槽,追加 id/name/arguments 片段。done 时全部 flush。
@@ -587,26 +595,101 @@ fn extractDeltaContent(data: []const u8) ?[]const u8 {
     return util_json.extractStringField(data, "content");
 }
 
+/// 从 OpenAI chat/completions delta 提取 reasoning_content(DeepSeek/Kimi/Qwen/GLM-5)。
+/// 与 content 平级的字符串字段。OpenAI 原生无此字段。
+fn extractDeltaReasoning(data: []const u8) ?[]const u8 {
+    return util_json.extractStringField(data, "reasoning_content");
+}
+
 /// 中立 Conversation/tools → OpenAI chat/completions 请求 body。caller free。
+/// 按 model 查 ModelProfile 决定 thinking wire 格式(GLM prompt 标签 / K3 extra_body / DeepSeek 顶层 / OpenAI effort)。
 pub fn serializeOpenAIRequest(allocator: std.mem.Allocator, model: []const u8, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, reasoning_effort: ?types.ReasoningEffort) ![]u8 {
+    const adapter = @import("model_adapter.zig");
+    const profile = adapter.profileFor(.openai, model);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "{\"model\":");
     try util_json.serializeString(model, &out, allocator);
-    if (reasoning_effort) |effort| {
-        if (effort.active()) {
-            try out.appendSlice(allocator, ",\"reasoning_effort\":");
-            try util_json.serializeString(effort.name(), &out, allocator);
-        }
+    // thinking 控制:按 profile.thinking_mode 选 wire 格式。
+    switch (profile.thinking_mode) {
+        .none => {},
+        .openai_effort => {
+            // OpenAI 原生:reasoning.effort 嵌套对象(GPT-5/o3)。effort 直接透传 7 档。
+            if (reasoning_effort) |effort| if (effort.active()) {
+                try out.appendSlice(allocator, ",\"reasoning_effort\":");
+                try util_json.serializeString(effort.name(), &out, allocator);
+            };
+        },
+        .glm_prompt_tag => {
+            // GLM-5:thinking:{type} 在 body(OpenAI-compatible),effort 7→2 映射注入 system prompt 标签。
+            // effort=null 时默认 enabled(GLM 自动判断是否思考)。
+            const enable = if (reasoning_effort) |e| e.active() else true;
+            try out.appendSlice(allocator, ",\"thinking\":{\"type\":");
+            try util_json.serializeString(if (enable) "enabled" else "disabled", &out, allocator);
+            try out.append(allocator, '}');
+            if (enable) {
+                // clear_thinking=false(保留)→ 对齐 preserved thinking;coding-plan 默认。
+                try out.appendSlice(allocator, ",\"clear_thinking\":false");
+            }
+        },
+        .kimi_extra_body => {
+            // Kimi K3:thinking:{type,keep,effort} 在 body。effort 3 档(low/high/max)。
+            const enable = if (reasoning_effort) |e| e.active() else true;
+            try out.appendSlice(allocator, ",\"thinking\":{\"type\":");
+            try util_json.serializeString(if (enable) "enabled" else "disabled", &out, allocator);
+            if (enable) {
+                try out.appendSlice(allocator, ",\"keep\":\"all\"");
+                if (adapter.kimiEffortMap(reasoning_effort.?)) |mapped| {
+                    try out.appendSlice(allocator, ",\"effort\":");
+                    try util_json.serializeString(mapped, &out, allocator);
+                }
+            }
+            try out.append(allocator, '}');
+        },
+        .deepseek_top => {
+            // DeepSeek:thinking:{type} + reasoning_effort 顶层(两独立参数)。effort 1 档(high)。
+            const enable = if (reasoning_effort) |e| e.active() else true;
+            try out.appendSlice(allocator, ",\"thinking\":{\"type\":");
+            try util_json.serializeString(if (enable) "enabled" else "disabled", &out, allocator);
+            try out.append(allocator, '}');
+            if (enable and adapter.deepseekEffortMap(reasoning_effort.?) != null) {
+                try out.appendSlice(allocator, ",\"reasoning_effort\":\"high\"");
+            }
+        },
+        .qwen_template => {
+            // Qwen3:enable_thinking bool + /think /no_think 文本指令(chat template 处理)。
+            // body 只传 enable_thinking;文本指令由 system prompt 或 user 消息携带(这里不注入,
+            // 由调用方在 system prompt 里加 /think /no_think)。
+            const enable = if (reasoning_effort) |e| e.active() else true;
+            try out.appendSlice(allocator, ",\"enable_thinking\":");
+            try out.appendSlice(allocator, if (enable) "true" else "false");
+        },
+        .gemini_level, .anthropic_adaptive => {
+            // 不该走到(Gemini/Claude 不经此函数),保守 no-op。
+        },
     }
     // stream_options.include_usage=true:OpenAI 默认流式不发 usage,显式要求才在末尾发一个
     // {choices:[],usage:{...}} chunk。缓存命中(cached_tokens)就在这个 usage 里。
     try out.appendSlice(allocator, ",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
     var first = true;
-    // system → 首条 {role:"system"}
+    // system → 首条 {role:"system"}。GLM-5 的 <reasoning_effort> 标签注入 system 内容。
     if (system) |sys| {
         try out.appendSlice(allocator, "{\"role\":\"system\",\"content\":");
-        try util_json.serializeString(sys, &out, allocator);
+        if (profile.thinking_mode == .glm_prompt_tag and reasoning_effort != null and reasoning_effort.?.active()) {
+            if (adapter.glmEffortMap(reasoning_effort.?)) |mapped| {
+                // 注入 <reasoning_effort> 标签到 system 末尾(GLM chat_template 约定)。
+                var sys_buf: std.ArrayList(u8) = .empty;
+                defer sys_buf.deinit(allocator);
+                try sys_buf.appendSlice(allocator, sys);
+                try sys_buf.appendSlice(allocator, "\n<reasoning_effort> ");
+                try sys_buf.appendSlice(allocator, mapped);
+                try util_json.serializeString(sys_buf.items, &out, allocator);
+            } else {
+                try util_json.serializeString(sys, &out, allocator);
+            }
+        } else {
+            try util_json.serializeString(sys, &out, allocator);
+        }
         try out.append(allocator, '}');
         first = false;
     }
@@ -723,4 +806,51 @@ test "OpenAI 请求翻译:中立 Conversation → chat/completions body" {
     try std.testing.expect(std.mem.indexOf(u8, body, "hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
+}
+
+test "extractDeltaReasoning: 从 chunk 解析 reasoning_content 字段" {
+    const chunk = "{\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking...\"}}]}";
+    const got = extractDeltaReasoning(chunk);
+    try std.testing.expect(got != null);
+    try std.testing.expectEqualStrings("thinking...", got.?);
+}
+
+test "extractDeltaReasoning: 缺失字段返回 null" {
+    const chunk = "{\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}";
+    try std.testing.expect(extractDeltaReasoning(chunk) == null);
+}
+
+test "serializeOpenAIRequest: GLM-5 effort=high 走 <reasoning_effort> system 标签" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const body = try serializeOpenAIRequest(a, "glm-5.2", &msgs, "sys", null, .high);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "<reasoning_effort> high") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"}") != null);
+}
+
+test "serializeOpenAIRequest: Kimi K3 effort=high 走 extra_body thinking" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const body = try serializeOpenAIRequest(a, "kimi-k2", &msgs, "sys", null, .high);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"keep\":\"all\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"high\"") != null);
+}
+
+test "serializeOpenAIRequest: DeepSeek effort=high 走顶层 reasoning_effort" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const body = try serializeOpenAIRequest(a, "deepseek-chat", &msgs, "sys", null, .high);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"}") != null);
 }

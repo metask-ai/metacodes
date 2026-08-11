@@ -220,6 +220,8 @@ pub const ApiMessage = struct {
 /// API 内容块
 pub const ApiContent = union(enum) {
     text: []const u8,
+    /// Anthropic preserved thinking block(原样回传,对齐 Claude 4.x)
+    thinking: []const u8,
     tool_use: ToolUseBlock,
     tool_result: ToolResultBlock,
 };

@@ -166,6 +166,7 @@ function coreEvent(ce) {
   const tag = Object.keys(ce)[0], p = ce[tag];
   switch (tag) {
     case "text_chunk": appendAssistant(p); break;
+    case "thinking_chunk": appendAssistant(p); break; // 暂与 text 同渲染(后续可折叠)
     case "stream_begin": endAssistant(); break;
     case "stream_done": endAssistant(); break;
 

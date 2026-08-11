@@ -182,6 +182,7 @@ pub const TuiBackend = struct {
                 self.region.beginGenAssistant();
             },
             .text_chunk => |t| self.region.writeGenAssistantText(t),
+            .thinking_chunk => |t| self.region.writeGenAssistantText(t), // TUI 暂与 text 同渲染(后续可折叠)
             .tool_start => |s| {
                 // backend 据 tool_card 分类自决渲染(层泄漏修复:agent_loop 无条件发,不碰 tool_card)。
                 if (tool_card.usesDynamicCard(s.name)) {

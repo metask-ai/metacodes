@@ -976,6 +976,7 @@ pub const StreamResponse = struct {
         };
         return switch (ev) {
             .text_delta => |t| StreamEvent{ .text = t },
+            .thinking_delta => |t| StreamEvent{ .thinking = t },
             .tool_use_start => |tu| StreamEvent{ .tool_use_start = tu },
             .web_search_result => |w| StreamEvent{ .web_search_result = w },
             .web_search_query => |q| StreamEvent{ .web_search_query = q },

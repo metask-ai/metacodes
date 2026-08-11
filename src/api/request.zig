@@ -180,6 +180,14 @@ fn serializeContent(content: []const types.ApiContent, buf: *std.ArrayList(u8), 
                 try util_json.serializeString(t, buf, allocator);
                 try buf.append(allocator, '}');
             },
+            .thinking => |t| {
+                // preserved thinking 回传(Anthropic):thinking block 必须原样、按序回传。
+                // 对齐 Claude Opus 4.5+:保留 thinking 提升多轮推理质量。
+                try buf.append(allocator, '{');
+                try buf.appendSlice(allocator, "\"type\":\"thinking\",\"thinking\":");
+                try util_json.serializeString(t, buf, allocator);
+                try buf.append(allocator, '}');
+            },
             .tool_use => |tu| {
                 try buf.append(allocator, '{');
                 try buf.appendSlice(allocator, "\"type\":\"tool_use\",\"id\":");

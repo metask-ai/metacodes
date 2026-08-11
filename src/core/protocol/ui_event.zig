@@ -139,6 +139,10 @@ pub const CoreEvent = union(enum) {
     /// assistant 文本流(进 scrollback)。borrow slice。
     text_chunk: []const u8,
 
+    /// 思考过程流(reasoning_content / thinking_delta)。borrow slice。
+    /// 与 text_chunk 分离:UI 折叠显示,不混入最终回答;多轮 preserved thinking 回传需要它。
+    thinking_chunk: []const u8,
+
     /// 一轮流式输出开始(取代 agent_loop 旧 `if(colorize) print("\x1b[32m")`)。
     /// backend 决定是否开颜色括号。
     stream_begin,

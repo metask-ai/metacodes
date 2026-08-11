@@ -723,6 +723,11 @@ pub fn run(
         var assistant_text = std.ArrayList(u8).empty;
         defer assistant_text.deinit(allocator);
 
+        // 思考过程累加器:本轮所有 thinking_delta/reasoning_content 拼成一个 thinking block,
+        // 存入 assistant message(preserved thinking)。下轮请求 serializeContent 回传。
+        var thinking_text = std.ArrayList(u8).empty;
+        defer thinking_text.deinit(allocator);
+
         var tool_uses = std.ArrayList(msg.ToolUse).empty;
         defer tool_uses.deinit(allocator);
 
@@ -892,6 +897,15 @@ pub fn run(
                         // text bytes 是 stream 分配的 owned——用完必须 free，否则泄漏
                         allocator.free(text);
                     },
+                    .thinking => |text| {
+                        // 思考过程:不混入 assistant_text(最终回答),单独 emit 给 UI 折叠显示。
+                        // preserved thinking:累加进 thinking_text,turn 末存入 thinking block,
+                        // 下轮请求 serializeContent 回传给模型。
+                        backend.emitEvent(sess, .{ .thinking_chunk = text });
+                        try thinking_text.appendSlice(allocator, text);
+                        log.debugId("agent", rid, "thinking chunk bytes={d}", .{text.len});
+                        allocator.free(text);
+                    },
                     .tool_use_start => |tu_in| {
                         var tu = tu_in;
                         // P0.6 弱模型健壮性:tool input 非法 JSON(markdown 围栏/trailing comma/括号不
@@ -1038,6 +1052,7 @@ pub fn run(
                 for (assistant_blocks.items) |b| b.deinit(allocator);
                 assistant_blocks.clearRetainingCapacity();
                 assistant_text.clearRetainingCapacity();
+                thinking_text.clearRetainingCapacity();
                 if (can_recover_context_error) {
                     if (!recoverContextWindowExceeded(
                         conversation,
@@ -1065,7 +1080,14 @@ pub fn run(
         }
         const rid = rid_for_turn;
 
-        // 4. 把 assistant text + tool_uses 组装成 Message 追加到 conversation
+        // 4. 把 thinking + assistant text + tool_uses 组装成 Message 追加到 conversation。
+        // 顺序:thinking block 先于 text(对齐 Anthropic content[] 规范;OpenAI-compatible
+        // 的 reasoning_content 平级字段由 request.zig 序列化时处理,block 顺序无害)。
+        if (thinking_text.items.len > 0) {
+            const th_owned = try allocator.dupe(u8, thinking_text.items);
+            errdefer allocator.free(th_owned);
+            try assistant_blocks.append(allocator, .{ .thinking = th_owned });
+        }
         if (assistant_text.items.len > 0) {
             const text_owned = try allocator.dupe(u8, assistant_text.items);
             errdefer allocator.free(text_owned);
