@@ -47,14 +47,18 @@ fn statelessCtx() *anyopaque {
 fn openaiSerializeToolChoice(ctx: *anyopaque, p: ModelProfile, tc: ?ToolChoice, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
     _ = ctx;
     const t = tc orelse return false;
-    // GLM-5 仅支持 auto:降级
+    // none 是通用语义(不调用工具),所有 OpenAI-compatible 服务端都认,不降级。
+    if (std.mem.eql(u8, t.type, "none")) {
+        try out.appendSlice(a, ",\"tool_choice\":\"none\"");
+        return true;
+    }
+    // GLM-5 仅支持 auto:none(不支持 required/function)。auto 透传,其它降级成 auto。
     if (p.tool_choice_support == .auto_only) {
         try out.appendSlice(a, ",\"tool_choice\":\"auto\"");
         return true;
     }
-    if (std.mem.eql(u8, t.type, "auto") or std.mem.eql(u8, t.type, "none")) {
-        try out.appendSlice(a, ",\"tool_choice\":");
-        try util_json.serializeString(t.type, out, a);
+    if (std.mem.eql(u8, t.type, "auto")) {
+        try out.appendSlice(a, ",\"tool_choice\":\"auto\"");
         return true;
     }
     if (std.mem.eql(u8, t.type, "any") or std.mem.eql(u8, t.type, "required")) {
@@ -86,16 +90,16 @@ fn openaiSerializeToolChoice(ctx: *anyopaque, p: ModelProfile, tc: ?ToolChoice, 
 // json_object(服务端拒 json_schema,静默降级保请求成功)。
 fn openaiSerializeResponseFormat(ctx: *anyopaque, p: ModelProfile, rf: ?ResponseFormatRequest, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
     _ = ctx;
-    const r = rf orelse return false;
-    if (r.kind == .none) return false;
+    const req = rf orelse return false;
+    if (req.kind == .none) return false;
     // GLM-5 仅 json_object:json_schema 降级
-    const kind: ResponseFormatRequest = if (p.response_format_support == .json_object_only and r.kind == .json_schema) .{ .kind = .json_object } else r;
-    if (kind.kind == .json_object) {
+    const effective: ResponseFormatRequest = if (p.response_format_support == .json_object_only and req.kind == .json_schema) .{ .kind = .json_object } else req;
+    if (effective.kind == .json_object) {
         try out.appendSlice(a, ",\"response_format\":{\"type\":\"json_object\"}");
         return true;
     }
-    if (kind.kind == .json_schema) {
-        if (kind.schema) |s| {
+    if (effective.kind == .json_schema) {
+        if (effective.schema) |s| {
             try out.appendSlice(a, ",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"schema\":");
             try out.appendSlice(a, s);
             try out.appendSlice(a, "}}");
@@ -112,9 +116,8 @@ fn openaiSerializeResponseFormat(ctx: *anyopaque, p: ModelProfile, rf: ?Response
 //
 // 中立 key → OpenAI chat/completions 顶层 \"prompt_cache_key\":\"<key>\"。
 // 该字段是 OpenAI 2024 引入的显式 cache 提示(同 prompt 命中率提升),DeepSeek/Kimi
-// 兼容此字段。GLM-5/Qwen/Mistral 当前不支持,但服务端忽略未知字段(无害)。
-// 能力守门:profile.supports_prompt_cache_key=false 时不发(避免给不支持的服务端
-// 加无意义字段;虽然无害,但能力探测应保持诚实)。
+// 兼容此字段。GLM-5/Qwen/Mistral 当前不支持(未实测服务端是否忽略未知字段,故靠
+// profile.supports_prompt_cache_key 能力守门,只对已确认支持的 model 发)。
 fn openaiSerializePromptCacheKey(ctx: *anyopaque, p: ModelProfile, key: ?[]const u8, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
     _ = ctx;
     if (!p.supports_prompt_cache_key) return false;

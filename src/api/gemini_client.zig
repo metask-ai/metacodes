@@ -573,8 +573,9 @@ pub fn serializeGeminiRequest(allocator: std.mem.Allocator, messages: []const ty
         }
     }
     // tool_choice:委托给 GeminiDialect 翻成 tool_config.function_calling_config。
+    // dialect.ToolChoice 是 api/request.zig ToolChoice 的 alias,直接传 json_mod.ToolChoice。
     if (tool_choice) |tc| {
-        _ = try dialect.serializeToolChoice(profile, .{ .type = tc.type, .name = tc.name }, &out, allocator);
+        _ = try dialect.serializeToolChoice(profile, tc, &out, allocator);
     }
     // generation_config:合并 thinking_level + response_mime_type(都进 generation_config)。
     // 先收集两个片段,再合并成一个 generation_config(避免两个 generation_config 键冲突)。

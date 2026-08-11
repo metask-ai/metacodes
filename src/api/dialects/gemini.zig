@@ -73,16 +73,21 @@ const Gemini = struct {
         return true;
     }
 
-    /// Gemini:response_format → generation_config.response_mime_type=application/json
-    /// (Gemini 不支持 json_schema 单独字段,schema 进 generation_config.response_schema,
-    /// 当前只接 json_object,留位 schema 待消费方需要时再扩)。
+    /// Gemini:response_format → response_mime_type 片段(由 serializeGeminiRequest
+    /// 的 gen_cfg 合并逻辑收进 generation_config,不带外层包裹)。
+    /// Gemini 不支持 json_schema 单独字段,schema 进 generation_config.response_schema,
+    /// 当前只接 json_object,留位 schema 待消费方需要时再扩。
+    /// **返回片段格式**:`"response_mime_type":"application/json"`(不带前导逗号或包裹,
+    /// 由调用方合并进 gen_cfg ArrayList,与 thinking_level 等其它片段同级)。
     fn serializeResponseFormat(ctx: *anyopaque, p: ModelProfile, rf: ?ResponseFormatRequest, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
         _ = ctx;
         _ = p;
         const r = rf orelse return false;
         if (r.kind == .none) return false;
         // json_object 或 json_schema(降级为 json_object,Gemini 当前只接 mime_type)
-        try out.appendSlice(a, ",\"generation_config\":{\"response_mime_type\":\"application/json\"}");
+        // 片段格式:与 serializeThinking 的 "thinking_level":"low" 同级(无前导逗号)。
+        if (out.items.len > 0) try out.appendSlice(a, ",");
+        try out.appendSlice(a, "\"response_mime_type\":\"application/json\"");
         return true;
     }
 

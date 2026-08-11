@@ -653,9 +653,9 @@ pub fn serializeOpenAIRequest(allocator: std.mem.Allocator, model: []const u8, m
     }
     // tool_choice:委托给 dialect(按 model 翻译 + 能力降级 GLM-5)。
     // dialect 返回 false 表示未序列化(如 tool_choice=null),true 表示已追加 wire 片段。
-    // 中立 ToolChoice 与 api/request.zig ToolChoice 同构,直接透传字段。
+    // dialect.ToolChoice 是 api/request.zig ToolChoice 的 alias,直接传 json_mod.ToolChoice。
     if (tool_choice) |tc| {
-        _ = try dialect.serializeToolChoice(profile, .{ .type = tc.type, .name = tc.name }, &out, allocator);
+        _ = try dialect.serializeToolChoice(profile, tc, &out, allocator);
     }
     try out.append(allocator, '}');
     return out.toOwnedSlice(allocator);
@@ -849,7 +849,7 @@ test "M3 serializeOpenAIRequest: tool_choice=none → \"none\"" {
 }
 
 test "M3 serializeOpenAIRequest: GLM-5 tool_choice=required 降级为 auto(能力守门)" {
-    // 声明=接线=测试:GLM-5 profile.tool_choice_support==.auto_only,任何非 auto 都必须降级。
+    // 声明=接线=测试:GLM-5 profile.tool_choice_support==.auto_only,任何非 auto/none 都必须降级。
     // 不降级 → 服务端 400;dialect 必须守门。
     const a = std.testing.allocator;
     const msgs = [_]types.ApiMessage{
@@ -860,6 +860,19 @@ test "M3 serializeOpenAIRequest: GLM-5 tool_choice=required 降级为 auto(能�
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"required\"") == null);
+}
+
+test "M3 serializeOpenAIRequest: GLM-5 tool_choice=none 不降级(通用语义)" {
+    // none=不调用工具,所有 OpenAI-compatible 服务端都认,不该降级成 auto(会变允许工具)。
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const tc = json_mod.ToolChoice{ .type = "none" };
+    const body = try serializeOpenAIRequest(a, "glm-5.2", &msgs, "sys", null, null, tc);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"none\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") == null);
 }
 
 test "M3 serializeOpenAIRequest: tool_choice=null 不发 tool_choice 字段" {

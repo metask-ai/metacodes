@@ -192,14 +192,10 @@ pub const Dialect = struct {
 pub const ToolChoiceKind = enum { none, auto, required, function };
 pub const ResponseFormatKind = enum { none, json_object, json_schema };
 
-/// 中立 ToolChoice(Anthropic 语义,与 api/request.zig ToolChoice 对齐)。
-/// dialect.serializeToolChoice 负责翻译成各家 wire 格式。
-pub const ToolChoice = struct {
-    /// "auto" / "any"(强制选一个工具) / "tool"(指定 name) / "none"(禁用工具)
-    type: []const u8 = "auto",
-    /// type=="tool" 时指定工具名;否则 null
-    name: ?[]const u8 = null,
-};
+/// 中立 ToolChoice。与 `api/request.zig ToolChoice` 同构(单申明源:api/request.zig);
+/// 这里 alias 避免重复定义 + 消费方手动 copy 字段(openai_client / gemini_client
+/// 可直接传 `json_mod.ToolChoice` 给 dialect,无需 `.type/.name` 拆装)。
+pub const ToolChoice = @import("request.zig").ToolChoice;
 
 /// 中立 ResponseFormat 请求(JSON mode)。dialect.serializeResponseFormat 翻译成各家 wire。
 /// - json_object:要求模型输出合法 JSON(不指定 schema)
@@ -479,7 +475,8 @@ test "M4 OpenAI dialect: json_schema 缺 schema 退到 json_object" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"response_format\":{\"type\":\"json_object\"}") != null);
 }
 
-test "M4 Gemini dialect: response_format json_object → response_mime_type" {
+test "M4 Gemini dialect: response_format json_object → response_mime_type 片段" {
+    // 片段格式:不带 ,"generation_config":{ 包裹(由 serializeGeminiRequest 合并)。
     const a = std.testing.allocator;
     const d = dialectFor(.gemini, "gemini-2.5-pro");
     const p = d.profileFor(.gemini, "gemini-2.5-pro");
@@ -487,7 +484,9 @@ test "M4 Gemini dialect: response_format json_object → response_mime_type" {
     defer out.deinit(a);
     const got = try d.serializeResponseFormat(p, .{ .kind = .json_object }, &out, a);
     try std.testing.expect(got);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"generation_config\":{\"response_mime_type\":\"application/json\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"response_mime_type\":\"application/json\"") != null);
+    // 不带 generation_config 包裹(片段格式)
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "generation_config") == null);
 }
 
 test "M4 Claude dialect: response_format 不发(用 system prompt 指示 JSON)" {
