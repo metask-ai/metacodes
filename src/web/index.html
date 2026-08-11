@@ -251,8 +251,8 @@ function toolProgress(p) {
 
 // ── 工具卡:完成(每工具专属渲染,镜像 TUI tool_card.zig)────────────────────────
 function finishToolCard(p) {
-  // agent_loop 双发 tool_result(先空 content 后实 content)——空且非错只保持 running。
-  if (!p.content && !p.is_error) return;
+  // P2.1:agent_loop 现每工具只发一条真 content 的 tool_result(不再空+实双发),
+  // 此处无需 content.len>0 去重。content 永远非空(无结果时 agent_loop 生成 error JSON)。
   let c = toolCards[p.id];
   if (!c) { // 无起始卡(hidden 工具的结果)→ 现建
     const card = el("tool-card"); const head = el("thead");

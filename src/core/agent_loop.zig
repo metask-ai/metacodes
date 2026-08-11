@@ -1391,10 +1391,8 @@ pub fn run(
             .elapsed_ms = elapsedSinceNs(tool_stage_started_ns),
         } });
         if (opts.event_projection.emitToolStart(opts.emit_tool_cards, opts.agent_depth)) {
-            // P2.1:只发 clear_current_tool 清运行态动态卡。**不再**为每个 slot 补发一条空 content
-            // 的 tool_result——那是历史"双发",逼每个 backend 靠 content.len>0 去重(tui gate / web JS dedup /
-            // WebSearch 靠真 emit 也会 clearToolCard)。真结果由下方每 slot 的单条 tool_result(真 content)
-            // 承载,backend 收敛为"每工具一条干净 tool_result"。
+            // P2.1:只发 clear_current_tool 清运行态动态卡。真结果由下方每 slot 的单条
+            // tool_result(真 content)承载,不再双发空+实。
             backend.emitEvent(sess, .clear_current_tool);
         }
 

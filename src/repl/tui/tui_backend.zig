@@ -217,8 +217,8 @@ pub const TuiBackend = struct {
                 self.spinner_fed = false; // 本轮结束,重置喂 spinner 标志。
             },
             .tool_result => |r| {
-                // backend 自决三分支(P2.1:agent_loop 现每工具只发一条真 content 的 tool_result,
-                // 不再有空 content 双发 → 无需 content.len>0 去重):
+                // P2.1:agent_loop 每工具只发一条真 content 的 tool_result,无需 content.len>0 去重。
+                // backend 自决三分支:
                 //  ① 类A(usesLiveCard):commit 动态卡进 scrollback(过去式标题)。
                 //  ② WebSearch(hasProgressCard):完成只移除动态卡(结果走助手文本)。
                 //  ③ 其余(类B 等):renderResult 写 scrollback(不变)。
