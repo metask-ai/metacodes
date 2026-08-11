@@ -136,12 +136,14 @@ fn anthropicProfile(model: []const u8) ModelProfile {
 }
 
 fn openaiProfile(model: []const u8) ModelProfile {
-    // GLM-5 系列(OpenAI-compatible 端点)
+    // GLM-5 系列(经 OpenAI-compatible 端点调用)
+    // 注:GLM 原生端点用 XML 工具格式 + defer_loading,但 metacodes 走 OpenAI-compatible
+    // 端点(标准 JSON function 调用),07-15 swarm e2e 真 GLM-5.2 + JSON 工具调用 PASS 证实。
+    // tool_format/supports_defer_loading 走默认(openai_json/false)——XML 格式留 ToolFormat.glm_xml
+    // 枚举供将来原生端点适配,OpenAI-compatible 端点不消费。
     if (hasSubstr(model, "glm-5") or hasSubstr(model, "glm4") or hasSubstr(model, "glm-4")) {
         return .{
             .thinking_mode = .glm_prompt_tag,
-            .tool_format = .glm_xml,
-            .supports_defer_loading = true,
             .effort_levels = .glm_7to2,
             .response_format_support = .json_object_only,
             .tool_choice_support = .auto_only,
@@ -248,8 +250,9 @@ test "profileFor: Anthropic Claude 4.x" {
 test "profileFor: GLM-5.2" {
     const p = profileFor(.openai, "glm-5.2");
     try std.testing.expect(p.thinking_mode == .glm_prompt_tag);
-    try std.testing.expect(p.tool_format == .glm_xml);
-    try std.testing.expect(p.supports_defer_loading);
+    // OpenAI-compatible 端点用 JSON function 调用(非原生 XML);glm_xml 枚举保留供将来原生端点。
+    try std.testing.expect(p.tool_format == .openai_json);
+    try std.testing.expect(!p.supports_defer_loading);
     try std.testing.expect(p.effort_levels == .glm_7to2);
     try std.testing.expect(p.response_format_support == .json_object_only);
     try std.testing.expect(p.tool_choice_support == .auto_only);
