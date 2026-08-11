@@ -752,6 +752,19 @@ test "M3 Gemini: tool_choice=none → mode NONE" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"mode\":\"NONE\"") != null);
 }
 
+test "M3 Gemini: tool_choice=tool 缺 name → ANY(强制选一个,不指定)" {
+    // tool 类型但 name=null,Gemini 输出 mode=ANY 但不发 allowed_function_names。
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const tc = json_mod.ToolChoice{ .type = "tool", .name = null };
+    const body = try serializeGeminiRequest(a, &msgs, "sys", null, null, "gemini-2.5-pro", tc, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"mode\":\"ANY\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "allowed_function_names") == null);
+}
+
 test "M3 Gemini: tool_choice=null 不发 tool_config" {
     const a = std.testing.allocator;
     const msgs = [_]types.ApiMessage{
