@@ -154,7 +154,7 @@ test "L2 Task preserves proxy-spaced text_delta in final_text" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"final_text\":\"PROXY_FINAL_TEXT\"") != null);
 }
 
-test "L2 AgentDef.effort=high: GLM-5 effort 走 <reasoning_effort> system 标签且父 Provider 恢复" {
+test "L2 AgentDef.effort=high: GLM-5.2 effort 走顶层 reasoning_effort body 且父 Provider 恢复" {
     const a = std.testing.allocator;
     var srv = try harness.MockServer.start(OPENAI_END_TURN_SSE, 0);
     defer srv.stop();
@@ -180,10 +180,12 @@ test "L2 AgentDef.effort=high: GLM-5 effort 走 <reasoning_effort> system 标签
     const out = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"deliberate-openai\",\"prompt\":\"go\"}");
     defer a.free(out);
     const body = (srv.lastRequest() orelse return error.NoRequestCaptured).body();
-    // GLM-5 用 <reasoning_effort> 标签注入 system prompt,不输出顶层 JSON reasoning_effort 字段。
-    // effort=high 经 glmEffortMap 映射为 "high"(7→2: low/medium/high → high)。
-    try std.testing.expect(std.mem.indexOf(u8, body, "<reasoning_effort> high") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") == null);
+    // GLM-5.2:顶层 reasoning_effort body 字段(7 档透传)+ thinking:{type:enabled}。
+    // 来源:docs.z.ai/guides/capabilities/thinking(2026-08 KnowForge 调研)。
+    // 不再注入 <reasoning_effort> system 标签(那是旧 GLM-4.6 时代格式)。
+    try std.testing.expect(std.mem.indexOf(u8, body, "<reasoning_effort>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"}") != null);
     try std.testing.expect(client.reasoning_effort == null);
 }
 

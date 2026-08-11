@@ -178,8 +178,9 @@ const Glm = struct {
     fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
         _ = ctx;
         _ = p;
-        // GLM-5:thinking:{type} 在 body(OpenAI-compatible),effort 7→2 映射注入 system prompt 标签。
-        // effort=null 时默认 enabled(GLM 自动判断是否思考)。
+        // GLM-5.2:thinking:{type} + 顶层 reasoning_effort(7 档,服务端自己做 low/medium→high 映射)。
+        // 来源:docs.z.ai/guides/capabilities/thinking(2026-08 KnowForge 调研)。
+        // effort=null 时默认 enabled(GLM 自动判断是否思考),不发 reasoning_effort(用服务端默认 max)。
         const enable = if (effort) |e| e.active() else true;
         try out.appendSlice(a, ",\"thinking\":{\"type\":");
         try util_json.serializeString(if (enable) "enabled" else "disabled", out, a);
@@ -187,19 +188,13 @@ const Glm = struct {
         if (enable) {
             // clear_thinking=false(保留)→ 对齐 preserved thinking;coding-plan 默认。
             try out.appendSlice(a, ",\"clear_thinking\":false");
-        }
-    }
-
-    fn injectSystemMods(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, sys: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
-        _ = ctx;
-        _ = p;
-        // effort 7→2 映射:low/medium/high → "high";xhigh → "max";none/minimal → 跳过(不发标签)。
-        if (effort) |e| if (e.active()) {
-            if (model_adapter.glmEffortMap(e)) |mapped| {
-                try sys.appendSlice(a, "\n<reasoning_effort> ");
-                try sys.appendSlice(a, mapped);
+            // 顶层 reasoning_effort(7 档透传:服务端自己把 low/medium→high, xhigh→max)。
+            // 仅 GLM-5.2+ 支持;GLM-5.1/5/4.x 不支持(服务端会忽略未知字段,安全)。
+            if (effort) |e| {
+                try out.appendSlice(a, ",\"reasoning_effort\":");
+                try util_json.serializeString(e.name(), out, a);
             }
-        };
+        }
     }
 
     fn extractThinkingDelta(ctx: *anyopaque, raw: []const u8, a: std.mem.Allocator) anyerror!?[]u8 {
@@ -214,7 +209,6 @@ const Glm = struct {
     const dialect = Dialect{
         .ctx = undefined,
         .serializeThinkingFn = serializeThinking,
-        .injectSystemModsFn = injectSystemMods,
         .extractThinkingDeltaFn = extractThinkingDelta,
         .serializeToolChoiceFn = openaiSerializeToolChoice,
         .serializeResponseFormatFn = openaiSerializeResponseFormat,
@@ -223,12 +217,46 @@ const Glm = struct {
     };
 };
 
-// ── Kimi K3 ──────────────────────────────────────────────────────────────────
+// ── Kimi K3(顶层 reasoning_effort,不发 thinking body)─────────────────────────
+const KimiK3 = struct {
+    fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
+        _ = ctx;
+        _ = p;
+        // Kimi K3:总是开 thinking(不能关),用顶层 reasoning_effort(low/high/max 默认 max)。
+        // 不发 thinking:{} body(那是 K2.6 的格式)。effort=null 走默认 "max"。
+        // 来源:platform.kimi.ai/docs/guide/kimi-k3-quickstart(2026-08 KnowForge 调研)。
+        const eff = effort orelse .xhigh; // null → 默认 max
+        const mapped = model_adapter.kimiK3EffortMap(eff);
+        try out.appendSlice(a, ",\"reasoning_effort\":");
+        try util_json.serializeString(mapped, out, a);
+    }
+
+    fn extractThinkingDelta(ctx: *anyopaque, raw: []const u8, a: std.mem.Allocator) anyerror!?[]u8 {
+        _ = ctx;
+        if (util_json.extractStringField(raw, "reasoning_content")) |r| {
+            if (r.len > 0) return try a.dupe(u8, r);
+        }
+        return null;
+    }
+
+    const dialect = Dialect{
+        .ctx = undefined,
+        .serializeThinkingFn = serializeThinking,
+        .extractThinkingDeltaFn = extractThinkingDelta,
+        .serializeToolChoiceFn = openaiSerializeToolChoice,
+        .serializeResponseFormatFn = openaiSerializeResponseFormat,
+        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
+        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
+    };
+};
+
+// ── Kimi K2.6(thinking:{type,keep,effort} body)───────────────────────────────
 const Kimi = struct {
     fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
         _ = ctx;
         _ = p;
-        // Kimi K3:thinking:{type,keep,effort} 在 body。effort 3 档(low/high/max)。
+        // Kimi K2.6:thinking:{type,keep,effort} 在 body。effort 3 档(low/high/max)。
+        // K3 用顶层 reasoning_effort(见 KimiK3 dialect),这里只是 K2.6 及更早。
         const enable = if (effort) |e| e.active() else true;
         try out.appendSlice(a, ",\"thinking\":{\"type\":");
         try util_json.serializeString(if (enable) "enabled" else "disabled", out, a);
@@ -266,13 +294,18 @@ const DeepSeek = struct {
     fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
         _ = ctx;
         _ = p;
-        // DeepSeek:thinking:{type} + reasoning_effort 顶层(两独立参数)。effort 1 档(high)。
+        // DeepSeek V4:thinking:{type} + reasoning_effort 顶层(两独立参数)。
+        // effort 2 档(high/max),V4 文档明确 xhigh→max(此前误为 high)。
+        // 来源:api-docs.deepseek.com/guides/thinking_mode(2026-08 KnowForge 调研)。
         const enable = if (effort) |e| e.active() else true;
         try out.appendSlice(a, ",\"thinking\":{\"type\":");
         try util_json.serializeString(if (enable) "enabled" else "disabled", out, a);
         try out.append(a, '}');
-        if (enable and model_adapter.deepseekEffortMap(effort.?) != null) {
-            try out.appendSlice(a, ",\"reasoning_effort\":\"high\"");
+        if (enable) {
+            if (model_adapter.deepseekEffortMap(effort.?)) |mapped| {
+                try out.appendSlice(a, ",\"reasoning_effort\":");
+                try util_json.serializeString(mapped, out, a);
+            }
         }
     }
 
@@ -356,6 +389,10 @@ pub fn openaiDialectFor(model: []const u8) Dialect {
     if (model_adapter.hasSubstr(model, "glm-5") or model_adapter.hasSubstr(model, "glm4") or model_adapter.hasSubstr(model, "glm-4")) {
         return Glm.dialect.withCtx(statelessCtx());
     }
+    // Kimi K3 必须在 K2.6 前匹配(更具体的子串)
+    if (model_adapter.hasSubstr(model, "kimi-k3") or model_adapter.hasSubstr(model, "kimi_k3")) {
+        return KimiK3.dialect.withCtx(statelessCtx());
+    }
     if (model_adapter.hasSubstr(model, "kimi") or model_adapter.hasSubstr(model, "k2") or model_adapter.hasSubstr(model, "moonshot")) {
         return Kimi.dialect.withCtx(statelessCtx());
     }
@@ -377,7 +414,7 @@ pub fn openaiDialectFor(model: []const u8) Dialect {
 
 // ── 测试 ─────────────────────────────────────────────────────────────────────
 
-test "openaiDialectFor: GLM-5 返 Glm dialect" {
+test "openaiDialectFor: GLM-5.2 返 Glm dialect(thinking+clear_thinking+reasoning_effort 顶层)" {
     const d = openaiDialectFor("glm-5.2");
     const a = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
@@ -385,9 +422,52 @@ test "openaiDialectFor: GLM-5 返 Glm dialect" {
     try d.serializeThinking(.{}, .high, &out, a);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking\":{\"type\":\"enabled\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "clear_thinking") != null);
+    // 顶层 reasoning_effort 透传 effort.name()(7 档),GLM-5.2+ 服务端自己做映射
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning_effort\":\"high\"") != null);
 }
 
-test "openaiDialectFor: Kimi K3 返 Kimi dialect" {
+test "openaiDialectFor: GLM-5.2 effort=xhigh 透传 xhigh(非 7→2 映射)" {
+    const d = openaiDialectFor("glm-5.2");
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try d.serializeThinking(.{}, .xhigh, &out, a);
+    // 透传 xhigh(服务端映射 xhigh→max);旧实现是发 "max",新实现发 "xhigh" 让服务端映射
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning_effort\":\"xhigh\"") != null);
+}
+
+test "openaiDialectFor: GLM-5.2 effort=null 不发 reasoning_effort(用服务端默认 max)" {
+    const d = openaiDialectFor("glm-5.2");
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try d.serializeThinking(.{}, null, &out, a);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking\":{\"type\":\"enabled\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "reasoning_effort") == null);
+}
+
+test "openaiDialectFor: Kimi K3 返 KimiK3 dialect(顶层 reasoning_effort,不发 thinking body)" {
+    const d = openaiDialectFor("kimi-k3");
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try d.serializeThinking(.{}, .high, &out, a);
+    // K3:顶层 reasoning_effort,不发 thinking:{} body(那是 K2.6)
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning_effort\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"keep\":\"all\"") == null);
+}
+
+test "openaiDialectFor: Kimi K3 effort=null 走默认 max" {
+    const d = openaiDialectFor("kimi-k3");
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try d.serializeThinking(.{}, null, &out, a);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning_effort\":\"max\"") != null);
+}
+
+test "openaiDialectFor: Kimi K2.6 返 Kimi dialect(thinking:{type,keep,effort} body)" {
     const d = openaiDialectFor("kimi-k2");
     const a = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
@@ -397,13 +477,18 @@ test "openaiDialectFor: Kimi K3 返 Kimi dialect" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"effort\":\"high\"") != null);
 }
 
-test "openaiDialectFor: DeepSeek 返 DeepSeek dialect" {
+test "openaiDialectFor: DeepSeek V4 返 DeepSeek dialect(thinking+reasoning_effort, xhigh→max)" {
     const d = openaiDialectFor("deepseek-chat");
     const a = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
     try d.serializeThinking(.{}, .high, &out, a);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking\":{\"type\":\"enabled\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning_effort\":\"high\"") != null);
+    // xhigh → max(V4 修正)
+    out.clearRetainingCapacity();
+    try d.serializeThinking(.{}, .xhigh, &out, a);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning_effort\":\"max\"") != null);
 }
 
 test "openaiDialectFor: Qwen3 返 Qwen dialect" {
@@ -426,14 +511,16 @@ test "openaiDialectFor: GPT-4o 返 OpenAI native dialect" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking\":") == null);
 }
 
-test "openaiDialectFor: GLM system 标签注入" {
+test "openaiDialectFor: GLM-5.2 不再注入 system 标签(已改顶层 reasoning_effort)" {
     const d = openaiDialectFor("glm-5.2");
     const a = std.testing.allocator;
     var sys: std.ArrayList(u8) = .empty;
     defer sys.deinit(a);
     try sys.appendSlice(a, "base system");
     try d.injectSystemMods(.{}, .high, &sys, a);
-    try std.testing.expect(std.mem.indexOf(u8, sys.items, "<reasoning_effort> high") != null);
+    // GLM-5.2 改用顶层 reasoning_effort body 字段,不再注入 system 标签
+    try std.testing.expect(std.mem.indexOf(u8, sys.items, "<reasoning_effort>") == null);
+    try std.testing.expectEqualStrings("base system", sys.items);
 }
 
 test "openaiDialectFor: GPT-4o 不注入 system 标签(default no-op)" {

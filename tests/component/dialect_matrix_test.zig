@@ -112,43 +112,87 @@ test "原则1: claude-opus-4 不发 reasoning_effort / prompt_cache_key / parall
 
 // ── 原则 2:方言模型自然启用方言字段(模型支持时启用)───────────────────────────
 
-test "原则2: glm-5.2 reasoning_effort=high → thinking:{type:enabled}(GLM 方言)" {
+test "原则2: glm-5.2 reasoning_effort=high → thinking:{type:enabled} + 顶层 reasoning_effort(GLM 方言)" {
     const a = std.testing.allocator;
     const msgs = [_]types.ApiMessage{
         .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
     };
     const body = try openai.serializeOpenAIRequest(a, "glm-5.2", &msgs, "sys", null, .high, null);
     defer a.free(body);
-    // GLM 方言:thinking:{type:enabled}(非 OpenAI 原生 reasoning_effort)
+    // GLM-5.2 方言:thinking:{type:enabled} + 顶层 reasoning_effort(7 档透传,服务端自映射)
+    // 来源:docs.z.ai/guides/capabilities/thinking(2026-08 KnowForge 调研)。
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"}") != null);
-    // GLM 不该发 OpenAI 原生 reasoning_effort(那是 OpenAINative dialect)
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "clear_thinking") != null); // preserved thinking
+    // 不该发 Kimi K2.6 的 keep 字段
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"keep\":\"all\"") == null);
 }
 
-test "原则2: kimi-k2 reasoning_effort=high → thinking:{type,keep,effort}(K3 方言)" {
-    const a = std.testing.allocator;
-    const msgs = [_]types.ApiMessage{
-        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
-    };
-    const body = try openai.serializeOpenAIRequest(a, "kimi-k2", &msgs, "sys", null, .high, null);
-    defer a.free(body);
-    // K3 方言:thinking:{type:enabled,keep:all,effort:high}
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"enabled\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"keep\":\"all\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"high\"") != null);
-}
-
-test "原则2: deepseek-chat reasoning_effort=high → reasoning_effort + thinking:{type:enabled}(DeepSeek 方言)" {
+test "原则2: deepseek-chat reasoning_effort=high → reasoning_effort + thinking:{type:enabled}(DeepSeek V4 方言)" {
     const a = std.testing.allocator;
     const msgs = [_]types.ApiMessage{
         .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
     };
     const body = try openai.serializeOpenAIRequest(a, "deepseek-chat", &msgs, "sys", null, .high, null);
     defer a.free(body);
-    // DeepSeek 方言:顶层 reasoning_effort + thinking:{type:enabled}(双发)
+    // DeepSeek V4 方言:顶层 reasoning_effort + thinking:{type:enabled}(双发,effort 2 档 high/max)
+    // 来源:api-docs.deepseek.com/guides/thinking_mode(2026-08 KnowForge 调研)。
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"}") != null);
+}
+
+test "原则2: deepseek-chat reasoning_effort=xhigh → reasoning_effort:\"max\"(V4 修正)" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
+    };
+    const body = try openai.serializeOpenAIRequest(a, "deepseek-chat", &msgs, "sys", null, .xhigh, null);
+    defer a.free(body);
+    // DeepSeek V4 文档明确 xhigh → max(此前误为 high,2026-08 KnowForge 调研修正)
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"max\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") == null);
+}
+
+test "原则2: kimi-k3 effort=high → 顶层 reasoning_effort,不发 thinking body(K3 方言)" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
+    };
+    const body = try openai.serializeOpenAIRequest(a, "kimi-k3", &msgs, "sys", null, .high, null);
+    defer a.free(body);
+    // Kimi K3:顶层 reasoning_effort(low/high/max),不发 thinking:{} body(那是 K2.6)
+    // 来源:platform.kimi.ai/docs/guide/kimi-k3-quickstart(2026-08 KnowForge 调研)。
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"keep\":\"all\"") == null);
+}
+
+test "原则2: kimi-k3 effort=null → reasoning_effort:\"max\"(K3 默认 max)" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
+    };
+    const body = try openai.serializeOpenAIRequest(a, "kimi-k3", &msgs, "sys", null, null, null);
+    defer a.free(body);
+    // K3 默认 max(不能关 thinking)
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"max\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":") == null);
+}
+
+test "原则2: kimi-k2 effort=high → thinking:{type,keep,effort}(K2.6 方言,与 K3 区分)" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
+    };
+    const body = try openai.serializeOpenAIRequest(a, "kimi-k2", &msgs, "sys", null, .high, null);
+    defer a.free(body);
+    // K2.6:thinking:{type,keep,effort} body(不是 K3 的顶层 reasoning_effort)
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"enabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"keep\":\"all\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"high\"") != null);
+    // K2.6 不该发顶层 reasoning_effort(那是 K3 的)
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":") == null);
 }
 
 test "原则2: gemini-2.5-pro reasoning_effort=high → thinking_level high(Gemini 方言)" {
@@ -251,7 +295,7 @@ test "无副作用: GLM-5 response_format=json_schema 降级为 json_object(能�
     try std.testing.expect(std.mem.indexOf(u8, out.items, "json_schema") == null);
 }
 
-test "无副作用: gemini reasoning_effort=null 不发 generation_config(自适应)" {
+test "无副作用: gemini 2.5 reasoning_effort=null 不发 generation_config(可关)" {
     const a = std.testing.allocator;
     const msgs = [_]types.ApiMessage{
         .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
@@ -260,6 +304,17 @@ test "无副作用: gemini reasoning_effort=null 不发 generation_config(自适
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "generation_config") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "thinking_level") == null);
+}
+
+test "无副作用: gemini 3.1 Pro reasoning_effort=null 仍发 thinking_level low(不能关)" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
+    };
+    const body = try gemini.serializeGeminiRequest(a, &msgs, "sys", null, null, "gemini-3.1-pro", null, null);
+    defer a.free(body);
+    // 3.x 不能关,effort=null 仍发 thinking_level=low
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking_level\":\"low\"") != null);
 }
 
 // ── 原则 3:dialectFor + profileFor 一致性(同 model 选同 dialect)──────────────────
@@ -271,22 +326,24 @@ test "一致性: dialectFor 与 profileFor 对同 model 选同方言(6 个 OpenA
     inline for ([_]struct { model: []const u8, kind: adapter.ProviderKind }{
         .{ .model = "gpt-4o", .kind = .openai },
         .{ .model = "glm-5.2", .kind = .openai },
+        .{ .model = "kimi-k3", .kind = .openai },
         .{ .model = "kimi-k2", .kind = .openai },
         .{ .model = "deepseek-chat", .kind = .openai },
         .{ .model = "qwen3-235b-a22b", .kind = .openai },
         .{ .model = "mistral-large-2411", .kind = .openai },
         .{ .model = "claude-opus-4", .kind = .anthropic },
         .{ .model = "gemini-2.5-pro", .kind = .gemini },
+        .{ .model = "gemini-3.1-pro", .kind = .gemini },
     }) |entry| {
         const profile = adapter.profileFor(entry.kind, entry.model);
         const dialect = dialect_mod.dialectFor(entry.kind, entry.model);
-        // dialect.profileFor 必须与 adapter.profileFor 一致(同方言选择)
         const dialect_profile = dialect.profileFor(entry.kind, entry.model);
         try std.testing.expectEqual(profile.thinking_mode, dialect_profile.thinking_mode);
         try std.testing.expectEqual(profile.tool_choice_support, dialect_profile.tool_choice_support);
         try std.testing.expectEqual(profile.response_format_support, dialect_profile.response_format_support);
         try std.testing.expectEqual(profile.supports_prompt_cache_key, dialect_profile.supports_prompt_cache_key);
         try std.testing.expectEqual(profile.supports_parallel_tool_calls, dialect_profile.supports_parallel_tool_calls);
+        try std.testing.expectEqual(profile.cannot_disable_thinking, dialect_profile.cannot_disable_thinking);
     }
 }
 
@@ -305,23 +362,33 @@ test "交叉矩阵: 各模型 reasoning_effort=high 的 thinking 字段输出差
         defer a.free(body);
         try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":") == null);
-        try std.testing.expect(std.mem.indexOf(u8, body, "\"keep\":\"all\"") == null); // K3 字段不泄漏
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"keep\":\"all\"") == null); // K2.6 字段不泄漏
         try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\"") == null); // Qwen 字段不泄漏
     }
-    // glm-5.2:只 thinking:{type:enabled},无 reasoning_effort,无 keep,无 enable_thinking
+    // glm-5.2:thinking:{type:enabled} + 顶层 reasoning_effort(双发),无 keep,无 enable_thinking
     {
         const body = try openai.serializeOpenAIRequest(a, "glm-5.2", &msgs, "sys", null, .high, null);
         defer a.free(body);
         try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"}") != null);
-        try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, body, "\"keep\":\"all\"") == null);
         try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\"") == null);
     }
-    // kimi-k2:thinking:{type,keep,effort},无 enable_thinking
+    // kimi-k3:顶层 reasoning_effort,不发 thinking:{} body,无 keep,无 enable_thinking
+    {
+        const body = try openai.serializeOpenAIRequest(a, "kimi-k3", &msgs, "sys", null, .high, null);
+        defer a.free(body);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"keep\":\"all\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\"") == null);
+    }
+    // kimi-k2 (K2.6):thinking:{type,keep,effort} body,无顶层 reasoning_effort,无 enable_thinking
     {
         const body = try openai.serializeOpenAIRequest(a, "kimi-k2", &msgs, "sys", null, .high, null);
         defer a.free(body);
         try std.testing.expect(std.mem.indexOf(u8, body, "\"keep\":\"all\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":") == null); // K3 字段不泄漏到 K2.6
         try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\"") == null);
     }
     // deepseek-chat:reasoning_effort + thinking:{type:enabled}(双发),无 keep,无 enable_thinking

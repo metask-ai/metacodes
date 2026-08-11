@@ -12,6 +12,7 @@ const dialect_mod = @import("../dialect.zig");
 
 const Dialect = dialect_mod.Dialect;
 const ModelProfile = model_adapter.ModelProfile;
+const profileFor = model_adapter.profileFor;
 const ReasoningEffort = types.ReasoningEffort;
 const ToolChoice = dialect_mod.ToolChoice;
 const ResponseFormatRequest = dialect_mod.ResponseFormatRequest;
@@ -22,8 +23,18 @@ fn statelessCtx() *anyopaque {
     return @ptrCast(&stateless);
 }
 
-/// effort → Gemini thinking_level 映射。Gemini 只 2 档(low/high)。
-fn geminiThinkingLevel(effort: ReasoningEffort) ?[]const u8 {
+/// effort → Gemini thinking_level 映射。Gemini 2.5 4 档(minimal/low/medium/high),
+/// Gemini 3.x 不能关 thinking(none/minimal → low)。
+fn geminiThinkingLevel(p: ModelProfile, effort: ReasoningEffort) ?[]const u8 {
+    if (p.cannot_disable_thinking) {
+        // Gemini 3.x:none/minimal → low(不能关);low → low;medium → medium;high/xhigh → high。
+        return switch (effort) {
+            .none, .minimal, .low => "low",
+            .medium => "medium",
+            .high, .xhigh => "high",
+        };
+    }
+    // Gemini 2.5:none/minimal → 不发(可关);low → low;medium/high/xhigh → high。
     if (!effort.active()) return null;
     return switch (effort) {
         .minimal, .low => "low",
@@ -35,16 +46,21 @@ fn geminiThinkingLevel(effort: ReasoningEffort) ?[]const u8 {
 const Gemini = struct {
     fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
         _ = ctx;
-        _ = p;
         // Gemini:generation_config.thinking_level(低/高)。输出 **片段**(不带外层包裹),
         // 由 serializeGeminiRequest 的 gen_cfg 合并逻辑收进 generation_config。
         // **逗号策略**:与 serializeResponseFormat 一致——若 out 非空(已有片段)则加前导逗号。
         // 这让两个片段函数调用顺序无关(gen_cfg 收集器不需关心谁先调)。
-        if (effort) |e| if (geminiThinkingLevel(e)) |level| {
+        // Gemini 3.x 不能关 thinking:effort=null 时也发 "low"(默认)。
+        if (effort) |e| if (geminiThinkingLevel(p, e)) |level| {
             if (out.items.len > 0) try out.appendSlice(a, ",");
             try out.appendSlice(a, "\"thinking_level\":");
             try util_json.serializeString(level, out, a);
         };
+        // effort=null 且 cannot_disable_thinking → 发 low(3.x 默认就开)
+        if (effort == null and p.cannot_disable_thinking) {
+            if (out.items.len > 0) try out.appendSlice(a, ",");
+            try out.appendSlice(a, "\"thinking_level\":\"low\"");
+        }
     }
 
     /// Gemini:tool_choice → tool_config.function_calling_config.mode + allowed_function_names。
@@ -127,12 +143,65 @@ test "geminiDialectFor: effort=low 发 thinking_level low" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking_level\":\"low\"") != null);
 }
 
-test "geminiDialectFor: effort=null 不发 thinking_level" {
+test "geminiDialectFor: 2.5 effort=null 不发 thinking_level(可关)" {
     const d = geminiDialectFor("gemini-2.5-pro");
     const a = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
     try d.serializeThinking(.{}, null, &out, a);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "geminiDialectFor: 3.1 Pro effort=null 仍发 thinking_level low(不能关)" {
+    const d = geminiDialectFor("gemini-3.1-pro");
+    const p = profileFor(.gemini, "gemini-3.1-pro");
+    try std.testing.expect(p.cannot_disable_thinking);
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try d.serializeThinking(p, null, &out, a);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking_level\":\"low\"") != null);
+}
+
+test "geminiDialectFor: 3.1 Pro effort=none 仍发 low(不能关,降级到默认)" {
+    const d = geminiDialectFor("gemini-3.1-pro");
+    const p = profileFor(.gemini, "gemini-3.1-pro");
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try d.serializeThinking(p, .none, &out, a);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking_level\":\"low\"") != null);
+}
+
+test "geminiDialectFor: 3.1 Pro effort=minimal 降级 low(3.1 Pro 把 minimal→low,不保留 minimal)" {
+    const d = geminiDialectFor("gemini-3.1-pro");
+    const p = profileFor(.gemini, "gemini-3.1-pro");
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try d.serializeThinking(p, .minimal, &out, a);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking_level\":\"low\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "minimal") == null);
+}
+
+test "geminiDialectFor: 3.1 Pro effort=high 仍发 high" {
+    const d = geminiDialectFor("gemini-3.1-pro");
+    const p = profileFor(.gemini, "gemini-3.1-pro");
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try d.serializeThinking(p, .high, &out, a);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking_level\":\"high\"") != null);
+}
+
+test "geminiDialectFor: 2.5 effort=none 不发(可关,与 3.x 区别)" {
+    const d = geminiDialectFor("gemini-2.5-pro");
+    const p = profileFor(.gemini, "gemini-2.5-pro");
+    try std.testing.expect(!p.cannot_disable_thinking);
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try d.serializeThinking(p, .none, &out, a);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 

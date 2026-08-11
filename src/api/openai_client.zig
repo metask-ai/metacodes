@@ -767,19 +767,46 @@ test "extractDeltaReasoning: 缺失字段返回 null" {
     try std.testing.expect(extractDeltaReasoning(chunk) == null);
 }
 
-test "serializeOpenAIRequest: GLM-5 effort=high 走 <reasoning_effort> system 标签" {
+test "serializeOpenAIRequest: GLM-5.2 effort=high 走顶层 reasoning_effort body(非 system 标签)" {
     const a = std.testing.allocator;
     const msgs = [_]types.ApiMessage{
         .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
     };
     const body = try serializeOpenAIRequest(a, "glm-5.2", &msgs, "sys", null, .high, null);
     defer a.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "<reasoning_effort> high") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") == null);
+    // GLM-5.2:顶层 reasoning_effort body + thinking:{type:enabled};不再注入 system 标签。
+    // 来源:docs.z.ai/guides/capabilities/thinking(2026-08 KnowForge 调研)。
+    try std.testing.expect(std.mem.indexOf(u8, body, "<reasoning_effort>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "clear_thinking") != null);
 }
 
-test "serializeOpenAIRequest: Kimi K3 effort=high 走 extra_body thinking" {
+test "serializeOpenAIRequest: Kimi K3 effort=high 走顶层 reasoning_effort(不发 thinking body)" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const body = try serializeOpenAIRequest(a, "kimi-k3", &msgs, "sys", null, .high, null);
+    defer a.free(body);
+    // K3:顶层 reasoning_effort,不发 thinking:{} body(那是 K2.6)。
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"keep\":\"all\"") == null);
+}
+
+test "serializeOpenAIRequest: Kimi K3 effort=null 默认 max" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const body = try serializeOpenAIRequest(a, "kimi-k3", &msgs, "sys", null, null, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"max\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":") == null);
+}
+
+test "serializeOpenAIRequest: Kimi K2.6 effort=high 走 extra_body thinking" {
     const a = std.testing.allocator;
     const msgs = [_]types.ApiMessage{
         .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
@@ -789,6 +816,8 @@ test "serializeOpenAIRequest: Kimi K3 effort=high 走 extra_body thinking" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"keep\":\"all\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"high\"") != null);
+    // K2.6 不发顶层 reasoning_effort(那是 K3 的)
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":") == null);
 }
 
 test "serializeOpenAIRequest: DeepSeek effort=high 走顶层 reasoning_effort" {
@@ -800,6 +829,18 @@ test "serializeOpenAIRequest: DeepSeek effort=high 走顶层 reasoning_effort" {
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"}") != null);
+}
+
+test "serializeOpenAIRequest: DeepSeek effort=xhigh → reasoning_effort=max(V4 修正)" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const body = try serializeOpenAIRequest(a, "deepseek-chat", &msgs, "sys", null, .xhigh, null);
+    defer a.free(body);
+    // V4 文档明确 xhigh → max(此前误为 high,2026-08 KnowForge 调研修正)
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"max\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") == null);
 }
 
 // ── M3:tool_choice 端到端字节断言(声明=接线=测试 DoD)───────────────────────────

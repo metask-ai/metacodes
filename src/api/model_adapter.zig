@@ -38,6 +38,9 @@ pub const ThinkingMode = enum {
     openai_effort,
     /// Gemini:thinking_level in generation_config
     gemini_level,
+    /// Kimi K3:顶层 reasoning_effort(low/high/max 默认 max),不发 thinking body,
+    /// 必须 省略 temperature/top_p/n 等参数。K3 总是开 thinking(不能关)。
+    kimi_k3_top_level,
 };
 
 /// 工具调用 wire 格式
@@ -56,8 +59,10 @@ pub const EffortLevels = enum {
     glm_7to2,
     /// Kimi K3:3 档(low/high/max)
     kimi_3,
-    /// DeepSeek:1 档(仅 high)
-    deepseek_1,
+    /// Kimi K2.6:thinking:{type,keep,effort} body,effort 3 档(同 kimi_3 但走 body 而非顶层)
+    kimi_k2_3,
+    /// DeepSeek:2 档(high/max)— V4 文档明确 xhigh→max(此前误为 high)
+    deepseek_2,
     /// 不支持 effort
     none_,
 };
@@ -104,6 +109,9 @@ pub const ModelProfile = struct {
     supports_parallel_tool_calls: bool = false,
     /// 支持 reasoning_content 响应字段(DeepSeek/Kimi/Qwen/GLM;Claude 用 thinking block;OpenAI 不暴露)
     returns_reasoning_content: bool = false,
+    /// 不能关 thinking(Kimi K3 总是开;Gemini 3.x 系列不能关)。
+    /// 若 effort=null 或 .none/.minimal,dialect 仍要发"最低档"而非不发。
+    cannot_disable_thinking: bool = false,
 };
 
 /// provider kind(与 capability.zig 对齐,但本模块独立持有以解耦)
@@ -153,21 +161,32 @@ fn openaiProfile(model: []const u8) ModelProfile {
             .preserved_thinking_default = false,
         };
     }
-    // Kimi K3
+    // Kimi K3(总是开 thinking,顶层 reasoning_effort,不发 thinking body,省略 temp/top_p/n)
+    if (hasSubstr(model, "kimi-k3") or hasSubstr(model, "kimi_k3")) {
+        return .{
+            .thinking_mode = .kimi_k3_top_level,
+            .effort_levels = .kimi_3,
+            .supports_prompt_cache_key = true,
+            .returns_reasoning_content = true,
+            .cannot_disable_thinking = true, // K3 总是开 thinking
+            // preserved_thinking 默认 null(K3 文档未提 keep 字段,只 K2.6 用)
+        };
+    }
+    // Kimi K2.6 及更早(thinking:{type,keep,effort} body,effort 3 档)
     if (hasSubstr(model, "kimi") or hasSubstr(model, "k2") or hasSubstr(model, "moonshot")) {
         return .{
             .thinking_mode = .kimi_extra_body,
-            .effort_levels = .kimi_3,
+            .effort_levels = .kimi_k2_3,
             .supports_prompt_cache_key = true,
             .returns_reasoning_content = true,
             .preserved_thinking_default = false, // keep="all" 等价
         };
     }
-    // DeepSeek
+    // DeepSeek V4(thinking:{type} + reasoning_effort 顶层;V4 xhigh→max,V3 仅 high)
     if (hasSubstr(model, "deepseek")) {
         return .{
             .thinking_mode = .deepseek_top,
-            .effort_levels = .deepseek_1,
+            .effort_levels = .deepseek_2,
             .returns_reasoning_content = true,
         };
     }
@@ -197,25 +216,19 @@ fn openaiProfile(model: []const u8) ModelProfile {
 }
 
 fn geminiProfile(model: []const u8) ModelProfile {
-    _ = model;
+    // Gemini 3.x 系列(3.1 Pro / 3.1 Flash-Lite / 3 Flash)不能关 thinking:
+    // 默认就是 low,effort=null/none/minimal 应映射为 low(不是不发)。
+    // 来源:ai.google.dev/gemini-api/docs/openai(2026-08 KnowForge 调研)。
+    const cannot_disable = hasSubstr(model, "gemini-3");
     return .{
         .thinking_mode = .gemini_level,
         .effort_levels = .none_, // Gemini 用 thinking_level(minimal/low/medium/high),非 effort
         .returns_reasoning_content = false, // Gemini 用 thought_summary + signature,非平级字段
+        .cannot_disable_thinking = cannot_disable,
     };
 }
 
-/// GLM-5 的 effort 7→2 映射:none/minimal → 跳过;low/medium → high;high → high;xhigh/max → max。
-/// 返回 null 表示"跳过 thinking"(对应 none/minimal)。
-pub fn glmEffortMap(effort: @import("../types.zig").ReasoningEffort) ?[]const u8 {
-    return switch (effort) {
-        .none, .minimal => null, // 跳过
-        .low, .medium, .high => "high",
-        .xhigh => "max",
-    };
-}
-
-/// Kimi K3 的 effort 映射:3 档(low/high/max)。
+/// Kimi K2.6 的 effort 映射:3 档(low/high/max)。
 pub fn kimiEffortMap(effort: @import("../types.zig").ReasoningEffort) ?[]const u8 {
     return switch (effort) {
         .none, .minimal => null, // 跳过
@@ -225,11 +238,25 @@ pub fn kimiEffortMap(effort: @import("../types.zig").ReasoningEffort) ?[]const u
     };
 }
 
-/// DeepSeek 的 effort 映射:1 档(仅 high)。
+/// Kimi K3 的 effort 映射:3 档(low/high/max,默认 max)。
+/// K3 总是开 thinking,effort=null 走默认 "max"(由调用方处理 null,本函数只接非 null)。
+pub fn kimiK3EffortMap(effort: @import("../types.zig").ReasoningEffort) []const u8 {
+    return switch (effort) {
+        .none, .minimal => "max", // K3 不能关,降级到默认 max
+        .low => "low",
+        .medium, .high => "high",
+        .xhigh => "max",
+    };
+}
+
+/// DeepSeek 的 effort 映射:2 档(high/max)。
+/// V4 文档明确 xhigh → max(此前误为 high,2026-08 KnowForge 调研修正)。
+/// 来源:api-docs.deepseek.com/guides/thinking_mode。
 pub fn deepseekEffortMap(effort: @import("../types.zig").ReasoningEffort) ?[]const u8 {
     return switch (effort) {
         .none, .minimal => null, // 跳过
-        .low, .medium, .high, .xhigh => "high",
+        .low, .medium, .high => "high",
+        .xhigh => "max",
     };
 }
 
@@ -259,19 +286,41 @@ test "profileFor: GLM-5.2" {
     try std.testing.expect(p.returns_reasoning_content);
 }
 
-test "profileFor: Kimi K3" {
-    const p = profileFor(.openai, "kimi-k2");
-    try std.testing.expect(p.thinking_mode == .kimi_extra_body);
+test "profileFor: Kimi K3(顶层 reasoning_effort,不能关)" {
+    const p = profileFor(.openai, "kimi-k3");
+    try std.testing.expect(p.thinking_mode == .kimi_k3_top_level);
     try std.testing.expect(p.effort_levels == .kimi_3);
     try std.testing.expect(p.supports_prompt_cache_key);
     try std.testing.expect(p.returns_reasoning_content);
+    try std.testing.expect(p.cannot_disable_thinking);
 }
 
-test "profileFor: DeepSeek" {
+test "profileFor: Kimi K2.6(thinking body,effort 3 档)" {
+    const p = profileFor(.openai, "kimi-k2");
+    try std.testing.expect(p.thinking_mode == .kimi_extra_body);
+    try std.testing.expect(p.effort_levels == .kimi_k2_3);
+    try std.testing.expect(p.supports_prompt_cache_key);
+    try std.testing.expect(p.returns_reasoning_content);
+    try std.testing.expect(!p.cannot_disable_thinking);
+}
+
+test "profileFor: DeepSeek V4" {
     const p = profileFor(.openai, "deepseek-chat");
     try std.testing.expect(p.thinking_mode == .deepseek_top);
-    try std.testing.expect(p.effort_levels == .deepseek_1);
+    try std.testing.expect(p.effort_levels == .deepseek_2);
     try std.testing.expect(p.returns_reasoning_content);
+}
+
+test "profileFor: Gemini 2.5(可关 thinking)" {
+    const p = profileFor(.gemini, "gemini-2.5-pro");
+    try std.testing.expect(p.thinking_mode == .gemini_level);
+    try std.testing.expect(!p.cannot_disable_thinking);
+}
+
+test "profileFor: Gemini 3.1 Pro(不能关 thinking)" {
+    const p = profileFor(.gemini, "gemini-3.1-pro");
+    try std.testing.expect(p.thinking_mode == .gemini_level);
+    try std.testing.expect(p.cannot_disable_thinking);
 }
 
 test "profileFor: Qwen3" {
@@ -299,25 +348,29 @@ test "profileFor: Gemini" {
     try std.testing.expect(p.thinking_mode == .gemini_level);
 }
 
-test "glmEffortMap 7→2" {
-    try std.testing.expect(glmEffortMap(.none) == null);
-    try std.testing.expect(glmEffortMap(.minimal) == null);
-    try std.testing.expectEqualStrings("high", glmEffortMap(.low).?);
-    try std.testing.expectEqualStrings("high", glmEffortMap(.medium).?);
-    try std.testing.expectEqualStrings("high", glmEffortMap(.high).?);
-    try std.testing.expectEqualStrings("max", glmEffortMap(.xhigh).?);
-}
-
-test "kimiEffortMap 3 档" {
+test "kimiEffortMap 3 档(K2.6)" {
     try std.testing.expect(kimiEffortMap(.none) == null);
     try std.testing.expectEqualStrings("low", kimiEffortMap(.low).?);
     try std.testing.expectEqualStrings("high", kimiEffortMap(.high).?);
     try std.testing.expectEqualStrings("max", kimiEffortMap(.xhigh).?);
 }
 
-test "deepseekEffortMap 1 档" {
+test "kimiK3EffortMap 3 档(K3,不能关)" {
+    // K3 不能关 thinking,none/minimal 降级到默认 max
+    try std.testing.expectEqualStrings("max", kimiK3EffortMap(.none));
+    try std.testing.expectEqualStrings("max", kimiK3EffortMap(.minimal));
+    try std.testing.expectEqualStrings("low", kimiK3EffortMap(.low));
+    try std.testing.expectEqualStrings("high", kimiK3EffortMap(.high));
+    try std.testing.expectEqualStrings("max", kimiK3EffortMap(.xhigh));
+}
+
+test "deepseekEffortMap 2 档(V4 xhigh→max)" {
     try std.testing.expect(deepseekEffortMap(.none) == null);
+    try std.testing.expect(deepseekEffortMap(.minimal) == null);
+    try std.testing.expectEqualStrings("high", deepseekEffortMap(.low).?);
+    try std.testing.expectEqualStrings("high", deepseekEffortMap(.medium).?);
     try std.testing.expectEqualStrings("high", deepseekEffortMap(.high).?);
+    try std.testing.expectEqualStrings("max", deepseekEffortMap(.xhigh).?);
 }
 
 test "profileFor: other 保守默认" {
