@@ -73,4 +73,5 @@ test {
     _ = @import("component/swarm_security_test.zig");
     _ = @import("component/swarm_process_test.zig");
     _ = @import("component/add_dir_test.zig");
+    _ = @import("component/dialect_matrix_test.zig");
 }
