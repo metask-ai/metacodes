@@ -139,6 +139,7 @@ pub const CallFailure = union(enum) {
     child_exit,
     cancelled,
     indeterminate,
+    instance_unavailable,
     resource_limit,
     out_of_memory,
 };

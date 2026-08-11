@@ -18,7 +18,16 @@ pub const Selector = struct {
     expected_schema_fingerprint: ?[32]u8 = null,
 };
 
-pub const BuildMode = enum { fresh, restore_degraded };
+pub const BuildMode = enum {
+    /// Explicit Host selection update: every selector must resolve and be
+    /// fresh, otherwise the update is rejected atomically.
+    fresh,
+    /// Checkpoint restore: unavailable historical authority is invalidated.
+    restore_degraded,
+    /// Run admission: unavailable MCP tools shrink this Run's tool surface;
+    /// they must never prevent the Conversation itself from running.
+    run_tolerant,
+};
 
 pub const Error = error{
     OutOfMemory,
@@ -56,6 +65,116 @@ pub const Entry = struct {
             "{s}__{s}",
             .{ self.server.namespace, self.tool.identity.name },
         ) catch error.OutOfMemory;
+    }
+};
+
+/// Durable Session MCP authority. This owns only copied values; it never
+/// retains a Runtime catalog generation or a live ServerInstance. A Run uses
+/// `materialize` to resolve these selectors against the then-current catalog.
+pub const Selection = struct {
+    allocator: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    selectors: []Selector,
+    entries: []SelectedEntry,
+    catalog_generation: u64,
+    catalog_fingerprint: [32]u8,
+    selection_fingerprint: [32]u8,
+    invalidated: u32,
+
+    pub const SelectedEntry = struct {
+        server_binding_identity: [32]u8,
+        schema_fingerprint: [32]u8,
+        tool_name: []const u8,
+        model_name: []const u8,
+        namespace: []const u8,
+        era: canonical.Era,
+
+        pub fn permissionIdentity(self: SelectedEntry) session_permission.ToolIdentity {
+            const identity = canonical.ToolIdentity{
+                .server_binding_identity = self.server_binding_identity,
+                .name = self.tool_name,
+                .schema_fingerprint = self.schema_fingerprint,
+            };
+            return .{
+                .namespace = .mcp,
+                .name = self.tool_name,
+                .binding = identity.permissionBinding(),
+            };
+        }
+    };
+
+    pub fn init(
+        backing: std.mem.Allocator,
+        source: *catalog.Snapshot,
+        selectors: []const Selector,
+        mode: BuildMode,
+    ) Error!Selection {
+        var view = try View.init(backing, source, selectors, mode);
+        defer view.deinit();
+        return fromView(backing, &view);
+    }
+
+    pub fn fromView(backing: std.mem.Allocator, view: *const View) Error!Selection {
+        var arena = std.heap.ArenaAllocator.init(backing);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const selectors = a.alloc(Selector, view.entries.len) catch
+            return error.OutOfMemory;
+        const entries = a.alloc(SelectedEntry, view.entries.len) catch
+            return error.OutOfMemory;
+        for (view.entries, selectors, entries) |entry, *selector, *selected| {
+            const tool_name = a.dupe(u8, entry.tool.identity.name) catch
+                return error.OutOfMemory;
+            selector.* = .{
+                .server_binding_identity = entry.tool.identity.server_binding_identity,
+                .tool_name = tool_name,
+                .expected_schema_fingerprint = entry.tool.identity.schema_fingerprint,
+            };
+            selected.* = .{
+                .server_binding_identity = entry.tool.identity.server_binding_identity,
+                .schema_fingerprint = entry.tool.identity.schema_fingerprint,
+                .tool_name = tool_name,
+                .model_name = a.dupe(u8, entry.model_name) catch
+                    return error.OutOfMemory,
+                .namespace = a.dupe(u8, entry.server.namespace) catch
+                    return error.OutOfMemory,
+                .era = entry.server.era,
+            };
+        }
+        return .{
+            .allocator = backing,
+            .arena = arena,
+            .selectors = selectors,
+            .entries = entries,
+            .catalog_generation = view.catalog_generation,
+            .catalog_fingerprint = view.catalog_fingerprint,
+            .selection_fingerprint = view.selection_fingerprint,
+            .invalidated = view.invalidated,
+        };
+    }
+
+    pub fn deinit(self: *Selection) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn materialize(
+        self: *const Selection,
+        backing: std.mem.Allocator,
+        source: *catalog.Snapshot,
+    ) Error!View {
+        return View.init(backing, source, self.selectors, .run_tolerant);
+    }
+
+    pub fn findCanonicalTool(
+        self: *const Selection,
+        binding: *const [32]u8,
+        name: []const u8,
+    ) ?*const SelectedEntry {
+        for (self.entries) |*entry|
+            if (std.mem.eql(u8, &entry.server_binding_identity, binding) and
+                std.mem.eql(u8, entry.tool_name, name)) return entry;
+        return null;
     }
 };
 
@@ -137,7 +256,7 @@ pub const View = struct {
             entries.append(a, .{
                 .server = resolved.server,
                 .admitted = resolved.admitted,
-                .tool = resolved.admitted.canonical,
+                .tool = &resolved.admitted.canonical,
                 .model_name = model_name,
                 .prepared = prepared,
             }) catch {
@@ -378,7 +497,18 @@ pub const Environment = struct {
             .ctx = if (tool_ctx.abort) |abort| abort else null,
             .is_cancelled_fn = abortAdapter,
         };
-        var outcome = entry.server.client.callTool(
+        var instance = self.view.snapshot.retainInstance(
+            entry.server.instance_id,
+        ) catch |err| return .{ .host_failed = try encodeFailure(
+            tool_ctx.allocator,
+            switch (err) {
+                error.InstanceUnavailable => .instance_unavailable,
+                error.ResourceLimit => .resource_limit,
+                error.OutOfMemory => .out_of_memory,
+            },
+        ) };
+        defer instance.deinit();
+        var outcome = instance.client().callTool(
             tool_ctx.allocator,
             entry.tool,
             arguments_json,
@@ -868,6 +998,8 @@ test "MCP expiry excludes new Runs without mutating an admitted Run environment"
     }};
     var view = try View.init(std.testing.allocator, snapshot, &selectors, .fresh);
     defer view.deinit();
+    var selection = try Selection.fromView(std.testing.allocator, &view);
+    defer selection.deinit();
     const model_name = view.entries[0].model_name;
     var admitted = try Environment.init(
         std.testing.allocator,
@@ -903,6 +1035,79 @@ test "MCP expiry excludes new Runs without mutating an admitted Run environment"
     defer degraded.deinit();
     try std.testing.expectEqual(@as(usize, 0), degraded.entries.len);
     try std.testing.expectEqual(@as(u32, 1), degraded.invalidated);
+    var admitted_after_expiry = try selection.materialize(
+        std.testing.allocator,
+        snapshot,
+    );
+    defer admitted_after_expiry.deinit();
+    try std.testing.expectEqual(@as(usize, 0), admitted_after_expiry.entries.len);
+    try std.testing.expectEqual(@as(u32, 1), admitted_after_expiry.invalidated);
+}
+
+test "Run materialization tolerates a selected server removed by Apply" {
+    const fixture = @import("mcp_test_support.zig");
+    var server = fixture.Server{};
+    const binding = [_]u8{0x73} ** 32;
+    const specs = [_]catalog.ServerSpec{.{
+        .binding = binding,
+        .namespace = "weather",
+        .connector = server.connector(),
+        .transport = .stdio,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    }};
+    var manager = try catalog.Manager.init(std.testing.allocator, &specs, .{});
+    defer manager.deinit();
+    _ = try manager.refresh();
+    const first_snapshot = try manager.retainCurrent();
+    var selected = try Selection.init(std.testing.allocator, first_snapshot, &.{.{
+        .server_binding_identity = binding,
+        .tool_name = "weather",
+    }}, .fresh);
+    first_snapshot.release();
+    defer selected.deinit();
+
+    const report = try manager.apply(1, &.{});
+    try std.testing.expectEqual(catalog.ApplyDisposition.applied, report.disposition);
+    const current = try manager.retainCurrent();
+    defer current.release();
+    var run_view = try selected.materialize(std.testing.allocator, current);
+    defer run_view.deinit();
+    try std.testing.expectEqual(@as(usize, 0), run_view.entries.len);
+    try std.testing.expectEqual(@as(u32, 1), run_view.invalidated);
+}
+
+test "Run materialization invalidates a selected tool after schema drift" {
+    const fixture = @import("mcp_test_support.zig");
+    var server = fixture.Server{};
+    const binding = [_]u8{0x74} ** 32;
+    const specs = [_]catalog.ServerSpec{.{
+        .binding = binding,
+        .namespace = "weather",
+        .connector = server.connector(),
+        .transport = .stdio,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    }};
+    var manager = try catalog.Manager.init(std.testing.allocator, &specs, .{});
+    defer manager.deinit();
+    _ = try manager.refresh();
+    const first = try manager.retainCurrent();
+    var selected = try Selection.init(std.testing.allocator, first, &.{.{
+        .server_binding_identity = binding,
+        .tool_name = "weather",
+    }}, .fresh);
+    first.release();
+    defer selected.deinit();
+    try std.testing.expect(selected.selectors[0].expected_schema_fingerprint != null);
+
+    server.input_schema_json =
+        "{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\"}},\"required\":[\"location\"]}";
+    _ = try manager.refresh();
+    const current = try manager.retainCurrent();
+    defer current.release();
+    var run_view = try selected.materialize(std.testing.allocator, current);
+    defer run_view.deinit();
+    try std.testing.expectEqual(@as(usize, 0), run_view.entries.len);
+    try std.testing.expectEqual(@as(u32, 1), run_view.invalidated);
 }
 
 test "all three protocol eras enter the same Session identity and dispatch seam" {
@@ -963,7 +1168,7 @@ test "all three protocol eras enter the same Session identity and dispatch seam"
                 .tool_name = "weather",
             }}, .fresh);
             defer view.deinit();
-            try std.testing.expectEqual(era, view.entries[0].server.client.era);
+            try std.testing.expectEqual(era, view.entries[0].server.era);
             var environment = try Environment.init(
                 std.testing.allocator,
                 &view,

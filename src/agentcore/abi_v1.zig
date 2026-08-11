@@ -8,6 +8,7 @@ pub const session_permission = @import("session_permission.zig");
 pub const mcp_protocol = @import("mcp_protocol.zig");
 pub const mcp_catalog = @import("mcp_catalog.zig");
 pub const mcp_runtime = @import("mcp_runtime.zig");
+pub const mcp_instance_pool = @import("mcp_instance_pool.zig");
 pub const mcp_negotiation = @import("mcp_negotiation.zig");
 pub const mcp_session = @import("mcp_session.zig");
 pub const mcp_checkpoint = @import("mcp_checkpoint.zig");
@@ -187,7 +188,8 @@ const AbiMcpConnector = struct {
                 return error.OutOfMemory;
             };
             connection.* = .{
-                .connector = self,
+                .descriptor = self.descriptor,
+                .max_frame_bytes = self.max_frame_bytes,
                 .host_connection = host_connection,
             };
             return .{ .connection = connection.interface() };
@@ -208,7 +210,8 @@ const AbiMcpConnector = struct {
 };
 
 const AbiMcpConnection = struct {
-    connector: *AbiMcpConnector,
+    descriptor: wire.McpConnectorV1,
+    max_frame_bytes: u64,
     host_connection: *anyopaque,
 
     fn interface(self: *AbiMcpConnection) mcp_runtime.Connection {
@@ -237,8 +240,8 @@ const AbiMcpConnection = struct {
             .reserved = [_]u64{0} ** 2,
         };
         var response = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
-        const status = self.connector.descriptor.request.?(
-            self.connector.descriptor.ctx,
+        const status = self.descriptor.request.?(
+            self.descriptor.ctx,
             self.host_connection,
             view(request_json),
             timeout_ms,
@@ -246,14 +249,14 @@ const AbiMcpConnection = struct {
             &response,
         );
         defer if (hasReleaseToken(response))
-            self.connector.descriptor.release_response.?(
-                self.connector.descriptor.ctx,
+            self.descriptor.release_response.?(
+                self.descriptor.ctx,
                 self.host_connection,
                 &response,
             );
         if (!canonicalOwned(response)) return error.InvalidConnectorResponse;
         if (status == wire.MCP_EXCHANGE_RESPONSE) {
-            if (response.len == 0 or response.len > self.connector.max_frame_bytes)
+            if (response.len == 0 or response.len > self.max_frame_bytes)
                 return error.InvalidConnectorResponse;
             const source = try ownedSlice(response);
             const copied = response_allocator.dupe(u8, source) catch
@@ -288,8 +291,8 @@ const AbiMcpConnection = struct {
             .is_cancelled = cancellationPoll,
             .reserved = [_]u64{0} ** 2,
         };
-        const status = self.connector.descriptor.notify.?(
-            self.connector.descriptor.ctx,
+        const status = self.descriptor.notify.?(
+            self.descriptor.ctx,
             self.host_connection,
             view(notification_json),
             timeout_ms,
@@ -300,8 +303,8 @@ const AbiMcpConnection = struct {
 
     fn close(raw: *anyopaque) void {
         const self: *AbiMcpConnection = @ptrCast(@alignCast(raw));
-        self.connector.descriptor.close.?(
-            self.connector.descriptor.ctx,
+        self.descriptor.close.?(
+            self.descriptor.ctx,
             self.host_connection,
         );
         allocator.destroy(self);
@@ -379,18 +382,18 @@ fn createInitialSkillBinding(
     };
 }
 
-fn createInitialMcpView(
+fn createInitialMcpSelection(
     runtime: *AbiRuntime,
     selectors: []const mcp_session.Selector,
     mode: mcp_session.BuildMode,
-) !?mcp_session.View {
+) !?mcp_session.Selection {
     if (selectors.len == 0) return null;
     const manager = if (runtime.mcp_manager) |*value| value else {
         return error.InvalidMcpBinding;
     };
     const snapshot = try manager.retainCurrent();
     defer snapshot.release();
-    return try mcp_session.View.init(allocator, snapshot, selectors, mode);
+    return try mcp_session.Selection.init(allocator, snapshot, selectors, mode);
 }
 
 const AbiSession = struct {
@@ -403,7 +406,7 @@ const AbiSession = struct {
     runtime: ?*AbiRuntime = null,
     workspace_scope_id: [64]u8 = [_]u8{0} ** 64,
     skill_binding: ?SkillBinding = null,
-    mcp_view: ?mcp_session.View = null,
+    mcp_selection: ?mcp_session.Selection = null,
     /// Borrowed only while one synchronous Run is admitted. Permission uses
     /// it to resolve the model-facing alias back to canonical MCP identity.
     active_mcp_environment: ?*const mcp_session.Environment = null,
@@ -1517,9 +1520,9 @@ const AbiSession = struct {
             self.policy_fingerprint,
         );
         defer allocator.free(permission_state);
-        const mcp_state = try mcp_checkpoint.encodeView(
+        const mcp_state = try mcp_checkpoint.encodeSelection(
             allocator,
-            if (self.mcp_view) |*mcp_bound| mcp_bound else null,
+            if (self.mcp_selection) |*selection| selection else null,
         );
         defer allocator.free(mcp_state);
         const terminal = self.terminalForCheckpoint(&lease);
@@ -1683,9 +1686,9 @@ const AbiSession = struct {
             self.policy_fingerprint,
         );
         defer allocator.free(permission_state);
-        const mcp_state = try mcp_checkpoint.encodeView(
+        const mcp_state = try mcp_checkpoint.encodeSelection(
             allocator,
-            if (self.mcp_view) |*mcp_bound| mcp_bound else null,
+            if (self.mcp_selection) |*selection| selection else null,
         );
         defer allocator.free(mcp_state);
 
@@ -1854,9 +1857,9 @@ const AbiSession = struct {
             self.policy_fingerprint,
         );
         defer allocator.free(permission_state);
-        const mcp_state = try mcp_checkpoint.encodeView(
+        const mcp_state = try mcp_checkpoint.encodeSelection(
             allocator,
-            if (self.mcp_view) |*mcp_bound| mcp_bound else null,
+            if (self.mcp_selection) |*selection| selection else null,
         );
         defer allocator.free(mcp_state);
         const next_generation = std.math.add(
@@ -1903,29 +1906,29 @@ const AbiSession = struct {
         const a = description_arena.allocator();
         const model = a.dupe(u8, lease.model) catch
             return error.OutOfMemory;
-        const mcp_count = if (self.mcp_view) |*mcp_bound|
-            mcp_bound.entries.len
+        const mcp_count = if (self.mcp_selection) |*selection|
+            selection.entries.len
         else
             0;
         const mcp_tools = a.alloc(
             session_authority.McpToolDescription,
             mcp_count,
         ) catch return error.OutOfMemory;
-        if (self.mcp_view) |*mcp_bound| {
-            for (mcp_bound.entries, mcp_tools) |entry, *description| {
+        if (self.mcp_selection) |*selection| {
+            for (selection.entries, mcp_tools) |entry, *description| {
                 description.* = .{
                     .model_name = a.dupe(u8, entry.model_name) catch
                         return error.OutOfMemory,
-                    .namespace = a.dupe(u8, entry.server.namespace) catch
+                    .namespace = a.dupe(u8, entry.namespace) catch
                         return error.OutOfMemory,
                     .canonical_name = a.dupe(
                         u8,
-                        entry.tool.identity.name,
+                        entry.tool_name,
                     ) catch return error.OutOfMemory,
-                    .server_binding_identity = entry.tool.identity.server_binding_identity,
-                    .schema_fingerprint = entry.tool.identity.schema_fingerprint,
-                    .permission_binding = entry.tool.identity.permissionBinding(),
-                    .era = entry.server.client.era,
+                    .server_binding_identity = entry.server_binding_identity,
+                    .schema_fingerprint = entry.schema_fingerprint,
+                    .permission_binding = entry.permissionIdentity().binding,
+                    .era = entry.era,
                 };
             }
         }
@@ -1951,8 +1954,8 @@ const AbiSession = struct {
                 binding.snapshot().revision
             else
                 null,
-            .mcp_selection_fingerprint = if (self.mcp_view) |*mcp_bound|
-                mcp_bound.selection_fingerprint
+            .mcp_selection_fingerprint = if (self.mcp_selection) |*selection|
+                selection.selection_fingerprint
             else
                 [_]u8{0} ** 32,
             .mcp_tools = mcp_tools,
@@ -2165,11 +2168,10 @@ const AbiSession = struct {
         self.commitDurableReplacement(projected);
     }
 
-    /// Replace the Session's filtered MCP catalog only at the common idle
-    /// mutation boundary. The new immutable Runtime snapshot and PolicyFrame
-    /// are fully prepared before publication; active Runs therefore keep the
-    /// generation they admitted with.
-    fn updateMcpView(
+    /// Replace the Session's value-only MCP selection at the common idle
+    /// mutation boundary. A temporary View validates the selection against
+    /// the current catalog, but the Session does not retain that generation.
+    fn updateMcpSelection(
         self: *AbiSession,
         selectors: []const mcp_session.Selector,
         mode: mcp_session.BuildMode,
@@ -2177,16 +2179,21 @@ const AbiSession = struct {
         if (self.facade_poisoned.load(.acquire)) return error.InvalidSessionState;
         if (!self.tryBeginMutation()) return error.SessionBusy;
         defer self.finishMutation();
-        if (selectors.len == 0 and self.mcp_view == null) return;
+        if (selectors.len == 0 and self.mcp_selection == null) return;
         const runtime_owner = self.runtime orelse return error.InvalidSessionState;
         const manager = if (runtime_owner.mcp_manager) |*value| value else return error.InvalidMcpBinding;
         const snapshot = try manager.retainCurrent();
         defer snapshot.release();
-        var replacement = try mcp_session.View.init(
+        var replacement_view = try mcp_session.View.init(
             allocator,
             snapshot,
             selectors,
             mode,
+        );
+        defer replacement_view.deinit();
+        var replacement = try mcp_session.Selection.fromView(
+            allocator,
+            &replacement_view,
         );
         var replacement_live = true;
         defer if (replacement_live) replacement.deinit();
@@ -2194,12 +2201,12 @@ const AbiSession = struct {
         const base_definitions = self.core_session.tools.definitions;
         const names = try allocator.alloc(
             []const u8,
-            base_definitions.len + replacement.entries.len,
+            base_definitions.len + replacement_view.entries.len,
         );
         defer allocator.free(names);
         for (base_definitions, names[0..base_definitions.len]) |definition, *name|
             name.* = definition.name;
-        for (replacement.entries, names[base_definitions.len..]) |entry, *name|
+        for (replacement_view.entries, names[base_definitions.len..]) |entry, *name|
             name.* = entry.model_name;
         const next_root = try policy_frame.PolicyFrame.createRoot(
             allocator,
@@ -2214,7 +2221,7 @@ const AbiSession = struct {
         const resolver_context = RestorePermissionResolver{
             .runtime = runtime_owner,
             .allowed_tools = names[0..base_definitions.len],
-            .mcp_view = &replacement,
+            .mcp_view = &replacement_view,
         };
         var prepared_permission = try self.permission_state.prepareInvalidation(
             .mcp,
@@ -2222,12 +2229,12 @@ const AbiSession = struct {
         );
         defer prepared_permission.deinit();
 
-        const current_mcp_state = try mcp_checkpoint.encodeView(
+        const current_mcp_state = try mcp_checkpoint.encodeSelection(
             allocator,
-            if (self.mcp_view) |*mcp_bound| mcp_bound else null,
+            if (self.mcp_selection) |*selection| selection else null,
         );
         defer allocator.free(current_mcp_state);
-        const replacement_mcp_state = try mcp_checkpoint.encodeView(
+        const replacement_mcp_state = try mcp_checkpoint.encodeSelection(
             allocator,
             &replacement,
         );
@@ -2261,23 +2268,36 @@ const AbiSession = struct {
             replacement_bytes,
         );
 
-        var previous_view = self.mcp_view;
+        var previous_selection = self.mcp_selection;
         const previous_root = self.policy_root;
-        self.mcp_view = replacement;
+        self.mcp_selection = replacement;
         replacement_live = false;
         self.policy_root = next_root;
         next_root_live = false;
-        self.catalog_generation = self.mcp_view.?.catalog_generation;
+        self.catalog_generation = self.mcp_selection.?.catalog_generation;
         self.pending_permission = null;
         self.permission_state.commitPrepared(&prepared_permission.state);
 
         const stale_grants = prepared_permission.invalidated;
-        self.invalidated_mcp_bindings +|= stale_grants +| self.mcp_view.?.invalidated;
-        if (stale_grants != 0 or self.mcp_view.?.invalidated != 0)
+        self.invalidated_mcp_bindings +|= stale_grants +| self.mcp_selection.?.invalidated;
+        if (stale_grants != 0 or self.mcp_selection.?.invalidated != 0)
             self.restore_health = .degraded;
         if (previous_root) |root| root.release();
-        if (previous_view) |*old| old.deinit();
+        if (previous_selection) |*old| old.deinit();
         self.commitDurableReplacement(projected);
+    }
+
+    /// Resolve the Session's copied selectors against the latest published
+    /// Runtime generation. The returned View owns the generation lease for
+    /// exactly one synchronous Run.
+    fn materializeMcpRunView(self: *AbiSession) !?mcp_session.View {
+        const selection = if (self.mcp_selection) |*value| value else return null;
+        if (selection.selectors.len == 0) return null;
+        const runtime_owner = self.runtime orelse return error.InvalidSessionState;
+        const manager = if (runtime_owner.mcp_manager) |*value| value else return error.InvalidMcpBinding;
+        const snapshot = try manager.retainCurrent();
+        defer snapshot.release();
+        return try selection.materialize(allocator, snapshot);
     }
 
     /// Internal typed-Skill entry. All validation before
@@ -2392,7 +2412,9 @@ const AbiSession = struct {
                 )
         else
             false;
-        const has_mcp = if (self.mcp_view) |*mcp_bound| mcp_bound.entries.len != 0 else false;
+        var mcp_run_view = try self.materializeMcpRunView();
+        defer if (mcp_run_view) |*run_view| run_view.deinit();
+        const has_mcp = if (mcp_run_view) |*run_view| run_view.entries.len != 0 else false;
         const identity = core.agent_session.RunIdentity{
             .session_id = self.core_session.session_id,
             .run_id = run_id,
@@ -2400,7 +2422,7 @@ const AbiSession = struct {
         var mcp_environment: ?mcp_session.Environment = if (has_mcp)
             try mcp_session.Environment.init(
                 allocator,
-                &self.mcp_view.?,
+                &mcp_run_view.?,
                 self.core_session.tools.definitions,
                 self.core_session.tools.dispatcher(),
                 null,
@@ -2432,7 +2454,7 @@ const AbiSession = struct {
                     environment.executionPolicy()
                 else
                     null,
-                .mcp_view = if (has_mcp) &self.mcp_view.? else null,
+                .mcp_view = if (has_mcp) &mcp_run_view.? else null,
                 .budget_controller = &budget_controller,
                 .permission_owner = self.permissionForkOwner(),
             });
@@ -2464,7 +2486,7 @@ const AbiSession = struct {
         var budget_tools = session_budget.ToolEnvironment{
             .controller = &budget_controller,
             .base = inner_surface,
-            .mcp_view = if (has_mcp) &self.mcp_view.? else null,
+            .mcp_view = if (has_mcp) &mcp_run_view.? else null,
         };
         const result = admitted.runUserMessagesWithToolSurfaceUsingProvider(
             &.{prompt},
@@ -2551,6 +2573,9 @@ const AbiSession = struct {
         budget_provider: ?*session_budget.BudgetedProvider,
         invocation_record: ?[]const u8,
     ) anyerror!SkillAdmission {
+        var mcp_run_view = try self.materializeMcpRunView();
+        var keep_mcp_run_view = false;
+        defer if (!keep_mcp_run_view) if (mcp_run_view) |*run_view| run_view.deinit();
         var admitted = try self.core_session.admitRun(
             run_id,
             .{ .ctx = self, .emit = AbiSession.emit },
@@ -2580,6 +2605,7 @@ const AbiSession = struct {
             if (cleanup_failed) return error.CoreError;
             return .aborted;
         }
+        keep_mcp_run_view = true;
         return .{ .ready = .{
             .facade = self,
             .materializations = materializations,
@@ -2588,6 +2614,7 @@ const AbiSession = struct {
             .budget_controller = budget_controller,
             .budget_provider = budget_provider,
             .invocation_record = invocation_record,
+            .mcp_view = mcp_run_view,
         } };
     }
 };
@@ -2612,6 +2639,8 @@ const MaterializedSkillRun = struct {
     /// Borrowed from the synchronous external run when budgeted. Test-only
     /// direct admission may omit it and falls back to local construction.
     invocation_record: ?[]const u8,
+    /// Exact catalog generation retained for this admitted Run.
+    mcp_view: ?mcp_session.View,
 
     fn executeInline(
         self: *MaterializedSkillRun,
@@ -2670,7 +2699,7 @@ const MaterializedSkillRun = struct {
             _ = try self.finishWithoutConversation();
             return error.InvalidSessionState;
         };
-        const has_mcp = if (self.facade.mcp_view) |*mcp_bound| mcp_bound.entries.len != 0 else false;
+        const has_mcp = if (self.mcp_view) |*run_view| run_view.entries.len != 0 else false;
         const root_mcp_restrictions = [_]mcp_session.SkillRestriction{.{
             .allowed = plan.skill.definition.allowed_tools,
             .disallowed = plan.skill.definition.disallowed_tools,
@@ -2678,7 +2707,7 @@ const MaterializedSkillRun = struct {
         var mcp_environment: ?mcp_session.Environment = if (has_mcp)
             mcp_session.Environment.initRestricted(
                 allocator,
-                &self.facade.mcp_view.?,
+                &self.mcp_view.?,
                 self.admitted.session.tools.definitions,
                 self.admitted.session.tools.dispatcher(),
                 null,
@@ -2718,7 +2747,7 @@ const MaterializedSkillRun = struct {
                         mcp_env.executionPolicy()
                     else
                         null,
-                    .mcp_view = if (has_mcp) &self.facade.mcp_view.? else null,
+                    .mcp_view = if (has_mcp) &self.mcp_view.? else null,
                     .budget_controller = budget_controller,
                     .permission_owner = self.facade.permissionForkOwner(),
                 }) catch |environment_error| {
@@ -2749,7 +2778,7 @@ const MaterializedSkillRun = struct {
         var budget_tools = session_budget.ToolEnvironment{
             .controller = budget_controller,
             .base = inner_surface,
-            .mcp_view = if (has_mcp) &self.facade.mcp_view.? else null,
+            .mcp_view = if (has_mcp) &self.mcp_view.? else null,
         };
         const result = self.admitted.runUserMessagesWithToolSurfaceUsingProvider(
             &.{ invocation_record, body_record },
@@ -2841,6 +2870,7 @@ const MaterializedSkillRun = struct {
             .max_turns = max_turns,
             .budget_controller = budget_controller,
             .budget_provider = budget_provider,
+            .mcp_view = if (self.mcp_view) |*run_view| run_view else null,
         };
         const result = self.admitted.runIsolated(
             &.{invocation_record},
@@ -2858,7 +2888,15 @@ const MaterializedSkillRun = struct {
     }
 
     fn releaseAssets(self: *MaterializedSkillRun) !void {
-        self.activation.deinit() catch return error.CoreError;
+        var cleanup_failed = false;
+        self.activation.deinit() catch {
+            cleanup_failed = true;
+        };
+        if (self.mcp_view) |*run_view| {
+            run_view.deinit();
+            self.mcp_view = null;
+        }
+        if (cleanup_failed) return error.CoreError;
     }
 
     /// Test/rollback path before prompt rendering. Always closes the core
@@ -2885,6 +2923,7 @@ const ForkExecutorContext = struct {
     max_turns: u32,
     budget_controller: *session_budget.Controller,
     budget_provider: *session_budget.BudgetedProvider,
+    mcp_view: ?*const mcp_session.View,
 
     fn execute(
         raw: *anyopaque,
@@ -2916,7 +2955,7 @@ const ForkExecutorContext = struct {
             } else null;
         const child_depth = try childDepth(self.activation.parent_agent_depth);
         const binding = if (self.facade.skill_binding) |*value| value else return error.InvalidSessionState;
-        const has_mcp = if (self.facade.mcp_view) |*mcp_bound| mcp_bound.entries.len != 0 else false;
+        const has_mcp = if (self.mcp_view) |run_view| run_view.entries.len != 0 else false;
         const root_mcp_restrictions = [_]mcp_session.SkillRestriction{.{
             .allowed = self.plan.skill.definition.allowed_tools,
             .disallowed = self.plan.skill.definition.disallowed_tools,
@@ -2924,7 +2963,7 @@ const ForkExecutorContext = struct {
         var mcp_environment: ?mcp_session.Environment = if (has_mcp)
             try mcp_session.Environment.initRestricted(
                 output_allocator,
-                &self.facade.mcp_view.?,
+                self.mcp_view.?,
                 self.session.tools.definitions,
                 self.session.tools.dispatcher(),
                 null,
@@ -2962,7 +3001,7 @@ const ForkExecutorContext = struct {
                         mcp_env.executionPolicy()
                     else
                         null,
-                    .mcp_view = if (has_mcp) &self.facade.mcp_view.? else null,
+                    .mcp_view = if (has_mcp) self.mcp_view else null,
                     .budget_controller = self.budget_controller,
                     .permission_owner = self.facade.permissionForkOwner(),
                 })
@@ -2982,7 +3021,7 @@ const ForkExecutorContext = struct {
         var budget_tools = session_budget.ToolEnvironment{
             .controller = self.budget_controller,
             .base = inner_surface,
-            .mcp_view = if (has_mcp) &self.facade.mcp_view.? else null,
+            .mcp_view = if (has_mcp) self.mcp_view else null,
         };
         const child_surface = budget_tools.surface();
         const execution_policy = if (environment) |*env|
@@ -4046,6 +4085,9 @@ const McpCatalogIssueJson = struct {
 const McpCatalogDescriptionJson = struct {
     schema: []const u8 = "agentcore.mcp-catalog/v1",
     catalog_generation: u64,
+    desired_revision: u64,
+    active_revision: u64,
+    convergence: []const u8,
     catalog_fingerprint: []const u8,
     servers: []const McpCatalogServerJson,
     tools: []const McpCatalogToolJson,
@@ -4102,6 +4144,9 @@ fn encodeMcpCatalogDescription(
     };
     const dto = McpCatalogDescriptionJson{
         .catalog_generation = description.generation,
+        .desired_revision = description.desired_revision,
+        .active_revision = description.active_revision,
+        .convergence = @tagName(description.convergence),
         .catalog_fingerprint = try lowerHexAlloc(a, &description.fingerprint),
         .servers = servers,
         .tools = tools,
@@ -4135,6 +4180,7 @@ fn runtimeRefreshMcp(
         error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
         error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
         error.InvalidConfig => wire.STATUS_INVALID_ARGUMENT,
+        error.ReentrantControlCall => wire.STATUS_INVALID_STATE,
         else => wire.STATUS_CORE_ERROR,
     }, err, out_error);
     return wire.STATUS_OK;
@@ -4189,7 +4235,7 @@ const SessionBuildConfig = struct {
     /// Non-null pointer transfers its optional value on every path. This lets
     /// restore deliberately preserve an absent historical MCP binding even
     /// when the current Runtime has a catalog.
-    mcp_view_transfer: ?*?mcp_session.View = null,
+    mcp_selection_transfer: ?*?mcp_session.Selection = null,
     mcp_invalidated_without_view: u32 = 0,
     authority_issue_seeds: []const session_authority.AuthorityIssueSeed = &.{},
     budget_profile: session_budget.Profile = .{},
@@ -4301,32 +4347,32 @@ fn buildAbiSession(
     );
     if (config.restored) |decoded|
         try budget_state.updateUsage(decoded.descriptor.total_bytes);
-    var initial_mcp_view = if (config.mcp_view_transfer) |source| blk: {
+    var initial_mcp_selection = if (config.mcp_selection_transfer) |source| blk: {
         const transferred = source.*;
         source.* = null;
         break :blk transferred;
-    } else try createInitialMcpView(
+    } else try createInitialMcpSelection(
         runtime,
         config.mcp_selectors,
         config.mcp_build_mode,
     );
-    var keep_mcp_view = false;
-    defer if (!keep_mcp_view) if (initial_mcp_view) |*mcp_bound| mcp_bound.deinit();
-    const mcp_tool_count = if (initial_mcp_view) |*mcp_bound| mcp_bound.entries.len else 0;
+    var keep_mcp_selection = false;
+    defer if (!keep_mcp_selection) if (initial_mcp_selection) |*selection| selection.deinit();
+    const mcp_tool_count = if (initial_mcp_selection) |*selection| selection.entries.len else 0;
     const authority_tool_names = try allocator.alloc(
         []const u8,
         config.allowed_tools.len + mcp_tool_count,
     );
     defer allocator.free(authority_tool_names);
     @memcpy(authority_tool_names[0..config.allowed_tools.len], config.allowed_tools);
-    if (initial_mcp_view) |*mcp_bound| {
-        for (mcp_bound.entries, authority_tool_names[config.allowed_tools.len..]) |entry, *name|
+    if (initial_mcp_selection) |*selection| {
+        for (selection.entries, authority_tool_names[config.allowed_tools.len..]) |entry, *name|
             name.* = entry.model_name;
     }
     const mcp_invalidated = std.math.add(
         u32,
         config.mcp_invalidated_without_view,
-        if (initial_mcp_view) |*mcp_bound| mcp_bound.invalidated else 0,
+        if (initial_mcp_selection) |*selection| selection.invalidated else 0,
     ) catch return error.ResourceLimit;
     const policy_fingerprint = try session_permission.computePolicyFingerprint(
         allocator,
@@ -4365,15 +4411,15 @@ fn buildAbiSession(
         .runtime = runtime,
         .workspace_scope_id = config.workspace_scope_id,
         .skill_binding = config.skill_binding,
-        .mcp_view = initial_mcp_view,
+        .mcp_selection = initial_mcp_selection,
         .checkpoint_generation = if (config.restored) |decoded|
             decoded.descriptor.checkpoint_generation
         else
             0,
         .policy_generation = policy_generation,
         .policy_fingerprint = policy_fingerprint,
-        .catalog_generation = if (initial_mcp_view) |*mcp_bound|
-            mcp_bound.catalog_generation
+        .catalog_generation = if (initial_mcp_selection) |*selection|
+            selection.catalog_generation
         else
             0,
         .logical_origin = if (config.restored == null) .fresh else .restored,
@@ -4409,9 +4455,9 @@ fn buildAbiSession(
     keep_permission_state = true;
     keep_permission_audit = true;
     keep_authority_issues = true;
-    keep_mcp_view = true;
+    keep_mcp_selection = true;
     errdefer {
-        if (self.mcp_view) |*mcp_bound| mcp_bound.deinit();
+        if (self.mcp_selection) |*selection| selection.deinit();
         if (self.permission_audit) |*audit| audit.deinit();
         if (self.authority_issues) |*issues| issues.deinit();
         self.permission_state.deinit();
@@ -4507,6 +4553,8 @@ fn restoreCheckpoint(
     }
     var restored_mcp_view: ?mcp_session.View = null;
     defer if (restored_mcp_view) |*mcp_bound| mcp_bound.deinit();
+    var restored_mcp_selection: ?mcp_session.Selection = null;
+    defer if (restored_mcp_selection) |*selection| selection.deinit();
     var mcp_invalidated_without_view: u32 = 0;
     if (restored_mcp_state) |*state| {
         const historical_selectors = try state.selectors(allocator);
@@ -4551,6 +4599,12 @@ fn restoreCheckpoint(
         } else {
             mcp_invalidated_without_view = @intCast(state.entries.len);
         }
+    }
+    if (restored_mcp_view) |*restored_view| {
+        restored_mcp_selection = try mcp_session.Selection.fromView(
+            allocator,
+            restored_view,
+        );
     }
     const restored_mcp_count: u32 = if (restored_mcp_view) |*mcp_bound|
         @intCast(mcp_bound.entries.len)
@@ -4716,7 +4770,7 @@ fn restoreCheckpoint(
         .restored = &decoded,
         .skill_summary = skill_summary,
         .permission_reconciliation = &permission_reconciliation,
-        .mcp_view_transfer = &restored_mcp_view,
+        .mcp_selection_transfer = &restored_mcp_selection,
         .mcp_invalidated_without_view = mcp_invalidated_without_view,
         .authority_issue_seeds = authority_issue_seeds.items,
         .budget_profile = config.budget_profile,
@@ -5295,9 +5349,9 @@ fn deinitAbiSession(self: *AbiSession, runtime: *AbiRuntime) void {
         binding.deinit(&runtime.catalogs);
         self.skill_binding = null;
     }
-    if (self.mcp_view) |*mcp_bound| {
-        mcp_bound.deinit();
-        self.mcp_view = null;
+    if (self.mcp_selection) |*selection| {
+        selection.deinit();
+        self.mcp_selection = null;
     }
     if (self.permission_audit) |*audit| audit.deinit();
     if (self.authority_issues) |*issues| issues.deinit();
@@ -5438,7 +5492,7 @@ fn sessionUpdateMcp(
         selection,
         &metadata,
     ) catch |err| return failError(inputErrorStatus(err), err, out_error);
-    self.updateMcpView(selectors, .fresh) catch |err|
+    self.updateMcpSelection(selectors, .fresh) catch |err|
         return failError(switch (err) {
             error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
             error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
@@ -7152,16 +7206,18 @@ test "Revision 6 MCP schema denial precedes Permission callback eligibility" {
         bufferRelease(&diagnostic);
         std.debug.assert(status == wire.STATUS_OK);
     }
+    var permission_run_view = (try session.materializeMcpRunView()).?;
+    defer permission_run_view.deinit();
     var active_mcp_environment = try mcp_session.Environment.init(
         std.testing.allocator,
-        &session.mcp_view.?,
+        &permission_run_view,
         session.core_session.tools.definitions,
         session.core_session.tools.dispatcher(),
         null,
     );
     defer active_mcp_environment.deinit();
     session.active_mcp_environment = &active_mcp_environment;
-    const model_name = session.mcp_view.?.entries[0].model_name;
+    const model_name = session.mcp_selection.?.entries[0].model_name;
     try std.testing.expectEqual(
         core.permission.PermissionResult.deny,
         core.permission.checkPermission(
@@ -7184,7 +7240,7 @@ test "Revision 6 MCP schema denial precedes Permission callback eligibility" {
     try std.testing.expectEqualStrings("weather", pending.tool_name);
     try std.testing.expectEqualSlices(
         u8,
-        &session.mcp_view.?.entries[0].permissionIdentity().binding,
+        &session.mcp_selection.?.entries[0].permissionIdentity().binding,
         &pending.binding,
     );
     // This focused rule projection check runs outside a real admitted tool
@@ -7318,10 +7374,10 @@ test "Revision 6 MCP view update is idle atomic and invalidates schema-bound gra
     defer Cleanup.session(session);
     const old_model_name = try std.testing.allocator.dupe(
         u8,
-        session.mcp_view.?.entries[0].model_name,
+        session.mcp_selection.?.entries[0].model_name,
     );
     defer std.testing.allocator.free(old_model_name);
-    const old_identity = session.mcp_view.?.entries[0].permissionIdentity();
+    const old_identity = session.mcp_selection.?.entries[0].permissionIdentity();
     const digest = try session_permission.digestCanonicalArguments(
         std.testing.allocator,
         "{\"city\":\"Paris\"}",
@@ -7337,7 +7393,7 @@ test "Revision 6 MCP view update is idle atomic and invalidates schema-bound gra
     session.call_state = .running;
     try std.testing.expectError(
         error.SessionBusy,
-        session.updateMcpView(&selectors, .fresh),
+        session.updateMcpSelection(&selectors, .fresh),
     );
     session.call_state = .idle;
     try std.testing.expectEqual(@as(u64, 1), session.catalog_generation);
@@ -7348,7 +7404,7 @@ test "Revision 6 MCP view update is idle atomic and invalidates schema-bound gra
     }};
     try std.testing.expectError(
         error.InvalidSelection,
-        session.updateMcpView(&missing_selectors, .fresh),
+        session.updateMcpSelection(&missing_selectors, .fresh),
     );
     try std.testing.expectEqual(@as(u64, 1), session.catalog_generation);
     try std.testing.expectEqual(@as(usize, 1), session.permission_state.ruleCount());
@@ -7356,22 +7412,24 @@ test "Revision 6 MCP view update is idle atomic and invalidates schema-bound gra
     server.input_schema_json =
         "{\"type\":\"object\",\"properties\":{\"country\":{\"type\":\"string\"}},\"required\":[\"country\"],\"additionalProperties\":false}";
     try std.testing.expectEqual(@as(u64, 2), try runtime.mcp_manager.?.refresh());
-    try session.updateMcpView(&selectors, .fresh);
+    try session.updateMcpSelection(&selectors, .fresh);
     try std.testing.expectEqual(@as(u64, 2), session.catalog_generation);
-    try std.testing.expectEqualStrings(old_model_name, session.mcp_view.?.entries[0].model_name);
+    try std.testing.expectEqualStrings(old_model_name, session.mcp_selection.?.entries[0].model_name);
     try std.testing.expect(!std.mem.eql(
         u8,
         &old_identity.binding,
-        &session.mcp_view.?.entries[0].permissionIdentity().binding,
+        &session.mcp_selection.?.entries[0].permissionIdentity().binding,
     ));
     try std.testing.expectEqual(@as(usize, 0), session.permission_state.ruleCount());
     try std.testing.expectEqual(@as(u32, 1), session.invalidated_mcp_bindings);
     try std.testing.expectEqual(session_authority.RestoreHealth.degraded, session.restore_health);
-    try std.testing.expect(session.mcp_view.?.validatesInvocation(
+    var changed_run_view = (try session.materializeMcpRunView()).?;
+    defer changed_run_view.deinit();
+    try std.testing.expect(changed_run_view.validatesInvocation(
         old_model_name,
         "{\"country\":\"France\"}",
     ));
-    try std.testing.expect(!session.mcp_view.?.validatesInvocation(
+    try std.testing.expect(!changed_run_view.validatesInvocation(
         old_model_name,
         "{\"city\":\"Paris\"}",
     ));
@@ -7403,7 +7461,7 @@ test "Revision 6 MCP view update is idle atomic and invalidates schema-bound gra
     }};
     try std.testing.expectError(
         error.CheckpointBudgetRequired,
-        session.updateMcpView(&larger_selectors, .fresh),
+        session.updateMcpSelection(&larger_selectors, .fresh),
     );
     try std.testing.expectEqual(@as(u64, 2), session.catalog_generation);
     try std.testing.expect(session.policy_root == before_root);
@@ -7509,7 +7567,7 @@ test "Revision 6 checkpoint restores compatible MCP view and exact Session grant
         arguments_json,
         .{},
     );
-    const original_entry = &original.mcp_view.?.entries[0];
+    const original_entry = &original.mcp_selection.?.entries[0];
     _ = try original.permission_state.remember(
         .allow_session,
         (try session_permission.deriveRuleCandidate(
@@ -7575,21 +7633,21 @@ test "Revision 6 checkpoint restores compatible MCP view and exact Session grant
     try std.testing.expectEqual(@as(u64, 1), restored.report.catalog_generation);
     // The current Runtime exposes additional MCP authority, but restore
     // reconstructs only the checkpoint selection and never auto-enables it.
-    try std.testing.expectEqual(@as(usize, 1), restored.session.mcp_view.?.entries.len);
+    try std.testing.expectEqual(@as(usize, 1), restored.session.mcp_selection.?.entries.len);
     try std.testing.expect(
-        restored.session.mcp_view.?.findCanonicalTool(
+        restored.session.mcp_selection.?.findCanonicalTool(
             &calendar_binding,
             "events",
         ) == null,
     );
     try std.testing.expectEqualStrings(
         expected_model_name,
-        restored.session.mcp_view.?.entries[0].model_name,
+        restored.session.mcp_selection.?.entries[0].model_name,
     );
     try std.testing.expectEqual(
         session_permission.Decision.allow,
         (try restored.session.permission_state.decide(
-            restored.session.mcp_view.?.entries[0].permissionIdentity(),
+            restored.session.mcp_selection.?.entries[0].permissionIdentity(),
             digest,
             .undecided,
             .{ .decision = .ask, .source = .mode_fallback },
@@ -7617,7 +7675,7 @@ test "Revision 6 checkpoint restores compatible MCP view and exact Session grant
     try std.testing.expectEqual(@as(u32, 0), changed.report.permission_rules_restored);
     try std.testing.expectEqual(@as(u32, 1), changed.report.permission_rules_invalidated);
     try std.testing.expectEqual(@as(u64, 2), changed.report.catalog_generation);
-    try std.testing.expectEqual(@as(usize, 0), changed.session.mcp_view.?.entries.len);
+    try std.testing.expectEqual(@as(usize, 0), changed.session.mcp_selection.?.entries.len);
     try std.testing.expectEqual(@as(usize, 1), changed.session.core_session.conversation.len());
     try std.testing.expectEqual(@as(usize, 2), changed.report.issues.len);
     var saw_permission_issue = false;
@@ -8728,7 +8786,7 @@ test "Revision 6 restore preserves Conversation and invalidates unavailable MCP 
     try std.testing.expectEqual(@as(u32, 0), first.report.permission_rules_restored);
     try std.testing.expectEqual(@as(u32, 1), first.report.permission_rules_invalidated);
     try std.testing.expectEqual(@as(usize, 0), first.session.permission_state.ruleCount());
-    try std.testing.expect(first.session.mcp_view == null);
+    try std.testing.expect(first.session.mcp_selection == null);
     try std.testing.expectEqual(@as(u64, 0), first.report.catalog_generation);
     try std.testing.expectEqual(@as(usize, 1), first.session.core_session.conversation.len());
     try std.testing.expectEqualStrings(

@@ -8,6 +8,7 @@ const std = @import("std");
 const sync = @import("platform").sync;
 const canonical = @import("mcp_canonical.zig");
 const runtime = @import("mcp_runtime.zig");
+const instance_pool = @import("mcp_instance_pool.zig");
 const schema = @import("mcp_schema.zig");
 const util_time = @import("metacodes-core").util_time;
 
@@ -37,6 +38,7 @@ pub const Limits = struct {
 pub const ServerSpec = struct {
     binding: [32]u8,
     namespace: []const u8,
+    configuration_fingerprint: [32]u8 = [_]u8{0} ** 32,
     connector: runtime.Connector,
     transport: @import("mcp_negotiation.zig").Transport,
     policy: @import("mcp_negotiation.zig").Policy = .auto,
@@ -50,6 +52,19 @@ pub const Error = error{
     InvalidConfig,
     ResourceLimit,
     NotRefreshed,
+};
+pub const ControlError = Error || error{ReentrantControlCall};
+
+const BuildError = Error || error{CandidateRejected};
+
+pub const ApplyDisposition = enum { applied, superseded, rejected };
+pub const Convergence = enum { converged, rejected };
+
+pub const ApplyReport = struct {
+    disposition: ApplyDisposition,
+    desired_revision: u64,
+    active_revision: u64,
+    catalog_generation: u64,
 };
 
 pub const MaterializeError = error{
@@ -75,7 +90,9 @@ pub const CatalogIssue = struct {
 
 pub const ServerRecord = struct {
     namespace: []const u8,
-    client: *runtime.Client,
+    server_binding_identity: [32]u8,
+    instance_id: instance_pool.InstanceId,
+    era: canonical.Era,
     fingerprint: [32]u8,
     expires_at_ns: util_time.Nanos,
     cache_scope: canonical.CacheScope,
@@ -88,11 +105,10 @@ pub const ServerRecord = struct {
 
 pub const MAX_MODEL_TOOL_NAME_BYTES: usize = 64;
 
-/// A Snapshot stores only immutable admission evidence and a pointer to the
-/// canonical Tool owned by its retained Runtime Client. Provider projection
-/// trees are materialized only for tools selected into a Session View.
+/// A Snapshot stores only immutable copied admission evidence. Provider
+/// projection trees are materialized only for tools selected into a Run View.
 pub const AdmittedTool = struct {
-    canonical: *const canonical.Tool,
+    canonical: canonical.Tool,
     model_name: []const u8,
     diagnostics: []const schema.ProjectionDiagnostic,
 };
@@ -130,6 +146,9 @@ pub const IssueDescription = struct {
 pub const Description = struct {
     arena: std.heap.ArenaAllocator,
     generation: u64,
+    desired_revision: u64,
+    active_revision: u64,
+    convergence: Convergence,
     fingerprint: [32]u8,
     servers: []ServerDescription,
     tools: []ToolDescription,
@@ -143,6 +162,7 @@ pub const Description = struct {
 
 pub const Snapshot = struct {
     backing: std.mem.Allocator,
+    instances: *instance_pool.Pool,
     arena: std.heap.ArenaAllocator,
     ref_count: std.atomic.Value(u32) = .init(1),
     generation: u64,
@@ -166,15 +186,22 @@ pub const Snapshot = struct {
         std.debug.assert(previous != 0);
         if (previous != 1) return;
         const backing = self.backing;
-        for (self.servers) |server| server.client.deinit();
+        for (self.servers) |server| self.instances.releaseId(server.instance_id);
         self.arena.deinit();
         backing.destroy(self);
     }
 
     pub fn findServer(self: *const Snapshot, binding: *const [32]u8) ?*const ServerRecord {
         for (self.servers) |*server|
-            if (std.mem.eql(u8, &server.client.binding, binding)) return server;
+            if (std.mem.eql(u8, &server.server_binding_identity, binding)) return server;
         return null;
+    }
+
+    pub fn retainInstance(
+        self: *const Snapshot,
+        id: instance_pool.InstanceId,
+    ) instance_pool.Error!instance_pool.Lease {
+        return self.instances.retain(id);
     }
 
     pub fn now(self: *const Snapshot) util_time.Nanos {
@@ -217,10 +244,10 @@ pub const Snapshot = struct {
         for (self.servers, servers) |server, *description| {
             const remaining_ns = @max(@as(util_time.Nanos, 0), server.expires_at_ns - now_ns);
             description.* = .{
-                .server_binding_identity = server.client.binding,
+                .server_binding_identity = server.server_binding_identity,
                 .namespace = a.dupe(u8, server.namespace) catch
                     return error.OutOfMemory,
-                .era = server.client.era,
+                .era = server.era,
                 .server_fingerprint = server.fingerprint,
                 .cache_scope = server.cache_scope,
                 .fresh = server.isFreshAt(now_ns),
@@ -269,6 +296,9 @@ pub const Snapshot = struct {
         return .{
             .arena = arena,
             .generation = self.generation,
+            .desired_revision = 0,
+            .active_revision = 0,
+            .convergence = .converged,
             .fingerprint = self.fingerprint,
             .servers = servers,
             .tools = tools,
@@ -297,6 +327,7 @@ fn issueParts(kind: IssueKind) struct { []const u8, []const u8 } {
 const OwnedSpec = struct {
     binding: [32]u8,
     namespace: []const u8,
+    configuration_fingerprint: [32]u8,
     connector: runtime.Connector,
     transport: @import("mcp_negotiation.zig").Transport,
     policy: @import("mcp_negotiation.zig").Policy,
@@ -317,15 +348,117 @@ const OwnedSpec = struct {
     }
 };
 
+fn ownSpecs(
+    allocator: std.mem.Allocator,
+    specs: []const ServerSpec,
+    limits: Limits,
+) Error![]OwnedSpec {
+    if (specs.len > limits.max_servers) return error.InvalidConfig;
+    const owned = allocator.alloc(OwnedSpec, specs.len) catch
+        return error.OutOfMemory;
+    const namespace_limit = @min(limits.max_namespace_bytes, MAX_NAMESPACE_BYTES);
+    for (specs, owned, 0..) |spec, *destination, index| {
+        if (allZero(&spec.binding) or
+            !validNamespace(spec.namespace, namespace_limit) or
+            spec.timeout_ms == 0 or
+            spec.protocol_limits.max_tools > (canonical.Limits{}).max_tools)
+            return error.InvalidConfig;
+        spec.protocol_limits.validate() catch return error.InvalidConfig;
+        for (specs[0..index]) |previous| {
+            if (std.mem.eql(u8, &previous.binding, &spec.binding) or
+                std.mem.eql(u8, previous.namespace, spec.namespace))
+                return error.InvalidConfig;
+        }
+        destination.* = .{
+            .binding = spec.binding,
+            .namespace = allocator.dupe(u8, spec.namespace) catch
+                return error.OutOfMemory,
+            .configuration_fingerprint = spec.configuration_fingerprint,
+            .connector = spec.connector,
+            .transport = spec.transport,
+            .policy = spec.policy,
+            .client = .{
+                .name = allocator.dupe(u8, spec.client.name) catch
+                    return error.OutOfMemory,
+                .version = allocator.dupe(u8, spec.client.version) catch
+                    return error.OutOfMemory,
+            },
+            .timeout_ms = spec.timeout_ms,
+            .protocol_limits = spec.protocol_limits,
+        };
+    }
+    return owned;
+}
+
+fn findOwnedSpec(specs: []const OwnedSpec, binding: *const [32]u8) ?*const OwnedSpec {
+    for (specs) |*spec|
+        if (std.mem.eql(u8, &spec.binding, binding)) return spec;
+    return null;
+}
+
+fn snapshotCoversSpecs(snapshot: ?*const Snapshot, specs: []const OwnedSpec) bool {
+    const current = snapshot orelse return false;
+    for (specs) |spec|
+        if (current.findServer(&spec.binding) == null) return false;
+    return true;
+}
+
+fn ownedSpecSetsEqual(a: []const OwnedSpec, b: []const OwnedSpec) bool {
+    if (a.len != b.len) return false;
+    for (a) |left| {
+        const right = findOwnedSpec(b, &left.binding) orelse return false;
+        if (!desiredSpecEqual(left, right.*)) return false;
+    }
+    return true;
+}
+
+fn instanceSpecEqual(a: OwnedSpec, b: OwnedSpec) bool {
+    const explicit_identity = !allZero(&a.configuration_fingerprint) or
+        !allZero(&b.configuration_fingerprint);
+    const connector_equal = if (explicit_identity)
+        true
+    else
+        a.connector.ctx == b.connector.ctx and
+            a.connector.open_fn == b.connector.open_fn;
+    return std.mem.eql(u8, &a.binding, &b.binding) and
+        std.mem.eql(u8, a.namespace, b.namespace) and
+        std.mem.eql(u8, &a.configuration_fingerprint, &b.configuration_fingerprint) and
+        connector_equal and
+        a.transport == b.transport and
+        a.policy == b.policy and
+        std.mem.eql(u8, a.client.name, b.client.name) and
+        std.mem.eql(u8, a.client.version, b.client.version) and
+        a.timeout_ms == b.timeout_ms and
+        std.meta.eql(a.protocol_limits, b.protocol_limits);
+}
+
+fn desiredSpecEqual(a: OwnedSpec, b: OwnedSpec) bool {
+    return instanceSpecEqual(a, b);
+}
+
+/// Runtime-local catalog and instance control plane.
+///
+/// Public operations are thread-safe. `deinit` is an exclusive terminal
+/// operation: the Host must first join control-plane callers and release every
+/// retained Snapshot, View, and dispatch Lease.
 pub const Manager = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
+    /// Heap-pinned because published Snapshots retain this address even if a
+    /// caller moves the Manager value before destruction.
+    instances: *instance_pool.Pool,
     limits: Limits,
     clock: Clock,
     specs: []OwnedSpec,
-    refresh_mutex: sync.Mutex = .{},
+    reconcile_mutex: sync.Mutex = .{},
+    reconcile_condition: sync.Condition = .{},
+    reconcile_active: bool = false,
+    reconcile_owner: ?std.Thread.Id = null,
     current_mutex: sync.Mutex = .{},
     current: ?*Snapshot = null,
+    desired_revision: u64 = 0,
+    active_revision: u64 = 0,
+    convergence: Convergence = .converged,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -375,6 +508,7 @@ pub const Manager = struct {
             destination.* = .{
                 .binding = spec.binding,
                 .namespace = namespace,
+                .configuration_fingerprint = spec.configuration_fingerprint,
                 .connector = spec.connector,
                 .transport = spec.transport,
                 .policy = spec.policy,
@@ -383,9 +517,13 @@ pub const Manager = struct {
                 .protocol_limits = spec.protocol_limits,
             };
         }
+        const instances = allocator.create(instance_pool.Pool) catch
+            return error.OutOfMemory;
+        instances.* = instance_pool.Pool.init(allocator);
         return .{
             .allocator = allocator,
             .arena = arena,
+            .instances = instances,
             .limits = limits,
             .clock = clock,
             .specs = owned,
@@ -394,6 +532,8 @@ pub const Manager = struct {
 
     pub fn deinit(self: *Manager) void {
         if (self.current) |snapshot| snapshot.release();
+        self.instances.deinit();
+        self.allocator.destroy(self.instances);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -402,9 +542,9 @@ pub const Manager = struct {
     /// catalog issues and do not prevent other servers (or Conversation) from
     /// being usable. Only Runtime-local allocation/global catalog failures
     /// abort publication, leaving the old generation untouched.
-    pub fn refresh(self: *Manager) Error!u64 {
-        self.refresh_mutex.lock();
-        defer self.refresh_mutex.unlock();
+    pub fn refresh(self: *Manager) ControlError!u64 {
+        try self.beginReconcile();
+        defer self.finishReconcile();
         self.current_mutex.lock();
         const generation = if (self.current) |snapshot|
             std.math.add(u64, snapshot.generation, 1) catch {
@@ -415,13 +555,143 @@ pub const Manager = struct {
             1;
         self.current_mutex.unlock();
 
-        const replacement = try self.buildSnapshot(generation);
+        const replacement = self.buildSnapshot(
+            self.specs,
+            generation,
+            null,
+            false,
+        ) catch |err| switch (err) {
+            error.CandidateRejected => unreachable,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidConfig => return error.InvalidConfig,
+            error.ResourceLimit => return error.ResourceLimit,
+            error.NotRefreshed => return error.NotRefreshed,
+        };
         self.current_mutex.lock();
         const previous = self.current;
         self.current = replacement;
         self.current_mutex.unlock();
         if (previous) |snapshot| snapshot.release();
         return generation;
+    }
+
+    /// Apply one complete desired server set. Candidate construction is
+    /// off-side and strict: a changed server that cannot connect rejects the
+    /// candidate and leaves the last-known-good specs and catalog untouched.
+    /// Unchanged healthy servers retain their exact instance and copied
+    /// discovery values instead of reconnecting.
+    pub fn apply(
+        self: *Manager,
+        desired_revision: u64,
+        specs: []const ServerSpec,
+    ) ControlError!ApplyReport {
+        if (desired_revision == 0) return error.InvalidConfig;
+        var candidate_arena = std.heap.ArenaAllocator.init(self.allocator);
+        var candidate_transferred = false;
+        defer if (!candidate_transferred) candidate_arena.deinit();
+        const candidate_specs = try ownSpecs(
+            candidate_arena.allocator(),
+            specs,
+            self.limits,
+        );
+        try self.beginReconcile();
+        defer self.finishReconcile();
+
+        self.current_mutex.lock();
+        const published_desired = self.desired_revision;
+        const published_active = self.active_revision;
+        const published_convergence = self.convergence;
+        const published_generation = if (self.current) |snapshot| snapshot.generation else 0;
+        const current_covers_desired = snapshotCoversSpecs(self.current, candidate_specs);
+        self.current_mutex.unlock();
+        if (desired_revision < published_desired) {
+            return .{
+                .disposition = .superseded,
+                .desired_revision = published_desired,
+                .active_revision = published_active,
+                .catalog_generation = published_generation,
+            };
+        }
+        if (desired_revision == published_desired and published_convergence != .rejected) {
+            if (!ownedSpecSetsEqual(self.specs, candidate_specs))
+                return error.InvalidConfig;
+            if (current_covers_desired) return .{
+                .disposition = .applied,
+                .desired_revision = published_desired,
+                .active_revision = published_active,
+                .catalog_generation = published_generation,
+            };
+        }
+        if (ownedSpecSetsEqual(self.specs, candidate_specs) and current_covers_desired) {
+            self.current_mutex.lock();
+            self.desired_revision = desired_revision;
+            self.active_revision = desired_revision;
+            self.convergence = .converged;
+            const generation = if (self.current) |snapshot| snapshot.generation else 0;
+            self.current_mutex.unlock();
+            return .{
+                .disposition = .applied,
+                .desired_revision = desired_revision,
+                .active_revision = desired_revision,
+                .catalog_generation = generation,
+            };
+        }
+
+        self.current_mutex.lock();
+        const previous = self.current;
+        const generation = if (previous) |snapshot|
+            std.math.add(u64, snapshot.generation, 1) catch {
+                self.current_mutex.unlock();
+                return error.ResourceLimit;
+            }
+        else
+            1;
+        self.current_mutex.unlock();
+        const replacement = self.buildSnapshot(
+            candidate_specs,
+            generation,
+            previous,
+            true,
+        ) catch |err| switch (err) {
+            error.CandidateRejected => {
+                self.current_mutex.lock();
+                self.desired_revision = desired_revision;
+                self.convergence = .rejected;
+                const active_revision = self.active_revision;
+                const current_generation = if (self.current) |snapshot| snapshot.generation else 0;
+                self.current_mutex.unlock();
+                return .{
+                    .disposition = .rejected,
+                    .desired_revision = desired_revision,
+                    .active_revision = active_revision,
+                    .catalog_generation = current_generation,
+                };
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidConfig => return error.InvalidConfig,
+            error.ResourceLimit => return error.ResourceLimit,
+            error.NotRefreshed => return error.NotRefreshed,
+        };
+
+        self.current_mutex.lock();
+        const retired = self.current;
+        self.current = replacement;
+        self.desired_revision = desired_revision;
+        self.active_revision = desired_revision;
+        self.convergence = .converged;
+        self.current_mutex.unlock();
+        var retired_arena = self.arena;
+        self.arena = candidate_arena;
+        candidate_transferred = true;
+        self.specs = candidate_specs;
+        if (retired) |snapshot| snapshot.release();
+        retired_arena.deinit();
+        return .{
+            .disposition = .applied,
+            .desired_revision = desired_revision,
+            .active_revision = desired_revision,
+            .catalog_generation = generation,
+        };
     }
 
     pub fn retainCurrent(self: *Manager) Error!*Snapshot {
@@ -435,12 +705,56 @@ pub const Manager = struct {
         self: *Manager,
         backing: std.mem.Allocator,
     ) Error!Description {
-        const snapshot = try self.retainCurrent();
-        defer snapshot.release();
-        return snapshot.describe(backing);
+        self.current_mutex.lock();
+        const snapshot = self.current orelse {
+            self.current_mutex.unlock();
+            return error.NotRefreshed;
+        };
+        const retained = snapshot.retain() catch |err| {
+            self.current_mutex.unlock();
+            return err;
+        };
+        const desired_revision = self.desired_revision;
+        const active_revision = self.active_revision;
+        const convergence = self.convergence;
+        self.current_mutex.unlock();
+        defer retained.release();
+        var description = try retained.describe(backing);
+        description.desired_revision = desired_revision;
+        description.active_revision = active_revision;
+        description.convergence = convergence;
+        return description;
     }
 
-    fn buildSnapshot(self: *Manager, generation: u64) Error!*Snapshot {
+    fn beginReconcile(self: *Manager) ControlError!void {
+        const current_thread = std.Thread.getCurrentId();
+        self.reconcile_mutex.lock();
+        defer self.reconcile_mutex.unlock();
+        if (self.reconcile_active and self.reconcile_owner.? == current_thread)
+            return error.ReentrantControlCall;
+        while (self.reconcile_active)
+            self.reconcile_condition.wait(&self.reconcile_mutex);
+        self.reconcile_active = true;
+        self.reconcile_owner = current_thread;
+    }
+
+    fn finishReconcile(self: *Manager) void {
+        self.reconcile_mutex.lock();
+        std.debug.assert(self.reconcile_active);
+        std.debug.assert(self.reconcile_owner.? == std.Thread.getCurrentId());
+        self.reconcile_active = false;
+        self.reconcile_owner = null;
+        self.reconcile_condition.broadcast();
+        self.reconcile_mutex.unlock();
+    }
+
+    fn buildSnapshot(
+        self: *Manager,
+        specs: []const OwnedSpec,
+        generation: u64,
+        reuse_from: ?*const Snapshot,
+        strict_candidate: bool,
+    ) BuildError!*Snapshot {
         const snapshot = self.allocator.create(Snapshot) catch return error.OutOfMemory;
         errdefer self.allocator.destroy(snapshot);
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -450,8 +764,48 @@ pub const Manager = struct {
         defer servers.deinit(a);
         var issues: std.ArrayList(CatalogIssue) = .empty;
         defer issues.deinit(a);
-        errdefer for (servers.items) |server| server.client.deinit();
-        for (self.specs) |spec| {
+        // Keep instance ownership independent from the arena-backed Server
+        // ArrayList. `toOwnedSlice` empties that list, so it cannot serve as
+        // the rollback ledger for a later allocation failure.
+        var instance_owners: std.ArrayList(instance_pool.InstanceId) = .empty;
+        defer instance_owners.deinit(self.allocator);
+        errdefer for (instance_owners.items) |id|
+            self.instances.releaseId(id);
+        for (specs) |spec| {
+            var strict_server = strict_candidate;
+            if (reuse_from) |previous| {
+                const prior_spec = findOwnedSpec(self.specs, &spec.binding);
+                const prior_server = previous.findServer(&spec.binding);
+                const unchanged = prior_spec != null and
+                    instanceSpecEqual(prior_spec.?.*, spec);
+                if (unchanged and prior_server != null) {
+                    const cloned = try cloneServerRecord(
+                        a,
+                        prior_server.?,
+                        spec.namespace,
+                    );
+                    self.instances.retainId(cloned.instance_id) catch |err|
+                        return switch (err) {
+                            error.OutOfMemory => error.OutOfMemory,
+                            error.InstanceUnavailable => error.CandidateRejected,
+                            error.ResourceLimit => error.ResourceLimit,
+                        };
+                    instance_owners.append(
+                        self.allocator,
+                        cloned.instance_id,
+                    ) catch {
+                        self.instances.releaseId(cloned.instance_id);
+                        return error.OutOfMemory;
+                    };
+                    servers.append(a, cloned) catch return error.OutOfMemory;
+                    continue;
+                }
+                // A server may be absent from the previous generation because
+                // its last refresh failed. It is still an unchanged desired
+                // definition, so another transient failure remains a
+                // server-scoped issue and cannot reject unrelated additions.
+                if (unchanged) strict_server = false;
+            }
             const connected = runtime.connectServer(self.allocator, spec.runtimeConfig());
             const client = switch (connected) {
                 .client => |value| value,
@@ -460,6 +814,7 @@ pub const Manager = struct {
                         .out_of_memory => return error.OutOfMemory,
                         .resource_limit, .diagnostic => {},
                     }
+                    if (strict_server) return error.CandidateRejected;
                     try appendIssue(&issues, a, self.limits, .{
                         .server_binding_identity = spec.binding,
                         .kind = .{ .connection = failure },
@@ -467,11 +822,23 @@ pub const Manager = struct {
                     continue;
                 },
             };
-            errdefer client.deinit();
+            const instance_id = self.instances.adopt(client) catch |err| {
+                client.deinit();
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.ResourceLimit, error.InstanceUnavailable => error.ResourceLimit,
+                };
+            };
+            instance_owners.append(self.allocator, instance_id) catch {
+                self.instances.releaseId(instance_id);
+                return error.OutOfMemory;
+            };
             const namespace = a.dupe(u8, spec.namespace) catch return error.OutOfMemory;
             var admitted_tools: std.ArrayList(AdmittedTool) = .empty;
             defer admitted_tools.deinit(a);
-            for (client.catalog.tools) |*tool| {
+            for (client.catalog.tools) |*source_tool| {
+                const tool = cloneTool(a, source_tool) catch
+                    return error.OutOfMemory;
                 const model_name = deriveModelName(
                     a,
                     namespace,
@@ -497,8 +864,15 @@ pub const Manager = struct {
                 return error.OutOfMemory;
             servers.append(a, .{
                 .namespace = namespace,
-                .client = client,
-                .fingerprint = serverFingerprint(self.allocator, client, owned_admitted) catch
+                .server_binding_identity = spec.binding,
+                .instance_id = instance_id,
+                .era = client.era,
+                .fingerprint = serverFingerprint(
+                    self.allocator,
+                    &spec.binding,
+                    client.era,
+                    owned_admitted,
+                ) catch
                     return error.OutOfMemory,
                 .expires_at_ns = try expiresAt(
                     // Protocol TTL starts when this server's complete
@@ -517,6 +891,7 @@ pub const Manager = struct {
         const owned_issues = issues.toOwnedSlice(a) catch return error.OutOfMemory;
         snapshot.* = .{
             .backing = self.allocator,
+            .instances = self.instances,
             .arena = arena,
             .generation = generation,
             .fingerprint = snapshotFingerprint(owned_servers),
@@ -534,6 +909,73 @@ const Inspection = union(enum) {
     unavailable: ToolIssue,
 };
 
+fn cloneServerRecord(
+    allocator: std.mem.Allocator,
+    source: *const ServerRecord,
+    namespace: []const u8,
+) error{OutOfMemory}!ServerRecord {
+    const admitted_tools = allocator.alloc(
+        AdmittedTool,
+        source.admitted_tools.len,
+    ) catch return error.OutOfMemory;
+    for (source.admitted_tools, admitted_tools) |admitted, *destination| {
+        destination.* = .{
+            .canonical = try cloneTool(allocator, &admitted.canonical),
+            .model_name = allocator.dupe(u8, admitted.model_name) catch
+                return error.OutOfMemory,
+            .diagnostics = allocator.dupe(
+                schema.ProjectionDiagnostic,
+                admitted.diagnostics,
+            ) catch return error.OutOfMemory,
+        };
+    }
+    return .{
+        .namespace = allocator.dupe(u8, namespace) catch
+            return error.OutOfMemory,
+        .server_binding_identity = source.server_binding_identity,
+        .instance_id = source.instance_id,
+        .era = source.era,
+        .fingerprint = source.fingerprint,
+        .expires_at_ns = source.expires_at_ns,
+        .cache_scope = source.cache_scope,
+        .admitted_tools = admitted_tools,
+    };
+}
+
+fn cloneTool(
+    allocator: std.mem.Allocator,
+    source: *const canonical.Tool,
+) error{OutOfMemory}!canonical.Tool {
+    return .{
+        .identity = .{
+            .server_binding_identity = source.identity.server_binding_identity,
+            .name = allocator.dupe(u8, source.identity.name) catch
+                return error.OutOfMemory,
+            .schema_fingerprint = source.identity.schema_fingerprint,
+        },
+        .title = try cloneOptional(allocator, source.title),
+        .description = try cloneOptional(allocator, source.description),
+        .input_schema_json = allocator.dupe(u8, source.input_schema_json) catch
+            return error.OutOfMemory,
+        .output_schema_json = try cloneOptional(allocator, source.output_schema_json),
+        .annotations_json = try cloneOptional(allocator, source.annotations_json),
+        .icons_json = try cloneOptional(allocator, source.icons_json),
+        .meta_json = try cloneOptional(allocator, source.meta_json),
+        .execution_json = try cloneOptional(allocator, source.execution_json),
+        .execution_mode = source.execution_mode,
+        .raw_json = allocator.dupe(u8, source.raw_json) catch
+            return error.OutOfMemory,
+    };
+}
+
+fn cloneOptional(
+    allocator: std.mem.Allocator,
+    value: ?[]const u8,
+) error{OutOfMemory}!?[]const u8 {
+    const bytes = value orelse return null;
+    return allocator.dupe(u8, bytes) catch error.OutOfMemory;
+}
+
 /// Perform the one authoritative executable admission pass. The temporary
 /// PreparedTool proves the complete schema can be parsed and projected under
 /// the declared profile; only compact diagnostics survive in the Snapshot.
@@ -541,11 +983,11 @@ fn inspectTool(
     snapshot_allocator: std.mem.Allocator,
     scratch_backing: std.mem.Allocator,
     model_name: []const u8,
-    tool: *const canonical.Tool,
+    tool: canonical.Tool,
 ) error{OutOfMemory}!Inspection {
     if (tool.execution_mode == .task_required)
         return .{ .unavailable = .task_required_unsupported };
-    var admission = try schema.prepareTool(scratch_backing, model_name, tool, .{});
+    var admission = try schema.prepareTool(scratch_backing, model_name, &tool, .{});
     return switch (admission) {
         .unavailable => |issue| .{ .unavailable = .{ .schema = issue } },
         .available => |*prepared| blk: {
@@ -573,7 +1015,7 @@ pub fn materializeAdmittedTool(
     const admission = schema.prepareTool(
         backing,
         admitted.model_name,
-        admitted.canonical,
+        &admitted.canonical,
         .{},
     ) catch return error.OutOfMemory;
     return switch (admission) {
@@ -679,19 +1121,20 @@ fn validNamespace(value: []const u8, max_bytes: usize) bool {
 
 fn serverFingerprint(
     allocator: std.mem.Allocator,
-    client: *const runtime.Client,
+    binding: *const [32]u8,
+    era: canonical.Era,
     admitted_tools: []const AdmittedTool,
 ) error{OutOfMemory}![32]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     // Stable domain; admitted contents, not the ABI revision, define change.
     hasher.update("agentcore-r6-mcp-server-catalog\x00");
-    hasher.update(&client.binding);
-    hasher.update(client.era.version());
+    hasher.update(binding);
+    hasher.update(era.version());
     const digests = allocator.alloc([32]u8, admitted_tools.len) catch
         return error.OutOfMemory;
     defer allocator.free(digests);
     for (admitted_tools, digests) |admitted, *digest| {
-        const tool = admitted.canonical;
+        const tool = &admitted.canonical;
         var tool_hasher = std.crypto.hash.sha2.Sha256.init(.{});
         hashBytes(&tool_hasher, tool.identity.name);
         tool_hasher.update(&tool.identity.schema_fingerprint);
@@ -709,7 +1152,7 @@ fn snapshotFingerprint(servers: []const ServerRecord) [32]u8 {
     // Stable domain retained for unchanged Runtime catalog generations.
     hasher.update("agentcore-r6-mcp-runtime-catalog\x00");
     for (servers) |server| {
-        hasher.update(&server.client.binding);
+        hasher.update(&server.server_binding_identity);
         hasher.update(&server.fingerprint);
     }
     var result: [32]u8 = undefined;
@@ -720,7 +1163,11 @@ fn snapshotFingerprint(servers: []const ServerRecord) [32]u8 {
 fn sortServers(servers: []ServerRecord) void {
     std.mem.sort(ServerRecord, servers, {}, struct {
         fn lessThan(_: void, left: ServerRecord, right: ServerRecord) bool {
-            return std.mem.order(u8, &left.client.binding, &right.client.binding) == .lt;
+            return std.mem.order(
+                u8,
+                &left.server_binding_identity,
+                &right.server_binding_identity,
+            ) == .lt;
         }
     }.lessThan);
 }
@@ -749,6 +1196,13 @@ const Fake = struct {
     paginate: bool = false,
     required_task: bool = false,
     fail_open_oom: bool = false,
+    fail_open: bool = false,
+    reenter_manager: ?*Manager = null,
+    saw_reentrant_rejection: bool = false,
+    block_mutex: sync.Mutex = .{},
+    block_condition: sync.Condition = .{},
+    block_open: bool = false,
+    open_waiting: bool = false,
 
     const Conn = struct { owner: *Fake };
 
@@ -758,7 +1212,22 @@ const Fake = struct {
 
     fn open(raw: *anyopaque, _: runtime.ConnectionPurpose, _: canonical.Era) anyerror!runtime.OpenOutcome {
         const self: *Fake = @ptrCast(@alignCast(raw));
+        if (self.reenter_manager) |manager| {
+            self.reenter_manager = null;
+            _ = manager.apply(99, &.{}) catch |err| {
+                self.saw_reentrant_rejection = err == error.ReentrantControlCall;
+            };
+        }
+        self.block_mutex.lock();
+        if (self.block_open) {
+            self.open_waiting = true;
+            self.block_condition.broadcast();
+            while (self.block_open)
+                self.block_condition.wait(&self.block_mutex);
+        }
+        self.block_mutex.unlock();
         if (self.fail_open_oom) return error.OutOfMemory;
+        if (self.fail_open) return .server_error;
         const connection = try std.heap.c_allocator.create(Conn);
         connection.* = .{ .owner = self };
         self.opens += 1;
@@ -865,6 +1334,12 @@ test "catalog refresh publishes generations while retained Run snapshot remains 
     defer second.release();
     try std.testing.expectEqual(@as(u64, 1), first.generation);
     try std.testing.expectEqual(@as(u64, 2), second.generation);
+    try std.testing.expect(first.servers[0].instance_id != second.servers[0].instance_id);
+    var first_instance = try first.retainInstance(first.servers[0].instance_id);
+    defer first_instance.deinit();
+    var second_instance = try second.retainInstance(second.servers[0].instance_id);
+    defer second_instance.deinit();
+    try std.testing.expect(first_instance.client() != second_instance.client());
     try std.testing.expect(first.findTool(&specs[0].binding, "weather") != null);
     var description = try manager.describeCurrent(std.testing.allocator);
     defer description.deinit();
@@ -887,6 +1362,327 @@ test "catalog refresh publishes generations while retained Run snapshot remains 
     // Each disposable probe and the Manager's released generation-1 owner are
     // closed; the explicit `first` retain keeps its actual connection alive.
     try std.testing.expectEqual(@as(u8, 2), fake.closes);
+}
+
+test "Connector callback reentry is rejected instead of deadlocking" {
+    var fake = Fake{};
+    const specs = [_]ServerSpec{.{
+        .binding = [_]u8{0xaf} ** 32,
+        .namespace = "reentrant",
+        .connector = fake.connector(),
+        .transport = .stdio,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    }};
+    var manager = try Manager.init(std.testing.allocator, &specs, .{});
+    defer manager.deinit();
+    fake.reenter_manager = &manager;
+    _ = try manager.refresh();
+    try std.testing.expect(fake.saw_reentrant_rejection);
+}
+
+test "describe does not wait for an in-flight Connector handshake" {
+    const RefreshWorker = struct {
+        manager: *Manager,
+        failed: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            _ = self.manager.refresh() catch {
+                self.failed.store(true, .release);
+                return;
+            };
+        }
+    };
+    const DescribeWorker = struct {
+        manager: *Manager,
+        completed: *std.atomic.Value(bool),
+        failed: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            var description = self.manager.describeCurrent(std.heap.c_allocator) catch {
+                self.failed.store(true, .release);
+                self.completed.store(true, .release);
+                return;
+            };
+            description.deinit();
+            self.completed.store(true, .release);
+        }
+    };
+
+    var fake = Fake{};
+    const specs = [_]ServerSpec{.{
+        .binding = [_]u8{0xb0} ** 32,
+        .namespace = "nonblocking",
+        .connector = fake.connector(),
+        .transport = .stdio,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    }};
+    var manager = try Manager.init(std.testing.allocator, &specs, .{});
+    defer manager.deinit();
+    _ = try manager.refresh();
+
+    fake.block_mutex.lock();
+    fake.block_open = true;
+    fake.open_waiting = false;
+    fake.block_mutex.unlock();
+    var refresh_failed = std.atomic.Value(bool).init(false);
+    var refresh_worker = RefreshWorker{
+        .manager = &manager,
+        .failed = &refresh_failed,
+    };
+    const refresh_thread = try std.Thread.spawn(.{}, RefreshWorker.run, .{&refresh_worker});
+    var refresh_joined = false;
+    defer if (!refresh_joined) refresh_thread.join();
+
+    var observed_blocked_handshake = false;
+    for (0..1_000) |_| {
+        fake.block_mutex.lock();
+        observed_blocked_handshake = fake.open_waiting;
+        fake.block_mutex.unlock();
+        if (observed_blocked_handshake) break;
+        sync.sleepMs(1);
+    }
+
+    var describe_completed = std.atomic.Value(bool).init(false);
+    var describe_failed = std.atomic.Value(bool).init(false);
+    var describe_worker = DescribeWorker{
+        .manager = &manager,
+        .completed = &describe_completed,
+        .failed = &describe_failed,
+    };
+    const describe_thread = try std.Thread.spawn(.{}, DescribeWorker.run, .{&describe_worker});
+    var describe_joined = false;
+    defer if (!describe_joined) describe_thread.join();
+
+    var completed_before_unblock = false;
+    for (0..1_000) |_| {
+        if (describe_completed.load(.acquire)) {
+            completed_before_unblock = true;
+            break;
+        }
+        sync.sleepMs(1);
+    }
+
+    // Always release the Connector before asserting so a failed regression
+    // test cannot strand either worker thread.
+    fake.block_mutex.lock();
+    fake.block_open = false;
+    fake.block_condition.broadcast();
+    fake.block_mutex.unlock();
+    refresh_thread.join();
+    refresh_joined = true;
+    describe_thread.join();
+    describe_joined = true;
+
+    try std.testing.expect(observed_blocked_handshake);
+    try std.testing.expect(completed_before_unblock);
+    try std.testing.expect(!describe_failed.load(.acquire));
+    try std.testing.expect(!refresh_failed.load(.acquire));
+}
+
+test "declarative apply reuses unchanged instances and rejects failed candidates" {
+    var stable = Fake{};
+    var added = Fake{};
+    var failing = Fake{ .fail_open = true };
+    const stable_binding = [_]u8{0xa1} ** 32;
+    const added_binding = [_]u8{0xa2} ** 32;
+    const initial = [_]ServerSpec{.{
+        .binding = stable_binding,
+        .namespace = "stable",
+        .connector = stable.connector(),
+        .transport = .stdio,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    }};
+    var manager = try Manager.init(std.testing.allocator, &initial, .{});
+    defer manager.deinit();
+    try std.testing.expectEqual(@as(u64, 1), try manager.refresh());
+    const first = try manager.retainCurrent();
+    defer first.release();
+    const stable_instance = first.servers[0].instance_id;
+
+    const no_op = try manager.apply(1, &initial);
+    try std.testing.expectEqual(ApplyDisposition.applied, no_op.disposition);
+    try std.testing.expectEqual(@as(u64, 1), no_op.catalog_generation);
+    try std.testing.expectEqual(@as(u8, 2), stable.opens);
+
+    const expanded = [_]ServerSpec{
+        initial[0],
+        .{
+            .binding = added_binding,
+            .namespace = "added",
+            .connector = added.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+    };
+    const applied = try manager.apply(2, &expanded);
+    try std.testing.expectEqual(ApplyDisposition.applied, applied.disposition);
+    try std.testing.expectEqual(@as(u64, 2), applied.catalog_generation);
+    const second = try manager.retainCurrent();
+    defer second.release();
+    try std.testing.expectEqual(
+        stable_instance,
+        second.findServer(&stable_binding).?.instance_id,
+    );
+    try std.testing.expectEqual(@as(u8, 2), stable.opens);
+    try std.testing.expectEqual(@as(u8, 2), added.opens);
+
+    const rejected_specs = [_]ServerSpec{
+        .{
+            .binding = stable_binding,
+            .namespace = "stable",
+            .connector = failing.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+        expanded[1],
+    };
+    const rejected = try manager.apply(3, &rejected_specs);
+    try std.testing.expectEqual(ApplyDisposition.rejected, rejected.disposition);
+    try std.testing.expectEqual(@as(u64, 2), rejected.active_revision);
+    try std.testing.expectEqual(@as(u64, 2), rejected.catalog_generation);
+    var rejected_description = try manager.describeCurrent(std.testing.allocator);
+    defer rejected_description.deinit();
+    try std.testing.expectEqual(@as(u64, 3), rejected_description.desired_revision);
+    try std.testing.expectEqual(@as(u64, 2), rejected_description.active_revision);
+    try std.testing.expectEqual(Convergence.rejected, rejected_description.convergence);
+    const after_rejection = try manager.retainCurrent();
+    defer after_rejection.release();
+    try std.testing.expectEqual(
+        stable_instance,
+        after_rejection.findServer(&stable_binding).?.instance_id,
+    );
+
+    failing.fail_open = false;
+    const retried = try manager.apply(3, &rejected_specs);
+    try std.testing.expectEqual(ApplyDisposition.applied, retried.disposition);
+    try std.testing.expectEqual(@as(u64, 3), retried.active_revision);
+    const after_retry = try manager.retainCurrent();
+    defer after_retry.release();
+    const retried_stable_instance = after_retry.findServer(&stable_binding).?.instance_id;
+    try std.testing.expect(retried_stable_instance != stable_instance);
+
+    const retained_after_remove = [_]ServerSpec{rejected_specs[0]};
+    const removed = try manager.apply(4, &retained_after_remove);
+    try std.testing.expectEqual(ApplyDisposition.applied, removed.disposition);
+    try std.testing.expectEqual(@as(u64, 4), removed.catalog_generation);
+    const final = try manager.retainCurrent();
+    defer final.release();
+    try std.testing.expectEqual(@as(usize, 1), final.servers.len);
+    try std.testing.expectEqual(retried_stable_instance, final.servers[0].instance_id);
+}
+
+test "unchanged unavailable server does not reject an unrelated addition" {
+    var healthy = Fake{};
+    var unavailable = Fake{ .fail_open = true };
+    var added = Fake{};
+    const initial = [_]ServerSpec{
+        .{
+            .binding = [_]u8{0xc1} ** 32,
+            .namespace = "healthy",
+            .connector = healthy.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+        .{
+            .binding = [_]u8{0xc2} ** 32,
+            .namespace = "unavailable",
+            .connector = unavailable.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+    };
+    var manager = try Manager.init(std.testing.allocator, &initial, .{});
+    defer manager.deinit();
+    _ = try manager.refresh();
+    const expanded = [_]ServerSpec{
+        initial[0],
+        initial[1],
+        .{
+            .binding = [_]u8{0xc3} ** 32,
+            .namespace = "added",
+            .connector = added.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+    };
+    const report = try manager.apply(1, &expanded);
+    try std.testing.expectEqual(ApplyDisposition.applied, report.disposition);
+    var description = try manager.describeCurrent(std.testing.allocator);
+    defer description.deinit();
+    try std.testing.expectEqual(@as(usize, 2), description.servers.len);
+    try std.testing.expectEqual(@as(usize, 1), description.issues.len);
+    try std.testing.expectEqual(@as(u32, 2), added.opens);
+}
+
+test "reapplying an unchanged desired set reconnects a missing server" {
+    var server = Fake{ .fail_open = true };
+    const binding = [_]u8{0xc4} ** 32;
+    const specs = [_]ServerSpec{.{
+        .binding = binding,
+        .namespace = "recovering",
+        .connector = server.connector(),
+        .transport = .stdio,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    }};
+    var manager = try Manager.init(std.testing.allocator, &specs, .{});
+    defer manager.deinit();
+    _ = try manager.refresh();
+    var missing = try manager.describeCurrent(std.testing.allocator);
+    defer missing.deinit();
+    try std.testing.expectEqual(@as(usize, 0), missing.servers.len);
+    try std.testing.expectEqual(@as(usize, 1), missing.issues.len);
+
+    server.fail_open = false;
+    const report = try manager.apply(1, &specs);
+    try std.testing.expectEqual(ApplyDisposition.applied, report.disposition);
+    try std.testing.expectEqual(@as(u64, 2), report.catalog_generation);
+    var recovered = try manager.describeCurrent(std.testing.allocator);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), recovered.servers.len);
+    try std.testing.expectEqual(@as(usize, 0), recovered.issues.len);
+    try std.testing.expectEqualSlices(
+        u8,
+        &binding,
+        &recovered.servers[0].server_binding_identity,
+    );
+}
+
+test "rejected candidate releases instances acquired before the failure" {
+    var admitted_first = Fake{};
+    var rejected_second = Fake{ .fail_open = true };
+    var manager = try Manager.init(std.testing.allocator, &.{}, .{});
+    defer manager.deinit();
+    _ = try manager.refresh();
+    const candidate = [_]ServerSpec{
+        .{
+            .binding = [_]u8{0xc5} ** 32,
+            .namespace = "admitted",
+            .connector = admitted_first.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+        .{
+            .binding = [_]u8{0xc6} ** 32,
+            .namespace = "rejected",
+            .connector = rejected_second.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+    };
+    const report = try manager.apply(1, &candidate);
+    try std.testing.expectEqual(ApplyDisposition.rejected, report.disposition);
+    try std.testing.expectEqual(@as(u64, 1), report.catalog_generation);
+    try std.testing.expect(admitted_first.opens != 0);
+    try std.testing.expectEqual(admitted_first.opens, admitted_first.closes);
+    var current = try manager.describeCurrent(std.testing.allocator);
+    defer current.deinit();
+    try std.testing.expectEqual(@as(usize, 0), current.servers.len);
+}
+
+test "catalog generations contain values and opaque ids, never Clients" {
+    try std.testing.expect(!@hasField(ServerRecord, "client"));
+    try std.testing.expect(!@hasField(AdmittedTool, "client"));
+    try std.testing.expect(@hasField(ServerRecord, "instance_id"));
 }
 
 test "catalog description uses an exact destination window for every server" {
@@ -1012,6 +1808,38 @@ test "Runtime-local allocation failure preserves the previous Snapshot" {
     try std.testing.expect(retained.findTool(&binding, "weather") != null);
 }
 
+fn catalogRefreshAllocationFailure(allocator: std.mem.Allocator) !void {
+    var healthy = Fake{};
+    var unavailable = Fake{ .fail_open = true };
+    const specs = [_]ServerSpec{
+        .{
+            .binding = [_]u8{0x44} ** 32,
+            .namespace = "healthy",
+            .connector = healthy.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+        .{
+            .binding = [_]u8{0x45} ** 32,
+            .namespace = "unavailable",
+            .connector = unavailable.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+    };
+    var manager = try Manager.init(allocator, &specs, .{});
+    defer manager.deinit();
+    _ = try manager.refresh();
+}
+
+test "catalog construction closes every instance at every allocation seam" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        catalogRefreshAllocationFailure,
+        .{},
+    );
+}
+
 test "catalog TTL policy supplies legacy default and caps modern duration" {
     const limits = Limits{ .legacy_ttl_ms = 30_000, .max_ttl_ms = 300_000 };
     try std.testing.expectEqual(
@@ -1103,10 +1931,7 @@ test "Catalog is the sole admission authority for schema and required-task tools
     try std.testing.expect(snapshot.findTool(&invalid_binding, "weather") == null);
     const required_server = snapshot.findServer(&required_binding) orelse
         return error.TestUnexpectedResult;
-    try std.testing.expectEqual(
-        canonical.ExecutionMode.task_required,
-        required_server.client.catalog.tools[0].execution_mode,
-    );
+    try std.testing.expectEqual(@as(usize, 0), required_server.admitted_tools.len);
     try std.testing.expect(snapshot.findTool(&required_binding, "tasked") == null);
 
     var description = try snapshot.describe(std.testing.allocator);

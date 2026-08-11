@@ -9,6 +9,7 @@ pub const classic = @import("mcp_classic.zig");
 pub const negotiation = @import("mcp_negotiation.zig");
 pub const schema = @import("mcp_schema.zig");
 pub const runtime = @import("mcp_runtime.zig");
+pub const instance_pool = @import("mcp_instance_pool.zig");
 pub const catalog = @import("mcp_catalog.zig");
 pub const session = @import("mcp_session.zig");
 pub const checkpoint = @import("mcp_checkpoint.zig");

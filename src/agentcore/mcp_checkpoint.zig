@@ -61,20 +61,20 @@ pub const DecodedState = struct {
     }
 };
 
-pub fn encodeView(
+pub fn encodeSelection(
     allocator: std.mem.Allocator,
-    optional_view: ?*const mcp_session.View,
+    optional_selection: ?*const mcp_session.Selection,
 ) Error![]u8 {
-    const source = optional_view orelse
+    const source = optional_selection orelse
         return allocator.alloc(u8, 0) catch error.OutOfMemory;
     const entries = allocator.alloc(PersistedEntry, source.entries.len) catch
         return error.OutOfMemory;
     defer allocator.free(entries);
     for (source.entries, entries) |entry, *persisted| persisted.* = .{
-        .server_binding_identity = entry.tool.identity.server_binding_identity,
-        .schema_fingerprint = entry.tool.identity.schema_fingerprint,
-        .tool_name = entry.tool.identity.name,
-        .era = entry.server.client.era,
+        .server_binding_identity = entry.server_binding_identity,
+        .schema_fingerprint = entry.schema_fingerprint,
+        .tool_name = entry.tool_name,
+        .era = entry.era,
     };
     return encode(allocator, .{
         .catalog_generation = source.catalog_generation,
