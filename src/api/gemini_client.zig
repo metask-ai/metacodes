@@ -32,6 +32,7 @@
 const std = @import("std");
 const http = std.http;
 const connection_gate = @import("connection_gate.zig");
+const ResponseStatus = @import("http_status.zig").ResponseStatus;
 const log = @import("../util/log.zig");
 const types = @import("../types.zig");
 const json_mod = @import("../json.zig");
@@ -238,9 +239,10 @@ pub const GeminiClient = struct {
             log.errId("gemini", rid, "receiveHead failed: {s}", .{@errorName(err)});
             return err;
         };
+        const status = ResponseStatus.capture(&response);
         connection_lease.release();
-        if (response.head.status != .ok) {
-            log.errId("gemini", rid, "HTTP {d}", .{@intFromEnum(response.head.status)});
+        if (!status.isOk()) {
+            log.errId("gemini", rid, "HTTP {d} {s}", .{ status.code, status.name });
             return error.RequestFailed;
         }
         // receiveHead 成功后,req_ptr.* 是个开着连接的完整 Request。到 heap 转移所有权之前若出错

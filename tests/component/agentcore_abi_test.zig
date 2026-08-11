@@ -3115,6 +3115,61 @@ test "L2 invalid model is a recoverable provider outcome through the public faca
     try std.testing.expect(std.mem.indexOf(u8, recovered.body(), "\"model\":\"recovered-model\"") != null);
 }
 
+test "L2 unnamed Provider HTTP 529 crosses AgentCore ABI without killing the Host" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    var server = try harness.MockServer.startWithStatus(
+        "{\"error\":{\"type\":\"overloaded_error\",\"message\":\"provider overloaded\"}}",
+        0,
+        "HTTP/1.1 529 Site Overloaded",
+    );
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var fixture = try PublicSessionFixture.init(root, url, "test-model");
+    defer fixture.deinit();
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        fixture.api.sessionRunText(
+            fixture.session,
+            1,
+            sdk.bytesView("exercise unnamed provider status"),
+            &options,
+            &result,
+            &fixture.diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
+
+    const diagnostic = try sdk.borrowedBytes(.{
+        .ptr = fixture.diagnostic.ptr,
+        .len = fixture.diagnostic.len,
+    });
+    // Provider failures are Run outcomes, not facade failures, so the ABI
+    // diagnostic is a valid empty buffer and the error is carried by stop_reason.
+    try std.testing.expectEqual(@as(usize, 0), diagnostic.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(diagnostic));
+    fixture.releaseDiagnostic();
+
+    // The Host remains in control and can safely destroy the same Session.
+    const session = fixture.session orelse return error.MissingSession;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        fixture.api.sessionDestroy()(session, &fixture.diagnostic),
+    );
+    fixture.session = null;
+    fixture.releaseDiagnostic();
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+}
+
 test "L2 public compact commits a summary and reports COMPACT_COMPACTED" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

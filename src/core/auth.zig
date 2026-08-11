@@ -14,6 +14,7 @@ const builtin = @import("builtin");
 const fs_util = @import("../util/fs.zig");
 const time = @import("../util/time.zig");
 const types = @import("../types.zig");
+const ResponseStatus = @import("../api/http_status.zig").ResponseStatus;
 
 pub const METASK_API_KEY_ENV = "METASK_API_KEY";
 pub const AUTH_FILE_ENV = "METACODES_AUTH_FILE";
@@ -518,12 +519,13 @@ fn postTokenForm(allocator: std.mem.Allocator, form: []const u8) ![]u8 {
     req.sendBodyComplete(@constCast(form)) catch return error.OAuthTokenExchangeFailed;
     var redirect_buf: [4096]u8 = undefined;
     const http_response = req.receiveHead(&redirect_buf) catch return error.OAuthTokenExchangeFailed;
+    const status = ResponseStatus.capture(&http_response);
     var transfer_buf: [8192]u8 = undefined;
     const body_reader = req.reader.bodyReader(&transfer_buf, http_response.head.transfer_encoding, http_response.head.content_length);
     const response_body = body_reader.allocRemaining(allocator, std.Io.Limit.limited(256 * 1024)) catch return error.OAuthTokenExchangeFailed;
     errdefer secureFree(allocator, response_body);
-    if (http_response.head.status != .ok) {
-        const err = classifyOAuthEndpointError(http_response.head.status, response_body);
+    if (!status.isOk()) {
+        const err = classifyOAuthEndpointError(status.code, response_body);
         secureFree(allocator, response_body);
         return err;
     }
@@ -709,14 +711,15 @@ fn refreshOAuthCredential(allocator: std.mem.Allocator, old: *const OAuthCredent
     req.sendBodyComplete(@constCast(body)) catch return error.OAuthRefreshFailed;
     var redirect_buf: [4096]u8 = undefined;
     const http_response = req.receiveHead(&redirect_buf) catch return error.OAuthRefreshFailed;
+    const status = ResponseStatus.capture(&http_response);
 
     var transfer_buf: [8192]u8 = undefined;
     const body_reader = req.reader.bodyReader(&transfer_buf, http_response.head.transfer_encoding, http_response.head.content_length);
     const response_body = body_reader.allocRemaining(allocator, std.Io.Limit.limited(256 * 1024)) catch return error.OAuthRefreshFailed;
     defer secureFree(allocator, response_body);
 
-    if (http_response.head.status != .ok) {
-        return classifyOAuthEndpointError(http_response.head.status, response_body);
+    if (!status.isOk()) {
+        return classifyOAuthEndpointError(status.code, response_body);
     }
     return parseOAuthTokenResponse(allocator, response_body, nowUnixSeconds(), .optional_replacement, old.refresh_token);
 }
@@ -759,7 +762,7 @@ fn appendFormEncoded(writer: *std.Io.Writer, value: []const u8) !void {
     }
 }
 
-fn classifyOAuthEndpointError(status: std.http.Status, body: []const u8) anyerror {
+fn classifyOAuthEndpointError(status_code: u16, body: []const u8) anyerror {
     if (parseOAuthErrorCode(body)) |code| {
         defer std.heap.c_allocator.free(code);
         if (std.mem.eql(u8, code, "invalid_grant")) return error.OAuthLoginRequired;
@@ -776,14 +779,25 @@ fn classifyOAuthEndpointError(status: std.http.Status, body: []const u8) anyerro
             return error.OAuthProtocolError;
         }
     }
-    return switch (status) {
-        .too_many_requests,
-        .internal_server_error,
-        .bad_gateway,
-        .service_unavailable,
-        => error.OAuthEndpointTransient,
+    return switch (status_code) {
+        429, 500, 502, 503 => error.OAuthEndpointTransient,
         else => error.OAuthRefreshFailed,
     };
+}
+
+test "OAuth endpoint classification accepts the full wire status domain" {
+    try std.testing.expectEqual(
+        error.OAuthEndpointTransient,
+        classifyOAuthEndpointError(429, "{}"),
+    );
+    try std.testing.expectEqual(
+        error.OAuthRefreshFailed,
+        classifyOAuthEndpointError(529, "{}"),
+    );
+    try std.testing.expectEqual(
+        error.OAuthLoginRequired,
+        classifyOAuthEndpointError(529, "{\"error\":\"invalid_grant\"}"),
+    );
 }
 
 fn parseOAuthErrorCode(body: []const u8) ?[]u8 {

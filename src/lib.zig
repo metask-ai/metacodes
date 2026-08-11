@@ -46,6 +46,7 @@ pub const context_pressure = @import("core/context_pressure.zig");
 // ── API / client / 配置 ─────────────────────────────────────────────────
 pub const client = @import("client.zig");
 pub const api_stream = @import("api/stream.zig");
+pub const api_http_status = @import("api/http_status.zig");
 pub const api_error_class = @import("api/error_class.zig");
 pub const api_provider = @import("api/provider.zig"); // 多 provider vtable
 pub const api_provider_factory = @import("api/provider_factory.zig");

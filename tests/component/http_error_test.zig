@@ -80,6 +80,41 @@ test "L2 Stage6: HTTP 401 → error.Unauthorized 且 body 进日志" {
     try std.testing.expect(std.mem.indexOf(u8, log_content, "BADKEY42") != null);
 }
 
+test "L2 Provider unnamed HTTP 529 returns HttpError without killing the process" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startWithStatus(
+        "{\"error\":{\"type\":\"overloaded_error\",\"message\":\"provider overloaded\"}}",
+        0,
+        "HTTP/1.1 529 Site Overloaded",
+    );
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    const io = io_runtime.io();
+
+    var client = cc.client_mod.Client.initWithBaseUrl(
+        a,
+        io,
+        "test-key",
+        "claude-3-5-haiku-20241022",
+        url,
+    );
+    defer client.deinit();
+
+    const empty_messages: []const cc.types_mod.ApiMessage = &.{};
+    try std.testing.expectError(
+        error.HttpError,
+        client.sendMessageStream(empty_messages, null, null),
+    );
+
+    // Reaching this assertion proves the unnamed status did not trigger a
+    // process-level panic before the typed error crossed the client boundary.
+    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+}
+
 // Stage 6.2:SSE 流中插 `event: error` 帧 → drain 时拿到 error.ApiError(区分 RequestFailed)。
 test "L2 Stage6: SSE error 帧 → error.ApiError(非 RequestFailed)" {
     const a = std.testing.allocator;

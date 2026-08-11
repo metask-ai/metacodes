@@ -5,6 +5,7 @@
 //! env-overridable while the parser accepts a few common response shapes.
 
 const std = @import("std");
+const ResponseStatus = @import("http_status.zig").ResponseStatus;
 
 pub const API_KEYS_URL_ENV = "METACODE_API_KEYS_URL";
 
@@ -187,7 +188,8 @@ pub fn fetchInto(
     req.sendBodiless() catch return error.RequestFailed;
     var redirect_buf: [4096]u8 = undefined;
     const resp = req.receiveHead(&redirect_buf) catch return error.RequestFailed;
-    if (resp.head.status != .ok) return error.HttpError;
+    const status = ResponseStatus.capture(&resp);
+    if (!status.isOk()) return error.HttpError;
 
     var transfer_buf: [8192]u8 = undefined;
     const body_reader = req.reader.bodyReader(&transfer_buf, resp.head.transfer_encoding, resp.head.content_length);

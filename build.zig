@@ -251,6 +251,31 @@ pub fn build(b: *std.Build) void {
     });
     addHl(b, core_mod);
 
+    // HTTP status is an open wire value. This host-native syntax gate keeps the
+    // std.http.Status interpretation authority in src/api/http_status.zig.
+    const http_status_gate_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/http_status_boundary_gate.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    const http_status_gate_exe = b.addExecutable(.{
+        .name = "http-status-boundary-gate",
+        .root_module = http_status_gate_mod,
+    });
+    const http_status_gate_run = b.addRunArtifact(http_status_gate_exe);
+    http_status_gate_run.setCwd(b.path("."));
+    http_status_gate_run.addArg(".");
+    const http_status_gate_unit = b.addTest(.{
+        .name = "http-status-boundary-gate-unit",
+        .root_module = http_status_gate_mod,
+    });
+    const http_status_gate_step = b.step(
+        "http-status:gate",
+        "Enforce the unique HTTP response status boundary",
+    );
+    http_status_gate_step.dependOn(&http_status_gate_run.step);
+    http_status_gate_step.dependOn(&addTestRunArtifact(b, http_status_gate_unit, windows_test_prelude).step);
+
     const agentcore_types_mod = b.createModule(.{
         .root_source_file = b.path("sdk/zig/types.zig"),
         .target = target,
@@ -286,6 +311,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const agentcore_test_step = b.step("agentcore:test", "Run AgentCore binary ABI v1 tests");
+    agentcore_test_step.dependOn(http_status_gate_step);
     const agentcore_abi_test = b.addTest(.{
         .name = "agentcore-abi-unit",
         .root_module = agentcore_abi_test_mod,
@@ -684,6 +710,7 @@ pub fn build(b: *std.Build) void {
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     const core_test_step = b.step("test:lib", "Test/compile the metacodes-core library module (proves UI isolation)");
+    core_test_step.dependOn(http_status_gate_step);
     core_test_step.dependOn(&addTestRunArtifact(b, core_test, windows_test_prelude).step);
 
     // test:lsp —— LSP 子系统(Y2 Step2:被动诊断)隔离测试。
@@ -741,6 +768,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const test_step = b.step("test", "Run tests");
+    test_step.dependOn(http_status_gate_step);
     const test_obj = b.addTest(.{
         .name = "cc-test",
         .root_module = test_cc_mod, // 共享模块(perf,见 debug exe 后注释)

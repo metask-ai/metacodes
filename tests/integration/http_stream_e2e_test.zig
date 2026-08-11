@@ -28,9 +28,10 @@ test "MockServer + std.http.Client + EventIterator: text_delta event" {
 
     var redirect_buf: [4096]u8 = undefined;
     var http_resp = try req.receiveHead(&redirect_buf);
+    const status = cc.api_http_status.ResponseStatus.capture(&http_resp);
     defer req.deinit();
 
-    try std.testing.expect(http_resp.head.status == .ok);
+    try std.testing.expect(status.isOk());
 
     var transfer_buf: [8192]u8 = undefined;
     const reader = http_resp.reader(&transfer_buf);

@@ -5,6 +5,7 @@ const http = std.http;
 const types = @import("types.zig");
 const json_mod = @import("json.zig");
 const api_stream = @import("api/stream.zig");
+const ResponseStatus = @import("api/http_status.zig").ResponseStatus;
 const error_class = @import("api/error_class.zig");
 const last_error = @import("api/last_error.zig");
 const Catalog = @import("api/catalog.zig").Catalog;
@@ -440,8 +441,9 @@ pub const Client = struct {
         req.sendBodiless() catch return error.RequestFailed;
         var redirect_buf: [4096]u8 = undefined;
         const http_response = req.receiveHead(&redirect_buf) catch return error.RequestFailed;
+        const status = ResponseStatus.capture(&http_response);
         connection_lease.release();
-        if (http_response.head.status != .ok) return error.HttpError;
+        if (!status.isOk()) return error.HttpError;
 
         var transfer_buf: [8192]u8 = undefined;
         const body_reader = req.reader.bodyReader(&transfer_buf, http_response.head.transfer_encoding, http_response.head.content_length);
@@ -728,54 +730,28 @@ pub const Client = struct {
             }
             return error.RequestFailed;
         };
+        const status = ResponseStatus.capture(&http_response);
         // DNS/TCP/TLS + request-head phase is complete; active streaming must not consume a slot.
         connection_lease.release();
 
         if (retry_hint) |hint| hint.delay_ms = retryAfterFromHead(http_response.head);
 
-        const status = http_response.head.status;
         const header_ms = timestampMs() - t_start;
         log.infoId("client", rid, "HTTP {d} {s} header_latency_ms={d}", .{
-            @intFromEnum(status),
-            @tagName(status),
+            status.code,
+            status.name,
             header_ms,
         });
 
-        switch (status) {
+        switch (classifyHttpStatus(status.code)) {
             // 成功即清陈旧错误现场——否则后续无记录的失败路径(如 mid-stream 断连)
             // 会把几轮前的无关错误当死因端给用户。
             .ok => last_error.clear(),
-            // 错误分支:读 body 进 log 后直接 return error。
-            // 清理交给 errdefer(:253 destroy + :266 deinit)——分支内**不要**手动
-            // deinit/destroy,否则与 errdefer 双重释放 → segfault(这些路径过去无测试
-            // 覆盖,Stage 6 L2 首次触发才暴露此潜伏 bug)。
-            .unauthorized => {
-                _ = logErrorBody(req_ptr, rid, status, http_response);
-                return error.Unauthorized;
-            },
-            .too_many_requests => {
-                _ = logErrorBody(req_ptr, rid, status, http_response);
-                return error.RateLimited;
-            },
-            .internal_server_error => {
-                _ = logErrorBody(req_ptr, rid, status, http_response);
-                return error.ServerError;
-            },
-            .bad_gateway => {
-                _ = logErrorBody(req_ptr, rid, status, http_response);
-                return error.BadGateway;
-            },
-            .service_unavailable => {
-                _ = logErrorBody(req_ptr, rid, status, http_response);
-                return error.ServiceUnavailable;
-            },
-            else => {
-                // 4xx/other：读 body 进 log 便于 debug。否则用户只看到 "HttpError"，
-                // 不知道是 model 名错、字段不识别、还是 API key 过期。
-                if (logErrorBody(req_ptr, rid, status, http_response).context_window_exceeded) {
-                    return error.ContextWindowExceeded;
-                }
-                return error.HttpError;
+            .failure => |failure| {
+                // Read every error body exactly once while the request reader is alive. Cleanup
+                // remains with the surrounding errdefers; do not deinit/destroy here.
+                const body_info = logErrorBody(req_ptr, rid, status, http_response);
+                return resolveHttpFailure(failure, body_info);
             },
         }
 
@@ -825,13 +801,66 @@ fn timestampMs() u64 {
     return if (ms < 0) 0 else @intCast(ms);
 }
 
-/// HTTP 错误现场:读响应 body(截断 2KB)以 err 级打日志。
-/// 五个明确 status 分支(401/429/500/502/503)和 else 分支共用,避免"零现场"return。
+const HttpFailure = enum {
+    unauthorized,
+    rate_limited,
+    server_error,
+    bad_gateway,
+    service_unavailable,
+    generic,
+};
+
+const HttpDisposition = union(enum) {
+    ok,
+    failure: HttpFailure,
+};
+
+const HttpFailureError = error{
+    Unauthorized,
+    RateLimited,
+    ServerError,
+    BadGateway,
+    ServiceUnavailable,
+    ContextWindowExceeded,
+    HttpError,
+};
+
+/// Total interpretation of the open HTTP status code domain into a closed,
+/// provider-owned disposition.
+fn classifyHttpStatus(status_code: u16) HttpDisposition {
+    return switch (status_code) {
+        200 => .ok,
+        401 => .{ .failure = .unauthorized },
+        429 => .{ .failure = .rate_limited },
+        500 => .{ .failure = .server_error },
+        502 => .{ .failure = .bad_gateway },
+        503 => .{ .failure = .service_unavailable },
+        else => .{ .failure = .generic },
+    };
+}
+
+/// Exhaustive mapping over the closed provider failure set. Adding a new
+/// failure category forces this function to make an explicit error decision.
+fn resolveHttpFailure(failure: HttpFailure, body: ErrorBodyInfo) HttpFailureError {
+    return switch (failure) {
+        .unauthorized => error.Unauthorized,
+        .rate_limited => error.RateLimited,
+        .server_error => error.ServerError,
+        .bad_gateway => error.BadGateway,
+        .service_unavailable => error.ServiceUnavailable,
+        .generic => if (body.context_window_exceeded)
+            error.ContextWindowExceeded
+        else
+            error.HttpError,
+    };
+}
+
+/// HTTP 错误现场:唯一失败分支在这里读取一次响应 body(截断 2KB)并以 err 级打日志。
 /// 必须在 req_ptr.deinit() 之前调用(reader 还活着)。
 fn logErrorBody(
     req_ptr: *http.Client.Request,
     rid: log.RequestId,
-    status: http.Status,
+    status: ResponseStatus,
     http_response: http.Client.Response,
 ) ErrorBodyInfo {
     var err_body: [2048]u8 = undefined;
@@ -843,15 +872,37 @@ fn logErrorBody(
     const n = body_reader_tmp.readSliceShort(err_body[0..]) catch 0;
     const preview = err_body[0..@min(n, err_body.len)];
     log.errId("client", rid, "HTTP {d} {s}: body={s}", .{
-        @intFromEnum(status), @tagName(status), preview,
+        status.code, status.name, preview,
     });
-    last_error.recordHttp(@intFromEnum(status), preview);
+    last_error.recordHttp(status.code, preview);
     return .{ .context_window_exceeded = error_class.isContextWindowExceeded(preview) };
 }
 
 const ErrorBodyInfo = struct {
     context_window_exceeded: bool = false,
 };
+
+test "HTTP status classification is total and preserves provider semantics" {
+    try std.testing.expectEqual(HttpDisposition.ok, classifyHttpStatus(200));
+
+    const cases = [_]struct { code: u16, failure: HttpFailure }{
+        .{ .code = 401, .failure = .unauthorized },
+        .{ .code = 429, .failure = .rate_limited },
+        .{ .code = 500, .failure = .server_error },
+        .{ .code = 502, .failure = .bad_gateway },
+        .{ .code = 503, .failure = .service_unavailable },
+        .{ .code = 529, .failure = .generic },
+        .{ .code = 599, .failure = .generic },
+    };
+    for (cases) |case| {
+        const disposition = classifyHttpStatus(case.code);
+        try std.testing.expectEqual(case.failure, disposition.failure);
+    }
+
+    try std.testing.expectEqual(error.Unauthorized, resolveHttpFailure(.unauthorized, .{ .context_window_exceeded = true }));
+    try std.testing.expectEqual(error.ContextWindowExceeded, resolveHttpFailure(.generic, .{ .context_window_exceeded = true }));
+    try std.testing.expectEqual(error.HttpError, resolveHttpFailure(.generic, .{}));
+}
 
 /// API 响应（非流式）
 // ApiResponse/ToolCallResult 下沉到中立层 api/stream.zig(多 Provider 重构);此处 re-export 保持兼容。
