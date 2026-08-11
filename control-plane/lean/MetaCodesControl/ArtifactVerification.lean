@@ -77,6 +77,7 @@ structure State where
 structure Proposal where
   event : EventKind
   expected_phase : Phase
+  expected_next_phase : Phase
   expected_snapshot_revision : String
   next_snapshot_revision : String
   provider_authorization_sha256 : String
@@ -295,7 +296,9 @@ def artifactAdvanceCheck (request : Request) : Bool :=
 
 def transitionWellFormed (request : Request) : Bool :=
   match transition request.state request.proposal with
-  | some next => stateWellFormed next
+  | some next =>
+      decide (request.proposal.expected_next_phase = next.phase) &&
+      stateWellFormed next
   | none => false
 
 def SafeTransition (request : Request) : Bool :=
@@ -367,7 +370,15 @@ theorem admitted_transition_produces_well_formed_state
     stateWellFormed next = true := by
   have checked := (safeTransition_sound request admitted).2.2.2.2.2.2.2
   simp [transitionWellFormed, applied] at checked
-  exact checked
+  exact checked.2
+
+theorem admitted_transition_binds_expected_next_phase
+    (request : Request) (admitted : SafeTransition request = true)
+    (next : State) (applied : transition request.state request.proposal = some next) :
+    request.proposal.expected_next_phase = next.phase := by
+  have checked := (safeTransition_sound request admitted).2.2.2.2.2.2.2
+  simp [transitionWellFormed, applied] at checked
+  exact checked.1
 
 def failureCodes (request : Request) : List String :=
   let failures := if requestBindingsValid request then []
@@ -490,6 +501,9 @@ def decodeCanonicalRequest (input : String) : Except String Request := do
   let cursor ← expectLiteral cursor ","
   let (expected_phase, cursor) ← parsePhaseField cursor "expected_phase"
   let cursor ← expectLiteral cursor ","
+  let (expected_next_phase, cursor) ←
+    parsePhaseField cursor "expected_next_phase"
+  let cursor ← expectLiteral cursor ","
   let (expected_snapshot_revision, cursor) ←
     parseStringField cursor "expected_snapshot_revision"
   let cursor ← expectLiteral cursor ","
@@ -521,7 +535,8 @@ def decodeCanonicalRequest (input : String) : Except String Request := do
     semantic_verdict_sha256, defect_sha256, repair_proposal_sha256
   }
   let proposal : Proposal := {
-    event, expected_phase, expected_snapshot_revision, next_snapshot_revision,
+    event, expected_phase, expected_next_phase,
+    expected_snapshot_revision, next_snapshot_revision,
     provider_authorization_sha256,
     semantic_verdict_sha256 := proposal_verdict_sha256,
     defect_sha256 := proposal_defect_sha256,

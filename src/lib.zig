@@ -68,6 +68,7 @@ pub const formal_artifact_store = @import("formal/artifact_store.zig"); // immut
 pub const formal_provenance = @import("formal/provenance.zig"); // strict sidecar build identity
 pub const formal_task_audit = @import("formal/task_audit.zig"); // TinyKG task-audit sensor/receipt
 pub const formal_memory_migration = @import("formal/memory_migration.zig"); // Lean-derived mutating memory gate
+pub const formal_artifact_verification = @import("formal/artifact_verification.zig"); // governed artifact verify/repair lifecycle
 
 // ── API / client / 配置 ─────────────────────────────────────────────────
 pub const client = @import("client.zig");

@@ -97,7 +97,8 @@ expected_axioms="$expected_axioms
 'MetaCodesControl.ArtifactVerification.admitted_provider_result_follows_authorized_state' depends on axioms: [propext]
 'MetaCodesControl.ArtifactVerification.admitted_repaired_state_requires_reverification' depends on axioms: [propext]
 'MetaCodesControl.ArtifactVerification.admitted_record_repair_advances_artifact' depends on axioms: [propext]
-'MetaCodesControl.ArtifactVerification.admitted_transition_produces_well_formed_state' depends on axioms: [propext]"
+'MetaCodesControl.ArtifactVerification.admitted_transition_produces_well_formed_state' depends on axioms: [propext]
+'MetaCodesControl.ArtifactVerification.admitted_transition_binds_expected_next_phase' depends on axioms: [propext]"
 if [[ "$axiom_audit" != "$expected_axioms" ]]; then
   echo "build-formal-kernel: unexpected soundness theorem axiom set" >&2
   printf '%s\n' "$axiom_audit" >&2
@@ -187,7 +188,7 @@ if [[ "$memory_block_verdict" != *'"decision":"block"'* || "$memory_block_verdic
 fi
 
 zero_hash=0000000000000000000000000000000000000000000000000000000000000000
-artifact_request="{\"schema_version\":\"metacodes-artifact-verification-request-v1\",\"request_id\":\"$hex_a\",\"operation\":\"artifact_transition\",\"proposal_sha256\":\"$hex_b\",\"snapshot_sha256\":\"$hex_c\",\"snapshot_revision\":\"$hex_d\",\"expected_checker_version\":\"metacodes-formal-kernel-v2\",\"state\":{\"phase\":\"candidate\",\"task_sha256\":\"$hex_a\",\"actor_run_sha256\":\"$hex_b\",\"artifact_sha256\":\"$hex_c\",\"artifact_revision\":\"$hex_d\",\"verifier_sha256\":\"$hex_a\",\"policy_sha256\":\"$hex_b\",\"budget_authority_sha256\":\"$hex_c\",\"active_provider_authorization_sha256\":\"$zero_hash\",\"transition_revision\":0,\"repair_attempts\":0,\"max_repair_attempts\":3,\"semantic_verdict_sha256\":\"$zero_hash\",\"defect_sha256\":\"$zero_hash\",\"repair_proposal_sha256\":\"$zero_hash\"},\"proposal\":{\"event\":\"request_verification\",\"expected_phase\":\"candidate\",\"expected_snapshot_revision\":\"$hex_d\",\"next_snapshot_revision\":\"$hex_a\",\"provider_authorization_sha256\":\"$hex_b\",\"semantic_verdict_sha256\":\"$zero_hash\",\"defect_sha256\":\"$zero_hash\",\"repair_proposal_sha256\":\"$zero_hash\",\"next_artifact_sha256\":\"$zero_hash\",\"next_artifact_revision\":\"$zero_hash\"}}"
+artifact_request="{\"schema_version\":\"metacodes-artifact-verification-request-v1\",\"request_id\":\"$hex_a\",\"operation\":\"artifact_transition\",\"proposal_sha256\":\"$hex_b\",\"snapshot_sha256\":\"$hex_c\",\"snapshot_revision\":\"$hex_d\",\"expected_checker_version\":\"metacodes-formal-kernel-v2\",\"state\":{\"phase\":\"candidate\",\"task_sha256\":\"$hex_a\",\"actor_run_sha256\":\"$hex_b\",\"artifact_sha256\":\"$hex_c\",\"artifact_revision\":\"$hex_d\",\"verifier_sha256\":\"$hex_a\",\"policy_sha256\":\"$hex_b\",\"budget_authority_sha256\":\"$hex_c\",\"active_provider_authorization_sha256\":\"$zero_hash\",\"transition_revision\":0,\"repair_attempts\":0,\"max_repair_attempts\":3,\"semantic_verdict_sha256\":\"$zero_hash\",\"defect_sha256\":\"$zero_hash\",\"repair_proposal_sha256\":\"$zero_hash\"},\"proposal\":{\"event\":\"request_verification\",\"expected_phase\":\"candidate\",\"expected_next_phase\":\"verification_requested\",\"expected_snapshot_revision\":\"$hex_d\",\"next_snapshot_revision\":\"$hex_a\",\"provider_authorization_sha256\":\"$hex_b\",\"semantic_verdict_sha256\":\"$zero_hash\",\"defect_sha256\":\"$zero_hash\",\"repair_proposal_sha256\":\"$zero_hash\",\"next_artifact_sha256\":\"$zero_hash\",\"next_artifact_revision\":\"$zero_hash\"}}"
 artifact_admit=$(printf '%s' "$artifact_request" | "$output")
 if [[ "$artifact_admit" != *'"decision":"admit"'* || "$artifact_admit" != *'"next_phase":"verification_requested"'* ]]; then
   echo "build-formal-kernel: native artifact verification admit smoke failed" >&2
@@ -197,6 +198,12 @@ artifact_block=${artifact_request/\"provider_authorization_sha256\":\"$hex_b\"/\
 artifact_block_verdict=$(printf '%s' "$artifact_block" | "$output")
 if [[ "$artifact_block_verdict" != *'"decision":"block"'* || "$artifact_block_verdict" != *'"artifact_provider_not_authorized"'* ]]; then
   echo "build-formal-kernel: native artifact verification block smoke failed" >&2
+  exit 1
+fi
+artifact_phase_block=${artifact_request/\"expected_next_phase\":\"verification_requested\"/\"expected_next_phase\":\"verified\"}
+artifact_phase_block_verdict=$(printf '%s' "$artifact_phase_block" | "$output")
+if [[ "$artifact_phase_block_verdict" != *'"decision":"block"'* || "$artifact_phase_block_verdict" != *'"artifact_transition_illegal"'* ]]; then
+  echo "build-formal-kernel: native artifact next-phase binding smoke failed" >&2
   exit 1
 fi
 set +e
