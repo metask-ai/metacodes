@@ -164,7 +164,7 @@ def policySatisfied (request : Request) : Bool :=
   match request.operation with
   | .promote =>
       request.facts.exposures >= request.policy.minExposures &&
-      request.facts.taskSuccess && request.facts.trustworthySuccess &&
+      promotionOutcomeValid request.facts &&
       !request.facts.driftDetected &&
       request.facts.formalFaults <= request.policy.maxFormalFaults &&
       request.facts.shadowDivergences <= request.policy.maxShadowDivergences &&

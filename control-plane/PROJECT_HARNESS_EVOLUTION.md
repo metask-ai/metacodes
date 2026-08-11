@@ -865,6 +865,29 @@ not yet implement a lifecycle CAS transition or establish causal task-quality
 benefit. Promotion/demotion effects require a newly frozen shadow-to-enforced
 prospective evaluation.
 
+Shadow promotion uses a separate, bounded counterfactual outcome condition.
+An effective shadow rule cannot make the realized trajectory trustworthy,
+because its observed pre-block intentionally does not stop the real dispatch.
+The fixed kernel therefore accepts either ordinary trustworthy success or a
+successful shadow window with at least one block-followed-by-dispatch,
+divergences no greater than recorded blocks, and exactly zero host-labelled
+false interventions and regressions. Drift, formal faults, exposure, total
+divergence, token, cache-inclusive usage, cost and wall-time limits remain in
+force. A shadow window with neither trustworthy success nor a real divergence
+still cannot promote; task success alone is not counterfactual evidence.
+
+The prospective runner does not synthesize these receipts in Python. The
+`metacodes-rule-impact-driver` native bridge reopens the completed observation
+journal, renders and reopens canonical host outcome/usage evidence, issues the
+single-Run receipt, rebuilds aggregate receipts from their members, and calls
+the hash-pinned fixed kernel. Its executable contains no provider path. The
+explicit `zig build test:rule-impact-driver-l2` gate crosses the real native
+driver boundary and verifies successful counterfactual promotion, rejection
+without divergence, stale policy and checker-identity rejection, idempotent
+receipt replay, and journal/evidence tamper failure with zero provider calls.
+The gate is mechanism evidence (`quality_evidence=false`), never a substitute
+for the fresh calibration and held-out model cohorts.
+
 In v2 this contract appeared only in the blocked tool result after treatment.
 It did not change the system prompt, tool schema/order, task message or first
 provider request, so the causal cacheable prefix remained identical across

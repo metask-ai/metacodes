@@ -128,9 +128,23 @@ def boundedCost (request : Request) : Bool :=
   request.facts.costMicrousd <= request.policy.maxCostMicrousd &&
   request.facts.wallElapsedNs <= request.policy.maxWallElapsedNs
 
+-- A shadowed rule cannot make the realized trajectory trustworthy: by
+-- definition its block is observed and the real dispatch still proceeds.
+-- Requiring trustworthySuccess alone therefore makes an effective safety
+-- rule impossible to promote.  The counterfactual branch is deliberately
+-- narrow: at least one pre-block must have diverged from the real dispatcher,
+-- every divergence must correspond to a recorded block, and the independent
+-- host outcome sensor must report zero false intervention and zero regression.
+def promotionOutcomeValid (facts : ImpactFacts) : Bool :=
+  facts.taskSuccess &&
+  (facts.trustworthySuccess ||
+    (facts.shadowDivergences > 0 &&
+      facts.shadowDivergences <= facts.blocks &&
+      facts.falseInterventions == 0 && facts.regressions == 0))
+
 def promotionPolicy (request : Request) : Bool :=
   request.facts.exposures >= request.policy.minExposures &&
-  request.facts.taskSuccess && request.facts.trustworthySuccess &&
+  promotionOutcomeValid request.facts &&
   !request.facts.driftDetected &&
   request.facts.formalFaults <= request.policy.maxFormalFaults &&
   request.facts.shadowDivergences <= request.policy.maxShadowDivergences &&
@@ -184,6 +198,14 @@ theorem unmetered_cache_cannot_transition (request : Request)
       request.facts.cacheReadTokens + request.facts.cacheWriteTokens) = false) :
     SafeTransition request = false := by
   simp [SafeTransition, usageConsistent, mismatch]
+
+theorem shadow_without_counterfactual_evidence_cannot_promote (request : Request)
+    (operation : request.operation = .promote)
+    (untrusted : request.facts.trustworthySuccess = false)
+    (missing : request.facts.shadowDivergences = 0) :
+    SafeTransition request = false := by
+  simp [SafeTransition, policySatisfied, promotionPolicy, promotionOutcomeValid,
+    operation, untrusted, missing]
 
 def operationName : Operation → String
   | .promote => "promote"

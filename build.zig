@@ -886,6 +886,23 @@ pub fn build(b: *std.Build) void {
     project_harness_lifecycle_driver_step.dependOn(
         &install_project_harness_lifecycle_driver.step,
     );
+    const rule_impact_driver_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/rule_impact_driver.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    rule_impact_driver_mod.addImport("cc", core_test_mod);
+    const rule_impact_driver = b.addExecutable(.{
+        .name = "metacodes-rule-impact-driver",
+        .root_module = rule_impact_driver_mod,
+    });
+    const install_rule_impact_driver = b.addInstallArtifact(rule_impact_driver, .{});
+    const rule_impact_driver_step = b.step(
+        "eval:rule-impact-driver",
+        "Build the zero-provider authenticated RuleImpact evaluation bridge",
+    );
+    rule_impact_driver_step.dependOn(&install_rule_impact_driver.step);
     // Explicit, expensive native L2: it builds a real promoted rule, starts a
     // loopback provider, and runs both full CLI artifacts. Keep it out of the
     // default aggregate so routine CI health does not pay Lean-build latency.
@@ -936,6 +953,22 @@ pub fn build(b: *std.Build) void {
         "Run the real production/enforced vs eval/shadow loopback-provider L2",
     );
     project_harness_binary_boundary_step.dependOn(&project_harness_binary_boundary_cmd.step);
+    const rule_impact_driver_l2_cmd = b.addSystemCommand(&.{project_harness_python});
+    rule_impact_driver_l2_cmd.addFileArg(b.path("scripts/eval/rule_impact_driver_l2.py"));
+    rule_impact_driver_l2_cmd.addArg("--eval-driver");
+    rule_impact_driver_l2_cmd.addArtifactArg(project_harness_eval_driver);
+    rule_impact_driver_l2_cmd.addArg("--impact-driver");
+    rule_impact_driver_l2_cmd.addArtifactArg(rule_impact_driver);
+    rule_impact_driver_l2_cmd.addArgs(&.{
+        "--kernel",
+        b.pathFromRoot("zig-out/libexec/metacodes/metacodes-project-kernel"),
+    });
+    rule_impact_driver_l2_cmd.step.dependOn(&project_harness_kernel_cmd.step);
+    const rule_impact_driver_l2_step = b.step(
+        "test:rule-impact-driver-l2",
+        "Run the zero-provider journal-to-receipt-to-Lean RuleImpact L2",
+    );
+    rule_impact_driver_l2_step.dependOn(&rule_impact_driver_l2_cmd.step);
     const core_test = b.addTest(.{
         .name = "metacodes-core-test",
         .root_module = core_test_mod,

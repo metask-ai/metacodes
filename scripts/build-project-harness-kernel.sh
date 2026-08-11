@@ -41,6 +41,7 @@ expected_axioms="'MetaCodesControl.ProjectHarness.safePromotion_sound' depends o
 'MetaCodesControl.RuleImpactGovernance.unauthenticated_evidence_cannot_transition' depends on axioms: [propext]
 'MetaCodesControl.RuleImpactGovernance.duplicate_window_cannot_transition' depends on axioms: [propext]
 'MetaCodesControl.RuleImpactGovernance.unmetered_cache_cannot_transition' depends on axioms: [propext]
+'MetaCodesControl.RuleImpactGovernance.shadow_without_counterfactual_evidence_cannot_promote' depends on axioms: [propext]
 'MetaCodesControl.RuleImpactAggregateGovernance.safeTransition_sound' depends on axioms: [propext]
 'MetaCodesControl.RuleImpactAggregateGovernance.admitted_preserves_member_obligations' depends on axioms: [propext]
 'MetaCodesControl.RuleImpactAggregateGovernance.stale_policy_cannot_transition' depends on axioms: [propext]
