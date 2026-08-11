@@ -498,6 +498,21 @@ test "M4 Gemini dialect: response_format json_object → response_mime_type 片�
     try std.testing.expect(std.mem.indexOf(u8, out.items, "generation_config") == null);
 }
 
+test "M4 Gemini dialect: response_format json_schema 降级为 response_mime_type(无 schema 字段)" {
+    // Gemini 当前只接 response_mime_type,json_schema 降级为 json_object(同样输出 mime_type)。
+    const a = std.testing.allocator;
+    const d = dialectFor(.gemini, "gemini-2.5-pro");
+    const p = d.profileFor(.gemini, "gemini-2.5-pro");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const got = try d.serializeResponseFormat(p, .{ .kind = .json_schema, .schema = "{\"type\":\"object\"}" }, &out, a);
+    try std.testing.expect(got);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"response_mime_type\":\"application/json\"") != null);
+    // Gemini 不发 schema 字段(降级)
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "response_schema") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "json_schema") == null);
+}
+
 test "M4 Claude dialect: response_format 不发(用 system prompt 指示 JSON)" {
     const a = std.testing.allocator;
     const d = dialectFor(.anthropic, "claude-opus-4");
