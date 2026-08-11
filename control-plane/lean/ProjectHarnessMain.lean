@@ -1,5 +1,6 @@
 import MetaCodesControl.ProjectHarness
 import MetaCodesControl.RuleImpactGovernance
+import MetaCodesControl.RuleImpactAggregateGovernance
 
 open MetaCodesControl.ProjectHarness
 
@@ -43,5 +44,10 @@ def main (args : List String) : IO UInt32 := do
                 IO.println (MetaCodesControl.RuleImpactGovernance.verdictJson request)
                 pure 0
             | .error impactMessage =>
-                IO.eprintln s!"invalid project harness request: {message}; batch: {batchMessage}; impact: {impactMessage}"
-                pure 64
+                match MetaCodesControl.RuleImpactAggregateGovernance.decodeCanonicalRequest input with
+                | .ok request =>
+                    IO.println (MetaCodesControl.RuleImpactAggregateGovernance.verdictJson request)
+                    pure 0
+                | .error aggregateMessage =>
+                    IO.eprintln s!"invalid project harness request: {message}; batch: {batchMessage}; impact: {impactMessage}; aggregate: {aggregateMessage}"
+                    pure 64

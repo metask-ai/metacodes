@@ -54,7 +54,7 @@ else:
 SCHEMA = "metacodes-project-harness-e3-templates-v1"
 FLAVORS = ("static", "evolved")
 MAX_TEMPLATE_BYTES = 64 * 1024 * 1024
-KERNEL_PROVENANCE_SCHEMA = "metacodes-project-kernel-artifact-v5"
+KERNEL_PROVENANCE_SCHEMA = "metacodes-project-kernel-artifact-v6"
 KERNEL_PROVENANCE_FIELDS = frozenset(
     {
         "schema_version",
@@ -65,12 +65,16 @@ KERNEL_PROVENANCE_FIELDS = frozenset(
         "batch_verdict_schema",
         "impact_request_schema",
         "impact_verdict_schema",
+        "impact_aggregate_request_schema",
+        "impact_aggregate_verdict_schema",
         "max_batch_requests",
+        "max_impact_aggregate_members",
         "binary_sha256",
         "binary_bytes",
         "kernel_source_sha256",
         "rule_source_sha256",
         "impact_source_sha256",
+        "impact_aggregate_source_sha256",
         "formal_kernel_source_sha256",
         "main_source_sha256",
         "axiom_audit_source_sha256",
@@ -84,6 +88,7 @@ KERNEL_PROVENANCE_FIELDS = frozenset(
         "native_batch_smoke",
         "native_recovery_smoke",
         "native_impact_smoke",
+        "native_impact_aggregate_smoke",
     }
 )
 EXPECTED_SPECS: Mapping[str, Mapping[str, Any]] = {
@@ -129,6 +134,8 @@ def _verified_kernel_artifact(repo: Path, kernel: Path) -> Dict[str, Any]:
         / "control-plane/lean/MetaCodesControl/ProjectRule.lean",
         "impact_source_sha256": repo
         / "control-plane/lean/MetaCodesControl/RuleImpactGovernance.lean",
+        "impact_aggregate_source_sha256": repo
+        / "control-plane/lean/MetaCodesControl/RuleImpactAggregateGovernance.lean",
         "formal_kernel_source_sha256": repo
         / "control-plane/lean/MetaCodesControl/FormalKernel.lean",
         "main_source_sha256": repo / "control-plane/lean/ProjectHarnessMain.lean",
@@ -149,7 +156,12 @@ def _verified_kernel_artifact(repo: Path, kernel: Path) -> Dict[str, Any]:
         != "metacodes-rule-impact-governance-request-v1"
         or provenance.get("impact_verdict_schema")
         != "metacodes-rule-impact-governance-verdict-v1"
+        or provenance.get("impact_aggregate_request_schema")
+        != "metacodes-rule-impact-aggregate-governance-request-v1"
+        or provenance.get("impact_aggregate_verdict_schema")
+        != "metacodes-rule-impact-aggregate-governance-verdict-v1"
         or provenance.get("max_batch_requests") != 1024
+        or provenance.get("max_impact_aggregate_members") != 64
         or provenance.get("binary_sha256") != _sha256_bytes(binary_raw)
         or provenance.get("binary_bytes") != len(binary_raw)
         or provenance.get("axiom_policy") != "propext"
@@ -158,6 +170,7 @@ def _verified_kernel_artifact(repo: Path, kernel: Path) -> Dict[str, Any]:
         or provenance.get("native_batch_smoke") != "passed"
         or provenance.get("native_recovery_smoke") != "passed"
         or provenance.get("native_impact_smoke") != "passed"
+        or provenance.get("native_impact_aggregate_smoke") != "passed"
         or not isinstance(provenance.get("lean_version"), str)
         or not provenance["lean_version"]
         or any(

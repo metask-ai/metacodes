@@ -6,3 +6,4 @@ import MetaCodesControl.PaidBudgetJournal
 import MetaCodesControl.ProjectRule
 import MetaCodesControl.ProjectHarness
 import MetaCodesControl.RuleImpactGovernance
+import MetaCodesControl.RuleImpactAggregateGovernance

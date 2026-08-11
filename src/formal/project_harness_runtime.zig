@@ -12,6 +12,7 @@ const time = @import("../util/time.zig");
 const observation = @import("../tools/observation.zig");
 const spec_mod = @import("../core/project_rule_spec.zig");
 const impact_receipt = @import("../core/rule_impact_receipt.zig");
+const impact_aggregate = @import("../core/rule_impact_aggregate_receipt.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
 pub const REQUEST_SCHEMA = "metacodes-project-harness-request-v3";
@@ -21,6 +22,8 @@ pub const BATCH_VERDICT_SCHEMA = "metacodes-project-harness-batch-verdict-v3";
 pub const CHECKER_VERSION = "metacodes-project-harness-kernel-v3";
 pub const IMPACT_REQUEST_SCHEMA = "metacodes-rule-impact-governance-request-v1";
 pub const IMPACT_VERDICT_SCHEMA = "metacodes-rule-impact-governance-verdict-v1";
+pub const IMPACT_AGGREGATE_REQUEST_SCHEMA = "metacodes-rule-impact-aggregate-governance-request-v1";
+pub const IMPACT_AGGREGATE_VERDICT_SCHEMA = "metacodes-rule-impact-aggregate-governance-verdict-v1";
 pub const MAX_REQUEST_BYTES: usize = 128 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 pub const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
@@ -137,6 +140,57 @@ pub const ImpactInput = struct {
     policy: ImpactPolicy,
 };
 
+const ImpactAggregateWindow = struct {
+    project_sha256: []const u8,
+    issuer_sha256: []const u8,
+    candidate_id: []const u8,
+    bundle_sha256: []const u8,
+    bundle_revision: u64,
+    session_id: []const u8,
+    run_id: []const u8,
+    first_sequence: u64,
+    last_sequence: u64,
+    source_interval_sha256: []const u8,
+    label_receipt_sha256: []const u8,
+    outcome_evidence_sha256: []const u8,
+    usage_evidence_sha256: []const u8,
+    facts: impact_aggregate.Facts,
+};
+
+const ImpactAggregateRequest = struct {
+    schema_version: []const u8 = IMPACT_AGGREGATE_REQUEST_SCHEMA,
+    request_id: []const u8,
+    operation: ImpactOperation,
+    expected_checker_version: []const u8 = CHECKER_VERSION,
+    kernel_sha256: []const u8,
+    candidate_id: []const u8,
+    project_sha256: []const u8,
+    issuer_sha256: []const u8,
+    bundle_sha256: []const u8,
+    bundle_revision: u64,
+    current_state: ImpactRuleState,
+    policy_epoch: u64,
+    expected_policy_epoch: u64,
+    aggregate_receipt_sha256: []const u8,
+    members_sha256: []const u8,
+    source_intervals_sha256: []const u8,
+    outcome_evidence_sha256: []const u8,
+    usage_evidence_sha256: []const u8,
+    facts: impact_aggregate.Facts,
+    members: []const ImpactAggregateWindow,
+    policy: ImpactPolicy,
+};
+
+pub const ImpactAggregateInput = struct {
+    aggregate_dir: []const u8,
+    receipt_id: [64]u8,
+    expected_issuer_sha256: [64]u8,
+    expected_policy_epoch: u64,
+    operation: ImpactOperation,
+    current_state: ImpactRuleState,
+    policy: ImpactPolicy,
+};
+
 pub const ImpactBindings = struct {
     request_id: [64]u8,
     operation: ImpactOperation,
@@ -148,6 +202,23 @@ pub const ImpactBindings = struct {
     bundle_revision: u64,
     source_interval_sha256: [64]u8,
     label_receipt_sha256: [64]u8,
+    outcome_evidence_sha256: [64]u8,
+    usage_evidence_sha256: [64]u8,
+};
+
+pub const ImpactAggregateBindings = struct {
+    request_id: [64]u8,
+    operation: ImpactOperation,
+    kernel_sha256: [64]u8,
+    candidate_id: [64]u8,
+    project_sha256: [64]u8,
+    issuer_sha256: [64]u8,
+    bundle_sha256: [64]u8,
+    bundle_revision: u64,
+    policy_epoch: u64,
+    aggregate_receipt_sha256: [64]u8,
+    members_sha256: [64]u8,
+    source_intervals_sha256: [64]u8,
     outcome_evidence_sha256: [64]u8,
     usage_evidence_sha256: [64]u8,
 };
@@ -164,6 +235,54 @@ pub const ImpactChecks = struct {
         return self.bindings_valid and self.evidence_valid and self.counts_consistent and
             self.usage_consistent and
             self.lifecycle_valid and self.policy_satisfied;
+    }
+};
+
+pub const ImpactAggregateChecks = struct {
+    bindings_valid: bool,
+    evidence_valid: bool,
+    members_valid: bool,
+    aggregate_exact: bool,
+    counts_consistent: bool,
+    usage_consistent: bool,
+    lifecycle_valid: bool,
+    policy_satisfied: bool,
+
+    pub fn all(self: ImpactAggregateChecks) bool {
+        return self.bindings_valid and self.evidence_valid and self.members_valid and
+            self.aggregate_exact and self.counts_consistent and self.usage_consistent and
+            self.lifecycle_valid and self.policy_satisfied;
+    }
+};
+
+pub const ImpactAggregateVerdict = struct {
+    admitted: bool,
+    checks: ImpactAggregateChecks,
+};
+
+pub const ImpactAggregateInvocation = struct {
+    bindings: ImpactAggregateBindings,
+    failure: FailureKind = .none,
+    actual_checker_sha256: [64]u8 = [_]u8{'0'} ** 64,
+    request_sha256: [64]u8 = [_]u8{'0'} ** 64,
+    verdict_sha256: ?[64]u8 = null,
+    checker_bytes: u64 = 0,
+    request_bytes: u64 = 0,
+    observer_elapsed_ns: u64 = 0,
+    checker_elapsed_ns: u64 = 0,
+    stdout: ?[]u8 = null,
+    stderr: ?[]u8 = null,
+    verdict_payload: ?[]const u8 = null,
+    verdict: ?ImpactAggregateVerdict = null,
+
+    pub fn deinit(self: *ImpactAggregateInvocation, allocator: std.mem.Allocator) void {
+        if (self.stdout) |bytes| allocator.free(bytes);
+        if (self.stderr) |bytes| allocator.free(bytes);
+        self.* = undefined;
+    }
+
+    pub fn checkerAdmitted(self: *const ImpactAggregateInvocation) bool {
+        return self.failure == .none and self.verdict != null and self.verdict.?.admitted;
     }
 };
 
@@ -215,6 +334,29 @@ const RawImpactVerdict = struct {
     admitted: bool,
     reason_codes: [][]const u8,
     checks: ImpactChecks,
+};
+
+const RawImpactAggregateVerdict = struct {
+    schema_version: []const u8,
+    checker_version: []const u8,
+    request_id: []const u8,
+    operation: ImpactOperation,
+    kernel_sha256: []const u8,
+    candidate_id: []const u8,
+    project_sha256: []const u8,
+    issuer_sha256: []const u8,
+    bundle_sha256: []const u8,
+    bundle_revision: u64,
+    policy_epoch: u64,
+    aggregate_receipt_sha256: []const u8,
+    members_sha256: []const u8,
+    source_intervals_sha256: []const u8,
+    outcome_evidence_sha256: []const u8,
+    usage_evidence_sha256: []const u8,
+    decision: []const u8,
+    admitted: bool,
+    reason_codes: [][]const u8,
+    checks: ImpactAggregateChecks,
 };
 
 pub const PromotionFacts = struct {
@@ -783,6 +925,155 @@ pub fn invokeImpact(
     return result;
 }
 
+/// Reauthenticate and govern a bounded, content-addressed cross-window
+/// aggregate. The request carries every member's exact facts so Lean can
+/// independently reject duplicate/overlapping windows and inexact sums.
+pub fn invokeImpactAggregate(
+    allocator: std.mem.Allocator,
+    config: Config,
+    input: ImpactAggregateInput,
+    abort: ?*const AbortSignal,
+) !ImpactAggregateInvocation {
+    if (input.expected_policy_epoch == 0 or
+        parseLowerHex64(&input.expected_issuer_sha256) == null)
+        return error.InvalidImpactInput;
+    const observer_started = time.nowNs();
+    var aggregate = impact_aggregate.loadBound(
+        allocator,
+        input.aggregate_dir,
+        input.receipt_id,
+    ) catch return error.InvalidImpactEvidence;
+    defer aggregate.deinit();
+    if (!std.mem.eql(u8, &aggregate.issuer_sha256, &input.expected_issuer_sha256) or
+        aggregate.members.len == 0 or aggregate.members.len > impact_aggregate.MAX_MEMBERS)
+        return error.InvalidImpactInput;
+    const windows = try allocator.alloc(ImpactAggregateWindow, aggregate.members.len);
+    defer allocator.free(windows);
+    for (aggregate.members, windows) |*member, *window| window.* = .{
+        .project_sha256 = &member.project_sha256,
+        .issuer_sha256 = &member.issuer_sha256,
+        .candidate_id = &member.candidate_id,
+        .bundle_sha256 = &member.bundle_sha256,
+        .bundle_revision = member.bundle_revision,
+        .session_id = member.session_id.asSlice(),
+        .run_id = member.run_id.asSlice(),
+        .first_sequence = member.first_sequence,
+        .last_sequence = member.last_sequence,
+        .source_interval_sha256 = &member.source_interval_sha256,
+        .label_receipt_sha256 = &member.label_receipt_sha256,
+        .outcome_evidence_sha256 = &member.outcome_evidence_sha256,
+        .usage_evidence_sha256 = &member.usage_evidence_sha256,
+        .facts = member.facts,
+    };
+    const zero = [_]u8{'0'} ** 64;
+    const provisional = ImpactAggregateRequest{
+        .request_id = &zero,
+        .operation = input.operation,
+        .kernel_sha256 = &config.expected_sha256,
+        .candidate_id = &aggregate.identity.candidate_id,
+        .project_sha256 = &aggregate.identity.project_sha256,
+        .issuer_sha256 = &aggregate.issuer_sha256,
+        .bundle_sha256 = &aggregate.identity.bundle_sha256,
+        .bundle_revision = aggregate.identity.bundle_revision,
+        .current_state = input.current_state,
+        .policy_epoch = aggregate.policy_epoch,
+        .expected_policy_epoch = input.expected_policy_epoch,
+        .aggregate_receipt_sha256 = &aggregate.aggregate_receipt_id,
+        .members_sha256 = &aggregate.members_sha256,
+        .source_intervals_sha256 = &aggregate.source_intervals_sha256,
+        .outcome_evidence_sha256 = &aggregate.outcome_evidence_sha256,
+        .usage_evidence_sha256 = &aggregate.usage_evidence_sha256,
+        .facts = aggregate.facts,
+        .members = windows,
+        .policy = input.policy,
+    };
+    const provisional_json = try std.json.Stringify.valueAlloc(allocator, provisional, .{});
+    defer allocator.free(provisional_json);
+    const request_id = observation.sha256Hex(provisional_json);
+    const request = ImpactAggregateRequest{
+        .request_id = &request_id,
+        .operation = input.operation,
+        .kernel_sha256 = &config.expected_sha256,
+        .candidate_id = &aggregate.identity.candidate_id,
+        .project_sha256 = &aggregate.identity.project_sha256,
+        .issuer_sha256 = &aggregate.issuer_sha256,
+        .bundle_sha256 = &aggregate.identity.bundle_sha256,
+        .bundle_revision = aggregate.identity.bundle_revision,
+        .current_state = input.current_state,
+        .policy_epoch = aggregate.policy_epoch,
+        .expected_policy_epoch = input.expected_policy_epoch,
+        .aggregate_receipt_sha256 = &aggregate.aggregate_receipt_id,
+        .members_sha256 = &aggregate.members_sha256,
+        .source_intervals_sha256 = &aggregate.source_intervals_sha256,
+        .outcome_evidence_sha256 = &aggregate.outcome_evidence_sha256,
+        .usage_evidence_sha256 = &aggregate.usage_evidence_sha256,
+        .facts = aggregate.facts,
+        .members = windows,
+        .policy = input.policy,
+    };
+    const bindings = ImpactAggregateBindings{
+        .request_id = request_id,
+        .operation = input.operation,
+        .kernel_sha256 = config.expected_sha256,
+        .candidate_id = aggregate.identity.candidate_id,
+        .project_sha256 = aggregate.identity.project_sha256,
+        .issuer_sha256 = aggregate.issuer_sha256,
+        .bundle_sha256 = aggregate.identity.bundle_sha256,
+        .bundle_revision = aggregate.identity.bundle_revision,
+        .policy_epoch = aggregate.policy_epoch,
+        .aggregate_receipt_sha256 = aggregate.aggregate_receipt_id,
+        .members_sha256 = aggregate.members_sha256,
+        .source_intervals_sha256 = aggregate.source_intervals_sha256,
+        .outcome_evidence_sha256 = aggregate.outcome_evidence_sha256,
+        .usage_evidence_sha256 = aggregate.usage_evidence_sha256,
+    };
+    var result = ImpactAggregateInvocation{
+        .bindings = bindings,
+    };
+    errdefer result.deinit(allocator);
+    const request_json = try std.json.Stringify.valueAlloc(allocator, request, .{});
+    defer allocator.free(request_json);
+    result.request_bytes = @intCast(request_json.len);
+    result.observer_elapsed_ns = elapsedNs(observer_started);
+    result.request_sha256 = observation.sha256Hex(request_json);
+    var execution = try executeChecker(
+        allocator,
+        config,
+        request_json,
+        MAX_REQUEST_BYTES,
+        MAX_OUTPUT_BYTES,
+        abort,
+    );
+    defer execution.deinit(allocator);
+    result.failure = execution.failure;
+    result.actual_checker_sha256 = execution.actual_checker_sha256;
+    result.checker_bytes = execution.checker_bytes;
+    result.checker_elapsed_ns = execution.checker_elapsed_ns;
+    result.stdout = execution.stdout;
+    result.stderr = execution.stderr;
+    execution.stdout = null;
+    execution.stderr = null;
+    if (result.failure != .none) return result;
+    const payload = verdictPayload(result.stdout.?) orelse {
+        result.failure = .malformed_verdict;
+        return result;
+    };
+    result.verdict_payload = payload;
+    result.verdict_sha256 = observation.sha256Hex(payload);
+    result.verdict = parseImpactAggregateVerdict(allocator, payload, bindings) catch |err| {
+        result.failure = switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidJson => .malformed_verdict,
+            error.SchemaMismatch => .verdict_schema_mismatch,
+            error.VersionMismatch => .checker_version_mismatch,
+            error.BindingMismatch => .verdict_binding_mismatch,
+            error.Inconsistent => .inconsistent_verdict,
+        };
+        return result;
+    };
+    return result;
+}
+
 pub fn invokeBatch(
     allocator: std.mem.Allocator,
     config: Config,
@@ -944,6 +1235,52 @@ fn parseImpactVerdict(
         raw.bundle_revision != bindings.bundle_revision or
         !equalHex(raw.source_interval_sha256, bindings.source_interval_sha256) or
         !equalHex(raw.label_receipt_sha256, bindings.label_receipt_sha256) or
+        !equalHex(raw.outcome_evidence_sha256, bindings.outcome_evidence_sha256) or
+        !equalHex(raw.usage_evidence_sha256, bindings.usage_evidence_sha256))
+        return error.BindingMismatch;
+    if ((!std.mem.eql(u8, raw.decision, "admit") and
+        !std.mem.eql(u8, raw.decision, "block")) or
+        raw.admitted != std.mem.eql(u8, raw.decision, "admit") or
+        raw.admitted != raw.checks.all() or
+        (raw.admitted and raw.reason_codes.len != 0) or
+        (!raw.admitted and raw.reason_codes.len == 0))
+        return error.Inconsistent;
+    return .{ .admitted = raw.admitted, .checks = raw.checks };
+}
+
+fn parseImpactAggregateVerdict(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    bindings: ImpactAggregateBindings,
+) ParseError!ImpactAggregateVerdict {
+    var parsed = std.json.parseFromSlice(RawImpactAggregateVerdict, allocator, payload, .{
+        .ignore_unknown_fields = false,
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidJson,
+    };
+    defer parsed.deinit();
+    const canonical = std.json.Stringify.valueAlloc(allocator, parsed.value, .{}) catch
+        return error.OutOfMemory;
+    defer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, payload)) return error.InvalidJson;
+    const raw = parsed.value;
+    if (!std.mem.eql(u8, raw.schema_version, IMPACT_AGGREGATE_VERDICT_SCHEMA))
+        return error.SchemaMismatch;
+    if (!std.mem.eql(u8, raw.checker_version, CHECKER_VERSION)) return error.VersionMismatch;
+    if (!equalHex(raw.request_id, bindings.request_id) or raw.operation != bindings.operation or
+        !equalHex(raw.kernel_sha256, bindings.kernel_sha256) or
+        !equalHex(raw.candidate_id, bindings.candidate_id) or
+        !equalHex(raw.project_sha256, bindings.project_sha256) or
+        !equalHex(raw.issuer_sha256, bindings.issuer_sha256) or
+        !equalHex(raw.bundle_sha256, bindings.bundle_sha256) or
+        raw.bundle_revision != bindings.bundle_revision or
+        raw.policy_epoch != bindings.policy_epoch or
+        !equalHex(raw.aggregate_receipt_sha256, bindings.aggregate_receipt_sha256) or
+        !equalHex(raw.members_sha256, bindings.members_sha256) or
+        !equalHex(raw.source_intervals_sha256, bindings.source_intervals_sha256) or
         !equalHex(raw.outcome_evidence_sha256, bindings.outcome_evidence_sha256) or
         !equalHex(raw.usage_evidence_sha256, bindings.usage_evidence_sha256))
         return error.BindingMismatch;

@@ -832,13 +832,38 @@ sandbox, and does not claim resistance to a hostile concurrent replacement of
 an ancestor directory.
 
 The checker executable is not accepted by path and hash alone. E3 template
-setup requires the adjacent `metacodes-project-kernel-artifact-v5` provenance
+setup requires the adjacent `metacodes-project-kernel-artifact-v6` provenance
 record, verifies its binary size/hash, native and axiom-audit gates, and binds
 the project, rule, impact, shared-kernel, entrypoint and axiom-audit Lean source
 hashes to the clean repository under study. The paid
 manifest freezes both the checker and provenance artifact identities. This
 prevents an executable but stale same-protocol kernel from silently becoming
 the experiment's formal authority.
+
+RuleImpact lifecycle decisions may now consume a bounded cross-Run aggregate
+without accepting a caller-supplied occurrence count. The host reopens at most
+64 independently authenticated single-Run receipts, their completed journal
+intervals and outcome/usage evidence; selects one exact project/candidate/
+bundle revision; sorts by rule and window identity; rejects duplicate receipt
+or interval hashes, overlapping sequence ranges in one session, mixed issuer
+or rule identity, changed artifacts and checked-sum overflow; and persists a
+content-addressed aggregate receipt bound to the ordered members and a positive
+policy epoch. On every governance invocation the host repeats that work before
+calling the sidecar. The aggregate Lean request carries all member facts, not
+only totals: the fixed kernel checks member identity, one-window membership,
+individual count/usage consistency, receipt/interval uniqueness, range
+non-overlap, exact folded totals, current policy epoch, lifecycle and policy.
+The original one-Run request/verdict remains supported unchanged.
+
+For boolean outcomes, aggregate `task_success` and `trustworthy_success` mean
+all member windows; `drift_detected` means any member; count, token, cache,
+cost and time fields are exact checked sums. `observer_elapsed_ns`,
+`checker_elapsed_ns` and serialized request bytes are exposed separately for
+prospective cost analysis. This is still mechanism evidence: the expected
+policy epoch is supplied by the trusted lifecycle caller, and this stage does
+not yet implement a lifecycle CAS transition or establish causal task-quality
+benefit. Promotion/demotion effects require a newly frozen shadow-to-enforced
+prospective evaluation.
 
 In v2 this contract appeared only in the blocked tool result after treatment.
 It did not change the system prompt, tool schema/order, task message or first

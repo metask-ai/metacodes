@@ -81,7 +81,15 @@ fn completedFixture(
     formal_result: cc.tools.tool_observation.FormalResult,
 ) !Fixture {
     const root = try rootPath(tmp, buffer);
-    const sid = cc.session_id.SessionId.fromSlice("0123456789abcdef01234567").?;
+    return completedFixtureAt(root, "0123456789abcdef01234567", formal_result);
+}
+
+fn completedFixtureAt(
+    root: []const u8,
+    session_id: []const u8,
+    formal_result: cc.tools.tool_observation.FormalResult,
+) !Fixture {
+    const sid = cc.session_id.SessionId.fromSlice(session_id).?;
     var journal = try cc.tool_observation_journal.Journal.init(root, sid);
     const sink = journal.sink();
     if (formal_result == .fault) {
@@ -108,6 +116,14 @@ fn completedFixture(
     };
 }
 
+fn createPrivateDir(path: []const u8) !void {
+    const permissions: std.Io.File.Permissions = if (std.Io.File.Permissions.has_executable_bit)
+        .fromMode(0o700)
+    else
+        .default_dir;
+    try std.Io.Dir.createDirAbsolute(std.testing.io, path, permissions);
+}
+
 fn writeArtifact(root: []const u8, name: []const u8, bytes: []const u8) !void {
     const path = try std.fs.path.join(std.testing.allocator, &.{ root, name });
     defer std.testing.allocator.free(path);
@@ -115,6 +131,14 @@ fn writeArtifact(root: []const u8, name: []const u8, bytes: []const u8) !void {
 }
 
 fn writeEvidence(fixture: Fixture, outcome: cc.rule_impact_evidence.OutcomeInput) !void {
+    return writeEvidenceWithCost(fixture, outcome, 100);
+}
+
+fn writeEvidenceWithCost(
+    fixture: Fixture,
+    outcome: cc.rule_impact_evidence.OutcomeInput,
+    cost_microusd: u64,
+) !void {
     const outcome_bytes = try cc.rule_impact_evidence.renderOutcome(std.testing.allocator, outcome);
     defer std.testing.allocator.free(outcome_bytes);
     const usage_bytes = try cc.rule_impact_evidence.renderUsage(std.testing.allocator, .{
@@ -124,7 +148,7 @@ fn writeEvidence(fixture: Fixture, outcome: cc.rule_impact_evidence.OutcomeInput
         .output_tokens = 100,
         .cache_read_tokens = 450,
         .cache_write_tokens = 50,
-        .cost_microusd = 100,
+        .cost_microusd = cost_microusd,
         .wall_elapsed_ns = 10_000,
     });
     defer std.testing.allocator.free(usage_bytes);
@@ -497,4 +521,298 @@ test "L2 formal fault admits quarantine" {
     );
     defer quarantine.deinit(std.testing.allocator);
     try std.testing.expect(quarantine.checkerAdmitted());
+}
+
+test "RuleImpact aggregate reopens, sorts, and checked-sums authenticated windows" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try rootPath(&tmp, &base_buffer);
+    const run_a = try std.fs.path.join(std.testing.allocator, &.{ base, "run-a" });
+    defer std.testing.allocator.free(run_a);
+    const run_b = try std.fs.path.join(std.testing.allocator, &.{ base, "run-b" });
+    defer std.testing.allocator.free(run_b);
+    try createPrivateDir(run_a);
+    try createPrivateDir(run_b);
+    const first = try completedFixtureAt(run_a, "0123456789abcdef01234561", .admit);
+    const second = try completedFixtureAt(run_b, "0123456789abcdef01234562", .admit);
+    try writeEvidence(first, successfulOutcome(first));
+    try writeEvidence(second, successfulOutcome(second));
+    const first_receipt = try persistReceipt(first);
+    const second_receipt = try persistReceipt(second);
+    const refs = [_]cc.rule_impact_aggregate_receipt.MemberRef{
+        .{ .session_dir = second.root, .receipt_id = second_receipt.receipt_id },
+        .{ .session_dir = first.root, .receipt_id = first_receipt.receipt_id },
+    };
+    const persisted = try cc.rule_impact_aggregate_receipt.persist(
+        std.testing.allocator,
+        base,
+        .{
+            .policy_epoch = 7,
+            .expected_issuer_sha256 = issuer_id,
+            .identity = .{
+                .candidate_id = candidate_id,
+                .project_sha256 = project_id,
+                .bundle_sha256 = bundle_id,
+                .bundle_revision = 1,
+            },
+            .members = &refs,
+        },
+    );
+    try std.testing.expect(persisted.created);
+    try std.testing.expectEqual(@as(u64, 2), persisted.member_count);
+    const canonical_refs = [_]cc.rule_impact_aggregate_receipt.MemberRef{
+        .{ .session_dir = first.root, .receipt_id = first_receipt.receipt_id },
+        .{ .session_dir = second.root, .receipt_id = second_receipt.receipt_id },
+    };
+    const replayed = try cc.rule_impact_aggregate_receipt.persist(
+        std.testing.allocator,
+        base,
+        .{
+            .policy_epoch = 7,
+            .expected_issuer_sha256 = issuer_id,
+            .identity = .{
+                .candidate_id = candidate_id,
+                .project_sha256 = project_id,
+                .bundle_sha256 = bundle_id,
+                .bundle_revision = 1,
+            },
+            .members = &canonical_refs,
+        },
+    );
+    try std.testing.expect(!replayed.created);
+    try std.testing.expectEqualSlices(u8, &persisted.receipt_id, &replayed.receipt_id);
+    var loaded = try cc.rule_impact_aggregate_receipt.loadBound(
+        std.testing.allocator,
+        base,
+        persisted.receipt_id,
+    );
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), loaded.members.len);
+    try std.testing.expect(std.mem.lessThan(
+        u8,
+        loaded.members[0].session_id.asSlice(),
+        loaded.members[1].session_id.asSlice(),
+    ));
+    try std.testing.expectEqual(@as(u64, 4), loaded.facts.exposures);
+    try std.testing.expectEqual(@as(u64, 2_000), loaded.facts.metered_tokens);
+    try std.testing.expectEqual(@as(u64, 900), loaded.facts.cache_read_tokens);
+    try std.testing.expectEqual(@as(u64, 100), loaded.facts.cache_write_tokens);
+    try std.testing.expectEqual(@as(u64, 200), loaded.facts.cost_microusd);
+    try std.testing.expect(loaded.facts.task_success);
+    try std.testing.expect(loaded.facts.trustworthy_success);
+}
+
+test "RuleImpact aggregate rejects duplicate, overlap, mixed issuer, and tamper" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try rootPath(&tmp, &base_buffer);
+    const run_a = try std.fs.path.join(std.testing.allocator, &.{ base, "run-a" });
+    defer std.testing.allocator.free(run_a);
+    const run_b = try std.fs.path.join(std.testing.allocator, &.{ base, "run-b" });
+    defer std.testing.allocator.free(run_b);
+    try createPrivateDir(run_a);
+    try createPrivateDir(run_b);
+    const first = try completedFixtureAt(run_a, "0123456789abcdef01234561", .admit);
+    const overlap = try completedFixtureAt(run_b, "0123456789abcdef01234561", .admit);
+    try writeEvidence(first, successfulOutcome(first));
+    try writeEvidence(overlap, successfulOutcome(overlap));
+    const first_receipt = try persistReceipt(first);
+    const overlap_receipt = try persistReceipt(overlap);
+    const duplicate_refs = [_]cc.rule_impact_aggregate_receipt.MemberRef{
+        .{ .session_dir = first.root, .receipt_id = first_receipt.receipt_id },
+        .{ .session_dir = first.root, .receipt_id = first_receipt.receipt_id },
+    };
+    const aggregate_input = cc.rule_impact_aggregate_receipt.Input{
+        .policy_epoch = 9,
+        .expected_issuer_sha256 = issuer_id,
+        .identity = .{
+            .candidate_id = candidate_id,
+            .project_sha256 = project_id,
+            .bundle_sha256 = bundle_id,
+            .bundle_revision = 1,
+        },
+        .members = &duplicate_refs,
+    };
+    try std.testing.expectError(
+        error.DuplicateMemberReceipt,
+        cc.rule_impact_aggregate_receipt.persist(std.testing.allocator, base, aggregate_input),
+    );
+    const overlap_refs = [_]cc.rule_impact_aggregate_receipt.MemberRef{
+        .{ .session_dir = first.root, .receipt_id = first_receipt.receipt_id },
+        .{ .session_dir = overlap.root, .receipt_id = overlap_receipt.receipt_id },
+    };
+    var overlap_input = aggregate_input;
+    overlap_input.members = &overlap_refs;
+    try std.testing.expectError(
+        error.OverlappingMemberWindow,
+        cc.rule_impact_aggregate_receipt.persist(std.testing.allocator, base, overlap_input),
+    );
+    var mixed_input = aggregate_input;
+    mixed_input.members = overlap_refs[0..1];
+    mixed_input.expected_issuer_sha256 = .{'f'} ** 64;
+    try std.testing.expectError(
+        error.MixedMemberIdentity,
+        cc.rule_impact_aggregate_receipt.persist(std.testing.allocator, base, mixed_input),
+    );
+    var mixed_revision = aggregate_input;
+    mixed_revision.members = overlap_refs[0..1];
+    mixed_revision.identity.bundle_revision = 2;
+    try std.testing.expectError(
+        error.MixedMemberIdentity,
+        cc.rule_impact_aggregate_receipt.persist(std.testing.allocator, base, mixed_revision),
+    );
+
+    var valid_input = aggregate_input;
+    valid_input.members = overlap_refs[0..1];
+    const persisted = try cc.rule_impact_aggregate_receipt.persist(
+        std.testing.allocator,
+        base,
+        valid_input,
+    );
+    const file_name = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}{s}.json",
+        .{ cc.rule_impact_aggregate_receipt.FILE_PREFIX, persisted.receipt_id },
+    );
+    defer std.testing.allocator.free(file_name);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ base, file_name });
+    defer std.testing.allocator.free(path);
+    const raw = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        path,
+        std.testing.allocator,
+        .limited(cc.rule_impact_aggregate_receipt.MAX_RECORD_BYTES),
+    );
+    defer std.testing.allocator.free(raw);
+    const needle = "\"policy_epoch\":9";
+    const offset = std.mem.indexOf(u8, raw, needle).? + needle.len - 1;
+    raw[offset] = '8';
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = raw });
+    try std.testing.expectError(
+        error.AggregateEvidenceChanged,
+        cc.rule_impact_aggregate_receipt.loadBound(
+            std.testing.allocator,
+            base,
+            persisted.receipt_id,
+        ),
+    );
+}
+
+test "RuleImpact aggregate rejects checked-sum overflow from real receipts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try rootPath(&tmp, &base_buffer);
+    const run_a = try std.fs.path.join(std.testing.allocator, &.{ base, "run-a" });
+    defer std.testing.allocator.free(run_a);
+    const run_b = try std.fs.path.join(std.testing.allocator, &.{ base, "run-b" });
+    defer std.testing.allocator.free(run_b);
+    try createPrivateDir(run_a);
+    try createPrivateDir(run_b);
+    const first = try completedFixtureAt(run_a, "0123456789abcdef01234561", .admit);
+    const second = try completedFixtureAt(run_b, "0123456789abcdef01234562", .admit);
+    try writeEvidenceWithCost(first, successfulOutcome(first), std.math.maxInt(u64));
+    try writeEvidenceWithCost(second, successfulOutcome(second), std.math.maxInt(u64));
+    const first_receipt = try persistReceipt(first);
+    const second_receipt = try persistReceipt(second);
+    const refs = [_]cc.rule_impact_aggregate_receipt.MemberRef{
+        .{ .session_dir = first.root, .receipt_id = first_receipt.receipt_id },
+        .{ .session_dir = second.root, .receipt_id = second_receipt.receipt_id },
+    };
+    try std.testing.expectError(
+        error.AggregateOverflow,
+        cc.rule_impact_aggregate_receipt.persist(std.testing.allocator, base, .{
+            .policy_epoch = 13,
+            .expected_issuer_sha256 = issuer_id,
+            .identity = .{
+                .candidate_id = candidate_id,
+                .project_sha256 = project_id,
+                .bundle_sha256 = bundle_id,
+                .bundle_revision = 1,
+            },
+            .members = &refs,
+        }),
+    );
+}
+
+test "L2 aggregate receipt invokes Lean and stale policy fails closed" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try rootPath(&tmp, &base_buffer);
+    const run_a = try std.fs.path.join(std.testing.allocator, &.{ base, "run-a" });
+    defer std.testing.allocator.free(run_a);
+    const run_b = try std.fs.path.join(std.testing.allocator, &.{ base, "run-b" });
+    defer std.testing.allocator.free(run_b);
+    try createPrivateDir(run_a);
+    try createPrivateDir(run_b);
+    const first = try completedFixtureAt(run_a, "0123456789abcdef01234561", .admit);
+    const second = try completedFixtureAt(run_b, "0123456789abcdef01234562", .admit);
+    try writeEvidence(first, successfulOutcome(first));
+    try writeEvidence(second, successfulOutcome(second));
+    const first_receipt = try persistReceipt(first);
+    const second_receipt = try persistReceipt(second);
+    const refs = [_]cc.rule_impact_aggregate_receipt.MemberRef{
+        .{ .session_dir = first.root, .receipt_id = first_receipt.receipt_id },
+        .{ .session_dir = second.root, .receipt_id = second_receipt.receipt_id },
+    };
+    const persisted = try cc.rule_impact_aggregate_receipt.persist(
+        std.testing.allocator,
+        base,
+        .{
+            .policy_epoch = 11,
+            .expected_issuer_sha256 = issuer_id,
+            .identity = .{
+                .candidate_id = candidate_id,
+                .project_sha256 = project_id,
+                .bundle_sha256 = bundle_id,
+                .bundle_revision = 1,
+            },
+            .members = &refs,
+        },
+    );
+    const invocation_input = cc.project_harness_runtime.ImpactAggregateInput{
+        .aggregate_dir = base,
+        .receipt_id = persisted.receipt_id,
+        .expected_issuer_sha256 = issuer_id,
+        .expected_policy_epoch = 11,
+        .operation = .promote,
+        .current_state = .shadowed,
+        .policy = policy(),
+    };
+    var invocation = try cc.project_harness_runtime.invokeImpactAggregate(
+        std.testing.allocator,
+        config,
+        invocation_input,
+        null,
+    );
+    defer invocation.deinit(std.testing.allocator);
+    try std.testing.expect(invocation.checkerAdmitted());
+    try std.testing.expect(invocation.verdict.?.checks.aggregate_exact);
+    try std.testing.expect(invocation.verdict.?.checks.members_valid);
+    try std.testing.expect(invocation.request_bytes > 0);
+    try std.testing.expect(invocation.observer_elapsed_ns > 0);
+    try std.testing.expect(invocation.checker_elapsed_ns > 0);
+    if (std.c.getenv("METACODES_REPORT_RULE_IMPACT_OVERHEAD") != null) {
+        std.debug.print(
+            "rule_impact_aggregate_overhead members=2 request_bytes={d} observer_ns={d} checker_ns={d}\n",
+            .{ invocation.request_bytes, invocation.observer_elapsed_ns, invocation.checker_elapsed_ns },
+        );
+    }
+
+    var stale_input = invocation_input;
+    stale_input.expected_policy_epoch = 12;
+    var stale = try cc.project_harness_runtime.invokeImpactAggregate(
+        std.testing.allocator,
+        config,
+        stale_input,
+        null,
+    );
+    defer stale.deinit(std.testing.allocator);
+    try std.testing.expectEqual(cc.project_harness_runtime.FailureKind.none, stale.failure);
+    try std.testing.expect(!stale.checkerAdmitted());
+    try std.testing.expect(!stale.verdict.?.checks.evidence_valid);
 }
