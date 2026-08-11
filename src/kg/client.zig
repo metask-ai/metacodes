@@ -397,6 +397,8 @@ pub const KgClient = struct {
                 allocator.free(dev);
             }
         }
+        // tinykg 已内置:build.zig 从 lib/tinykg/src/ 编译到 <prefix>/vendor/tinykg/tinykg,
+        // findVendoredUpward 已能找到。不再兜底 $PATH(内置即基础特性,无需 PATH 查找)。
         return null;
     }
 
@@ -456,7 +458,7 @@ pub const KgClient = struct {
     pub fn ensureReady(self: *KgClient) void {
         if (self.ready) return;
         const bin = self.bin_path orelse {
-            self.setDegraded("tinykg 二进制未找到。跑 `zig build`(会从 lib/tinykg 源交叉编译到 <prefix>/vendor/tinykg/tinykg),或设 METACODES_KG_BIN=<path>(dev 树用 METACODES_KG_DEV=1 显式开启)", .{});
+            self.setDegraded("tinykg 二进制未找到。已查找:vendored(<exe_dir>/vendor/tinykg/,build.zig 从 lib/tinykg/src/ 编译)、METACODES_KG_BIN、METACODES_KG_DEV。修复:跑 `zig build`(从 lib/tinykg 源编译到 vendor/tinykg/),或设 METACODES_KG_BIN=<path>", .{});
             return;
         };
         // store 缺 → init(先建父目录)。
@@ -472,31 +474,109 @@ pub const KgClient = struct {
                 return;
             }
         }
-        // 版本门。
+        // 版本门(含 legacy 自动 migrate)。
+        if (!self.checkStoreVersionOrMigrate(bin)) return;
+        self.ready = true;
+        log.info("kg", "ready bin={s} store={s} domain={s}", .{ bin, self.store_path, self.domain });
+    }
+
+    /// 版本门检查;legacy store 自动 migrate 到 v2 后重新验证。true=通过,false=已 setDegraded。
+    fn checkStoreVersionOrMigrate(self: *KgClient, bin: []const u8) bool {
         const out = self.runRaw(&.{ "store-info", self.store_path }) catch {
             self.setDegraded("tinykg store-info 失败(bin={s} store={s})", .{ bin, self.store_path });
-            return;
+            return false;
         };
         defer self.freeOut(out);
         if (out.exit_code != 0) {
             self.setDegraded("tinykg store-info 退出码 {d}: {s}", .{ out.exit_code, trimForLog(out.stderr) });
-            return;
+            return false;
         }
         const ver = extractInfoField(out.stdout, "storage_format_version") orelse "missing";
-        if (!std.mem.eql(u8, ver, EXPECTED_STORAGE_FORMAT_VERSION)) {
-            self.setDegraded("store 格式版本不符:期望 {s} 实际 {s}(bin={s} store={s});见 vendor/tinykg/VERSION.txt,勿混用二进制版本", .{ EXPECTED_STORAGE_FORMAT_VERSION, ver, bin, self.store_path });
-            return;
+        if (std.mem.eql(u8, ver, EXPECTED_STORAGE_FORMAT_VERSION)) {
+            // storage_format 通过,继续检查 schema_version
+            return self.checkSchemaVersion(bin);
+        }
+        // storage_format 不符:仅 legacy 自动 migrate,其它版本直接 degraded
+        if (!std.mem.eql(u8, ver, "legacy")) {
+            self.setDegraded("store 格式版本不符:期望 {s} 实际 {s}(bin={s} store={s});非 legacy 无法自动 migrate,见 lib/tinykg/SOURCE.txt", .{ EXPECTED_STORAGE_FORMAT_VERSION, ver, bin, self.store_path });
+            return false;
+        }
+        // legacy → v2 自动 migrate(本机 KG 是基础特性,不应让用户手动跑 tinykg 命令)
+        if (!self.autoMigrateLegacyStore()) {
+            self.setDegraded("store legacy→v2 自动 migrate 失败(bin={s} store={s});手动跑 `tinykg migrate-store-v2 {s} <new> --task-status-v1 --verify` 后替换", .{ bin, self.store_path, self.store_path });
+            return false;
+        }
+        log.info("kg", "legacy→v2 自动 migrate 成功 store={s}", .{self.store_path});
+        // migrate 后重新跑 store-info + schema 检查(不再递归 storage_format 检查,直接 schema)
+        return self.checkSchemaVersion(bin);
+    }
+
+    /// schema_version 检查(storage_format 已通过或 migrate 后调用)。
+    fn checkSchemaVersion(self: *KgClient, bin: []const u8) bool {
+        const out = self.runRaw(&.{ "store-info", self.store_path }) catch {
+            self.setDegraded("store-info 失败(schema 检查)(bin={s} store={s})", .{ bin, self.store_path });
+            return false;
+        };
+        defer self.freeOut(out);
+        if (out.exit_code != 0) {
+            self.setDegraded("store-info 退出码 {d}(schema 检查): {s}", .{ out.exit_code, trimForLog(out.stderr) });
+            return false;
         }
         const schema_ver = extractInfoField(out.stdout, "schema_version") orelse "missing";
         if (!std.mem.eql(u8, schema_ver, EXPECTED_SCHEMA_VERSION)) {
             self.setDegraded(
-                "store schema 版本不符:期望 {s} 实际 {s}(store={s})。不要原地改 canonical store；请先运行 `tinykg migrate-store-v2 {s} <new-store> --task-status-v1 --verify`，核验后再切换 store",
+                "store schema 版本不符:期望 {s} 实际 {s}(store={s})。不要原地改 canonical store;请先运行 `tinykg migrate-store-v2 {s} <new-store> --task-status-v1 --verify`,核验后再切换 store",
                 .{ EXPECTED_SCHEMA_VERSION, schema_ver, self.store_path, self.store_path },
             );
-            return;
+            return false;
         }
-        self.ready = true;
-        log.info("kg", "ready bin={s} store={s} domain={s}", .{ bin, self.store_path, self.domain });
+        return true;
+    }
+
+    /// legacy store → v2 自动 migrate:tmp store → verify → 备份旧 → 替换。true=成功。
+    /// 不预删 tmp/backup(目录删除复杂,改用唯一后缀避冲突);旧 store 备份到 .legacy.bak。
+    fn autoMigrateLegacyStore(self: *KgClient) bool {
+        // tmp store 路径(同目录加 .migrating 后缀;如已存在则加时间戳避冲突)
+        const tmp_store = std.fmt.allocPrint(self.allocator, "{s}.migrating", .{self.store_path}) catch return false;
+        defer self.allocator.free(tmp_store);
+        const backup_dir = std.fmt.allocPrint(self.allocator, "{s}.legacy-backup", .{self.store_path}) catch return false;
+        defer self.allocator.free(backup_dir);
+        // 跑 migrate-store-v2(tinykg 自己处理 tmp 已存在的情况——它会报错,我们 fallback)
+        const out = self.runRaw(&.{ "migrate-store-v2", self.store_path, tmp_store, "--backup", backup_dir, "--task-status-v1", "--verify" }) catch return false;
+        self.freeOut(out);
+        // rename 旧 store → .legacy.bak,tmp store → 原路径(原子替换)
+        const bak_path = std.fmt.allocPrint(self.allocator, "{s}.legacy.bak", .{self.store_path}) catch return false;
+        defer self.allocator.free(bak_path);
+        // bak 如已存在(上次 migrate 遗留),加 .old 后缀避冲突
+        const bak_old = std.fmt.allocPrint(self.allocator, "{s}.old", .{bak_path}) catch return false;
+        defer self.allocator.free(bak_old);
+        _ = renamePath(self.allocator, bak_path, bak_old); // bak → bak.old(失败也无妨)
+        if (!renamePath(self.allocator, self.store_path, bak_path)) {
+            // 旧 store rename 失败:migrate 出来的 tmp 留给用户手动处理
+            log.warn("kg", "auto migrate: 旧 store rename 失败,tmp store 在 {s}", .{tmp_store});
+            return false;
+        }
+        if (!renamePath(self.allocator, tmp_store, self.store_path)) {
+            // tmp → 原路径失败:恢复旧 store
+            _ = renamePath(self.allocator, bak_path, self.store_path);
+            return false;
+        }
+        log.info("kg", "auto migrate: legacy backup at {s}(old backup at {s})", .{ bak_path, bak_old });
+        return true;
+    }
+
+    /// best-effort rename(文件或目录)。成功 true。失败 false(不 brick)。
+    /// 用 std.c.rename(POSIX 原子,支持文件和目录)。
+    fn renamePath(allocator: std.mem.Allocator, from: []const u8, to: []const u8) bool {
+        _ = allocator;
+        var from_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        var to_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        if (from.len >= from_buf.len or to.len >= to_buf.len) return false;
+        @memcpy(from_buf[0..from.len], from);
+        from_buf[from.len] = 0;
+        @memcpy(to_buf[0..to.len], to);
+        to_buf[to.len] = 0;
+        return std.c.rename(@ptrCast(&from_buf), @ptrCast(&to_buf)) == 0;
     }
 
     fn setDegraded(self: *KgClient, comptime fmt: []const u8, args: anytype) void {
