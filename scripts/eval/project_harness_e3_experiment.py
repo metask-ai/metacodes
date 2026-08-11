@@ -1780,6 +1780,8 @@ def _reopen_rollout_receipt(
     run_dir: Path,
     expected: Mapping[str, Any],
     path: Path,
+    expected_rollout_schema: str | None = None,
+    arm_config: Mapping[str, Mapping[str, Any]] = ARM_CONFIG,
 ) -> Mapping[str, Any]:
     try:
         resolved_receipt = path.resolve(strict=True)
@@ -1787,9 +1789,9 @@ def _reopen_rollout_receipt(
     except (FileNotFoundError, ValueError) as exc:
         raise E3Error("E3 rollout receipt escaped run root") from exc
     row = _read_json(resolved_receipt)
-    expected_rollout_schema = rollout_schema_for_manifest(manifest)
+    receipt_schema = expected_rollout_schema or rollout_schema_for_manifest(manifest)
     if (
-        row.get("schema_version") != expected_rollout_schema
+        row.get("schema_version") != receipt_schema
         or row.get("evidence_level") != "E3-paid-model-rollout"
         or row.get("quality_evidence") is not True
         or row.get("manifest_id") != manifest["manifest_id"]
@@ -1808,9 +1810,9 @@ def _reopen_rollout_receipt(
         case = manifest_cases[str(row["case_id"])]
     except KeyError as exc:
         raise E3Error("E3 rollout case is outside the frozen cohort") from exc
-    arm_config = ARM_CONFIG[arm]
+    selected_arm_config = arm_config[arm]
     templates = _read_json(Path(str(manifest["templates_manifest"]["path"])))
-    flavor = arm_config["rule_flavor"]
+    flavor = selected_arm_config["rule_flavor"]
     expected_template = templates["templates"].get(flavor) if flavor is not None else None
     expected_harness_fingerprint = _harness_fingerprint(
         manifest,
@@ -1823,7 +1825,7 @@ def _reopen_rollout_receipt(
         or row.get("horizon_class") != case["horizon_class"]
         or row.get("correction_family") != case["correction_family"]
         or row.get("task_fingerprint") != _canonical_sha256(case)
-        or row.get("binary_sha256") != manifest["artifacts"][arm_config["binary"]]["sha256"]
+        or row.get("binary_sha256") != manifest["artifacts"][selected_arm_config["binary"]]["sha256"]
         or row.get("kernel_sha256") != manifest["artifacts"]["kernel"]["sha256"]
         or row.get("harness_fingerprint") != expected_harness_fingerprint
         or row.get("candidate_id") != (

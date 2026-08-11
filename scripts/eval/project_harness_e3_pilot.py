@@ -399,6 +399,7 @@ def _run_one(
     budget: BudgetJournal,
     timeout_seconds: int,
     test_base_url: str | None = None,
+    receipt_schema: str | None = None,
 ) -> Mapping[str, Any]:
     sequence = int(schedule["sequence"])
     arm = str(schedule["arm"])
@@ -744,7 +745,7 @@ def _run_one(
     snapshot = artifact_dir / "workspace-final"
     _copy_workspace_snapshot(workspace, snapshot)
     receipt: Mapping[str, Any] = {
-        "schema_version": rollout_schema_for_manifest(manifest),
+        "schema_version": receipt_schema or rollout_schema_for_manifest(manifest),
         "evidence_level": (
             "E3-paid-model-rollout" if test_base_url is None else "E2-loopback-runner-boundary"
         ),
@@ -819,6 +820,8 @@ def _run_one(
             "cassette": _artifact_tree_digest(cassette),
         },
     }
+    if "phase" in schedule:
+        receipt = {**receipt, "phase": schedule["phase"]}
     receipt_path = artifact_dir / "rollout-receipt.json"
     _write_new(receipt_path, (stable_json(receipt) + "\n").encode("utf-8"))
     _assert_production_secret_absent(root, api_key)
