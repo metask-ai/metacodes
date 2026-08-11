@@ -19,6 +19,7 @@ from scripts.eval.workbuddy.launch_gate import (
     _paid_host_guard,
     _official_task_identity,
     _collect_usage,
+    _receipt_quality_evidence,
     _reobserve_host_control_plane,
     _reobserve_launch_inputs,
     execute_launch,
@@ -85,12 +86,15 @@ class _Server:
 
 
 class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
-    def _manifest(self, root: Path) -> Path:
+    def _manifest(
+        self, root: Path, *, quality_evidence_on_commit: bool = False
+    ) -> Path:
         workbuddy = root / "workbuddy"
         workbuddy.mkdir(mode=0o700)
         manifest = {
             "schema_version": SCHEMA_VERSION,
             "quality_evidence": False,
+            "quality_evidence_on_commit": quality_evidence_on_commit,
             "run_id": "workbuddy-l2-run-1",
             "workbuddy": {
                 "checkout": str(workbuddy),
@@ -260,6 +264,47 @@ record = {"request": {"body": {"model": "volatile-route", "system": "stable", "m
             self.assertTrue(receipt.is_file())
             self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
             self.assertNotIn("private-workbuddy-test-key", receipt.read_text())
+
+    def test_injected_runner_cannot_create_quality_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest = self._manifest(root, quality_evidence_on_commit=True)
+            journal = root / "budget.json"
+            repo = Path(__file__).resolve().parents[3]
+            with _Server(journal) as provider:
+                result = execute_launch(
+                    manifest_path=manifest,
+                    journal_path=journal,
+                    receipt_path=root / "receipt.json",
+                    credential_fd=self._credential_fd(),
+                    runner_argv=[
+                        sys.executable,
+                        "-c",
+                        self._runner_code(),
+                        str(repo),
+                        provider.url,
+                        str(root / "workbuddy"),
+                    ],
+                )
+            self.assertFalse(result["quality_evidence"])
+
+    def test_receipt_quality_classification_requires_official_runner_and_opt_in(self):
+        self.assertFalse(
+            _receipt_quality_evidence(
+                {"quality_evidence_on_commit": False}, official_runner=True
+            )
+        )
+        self.assertFalse(
+            _receipt_quality_evidence(
+                {"quality_evidence_on_commit": True}, official_runner=False
+            )
+        )
+        self.assertTrue(
+            _receipt_quality_evidence(
+                {"quality_evidence_on_commit": True}, official_runner=True
+            )
+        )
 
     def test_usage_rejects_boolean_token_counts(self):
         for field, value in (

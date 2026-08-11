@@ -287,6 +287,7 @@ def build_launch_manifest(
     max_cost_microusd: int,
     max_metered_tokens: int,
     prior_exposure_microusd: int = 0,
+    quality_evidence_on_commit: bool = False,
 ) -> Dict[str, object]:
     if not RUN_ID_RE.fullmatch(run_id):
         raise LaunchError("run id must be a safe 3-128 character path component")
@@ -368,6 +369,8 @@ def build_launch_manifest(
         raise LaunchError("wave maximum exceeds its journal authority")
     if prior_exposure_microusd + total_cost_microusd > MAX_USER_AUTHORITY_MICROUSD:
         raise LaunchError("cumulative WorkBuddy authority exceeds the user $1000 limit")
+    if not isinstance(quality_evidence_on_commit, bool):
+        raise LaunchError("quality_evidence_on_commit must be boolean")
 
     job_identity = _identity(job_path)
     model_identity = _identity(model_path)
@@ -395,6 +398,7 @@ def build_launch_manifest(
     manifest: Dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "quality_evidence": False,
+        "quality_evidence_on_commit": quality_evidence_on_commit,
         "run_id": run_id,
         "workbuddy": {
             "checkout": str(workbuddy),
@@ -473,6 +477,8 @@ def validate_launch_manifest(path: Path) -> Dict[str, Any]:
     manifest["content_sha256"] = content_sha
     if manifest.get("schema_version") != SCHEMA_VERSION or manifest.get("quality_evidence") is not False:
         raise LaunchError("unsupported or mislabeled paid launch manifest")
+    if not isinstance(manifest.get("quality_evidence_on_commit"), bool):
+        raise LaunchError("paid launch commit evidence classification is missing")
     if manifest.get("workbuddy", {}).get("commit") != WORKBUDDY_PINNED_COMMIT:
         raise LaunchError("paid launch WorkBuddy commit drifted")
     if not re.fullmatch(
@@ -970,6 +976,12 @@ def _collect_usage(
     return result
 
 
+def _receipt_quality_evidence(
+    manifest: Mapping[str, Any], *, official_runner: bool
+) -> bool:
+    return official_runner and manifest["quality_evidence_on_commit"] is True
+
+
 def execute_launch(
     *,
     manifest_path: Path,
@@ -1095,7 +1107,9 @@ def execute_launch(
                 snapshot = journal.snapshot()
                 receipt = {
                     "schema_version": RECEIPT_SCHEMA_VERSION,
-                    "quality_evidence": official_runner,
+                    "quality_evidence": _receipt_quality_evidence(
+                        manifest, official_runner=official_runner
+                    ),
                     "launch_manifest_content_sha256": manifest["content_sha256"],
                     "run_id": manifest["run_id"],
                     "cohort": manifest["cohort"],
@@ -1158,6 +1172,7 @@ def main(argv: list[str] | None = None) -> int:
     create.add_argument("--max-cost-microusd", type=int, required=True)
     create.add_argument("--max-metered-tokens", type=int, required=True)
     create.add_argument("--prior-exposure-microusd", type=int, default=0)
+    create.add_argument("--quality-evidence-on-commit", action="store_true")
     create.add_argument("--output", type=Path, required=True)
     run = subparsers.add_parser("run")
     run.add_argument("--manifest", type=Path, required=True)
@@ -1186,6 +1201,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_cost_microusd=args.max_cost_microusd,
                 max_metered_tokens=args.max_metered_tokens,
                 prior_exposure_microusd=args.prior_exposure_microusd,
+                quality_evidence_on_commit=args.quality_evidence_on_commit,
             )
             _write_private_new(
                 args.output,

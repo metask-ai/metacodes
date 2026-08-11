@@ -93,6 +93,12 @@ Committed token usage includes uncached prompt, completion, cache-read and
 cache-creation tokens. Cache accounting is not allowed to disappear merely
 because the provider reports those fields separately.
 
+Receipt evidence classification is also frozen before authorization. Omit
+`--quality-evidence-on-commit` for Mock, smoke, preflight and infrastructure
+runs; their committed receipts remain `quality_evidence=false` even though
+they use the official runner. Pass it only for a preregistered real-provider
+wave whose official task outcomes are intended to count as quality evidence.
+
 The overlay also keeps the opaque local-proxy route free of Harbor's ``__``
 eval-group delimiter. Otherwise a completed multi-task job can fail only while
 Harbor formats its final summary, after all provider and scorer work has run.
@@ -103,6 +109,7 @@ python3 -m scripts.eval.workbuddy.launch_gate create ... \
   --runner-bash /absolute/path/to/bash \
   --runner-uv /absolute/path/to/uv \
   --output launch.json
+# Real scored waves add: --quality-evidence-on-commit
 python3 -m scripts.eval.workbuddy.launch_gate run \
   --manifest launch.json --budget-journal /private/budget.json \
   --receipt /private/receipts/run.json --credential-fd 9

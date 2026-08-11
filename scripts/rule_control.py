@@ -3208,6 +3208,7 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                         "pass_fds=(read_fd,)",
                         '"WBBENCH_PROXY_MAX_RETRIES": "0"',
                         '"SHARED_PROXY": "0"',
+                        '"quality_evidence": _receipt_quality_evidence(',
                     )
                 )
                 and workbuddy_launch_source.find("journal.authorize_request(")
@@ -3249,6 +3250,7 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                         "cacheable_first_request_sha256",
                         "test_paid_host_rejects_dotenv_and_uv_docker_shadow",
                         "test_host_control_plane_source_drift_fails_closed",
+                        "test_receipt_quality_classification_requires_official_runner_and_opt_in",
                         "test_real_reobserve_rejects_installed_overlay_tamper_before_authorization",
                     )
                 )
