@@ -13,6 +13,7 @@ const dialect_mod = @import("../dialect.zig");
 const Dialect = dialect_mod.Dialect;
 const ModelProfile = model_adapter.ModelProfile;
 const ReasoningEffort = types.ReasoningEffort;
+const ToolChoice = dialect_mod.ToolChoice;
 
 const Stateless = struct {};
 var stateless: Stateless = .{};
@@ -42,9 +43,39 @@ const Gemini = struct {
         };
     }
 
+    /// Gemini:tool_choice → tool_config.function_calling_config.mode + allowed_function_names。
+    /// 中立语义映射:auto→AUTO,any→ANY,tool+name→ANY+allowed_function_names=[name],none→NONE。
+    /// 输出片段形如 `"tool_config":{"function_calling_config":{"mode":"ANY","allowed_function_names":["web_search"]}}`,
+    /// 由 serializeGeminiRequest 合并进请求体。
+    fn serializeToolChoice(ctx: *anyopaque, p: ModelProfile, tc: ?ToolChoice, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
+        _ = ctx;
+        _ = p;
+        const t = tc orelse return false;
+        const mode: []const u8 = blk: {
+            if (std.mem.eql(u8, t.type, "auto")) break :blk "AUTO";
+            if (std.mem.eql(u8, t.type, "any") or std.mem.eql(u8, t.type, "required")) break :blk "ANY";
+            if (std.mem.eql(u8, t.type, "tool")) break :blk "ANY";
+            if (std.mem.eql(u8, t.type, "none")) break :blk "NONE";
+            return false; // 未识别 type:不发
+        };
+        try out.appendSlice(a, ",\"tool_config\":{\"function_calling_config\":{\"mode\":");
+        try util_json.serializeString(mode, out, a);
+        // tool+name → allowed_function_names:[name](Gemini 靠此锁定单工具)
+        if (std.mem.eql(u8, t.type, "tool")) {
+            if (t.name) |n| {
+                try out.appendSlice(a, ",\"allowed_function_names\":[");
+                try util_json.serializeString(n, out, a);
+                try out.appendSlice(a, "]");
+            }
+        }
+        try out.appendSlice(a, "}}");
+        return true;
+    }
+
     const dialect = Dialect{
         .ctx = undefined,
         .serializeThinkingFn = serializeThinking,
+        .serializeToolChoiceFn = serializeToolChoice,
     };
 };
 

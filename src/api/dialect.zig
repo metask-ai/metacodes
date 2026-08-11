@@ -89,6 +89,21 @@ pub const Dialect = struct {
         kind: ResponseFormatKind,
     ) bool = defaultSupportsResponseFormat,
 
+    /// 请求侧:把中立 ToolChoice(Anthropic 语义:type=auto/any/tool/none + name?)翻译成
+    /// 厂商 wire 格式,追加到 `out`。返回是否追加了内容(false=该 dialect 不发 tool_choice)。
+    /// - OpenAI dialect:auto→"auto",any/required→"required",tool+name→{type:function,function:{name}},
+    ///   none→"none";GLM-5 仅 auto(其它 dialect 查 supportsToolChoice 降级或拒)。
+    /// - Anthropic dialect:原样透传(已是 Anthropic 语义)。
+    /// - Gemini dialect:翻成 function_calling_config.mode(AUTO/ANY/NONE)+ allowed_function_names。
+    /// default = 不发(no-op,返回 false)。
+    serializeToolChoiceFn: *const fn (
+        ctx: *anyopaque,
+        profile: ModelProfile,
+        tc: ?ToolChoice,
+        out: *std.ArrayList(u8),
+        allocator: std.mem.Allocator,
+    ) anyerror!bool = defaultSerializeToolChoice,
+
     /// 暴露纯数据 profile 供 UI/agent_loop 快速问能力。单一真相源收口(step 8 后)。
     /// default = 返回 profileFor 的结果。
     profileFn: *const fn (ctx: *anyopaque, kind: ProviderKind, model: []const u8) ModelProfile = defaultProfile,
@@ -109,6 +124,9 @@ pub const Dialect = struct {
     pub fn supportsResponseFormat(self: Dialect, p: ModelProfile, k: ResponseFormatKind) bool {
         return self.supportsResponseFormatFn(self.ctx, p, k);
     }
+    pub fn serializeToolChoice(self: Dialect, p: ModelProfile, tc: ?ToolChoice, out: *std.ArrayList(u8), a: std.mem.Allocator) !bool {
+        return try self.serializeToolChoiceFn(self.ctx, p, tc, out, a);
+    }
     pub fn profileFor(self: Dialect, kind: ProviderKind, model: []const u8) ModelProfile {
         return self.profileFn(self.ctx, kind, model);
     }
@@ -123,6 +141,15 @@ pub const Dialect = struct {
 
 pub const ToolChoiceKind = enum { none, auto, required, function };
 pub const ResponseFormatKind = enum { none, json_object, json_schema };
+
+/// 中立 ToolChoice(Anthropic 语义,与 api/request.zig ToolChoice 对齐)。
+/// dialect.serializeToolChoice 负责翻译成各家 wire 格式。
+pub const ToolChoice = struct {
+    /// "auto" / "any"(强制选一个工具) / "tool"(指定 name) / "none"(禁用工具)
+    type: []const u8 = "auto",
+    /// type=="tool" 时指定工具名;否则 null
+    name: ?[]const u8 = null,
+};
 
 // ── default 实现(未覆盖方法的兜底)──────────────────────────────────────────
 
@@ -165,6 +192,16 @@ fn defaultSupportsResponseFormat(ctx: *anyopaque, p: ModelProfile, k: ResponseFo
         .json_schema => k == .json_object or k == .json_schema,
         .json_object_only => k == .json_object,
     };
+}
+
+fn defaultSerializeToolChoice(ctx: *anyopaque, p: ModelProfile, tc: ?ToolChoice, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
+    _ = ctx;
+    _ = p;
+    _ = tc;
+    _ = out;
+    _ = a;
+    // no-op:default 不发 tool_choice(由 Provider 自己处理,如 Anthropic request.zig 既有路径)。
+    return false;
 }
 
 fn defaultProfile(ctx: *anyopaque, kind: ProviderKind, model: []const u8) ModelProfile {

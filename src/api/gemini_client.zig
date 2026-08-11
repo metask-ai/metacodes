@@ -176,7 +176,6 @@ pub const GeminiClient = struct {
         return pSendStream(ctx, messages, system, tools, abort, model_override, tool_choice, user_query);
     }
     fn pSendStream(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, user_query: []const u8) anyerror!StreamHandle {
-        _ = tool_choice;
         _ = user_query;
         const self = cast(ctx);
         const model = model_override orelse self.model;
@@ -185,7 +184,7 @@ pub const GeminiClient = struct {
         // 误命中别的 model 的句柄 → 发 400/404(C 修复)。
         const prefix_hash = hashPrefix(model, system, tools);
         const cached_ref = self.lookupCache(prefix_hash, nowMonoMs());
-        const body = try serializeGeminiRequest(self.allocator, messages, system, tools, cached_ref);
+        const body = try serializeGeminiRequest(self.allocator, messages, system, tools, cached_ref, model, tool_choice);
         defer self.allocator.free(body);
         return self.doStream(model, body, abort);
     }
@@ -522,7 +521,13 @@ fn nowMonoMs() i64 {
 
 /// 中立 Conversation/tools → Gemini generateContent 请求 body。caller free。
 /// cached_ref 非 null → 请求带 cachedContent 引用(有状态缓存命中)。
-pub fn serializeGeminiRequest(allocator: std.mem.Allocator, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, cached_ref: ?[]const u8) ![]u8 {
+/// model 用于查 dialect(GeminiDialect)翻译 tool_choice + thinking_level。
+/// tool_choice 由 dialect.serializeToolChoice 翻成 tool_config.function_calling_config。
+pub fn serializeGeminiRequest(allocator: std.mem.Allocator, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, cached_ref: ?[]const u8, model: []const u8, tool_choice: ?json_mod.ToolChoice) ![]u8 {
+    const dialect_mod = @import("dialect.zig");
+    const adapter = @import("model_adapter.zig");
+    const dialect = dialect_mod.dialectFor(.gemini, model);
+    const profile = adapter.profileFor(.gemini, model);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.append(allocator, '{');
@@ -561,6 +566,10 @@ pub fn serializeGeminiRequest(allocator: std.mem.Allocator, messages: []const ty
             }
             try out.appendSlice(allocator, "]}]");
         }
+    }
+    // tool_choice:委托给 GeminiDialect 翻成 tool_config.function_calling_config。
+    if (tool_choice) |tc| {
+        _ = try dialect.serializeToolChoice(profile, .{ .type = tc.type, .name = tc.name }, &out, allocator);
     }
     try out.append(allocator, '}');
     return out.toOwnedSlice(allocator);
@@ -655,7 +664,7 @@ test "Gemini 请求翻译:中立 → generateContent body" {
     const msgs = [_]types.ApiMessage{
         .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hello" }} },
     };
-    const body = try serializeGeminiRequest(a, &msgs, "you are helpful", null, null);
+    const body = try serializeGeminiRequest(a, &msgs, "you are helpful", null, null, "gemini-2.5-pro", null);
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"systemInstruction\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"user\"") != null);
@@ -668,9 +677,66 @@ test "Gemini 缓存命中:cachedContent 引用进请求体" {
     const msgs = [_]types.ApiMessage{
         .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "q" }} },
     };
-    const body = try serializeGeminiRequest(a, &msgs, "sys", null, "cachedContents/abc123");
+    const body = try serializeGeminiRequest(a, &msgs, "sys", null, "cachedContents/abc123", "gemini-2.5-pro", null);
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"cachedContent\":\"cachedContents/abc123\"") != null);
+}
+
+// ── M3:Gemini tool_choice 端到端字节断言(声明=接线=测试 DoD)─────────────────────
+
+test "M3 Gemini: tool_choice=auto → function_calling_config.mode AUTO" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const tc = json_mod.ToolChoice{ .type = "auto" };
+    const body = try serializeGeminiRequest(a, &msgs, "sys", null, null, "gemini-2.5-pro", tc);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_config\":{\"function_calling_config\":{\"mode\":\"AUTO\"}}") != null);
+}
+
+test "M3 Gemini: tool_choice=any → mode ANY" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const tc = json_mod.ToolChoice{ .type = "any" };
+    const body = try serializeGeminiRequest(a, &msgs, "sys", null, null, "gemini-2.5-pro", tc);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"mode\":\"ANY\"") != null);
+}
+
+test "M3 Gemini: tool_choice=tool+name → ANY + allowed_function_names" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const tc = json_mod.ToolChoice{ .type = "tool", .name = "web_search" };
+    const body = try serializeGeminiRequest(a, &msgs, "sys", null, null, "gemini-2.5-pro", tc);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"mode\":\"ANY\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"allowed_function_names\":[\"web_search\"]") != null);
+}
+
+test "M3 Gemini: tool_choice=none → mode NONE" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const tc = json_mod.ToolChoice{ .type = "none" };
+    const body = try serializeGeminiRequest(a, &msgs, "sys", null, null, "gemini-2.5-pro", tc);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"mode\":\"NONE\"") != null);
+}
+
+test "M3 Gemini: tool_choice=null 不发 tool_config" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const body = try serializeGeminiRequest(a, &msgs, "sys", null, null, "gemini-2.5-pro", null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tool_config") == null);
 }
 
 test "Gemini 有状态缓存句柄表:命中/过期/剔除" {

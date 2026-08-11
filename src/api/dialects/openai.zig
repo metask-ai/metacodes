@@ -17,6 +17,7 @@ const dialect_mod = @import("../dialect.zig");
 const Dialect = dialect_mod.Dialect;
 const ModelProfile = model_adapter.ModelProfile;
 const ReasoningEffort = types.ReasoningEffort;
+const ToolChoice = dialect_mod.ToolChoice;
 
 // ── 公共 helper ──────────────────────────────────────────────────────────────
 
@@ -28,6 +29,50 @@ var stateless: Stateless = .{};
 
 fn statelessCtx() *anyopaque {
     return @ptrCast(&stateless);
+}
+
+// ── 共享:tool_choice 序列化(所有 OpenAI-compatible dialect 同 wire 格式)─────────
+//
+// 中立 ToolChoice(Anthropic 语义)→ OpenAI chat/completions wire:
+//   auto     → "auto"
+//   any      → "required"(OpenAI 强制选一个工具的语义)
+//   tool+name→ {"type":"function","function":{"name":...}}
+//   none     → "none"
+//
+// 能力降级:GLM-5 profile.tool_choice_support==.auto_only,任何非 auto 都降级成 "auto"
+// (服务端拒 required/function,静默降级保请求成功)。其它 dialect 全支持。
+// **本函数是 OpenAI-compatible 协议的单一真相源**——6 个 dialect struct 都指向它,
+// 通过 profile 参数实现 per-model 降级(无需每个 dialect 重复实现)。
+fn openaiSerializeToolChoice(ctx: *anyopaque, p: ModelProfile, tc: ?ToolChoice, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!bool {
+    _ = ctx;
+    const t = tc orelse return false;
+    // GLM-5 仅支持 auto:降级
+    if (p.tool_choice_support == .auto_only) {
+        try out.appendSlice(a, ",\"tool_choice\":\"auto\"");
+        return true;
+    }
+    if (std.mem.eql(u8, t.type, "auto") or std.mem.eql(u8, t.type, "none")) {
+        try out.appendSlice(a, ",\"tool_choice\":");
+        try util_json.serializeString(t.type, out, a);
+        return true;
+    }
+    if (std.mem.eql(u8, t.type, "any") or std.mem.eql(u8, t.type, "required")) {
+        try out.appendSlice(a, ",\"tool_choice\":\"required\"");
+        return true;
+    }
+    if (std.mem.eql(u8, t.type, "tool")) {
+        if (t.name) |n| {
+            try out.appendSlice(a, ",\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":");
+            try util_json.serializeString(n, out, a);
+            try out.appendSlice(a, "}}");
+            return true;
+        }
+        // name 缺失:退到 required
+        try out.appendSlice(a, ",\"tool_choice\":\"required\"");
+        return true;
+    }
+    // 未识别 type:不发(让服务端用默认)
+    return false;
 }
 
 // ── OpenAI 原生(GPT-4o / GPT-5 / o1 / o3)──────────────────────────────────
@@ -54,6 +99,7 @@ const OpenAINative = struct {
         .ctx = undefined, // 运行时由 statelessCtx() 填
         .serializeThinkingFn = serializeThinking,
         .extractThinkingDeltaFn = extractThinkingDelta,
+        .serializeToolChoiceFn = openaiSerializeToolChoice,
         // injectSystemMods / supportsToolChoice / supportsResponseFormat / profile 走 default
     };
 };
@@ -101,6 +147,7 @@ const Glm = struct {
         .serializeThinkingFn = serializeThinking,
         .injectSystemModsFn = injectSystemMods,
         .extractThinkingDeltaFn = extractThinkingDelta,
+        .serializeToolChoiceFn = openaiSerializeToolChoice,
     };
 };
 
@@ -135,6 +182,7 @@ const Kimi = struct {
         .ctx = undefined,
         .serializeThinkingFn = serializeThinking,
         .extractThinkingDeltaFn = extractThinkingDelta,
+        .serializeToolChoiceFn = openaiSerializeToolChoice,
     };
 };
 
@@ -165,6 +213,7 @@ const DeepSeek = struct {
         .ctx = undefined,
         .serializeThinkingFn = serializeThinking,
         .extractThinkingDeltaFn = extractThinkingDelta,
+        .serializeToolChoiceFn = openaiSerializeToolChoice,
     };
 };
 
@@ -192,6 +241,7 @@ const Qwen = struct {
         .ctx = undefined,
         .serializeThinkingFn = serializeThinking,
         .extractThinkingDeltaFn = extractThinkingDelta,
+        .serializeToolChoiceFn = openaiSerializeToolChoice,
     };
 };
 
@@ -208,6 +258,7 @@ const Mistral = struct {
     const dialect = Dialect{
         .ctx = undefined,
         .extractThinkingDeltaFn = extractThinkingDelta,
+        .serializeToolChoiceFn = openaiSerializeToolChoice,
     };
 };
 
