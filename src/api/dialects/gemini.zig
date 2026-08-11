@@ -36,9 +36,12 @@ const Gemini = struct {
     fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
         _ = ctx;
         _ = p;
-        // Gemini:generation_config.thinking_level(低/高)。当前 gemini_client.zig 未接 thinking
-        // 控制,这里只输出 thinking_level 片段,由调用方合并进 generation_config。
+        // Gemini:generation_config.thinking_level(低/高)。输出 **片段**(不带外层包裹),
+        // 由 serializeGeminiRequest 的 gen_cfg 合并逻辑收进 generation_config。
+        // **逗号策略**:与 serializeResponseFormat 一致——若 out 非空(已有片段)则加前导逗号。
+        // 这让两个片段函数调用顺序无关(gen_cfg 收集器不需关心谁先调)。
         if (effort) |e| if (geminiThinkingLevel(e)) |level| {
+            if (out.items.len > 0) try out.appendSlice(a, ",");
             try out.appendSlice(a, "\"thinking_level\":");
             try util_json.serializeString(level, out, a);
         };
@@ -131,4 +134,33 @@ test "geminiDialectFor: effort=null 不发 thinking_level" {
     defer out.deinit(a);
     try d.serializeThinking(.{}, null, &out, a);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+// ── 片段合并逗号策略(顺序无关)─────────────────────────────────────────────
+// gen_cfg 收集器把 serializeThinking + serializeResponseFormat 的片段合并进一个
+// generation_config。两个片段函数都必须用"若 out 非空则加前导逗号"策略,否则
+// 调用顺序敏感:先调的片段没前导逗号(正确),后调的片段缺逗号(JSON 破损)。
+
+test "Gemini 片段合并: thinking 先 + response_format 后,逗号正确" {
+    const d = geminiDialectFor("gemini-2.5-pro");
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try d.serializeThinking(.{}, .high, &out, a);
+    _ = try d.serializeResponseFormat(.{}, .{ .kind = .json_object }, &out, a);
+    // 期望:thinking_level 在前,response_mime_type 在后,中间有逗号
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking_level\":\"high\",\"response_mime_type\":\"application/json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking_level\":\"high\"\"response_mime_type") == null); // 无缺逗号破损
+}
+
+test "Gemini 片段合并: response_format 先 + thinking 后,逗号正确" {
+    const d = geminiDialectFor("gemini-2.5-pro");
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    _ = try d.serializeResponseFormat(.{}, .{ .kind = .json_object }, &out, a);
+    try d.serializeThinking(.{}, .high, &out, a);
+    // 期望:response_mime_type 在前,thinking_level 在后,中间有逗号
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"response_mime_type\":\"application/json\",\"thinking_level\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "application/json\"\"thinking_level") == null); // 无缺逗号破损
 }

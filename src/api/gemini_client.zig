@@ -578,16 +578,17 @@ pub fn serializeGeminiRequest(allocator: std.mem.Allocator, messages: []const ty
         _ = try dialect.serializeToolChoice(profile, tc, &out, allocator);
     }
     // generation_config:合并 thinking_level + response_mime_type(都进 generation_config)。
-    // 先收集两个片段,再合并成一个 generation_config(避免两个 generation_config 键冲突)。
+    // 先收集片段到 gen_cfg,再合并成一个 generation_config(避免两个 generation_config 键冲突)。
+    // 片段函数(serializeThinking / serializeResponseFormat)用"若 out 非空则加前导逗号"策略,
+    // 调用顺序无关。
     var gen_cfg: std.ArrayList(u8) = .empty;
     defer gen_cfg.deinit(allocator);
     // thinking_level(M7 接线):dialect.serializeThinking 输出 "thinking_level":"low" 片段。
-    if (reasoning_effort != null) {
-        try dialect.serializeThinking(profile, reasoning_effort, &gen_cfg, allocator);
-    }
-    // 注:response_format 也进 generation_config(serializeResponseFormat 输出
-    // "generation_config":{"response_mime_type":...}),但当前无消费方传 response_format,
-    // 所以这里不调。若后续接 response_format,需把它的 response_mime_type 片段也并入 gen_cfg。
+    try dialect.serializeThinking(profile, reasoning_effort, &gen_cfg, allocator);
+    // 注:response_format 也进 generation_config(dialect.serializeResponseFormat 输出
+    // "response_mime_type":... 片段),但当前 serializeGeminiRequest 无 response_format 入参,
+    // 所以这里不调。若后续接 response_format,加参数 + 调 dialect.serializeResponseFormat
+    // 把片段并入 gen_cfg 即可(逗号策略已一致)。
     if (gen_cfg.items.len > 0) {
         try out.appendSlice(allocator, ",\"generation_config\":{");
         try out.appendSlice(allocator, gen_cfg.items);
