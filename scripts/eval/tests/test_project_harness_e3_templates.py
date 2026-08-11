@@ -75,6 +75,8 @@ class ProjectHarnessE3TemplatesTest(unittest.TestCase):
                 result["templates"]["static"]["bundle_sha256"],
                 result["templates"]["evolved"]["bundle_sha256"],
             )
+            self.assertEqual(1, result["templates"]["static"]["bundle_revision"])
+            self.assertEqual(1, result["templates"]["evolved"]["bundle_revision"])
             self.assertEqual(
                 Path(f"{kernel.resolve()}.provenance.json"),
                 Path(result["artifacts"]["kernel"]["provenance_path"]),

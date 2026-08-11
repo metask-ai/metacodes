@@ -406,11 +406,20 @@ def verify_templates(
         bundle = _read_json(rules_dir / f"project-rule-bundle-{bundle_id}.json")
         body = bundle.get("body")
         rules = body.get("rules") if isinstance(body, Mapping) else None
+        bundle_revision = body.get("revision") if isinstance(body, Mapping) else None
         if (
             not isinstance(body, Mapping)
             or bundle.get("bundle_sha256") != bundle_id
             or _sha256_bytes(_wire_json(body)) != bundle_id
             or body.get("project_sha256") != project_sha256
+            or isinstance(bundle_revision, bool)
+            or not isinstance(bundle_revision, int)
+            or bundle_revision <= 0
+            or active_body.get("revision") != bundle_revision
+            or (
+                "bundle_revision" in template
+                and template.get("bundle_revision") != bundle_revision
+            )
             or not isinstance(rules, list)
             or len(rules) != 1
             or not isinstance(rules[0], Mapping)
@@ -526,7 +535,17 @@ def _run_flavor(
     bundle = _read_json(rules_dir / f"project-rule-bundle-{bundle_sha256}.json")
     body = bundle.get("body")
     rules = body.get("rules") if isinstance(body, dict) else None
-    if not isinstance(rules, list) or len(rules) != 1 or not isinstance(rules[0], dict):
+    bundle_revision = body.get("revision") if isinstance(body, dict) else None
+    if (
+        isinstance(bundle_revision, bool)
+        or not isinstance(bundle_revision, int)
+        or bundle_revision <= 0
+        or not isinstance(active_body, dict)
+        or active_body.get("revision") != bundle_revision
+        or not isinstance(rules, list)
+        or len(rules) != 1
+        or not isinstance(rules[0], dict)
+    ):
         raise TemplateError("template bundle must contain exactly one rule")
     return {
         "flavor": flavor,
@@ -539,6 +558,7 @@ def _run_flavor(
         "candidate_id": candidate_id,
         "source_receipt_id": _identity(prepared.get("source_receipt_id"), "source_receipt_id"),
         "bundle_sha256": bundle_sha256,
+        "bundle_revision": bundle_revision,
         "active_pointer_sha256": _identity(final.get("active_pointer_sha256"), "active_pointer_sha256"),
         "promotion_receipt_id": _identity(final.get("promotion_receipt_id"), "promotion_receipt_id"),
         "rule_spec": rules[0]["rule_spec"],
