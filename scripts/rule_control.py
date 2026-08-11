@@ -2825,7 +2825,9 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
         "multi_tests": "scripts/eval/tests/test_experiment.py",
         "multi_fd_tests": "scripts/eval/tests/test_paid_multi_arm_fd.py",
         "workbuddy_launch": "scripts/eval/workbuddy/launch_gate.py",
+        "workbuddy_preflight": "scripts/eval/workbuddy/environment_preflight.py",
         "workbuddy_launch_tests": "scripts/eval/tests/test_workbuddy_launch_gate.py",
+        "workbuddy_adapter_tests": "scripts/eval/tests/test_workbuddy_adapter.py",
         "e2e_lib": "tests/e2e/lib.sh",
         "retry_test": "tests/component/stream_retry_test.zig",
     }
@@ -2965,6 +2967,16 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
     multi_runner_calls = call_names(multi_locked)
     workbuddy_launch = top_function("workbuddy_launch", "execute_launch")
     workbuddy_launch_source = node_source("workbuddy_launch", workbuddy_launch)
+    workbuddy_reobserve_source = top_source(
+        "workbuddy_launch", "_reobserve_launch_inputs"
+    )
+    workbuddy_preflight_source = top_source("workbuddy_preflight", "validate_receipt")
+    workbuddy_reobserve_lines = call_lines(
+        workbuddy_launch, "_reobserve_launch_inputs"
+    )
+    workbuddy_authorize_lines = call_lines(
+        workbuddy_launch, "journal.authorize_request"
+    )
     alternate_launchers = {
         name
         for name in runner_calls
@@ -3201,6 +3213,31 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                 and workbuddy_launch_source.find("journal.authorize_request(")
                 < workbuddy_launch_source.find("_read_credential(credential_fd)")
                 < workbuddy_launch_source.find("subprocess.run(")
+                and len(workbuddy_reobserve_lines) == 2
+                and len(workbuddy_authorize_lines) == 1
+                and all(
+                    line < workbuddy_authorize_lines[0]
+                    for line in workbuddy_reobserve_lines
+                )
+                and all(
+                    marker in workbuddy_reobserve_source
+                    for marker in (
+                        "validate_installed_overlay(workbuddy)",
+                        "installed WorkBuddy overlay identity drifted",
+                        "validate_environment_preflight(",
+                        "_paid_host_guard(workbuddy, preflight)",
+                        "environment preflight receipt drifted",
+                    )
+                )
+                and all(
+                    marker in workbuddy_preflight_source
+                    for marker in (
+                        "_tree_identity(",
+                        "_docker_inspect(",
+                        "docker client changed after environment preflight",
+                        "WorkBuddy harness mount image changed after preflight",
+                    )
+                )
                 and all(
                     marker in sources["workbuddy_launch_tests"]
                     for marker in (
@@ -3209,6 +3246,15 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                         '"after_request_authorized"',
                         "retry is forbidden",
                         "cacheable_first_request_sha256",
+                        "test_paid_host_rejects_dotenv_and_uv_docker_shadow",
+                        "test_real_reobserve_rejects_installed_overlay_tamper_before_authorization",
+                    )
+                )
+                and all(
+                    marker in sources["workbuddy_adapter_tests"]
+                    for marker in (
+                        "test_preflight_binds_environment_hash_image_and_platform",
+                        "test_preflight_rejects_non_amd64_image",
                     )
                 )
             ),
@@ -3510,6 +3556,7 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
             {"unittest": "scripts.eval.tests.test_experiment"},
             {"unittest": "scripts.eval.tests.test_paid_multi_arm_fd"},
             {"unittest": "scripts.eval.tests.test_workbuddy_launch_gate"},
+            {"unittest": "scripts.eval.tests.test_workbuddy_adapter"},
             {"step": "test:new", "filter": "L2 evaluation gate makes one physical provider attempt"},
         ],
         errors=errors,

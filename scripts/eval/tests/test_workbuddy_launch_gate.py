@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.eval.memory_budget_journal import validate_checkpoint_payload
 from scripts.eval.model import ValidationError, stable_json
@@ -14,10 +15,13 @@ from scripts.eval.workbuddy.launch_gate import (
     LaunchError,
     PROVIDER_KEY_ENV,
     SCHEMA_VERSION,
+    _paid_host_guard,
+    _reobserve_launch_inputs,
     execute_launch,
     validate_launch_manifest,
 )
 from scripts.eval.workbuddy import WORKBUDDY_PINNED_COMMIT
+from scripts.eval.workbuddy.install_overlay import _digest
 
 
 def digest(label: str) -> str:
@@ -88,6 +92,7 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
                 "checkout": str(workbuddy),
                 "commit": WORKBUDDY_PINNED_COMMIT,
                 "overlay": {"sha256": digest("overlay")},
+                "overlay_content_sha256": digest("installed-overlay"),
             },
             "cohort": {
                 "subset": "code",
@@ -97,6 +102,15 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
                 "selected_tasks_sha256": digest("tasks"),
             },
             "artifacts": {"manifest": {"sha256": digest("artifacts")}},
+            "environment_preflight": {
+                "receipt": {
+                    "path": "/fixture/environment-preflight.json",
+                    "bytes": 1,
+                    "sha256": digest("environment-preflight-receipt"),
+                },
+                "content_sha256": digest("environment-preflight-content"),
+                "target_platform": "linux/amd64",
+            },
             "job": {"slug": "metacodes-code-l2", "config": {"sha256": digest("job")}},
             "model": {
                 "slug": "test-model",
@@ -124,8 +138,24 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
                 "remote_tinykg_env_cleared": True,
                 "local_tinykg": "fresh-home-per-trial",
                 "cacheable_first_request_hash_required": True,
+                "target_platform": "linux/amd64",
+                "docker_default_platform": "linux/amd64",
+                "environment_preflight_required": True,
+                "harbor_force_build": False,
+                "runner_tools": {
+                    "bash": {
+                        "path": "/fixture/bash",
+                        "sha256": digest("bash"),
+                        "version_sha256": digest("bash-version"),
+                    },
+                    "uv": {
+                        "path": "/fixture/uv",
+                        "sha256": digest("uv"),
+                        "version_sha256": digest("uv-version"),
+                    },
+                },
                 "runner": [
-                    "uv", "run", "--frozen", "bash", "scripts/run.sh", "--job",
+                    "/fixture/uv", "run", "--frozen", "/fixture/bash", "scripts/run.sh", "--job",
                     "metacodes-code-l2",
                 ],
             },
@@ -263,6 +293,71 @@ record = {"request": {"body": {"model": "volatile-route", "system": "stable", "m
             with self.assertRaisesRegex(LaunchError, "content hash mismatch"):
                 validate_launch_manifest(manifest)
             self.assertFalse((root / "budget.json").exists())
+
+    def test_paid_host_rejects_dotenv_and_uv_docker_shadow(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            docker = root / "docker"
+            docker.write_text("bound\n", encoding="utf-8")
+            docker.chmod(0o755)
+            preflight = {"docker": {"path": str(docker)}}
+            with mock.patch(
+                "scripts.eval.workbuddy.launch_gate.shutil.which",
+                return_value=str(docker),
+            ):
+                _paid_host_guard(root, preflight)
+                (root / ".env").write_text("NO_FORCE_BUILD=0\n", encoding="utf-8")
+                with self.assertRaisesRegex(LaunchError, "unbound .env"):
+                    _paid_host_guard(root, preflight)
+                (root / ".env").unlink()
+                shadow = root / ".venv/bin/docker"
+                shadow.parent.mkdir(parents=True)
+                shadow.write_text("shadow\n", encoding="utf-8")
+                shadow.chmod(0o755)
+                with self.assertRaisesRegex(LaunchError, "shadows"):
+                    _paid_host_guard(root, preflight)
+
+    def test_real_reobserve_rejects_installed_overlay_tamper_before_authorization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workbuddy = root / "workbuddy"
+            installed = workbuddy / "src/installed.py"
+            installed.parent.mkdir(parents=True)
+            installed.write_text("trusted\n", encoding="utf-8")
+            overlay = {
+                "schema_version": "metacodes-workbuddy-overlay-v1",
+                "workbuddy_commit": WORKBUDDY_PINNED_COMMIT,
+                "overlay_sha256": _digest(
+                    [(Path("src/installed.py"), b"trusted\n")], {}
+                ),
+                "quality_evidence": False,
+                "installed_paths": ["src/installed.py"],
+            }
+            overlay_path = workbuddy / "configs/harnesses/metacodes/OVERLAY.json"
+            overlay_path.parent.mkdir(parents=True)
+            overlay_path.write_text(
+                json.dumps(overlay, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            installed.write_text("tampered\n", encoding="utf-8")
+            manifest = {
+                "workbuddy": {
+                    "checkout": str(workbuddy),
+                    "overlay": {
+                        "path": str(overlay_path.resolve()),
+                        "bytes": overlay_path.stat().st_size,
+                        "sha256": hashlib.sha256(overlay_path.read_bytes()).hexdigest(),
+                    },
+                    "overlay_content_sha256": overlay["overlay_sha256"],
+                }
+            }
+            with mock.patch(
+                "scripts.eval.workbuddy.launch_gate._git",
+                side_effect=[WORKBUDDY_PINNED_COMMIT, "https://github.com/Tencent/WorkBuddy-Bench"],
+            ):
+                with self.assertRaisesRegex(
+                    LaunchError, "installed overlay files changed"
+                ):
+                    _reobserve_launch_inputs(manifest)
 
 
 if __name__ == "__main__":

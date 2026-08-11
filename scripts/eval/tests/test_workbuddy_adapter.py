@@ -11,12 +11,18 @@ from unittest import mock
 
 import yaml
 
+from scripts.eval.workbuddy import WORKBUDDY_PINNED_COMMIT
 from scripts.eval.workbuddy.cohort_manifest import (
     CohortError,
     SUBSETS,
     build_manifest,
 )
 from scripts.eval.workbuddy.stage_artifacts import StageError, stage
+from scripts.eval.workbuddy.environment_preflight import (
+    EnvironmentPreflightError,
+    prebuild,
+    validate_receipt,
+)
 from scripts.eval.workbuddy.install_overlay import _digest
 from scripts.eval.workbuddy import install_overlay as overlay_installer
 from scripts.eval.workbuddy.key_fd import (
@@ -125,6 +131,13 @@ class WorkBuddyTraceTest(unittest.TestCase):
 
 
 class WorkBuddyArtifactStageTest(unittest.TestCase):
+    @staticmethod
+    def _elf(machine: int) -> bytes:
+        header = bytearray(64)
+        header[:7] = b"\x7fELF\x02\x01\x01"
+        header[18:20] = machine.to_bytes(2, "little")
+        return bytes(header)
+
     def test_synthetic_stage_binds_all_hashes_and_licenses(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -162,6 +175,7 @@ class WorkBuddyArtifactStageTest(unittest.TestCase):
                 )
             )
             self.assertEqual(on_disk, manifest)
+            self.assertEqual(manifest["target_platform"], "test-fixture")
             with self.assertRaises(StageError):
                 stage(
                     output=output,
@@ -234,6 +248,162 @@ class WorkBuddyArtifactStageTest(unittest.TestCase):
                     ),
                     allow_synthetic_fixtures=True,
                 )
+
+    def test_production_stage_requires_x86_64_and_records_elf_machine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            x86 = root / "x86"
+            x86.write_bytes(self._elf(62))
+            arm = root / "arm"
+            arm.write_bytes(self._elf(183))
+            license_file = root / "LICENSE"
+            license_file.write_text("license\n", encoding="utf-8")
+            licenses = (
+                ("metacodes", "NOASSERTION", license_file),
+                ("tinykg", "Apache-2.0", license_file),
+                ("lean4", "Apache-2.0", license_file),
+            )
+            manifest = stage(
+                output=root / "x86-stage",
+                metacodes=x86,
+                tinykg=x86,
+                formal_kernel=x86,
+                metacodes_commit=ZERO_COMMIT,
+                tinykg_commit=ONE_COMMIT,
+                licenses=licenses,
+            )
+            self.assertEqual(manifest["target_platform"], "linux/amd64")
+            self.assertEqual(
+                {row["elf_machine"] for row in manifest["executables"].values()},
+                {62},
+            )
+            with self.assertRaisesRegex(StageError, "does not match linux/amd64"):
+                stage(
+                    output=root / "arm-stage",
+                    metacodes=arm,
+                    tinykg=arm,
+                    formal_kernel=arm,
+                    metacodes_commit=ZERO_COMMIT,
+                    tinykg_commit=ONE_COMMIT,
+                    licenses=licenses,
+                )
+            self.assertFalse((root / "arm-stage").exists())
+
+
+class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
+    @staticmethod
+    def _fake_run(architecture: str = "amd64"):
+        def run(argv, **_kwargs):
+            args = [str(item) for item in argv]
+            if args[0] == "git" and args[-2:] == ["rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(
+                    args, 0, WORKBUDDY_PINNED_COMMIT + "\n", ""
+                )
+            if "buildx" in args and "build" in args:
+                return subprocess.CompletedProcess(args, 0, "built\n", "")
+            if args[1:3] == ["image", "inspect"]:
+                row = {
+                    "Id": "sha256:" + "a" * 64,
+                    "Architecture": architecture,
+                    "Os": "linux",
+                }
+                return subprocess.CompletedProcess(args, 0, json.dumps(row), "")
+            if args[1:3] == ["version", "--format"]:
+                return subprocess.CompletedProcess(
+                    args, 0, '{"Version":"test"}\n', ""
+                )
+            raise AssertionError(f"unexpected preflight command: {args}")
+
+        return run
+
+    def test_preflight_binds_environment_hash_image_and_platform(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            workbuddy = root / "workbuddy"
+            harness = workbuddy / "configs/harnesses/metacodes/docker"
+            harness.mkdir(parents=True)
+            (harness / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            environment = workbuddy / "datasets/code/tasks/task-a/environment"
+            environment.mkdir(parents=True)
+            (environment / "Dockerfile").write_text(
+                "FROM scratch\n", encoding="utf-8"
+            )
+            docker = root / "docker"
+            docker.write_text("fixture\n", encoding="utf-8")
+            docker.chmod(0o755)
+            receipt = root / "preflight.json"
+            with mock.patch(
+                "scripts.eval.workbuddy.environment_preflight._run",
+                side_effect=self._fake_run(),
+            ):
+                built = prebuild(
+                    workbuddy=workbuddy,
+                    dataset="datasets/code/tasks",
+                    selected_tasks=["task-a"],
+                    output=receipt,
+                    docker=docker,
+                )
+                observed = validate_receipt(
+                    receipt,
+                    workbuddy=workbuddy,
+                    dataset="datasets/code/tasks",
+                    selected_tasks=["task-a"],
+                    inspect_images=True,
+                )
+            self.assertEqual(built, observed)
+            self.assertEqual(built["target_platform"], "linux/amd64")
+            self.assertEqual(built["tasks"]["task-a"]["architecture"], "amd64")
+            self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+
+            (environment / "Dockerfile").write_text(
+                "FROM busybox\n", encoding="utf-8"
+            )
+            with mock.patch(
+                "scripts.eval.workbuddy.environment_preflight._run",
+                side_effect=self._fake_run(),
+            ):
+                with self.assertRaisesRegex(
+                    EnvironmentPreflightError, "changed after preflight"
+                ):
+                    validate_receipt(
+                        receipt,
+                        workbuddy=workbuddy,
+                        dataset="datasets/code/tasks",
+                        selected_tasks=["task-a"],
+                        inspect_images=True,
+                    )
+
+    def test_preflight_rejects_non_amd64_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            workbuddy = root / "workbuddy"
+            harness = workbuddy / "configs/harnesses/metacodes/docker"
+            harness.mkdir(parents=True)
+            (harness / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            environment = workbuddy / "datasets/code/tasks/task-a/environment"
+            environment.mkdir(parents=True)
+            (environment / "Dockerfile").write_text(
+                "FROM scratch\n", encoding="utf-8"
+            )
+            docker = root / "docker"
+            docker.write_text("fixture\n", encoding="utf-8")
+            docker.chmod(0o755)
+            with mock.patch(
+                "scripts.eval.workbuddy.environment_preflight._run",
+                side_effect=self._fake_run("arm64"),
+            ):
+                with self.assertRaisesRegex(
+                    EnvironmentPreflightError, "expected linux/amd64"
+                ):
+                    prebuild(
+                        workbuddy=workbuddy,
+                        dataset="datasets/code/tasks",
+                        selected_tasks=["task-a"],
+                        output=root / "preflight.json",
+                        docker=docker,
+                    )
 
 
 class WorkBuddyOverlayUpgradeTest(unittest.TestCase):

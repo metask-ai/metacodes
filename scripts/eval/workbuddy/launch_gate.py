@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import shutil
 import stat
 import subprocess
 import time
@@ -32,7 +33,13 @@ from ..memory_budget_journal import (
 )
 from ..model import ValidationError, stable_json
 from . import WORKBUDDY_PINNED_COMMIT
+from .environment_preflight import (
+    EnvironmentPreflightError,
+    validate_receipt as validate_environment_preflight,
+)
+from .install_overlay import OverlayError, validate_installed_overlay
 from .key_fd import MAX_CREDENTIAL_BYTES
+from .stage_artifacts import ELF_MACHINE_X86_64, TARGET_PLATFORM, _elf_machine
 
 
 SCHEMA_VERSION = "metacodes-workbuddy-paid-launch-v1"
@@ -138,6 +145,38 @@ def _git(repo: Path, *args: str) -> str:
         raise LaunchError(f"git {' '.join(args)} failed for {repo}: {exc}") from exc
 
 
+def _runner_tool(path: Path, version_args: Sequence[str], *, bash: bool = False) -> Dict[str, object]:
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise LaunchError(f"runner tool does not exist: {path}") from exc
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise LaunchError(f"runner tool is not an executable file: {resolved}")
+    try:
+        completed = subprocess.run(
+            [str(resolved), *version_args],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise LaunchError(f"cannot identify runner tool {resolved}: {exc}") from exc
+    version = completed.stdout.strip()
+    if not version:
+        raise LaunchError(f"runner tool has no version output: {resolved}")
+    if bash:
+        match = re.search(r"GNU bash, version ([0-9]+)(?:\.|$)", version)
+        if match is None or int(match.group(1)) < 4:
+            raise LaunchError("WorkBuddy paid runner requires GNU Bash 4 or newer")
+    return {
+        **_identity(resolved, maximum=128 * 1024 * 1024),
+        "version_sha256": _sha256_bytes(version.encode("utf-8")),
+        "version_first_line": version.splitlines()[0],
+    }
+
+
 def _cohort(path: Path, subset: str, cohort: str, take: int) -> Dict[str, object]:
     manifest = _json(path)
     content_sha = manifest.pop("content_sha256", None)
@@ -177,6 +216,7 @@ def _artifact_contract(path: Path) -> Dict[str, object]:
         manifest.get("schema_version") != "metacodes-workbuddy-split-mount-v1"
         or manifest.get("workbuddy_commit") != WORKBUDDY_PINNED_COMMIT
         or manifest.get("target") != "linux-container"
+        or manifest.get("target_platform") != TARGET_PLATFORM
         or manifest.get("synthetic_fixture") is not False
     ):
         raise LaunchError("paid WorkBuddy launch requires a production Linux split mount")
@@ -194,10 +234,21 @@ def _artifact_contract(path: Path) -> Dict[str, object]:
         identity = _identity(binary, maximum=512 * 1024 * 1024)
         if identity["sha256"] != executables[name].get("sha256"):
             raise LaunchError(f"split-mount {name} hash mismatch")
-        if _read_regular(binary, maximum=512 * 1024 * 1024)[:4] != b"\x7fELF":
-            raise LaunchError(f"split-mount {name} is not a Linux ELF")
+        machine = _elf_machine(binary)
+        if (
+            machine != ELF_MACHINE_X86_64
+            or executables[name].get("elf_machine") != ELF_MACHINE_X86_64
+        ):
+            raise LaunchError(
+                f"split-mount {name} does not match {TARGET_PLATFORM} ELF machine"
+            )
+        identity["elf_machine"] = machine
         observed[name] = identity
-    return {"manifest": _identity(path), "executables": observed}
+    return {
+        "manifest": _identity(path),
+        "target_platform": TARGET_PLATFORM,
+        "executables": observed,
+    }
 
 
 def build_launch_manifest(
@@ -209,8 +260,11 @@ def build_launch_manifest(
     cohort: str,
     take: int,
     split_mount_manifest: Path,
+    environment_preflight_receipt: Path,
     job_config: Path,
     model_config: Path,
+    runner_bash: Path,
+    runner_uv: Path,
     provider_identity: str,
     total_cost_microusd: int,
     total_metered_tokens: int,
@@ -227,9 +281,10 @@ def build_launch_manifest(
     if "tencent/workbuddy-bench" not in origin:
         raise LaunchError("WorkBuddy checkout origin mismatch")
     overlay_path = workbuddy / "configs/harnesses/metacodes/OVERLAY.json"
-    overlay = _json(overlay_path)
-    if overlay.get("workbuddy_commit") != WORKBUDDY_PINNED_COMMIT:
-        raise LaunchError("metacodes WorkBuddy overlay commit mismatch")
+    try:
+        overlay = validate_installed_overlay(workbuddy)
+    except OverlayError as exc:
+        raise LaunchError(str(exc)) from exc
 
     cohort_row = _cohort(cohort_manifest.resolve(), subset, cohort, take)
     artifact_row = _artifact_contract(split_mount_manifest.resolve())
@@ -240,6 +295,18 @@ def build_launch_manifest(
     if not isinstance(model, dict):
         raise LaunchError("WorkBuddy model config has no model mapping")
     selected = cohort_row["selected_tasks"]
+    try:
+        environment_preflight = validate_environment_preflight(
+            environment_preflight_receipt.resolve(),
+            workbuddy=workbuddy,
+            dataset=str(cohort_row["dataset"]),
+            selected_tasks=selected,
+            inspect_images=True,
+        )
+    except EnvironmentPreflightError as exc:
+        raise LaunchError(str(exc)) from exc
+    bash_tool = _runner_tool(runner_bash, ("--version",), bash=True)
+    uv_tool = _runner_tool(runner_uv, ("--version",))
     expected_selection = {"mode": "name", "names": selected}
     if job.get("dataset") != cohort_row["dataset"] or job.get("task_selection") != expected_selection:
         raise LaunchError("WorkBuddy job dataset/task_selection differs from frozen cohort")
@@ -293,7 +360,10 @@ def build_launch_manifest(
             "workbuddy_commit": WORKBUDDY_PINNED_COMMIT,
             "overlay": overlay_identity,
             "artifact": artifact_row,
+            "environment_preflight": environment_preflight["content_sha256"],
             "job": job_identity,
+            "runner_tools": {"bash": bash_tool, "uv": uv_tool},
+            "target_platform": TARGET_PLATFORM,
         }
     )
     model_fingerprint = _canonical_sha256(
@@ -312,9 +382,15 @@ def build_launch_manifest(
             "checkout": str(workbuddy),
             "commit": WORKBUDDY_PINNED_COMMIT,
             "overlay": overlay_identity,
+            "overlay_content_sha256": overlay["overlay_sha256"],
         },
         "cohort": cohort_row,
         "artifacts": artifact_row,
+        "environment_preflight": {
+            "receipt": _identity(environment_preflight_receipt.resolve()),
+            "content_sha256": environment_preflight["content_sha256"],
+            "target_platform": environment_preflight["target_platform"],
+        },
         "job": {"slug": job_path.stem, "config": job_identity},
         "model": {
             "slug": model_slug,
@@ -344,7 +420,20 @@ def build_launch_manifest(
             "remote_tinykg_env_cleared": True,
             "local_tinykg": "fresh-home-per-trial",
             "cacheable_first_request_hash_required": True,
-            "runner": ["uv", "run", "--frozen", "bash", "scripts/run.sh", "--job", job_path.stem],
+            "target_platform": TARGET_PLATFORM,
+            "docker_default_platform": TARGET_PLATFORM,
+            "environment_preflight_required": True,
+            "harbor_force_build": False,
+            "runner_tools": {"bash": bash_tool, "uv": uv_tool},
+            "runner": [
+                uv_tool["path"],
+                "run",
+                "--frozen",
+                bash_tool["path"],
+                "scripts/run.sh",
+                "--job",
+                job_path.stem,
+            ],
         },
         "dry_run": {
             "network_requests": 0,
@@ -367,9 +456,32 @@ def validate_launch_manifest(path: Path) -> Dict[str, Any]:
         raise LaunchError("unsupported or mislabeled paid launch manifest")
     if manifest.get("workbuddy", {}).get("commit") != WORKBUDDY_PINNED_COMMIT:
         raise LaunchError("paid launch WorkBuddy commit drifted")
+    if not re.fullmatch(
+        r"[0-9a-f]{64}",
+        str(manifest.get("workbuddy", {}).get("overlay_content_sha256", "")),
+    ):
+        raise LaunchError("paid launch installed-overlay identity is incomplete")
     selected = manifest.get("cohort", {}).get("selected_tasks")
     if not isinstance(selected, list) or not selected or len(selected) != len(set(selected)):
         raise LaunchError("paid launch selected task set is empty or duplicated")
+    preflight = manifest.get("environment_preflight") or {}
+    preflight_receipt = preflight.get("receipt") or {}
+    if (
+        not isinstance(preflight, dict)
+        or preflight.get("target_platform") != TARGET_PLATFORM
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", str(preflight.get("content_sha256", ""))
+        )
+        or not isinstance(preflight_receipt, dict)
+        or not isinstance(preflight_receipt.get("path"), str)
+        or not Path(preflight_receipt["path"]).is_absolute()
+        or not isinstance(preflight_receipt.get("bytes"), int)
+        or preflight_receipt["bytes"] <= 0
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", str(preflight_receipt.get("sha256", ""))
+        )
+    ):
+        raise LaunchError("paid launch environment preflight identity is incomplete")
     execution = manifest.get("execution") or {}
     if execution != {
         **execution,
@@ -383,10 +495,30 @@ def validate_launch_manifest(path: Path) -> Dict[str, Any]:
         "remote_tinykg_env_cleared": True,
         "local_tinykg": "fresh-home-per-trial",
         "cacheable_first_request_hash_required": True,
+        "target_platform": TARGET_PLATFORM,
+        "docker_default_platform": TARGET_PLATFORM,
+        "environment_preflight_required": True,
+        "harbor_force_build": False,
     }:
         raise LaunchError("paid launch execution invariants drifted")
+    tools = execution.get("runner_tools") or {}
+    if (
+        not isinstance(tools, dict)
+        or set(tools) != {"bash", "uv"}
+        or any(
+            not isinstance(tools[name], dict)
+            or not isinstance(tools[name].get("path"), str)
+            or not Path(tools[name]["path"]).is_absolute()
+            or not re.fullmatch(r"[0-9a-f]{64}", str(tools[name].get("sha256", "")))
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", str(tools[name].get("version_sha256", ""))
+            )
+            for name in ("bash", "uv")
+        )
+    ):
+        raise LaunchError("paid launch runner tool identity is incomplete")
     expected_runner = [
-        "uv", "run", "--frozen", "bash", "scripts/run.sh", "--job",
+        tools["uv"]["path"], "run", "--frozen", tools["bash"]["path"], "scripts/run.sh", "--job",
         manifest.get("job", {}).get("slug"),
     ]
     if execution.get("runner") != expected_runner:
@@ -433,15 +565,76 @@ def _reobserve_identity(row: Mapping[str, Any], label: str, *, maximum: int) -> 
         raise LaunchError(f"{label} changed after launch manifest creation")
 
 
+def _paid_host_guard(workbuddy: Path, preflight: Mapping[str, Any]) -> None:
+    dotenv = workbuddy / ".env"
+    if dotenv.exists() or dotenv.is_symlink():
+        raise LaunchError(
+            "paid WorkBuddy checkout must not load an unbound .env file"
+        )
+    bound_docker = Path(preflight["docker"]["path"]).resolve(strict=True)
+    active = shutil.which("docker")
+    if active is None or Path(active).resolve(strict=True) != bound_docker:
+        raise LaunchError("PATH docker differs from the preflight-bound client")
+    uv_shadow = workbuddy / ".venv/bin/docker"
+    if uv_shadow.exists() or uv_shadow.is_symlink():
+        try:
+            shadow = uv_shadow.resolve(strict=True)
+        except OSError as exc:
+            raise LaunchError("WorkBuddy uv environment has a broken docker shadow") from exc
+        if shadow != bound_docker:
+            raise LaunchError("WorkBuddy uv environment shadows the preflight-bound docker")
+
+
 def _reobserve_launch_inputs(manifest: Mapping[str, Any]) -> None:
     workbuddy = Path(manifest["workbuddy"]["checkout"])
     if _git(workbuddy, "rev-parse", "HEAD") != WORKBUDDY_PINNED_COMMIT:
         raise LaunchError("WorkBuddy checkout changed after launch manifest creation")
     _reobserve_identity(manifest["workbuddy"]["overlay"], "WorkBuddy overlay", maximum=16 * 1024 * 1024)
+    try:
+        overlay = validate_installed_overlay(workbuddy)
+    except OverlayError as exc:
+        raise LaunchError(str(exc)) from exc
+    if overlay["overlay_sha256"] != manifest["workbuddy"]["overlay_content_sha256"]:
+        raise LaunchError("installed WorkBuddy overlay identity drifted")
     _reobserve_identity(manifest["cohort"]["manifest"], "cohort manifest", maximum=16 * 1024 * 1024)
     _reobserve_identity(manifest["artifacts"]["manifest"], "split-mount manifest", maximum=16 * 1024 * 1024)
     for name, row in manifest["artifacts"]["executables"].items():
         _reobserve_identity(row, f"split-mount {name}", maximum=512 * 1024 * 1024)
+        if _elf_machine(Path(row["path"])) != ELF_MACHINE_X86_64:
+            raise LaunchError(f"split-mount {name} ELF architecture drifted")
+    preflight_row = manifest["environment_preflight"]
+    _reobserve_identity(
+        preflight_row["receipt"],
+        "environment preflight receipt",
+        maximum=16 * 1024 * 1024,
+    )
+    try:
+        preflight = validate_environment_preflight(
+            Path(preflight_row["receipt"]["path"]),
+            workbuddy=workbuddy,
+            dataset=str(manifest["cohort"]["dataset"]),
+            selected_tasks=list(manifest["cohort"]["selected_tasks"]),
+            inspect_images=True,
+        )
+    except EnvironmentPreflightError as exc:
+        raise LaunchError(str(exc)) from exc
+    if (
+        preflight["content_sha256"] != preflight_row["content_sha256"]
+        or preflight["target_platform"] != TARGET_PLATFORM
+    ):
+        raise LaunchError("environment preflight receipt drifted")
+    _paid_host_guard(workbuddy, preflight)
+    for name, args, is_bash in (
+        ("bash", ("--version",), True),
+        ("uv", ("--version",), False),
+    ):
+        observed = _runner_tool(
+            Path(manifest["execution"]["runner_tools"][name]["path"]),
+            args,
+            bash=is_bash,
+        )
+        if observed != manifest["execution"]["runner_tools"][name]:
+            raise LaunchError(f"WorkBuddy runner tool changed after manifest creation: {name}")
     _reobserve_identity(manifest["job"]["config"], "WorkBuddy job config", maximum=16 * 1024 * 1024)
     _reobserve_identity(manifest["model"]["config"], "WorkBuddy model config", maximum=16 * 1024 * 1024)
     backend_url = os.environ.get(manifest["model"]["backend_url_env"], "")
@@ -727,6 +920,8 @@ def execute_launch(
                         "PROXY_MAX_CONCURRENT": "1",
                         "SHARED_PROXY": "0",
                         "INSTANCE_ID": str(manifest["run_id"]),
+                        "DOCKER_DEFAULT_PLATFORM": TARGET_PLATFORM,
+                        "NO_FORCE_BUILD": "1",
                     }
                 )
                 started_ns = time.time_ns()
@@ -811,8 +1006,11 @@ def main(argv: list[str] | None = None) -> int:
     create.add_argument("--cohort", choices=("dev", "promotion_a", "promotion_b", "sealed"), required=True)
     create.add_argument("--take", type=int, default=0)
     create.add_argument("--split-mount-manifest", type=Path, required=True)
+    create.add_argument("--environment-preflight-receipt", type=Path, required=True)
     create.add_argument("--job-config", type=Path, required=True)
     create.add_argument("--model-config", type=Path, required=True)
+    create.add_argument("--runner-bash", type=Path, required=True)
+    create.add_argument("--runner-uv", type=Path, required=True)
     create.add_argument("--provider-identity", required=True)
     create.add_argument("--total-cost-microusd", type=int, required=True)
     create.add_argument("--total-metered-tokens", type=int, required=True)
@@ -836,8 +1034,11 @@ def main(argv: list[str] | None = None) -> int:
                 cohort=args.cohort,
                 take=args.take,
                 split_mount_manifest=args.split_mount_manifest,
+                environment_preflight_receipt=args.environment_preflight_receipt,
                 job_config=args.job_config,
                 model_config=args.model_config,
+                runner_bash=args.runner_bash,
+                runner_uv=args.runner_uv,
                 provider_identity=args.provider_identity,
                 total_cost_microusd=args.total_cost_microusd,
                 total_metered_tokens=args.total_metered_tokens,

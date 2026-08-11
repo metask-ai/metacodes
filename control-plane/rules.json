@@ -667,6 +667,7 @@
             "scripts.eval.tests.test_experiment",
             "scripts.eval.tests.test_paid_multi_arm_fd",
             "scripts.eval.tests.test_workbuddy_launch_gate",
+            "scripts.eval.tests.test_workbuddy_adapter",
             "-v"
           ],
           [

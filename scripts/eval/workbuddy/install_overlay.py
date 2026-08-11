@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import subprocess
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -299,46 +300,113 @@ def _write_expected(target: Path, content: bytes, *, replace_owned: bool = False
     os.replace(temporary, target)
 
 
-def _verified_previous_overlay(repo: Path, manifest_path: Path) -> set[Path]:
-    """Return paths owned by an intact prior overlay, or fail closed.
+def _read_single_link_regular(path: Path, *, maximum: int = 32 * 1024 * 1024) -> bytes:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise OverlayError(f"cannot open overlay file {path}: {exc}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise OverlayError(f"overlay file is not a single-link regular file: {path}")
+        if before.st_size > maximum:
+            raise OverlayError(f"overlay file size is outside the safety bound: {path}")
+        chunks: List[bytes] = []
+        observed = 0
+        while True:
+            chunk = os.read(descriptor, min(1024 * 1024, maximum + 1 - observed))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            observed += len(chunk)
+            if observed > maximum:
+                raise OverlayError(f"overlay file exceeds the safety bound: {path}")
+        after = os.fstat(descriptor)
+        identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            raise OverlayError(f"overlay file changed while hashing: {path}")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def validate_installed_overlay(
+    repo: Path,
+    manifest_path: Path = Path("configs/harnesses/metacodes/OVERLAY.json"),
+) -> Dict[str, object]:
+    """Validate every installed overlay byte against its aggregate manifest.
 
     The aggregate v1 digest covers every installed file except the generated
-    manifest itself.  Recomputing it before replacement makes an overlay
-    upgrade possible without treating unrelated edits as ours.
+    manifest itself.  Paid launch creation and re-observation share this exact
+    verifier with upgrades so the installer and execution gate cannot drift.
     """
-    target = repo / manifest_path
-    if not target.exists():
-        return set()
-    if target.is_symlink() or not target.is_file():
-        raise OverlayError(f"overlay manifest is not a regular file: {target}")
+    checkout = repo.resolve(strict=True)
+    if manifest_path.is_absolute() or ".." in manifest_path.parts:
+        raise OverlayError("overlay manifest path escapes checkout")
+    target = checkout / manifest_path
+
+    def unique(pairs: List[Tuple[str, object]]) -> Dict[str, object]:
+        result: Dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise OverlayError(f"duplicate overlay manifest field: {key}")
+            result[key] = value
+        return result
+
     try:
-        previous = json.loads(target.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise OverlayError(f"existing overlay manifest is invalid: {exc}") from exc
+        previous = json.loads(
+            _read_single_link_regular(target).decode("utf-8"),
+            object_pairs_hook=unique,
+        )
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise OverlayError(f"overlay manifest is invalid: {exc}") from exc
+    if not isinstance(previous, dict):
+        raise OverlayError("overlay manifest is not an object")
     if (
         previous.get("schema_version") != "metacodes-workbuddy-overlay-v1"
         or previous.get("workbuddy_commit") != WORKBUDDY_PINNED_COMMIT
+        or previous.get("quality_evidence") is not False
     ):
-        raise OverlayError("existing overlay manifest has an unrelated identity")
+        raise OverlayError("overlay manifest has an unrelated identity")
+    overlay_sha = previous.get("overlay_sha256")
+    if (
+        not isinstance(overlay_sha, str)
+        or len(overlay_sha) != 64
+        or any(character not in "0123456789abcdef" for character in overlay_sha)
+    ):
+        raise OverlayError("overlay manifest has an invalid aggregate digest")
     raw_paths = previous.get("installed_paths")
-    if not isinstance(raw_paths, list) or not raw_paths:
-        raise OverlayError("existing overlay manifest has no installed paths")
-    owned: set[Path] = set()
+    if (
+        not isinstance(raw_paths, list)
+        or not raw_paths
+        or any(not isinstance(raw, str) for raw in raw_paths)
+        or len(raw_paths) != len(set(raw_paths))
+        or raw_paths != sorted(raw_paths)
+    ):
+        raise OverlayError("overlay manifest has invalid or duplicate installed paths")
     rows: List[Tuple[Path, bytes]] = []
     for raw in raw_paths:
-        if not isinstance(raw, str):
-            raise OverlayError("existing overlay manifest has an invalid path")
         relative = Path(raw)
-        if relative.is_absolute() or ".." in relative.parts:
-            raise OverlayError(f"existing overlay manifest path escapes checkout: {raw}")
-        installed = repo / relative
-        if installed.is_symlink() or not installed.is_file():
-            raise OverlayError(f"prior overlay path is missing or unsafe: {installed}")
-        owned.add(relative)
-        rows.append((relative, installed.read_bytes()))
-    if _digest(rows, {}) != previous.get("overlay_sha256"):
-        raise OverlayError("prior overlay files changed after installation")
-    return owned
+        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+            raise OverlayError(f"overlay manifest path escapes checkout: {raw}")
+        installed = checkout / relative
+        try:
+            installed.resolve(strict=True).relative_to(checkout)
+        except (OSError, ValueError) as exc:
+            raise OverlayError(f"overlay path is missing or escapes checkout: {raw}") from exc
+        rows.append((relative, _read_single_link_regular(installed)))
+    if _digest(rows, {}) != overlay_sha:
+        raise OverlayError("installed overlay files changed after installation")
+    return previous
+
+
+def _verified_previous_overlay(repo: Path, manifest_path: Path) -> set[Path]:
+    """Return paths owned by an intact prior overlay, or fail closed."""
+    target = repo / manifest_path
+    if not target.exists() and not target.is_symlink():
+        return set()
+    previous = validate_installed_overlay(repo, manifest_path)
+    return {Path(raw) for raw in previous["installed_paths"]}
 
 
 def _write_generated_manifest(target: Path, content: bytes) -> None:

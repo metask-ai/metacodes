@@ -21,6 +21,8 @@ from . import WORKBUDDY_PINNED_COMMIT
 
 
 SCHEMA_VERSION = "metacodes-workbuddy-split-mount-v1"
+TARGET_PLATFORM = "linux/amd64"
+ELF_MACHINE_X86_64 = 62
 
 
 class StageError(ValueError):
@@ -79,9 +81,18 @@ def _copy_regular(source: Path, target: Path, mode: int) -> Dict[str, object]:
     }
 
 
-def _is_elf(path: Path) -> bool:
+def _elf_machine(path: Path) -> int | None:
     with path.open("rb") as handle:
-        return handle.read(4) == b"\x7fELF"
+        header = handle.read(20)
+    if (
+        len(header) < 20
+        or header[:4] != b"\x7fELF"
+        or header[4] != 2  # ELFCLASS64
+        or header[5] != 1  # ELFDATA2LSB
+        or header[6] != 1  # EV_CURRENT
+    ):
+        return None
+    return int.from_bytes(header[18:20], "little")
 
 
 def stage(
@@ -116,6 +127,18 @@ def stage(
         raise StageError("licenses must bind exactly metacodes, tinykg, and lean4")
     if any(not spdx.strip() for _, spdx, _ in license_rows):
         raise StageError("every license requires an explicit SPDX expression or NOASSERTION")
+    if not allow_synthetic_fixtures:
+        for label, source in binaries.items():
+            machine = _elf_machine(source)
+            if machine is None:
+                raise StageError(
+                    f"production {label} is not a Linux ELF64 little-endian artifact"
+                )
+            if machine != ELF_MACHINE_X86_64:
+                raise StageError(
+                    f"production {label} ELF machine {machine} does not match "
+                    f"{TARGET_PLATFORM} (expected {ELF_MACHINE_X86_64})"
+                )
 
     output.mkdir(parents=True, mode=0o755)
     executable_targets = {
@@ -129,8 +152,17 @@ def stage(
     }
     if not allow_synthetic_fixtures:
         for label, target in executable_targets.items():
-            if not _is_elf(target):
-                raise StageError(f"production {label} is not a Linux ELF artifact")
+            machine = _elf_machine(target)
+            if machine is None:
+                raise StageError(
+                    f"production {label} is not a Linux ELF64 little-endian artifact"
+                )
+            if machine != ELF_MACHINE_X86_64:
+                raise StageError(
+                    f"production {label} ELF machine {machine} does not match "
+                    f"{TARGET_PLATFORM} (expected {ELF_MACHINE_X86_64})"
+                )
+            executable_meta[label]["elf_machine"] = machine
 
     license_meta: Dict[str, object] = {}
     for component, spdx, source in sorted(license_rows):
@@ -144,6 +176,7 @@ def stage(
         "quality_evidence": False,
         "synthetic_fixture": bool(allow_synthetic_fixtures),
         "target": "linux-container" if not allow_synthetic_fixtures else "test-fixture",
+        "target_platform": TARGET_PLATFORM if not allow_synthetic_fixtures else "test-fixture",
         "workbuddy_commit": WORKBUDDY_PINNED_COMMIT,
         "sources": {
             "metacodes_commit": metacodes_commit,

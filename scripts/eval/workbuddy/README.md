@@ -10,7 +10,9 @@ Install the idempotent overlay:
 python3 -m scripts.eval.workbuddy.install_overlay /path/to/workbuddy-bench
 ```
 
-Stage production Linux artifacts with explicit source and license provenance:
+Stage production `linux/amd64` artifacts with explicit source and license
+provenance. The stager parses every ELF header and rejects ARM64 or mixed-arch
+inputs before creating the output directory:
 
 ```bash
 python3 -m scripts.eval.workbuddy.stage_artifacts \
@@ -63,16 +65,34 @@ behavior. Production metacodes pilots must not use the shared proxy because its
 long-lived credential lifecycle is outside the single-run budget transaction.
 
 The paid launch gate is separate from the normal WorkBuddy runner. `create`
-performs a side-effect-free plan and binds the cohort, WorkBuddy commit/overlay,
-Linux split-mount hashes, job/model configs, caps and cache policy. `run`
-re-observes those identities, appends `request_authorized` to the external
-journal, then starts the fixed WorkBuddy command with the anonymous credential
-FD. It commits only after every selected trajectory has a request audit, usage
-and cache-prefix hash. A failed or interrupted authorized run is not
-automatically retried.
+performs a provider-side-effect-free plan and binds the cohort, WorkBuddy
+commit/overlay, linux/amd64 split-mount hashes, job/model configs, caps and
+cache policy. Before `create`, prebuild the selected task environments. This
+warms Harbor's BuildKit cache and writes a private receipt binding every Docker
+context hash, resulting image ID, the split-mount image and Docker client:
 
 ```bash
-python3 -m scripts.eval.workbuddy.launch_gate create ... --output launch.json
+python3 -m scripts.eval.workbuddy.environment_preflight \
+  --workbuddy-checkout /path/to/workbuddy-bench \
+  --dataset datasets/wb-bench-code-v1.0/tasks \
+  --task <frozen-task-1> --task <frozen-task-2> --task <frozen-task-3> \
+  --output /private/preflight.json
+```
+
+The launch manifest requires that receipt plus absolute, hashed GNU Bash 4+
+and `uv` executables. `run` re-observes those identities and the cached
+linux/amd64 images, sets `DOCKER_DEFAULT_PLATFORM=linux/amd64`, appends
+`request_authorized` to the external journal, then starts the fixed WorkBuddy
+command with the anonymous credential FD. It commits only after every selected
+trajectory has a request audit, usage and cache-prefix hash. A failed or
+interrupted authorized run is not automatically retried.
+
+```bash
+python3 -m scripts.eval.workbuddy.launch_gate create ... \
+  --environment-preflight-receipt /private/preflight.json \
+  --runner-bash /absolute/path/to/bash \
+  --runner-uv /absolute/path/to/uv \
+  --output launch.json
 python3 -m scripts.eval.workbuddy.launch_gate run \
   --manifest launch.json --budget-journal /private/budget.json \
   --receipt /private/receipts/run.json --credential-fd 9
