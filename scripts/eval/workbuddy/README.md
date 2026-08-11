@@ -123,6 +123,8 @@ The first paid cohort is frozen in
 `configs/jobs/metacodes-glm52-code-3-canary.yaml` by the maintained overlay.  It
 selects the first three Code `dev` tasks from the committed cohort manifest,
 uses one attempt and one concurrent trial, and records complete provider I/O.
+Its backend model id is the provider-catalog spelling `GLM-5.2`; model ids are
+case-sensitive and must not be normalized by the benchmark adapter.
 Do not widen that job in place; later Code16 and cross-domain waves get separate
 job files and budget transactions.
 

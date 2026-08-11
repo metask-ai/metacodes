@@ -493,7 +493,7 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         self.assertEqual(job["n_attempts"], 1)
         self.assertTrue(job["record_full_io"])
         self.assertEqual(job["orchestrator_override"]["n_concurrent_trials"], 1)
-        self.assertEqual(model["name"], "glm-5.2")
+        self.assertEqual(model["name"], "GLM-5.2")
         self.assertEqual(model["protocols"], ["anthropic"])
         self.assertEqual(
             model["backend_key_env"],
