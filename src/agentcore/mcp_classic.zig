@@ -125,7 +125,16 @@ pub fn parseInitializeResponse(
 ) error{OutOfMemory}!canonical.Outcome(canonical.OwnedHandshake) {
     var owned = canonical.OwnedHandshake.init(backing, requested_profile.era);
     const allocator = owned.allocator();
-    const envelope = try wire.parseEnvelope(allocator, encoded, expected_id, .initialize, limits);
+    const envelope = wire.parseEnvelope(
+        allocator,
+        encoded,
+        expected_id,
+        .initialize,
+        limits,
+    ) catch |err| {
+        owned.deinit();
+        return err;
+    };
     const result = switch (envelope) {
         .diagnostic => |diagnostic| {
             owned.deinit();
@@ -205,7 +214,16 @@ pub fn parseListToolsResponse(
 ) error{OutOfMemory}!canonical.Outcome(canonical.OwnedCatalog) {
     var owned = canonical.OwnedCatalog.init(backing, profile.era);
     const allocator = owned.allocator();
-    const envelope = try wire.parseEnvelope(allocator, encoded, expected_id, .tools_list, limits);
+    const envelope = wire.parseEnvelope(
+        allocator,
+        encoded,
+        expected_id,
+        .tools_list,
+        limits,
+    ) catch |err| {
+        owned.deinit();
+        return err;
+    };
     const result = switch (envelope) {
         .diagnostic => |diagnostic| {
             owned.deinit();
@@ -275,7 +293,16 @@ pub fn parseCallToolResponse(
 ) error{OutOfMemory}!canonical.Outcome(canonical.OwnedCallResult) {
     var owned = canonical.OwnedCallResult.init(backing, profile.era);
     const allocator = owned.allocator();
-    const envelope = try wire.parseEnvelope(allocator, encoded, expected_id, .tools_call, limits);
+    const envelope = wire.parseEnvelope(
+        allocator,
+        encoded,
+        expected_id,
+        .tools_call,
+        limits,
+    ) catch |err| {
+        owned.deinit();
+        return err;
+    };
     const result = switch (envelope) {
         .diagnostic => |diagnostic| {
             owned.deinit();
