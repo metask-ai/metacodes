@@ -1,5 +1,5 @@
 model:
-  name: GLM-5.2
+  name: glm-5.2
   protocols: [anthropic]
   backend_url_env: METACODES_WORKBUDDY_PROVIDER_BASE_URL
   backend_key_env: METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF

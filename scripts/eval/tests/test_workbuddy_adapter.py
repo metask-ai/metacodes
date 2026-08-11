@@ -493,7 +493,7 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         self.assertEqual(job["n_attempts"], 1)
         self.assertTrue(job["record_full_io"])
         self.assertEqual(job["orchestrator_override"]["n_concurrent_trials"], 1)
-        self.assertEqual(model["name"], "GLM-5.2")
+        self.assertEqual(model["name"], "glm-5.2")
         self.assertEqual(model["protocols"], ["anthropic"])
         self.assertEqual(
             model["backend_key_env"],
@@ -501,6 +501,25 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         )
         self.assertEqual(model["max_concurrent"], 1)
         self.assertEqual(model["context_window"], job["context_window"])
+
+    def test_paid_code_probe_is_frozen_to_first_code_dev_task(self):
+        root = Path(__file__).parents[1] / "workbuddy"
+        overlay = root / "overlay"
+        job = yaml.safe_load(
+            (overlay / "configs/jobs/metacodes-glm52-code-1-probe.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        cohort = json.loads(
+            (root / "manifests/workbuddy-v1-cohorts.json").read_text(encoding="utf-8")
+        )
+        expected = cohort["subsets"]["code"]["cohorts"]["dev"][
+            "task_selection"
+        ]["names"][:1]
+        self.assertEqual(job["task_selection"], {"mode": "name", "names": expected})
+        self.assertEqual(job["n_attempts"], 1)
+        self.assertEqual(job["orchestrator_override"]["n_concurrent_trials"], 1)
+        self.assertTrue(job["record_full_io"])
 
 
 class WorkBuddyCredentialFdTest(unittest.TestCase):
