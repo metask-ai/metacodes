@@ -2,6 +2,7 @@ import json
 import hashlib
 import io
 import os
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -17,6 +18,7 @@ from scripts.eval.workbuddy.cohort_manifest import (
 )
 from scripts.eval.workbuddy.stage_artifacts import StageError, stage
 from scripts.eval.workbuddy.install_overlay import _digest
+from scripts.eval.workbuddy import install_overlay as overlay_installer
 from scripts.eval.workbuddy.key_fd import (
     CredentialFdError,
     _SECRET_CACHE,
@@ -235,6 +237,51 @@ class WorkBuddyArtifactStageTest(unittest.TestCase):
 
 
 class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
+    def test_overlay_patches_resolve_and_prepare_with_one_mount_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            fixtures = {
+                overlay_installer._ADAPTER_PATH:
+                    overlay_installer._ADAPTER_ANCHOR,
+                overlay_installer._RESOLVER_PATH: (
+                    overlay_installer._DISPATCH_OLD
+                    + overlay_installer._GENERIC_ANCHOR
+                    + overlay_installer._RESOLVER_MOUNT_OLD
+                ),
+                overlay_installer._PREPARE_JOB_PATH:
+                    overlay_installer._PREPARE_MOUNT_OLD,
+                overlay_installer._PROXY_CONFIG_PATH: (
+                    overlay_installer._PROXY_IMPORT_ANCHOR
+                    + overlay_installer._PROXY_KEY_OLD
+                ),
+            }
+            for relative, content in fixtures.items():
+                path = repo / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            for args in (
+                ("init", "-q"),
+                ("add", "."),
+                (
+                    "-c", "user.name=metacodes-test",
+                    "-c", "user.email=metacodes-test@example.invalid",
+                    "commit", "-qm", "fixture",
+                ),
+            ):
+                subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            patched = overlay_installer._patched_upstream(repo)
+            resolver = patched[overlay_installer._RESOLVER_PATH].decode("utf-8")
+            prepare = patched[overlay_installer._PREPARE_JOB_PATH].decode("utf-8")
+            self.assertIn(overlay_installer._RESOLVER_MOUNT_NEW, resolver)
+            self.assertIn(overlay_installer._PREPARE_MOUNT_NEW, prepare)
+            self.assertNotIn(overlay_installer._RESOLVER_MOUNT_OLD, resolver)
+            self.assertNotIn(overlay_installer._PREPARE_MOUNT_OLD, prepare)
+
     def test_digest_detects_changes_before_owned_overlay_replacement(self):
         rows = [(Path("a"), b"one"), (Path("b"), b"two")]
         before = _digest(rows, {})

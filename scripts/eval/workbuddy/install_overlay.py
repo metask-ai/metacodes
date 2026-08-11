@@ -25,6 +25,7 @@ class OverlayError(ValueError):
 
 _ADAPTER_PATH = Path("src/workbuddy_bench/runner/harness_adapters.py")
 _RESOLVER_PATH = Path("src/workbuddy_bench/runner/resolve_manifest.py")
+_PREPARE_JOB_PATH = Path("src/workbuddy_bench/runner/prepare_job.py")
 _AGENT_PATH = Path("src/workbuddy_bench/agents/metacodes_agent.py")
 _TRACE_PATH = Path("src/workbuddy_bench/agents/_metacodes_trace.py")
 _KEY_FD_PATH = Path("src/workbuddy_bench/proxy/_metacodes_key_fd.py")
@@ -127,6 +128,50 @@ _PROXY_KEY_OLD = '        key = _resolve_env(backend_raw.get("key", ""), backend
 _PROXY_KEY_NEW = '        key = resolve_secret_env(backend_raw.get("key", ""), backend_raw.get("key_env", ""))\n'
 
 
+_RESOLVER_MOUNT_OLD = '''    dataset_runtime = load_dataset_runtime_contract(dataset, repo_root=_repo_root())
+    dataset_requires_mount = dataset_runtime.requires_split_mount_for(harness_name)
+    backend_for_mount = "local"
+'''
+_RESOLVER_MOUNT_NEW = '''    dataset_runtime = load_dataset_runtime_contract(dataset, repo_root=_repo_root())
+    # Official v1 datasets predate metacodes and therefore enumerate only the
+    # original split-mount harnesses.  The metacodes harness itself declares a
+    # pinned mount and is never baked into task images, so treat that declaration
+    # as the authoritative delivery requirement instead of silently omitting it.
+    metacodes_declares_mount = (
+        harness_name == "metacodes" and isinstance(harness.get("mount"), dict)
+    )
+    dataset_requires_mount = (
+        dataset_runtime.requires_split_mount_for(harness_name)
+        or metacodes_declares_mount
+    )
+    backend_for_mount = "local"
+'''
+
+
+_PREPARE_MOUNT_OLD = '''    harness_name = harness.get("name", "")
+    dataset_requires_mount = dataset_runtime.requires_split_mount_for(str(harness_name))
+    harness_mount = harness.get("mount")
+    if dataset_requires_mount:
+'''
+_PREPARE_MOUNT_NEW = '''    harness_name = harness.get("name", "")
+    metacodes_declares_mount = (
+        harness_name == "metacodes" and isinstance(harness.get("mount"), dict)
+    )
+    dataset_requires_mount = (
+        dataset_runtime.requires_split_mount_for(str(harness_name))
+        or metacodes_declares_mount
+    )
+    manifest_mount = (manifest or {}).get("harness_mount")
+    if isinstance(manifest_mount, dict):
+        if manifest_mount.get("required") is not dataset_requires_mount:
+            raise ValueError(
+                f"{job_path}: resolved harness-mount requirement drifted before prepare_job"
+            )
+    harness_mount = harness.get("mount")
+    if dataset_requires_mount:
+'''
+
+
 def _run(repo: Path, *args: str) -> str:
     try:
         return subprocess.run(
@@ -169,6 +214,14 @@ def _patched_upstream(repo: Path) -> Dict[Path, bytes]:
     resolver = resolver.replace(
         _GENERIC_ANCHOR, _METACODES_RUNTIME_BUILDER + _GENERIC_ANCHOR, 1
     )
+    if resolver.count(_RESOLVER_MOUNT_OLD) != 1:
+        raise OverlayError("WorkBuddy resolver mount-requirement anchor drifted")
+    resolver = resolver.replace(_RESOLVER_MOUNT_OLD, _RESOLVER_MOUNT_NEW, 1)
+
+    prepare_job = _head_file(repo, _PREPARE_JOB_PATH).decode("utf-8")
+    if prepare_job.count(_PREPARE_MOUNT_OLD) != 1:
+        raise OverlayError("WorkBuddy prepare_job mount-requirement anchor drifted")
+    prepare_job = prepare_job.replace(_PREPARE_MOUNT_OLD, _PREPARE_MOUNT_NEW, 1)
 
     proxy_config = _head_file(repo, _PROXY_CONFIG_PATH).decode("utf-8")
     if proxy_config.count(_PROXY_IMPORT_ANCHOR) != 1:
@@ -183,6 +236,7 @@ def _patched_upstream(repo: Path) -> Dict[Path, bytes]:
     return {
         _ADAPTER_PATH: adapter.encode("utf-8"),
         _RESOLVER_PATH: resolver.encode("utf-8"),
+        _PREPARE_JOB_PATH: prepare_job.encode("utf-8"),
         _PROXY_CONFIG_PATH: proxy_config.encode("utf-8"),
     }
 
