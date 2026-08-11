@@ -30,6 +30,23 @@ Run the zero-provider W0 vertical slice:
 python3 -m scripts.eval.workbuddy.run_w0 /path/to/workbuddy-bench
 ```
 
+Freeze the official task cohorts before inspecting any task body:
+
+```bash
+python3 -m scripts.eval.workbuddy.cohort_manifest \
+  --workbuddy-checkout /path/to/workbuddy-bench \
+  --archives-dir /path/to/downloaded-but-not-extracted-archives \
+  --sha256sums /path/to/SHA256SUMS \
+  --output /path/to/workbuddy-cohorts-v1.json
+```
+
+The generator has a fixed salt and quota table. It verifies each official
+archive, scans only tar member headers ending in `tasks/<slug>/task.toml`, and
+does not extract or open task instructions, tests, or workspaces. Each generated
+cohort contains the exact `task_selection: {mode: name, names: [...]}` mapping
+accepted by WorkBuddy jobs. Commit the generator before obtaining official task
+slugs; keep the resulting manifest immutable and bind it into every paid run.
+
 W0 uses a static synthetic ELF, Docker `network_mode: none`, `n_attempts=1`,
 and concurrency 1. The ELF also asserts at runtime that its namespace has no
 non-loopback interface. This native compose rule works on Docker Desktop where

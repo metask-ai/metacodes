@@ -1,8 +1,16 @@
 import json
+import hashlib
+import io
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
 
+from scripts.eval.workbuddy.cohort_manifest import (
+    CohortError,
+    SUBSETS,
+    build_manifest,
+)
 from scripts.eval.workbuddy.stage_artifacts import StageError, stage
 from scripts.eval.workbuddy.install_overlay import _digest
 from scripts.eval.workbuddy.trace import (
@@ -231,6 +239,92 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         config = (task / "task.toml").read_text(encoding="utf-8")
         self.assertIn("network_mode: none", compose)
         self.assertEqual(config.count('network_mode = "public"'), 3)
+
+
+class WorkBuddyCohortManifestTest(unittest.TestCase):
+    @staticmethod
+    def _archive(path: Path, dataset_id: str, slugs: list[str], *, reverse: bool = False):
+        ordered = list(reversed(slugs)) if reverse else slugs
+        with tarfile.open(path, "w:gz") as archive:
+            for slug in ordered:
+                payload = b"\xff\x00body-must-not-be-parsed"
+                member = tarfile.TarInfo(f"{dataset_id}/tasks/{slug}/task.toml")
+                member.size = len(payload)
+                archive.addfile(member, io.BytesIO(payload))
+                instruction = tarfile.TarInfo(
+                    f"{dataset_id}/tasks/{slug}/instruction.md"
+                )
+                instruction.size = 7
+                archive.addfile(instruction, io.BytesIO(b"private"))
+
+    def _fixtures(self, root: Path, *, reverse: bool = False):
+        archives = {}
+        sums = {}
+        for subset in SUBSETS:
+            path = root / subset.archive
+            slugs = [f"{subset.name}-task-{index:03}" for index in range(subset.task_count)]
+            self._archive(path, subset.dataset_id, slugs, reverse=reverse)
+            archives[subset.name] = path
+            sums[subset.archive] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return archives, sums
+
+    def test_fixed_split_is_exhaustive_disjoint_and_workbuddy_consumable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archives, sums = self._fixtures(Path(directory))
+            manifest = build_manifest(archives=archives, expected_sums=sums)
+        self.assertFalse(manifest["quality_evidence"])
+        self.assertFalse(
+            manifest["contamination_boundary"]["task_payload_exposed_to_generator"]
+        )
+        self.assertEqual(
+            manifest["cohort_totals"],
+            {"dev": 52, "promotion_a": 26, "promotion_b": 26, "sealed": 156},
+        )
+        for subset in SUBSETS:
+            rows = manifest["subsets"][subset.name]
+            assigned = []
+            for cohort, expected_count in subset.cohort_counts:
+                selection = rows["cohorts"][cohort]["task_selection"]
+                self.assertEqual(selection["mode"], "name")
+                self.assertEqual(len(selection["names"]), expected_count)
+                assigned.extend(selection["names"])
+            self.assertEqual(len(assigned), len(set(assigned)))
+            self.assertEqual(len(assigned), subset.task_count)
+
+    def test_member_order_cannot_change_partition(self):
+        with tempfile.TemporaryDirectory() as first_dir, tempfile.TemporaryDirectory() as second_dir:
+            first, first_sums = self._fixtures(Path(first_dir))
+            second, second_sums = self._fixtures(Path(second_dir), reverse=True)
+            a = build_manifest(archives=first, expected_sums=first_sums)
+            b = build_manifest(archives=second, expected_sums=second_sums)
+        for subset in SUBSETS:
+            self.assertEqual(
+                a["subsets"][subset.name]["cohorts"],
+                b["subsets"][subset.name]["cohorts"],
+            )
+
+    def test_checksum_mismatch_and_linked_task_metadata_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archives, sums = self._fixtures(root)
+            sums[SUBSETS[0].archive] = "0" * 64
+            with self.assertRaisesRegex(CohortError, "checksum mismatch"):
+                build_manifest(archives=archives, expected_sums=sums)
+
+            subset = SUBSETS[0]
+            linked = root / "linked.tar.gz"
+            with tarfile.open(linked, "w:gz") as archive:
+                for index in range(subset.task_count):
+                    member = tarfile.TarInfo(
+                        f"{subset.dataset_id}/tasks/code-task-{index:03}/task.toml"
+                    )
+                    member.type = tarfile.SYMTYPE
+                    member.linkname = "elsewhere"
+                    archive.addfile(member)
+            archives[subset.name] = linked
+            sums[subset.archive] = hashlib.sha256(linked.read_bytes()).hexdigest()
+            with self.assertRaisesRegex(CohortError, "not a regular file"):
+                build_manifest(archives=archives, expected_sums=sums)
 
 if __name__ == "__main__":
     unittest.main()
