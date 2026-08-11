@@ -710,6 +710,57 @@ def _task_for_path(path: Path, selected: Sequence[str]) -> str | None:
     return None
 
 
+def _official_task_identity(
+    trajectory_path: Path,
+    manifest: Mapping[str, Any],
+    selected: Sequence[str],
+    expected_model_route: str,
+) -> tuple[str, Path, Dict[str, Any]]:
+    """Bind a trajectory through Harbor's authoritative trial result.
+
+    Harbor truncates long task names in trial-directory basenames and appends a
+    random suffix, so directory-name heuristics are not provenance.  The
+    sibling result carries the canonical task name, staged task path, source,
+    model route, checksum and trial URI; require all of them to agree.
+    """
+    trial_dir = trajectory_path.parent.parent.resolve()
+    result_path = trial_dir / "result.json"
+    result = _json(result_path)
+    task_id = result.get("task_id") or {}
+    agent_info = result.get("agent_info") or {}
+    model_info = agent_info.get("model_info") or {}
+    raw_task_path = task_id.get("path") if isinstance(task_id, dict) else None
+    dataset_root = Path(str(manifest["cohort"]["dataset"])).parent.name
+    matches = [
+        task
+        for task in selected
+        if result.get("task_name") == f"workbuddy/{task}"
+        and raw_task_path
+        == str(
+            Path(".workspace/tmp/staged")
+            / str(manifest["run_id"])
+            / dataset_root
+            / "tasks"
+            / task
+        )
+    ]
+    checksum = result.get("task_checksum")
+    if (
+        len(matches) != 1
+        or result.get("source") != "tasks"
+        or result.get("trial_uri") != trial_dir.as_uri()
+        or result.get("exception_info") is not None
+        or agent_info.get("name") != "metacodes"
+        or model_info.get("name") != expected_model_route
+        or not isinstance(checksum, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", checksum)
+    ):
+        raise LaunchError(
+            f"official WorkBuddy trial identity is incomplete or drifted: {result_path}"
+        )
+    return matches[0], result_path, result
+
+
 def _runtime_contract(manifest: Mapping[str, Any]) -> Dict[str, object]:
     workbuddy = Path(manifest["workbuddy"]["checkout"])
     run_id = manifest["run_id"]
@@ -768,8 +819,29 @@ def _collect_usage(
     total_cache_read = 0
     total_cache_create = 0
     total_requests = 0
+    expected_model_route = ""
+    if official_runner:
+        resolved_path = (
+            workbuddy
+            / "scripts/logs/instances"
+            / str(manifest["run_id"])
+            / "manifest.json"
+        )
+        expected_model_route = str(_json(resolved_path).get("model_route") or "")
+        if not expected_model_route or "__" in expected_model_route:
+            raise LaunchError("official WorkBuddy model route is missing or Harbor-unsafe")
     for trajectory_path in sorted(trajectories):
-        task = _task_for_path(trajectory_path, selected)
+        trial_result_path: Path | None = None
+        trial_result: Dict[str, Any] | None = None
+        if official_runner:
+            task, trial_result_path, trial_result = _official_task_identity(
+                trajectory_path,
+                manifest,
+                selected,
+                expected_model_route,
+            )
+        else:
+            task = _task_for_path(trajectory_path, selected)
         if task is None or task in rows:
             raise LaunchError(f"cannot uniquely bind trajectory to selected task: {trajectory_path}")
         trajectory = _json(trajectory_path)
@@ -814,6 +886,13 @@ def _collect_usage(
             "cache_creation_input_tokens": cache_create,
             "cost_usd": float(cost),
         }
+        if trial_result_path is not None and trial_result is not None:
+            rows[task].update(
+                {
+                    "trial_result_sha256": _identity(trial_result_path)["sha256"],
+                    "task_checksum": trial_result["task_checksum"],
+                }
+            )
     if set(rows) != set(selected):
         raise LaunchError("WorkBuddy result set differs from frozen task selection")
     result = {

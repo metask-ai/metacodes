@@ -16,6 +16,7 @@ from scripts.eval.workbuddy.launch_gate import (
     PROVIDER_KEY_ENV,
     SCHEMA_VERSION,
     _paid_host_guard,
+    _official_task_identity,
     _reobserve_launch_inputs,
     execute_launch,
     validate_launch_manifest,
@@ -358,6 +359,58 @@ record = {"request": {"body": {"model": "volatile-route", "system": "stable", "m
                     LaunchError, "installed overlay files changed"
                 ):
                     _reobserve_launch_inputs(manifest)
+
+    def test_official_task_identity_uses_result_not_truncated_trial_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            trial = root / "data_quality-hard-label_conflict__random"
+            trajectory = trial / "agent/trajectory.json"
+            trajectory.parent.mkdir(parents=True)
+            trajectory.write_text("{}\n", encoding="utf-8")
+            task = "data_quality-hard-label_conflicts"
+            run_id = "workbuddy-authoritative-task-l2"
+            route = run_id + "--metacodes-glm52"
+            result = {
+                "task_name": f"workbuddy/{task}",
+                "task_id": {
+                    "path": str(
+                        Path(".workspace/tmp/staged")
+                        / run_id
+                        / "wb-bench-code-v1.0/tasks"
+                        / task
+                    )
+                },
+                "source": "tasks",
+                "trial_uri": trial.as_uri(),
+                "task_checksum": digest("task-checksum"),
+                "exception_info": None,
+                "agent_info": {
+                    "name": "metacodes",
+                    "model_info": {"name": route},
+                },
+            }
+            (trial / "result.json").write_text(
+                json.dumps(result, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            manifest = {
+                "run_id": run_id,
+                "cohort": {"dataset": "datasets/wb-bench-code-v1.0/tasks"},
+            }
+            observed, result_path, loaded = _official_task_identity(
+                trajectory, manifest, [task], route
+            )
+            self.assertEqual(task, observed)
+            self.assertEqual(trial / "result.json", result_path)
+            self.assertEqual(result, loaded)
+
+            result["task_id"]["path"] = result["task_id"]["path"].replace(
+                task, "different-task"
+            )
+            (trial / "result.json").write_text(
+                json.dumps(result, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(LaunchError, "identity is incomplete"):
+                _official_task_identity(trajectory, manifest, [task], route)
 
 
 if __name__ == "__main__":
