@@ -23,9 +23,12 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const model_adapter = @import("model_adapter.zig");
-const provider_mod = @import("provider.zig");
+const openai_dialects = @import("dialects/openai.zig");
+const claude_dialects = @import("dialects/claude.zig");
+const gemini_dialects = @import("dialects/gemini.zig");
+const sync = @import("platform").sync;
 
-pub const ProviderKind = provider_mod.Kind;
+pub const ProviderKind = model_adapter.ProviderKind;
 pub const ModelProfile = model_adapter.ModelProfile;
 pub const ReasoningEffort = types.ReasoningEffort;
 
@@ -42,7 +45,7 @@ pub const Dialect = struct {
     /// K3 发 `,"thinking":{"type":"enabled","keep":"all","effort":"high"}`;Anthropic 发顶层
     /// `thinking:{type:adaptive,...}`;Gemini 发 `generation_config.thinkingLevel`。
     /// default = no-op(thinking_mode==.none)。
-    serializeThinking: *const fn (
+    serializeThinkingFn: *const fn (
         ctx: *anyopaque,
         profile: ModelProfile,
         effort: ?ReasoningEffort,
@@ -53,7 +56,7 @@ pub const Dialect = struct {
     /// 请求侧:对 system prompt 做厂商特定改写(如 GLM-5 注入 `<reasoning_effort> high` 标签)。
     /// `system_buf` 是调用方预填的原始 system 内容;本方法可追加/改写。
     /// default = no-op。
-    injectSystemMods: *const fn (
+    injectSystemModsFn: *const fn (
         ctx: *anyopaque,
         profile: ModelProfile,
         effort: ?ReasoningEffort,
@@ -64,7 +67,7 @@ pub const Dialect = struct {
     /// 响应侧:从原始 chunk 提取 thinking/reasoning 增量(可为 null)。
     /// 调用方负责 free 返回的非 null slice。
     /// default = 始终返 null(不解析)。
-    extractThinkingDelta: *const fn (
+    extractThinkingDeltaFn: *const fn (
         ctx: *anyopaque,
         raw_chunk: []const u8,
         allocator: std.mem.Allocator,
@@ -72,7 +75,7 @@ pub const Dialect = struct {
 
     /// 能力查询:tool_choice 支持(none/auto/required/指定函数)。
     /// default = 查 profile.tool_choice_support。
-    supportsToolChoice: *const fn (
+    supportsToolChoiceFn: *const fn (
         ctx: *anyopaque,
         profile: ModelProfile,
         kind: ToolChoiceKind,
@@ -80,7 +83,7 @@ pub const Dialect = struct {
 
     /// 能力查询:response_format 支持(none/json_object/json_schema)。
     /// default = 查 profile.response_format_support。
-    supportsResponseFormat: *const fn (
+    supportsResponseFormatFn: *const fn (
         ctx: *anyopaque,
         profile: ModelProfile,
         kind: ResponseFormatKind,
@@ -88,26 +91,33 @@ pub const Dialect = struct {
 
     /// 暴露纯数据 profile 供 UI/agent_loop 快速问能力。单一真相源收口(step 8 后)。
     /// default = 返回 profileFor 的结果。
-    profile: *const fn (ctx: *anyopaque, kind: ProviderKind, model: []const u8) ModelProfile = defaultProfile,
+    profileFn: *const fn (ctx: *anyopaque, kind: ProviderKind, model: []const u8) ModelProfile = defaultProfile,
 
-    /// 便利转发:inline 调对应方法(免调用方写 `dialect.serializeThinking(dialect.ctx, ...)`)。
+    /// 便利转发:inline 调对应方法(免调用方写 `dialect.serializeThinkingFn(dialect.ctx, ...)`)。
     pub fn serializeThinking(self: Dialect, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) !void {
-        try self.serializeThinking(self.ctx, p, effort, out, a);
+        try self.serializeThinkingFn(self.ctx, p, effort, out, a);
     }
     pub fn injectSystemMods(self: Dialect, p: ModelProfile, effort: ?ReasoningEffort, sys: *std.ArrayList(u8), a: std.mem.Allocator) !void {
-        try self.injectSystemMods(self.ctx, p, effort, sys, a);
+        try self.injectSystemModsFn(self.ctx, p, effort, sys, a);
     }
     pub fn extractThinkingDelta(self: Dialect, raw: []const u8, a: std.mem.Allocator) !?[]u8 {
-        return try self.extractThinkingDelta(self.ctx, raw, a);
+        return try self.extractThinkingDeltaFn(self.ctx, raw, a);
     }
     pub fn supportsToolChoice(self: Dialect, p: ModelProfile, k: ToolChoiceKind) bool {
-        return self.supportsToolChoice(self.ctx, p, k);
+        return self.supportsToolChoiceFn(self.ctx, p, k);
     }
     pub fn supportsResponseFormat(self: Dialect, p: ModelProfile, k: ResponseFormatKind) bool {
-        return self.supportsResponseFormat(self.ctx, p, k);
+        return self.supportsResponseFormatFn(self.ctx, p, k);
     }
     pub fn profileFor(self: Dialect, kind: ProviderKind, model: []const u8) ModelProfile {
-        return self.profile(self.ctx, kind, model);
+        return self.profileFn(self.ctx, kind, model);
+    }
+
+    /// 返回一个填好 ctx 的副本(供 const dialect 声明在运行时填 ctx)。
+    pub fn withCtx(self: Dialect, ctx: *anyopaque) Dialect {
+        var copy = self;
+        copy.ctx = ctx;
+        return copy;
     }
 };
 
@@ -146,16 +156,14 @@ fn defaultSupportsToolChoice(ctx: *anyopaque, p: ModelProfile, k: ToolChoiceKind
     return switch (p.tool_choice_support) {
         .full => k == .auto or k == .none or k == .required or k == .function,
         .auto_only => k == .auto,
-        .none => false,
     };
 }
 
 fn defaultSupportsResponseFormat(ctx: *anyopaque, p: ModelProfile, k: ResponseFormatKind) bool {
     _ = ctx;
     return switch (p.response_format_support) {
-        .full => k == .json_object or k == .json_schema,
+        .json_schema => k == .json_object or k == .json_schema,
         .json_object_only => k == .json_object,
-        .none => false,
     };
 }
 
@@ -173,11 +181,14 @@ fn defaultProfile(ctx: *anyopaque, kind: ProviderKind, model: []const u8) ModelP
 const defaultDialect = Dialect{ .ctx = @ptrFromInt(@as(usize, 0x1)) };
 
 /// 按 (provider_kind, model) 返回 Dialect。永不返回 null——未注册模型走 defaultDialect。
-/// 借用:返回的 Dialect 值是静态的(defaultDialect)或 ctx 借用底层实例(step 2+ 的具体 dialect)。
+/// 借用:返回的 Dialect 值是静态的(defaultDialect)或 ctx 借用底层实例(具体 dialect)。
 pub fn dialectFor(kind: ProviderKind, model: []const u8) Dialect {
-    _ = kind;
-    _ = model;
-    return defaultDialect;
+    return switch (kind) {
+        .openai => openai_dialects.openaiDialectFor(model),
+        .anthropic => claude_dialects.claudeDialectFor(model),
+        .gemini => gemini_dialects.geminiDialectFor(model),
+        .other => defaultDialect,
+    };
 }
 
 // ── Registry(运行时留位,comptime 注册走它)─────────────────────────────────
@@ -187,7 +198,7 @@ pub fn dialectFor(kind: ProviderKind, model: []const u8) Dialect {
 // 未来第三方 dialect 可运行时注册(类似 RequestAbortRegistry)。
 
 pub const DialectRegistry = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: sync.Mutex = .{},
     entries: std.ArrayList(Entry) = .empty,
 
     const Entry = struct {
@@ -216,23 +227,25 @@ pub var registry: DialectRegistry = .{};
 
 // ── 测试 ─────────────────────────────────────────────────────────────────────
 
-test "dialectFor: 未注册模型返回 defaultDialect" {
+test "dialectFor: 未注册 OpenAI 模型走 OpenAINative dialect" {
+    // step 2-4 后:未注册 OpenAI 模型默认走 OpenAINative dialect(发 reasoning_effort),
+    // 不再是 defaultDialect(no-op)。profile.thinking_mode 仍为 .openai_effort。
     const d = dialectFor(.openai, "some-unknown-model");
     const p = d.profileFor(.openai, "some-unknown-model");
-    try std.testing.expect(p.thinking_mode == .none);
+    try std.testing.expect(p.thinking_mode == .openai_effort);
 }
 
-test "defaultDialect: serializeThinking no-op(不发任何 wire)" {
+test "defaultDialect: serializeThinking 走 OpenAINative(effort=high 发 reasoning_effort)" {
     const a = std.testing.allocator;
     const d = dialectFor(.openai, "unknown");
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
     const p = d.profileFor(.openai, "unknown");
     try d.serializeThinking(p, .high, &out, a);
-    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning_effort\":\"high\"") != null);
 }
 
-test "defaultDialect: extractThinkingDelta 返回 null" {
+test "defaultDialect: extractThinkingDelta OpenAI 原生返 null" {
     const a = std.testing.allocator;
     const d = dialectFor(.openai, "unknown");
     const got = try d.extractThinkingDelta("{\"choices\":[]}", a);

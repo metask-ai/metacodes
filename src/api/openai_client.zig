@@ -198,6 +198,7 @@ pub const OpenAIClient = struct {
         const heap = try self.allocator.create(OpenAIStream);
         heap.* = .{
             .allocator = self.allocator,
+            .model = self.model,
             .request = req_ptr,
             .response = response,
             .abort = abort,
@@ -216,6 +217,7 @@ fn secureFree(allocator: std.mem.Allocator, buf: []u8) void {
 /// OpenAI 流式响应:持 Response + transfer buffer + 逐行 SSE 解析状态。包成中立 StreamHandle。
 const OpenAIStream = struct {
     allocator: std.mem.Allocator,
+    model: []const u8,
     request: *http.Client.Request,
     response: http.Client.Response,
     transfer_buf: [8192]u8 = undefined,
@@ -338,11 +340,14 @@ const OpenAIStream = struct {
         }
         // delta.reasoning_content → thinking(DeepSeek/Kimi/Qwen/GLM-5)。
         // OpenAI 原生不返回此字段(仅 reasoning_tokens 计数);兼容端点把它作为平级字符串返回。
-        if (extractDeltaReasoning(data)) |reasoning| {
+        // 委托给 dialect(按 model 选解析逻辑;OpenAI 原生 dialect 返 null)。
+        const dialect_mod = @import("dialect.zig");
+        const dialect = dialect_mod.dialectFor(.openai, self.model);
+        if (try dialect.extractThinkingDelta(data, self.allocator)) |reasoning| {
             if (reasoning.len > 0) {
-                const owned = try self.allocator.dupe(u8, reasoning);
-                return StreamEvent{ .thinking = owned };
+                return StreamEvent{ .thinking = reasoning };
             }
+            self.allocator.free(reasoning);
         }
         // delta.tool_calls 增量(P0.1 并行):按 `index` 分槽累积。OpenAI 流式对每个并行 tool_call
         // 用独立 index;同一 chunk 的 tool_calls array 可含多个元素,元素跨 chunk 续拼 arguments。
@@ -605,91 +610,27 @@ fn extractDeltaReasoning(data: []const u8) ?[]const u8 {
 /// 按 model 查 ModelProfile 决定 thinking wire 格式(GLM prompt 标签 / K3 extra_body / DeepSeek 顶层 / OpenAI effort)。
 pub fn serializeOpenAIRequest(allocator: std.mem.Allocator, model: []const u8, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, reasoning_effort: ?types.ReasoningEffort) ![]u8 {
     const adapter = @import("model_adapter.zig");
+    const dialect_mod = @import("dialect.zig");
     const profile = adapter.profileFor(.openai, model);
+    const dialect = dialect_mod.dialectFor(.openai, model);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "{\"model\":");
     try util_json.serializeString(model, &out, allocator);
-    // thinking 控制:按 profile.thinking_mode 选 wire 格式。
-    switch (profile.thinking_mode) {
-        .none => {},
-        .openai_effort => {
-            // OpenAI 原生:reasoning.effort 嵌套对象(GPT-5/o3)。effort 直接透传 7 档。
-            if (reasoning_effort) |effort| if (effort.active()) {
-                try out.appendSlice(allocator, ",\"reasoning_effort\":");
-                try util_json.serializeString(effort.name(), &out, allocator);
-            };
-        },
-        .glm_prompt_tag => {
-            // GLM-5:thinking:{type} 在 body(OpenAI-compatible),effort 7→2 映射注入 system prompt 标签。
-            // effort=null 时默认 enabled(GLM 自动判断是否思考)。
-            const enable = if (reasoning_effort) |e| e.active() else true;
-            try out.appendSlice(allocator, ",\"thinking\":{\"type\":");
-            try util_json.serializeString(if (enable) "enabled" else "disabled", &out, allocator);
-            try out.append(allocator, '}');
-            if (enable) {
-                // clear_thinking=false(保留)→ 对齐 preserved thinking;coding-plan 默认。
-                try out.appendSlice(allocator, ",\"clear_thinking\":false");
-            }
-        },
-        .kimi_extra_body => {
-            // Kimi K3:thinking:{type,keep,effort} 在 body。effort 3 档(low/high/max)。
-            const enable = if (reasoning_effort) |e| e.active() else true;
-            try out.appendSlice(allocator, ",\"thinking\":{\"type\":");
-            try util_json.serializeString(if (enable) "enabled" else "disabled", &out, allocator);
-            if (enable) {
-                try out.appendSlice(allocator, ",\"keep\":\"all\"");
-                if (adapter.kimiEffortMap(reasoning_effort.?)) |mapped| {
-                    try out.appendSlice(allocator, ",\"effort\":");
-                    try util_json.serializeString(mapped, &out, allocator);
-                }
-            }
-            try out.append(allocator, '}');
-        },
-        .deepseek_top => {
-            // DeepSeek:thinking:{type} + reasoning_effort 顶层(两独立参数)。effort 1 档(high)。
-            const enable = if (reasoning_effort) |e| e.active() else true;
-            try out.appendSlice(allocator, ",\"thinking\":{\"type\":");
-            try util_json.serializeString(if (enable) "enabled" else "disabled", &out, allocator);
-            try out.append(allocator, '}');
-            if (enable and adapter.deepseekEffortMap(reasoning_effort.?) != null) {
-                try out.appendSlice(allocator, ",\"reasoning_effort\":\"high\"");
-            }
-        },
-        .qwen_template => {
-            // Qwen3:enable_thinking bool + /think /no_think 文本指令(chat template 处理)。
-            // body 只传 enable_thinking;文本指令由 system prompt 或 user 消息携带(这里不注入,
-            // 由调用方在 system prompt 里加 /think /no_think)。
-            const enable = if (reasoning_effort) |e| e.active() else true;
-            try out.appendSlice(allocator, ",\"enable_thinking\":");
-            try out.appendSlice(allocator, if (enable) "true" else "false");
-        },
-        .gemini_level, .anthropic_adaptive => {
-            // 不该走到(Gemini/Claude 不经此函数),保守 no-op。
-        },
-    }
+    // thinking 控制:委托给 dialect(按 model 选 wire 格式)。
+    try dialect.serializeThinking(profile, reasoning_effort, &out, allocator);
     // stream_options.include_usage=true:OpenAI 默认流式不发 usage,显式要求才在末尾发一个
     // {choices:[],usage:{...}} chunk。缓存命中(cached_tokens)就在这个 usage 里。
     try out.appendSlice(allocator, ",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
     var first = true;
-    // system → 首条 {role:"system"}。GLM-5 的 <reasoning_effort> 标签注入 system 内容。
+    // system → 首条 {role:"system"}。dialect 可注入厂商特定标签(如 GLM-5 <reasoning_effort>)。
     if (system) |sys| {
         try out.appendSlice(allocator, "{\"role\":\"system\",\"content\":");
-        if (profile.thinking_mode == .glm_prompt_tag and reasoning_effort != null and reasoning_effort.?.active()) {
-            if (adapter.glmEffortMap(reasoning_effort.?)) |mapped| {
-                // 注入 <reasoning_effort> 标签到 system 末尾(GLM chat_template 约定)。
-                var sys_buf: std.ArrayList(u8) = .empty;
-                defer sys_buf.deinit(allocator);
-                try sys_buf.appendSlice(allocator, sys);
-                try sys_buf.appendSlice(allocator, "\n<reasoning_effort> ");
-                try sys_buf.appendSlice(allocator, mapped);
-                try util_json.serializeString(sys_buf.items, &out, allocator);
-            } else {
-                try util_json.serializeString(sys, &out, allocator);
-            }
-        } else {
-            try util_json.serializeString(sys, &out, allocator);
-        }
+        var sys_buf: std.ArrayList(u8) = .empty;
+        defer sys_buf.deinit(allocator);
+        try sys_buf.appendSlice(allocator, sys);
+        try dialect.injectSystemMods(profile, reasoning_effort, &sys_buf, allocator);
+        try util_json.serializeString(sys_buf.items, &out, allocator);
         try out.append(allocator, '}');
         first = false;
     }

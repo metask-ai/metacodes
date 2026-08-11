@@ -233,7 +233,7 @@ pub fn deepseekEffortMap(effort: @import("../types.zig").ReasoningEffort) ?[]con
     };
 }
 
-fn hasSubstr(haystack: []const u8, needle: []const u8) bool {
+pub fn hasSubstr(haystack: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, haystack, needle) != null;
 }
 
