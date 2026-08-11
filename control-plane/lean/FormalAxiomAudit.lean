@@ -1,5 +1,6 @@
 import MetaCodesControl.FormalKernel
 import MetaCodesControl.MemoryMigration
+import MetaCodesControl.ArtifactVerification
 
 -- Build automation treats this output as part of the shipped trust boundary:
 -- the soundness theorem must not acquire `sorryAx` or any other axiom.
@@ -9,3 +10,9 @@ import MetaCodesControl.MemoryMigration
 #print axioms MetaCodesControl.MemoryMigration.safeSupersede_sound
 #print axioms MetaCodesControl.MemoryMigration.applySupersede_preserves_nodes
 #print axioms MetaCodesControl.MemoryMigration.rollbackSupersede_apply
+#print axioms MetaCodesControl.ArtifactVerification.safeTransition_sound
+#print axioms MetaCodesControl.ArtifactVerification.admitted_provider_request_is_bound_to_authorization
+#print axioms MetaCodesControl.ArtifactVerification.admitted_provider_result_follows_authorized_state
+#print axioms MetaCodesControl.ArtifactVerification.admitted_repaired_state_requires_reverification
+#print axioms MetaCodesControl.ArtifactVerification.admitted_record_repair_advances_artifact
+#print axioms MetaCodesControl.ArtifactVerification.admitted_transition_produces_well_formed_state

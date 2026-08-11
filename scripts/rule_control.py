@@ -1464,7 +1464,7 @@ def observe_build_test_throughput(repo: Path) -> Observation:
         "builder separates stable manifest from time-bearing receipt": all(
             marker in sources["formal_build"]
             for marker in (
-                "metacodes-formal-artifact-v3",
+                "metacodes-formal-artifact-v4",
                 "metacodes-formal-build-receipt-v1",
                 "artifact_manifest_sha256",
                 "built_at_utc",
@@ -1486,6 +1486,7 @@ def observe_build_test_throughput(repo: Path) -> Observation:
                 "checker_version",
                 "request_schema",
                 "memory_request_schema",
+                "artifact_request_schema",
                 "verdict_schema",
             }
             == fingerprint_payload_keys

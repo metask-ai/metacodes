@@ -234,11 +234,13 @@ FORMAL_PROVENANCE_KEYS = {
     "checker_version",
     "request_schema",
     "memory_request_schema",
+    "artifact_request_schema",
     "verdict_schema",
     "binary_sha256",
     "binary_bytes",
     "kernel_source_sha256",
     "memory_kernel_source_sha256",
+    "artifact_kernel_source_sha256",
     "main_source_sha256",
     "axiom_audit_source_sha256",
     "axiom_policy",
@@ -416,11 +418,13 @@ def formal_kernel_identity(binary: Path) -> Dict[str, Any]:
             f"formal kernel provenance fields mismatch: missing={missing} unknown={unknown}"
         )
     if (
-        provenance.get("schema_version") != "metacodes-formal-artifact-v3"
+        provenance.get("schema_version") != "metacodes-formal-artifact-v4"
         or provenance.get("checker_version") != "metacodes-formal-kernel-v2"
         or provenance.get("request_schema") != "metacodes-formal-request-v1"
         or provenance.get("memory_request_schema")
         != "metacodes-memory-migration-request-v1"
+        or provenance.get("artifact_request_schema")
+        != "metacodes-artifact-verification-request-v1"
         or provenance.get("verdict_schema") != "metacodes-formal-verdict-v2"
         or provenance.get("axiom_policy") != "propext,Quot.sound"
         or provenance.get("axiom_audit") != "passed"
@@ -428,10 +432,11 @@ def formal_kernel_identity(binary: Path) -> Dict[str, Any]:
         or provenance.get("binary_sha256") != binary_sha256
         or provenance.get("binary_bytes") != binary_info.st_size
     ):
-        raise ValidationError("formal kernel provenance does not bind a deployable v3 artifact")
+        raise ValidationError("formal kernel provenance does not bind a deployable v4 artifact")
     source_hash_fields = (
         "kernel_source_sha256",
         "memory_kernel_source_sha256",
+        "artifact_kernel_source_sha256",
         "main_source_sha256",
         "axiom_audit_source_sha256",
     )
@@ -490,6 +495,7 @@ def formal_kernel_identity(binary: Path) -> Dict[str, Any]:
         "checker_version": provenance["checker_version"],
         "request_schema": provenance["request_schema"],
         "memory_request_schema": provenance["memory_request_schema"],
+        "artifact_request_schema": provenance["artifact_request_schema"],
         "verdict_schema": provenance["verdict_schema"],
     }
     return {

@@ -14,6 +14,7 @@ const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
 pub const REQUEST_SCHEMA = "metacodes-formal-request-v1";
 pub const MEMORY_REQUEST_SCHEMA = "metacodes-memory-migration-request-v1";
+pub const ARTIFACT_REQUEST_SCHEMA = "metacodes-artifact-verification-request-v1";
 pub const VERDICT_SCHEMA = "metacodes-formal-verdict-v2";
 pub const CHECKER_VERSION = "metacodes-formal-kernel-v2";
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -38,6 +39,8 @@ pub const Bindings = struct {
     proposal_sha256: [64]u8,
     snapshot_sha256: [64]u8,
     snapshot_revision: [64]u8,
+    next_snapshot_revision: ?[64]u8 = null,
+    expected_next_phase: ?[]const u8 = null,
 };
 
 pub const FailureKind = enum {
@@ -86,6 +89,14 @@ pub const ReasonCode = enum {
     stale_memory_generation,
     migration_evidence_invalid,
     replacement_excluded,
+    artifact_request_binding_invalid,
+    artifact_state_invalid,
+    artifact_revision_not_bound,
+    artifact_provider_not_authorized,
+    artifact_repair_budget_exhausted,
+    artifact_reverification_required,
+    artifact_not_advanced,
+    artifact_transition_illegal,
 };
 
 pub const TaskAuditChecks = struct {
@@ -122,9 +133,28 @@ pub const MemorySupersedeChecks = struct {
     }
 };
 
+pub const ArtifactTransitionChecks = struct {
+    bindings_valid: bool,
+    state_well_formed: bool,
+    revision_advances: bool,
+    provider_authorized: bool,
+    repair_budget_preserved: bool,
+    reverification_required: bool,
+    artifact_advanced: bool,
+    event_legal: bool,
+
+    pub fn all(self: ArtifactTransitionChecks) bool {
+        return self.bindings_valid and self.state_well_formed and
+            self.revision_advances and self.provider_authorized and
+            self.repair_budget_preserved and self.reverification_required and
+            self.artifact_advanced and self.event_legal;
+    }
+};
+
 pub const Checks = union(enum) {
     task_audit: TaskAuditChecks,
     memory_supersede_existing: MemorySupersedeChecks,
+    artifact_transition: ArtifactTransitionChecks,
 
     pub fn all(self: Checks) bool {
         return switch (self) {
@@ -384,6 +414,22 @@ const RawMemoryVerdict = struct {
     checks: MemorySupersedeChecks,
 };
 
+const RawArtifactVerdict = struct {
+    schema_version: []const u8,
+    checker_version: []const u8,
+    request_id: []const u8,
+    operation: []const u8,
+    proposal_sha256: []const u8,
+    snapshot_sha256: []const u8,
+    snapshot_revision: []const u8,
+    decision: []const u8,
+    admitted: bool,
+    next_phase: []const u8,
+    next_snapshot_revision: []const u8,
+    reason_codes: [][]const u8,
+    checks: ArtifactTransitionChecks,
+};
+
 const OperationProbe = struct { operation: []const u8 };
 
 const VerdictError = error{ OutOfMemory, InvalidJson, SchemaMismatch, VersionMismatch, BindingMismatch, Inconsistent };
@@ -408,6 +454,16 @@ fn parseVerdict(allocator: std.mem.Allocator, payload: []const u8, bindings: Bin
         var parsed = try parseRawVerdict(RawMemoryVerdict, allocator, payload);
         defer parsed.deinit();
         return finishVerdict(allocator, parsed.value, bindings, .{ .memory_supersede_existing = parsed.value.checks });
+    }
+    if (std.mem.eql(u8, bindings.operation, "artifact_transition")) {
+        var parsed = try parseRawVerdict(RawArtifactVerdict, allocator, payload);
+        defer parsed.deinit();
+        const next_revision = bindings.next_snapshot_revision orelse return error.BindingMismatch;
+        const next_phase = bindings.expected_next_phase orelse return error.BindingMismatch;
+        if (!std.mem.eql(u8, parsed.value.next_snapshot_revision, next_revision[0..]) or
+            !std.mem.eql(u8, parsed.value.next_phase, next_phase))
+            return error.BindingMismatch;
+        return finishVerdict(allocator, parsed.value, bindings, .{ .artifact_transition = parsed.value.checks });
     }
     return error.BindingMismatch;
 }
@@ -567,6 +623,34 @@ test "formal runtime times out and rejects a verdict bound to another request" {
     }
 }
 
+test "formal runtime binds artifact verdict to next revision and phase" {
+    const payload =
+        "{\"schema_version\":\"metacodes-formal-verdict-v2\",\"checker_version\":\"metacodes-formal-kernel-v2\",\"request_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operation\":\"artifact_transition\",\"proposal_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"snapshot_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"snapshot_revision\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"decision\":\"admit\",\"admitted\":true,\"next_phase\":\"verification_requested\",\"next_snapshot_revision\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"reason_codes\":[],\"checks\":{\"bindings_valid\":true,\"state_well_formed\":true,\"revision_advances\":true,\"provider_authorized\":true,\"repair_budget_preserved\":true,\"reverification_required\":true,\"artifact_advanced\":true,\"event_legal\":true}}";
+    const bindings = artifactTestBindings();
+    const verdict = try parseVerdict(std.testing.allocator, payload, bindings);
+    defer std.testing.allocator.free(verdict.reasons);
+    try std.testing.expect(verdict.admitted);
+    switch (verdict.checks) {
+        .artifact_transition => |checks| try std.testing.expect(checks.all()),
+        else => return error.UnexpectedVerdictChecks,
+    }
+
+    var forged_revision = bindings;
+    forged_revision.next_snapshot_revision =
+        ("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff").*;
+    try std.testing.expectError(
+        error.BindingMismatch,
+        parseVerdict(std.testing.allocator, payload, forged_revision),
+    );
+
+    var forged_phase = bindings;
+    forged_phase.expected_next_phase = "verified";
+    try std.testing.expectError(
+        error.BindingMismatch,
+        parseVerdict(std.testing.allocator, payload, forged_phase),
+    );
+}
+
 fn testBindings() Bindings {
     return .{
         .operation = "task_audit",
@@ -574,6 +658,18 @@ fn testBindings() Bindings {
         .proposal_sha256 = ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").*,
         .snapshot_sha256 = ("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc").*,
         .snapshot_revision = ("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd").*,
+    };
+}
+
+fn artifactTestBindings() Bindings {
+    return .{
+        .operation = "artifact_transition",
+        .request_id = ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").*,
+        .proposal_sha256 = ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").*,
+        .snapshot_sha256 = ("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc").*,
+        .snapshot_revision = ("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd").*,
+        .next_snapshot_revision = ("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").*,
+        .expected_next_phase = "verification_requested",
     };
 }
 

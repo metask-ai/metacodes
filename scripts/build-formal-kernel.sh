@@ -72,7 +72,8 @@ mkdir -p "$(dirname "$output")" "$(dirname "$manifest")" "$(dirname "$receipt")"
     "$lake" build \
       FormalMain:c.o \
       MetaCodesControl.FormalKernel:c.o \
-      MetaCodesControl.MemoryMigration:c.o
+      MetaCodesControl.MemoryMigration:c.o \
+      MetaCodesControl.ArtifactVerification:c.o
   else
     "$lake" build metacodes-formal-kernel
   fi
@@ -90,7 +91,13 @@ expected_axioms="$expected_axioms
 'MetaCodesControl.FormalKernel.taskAudit_terminal_closed' does not depend on any axioms
 'MetaCodesControl.MemoryMigration.safeSupersede_sound' depends on axioms: [propext]
 'MetaCodesControl.MemoryMigration.applySupersede_preserves_nodes' does not depend on any axioms
-'MetaCodesControl.MemoryMigration.rollbackSupersede_apply' depends on axioms: [propext, Quot.sound]"
+'MetaCodesControl.MemoryMigration.rollbackSupersede_apply' depends on axioms: [propext, Quot.sound]
+'MetaCodesControl.ArtifactVerification.safeTransition_sound' depends on axioms: [propext]
+'MetaCodesControl.ArtifactVerification.admitted_provider_request_is_bound_to_authorization' depends on axioms: [propext]
+'MetaCodesControl.ArtifactVerification.admitted_provider_result_follows_authorized_state' depends on axioms: [propext]
+'MetaCodesControl.ArtifactVerification.admitted_repaired_state_requires_reverification' depends on axioms: [propext]
+'MetaCodesControl.ArtifactVerification.admitted_record_repair_advances_artifact' depends on axioms: [propext]
+'MetaCodesControl.ArtifactVerification.admitted_transition_produces_well_formed_state' depends on axioms: [propext]"
 if [[ "$axiom_audit" != "$expected_axioms" ]]; then
   echo "build-formal-kernel: unexpected soundness theorem axiom set" >&2
   printf '%s\n' "$axiom_audit" >&2
@@ -126,6 +133,7 @@ if [[ "$host_os" == "Darwin" ]]; then
       "$lean_dir/.lake/build/ir/FormalMain.c.o.export" \
       "$lean_dir/.lake/build/ir/MetaCodesControl/FormalKernel.c.o.export" \
       "$lean_dir/.lake/build/ir/MetaCodesControl/MemoryMigration.c.o.export" \
+      "$lean_dir/.lake/build/ir/MetaCodesControl/ArtifactVerification.c.o.export" \
       "${link_args[@]}"
   done
   if ! cmp -s "$tmp_binary" "$tmp_repro"; then
@@ -177,6 +185,20 @@ if [[ "$memory_block_verdict" != *'"decision":"block"'* || "$memory_block_verdic
   echo "build-formal-kernel: native memory migration block smoke failed" >&2
   exit 1
 fi
+
+zero_hash=0000000000000000000000000000000000000000000000000000000000000000
+artifact_request="{\"schema_version\":\"metacodes-artifact-verification-request-v1\",\"request_id\":\"$hex_a\",\"operation\":\"artifact_transition\",\"proposal_sha256\":\"$hex_b\",\"snapshot_sha256\":\"$hex_c\",\"snapshot_revision\":\"$hex_d\",\"expected_checker_version\":\"metacodes-formal-kernel-v2\",\"state\":{\"phase\":\"candidate\",\"task_sha256\":\"$hex_a\",\"actor_run_sha256\":\"$hex_b\",\"artifact_sha256\":\"$hex_c\",\"artifact_revision\":\"$hex_d\",\"verifier_sha256\":\"$hex_a\",\"policy_sha256\":\"$hex_b\",\"budget_authority_sha256\":\"$hex_c\",\"active_provider_authorization_sha256\":\"$zero_hash\",\"transition_revision\":0,\"repair_attempts\":0,\"max_repair_attempts\":3,\"semantic_verdict_sha256\":\"$zero_hash\",\"defect_sha256\":\"$zero_hash\",\"repair_proposal_sha256\":\"$zero_hash\"},\"proposal\":{\"event\":\"request_verification\",\"expected_phase\":\"candidate\",\"expected_snapshot_revision\":\"$hex_d\",\"next_snapshot_revision\":\"$hex_a\",\"provider_authorization_sha256\":\"$hex_b\",\"semantic_verdict_sha256\":\"$zero_hash\",\"defect_sha256\":\"$zero_hash\",\"repair_proposal_sha256\":\"$zero_hash\",\"next_artifact_sha256\":\"$zero_hash\",\"next_artifact_revision\":\"$zero_hash\"}}"
+artifact_admit=$(printf '%s' "$artifact_request" | "$output")
+if [[ "$artifact_admit" != *'"decision":"admit"'* || "$artifact_admit" != *'"next_phase":"verification_requested"'* ]]; then
+  echo "build-formal-kernel: native artifact verification admit smoke failed" >&2
+  exit 1
+fi
+artifact_block=${artifact_request/\"provider_authorization_sha256\":\"$hex_b\"/\"provider_authorization_sha256\":\"$zero_hash\"}
+artifact_block_verdict=$(printf '%s' "$artifact_block" | "$output")
+if [[ "$artifact_block_verdict" != *'"decision":"block"'* || "$artifact_block_verdict" != *'"artifact_provider_not_authorized"'* ]]; then
+  echo "build-formal-kernel: native artifact verification block smoke failed" >&2
+  exit 1
+fi
 set +e
 printf '%s\n' "$admit_request" | "$output" >/dev/null 2>&1
 trailing_status=$?
@@ -190,12 +212,14 @@ if command -v shasum >/dev/null 2>&1; then
   binary_sha256=$(shasum -a 256 "$output" | awk '{print $1}')
   kernel_source_sha256=$(shasum -a 256 "$lean_dir/MetaCodesControl/FormalKernel.lean" | awk '{print $1}')
   memory_kernel_source_sha256=$(shasum -a 256 "$lean_dir/MetaCodesControl/MemoryMigration.lean" | awk '{print $1}')
+  artifact_kernel_source_sha256=$(shasum -a 256 "$lean_dir/MetaCodesControl/ArtifactVerification.lean" | awk '{print $1}')
   main_source_sha256=$(shasum -a 256 "$lean_dir/FormalMain.lean" | awk '{print $1}')
   axiom_audit_source_sha256=$(shasum -a 256 "$lean_dir/FormalAxiomAudit.lean" | awk '{print $1}')
 else
   binary_sha256=$(sha256sum "$output" | awk '{print $1}')
   kernel_source_sha256=$(sha256sum "$lean_dir/MetaCodesControl/FormalKernel.lean" | awk '{print $1}')
   memory_kernel_source_sha256=$(sha256sum "$lean_dir/MetaCodesControl/MemoryMigration.lean" | awk '{print $1}')
+  artifact_kernel_source_sha256=$(sha256sum "$lean_dir/MetaCodesControl/ArtifactVerification.lean" | awk '{print $1}')
   main_source_sha256=$(sha256sum "$lean_dir/FormalMain.lean" | awk '{print $1}')
   axiom_audit_source_sha256=$(sha256sum "$lean_dir/FormalAxiomAudit.lean" | awk '{print $1}')
 fi
@@ -212,7 +236,7 @@ built_at_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 # the wall-clock timestamp live in a separately hashed receipt so rebuilding
 # identical source cannot silently create a different experiment treatment.
 printf '%s\n' \
-  "{\"schema_version\":\"metacodes-formal-artifact-v3\",\"checker_version\":\"metacodes-formal-kernel-v2\",\"request_schema\":\"metacodes-formal-request-v1\",\"memory_request_schema\":\"metacodes-memory-migration-request-v1\",\"verdict_schema\":\"metacodes-formal-verdict-v2\",\"binary_sha256\":\"$binary_sha256\",\"binary_bytes\":$binary_bytes,\"kernel_source_sha256\":\"$kernel_source_sha256\",\"memory_kernel_source_sha256\":\"$memory_kernel_source_sha256\",\"main_source_sha256\":\"$main_source_sha256\",\"axiom_audit_source_sha256\":\"$axiom_audit_source_sha256\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"host_os\":\"$host_os\",\"host_arch\":\"$host_arch\",\"linker\":\"$linker\",\"lean_version\":\"$lean_version\",\"native_smoke\":\"passed\"}" \
+  "{\"schema_version\":\"metacodes-formal-artifact-v4\",\"checker_version\":\"metacodes-formal-kernel-v2\",\"request_schema\":\"metacodes-formal-request-v1\",\"memory_request_schema\":\"metacodes-memory-migration-request-v1\",\"artifact_request_schema\":\"metacodes-artifact-verification-request-v1\",\"verdict_schema\":\"metacodes-formal-verdict-v2\",\"binary_sha256\":\"$binary_sha256\",\"binary_bytes\":$binary_bytes,\"kernel_source_sha256\":\"$kernel_source_sha256\",\"memory_kernel_source_sha256\":\"$memory_kernel_source_sha256\",\"artifact_kernel_source_sha256\":\"$artifact_kernel_source_sha256\",\"main_source_sha256\":\"$main_source_sha256\",\"axiom_audit_source_sha256\":\"$axiom_audit_source_sha256\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"host_os\":\"$host_os\",\"host_arch\":\"$host_arch\",\"linker\":\"$linker\",\"lean_version\":\"$lean_version\",\"native_smoke\":\"passed\"}" \
   >"$manifest"
 
 if command -v shasum >/dev/null 2>&1; then

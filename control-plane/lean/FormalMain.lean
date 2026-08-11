@@ -1,5 +1,6 @@
 import MetaCodesControl.FormalKernel
 import MetaCodesControl.MemoryMigration
+import MetaCodesControl.ArtifactVerification
 
 open Lean
 open MetaCodesControl.FormalKernel
@@ -38,6 +39,15 @@ def main (args : List String) : IO UInt32 := do
         pure 64
     | .ok request =>
         IO.println (MetaCodesControl.MemoryMigration.verdictJson request)
+        pure 0
+  else if input.startsWith
+      ("{\"schema_version\":\"" ++ MetaCodesControl.ArtifactVerification.requestSchema ++ "\"") then
+    match MetaCodesControl.ArtifactVerification.decodeCanonicalRequest input with
+    | .error message =>
+        IO.eprintln s!"invalid formal request: {message}"
+        pure 64
+    | .ok request =>
+        IO.println (MetaCodesControl.ArtifactVerification.verdictJson request)
         pure 0
   else
     match decodeRequest input with

@@ -10,7 +10,7 @@ const builtin = @import("builtin");
 const pfs = @import("platform").fs;
 const runtime = @import("runtime.zig");
 
-pub const MANIFEST_SCHEMA = "metacodes-formal-artifact-v3";
+pub const MANIFEST_SCHEMA = "metacodes-formal-artifact-v4";
 pub const BUILD_RECEIPT_SCHEMA = "metacodes-formal-build-receipt-v1";
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 
@@ -19,11 +19,13 @@ const Raw = struct {
     checker_version: []const u8,
     request_schema: []const u8,
     memory_request_schema: []const u8,
+    artifact_request_schema: []const u8,
     verdict_schema: []const u8,
     binary_sha256: []const u8,
     binary_bytes: u64,
     kernel_source_sha256: []const u8,
     memory_kernel_source_sha256: []const u8,
+    artifact_kernel_source_sha256: []const u8,
     main_source_sha256: []const u8,
     axiom_audit_source_sha256: []const u8,
     axiom_policy: []const u8,
@@ -52,6 +54,7 @@ pub const Loaded = struct {
     binary_bytes: u64,
     kernel_source_sha256: [64]u8,
     memory_kernel_source_sha256: [64]u8,
+    artifact_kernel_source_sha256: [64]u8,
     main_source_sha256: [64]u8,
     axiom_audit_source_sha256: [64]u8,
     host_os: []const u8,
@@ -89,6 +92,7 @@ pub fn loadAdjacent(
         !std.mem.eql(u8, parsed.checker_version, runtime.CHECKER_VERSION) or
         !std.mem.eql(u8, parsed.request_schema, runtime.REQUEST_SCHEMA) or
         !std.mem.eql(u8, parsed.memory_request_schema, runtime.MEMORY_REQUEST_SCHEMA) or
+        !std.mem.eql(u8, parsed.artifact_request_schema, runtime.ARTIFACT_REQUEST_SCHEMA) or
         !std.mem.eql(u8, parsed.verdict_schema, runtime.VERDICT_SCHEMA) or
         !std.mem.eql(u8, parsed.axiom_policy, "propext,Quot.sound") or
         !std.mem.eql(u8, parsed.axiom_audit, "passed") or
@@ -101,6 +105,8 @@ pub fn loadAdjacent(
     const kernel_source_sha256 = parseLowerHex64(parsed.kernel_source_sha256) orelse
         return error.InvalidProvenanceHash;
     const memory_kernel_source_sha256 = parseLowerHex64(parsed.memory_kernel_source_sha256) orelse
+        return error.InvalidProvenanceHash;
+    const artifact_kernel_source_sha256 = parseLowerHex64(parsed.artifact_kernel_source_sha256) orelse
         return error.InvalidProvenanceHash;
     const main_source_sha256 = parseLowerHex64(parsed.main_source_sha256) orelse
         return error.InvalidProvenanceHash;
@@ -154,6 +160,7 @@ pub fn loadAdjacent(
         .binary_bytes = parsed.binary_bytes,
         .kernel_source_sha256 = kernel_source_sha256,
         .memory_kernel_source_sha256 = memory_kernel_source_sha256,
+        .artifact_kernel_source_sha256 = artifact_kernel_source_sha256,
         .main_source_sha256 = main_source_sha256,
         .axiom_audit_source_sha256 = axiom_audit_source_sha256,
         .host_os = parsed.host_os,
@@ -270,7 +277,7 @@ test "formal checker provenance is mandatory for a deployable admission" {
     );
 }
 
-test "formal v3 provenance requires a hash-bound build receipt" {
+test "formal v4 provenance requires a hash-bound build receipt" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -287,7 +294,7 @@ test "formal v3 provenance requires a hash-bound build receipt" {
     const host_arch = expectedHostArch() orelse return error.SkipZigTest;
     const manifest = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"schema_version\":\"metacodes-formal-artifact-v3\",\"checker_version\":\"metacodes-formal-kernel-v2\",\"request_schema\":\"metacodes-formal-request-v1\",\"memory_request_schema\":\"metacodes-memory-migration-request-v1\",\"verdict_schema\":\"metacodes-formal-verdict-v2\",\"binary_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"binary_bytes\":7,\"kernel_source_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"memory_kernel_source_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"main_source_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"axiom_audit_source_sha256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"host_os\":\"{s}\",\"host_arch\":\"{s}\",\"linker\":\"test\",\"lean_version\":\"Lean test\",\"native_smoke\":\"passed\"}}\n",
+        "{{\"schema_version\":\"metacodes-formal-artifact-v4\",\"checker_version\":\"metacodes-formal-kernel-v2\",\"request_schema\":\"metacodes-formal-request-v1\",\"memory_request_schema\":\"metacodes-memory-migration-request-v1\",\"artifact_request_schema\":\"metacodes-artifact-verification-request-v1\",\"verdict_schema\":\"metacodes-formal-verdict-v2\",\"binary_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"binary_bytes\":7,\"kernel_source_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"memory_kernel_source_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"artifact_kernel_source_sha256\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"main_source_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"axiom_audit_source_sha256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"host_os\":\"{s}\",\"host_arch\":\"{s}\",\"linker\":\"test\",\"lean_version\":\"Lean test\",\"native_smoke\":\"passed\"}}\n",
         .{ host_os, host_arch },
     );
     defer std.testing.allocator.free(manifest);

@@ -676,8 +676,8 @@ fn renderReceipt(allocator: std.mem.Allocator, receipt: Receipt) ![]u8 {
         try writer.print(",\"provenance_elapsed_ns\":{d},\"provenance\":", .{receipt.provenance_elapsed_ns});
         if (receipt.provenance) |loaded| {
             try writer.print(
-                "{{\"schema_version\":\"{s}\",\"manifest_sha256\":\"{s}\",\"build_receipt_schema\":\"{s}\",\"build_receipt_sha256\":\"{s}\",\"kernel_source_sha256\":\"{s}\",\"memory_kernel_source_sha256\":\"{s}\",\"main_source_sha256\":\"{s}\",\"axiom_audit_source_sha256\":\"{s}\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"source_identity_claim\":\"binary_hash_and_build_receipt_bound\",\"host_os\":",
-                .{ provenance.MANIFEST_SCHEMA, loaded.manifest_sha256[0..], provenance.BUILD_RECEIPT_SCHEMA, loaded.build_receipt_sha256[0..], loaded.kernel_source_sha256[0..], loaded.memory_kernel_source_sha256[0..], loaded.main_source_sha256[0..], loaded.axiom_audit_source_sha256[0..] },
+                "{{\"schema_version\":\"{s}\",\"manifest_sha256\":\"{s}\",\"build_receipt_schema\":\"{s}\",\"build_receipt_sha256\":\"{s}\",\"kernel_source_sha256\":\"{s}\",\"memory_kernel_source_sha256\":\"{s}\",\"artifact_kernel_source_sha256\":\"{s}\",\"main_source_sha256\":\"{s}\",\"axiom_audit_source_sha256\":\"{s}\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"source_identity_claim\":\"binary_hash_and_build_receipt_bound\",\"host_os\":",
+                .{ provenance.MANIFEST_SCHEMA, loaded.manifest_sha256[0..], provenance.BUILD_RECEIPT_SCHEMA, loaded.build_receipt_sha256[0..], loaded.kernel_source_sha256[0..], loaded.memory_kernel_source_sha256[0..], loaded.artifact_kernel_source_sha256[0..], loaded.main_source_sha256[0..], loaded.axiom_audit_source_sha256[0..] },
             );
             try std.json.Stringify.encodeJsonString(loaded.host_os, .{}, writer);
             try writer.writeAll(",\"host_arch\":");
@@ -711,6 +711,7 @@ fn renderReceipt(allocator: std.mem.Allocator, receipt: Receipt) ![]u8 {
                 );
             },
             .memory_supersede_existing => try writer.writeAll("null"),
+            .artifact_transition => try writer.writeAll("null"),
         } else {
             try writer.writeAll("null");
         }

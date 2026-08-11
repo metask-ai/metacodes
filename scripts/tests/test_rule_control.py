@@ -703,7 +703,7 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
             encoding="utf-8",
         )
         (root / "scripts/build-formal-kernel.sh").write_text(
-            'manifest="metacodes-formal-artifact-v3"\n'
+            'manifest="metacodes-formal-artifact-v4"\n'
             'receipt="metacodes-formal-build-receipt-v1"\n'
             'artifact_manifest_sha256="$manifest_sha256"\n'
             'built_at_utc=$(date -u)\n',
@@ -722,6 +722,7 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
             '        "checker_version": checker_version,\n'
             '        "request_schema": request_schema,\n'
             '        "memory_request_schema": memory_request_schema,\n'
+            '        "artifact_request_schema": artifact_request_schema,\n'
             '        "verdict_schema": verdict_schema,\n'
             '    }\n',
             encoding="utf-8",

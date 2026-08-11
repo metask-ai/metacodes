@@ -7,3 +7,4 @@ import MetaCodesControl.ProjectRule
 import MetaCodesControl.ProjectHarness
 import MetaCodesControl.RuleImpactGovernance
 import MetaCodesControl.RuleImpactAggregateGovernance
+import MetaCodesControl.ArtifactVerification

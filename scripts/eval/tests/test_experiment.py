@@ -64,15 +64,17 @@ def fake_formal_artifact(root: Path) -> tuple[Path, dict]:
     binary_sha = hashlib.sha256(binary.read_bytes()).hexdigest()
     provenance_path = Path(f"{binary}.provenance.json")
     provenance = {
-        "schema_version": "metacodes-formal-artifact-v3",
+        "schema_version": "metacodes-formal-artifact-v4",
         "checker_version": "metacodes-formal-kernel-v2",
         "request_schema": "metacodes-formal-request-v1",
         "memory_request_schema": "metacodes-memory-migration-request-v1",
+        "artifact_request_schema": "metacodes-artifact-verification-request-v1",
         "verdict_schema": "metacodes-formal-verdict-v2",
         "binary_sha256": binary_sha,
         "binary_bytes": binary.stat().st_size,
         "kernel_source_sha256": "1" * 64,
         "memory_kernel_source_sha256": "2" * 64,
+        "artifact_kernel_source_sha256": "5" * 64,
         "main_source_sha256": "3" * 64,
         "axiom_audit_source_sha256": "4" * 64,
         "axiom_policy": "propext,Quot.sound",
@@ -106,6 +108,7 @@ def fake_formal_artifact(root: Path) -> tuple[Path, dict]:
         "checker_version": provenance["checker_version"],
         "request_schema": provenance["request_schema"],
         "memory_request_schema": provenance["memory_request_schema"],
+        "artifact_request_schema": provenance["artifact_request_schema"],
         "verdict_schema": provenance["verdict_schema"],
     }
     identity = {
