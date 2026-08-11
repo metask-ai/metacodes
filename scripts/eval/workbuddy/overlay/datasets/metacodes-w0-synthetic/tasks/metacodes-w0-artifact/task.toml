@@ -1,0 +1,22 @@
+version = "1.0"
+artifacts = ["/workspace/result.txt"]
+
+[metadata]
+source_case = "metacodes-workbuddy-w0-synthetic"
+
+[agent]
+timeout_sec = 120.0
+# Docker Desktop cannot run Harbor's nftables egress sidecar.  The task's
+# compose file enforces network_mode:none directly, while these declarations
+# stay public so Harbor does not reject the stronger native isolation.
+network_mode = "public"
+
+[verifier]
+timeout_sec = 30.0
+network_mode = "public"
+environment_mode = "shared"
+
+[environment]
+build_timeout_sec = 600.0
+network_mode = "public"
+workdir = "/workspace"

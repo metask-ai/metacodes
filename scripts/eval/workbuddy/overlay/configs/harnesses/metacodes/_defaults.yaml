@@ -1,0 +1,16 @@
+harness:
+  name: metacodes
+  import_path: "workbuddy_bench.agents.metacodes_agent:MetacodesAgent"
+  protocol: anthropic
+  params:
+    # Keep the first pilot single-agent.  This limits attribution ambiguity;
+    # later cohorts may explicitly enable swarm as a separate treatment.
+    METACODES_DISALLOWED_TOOLS: "Agent,Task,TaskBatch,TeamCreate,TeamDelete,SendMessage"
+  mount:
+    name: metacodes
+    path: /opt/metacodes
+    dockerfile: configs/harnesses/metacodes/docker/Dockerfile
+    context: configs/harnesses/metacodes/docker
+    build:
+      args:
+        MOUNT_PATH: /opt/metacodes

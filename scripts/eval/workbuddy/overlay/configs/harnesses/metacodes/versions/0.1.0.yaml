@@ -1,0 +1,7 @@
+harness:
+  params:
+    # Adapter protocol version, not the metacodes product semver.  The resolved
+    # artifact manifest pins the product commit and all three executable hashes.
+    METACODES_VERSION: "0.1.0"
+  env:
+    METACODES_NO_PROBE: "1"
