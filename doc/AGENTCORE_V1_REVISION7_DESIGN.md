@@ -2,15 +2,17 @@
 
 ## Status and scope
 
-Revision 7 is an explicit AgentCore ABI hard cut. It completes one end-to-end
-product path: a user can add, change, disable, remove, and test an MCP server in
-the running application without restarting it.
+Revision 7 is an explicit AgentCore ABI hard cut. It completes the library-side
+MCP Runtime and public live-configuration control plane: a Host can add, change,
+disable, remove, and test MCP server definitions without recreating the Runtime.
+How a Host obtains configuration, observes changes, presents UI, or organizes
+its own lifecycle is outside this AgentCore specification.
 
-The owned path is:
+The AgentCore-owned path begins at the complete desired set supplied by the
+Host:
 
 ```text
-Host configuration, credentials, transport, and UI
-  -> declarative DesiredMcpConfiguration
+declarative DesiredMcpConfiguration
   -> serial Runtime reconcile
   -> exact-era ServerInstance
   -> era adapter
@@ -21,8 +23,8 @@ Host configuration, credentials, transport, and UI
   -> exact-instance dispatch lease
 ```
 
-Revision 7 includes product integration and removal of the legacy product MCP
-protocol/client/registry lifecycle. It does not keep two executable MCP paths.
+Revision 7 defines exactly one protocol/client/catalog lifecycle inside
+AgentCore. It does not specify or evaluate a Host's internal implementation.
 
 Out of scope: MCP Tasks, automatic replay, interactive connection affinity,
 sampling/elicitation routing, credential lifecycle management, configurable
@@ -219,23 +221,22 @@ discovery does not reuse that Classic rule. Execution modes normalize to
 callable as an ordinary request. Required-task tools remain unavailable because
 Revision 7 does not implement MCP Tasks.
 
-## Host configuration and product integration
+## Host integration boundary
 
-The product resolves managed policy, Session overlay, Workspace definition,
-and user definition into the complete desired set. Workspace files may store
-secret references but never secret values. Project-defined executable servers
-require user trust, and a security-relevant definition change invalidates the
-corresponding trust decision.
+AgentCore neither reads nor watches Host configuration. The Host resolves its
+policy and configuration layers into the complete desired set and supplies
+opaque Connector contexts. Secret values remain Host-owned and must never enter
+configuration fingerprints, diagnostics, logs, or checkpoints.
 
-Saving configuration invokes Apply in a Host worker thread. The UI can query
-Runtime description concurrently. On successful convergence, the current
-Session sees new tools on its next Run without restarting the application.
+The Host invokes Apply synchronously from a thread on which Connector callbacks
+are legal, while other threads may query Runtime description concurrently. An
+existing Session rematerializes its value selectors against the current catalog
+on its next Run. Apply never expands Session authority implicitly: newly added
+tools become available only after the Host explicitly updates that Session's
+MCP selection through `session_update_mcp`.
 
-The completed product path replaces startup-only `App.connectMcpServers()` and
-the mutable registry bindings that borrow product `McpClient` pointers. Once
-the AgentCore path supports the existing product features, the duplicate
-product protocol, Client, and registry lifecycle implementations are removed.
-Retaining both executable paths is a Revision 7 release blocker.
+Host behavior before configuration reaches Apply and after AgentCore returns a
+result is outside the Revision 7 ABI contract and its verification gates.
 
 ## ABI contract
 
@@ -274,14 +275,11 @@ consumers are updated together and reject Revision 6 tables.
 - schema changes invalidate grants while reconnects preserve identity;
 - configuration, diagnostics, logs, and checkpoints contain no secrets;
 - Runtime description is safe during Apply and exposes no internal IDs;
-- saving product configuration makes tools usable in the current application's
-  next Run without restart;
-- the duplicate product MCP protocol/client/registry lifecycle is removed;
 - strict C/Zig/Rust ABI, source-free consumers, bundle/archive/diff gates, and
-  full AgentCore and product component suites pass.
+  the full AgentCore component suite pass.
 
-Revision 7 freezes only after every gate above passes and the final architecture
-and implementation reviews converge.
+Revision 7 freezes only after the AgentCore gates above pass and the final
+architecture and implementation reviews converge.
 
 ## Deferred supervisor capabilities
 

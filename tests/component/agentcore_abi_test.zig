@@ -1126,6 +1126,7 @@ test "L2 Revision 7 public MCP exact 2025-06 and AUTO reopen reach one canonical
         server.transport_code = wire.MCP_TRANSPORT_STDIO;
         server.negotiation_policy_code = case.policy;
         server.server_binding_identity = [_]u8{@intCast(0x60 + index)} ** 32;
+        server.configuration_fingerprint = server.server_binding_identity;
         server.namespace = sdk.bytesView(if (index == 0) "exact06" else "auto06");
         server.client_name = sdk.bytesView("agentcore-r7-test");
         server.client_version = sdk.bytesView("7");
@@ -1341,7 +1342,7 @@ test "L2 Revision 7 public MCP Apply publishes complete sets and replaces change
     try std.testing.expectEqual(second_probe.connector_retains, second_probe.connector_releases);
 }
 
-test "L2 Revision 7 public MCP Apply requires connector lifetime callbacks" {
+test "L2 Revision 7 public MCP Apply requires explicit instance identity and lifetime" {
     const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
         return error.MissingApi;
     const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
@@ -1358,8 +1359,12 @@ test "L2 Revision 7 public MCP Apply requires connector lifetime callbacks" {
         _ = api.runtimeDestroy()(handle, &diagnostic);
     };
 
-    const missing_callbacks = [_]enum { retain, release }{ .retain, .release };
-    for (missing_callbacks) |missing| {
+    const invalid_contracts = [_]enum { zero_fingerprint, retain, release }{
+        .zero_fingerprint,
+        .retain,
+        .release,
+    };
+    for (invalid_contracts) |invalid| {
         var probe = PublicMcpProbe{};
         var server = std.mem.zeroes(wire.McpServerV1);
         server.struct_size = @sizeOf(wire.McpServerV1);
@@ -1372,7 +1377,8 @@ test "L2 Revision 7 public MCP Apply requires connector lifetime callbacks" {
         server.client_version = sdk.bytesView("7");
         server.timeout_ms = 1000;
         server.connector = probe.connector();
-        switch (missing) {
+        switch (invalid) {
+            .zero_fingerprint => server.configuration_fingerprint = [_]u8{0} ** 32,
             .retain => server.connector.retain_connector = null,
             .release => server.connector.release_connector = null,
         }
@@ -1527,6 +1533,7 @@ test "L2 public MCP wire failures preserve downgrade and no-replay semantics" {
         server.transport_code = case.transport;
         server.negotiation_policy_code = wire.MCP_NEGOTIATION_AUTO;
         server.server_binding_identity = [_]u8{@intCast(0x79 + index)} ** 32;
+        server.configuration_fingerprint = server.server_binding_identity;
         server.namespace = sdk.bytesView("failure");
         server.client_name = sdk.bytesView("agentcore-r7-test");
         server.client_version = sdk.bytesView("7");
@@ -1607,6 +1614,7 @@ test "L2 public MCP catalog preserves heterogeneous multi-server tool windows" {
         server.transport_code = wire.MCP_TRANSPORT_STDIO;
         server.negotiation_policy_code = wire.MCP_NEGOTIATION_AUTO;
         server.server_binding_identity = bindings[index];
+        server.configuration_fingerprint = server.server_binding_identity;
         server.namespace = sdk.bytesView(namespaces[index]);
         server.client_name = sdk.bytesView("agentcore-r7-test");
         server.client_version = sdk.bytesView("7");
@@ -1711,6 +1719,7 @@ test "L2 Revision 7 MCP no-tools and required-task peers expose zero executable 
         server.transport_code = wire.MCP_TRANSPORT_STDIO;
         server.negotiation_policy_code = case.policy;
         server.server_binding_identity = [_]u8{@intCast(0x70 + index)} ** 32;
+        server.configuration_fingerprint = server.server_binding_identity;
         server.namespace = sdk.bytesView(if (index == 0) "notools" else "required");
         server.client_name = sdk.bytesView("agentcore-r7-test");
         server.client_version = sdk.bytesView("7");
@@ -2105,6 +2114,7 @@ test "L2 Revision 7 public MCP checkpoint restore facade preserves Conversation 
     mcp_server.transport_code = wire.MCP_TRANSPORT_STDIO;
     mcp_server.negotiation_policy_code = wire.MCP_NEGOTIATION_AUTO;
     mcp_server.server_binding_identity = [_]u8{0x42} ** 32;
+    mcp_server.configuration_fingerprint = mcp_server.server_binding_identity;
     mcp_server.namespace = sdk.bytesView("weather");
     mcp_server.client_name = sdk.bytesView("agentcore-component-test");
     mcp_server.client_version = sdk.bytesView("6");

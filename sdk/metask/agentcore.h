@@ -326,7 +326,7 @@ typedef struct {
     uint32_t reserved1;
     metask_agentcore_mcp_connector_v1 connector;
     const metask_agentcore_mcp_protocol_limits_v1 *protocol_limits;
-    /* Stable non-secret identity of connection-relevant configuration. */
+    /* Nonzero stable, non-secret identity of connection-relevant configuration. */
     uint8_t configuration_fingerprint[32];
 } metask_agentcore_mcp_server_v1;
 
@@ -736,7 +736,7 @@ metask_agentcore_api_v1_is_compatible(const metask_agentcore_api_v1 *api) {
                (metask_agentcore_session_export_checkpoint_fn_v1)0 &&
            api->buffer_release != (metask_agentcore_buffer_release_fn_v1)0 &&
            api->reserved[0] == 0 && api->reserved[1] == 0 &&
-           api->reserved[2] == 0 && api->reserved[3] == 0;
+           api->reserved[2] == 0;
 }
 
 static inline const metask_agentcore_api_v1 *

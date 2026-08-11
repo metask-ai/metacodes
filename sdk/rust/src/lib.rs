@@ -379,7 +379,7 @@ mod tests {
         assert_eq!(raw::METASK_AGENTCORE_MCP_APPLY_APPLIED, 1);
         assert_eq!(raw::METASK_AGENTCORE_MCP_APPLY_SUPERSEDED, 2);
         assert_eq!(raw::METASK_AGENTCORE_MCP_APPLY_REJECTED, 3);
-        assert_eq!(size_of::<raw::metask_agentcore_api_v1>(), 224);
+        assert_eq!(size_of::<raw::metask_agentcore_api_v1>(), 216);
         assert_eq!(
             size_of::<raw::metask_agentcore_mcp_configuration_v1>(),
             64

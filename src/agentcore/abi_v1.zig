@@ -3861,7 +3861,8 @@ fn parseMcpSpecs(
             descriptor.connector.close == null or
             descriptor.connector.release_response == null or
             descriptor.connector.retain_connector == null or
-            descriptor.connector.release_connector == null)
+            descriptor.connector.release_connector == null or
+            allZero(descriptor.configuration_fingerprint))
             return error.InvalidArgument;
         const transport = mcpTransport(descriptor.transport_code) orelse
             return error.InvalidArgument;

@@ -28,8 +28,8 @@ hard-cut replacement for every earlier revision. In addition to the Revision
 - `RuntimeConfigV1`, `SessionHostConfigV1`, `SessionCreateConfigV1`,
   `SessionRestoreConfigV1`, `RunInputV1`, and `RunResultV1` are respectively
   96, 168, 64, 64, 104, and 72 bytes on the required 64-bit ABI;
-- checkpoint, restore, describe, MCP refresh/describe/selection, Permission
-  rule update, compact, and abort entries are mandatory;
+- checkpoint, restore, describe, MCP refresh/describe/apply/selection,
+  Permission rule update, compact, and abort entries are mandatory;
 - the exact required capability set is `0x7ffff`;
 - `manifest.json` records revision 7, table size 216, and that exact capability
   set.

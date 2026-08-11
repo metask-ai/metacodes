@@ -452,7 +452,8 @@ pub const McpServerV1 = extern struct {
     protocol_limits: ?*const McpProtocolLimitsV1,
     /// Stable, non-secret identity of every connection-relevant input. A
     /// changed value replaces the ServerInstance; secret bytes and
-    /// secret-derived digests must never be supplied here.
+    /// secret-derived digests must never be supplied here. The value must not
+    /// be all zero.
     configuration_fingerprint: [32]u8,
 };
 
