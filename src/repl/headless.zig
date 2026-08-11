@@ -410,8 +410,17 @@ pub fn buildResultLine(
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.print(
-        \\{{"type":"result","stop_reason":"{s}","turns":{d},"tool_calls":{d},"input_tokens":{d},"output_tokens":{d},"cost_usd":{d:.6},"text":
-    , .{ stop, result.turns, result.tool_calls, usage.input_tokens, usage.output_tokens, cost });
+        \\{{"type":"result","stop_reason":"{s}","turns":{d},"tool_calls":{d},"input_tokens":{d},"output_tokens":{d},"cache_read_input_tokens":{d},"cache_creation_input_tokens":{d},"cost_usd":{d:.6},"text":
+    , .{
+        stop,
+        result.turns,
+        result.tool_calls,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_read_input_tokens,
+        usage.cache_creation_input_tokens,
+        cost,
+    });
     try std.json.Stringify.encodeJsonString(final_text, .{}, &aw.writer);
     try aw.writer.writeAll("}\n");
     return try aw.toOwnedSlice();

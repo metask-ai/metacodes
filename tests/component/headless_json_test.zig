@@ -13,7 +13,12 @@ const UsageTotals = cc.app_module.UsageTotals;
 
 test "L2 headless --json: result 行字段完整 + 合法 JSON + text 转义" {
     const a = std.testing.allocator;
-    const usage = UsageTotals{ .input_tokens = 120, .output_tokens = 45 };
+    const usage = UsageTotals{
+        .input_tokens = 120,
+        .output_tokens = 45,
+        .cache_read_input_tokens = 80,
+        .cache_creation_input_tokens = 20,
+    };
     const result = RunResult{ .stop_reason = .end_turn, .turns = 3, .tool_calls = 2 };
 
     const line = try headless.buildResultLine(a, "hi \"there\"\nline2", result, &usage, "claude-sonnet-4-20250514");
@@ -26,6 +31,8 @@ test "L2 headless --json: result 行字段完整 + 合法 JSON + text 转义" {
         "\"type\":\"result\"",  "\"stop_reason\":\"end_turn\"",
         "\"turns\":3",          "\"tool_calls\":2",
         "\"input_tokens\":120", "\"output_tokens\":45",
+        "\"cache_read_input_tokens\":80",
+        "\"cache_creation_input_tokens\":20",
         "\"cost_usd\":",
     }) |needle| {
         try std.testing.expect(std.mem.indexOf(u8, line, needle) != null);

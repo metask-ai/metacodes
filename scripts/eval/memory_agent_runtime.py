@@ -1254,7 +1254,7 @@ def _parse_result(stdout: str) -> Mapping[str, Any]:
     if len(rows) != 1:
         _fail("native metacodes stdout", f"expected exactly one result row, observed {len(rows)}")
     result = rows[0]
-    required = {
+    legacy_fields = {
         "type",
         "stop_reason",
         "turns",
@@ -1264,11 +1264,29 @@ def _parse_result(stdout: str) -> Mapping[str, Any]:
         "cost_usd",
         "text",
     }
-    if set(result) != required:
-        _fail("native metacodes result", f"unexpected fields: {sorted(set(result) ^ required)}")
+    cache_fields = {"cache_read_input_tokens", "cache_creation_input_tokens"}
+    observed_fields = set(result)
+    if observed_fields == legacy_fields:
+        # Historical receipts predate public cache telemetry. Preserve replay
+        # compatibility without accepting a partially upgraded schema.
+        result = dict(result)
+        result.update({key: 0 for key in cache_fields})
+    elif observed_fields != legacy_fields | cache_fields:
+        expected = legacy_fields | cache_fields
+        _fail(
+            "native metacodes result",
+            f"unexpected fields: {sorted(observed_fields ^ expected)}",
+        )
     if not isinstance(result["stop_reason"], str) or not result["stop_reason"]:
         _fail("native metacodes result.stop_reason", "expected non-empty string")
-    for key in ("turns", "tool_calls", "input_tokens", "output_tokens"):
+    for key in (
+        "turns",
+        "tool_calls",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ):
         value = result[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             _fail(f"native metacodes result.{key}", "expected non-negative integer")

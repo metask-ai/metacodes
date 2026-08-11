@@ -25,6 +25,7 @@ from scripts.eval.memory_agent_runtime import (
     _project_domain,
     _production_environment,
     _materialize_production_sandbox,
+    _parse_result,
     _run_production_sandbox_probe,
     _safe_component,
     _sanitized_environment,
@@ -103,6 +104,34 @@ def digest(label: str) -> str:
 
 
 class MemoryAgentRuntimeContractTest(unittest.TestCase):
+    def test_headless_result_cache_schema_is_atomic_and_legacy_replayable(self):
+        legacy = {
+            "type": "result",
+            "stop_reason": "end_turn",
+            "turns": 1,
+            "tool_calls": 0,
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "cost_usd": 0.0,
+            "text": "done",
+        }
+        parsed_legacy = _parse_result(stable_json(legacy))
+        self.assertEqual(parsed_legacy["cache_read_input_tokens"], 0)
+        self.assertEqual(parsed_legacy["cache_creation_input_tokens"], 0)
+
+        current = dict(legacy)
+        current.update(
+            {"cache_read_input_tokens": 8, "cache_creation_input_tokens": 3}
+        )
+        parsed_current = _parse_result(stable_json(current))
+        self.assertEqual(parsed_current["cache_read_input_tokens"], 8)
+        self.assertEqual(parsed_current["cache_creation_input_tokens"], 3)
+
+        partial = dict(legacy)
+        partial["cache_read_input_tokens"] = 8
+        with self.assertRaises(ValidationError):
+            _parse_result(stable_json(partial))
+
     def test_context_cache_contract_binds_full_prefix_and_breaker_finalization(self):
         def normal(system="stable-system", tools=None):
             return {
