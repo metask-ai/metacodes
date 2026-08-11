@@ -60,6 +60,14 @@ _DISPATCH_NEW = '''    if name in ("cc", "claude-code"):
 
 
 _GENERIC_ANCHOR = "def _build_generic_runtime_config(\n"
+_MODEL_ROUTE_OLD = '        model_route = f"{instance_id}__{model_slug}"\n'
+_MODEL_ROUTE_NEW = '''        # Harbor uses ``__`` as the serialized eval-group delimiter and its
+        # summary parser accepts only agent[__model]__dataset.  Embedding that
+        # delimiter inside the opaque local-proxy route makes a fully completed
+        # job crash while formatting its final table.  Route lookup is exact, so
+        # use a delimiter that cannot be mistaken for Harbor group structure.
+        model_route = f"{instance_id}--{model_slug}"
+'''
 _METACODES_RUNTIME_BUILDER = '''def _build_metacodes_runtime_config(
     *,
     harness: dict[str, Any],
@@ -215,6 +223,9 @@ def _patched_upstream(repo: Path) -> Dict[Path, bytes]:
     resolver = resolver.replace(
         _GENERIC_ANCHOR, _METACODES_RUNTIME_BUILDER + _GENERIC_ANCHOR, 1
     )
+    if resolver.count(_MODEL_ROUTE_OLD) != 1:
+        raise OverlayError("WorkBuddy local-proxy route anchor drifted")
+    resolver = resolver.replace(_MODEL_ROUTE_OLD, _MODEL_ROUTE_NEW, 1)
     if resolver.count(_RESOLVER_MOUNT_OLD) != 1:
         raise OverlayError("WorkBuddy resolver mount-requirement anchor drifted")
     resolver = resolver.replace(_RESOLVER_MOUNT_OLD, _RESOLVER_MOUNT_NEW, 1)

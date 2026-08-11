@@ -416,6 +416,7 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
                 overlay_installer._RESOLVER_PATH: (
                     overlay_installer._DISPATCH_OLD
                     + overlay_installer._GENERIC_ANCHOR
+                    + overlay_installer._MODEL_ROUTE_OLD
                     + overlay_installer._RESOLVER_MOUNT_OLD
                 ),
                 overlay_installer._PREPARE_JOB_PATH:
@@ -448,8 +449,10 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
             resolver = patched[overlay_installer._RESOLVER_PATH].decode("utf-8")
             prepare = patched[overlay_installer._PREPARE_JOB_PATH].decode("utf-8")
             self.assertIn(overlay_installer._RESOLVER_MOUNT_NEW, resolver)
+            self.assertIn(overlay_installer._MODEL_ROUTE_NEW, resolver)
             self.assertIn(overlay_installer._PREPARE_MOUNT_NEW, prepare)
             self.assertNotIn(overlay_installer._RESOLVER_MOUNT_OLD, resolver)
+            self.assertNotIn(overlay_installer._MODEL_ROUTE_OLD, resolver)
             self.assertNotIn(overlay_installer._PREPARE_MOUNT_OLD, prepare)
 
     def test_digest_detects_changes_before_owned_overlay_replacement(self):

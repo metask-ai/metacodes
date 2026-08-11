@@ -87,6 +87,10 @@ command with the anonymous credential FD. It commits only after every selected
 trajectory has a request audit, usage and cache-prefix hash. A failed or
 interrupted authorized run is not automatically retried.
 
+The overlay also keeps the opaque local-proxy route free of Harbor's ``__``
+eval-group delimiter. Otherwise a completed multi-task job can fail only while
+Harbor formats its final summary, after all provider and scorer work has run.
+
 ```bash
 python3 -m scripts.eval.workbuddy.launch_gate create ... \
   --environment-preflight-receipt /private/preflight.json \
