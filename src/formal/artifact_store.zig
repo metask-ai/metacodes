@@ -53,6 +53,7 @@ pub const PersistResult = struct {
 pub const VerifiedBundle = struct {
     event_id: [64]u8,
     manifest_sha256: [64]u8,
+    receipt_sha256: [64]u8,
     files_verified: usize,
 };
 
@@ -226,7 +227,7 @@ pub fn verifyBundle(allocator: std.mem.Allocator, event_dir: []const u8) !Verifi
         manifest.files.len == 0 or manifest.files.len > MAX_FILES)
         return error.InvalidManifest;
 
-    var receipt_seen = false;
+    var receipt_sha256: ?[64]u8 = null;
     for (manifest.files, 0..) |entry, index| {
         if (!validArtifactName(entry.name) or entry.bytes > MAX_ARTIFACT_BYTES)
             return error.InvalidManifest;
@@ -241,12 +242,13 @@ pub fn verifyBundle(allocator: std.mem.Allocator, event_dir: []const u8) !Verifi
         const actual_hash = sha256Hex(payload);
         if (payload.len != entry.bytes or !std.mem.eql(u8, &actual_hash, &expected_hash))
             return error.ArtifactHashMismatch;
-        if (std.mem.eql(u8, entry.name, "receipt.json")) receipt_seen = true;
+        if (std.mem.eql(u8, entry.name, "receipt.json")) receipt_sha256 = actual_hash;
     }
-    if (!receipt_seen) return error.InvalidManifest;
+    const verified_receipt_sha256 = receipt_sha256 orelse return error.InvalidManifest;
     return .{
         .event_id = event_id,
         .manifest_sha256 = sha256Hex(manifest_bytes),
+        .receipt_sha256 = verified_receipt_sha256,
         .files_verified = manifest.files.len,
     };
 }

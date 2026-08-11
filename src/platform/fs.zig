@@ -112,6 +112,11 @@ pub const FileInfo = struct {
     size: u64,
     is_regular: bool,
     link_count: u64,
+    /// Stable identity for one open file while the descriptor remains live.
+    /// Security-sensitive pathname re-observation must compare both fields;
+    /// matching size/content alone cannot detect a same-byte final-path swap.
+    device: u64,
+    inode: u64,
 };
 
 /// 对已打开 fd 做类型与大小检查。安全敏感读取必须先 open(O_NOFOLLOW)，再 fstat fd，
@@ -124,6 +129,8 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
             .size = @intCast(st.st_size),
             .is_regular = (@as(u32, st.st_mode) & S_IFMT) == S_IFREG,
             .link_count = @intCast(@max(st.st_nlink, 0)),
+            .device = @intCast(st.st_dev),
+            .inode = @intCast(st.st_ino),
         };
     }
     if (builtin.os.tag == .linux) {
@@ -136,6 +143,8 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
             .size = stx.size,
             .is_regular = (@as(u32, stx.mode) & S_IFMT) == S_IFREG,
             .link_count = stx.nlink,
+            .device = (@as(u64, stx.dev_major) << 32) | @as(u64, stx.dev_minor),
+            .inode = stx.ino,
         };
     }
     var st: std.c.Stat = undefined;
@@ -144,6 +153,8 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
         .size = @intCast(st.size),
         .is_regular = (@as(u32, @intCast(st.mode)) & S_IFMT) == S_IFREG,
         .link_count = @intCast(st.nlink),
+        .device = @intCast(st.dev),
+        .inode = @intCast(st.ino),
     };
 }
 
