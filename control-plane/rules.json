@@ -550,7 +550,7 @@
           "admitted_implies_closed_loop",
           "admitted_implies_zero_deviation",
           "admitted_implies_feedback_passed",
-          "memory_isolation_admitted_implies_six_obligations",
+          "memory_isolation_admitted_implies_seven_obligations",
           "memory_isolation_missing_obligation_blocks",
           "memory_isolation_wrong_cardinality_blocks",
           "orphan_cannot_be_compliant",
@@ -562,7 +562,7 @@
       "actuator": {
         "kind": "release_gate",
         "on_violation": "block",
-        "remediation": "Restore direct hash-pinned TinyKG execution, sealed HOME/TMP and removal of every TINYKG_* child variable, fresh run-local store/output containment, the unnormalized whole-store digest around read operations, all three adapter tests plus real native remote sentinels and write-fault rejection, and the three-trace zero-remote pin. Never substitute the TinyKG skill harness or a remote canonical store for benchmark storage.",
+        "remediation": "Restore direct hash-pinned TinyKG execution, explicit METACODES_KG_TRANSPORT=cli-exclusive routing, sealed HOME/TMP and removal of every TINYKG_* child variable, fresh run-local store/output containment, the unnormalized whole-store digest around read operations, all three adapter tests plus real native remote sentinels and write-fault rejection, and the three-trace zero-remote pin. Never substitute the TinyKG skill harness or a remote canonical store for benchmark storage.",
         "observation": {
           "schema_version": 1,
           "build_file": "control-plane/build.zig",
@@ -693,7 +693,7 @@
       "target": {
         "metric": "tinykg_daemon_transport_obligations_minus_observed",
         "setpoint": 0,
-        "goal": "Every Metacodes process uses authenticated Web transport to one daemon-owned StoreActor, with pinned compatibility, generation-bound sessions, bounded failure semantics, same-request replay identity, content-bound Markdown uploads, and native multi-process feedback; shared raw Store fallback is impossible."
+        "goal": "Every Metacodes process uses the TinyKG Skill's authenticated and build-pinned Web transport to one daemon-owned StoreActor, with session-pinned schema, generation-bound queries, zero transport-level write retries, a process-shared ambiguity fence across cloned agent sessions, content-bound Markdown uploads, and native multi-process feedback; shared raw Store fallback is impossible."
       },
       "sensor": {
         "adapter": "daemon_transport",
@@ -718,7 +718,7 @@
       "actuator": {
         "kind": "release_gate",
         "on_violation": "block",
-        "remediation": "Restore authenticated and build/schema-pinned Web routing, explicit isolated cli-exclusive compatibility, the no-raw-Store boundary, same-id replay/conflict and ambiguous-commit behavior, generation-bound sessions, real wall-clock deadlines, bounded backpressure/unavailability, Markdown content upload, and the native two-process/one-StoreActor feedback. Comments, manifest claims, or a hand-built fake Skill cannot satisfy this gate.",
+        "remediation": "Restore canonical TinyKG Skill remote-config routing, build/session-schema pins, explicit isolated cli-exclusive compatibility, the no-raw-Store boundary, request identity with zero transport-level write retries, the process-shared ambiguity fence across cloned agent sessions, generation-bound sessions, real wall-clock deadlines, bounded backpressure/unavailability, Markdown content upload, and native two-process/one-StoreActor feedback. Comments or manifest claims cannot satisfy this gate.",
         "observation": {
           "schema_version": 1,
           "build_file": "control-plane/build.zig",

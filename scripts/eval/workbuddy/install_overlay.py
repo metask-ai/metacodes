@@ -101,6 +101,7 @@ _METACODES_RUNTIME_BUILDER = '''def _build_metacodes_runtime_config(
             "METACODES_MODEL": backend_model_name,
         })
     env.update({
+        "METACODES_KG_TRANSPORT": "cli-exclusive",
         "METACODES_KG_BIN": "/opt/metacodes/bin/tinykg",
         "METACODES_KG_STORE": "<fresh-home>/.local/share/tinykg/store",
         "METACODES_FORMAL_KERNEL_PATH": "/opt/metacodes/libexec/metacodes-formal-kernel",

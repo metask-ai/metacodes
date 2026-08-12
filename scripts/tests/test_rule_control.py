@@ -1278,6 +1278,8 @@ class MemoryLocalStoreIsolationSensorTests(unittest.TestCase):
         "scripts/eval/cli.py",
         "scripts/eval/tests/test_memory_tinykg_local.py",
         "evals/memory/pins/local-tinykg-memory-smoke-pin.json",
+        "scripts/eval/memory_agent_runtime.py",
+        "scripts/eval/runtime_arm_smoke.py",
     )
 
     def make_repo(self) -> tuple[tempfile.TemporaryDirectory[str], Path]:
@@ -1290,13 +1292,13 @@ class MemoryLocalStoreIsolationSensorTests(unittest.TestCase):
             target.write_bytes(source.read_bytes())
         return temporary, root
 
-    def test_all_six_local_store_isolation_obligations_are_observed(self) -> None:
+    def test_all_seven_local_store_isolation_obligations_are_observed(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
         observation = rule_control.observe_memory_local_store_isolation(root)
         self.assertTrue(observation.sensor_ok, observation.errors)
-        self.assertEqual(6, observation.declared)
-        self.assertEqual(6, observation.covered)
+        self.assertEqual(7, observation.declared)
+        self.assertEqual(7, observation.covered)
         self.assertEqual(2, len(observation.feedback_bindings))
 
     def test_missing_environment_sanitizer_is_observed(self) -> None:
@@ -1367,6 +1369,25 @@ class MemoryLocalStoreIsolationSensorTests(unittest.TestCase):
         self.assertFalse(observation.sensor_ok)
         self.assertIn(
             "three_trace_identity_and_zero_remote_pin",
+            observation.missing_declarations,
+        )
+
+    def test_native_runtime_without_explicit_exclusive_transport_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        runtime = root / "scripts/eval/memory_agent_runtime.py"
+        runtime.write_text(
+            runtime.read_text(encoding="utf-8").replace(
+                'env["METACODES_KG_TRANSPORT"] = "cli-exclusive"',
+                'env["METACODES_KG_TRANSPORT"] = "daemon"',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_memory_local_store_isolation(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "native_runtime_explicitly_selects_exclusive_cli",
             observation.missing_declarations,
         )
 
@@ -1838,6 +1859,55 @@ class DaemonTransportSensorTests(unittest.TestCase):
             self.assertFalse(observation.sensor_ok)
             self.assertIn("multi_process_one_store_actor_feedback", observation.missing_declarations)
 
+    def test_removing_cloned_session_ambiguity_fence_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative in (
+                "src/kg/transport.zig", "src/kg/client.zig",
+                "tests/helpers/kg_daemon_transport_probe.zig",
+                "scripts/test_kg_daemon_transport.py", "build.zig",
+            ):
+                source = PROJECT_ROOT / relative
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
+            probe = root / "tests/helpers/kg_daemon_transport_probe.zig"
+            probe.write_text(
+                probe.read_text(encoding="utf-8").replace(
+                    "clone-must-not-send", "clone-fence-removed", 1
+                ),
+                encoding="utf-8",
+            )
+            observation = rule_control.observe_daemon_transport(root)
+            self.assertFalse(observation.sensor_ok)
+            self.assertIn("ambiguous_write_outcome", observation.missing_declarations)
+
+    def test_removing_cloned_session_schema_pin_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative in (
+                "src/kg/transport.zig", "src/kg/client.zig",
+                "tests/helpers/kg_daemon_transport_probe.zig",
+                "scripts/test_kg_daemon_transport.py", "build.zig",
+            ):
+                source = PROJECT_ROOT / relative
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
+            probe = root / "tests/helpers/kg_daemon_transport_probe.zig"
+            probe.write_text(
+                probe.read_text(encoding="utf-8").replace(
+                    "schema-drift-across-clone", "schema-drift-not-tested"
+                ),
+                encoding="utf-8",
+            )
+            observation = rule_control.observe_daemon_transport(root)
+            self.assertFalse(observation.sensor_ok)
+            self.assertIn(
+                "generation_and_schema_bound_sessions",
+                observation.missing_declarations,
+            )
+
     def test_executable_proof_placeholders_remain_visible(self) -> None:
         self.assertEqual(
             ["admit", "axiom", "sorry"],
@@ -2123,7 +2193,7 @@ class TopologyTests(unittest.TestCase):
         )
         self.assertFalse(missing_real_dependency["feedback"])
 
-    def test_memory_isolation_rule_requires_six_obligation_kernel_and_native_feedback(self) -> None:
+    def test_memory_isolation_rule_requires_seven_obligation_kernel_and_native_feedback(self) -> None:
         rule = self.complete_rule()
         rule["id"] = "eval.memory-local-store-isolation.l2"
         rule["sensor"] = {

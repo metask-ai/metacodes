@@ -45,6 +45,10 @@ def _dump(binary: Path, tinykg_binary: Path, arm: str) -> str:
             }
         )
         if arm == "tinykg":
+            # Rule 8: benchmark memory is an isolated, single-run local Store.
+            # Setting only the binary path must not accidentally opt production
+            # Metacodes out of its daemon-default shared-Store boundary.
+            env["METACODES_KG_TRANSPORT"] = "cli-exclusive"
             env["METACODES_KG_BIN"] = str(tinykg_binary)
         try:
             completed = subprocess.run(

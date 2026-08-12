@@ -337,6 +337,7 @@ def _run_arm(
             "METACODES_NO_PROBE": "1",
             "METACODES_NO_AUTO_RECALL": "1",
             "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
+            "METACODES_KG_TRANSPORT": "cli-exclusive",
             "METACODES_KG_BIN": "/nonexistent/metacodes-boundary-tinykg",
             "METACODES_PROJECT_KERNEL_PATH": str(kernel),
             "METACODES_PROJECT_KERNEL_SHA256": kernel_sha256,

@@ -1037,6 +1037,7 @@ def arm_runtime_env(
     # All config identities bind the dependency hash, but exposing the path to
     # a baseline would let Bash bypass the typed treatment.
     if arm_id == "tinykg":
+        env["METACODES_KG_TRANSPORT"] = "cli-exclusive"
         env["METACODES_KG_BIN"] = str(tinykg_binary.resolve())
         env["METACODES_FORMAL_KERNEL_PATH"] = str(formal_kernel["path"])
         env["METACODES_FORMAL_KERNEL_SHA256"] = str(formal_kernel["sha256"])

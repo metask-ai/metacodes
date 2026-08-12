@@ -2370,12 +2370,15 @@ def observe_memory_local_store_isolation(repo: Path) -> Observation:
         "raw_store_digest_guards_read_phase",
         "three_adapter_native_sentinel_and_fault_l2",
         "three_trace_identity_and_zero_remote_pin",
+        "native_runtime_explicitly_selects_exclusive_cli",
     ]
     relative_sources = {
         "runtime": "scripts/eval/memory_tinykg_local.py",
         "cli": "scripts/eval/cli.py",
         "tests": "scripts/eval/tests/test_memory_tinykg_local.py",
         "pin": "evals/memory/pins/local-tinykg-memory-smoke-pin.json",
+        "native_runtime": "scripts/eval/memory_agent_runtime.py",
+        "arm_smoke": "scripts/eval/runtime_arm_smoke.py",
     }
     paths = {name: repo / relative for name, relative in relative_sources.items()}
     missing_files = [relative_sources[name] for name, path in paths.items() if not path.is_file()]
@@ -2464,6 +2467,8 @@ def observe_memory_local_store_isolation(repo: Path) -> Observation:
     tree_digest_source = module_function_source("runtime", "_tree_digest")
     cli_command = module_function_source("cli", "cmd_smoke_local_tinykg_memory")
     cli_module = sources["cli"]
+    native_runtime = sources["native_runtime"]
+    arm_smoke = sources["arm_smoke"]
 
     imports_harness = any(
         (
@@ -2765,6 +2770,23 @@ def observe_memory_local_store_isolation(repo: Path) -> Observation:
             "pin has strict identity and native no-skip evidence": pin_objects and pin_identity,
             "pin has one provenance-complete trace per adapter": trace_identity_complete,
             "pin records zero remote access and the executable guards": pin_zero_remote,
+        },
+        declarations[6]: {
+            "native rollout selects the isolated compatibility transport": all(
+                marker in native_runtime
+                for marker in (
+                    'env["METACODES_KG_TRANSPORT"] = "cli-exclusive"',
+                    'env["METACODES_KG_BIN"] = str(tinykg)',
+                    'env["METACODES_KG_STORE"] = str(store)',
+                )
+            ),
+            "prompt-arm smoke selects the isolated compatibility transport": all(
+                marker in arm_smoke
+                for marker in (
+                    'env["METACODES_KG_TRANSPORT"] = "cli-exclusive"',
+                    'env["METACODES_KG_BIN"] = str(tinykg_binary)',
+                )
+            ),
         },
     }
     covered = [name for name, checks in obligations.items() if all(checks.values())]
@@ -3678,17 +3700,17 @@ def observe_daemon_transport(repo: Path) -> Observation:
     client_init = zig_function_slice(sources["client"], "init") or ""
     ensure_ready = zig_function_slice(sources["client"], "ensureReady") or ""
     remote_run = zig_function_slice(sources["client"], "runCheckedRetry") or ""
-    retry = zig_function_slice(sources["transport"], "postWithSameIdRetry") or ""
+    policy = zig_function_slice(sources["transport"], "postWithPolicy") or ""
+    remote_config = zig_function_slice(sources["client"], "initRemoteTransport") or ""
     parse = zig_function_slice(sources["transport"], "parseResponse") or ""
     deadline = zig_function_slice(sources["transport"], "postBeforeDeadline") or ""
     markdown = zig_function_slice(sources["transport"], "importMarkdown") or ""
     step = build_step_slice(sources["build"], "test:kg-daemon-transport") or ""
 
     obligations = {
-        "authenticated_remote_default": all(marker in client_init for marker in (
-            "METACODES_KG_URL", "METACODES_KG_API_KEY",
-            "METACODES_KG_EXPECTED_BUILD_ID", "METACODES_KG_EXPECTED_SCHEMA_DIGEST",
-            ".remote = transport_mod.WebTransport.init", ".unconfigured",
+        "authenticated_remote_default": all(marker in client_init + remote_config for marker in (
+            "TINYKG_REMOTE_URL", "TINYKG_API_KEY", "TINYKG_REMOTE_EXPECTED_BUILD_ID",
+            "remoteConfigPath", "transport_mod.WebTransport.init", ".unconfigured",
         )),
         "explicit_exclusive_cli_compatibility": all(marker in client_init for marker in (
             "opts.exclusive_cli", 'std.mem.eql(u8, mode, "cli-exclusive")',
@@ -3704,21 +3726,31 @@ def observe_daemon_transport(repo: Path) -> Observation:
             "self.transport.remote.run(args[0], args[2..]" in remote_run,
             '@import("../storage' not in sources["transport"],
         )),
-        "request_identity_replay_and_conflict": all(marker in retry + parse + sources["runtime"] for marker in (
-            "self.postBeforeDeadline(url, body, request_id, remaining_ms)", "attempt == 0",
-            "RequestIdConflict", '"conflict=observed"',
+        "request_identity_and_no_write_retry": all(marker in policy + parse + sources["runtime"] for marker in (
+            "max_attempts: u8 = if (mutates) 1 else 2",
+            "self.postBeforeDeadline(url, body, request_id, remaining_ms)",
+            "RequestIdConflict", '"conflict=observed"', "write_transport_retries=0",
         )),
-        "ambiguous_write_outcome": all(marker in retry + sources["probe"] + sources["runtime"] for marker in (
+        "ambiguous_write_outcome": all(marker in policy + sources["transport"] + sources["probe"] + sources["runtime"] for marker in (
             "recordAmbiguousRequestId(request_id)", "ambiguousRequestId()", '"ambiguous_write=observed',
             '"unavailable-write"', "^request_id=([A-Za-z0-9_.:-]{1,128})$",
             "provesNoCommit(err)", '"backpressure_write_no_commit=observed"',
             '"unauthorized_write_no_commit=observed"', '"service-unavailable-write"',
+            '"ambiguous-blocks-writes"', "ambiguous_write_latch=pass",
+            "cloneForSession", "write_fence", "clone-must-not-send",
         )),
-        "generation_bound_sessions": all(marker in sources["transport"] + sources["runtime"] for marker in (
-            "sessionId = session", "self.session_id", "self.last_generation = generation",
-            "generation_bound_sessions", "len(ACTOR.sessions) == 1",
+        "generation_and_schema_bound_sessions": all((
+            all(marker in sources["transport"] for marker in (
+                "sessionId = session", "self.session_id", "self.last_generation = generation",
+                "matchesOrPinsSchema",
+            )),
+            '"schema-drift-across-clone"' in sources["probe"],
+            '"schema-drift-across-clone"' in sources["runtime"],
+            "generation_bound_sessions" in sources["runtime"],
+            "len(ACTOR.sessions) == 1" in sources["runtime"],
+            "shared_schema_pin=pass" in sources["runtime"],
         )),
-        "end_to_end_wall_clock_deadline": all(marker in retry + deadline + sources["probe"] + sources["runtime"] for marker in (
+        "end_to_end_wall_clock_deadline": all(marker in policy + deadline + sources["probe"] + sources["runtime"] for marker in (
             "std.Io.Select(PostRace)", "deadlineTask", "remainingTimeoutMs", "Error.RequestTimedOut",
             '"wall_clock_timeout=observed', "time.monotonic() - started < 1.0",
         )),

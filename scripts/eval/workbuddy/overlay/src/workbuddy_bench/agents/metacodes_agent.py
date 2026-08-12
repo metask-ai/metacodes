@@ -235,6 +235,7 @@ class MetacodesAgent(BaseInstalledAgent):
             'test ! -e "$run_home" || { echo "fresh HOME already exists" >&2; exit 70; }; '
             'mkdir -p "$run_home" || exit 70; export HOME="$run_home"; '
             f"{project_setup}"
+            "export METACODES_KG_TRANSPORT=cli-exclusive; "
             f'export METACODES_KG_BIN={shlex.quote(mount + "/bin/tinykg")}; '
             'export METACODES_KG_STORE="$HOME/.local/share/tinykg/store"; '
             f'export METACODES_FORMAL_KERNEL_PATH={shlex.quote(mount + "/libexec/metacodes-formal-kernel")}; '

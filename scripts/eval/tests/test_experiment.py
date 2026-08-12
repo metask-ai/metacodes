@@ -431,6 +431,9 @@ class LongHorizonExperimentTest(unittest.TestCase):
             self.assertEqual(row["timeout_seconds"], 900)
             if row["arm_id"] == "tinykg":
                 self.assertEqual(
+                    row["runtime_env"]["METACODES_KG_TRANSPORT"], "cli-exclusive"
+                )
+                self.assertEqual(
                     row["runtime_env"]["METACODES_KG_BIN"], str(tinykg.resolve())
                 )
                 self.assertEqual(
@@ -442,6 +445,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                     formal_identity["sha256"],
                 )
             else:
+                self.assertNotIn("METACODES_KG_TRANSPORT", row["runtime_env"])
                 self.assertNotIn("METACODES_KG_BIN", row["runtime_env"])
                 self.assertNotIn("METACODES_FORMAL_KERNEL_PATH", row["runtime_env"])
                 self.assertNotIn("METACODES_FORMAL_KERNEL_SHA256", row["runtime_env"])
@@ -533,6 +537,9 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 ) = run_state[run_dir]
                 self.assertEqual(runtime_env["METACODES_LONG_HORIZON_ARM"], arm_id)
                 if arm_id == "tinykg":
+                    self.assertEqual(
+                        runtime_env["METACODES_KG_TRANSPORT"], "cli-exclusive"
+                    )
                     self.assertEqual(runtime_env["METACODES_KG_BIN"], str(tinykg.resolve()))
                     self.assertEqual(
                         runtime_env["METACODES_FORMAL_KERNEL_PATH"],
@@ -543,6 +550,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         formal_identity["sha256"],
                     )
                 else:
+                    self.assertNotIn("METACODES_KG_TRANSPORT", runtime_env)
                     self.assertNotIn("METACODES_KG_BIN", runtime_env)
                     self.assertNotIn("METACODES_FORMAL_KERNEL_PATH", runtime_env)
                     self.assertNotIn("METACODES_FORMAL_KERNEL_SHA256", runtime_env)

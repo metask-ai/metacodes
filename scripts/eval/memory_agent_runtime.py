@@ -1498,6 +1498,7 @@ def _sanitized_environment(base: Mapping[str, str]) -> Dict[str, str]:
         "METACODES_KG_BIN",
         "METACODES_KG_DOMAIN",
         "METACODES_KG_STORE",
+        "METACODES_KG_TRANSPORT",
         "METACODES_LONG_HORIZON_ARM",
         "METACODES_BASE_URL",
         "METACODES_RECORD_DIR",
@@ -3091,6 +3092,10 @@ def run_memory_agent_schedule(
             }
         )
         if tinykg_enabled and store is not None:
+            # Rule 8 owns this fresh Store for exactly one local rollout. The
+            # explicit mode is therefore part of the benchmark isolation
+            # contract, not a production fallback from tinykgd.
+            env["METACODES_KG_TRANSPORT"] = "cli-exclusive"
             env["METACODES_KG_BIN"] = str(tinykg)
             env["METACODES_KG_DOMAIN"] = _project_domain(project_root)
             env["METACODES_KG_STORE"] = str(store)

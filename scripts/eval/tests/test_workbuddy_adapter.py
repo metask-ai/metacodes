@@ -727,6 +727,7 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
             command_fragment,
         )
         self.assertIn("remote_tinykg_env_absent", source)
+        self.assertIn("export METACODES_KG_TRANSPORT=cli-exclusive", source)
         self.assertIn(
             'raise ValueError("metacodes WorkBuddy trial received remote TinyKG authority")',
             source,

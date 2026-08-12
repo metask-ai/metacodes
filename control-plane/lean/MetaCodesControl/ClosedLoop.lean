@@ -130,15 +130,16 @@ def buildTestReleaseAllowed
     (topology : Topology) (observation : Observation) : Bool :=
   buildTestSignal topology observation == .admitRelease
 
-/-- The memory-benchmark storage boundary has six non-substitutable links:
+/-- The memory-benchmark storage boundary has seven non-substitutable links:
 direct invocation of a hash-pinned TinyKG binary, a sealed child environment,
 fresh run-local path containment, a raw store-digest read guard, native L2
-sentinel/fault feedback across all three adapters, and a provenance-complete
-three-trace pin. A weakened adapter cannot redefine its surviving subset as a
-safe local benchmark after silently reconnecting the remote skill harness. -/
+sentinel/fault feedback across all three adapters, a provenance-complete
+three-trace pin, and explicit `cli-exclusive` routing for the native runtime
+path. A weakened adapter cannot redefine its surviving subset as a safe local
+benchmark after silently reconnecting the remote skill harness. -/
 def memoryIsolationSignal
     (topology : Topology) (observation : Observation) : Signal :=
-  if observation.declared == 6 then signal topology observation else .blockRelease
+  if observation.declared == 7 then signal topology observation else .blockRelease
 
 def memoryIsolationNextState
     (topology : Topology) (observation : Observation) : RuleState :=
@@ -153,9 +154,9 @@ def memoryIsolationReleaseAllowed
 
 /-- The shared TinyKG daemon transport has ten non-substitutable obligations:
 authenticated remote-by-default routing, explicit exclusive CLI compatibility,
-no shared raw Store fallback, request identity/replay/conflict, ambiguous
-writes, generation sessions, an end-to-end wall-clock deadline, bounded
-backpressure/unavailability, uploaded Markdown bytes rather than client paths,
+no shared raw Store fallback, request identity with no transport-level write
+retry, process-shared latched ambiguous writes, generation sessions, an end-to-end wall-clock
+deadline, bounded backpressure/unavailability, uploaded Markdown bytes rather than client paths,
 and multi-process runtime feedback through one StoreActor. -/
 def daemonTransportSignal
     (topology : Topology) (observation : Observation) : Signal :=
@@ -304,14 +305,14 @@ theorem build_test_wrong_cardinality_blocks
 
 /-- Admission proves that every part of the local-store isolation boundary was
 observed and survived native feedback; a self-consistent 5/5 projection is not
-an admissible substitute for the fixed six-part boundary. -/
-theorem memory_isolation_admitted_implies_six_obligations
+an admissible substitute for the fixed seven-part boundary. -/
+theorem memory_isolation_admitted_implies_seven_obligations
     (topology : Topology) (observation : Observation)
     (admitted : memoryIsolationReleaseAllowed topology observation = true) :
-    observation.declared = 6 ∧ observation.covered = 6 := by
+    observation.declared = 7 ∧ observation.covered = 7 := by
   simp [memoryIsolationReleaseAllowed, memoryIsolationSignal] at admitted
   split at admitted
-  · rename_i declaredSix
+  · rename_i declaredSeven
     have genericAdmitted : releaseAllowed topology observation = true := by
       simpa [releaseAllowed] using admitted
     have exact := admitted_implies_zero_deviation topology observation genericAdmitted
@@ -320,16 +321,16 @@ theorem memory_isolation_admitted_implies_six_obligations
 
 theorem memory_isolation_missing_obligation_blocks
     (topology : Topology) (observation : Observation)
-    (declaresSix : observation.declared = 6)
-    (missing : observation.covered < 6) :
+    (declaresSeven : observation.declared = 7)
+    (missing : observation.covered < 7) :
     memoryIsolationSignal topology observation = .blockRelease := by
-  simp [memoryIsolationSignal, declaresSix]
+  simp [memoryIsolationSignal, declaresSeven]
   apply missing_evidence_blocks topology observation
   omega
 
 theorem memory_isolation_wrong_cardinality_blocks
     (topology : Topology) (observation : Observation)
-    (wrong : observation.declared ≠ 6) :
+    (wrong : observation.declared ≠ 7) :
     memoryIsolationSignal topology observation = .blockRelease := by
   simp [memoryIsolationSignal, wrong]
 
