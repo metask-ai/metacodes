@@ -84,11 +84,14 @@ pub const Projector = struct {
     }
 
     pub fn nextSnapshot(self: *Projector) Error!protocol.RunState {
-        self.transition_seq += 1;
         const view = try self.allocator.alloc(protocol.RunStateTool, self.tools.items.len);
         for (self.tools.items, view) |tool, *dest| {
             dest.* = .{ .tool_call_id = tool.tool_call_id, .name = tool.name };
         }
+        // Allocate and populate the borrowed view before consuming a public
+        // sequence number.  An allocation failure must not create an
+        // unobservable transition gap.
+        self.transition_seq += 1;
         return .{
             .run_id = self.run_id,
             .transition_seq = self.transition_seq,
