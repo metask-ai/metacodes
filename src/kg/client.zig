@@ -1,7 +1,8 @@
 //! TinyKG 集成客户端(设计:KG_DESIGN v3-final §1 D1/D2、§6)。
 //!
-//! tinykg = 跨会话真相源(记忆 + 计划任务 DAG),本模块是 cc-zig 侧唯一入口:
-//! 子进程 CLI 驱动(tinykg 无 daemon;每次调用开店-操作-退出,全店目录锁串行)。
+//! tinykg = 跨会话真相源(记忆 + 计划任务 DAG),本模块是 metacodes 侧唯一入口。
+//! 默认 transport 是 authenticated TinyKG Web → one tinykgd → one StoreActor；
+//! 本地 CLI 只供显式 exclusive-store compatibility 与隔离测试使用。
 //!
 //! 纪律(全部实证,见设计 §9 原语核对表):
 //! - spawn 超时 35s **必须大于** tinykg 30s 目录锁超时——绝不在锁等待中 killpg
@@ -25,6 +26,7 @@ const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const log = @import("../util/log.zig");
 const execution_knowledge = @import("execution_knowledge.zig");
 const file_lock = @import("../swarm/file_lock.zig");
+const transport_mod = @import("transport.zig");
 
 pub const EXPECTED_STORAGE_FORMAT_VERSION = "2";
 pub const EXPECTED_SCHEMA_VERSION = "3";
@@ -40,6 +42,12 @@ pub const KgError = error{
     Degraded,
     /// 数据:环检测/NotFound 等,模型可改参重试。detail 在 last_detail。
     Data,
+    /// 写请求在相同 request-id 重试后仍无法确认 commit 结果。
+    AmbiguousCommit,
+    /// daemon 的有界队列已满；调用方应退避而不是扩大并发。
+    Backpressure,
+    /// 认证入口或 daemon 暂时不可达，禁止回退到 raw Store。
+    DaemonUnavailable,
     OutOfMemory,
 };
 
@@ -158,12 +166,19 @@ pub const TaskStatus = enum {
 };
 
 pub const KgClient = struct {
+    const Transport = union(enum) {
+        remote: transport_mod.WebTransport,
+        exclusive_cli,
+        unconfigured,
+    };
+
     /// **内存契约(血泪,真模型 e2e 抓的进程级 panic)**:本 client 所有返回 owned 内存
     /// (frontier rows/fetchNodeText/recall hits/…)都以 `self.allocator` 分配,调用方必须用
     /// **kg.allocator** 释放。主循环里 ctx.allocator 恰好同源(App gpa)侥幸工作;subagent
     /// 后台线程的 ctx.allocator 是另一个 allocator——用它 free 会 ArenaAllocator null panic
     /// 杀整个进程。新增调用点一律 `deinit(kg.allocator)` / `kg.allocator.free(...)`。
     allocator: std.mem.Allocator,
+    transport: Transport,
     /// tinykg 二进制绝对路径(owned)。null = 未解析到 → degraded。
     bin_path: ?[]u8 = null,
     /// store 目录绝对路径(owned)。
@@ -226,6 +241,10 @@ pub const KgClient = struct {
     }
 
     pub fn deinit(self: *KgClient) void {
+        switch (self.transport) {
+            .remote => |*remote| remote.deinit(),
+            .exclusive_cli, .unconfigured => {},
+        }
         if (self.bin_path) |p| self.allocator.free(p);
         self.allocator.free(self.store_path);
         self.allocator.free(self.domain);
@@ -255,17 +274,53 @@ pub const KgClient = struct {
         env_dev: ?[]const u8 = null,
         /// 测试注入:覆盖 exe 目录(null = selfExeDirPath 真实定位,不再依赖 argv[0])。
         exe_dir: ?[]const u8 = null,
+        /// App supplies process IO for authenticated Web transport.
+        io: ?std.Io = null,
+        /// Test/config injection. Production normally reads these env vars.
+        remote_url: ?[]const u8 = null,
+        remote_api_key: ?[]const u8 = null,
+        remote_expected_build_id: ?[]const u8 = null,
+        remote_expected_schema_digest: ?[]const u8 = null,
+        /// Explicit compatibility escape hatch. It must own an isolated Store.
+        exclusive_cli: bool = false,
     };
 
     /// 解析 bin/store 路径并构造(不做 IO 探测;ensureReady 才探)。
     pub fn init(allocator: std.mem.Allocator, opts: ResolveOptions) !KgClient {
-        const store = try resolveStorePath(allocator, opts);
+        const injected_cli = opts.exclusive_cli or opts.config_bin != null or opts.config_store != null or
+            opts.env_bin != null or opts.env_store != null;
+        const env_cli = if (envGet("METACODES_KG_TRANSPORT")) |mode|
+            std.mem.eql(u8, mode, "cli-exclusive")
+        else
+            false;
+        const use_cli = injected_cli or env_cli;
+        const store = if (use_cli)
+            try resolveStorePath(allocator, opts)
+        else
+            try allocator.dupe(u8, "daemon-owned");
         errdefer allocator.free(store);
         const domain = try allocator.dupe(u8, opts.domain);
         errdefer allocator.free(domain);
-        const bin = try resolveBinPath(allocator, opts);
+        const bin = if (use_cli) try resolveBinPath(allocator, opts) else null;
+        const transport: Transport = if (use_cli)
+            .exclusive_cli
+        else remote: {
+            const io = opts.io orelse break :remote .unconfigured;
+            const url = opts.remote_url orelse envGet("METACODES_KG_URL") orelse break :remote .unconfigured;
+            const key = opts.remote_api_key orelse envGet("METACODES_KG_API_KEY") orelse break :remote .unconfigured;
+            const build_id = opts.remote_expected_build_id orelse envGet("METACODES_KG_EXPECTED_BUILD_ID") orelse break :remote .unconfigured;
+            const schema_digest = opts.remote_expected_schema_digest orelse envGet("METACODES_KG_EXPECTED_SCHEMA_DIGEST") orelse break :remote .unconfigured;
+            break :remote .{ .remote = transport_mod.WebTransport.init(allocator, .{
+                .io = io,
+                .url = url,
+                .api_key = key,
+                .expected_build_id = build_id,
+                .expected_schema_digest = schema_digest,
+            }) catch break :remote .unconfigured };
+        };
         return .{
             .allocator = allocator,
+            .transport = transport,
             .bin_path = bin,
             .store_path = store,
             .domain = domain,
@@ -282,6 +337,23 @@ pub const KgClient = struct {
     /// 客户端的执行,数据一致。self 的 store_path/domain/bin_path init 后不可变,并发读安全。
     /// 返回的 client 由调用线程 own(deinit 释放);未 ensureReady——调用方自行 ensureReady。
     pub fn cloneForThread(self: *const KgClient, allocator: std.mem.Allocator, home: []const u8) !KgClient {
+        if (self.transport == .remote) {
+            const domain = try allocator.dupe(u8, self.domain);
+            errdefer allocator.free(domain);
+            const store = try allocator.dupe(u8, "daemon-owned");
+            errdefer allocator.free(store);
+            const remote = try self.transport.remote.cloneForSession(allocator);
+            return .{
+                .allocator = allocator,
+                .transport = .{ .remote = remote },
+                .bin_path = null,
+                .store_path = store,
+                .domain = domain,
+                .scoped_types = std.StringHashMap(void).init(allocator),
+                .pending_ref_tasks = std.AutoHashMap(u64, void).init(allocator),
+                .execution_ledger = execution_knowledge.Ledger.init(allocator),
+            };
+        }
         return KgClient.init(allocator, .{
             .home = home,
             .domain = self.domain,
@@ -290,6 +362,7 @@ pub const KgClient = struct {
             .env_bin = "", // 屏蔽 env 重解析,直接用 self 已解析的路径
             .env_store = "",
             .env_dev = "",
+            .exclusive_cli = true,
         });
     }
 
@@ -459,6 +532,35 @@ pub const KgClient = struct {
     /// 任何失败 → degraded(reason 含修复提示),**绝不 throw**——KG 是增强非依赖。
     pub fn ensureReady(self: *KgClient) void {
         if (self.ready) return;
+        switch (self.transport) {
+            .unconfigured => {
+                self.setDegraded("TinyKG daemon transport 未配置。设置 METACODES_KG_URL、METACODES_KG_API_KEY、METACODES_KG_EXPECTED_BUILD_ID、METACODES_KG_EXPECTED_SCHEMA_DIGEST；共享 Store 禁止 CLI fallback", .{});
+                return;
+            },
+            .remote => |*remote| {
+                const result = remote.run("store-info", &.{}, false) catch |err| {
+                    self.setDegraded("TinyKG daemon preflight 失败: {s}；未打开本地 Store", .{@errorName(err)});
+                    return;
+                };
+                defer result.deinit(self.allocator);
+                if (result.exit_code != 0) {
+                    self.setDegraded("TinyKG daemon store-info 失败: {s}", .{trimForLog(result.stderr)});
+                    return;
+                }
+                const ver = extractInfoField(result.stdout, "storage_format_version") orelse "missing";
+                const schema_ver = extractInfoField(result.stdout, "schema_version") orelse "missing";
+                if (!std.mem.eql(u8, ver, EXPECTED_STORAGE_FORMAT_VERSION) or
+                    !std.mem.eql(u8, schema_ver, EXPECTED_SCHEMA_VERSION))
+                {
+                    self.setDegraded("TinyKG daemon Store contract mismatch: storage={s} schema={s}", .{ ver, schema_ver });
+                    return;
+                }
+                self.ready = true;
+                log.info("kg", "ready transport=authenticated-web store=daemon-owned domain={s} generation={d}", .{ self.domain, result.generation });
+                return;
+            },
+            .exclusive_cli => {},
+        }
         const bin = self.bin_path orelse {
             self.setDegraded("tinykg 二进制未找到。已查找:vendored(<exe_dir>/vendor/tinykg/,build.zig 从 lib/tinykg/src/ 编译)、METACODES_KG_BIN、METACODES_KG_DEV。修复:跑 `zig build`(从 lib/tinykg 源编译到 vendor/tinykg/),或设 METACODES_KG_BIN=<path>", .{});
             return;
@@ -816,10 +918,11 @@ pub const KgClient = struct {
         const n_str = std.fmt.bufPrint(&nbuf, "{d}", .{node_id}) catch unreachable;
         const a_str = std.fmt.bufPrint(&abuf, "{d}", .{aid}) catch unreachable;
         switch (kind) {
-            // 任务面:锚=总任务,挂 contains(frontier(锚) 可深遍历全览;12b 指针退役的地基)。
+            // 任务面:锚=总任务,挂 canonical contain(frontier(锚) 可深遍历全览;
+            // TinyKG 仍兼容旧 task→task contains)。contains 属于 markdown 有序组合。
             // add-edge 幂等(同 src/rel/dst 去重),schema_type 已在 add-node 时写。
             .task => {
-                const out = self.runCheckedWrite(&.{ "add-edge", self.store_path, a_str, "contains", n_str }) catch |e| {
+                const out = self.runCheckedWrite(&.{ "add-edge", self.store_path, a_str, "contain", n_str }) catch |e| {
                     self.invalidateAnchor(scope_global, kind);
                     return e;
                 };
@@ -990,6 +1093,23 @@ pub const KgClient = struct {
     }
 
     fn importMarkdownDocAtLabeled(self: *KgClient, markdown: []const u8, path_key: u64, attach: bool, source_label: ?[]const u8) KgError!u64 {
+        if (self.transport == .remote) {
+            const result = self.transport.remote.importMarkdown(markdown, path_key, source_label) catch |err|
+                return self.mapTransportError(err);
+            defer result.deinit(self.allocator);
+            if (result.exit_code != 0) {
+                self.setDetail("{s}", .{trimForLog(result.stderr)});
+                return KgError.Data;
+            }
+            const doc_id = extractKvU64(result.stdout, "document=") orelse
+                return self.dataError("import-md-doc 输出无 document id: {s}", .{trimForLog(result.stdout)});
+            if (!attach) return doc_id;
+            self.attachToProject(doc_id, "document", false) catch |e| {
+                const prior = if (self.last_detail) |d| d else "";
+                return self.dataError("document {d} 已导入但挂接项目失败({s}: {s})。可 /kg forget {d}", .{ doc_id, @errorName(e), prior, doc_id });
+            };
+            return doc_id;
+        }
         const tmp_path = std.fmt.allocPrint(self.allocator, "{s}.mdimport.{x}.tmp", .{ self.store_path, path_key }) catch return KgError.OutOfMemory;
         defer self.allocator.free(tmp_path);
         writeTmpFile(self.allocator, tmp_path, markdown) catch return self.dataError("写 md 临时文件失败", .{});
@@ -1043,7 +1163,7 @@ pub const KgClient = struct {
         return id;
     }
 
-    /// 建**子**任务:挂父任务(contains),**不**直挂 project/锚——归属经根传递
+    /// 建**子**任务:挂父任务(canonical contain),**不**直挂 project/锚——归属经根传递
     /// (membership 下钻),直挂是拍平反模式。深树子任务/计划步骤/inbox todo 用此。
     pub fn createChildTask(self: *KgClient, parent_id: u64, text: []const u8, schema_type: []const u8) KgError!u64 {
         const out = try self.runCheckedWrite(&.{
@@ -1051,14 +1171,14 @@ pub const KgClient = struct {
         });
         defer self.freeOut(out);
         const id = parseNodeIdLine(out.stdout) orelse return self.dataError("createChildTask 输出不可解析: {s}", .{trimForLog(out.stdout)});
-        self.addEdge(parent_id, "contains", id) catch |e| {
+        self.addEdge(parent_id, "contain", id) catch |e| {
             const prior = if (self.last_detail) |d| d else "";
             return self.dataError("子任务 {d} 已建但挂接父 {d} 失败({s}: {s})。请勿整体重试;可 /kg forget {d}", .{ id, parent_id, @errorName(e), prior, id });
         };
         return id;
     }
 
-    /// 建边(contains/depends_on/blocks…)。环检测由 tinykg dag 层强制 → data 错透传。
+    /// 建边(contain/depends_on/blocks…)。环检测由 tinykg dag 层强制 → data 错透传。
     pub fn addEdge(self: *KgClient, src: u64, rel: []const u8, dst: u64) KgError!void {
         var sbuf: [24]u8 = undefined;
         var dbuf: [24]u8 = undefined;
@@ -1891,7 +2011,7 @@ pub const KgClient = struct {
     pub fn claimTask(self: *KgClient, task_id: u64, agent: []const u8) KgError!void {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{task_id}) catch unreachable;
-        const out = try self.runChecked(&.{ "task-claim", self.store_path, id_str, "--by", agent });
+        const out = try self.runCheckedWrite(&.{ "task-claim", self.store_path, id_str, "--by", agent });
         self.freeOut(out);
     }
 
@@ -1900,7 +2020,7 @@ pub const KgClient = struct {
     pub fn releaseTask(self: *KgClient, task_id: u64, agent: []const u8) KgError!void {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{task_id}) catch unreachable;
-        const out = try self.runChecked(&.{ "task-release", self.store_path, id_str, "--by", agent });
+        const out = try self.runCheckedWrite(&.{ "task-release", self.store_path, id_str, "--by", agent });
         self.freeOut(out);
     }
 
@@ -2105,6 +2225,11 @@ pub const KgClient = struct {
 
     /// 跑一条 tinykg 命令(不做 ready 检查——ensureReady 自己用)。
     fn runRaw(self: *KgClient, args: []const []const u8) !Out {
+        if (self.transport == .remote) {
+            if (args.len < 2 or !std.mem.eql(u8, args[1], self.store_path)) return error.InvalidRemoteCommandShape;
+            const result = try self.transport.remote.run(args[0], args[2..], false);
+            return .{ .stdout = result.stdout, .stderr = result.stderr, .exit_code = result.exit_code };
+        }
         const bin = self.bin_path orelse return error.NoBin;
         // argv: bin + args + null。
         var argv: std.ArrayList(?[*:0]const u8) = .empty;
@@ -2143,6 +2268,27 @@ pub const KgClient = struct {
     }
     fn runCheckedRetry(self: *KgClient, args: []const []const u8, retry: bool) KgError!Out {
         if (!self.ready) return KgError.Degraded;
+        if (self.transport == .remote) {
+            if (args.len < 2 or !std.mem.eql(u8, args[1], self.store_path))
+                return self.dataError("invalid remote command shape", .{});
+            const result = self.transport.remote.run(args[0], args[2..], !retry) catch |err|
+                return self.mapTransportError(err);
+            const out: Out = .{ .stdout = result.stdout, .stderr = result.stderr, .exit_code = result.exit_code };
+            if (out.exit_code == 0) return out;
+            const err_name = parseCliError(out.stderr);
+            const class = classifyCliError(err_name);
+            switch (class) {
+                .data => {
+                    self.setDetail("{s}", .{trimForLog(out.stderr)});
+                    self.freeOut(out);
+                    return KgError.Data;
+                },
+                .transient => {
+                    self.freeOut(out);
+                    return KgError.DaemonUnavailable;
+                },
+            }
+        }
         var attempt: u32 = 0;
         while (true) : (attempt += 1) {
             const out = self.runRaw(args) catch {
@@ -2224,6 +2370,20 @@ pub const KgClient = struct {
     fn dataError(self: *KgClient, comptime fmt: []const u8, args: anytype) KgError {
         self.setDetail(fmt, args);
         return KgError.Data;
+    }
+
+    fn mapTransportError(self: *KgClient, err: transport_mod.Error) KgError {
+        self.setDetail("TinyKG daemon transport: {s}", .{@errorName(err)});
+        return switch (err) {
+            transport_mod.Error.AmbiguousCommit => KgError.AmbiguousCommit,
+            transport_mod.Error.Backpressure => KgError.Backpressure,
+            transport_mod.Error.OutOfMemory => KgError.OutOfMemory,
+            transport_mod.Error.AuthenticationFailed, transport_mod.Error.IncompatibleDaemon, transport_mod.Error.InvalidConfiguration, transport_mod.Error.InvalidUrl => blk: {
+                self.setDegraded("TinyKG daemon contract 失败: {s}；禁止 CLI fallback", .{@errorName(err)});
+                break :blk KgError.Degraded;
+            },
+            else => KgError.DaemonUnavailable,
+        };
     }
 
     fn setDetail(self: *KgClient, comptime fmt: []const u8, args: anytype) void {

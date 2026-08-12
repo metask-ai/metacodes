@@ -637,6 +637,18 @@ fn kgErrorResult(ctx: *const ToolContext, kg: *kg_mod.KgClient, e: kg_mod.KgErro
             common.setErrorDetail(ctx.error_detail, ctx.allocator, "{s} 暂时失败(KG 忙/锁竞争),稍后可重试", .{tool});
             return error.KgTransient;
         },
+        kg_mod.KgError.AmbiguousCommit => {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "{s} 写入结果不确定；保留 request id 并核验应用状态后再继续: {s}", .{ tool, kg.detail() });
+            return error.KgAmbiguousCommit;
+        },
+        kg_mod.KgError.Backpressure => {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "{s} TinyKG daemon 队列已满；请有界退避后重试", .{tool});
+            return error.KgBackpressure;
+        },
+        kg_mod.KgError.DaemonUnavailable => {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "{s} TinyKG daemon 不可达；禁止回退为直接打开共享 Store", .{tool});
+            return error.KgDaemonUnavailable;
+        },
         kg_mod.KgError.Degraded => return degradedResult(ctx.allocator, kg),
         kg_mod.KgError.OutOfMemory => return error.OutOfMemory,
     }

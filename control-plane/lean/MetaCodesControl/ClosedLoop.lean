@@ -151,6 +151,27 @@ def memoryIsolationReleaseAllowed
     (topology : Topology) (observation : Observation) : Bool :=
   memoryIsolationSignal topology observation == .admitRelease
 
+/-- The shared TinyKG daemon transport has ten non-substitutable obligations:
+authenticated remote-by-default routing, explicit exclusive CLI compatibility,
+no shared raw Store fallback, request identity/replay/conflict, ambiguous
+writes, generation sessions, an end-to-end wall-clock deadline, bounded
+backpressure/unavailability, uploaded Markdown bytes rather than client paths,
+and multi-process runtime feedback through one StoreActor. -/
+def daemonTransportSignal
+    (topology : Topology) (observation : Observation) : Signal :=
+  if observation.declared == 10 then signal topology observation else .blockRelease
+
+def daemonTransportNextState
+    (topology : Topology) (observation : Observation) : RuleState :=
+  match daemonTransportSignal topology observation with
+  | .blockRelease => .blocked
+  | .runFeedback => .verifying
+  | .admitRelease => .compliant
+
+def daemonTransportReleaseAllowed
+    (topology : Topology) (observation : Observation) : Bool :=
+  daemonTransportSignal topology observation == .admitRelease
+
 /-- An admitted rule can never be a formalization orphan. -/
 theorem admitted_implies_closed_loop
     (topology : Topology) (observation : Observation)
@@ -311,6 +332,34 @@ theorem memory_isolation_wrong_cardinality_blocks
     (wrong : observation.declared ≠ 6) :
     memoryIsolationSignal topology observation = .blockRelease := by
   simp [memoryIsolationSignal, wrong]
+
+theorem daemon_transport_admitted_implies_ten_obligations
+    (topology : Topology) (observation : Observation)
+    (admitted : daemonTransportReleaseAllowed topology observation = true) :
+    observation.declared = 10 ∧ observation.covered = 10 := by
+  simp [daemonTransportReleaseAllowed, daemonTransportSignal] at admitted
+  split at admitted
+  · rename_i declaredTen
+    have genericAdmitted : releaseAllowed topology observation = true := by
+      simpa [releaseAllowed] using admitted
+    have exact := admitted_implies_zero_deviation topology observation genericAdmitted
+    omega
+  · simp at admitted
+
+theorem daemon_transport_missing_obligation_blocks
+    (topology : Topology) (observation : Observation)
+    (declaresTen : observation.declared = 10)
+    (missing : observation.covered < 10) :
+    daemonTransportSignal topology observation = .blockRelease := by
+  simp [daemonTransportSignal, declaresTen]
+  apply missing_evidence_blocks topology observation
+  omega
+
+theorem daemon_transport_wrong_cardinality_blocks
+    (topology : Topology) (observation : Observation)
+    (wrong : observation.declared ≠ 10) :
+    daemonTransportSignal topology observation = .blockRelease := by
+  simp [daemonTransportSignal, wrong]
 
 /-- A theorem with any missing loop link cannot reach the compliant state. -/
 theorem orphan_cannot_be_compliant

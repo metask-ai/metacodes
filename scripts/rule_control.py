@@ -35,6 +35,7 @@ SUPPORTED_SENSOR_ADAPTERS = frozenset(
         "treatment_activation",
         "memory_local_store_isolation",
         "paid_budget_journal",
+        "daemon_transport",
     )
 )
 RULE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,127}$")
@@ -3636,6 +3637,125 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
     )
 
 
+def observe_daemon_transport(repo: Path) -> Observation:
+    """Observe authenticated TinyKG daemon routing and its native feedback."""
+    source_relatives = {
+        "transport": "src/kg/transport.zig",
+        "client": "src/kg/client.zig",
+        "probe": "tests/helpers/kg_daemon_transport_probe.zig",
+        "runtime": "scripts/test_kg_daemon_transport.py",
+        "build": "build.zig",
+    }
+    paths: dict[str, Path] = {}
+    touched: list[Path] = []
+    errors: list[str] = []
+    for name, relative in source_relatives.items():
+        try:
+            path = safe_repo_path(repo, relative)
+            paths[name] = path
+            touched.append(path)
+        except ControlError as exc:
+            errors.append(str(exc))
+    if errors:
+        return Observation(
+            sensor="daemon_transport",
+            errors=errors,
+            fingerprint_sha256=fingerprint(touched),
+        )
+    try:
+        sources = {
+            name: _strip_zig_comments(read_text(path))
+            if path.suffix == ".zig" else read_text(path)
+            for name, path in paths.items()
+        }
+    except ControlError as exc:
+        return Observation(
+            sensor="daemon_transport",
+            errors=[str(exc)],
+            fingerprint_sha256=fingerprint(touched),
+        )
+
+    client_init = zig_function_slice(sources["client"], "init") or ""
+    ensure_ready = zig_function_slice(sources["client"], "ensureReady") or ""
+    remote_run = zig_function_slice(sources["client"], "runCheckedRetry") or ""
+    retry = zig_function_slice(sources["transport"], "postWithSameIdRetry") or ""
+    parse = zig_function_slice(sources["transport"], "parseResponse") or ""
+    deadline = zig_function_slice(sources["transport"], "postBeforeDeadline") or ""
+    markdown = zig_function_slice(sources["transport"], "importMarkdown") or ""
+    step = build_step_slice(sources["build"], "test:kg-daemon-transport") or ""
+
+    obligations = {
+        "authenticated_remote_default": all(marker in client_init for marker in (
+            "METACODES_KG_URL", "METACODES_KG_API_KEY",
+            "METACODES_KG_EXPECTED_BUILD_ID", "METACODES_KG_EXPECTED_SCHEMA_DIGEST",
+            ".remote = transport_mod.WebTransport.init", ".unconfigured",
+        )),
+        "explicit_exclusive_cli_compatibility": all(marker in client_init for marker in (
+            "opts.exclusive_cli", 'std.mem.eql(u8, mode, "cli-exclusive")',
+            ".exclusive_cli",
+        )),
+        "no_shared_raw_store_fallback": all((
+            'dupe(u8, "daemon-owned")' in client_init,
+            "invalid remote command shape" in remote_run,
+            ".unconfigured" in ensure_ready,
+            "未打开本地 Store" in ensure_ready,
+            "if (!self.ready)" in remote_run,
+            "self.transport == .remote" in remote_run,
+            "self.transport.remote.run(args[0], args[2..]" in remote_run,
+            '@import("../storage' not in sources["transport"],
+        )),
+        "request_identity_replay_and_conflict": all(marker in retry + parse + sources["runtime"] for marker in (
+            "self.postBeforeDeadline(url, body, request_id)", "attempt == 0",
+            "RequestIdConflict", '"conflict=observed"',
+        )),
+        "ambiguous_write_outcome": all(marker in retry + sources["probe"] + sources["runtime"] for marker in (
+            "Error.AmbiguousCommit", '"ambiguous_write=observed', '"unavailable-write"',
+        )),
+        "generation_bound_sessions": all(marker in sources["transport"] + sources["runtime"] for marker in (
+            "sessionId = session", "self.session_id", "self.last_generation = generation",
+            "generation_bound_sessions", "len(ACTOR.sessions) == 1",
+        )),
+        "end_to_end_wall_clock_deadline": all(marker in deadline + sources["probe"] + sources["runtime"] for marker in (
+            "std.Io.Select(PostRace)", "deadlineTask", "Error.RequestTimedOut",
+            '"wall_clock_timeout=observed', "time.monotonic() - started < 1.0",
+        )),
+        "bounded_backpressure_and_unavailability": all(marker in parse + sources["probe"] + sources["runtime"] for marker in (
+            "DaemonQueueFull", "Error.Backpressure", "Error.DaemonUnavailable",
+            '"backpressure=observed', '"unavailable_read=observed',
+        )),
+        "markdown_upload_boundary": all(marker in markdown + sources["runtime"] for marker in (
+            ".markdown = markdown", ".sourceKey = source_key_text",
+            "self.markdown_url", 'ACTOR.markdown_uploads[0]["markdown"]',
+            '"path" not in ACTOR.markdown_uploads[0]',
+        )),
+        "multi_process_one_store_actor_feedback": all(marker in step + sources["runtime"] for marker in (
+            "kg_transport_step.dependOn(&kg_transport_runtime.step)",
+            "metacodes_processes=2", "store_actor_instances=1",
+            "shared_generation=", "kg_daemon_transport=pass",
+        )),
+    }
+    declarations = sorted(obligations)
+    covered = sorted(name for name, present in obligations.items() if present)
+    missing = sorted(name for name, present in obligations.items() if not present)
+    errors.extend(f"{name}: missing executable daemon transport evidence" for name in missing)
+    return Observation(
+        sensor="daemon_transport",
+        sensor_ok=not errors and len(covered) == len(declarations),
+        declared=len(declarations),
+        covered=len(covered),
+        deviation=max(len(declarations) - len(covered), 0),
+        declarations=declarations,
+        covered_declarations=covered,
+        missing_declarations=missing,
+        feedback_bindings=[
+            {"unittest": "scripts.tests.test_rule_control.DaemonTransportSensorTests"},
+            {"step": "test:kg-daemon-transport"},
+        ],
+        errors=errors,
+        fingerprint_sha256=fingerprint(touched),
+    )
+
+
 def observe_rule(repo: Path, rule: dict[str, Any]) -> Observation:
     sensor = rule.get("sensor")
     if not isinstance(sensor, dict):
@@ -3666,6 +3786,8 @@ def observe_rule(repo: Path, rule: dict[str, Any]) -> Observation:
         return observe_memory_local_store_isolation(repo)
     if adapter == "paid_budget_journal":
         return observe_paid_budget_journal(repo)
+    if adapter == "daemon_transport":
+        return observe_daemon_transport(repo)
     return Observation(sensor=str(adapter), errors=[f"unsupported sensor adapter: {adapter!r}"])
 
 
@@ -3827,6 +3949,9 @@ def link_topology(
         "eval.paid-budget-journal-authorization.l2": (
             "MetaCodesControl.PaidBudgetJournal.paidBudgetSignal"
         ),
+        "tinykg.daemon-transport.l2": (
+            "MetaCodesControl.ClosedLoop.daemonTransportSignal"
+        ),
     }.get(rule.get("id"), "MetaCodesControl.ClosedLoop.signal")
     decision_ok = (
         isinstance(decision, dict)
@@ -3881,6 +4006,8 @@ def link_topology(
         "eval.memory-local-store-isolation.l2",
     }:
         feedback_runner_ok = feedback_runner_ok and has_tinykg_build
+    if rule.get("id") == "tinykg.daemon-transport.l2":
+        feedback_runner_ok = feedback_runner_ok and has_python_unittest and has_zig_test
     feedback_ok = (
         isinstance(feedback, dict)
         and feedback_kind

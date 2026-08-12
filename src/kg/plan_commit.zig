@@ -1,7 +1,8 @@
 //! Plan 落图(设计 v3-final §3):批准的 `<proposed_plan>` 正文 → 持久任务 DAG。
 //!
 //! 取代"plan 写 markdown 文档"陋习——计划成为图里的 root task + 步骤 task 链,
-//! 未来 session 从 frontier 恢复进度。
+//! 未来 session 从 frontier 恢复进度。任务层级写 canonical `contain`；TinyKG 兼容读旧
+//! task→task `contains`，后者保留给 markdown 有序组合。
 //!
 //! 解析:容忍有序/无序/粗体标题列表;≥2 步即结构化。依赖标注 `(depends: 2,3)` →
 //! fan-out/join;无标注默认线性链(步骤 N depends_on 步骤 N-1)。
@@ -146,7 +147,7 @@ pub const CommitResult = struct {
 };
 
 /// 把计划落成任务 DAG。返回 root id(供指针文件持久化)。
-/// 崩溃安全序:先 root 后逐步骤(节点→contains→depends_on),任意前缀合法图。
+/// 崩溃安全序:先 root 后逐步骤(节点→contain→depends_on),任意前缀合法图。
 pub fn commit(
     allocator: std.mem.Allocator,
     kg: *client_mod.KgClient,
@@ -168,7 +169,7 @@ pub fn commit(
 
     var committed: usize = 0;
     for (parsed.steps, 0..) |step, i| {
-        // 子任务原语(节点+contains 一体):steps **不直挂 project**——root 已挂 task 锚,
+        // 子任务原语(节点+contain 一体):steps **不直挂 project**——root 已挂 task 锚,
         // steps 经 root 可达(membership 下钻),直挂是拍平反模式。失败即停,前缀已是合法图。
         const sid = kg.createChildTask(root, step.text, "plan_step") catch {
             return .{ .root_id = root, .steps_committed = committed, .total_steps = parsed.steps.len, .incomplete = true, .structured = true, .truncated = parsed.truncated };

@@ -1034,6 +1034,7 @@ pub const App = struct {
             .config_bin = null, // config.json kg_bin(P2 接线)
             .config_store = null,
             .exe_dir = app.config.exe_dir, // argv[0] 解析(H1:vendor 定位现在真可达)
+            .io = app.api_client.http_client.io,
         }) catch return;
         client.ensureReady();
         app.kg = client;

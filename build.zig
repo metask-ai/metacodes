@@ -274,17 +274,14 @@ pub fn build(b: *std.Build) void {
     var tinykg_artifact: ?*std.Build.Step.Compile = null;
     const vendor_tinykg_step = b.step("vendor:tinykg", "Build and install the vendored TinyKG engine");
     if (build_tinykg) {
-        const tinykg_exe = b.addExecutable(.{
-            .name = "tinykg",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("lib/tinykg/src/main.zig"),
-                .target = target,
-                .optimize = .ReleaseSafe,
-                .link_libc = true,
-            }),
+        const tinykg_dependency = b.dependency("tinykg", .{
+            .target = target,
+            .optimize = .ReleaseSafe,
         });
-        // ReleaseSafe keeps absolute source paths in Mach-O debug symbols,
-        // which makes otherwise identical TinyKG builds differ by worktree.
+        const tinykg_exe = tinykg_dependency.artifact("tinykg");
+        // ReleaseSafe retains absolute source paths in Mach-O debug symbols.
+        // Strip the shipped artifact so identical source snapshots remain
+        // byte-reproducible across worktree locations (including UUID/signature).
         tinykg_exe.root_module.strip = true;
         const install_tinykg = b.addInstallArtifact(tinykg_exe, .{
             .dest_dir = .{ .override = .{ .custom = "vendor/tinykg" } },
@@ -1136,6 +1133,30 @@ pub fn build(b: *std.Build) void {
     // kg/swarm 集成测试用真 tinykg → 先把它建到 zig-out/vendor/tinykg/tinykg(测试候选路径)。
     if (tinykg_install_step) |s| test_run.step.dependOn(s);
     test_step.dependOn(&test_run.step);
+
+    // Two independent Metacodes processes share one authenticated StoreActor.
+    // This is the runtime actuator for the daemon transport control plane.
+    const kg_transport_probe_mod = b.createModule(.{
+        .root_source_file = b.path("tests/helpers/kg_daemon_transport_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    kg_transport_probe_mod.addImport("cc", test_cc_mod);
+    addPlatform(b, kg_transport_probe_mod);
+    const kg_transport_probe = b.addExecutable(.{
+        .name = "kg-daemon-transport-probe",
+        .root_module = kg_transport_probe_mod,
+    });
+    const kg_transport_runtime = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/test_kg_daemon_transport.py",
+        "--probe",
+    });
+    kg_transport_runtime.addArtifactArg(kg_transport_probe);
+    const kg_transport_step = b.step("test:kg-daemon-transport", "Run authenticated shared-Store daemon transport L2");
+    kg_transport_step.dependOn(&kg_transport_runtime.step);
+    test_step.dependOn(&kg_transport_runtime.step);
 
     // test:eval —— harness 评估控制面（suite/readiness/rollout/judgement/
     // compare/gate）。Python 合同测试 + 同宿主原生零付费 smoke；不访问真实模型，

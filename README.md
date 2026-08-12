@@ -17,7 +17,15 @@ zig build                                     # 产出 zig-out/bin/metacodes + z
 ./zig-out/bin/metacodes --api-key <KEY>
 ```
 
-**零下载依赖**:`highlight-zig`(高亮)与 `tinykg`(KG 记忆引擎)的源码作为**快照 vendored 在 `lib/`**(非 submodule,因更新频度低——plain clone 即可构建)。`zig build` 从这份源随 `-Dtarget` **交叉编译**它们:tinykg 装到 `zig-out/vendor/tinykg/tinykg`。更新依赖用 `scripts/vendor-deps.sh`。跳过 tinykg 构建:`-Dtinykg=false`。
+**零下载依赖**:`highlight-zig`(高亮)与 `tinykg`(KG 记忆引擎)的源码作为**快照 vendored 在 `lib/`**(非 submodule,因更新频度低——plain clone 即可构建)。`lib/tinykg` 保留完整 Zig package root，主构建只消费其公共 `artifact("tinykg")`，不依赖上游 `src/` 内部布局。`zig build` 随 `-Dtarget` **交叉编译**它们:tinykg 装到 `zig-out/vendor/tinykg/tinykg`。更新依赖用 `scripts/vendor-deps.sh`。跳过 tinykg 构建:`-Dtinykg=false`。
+
+共享 TinyKG Store 默认只经 authenticated Web → `tinykgd` → 单一 `StoreActor` 访问；
+启动 Metacodes 前设置 `METACODES_KG_URL`、`METACODES_KG_API_KEY`、
+`METACODES_KG_EXPECTED_BUILD_ID` 和 `METACODES_KG_EXPECTED_SCHEMA_DIGEST`。
+缺少任一项会 fail closed 为 KG degraded，不会回退为直接打开共享 Store。仅隔离的单进程
+开发 Store 可显式设置 `METACODES_KG_TRANSPORT=cli-exclusive`，并用
+`METACODES_KG_BIN` / `METACODES_KG_STORE` 指向该独占实例；不要把 canonical Store
+用于这个兼容模式。
 
 常用构建目标:
 
@@ -59,7 +67,7 @@ metacodes/
 │   └── lib.zig                 # metacodes-core 库 root
 ├── lib/                        # vendored 依赖【源码快照】(非 submodule),build.zig 交叉编译
 │   ├── highlight-zig/          #   纯 Zig 语法高亮库
-│   └── tinykg/                 #   KG 记忆/计划/DAG 引擎(subprocess CLI)
+│   └── tinykg/                 #   完整 Zig package 快照；KG 记忆/计划/DAG CLI
 ├── sdk/                        # AgentCore C 头 + Zig SDK
 └── example/                    # metacodes-core 内部 dogfood 示例
 ```
@@ -87,6 +95,6 @@ C ABI(`sdk/metacodes_agentcore.h`)刻意只导出单入口 `metacodes_agentcore_
 | 语言 | Zig 0.16-dev |
 | 内存 | 命名 allocators(gpa / arena / scratch / c_allocator) |
 | 高亮 | highlight-zig(纯 Zig submodule,取代 tree-sitter) |
-| 记忆 | tinykg 图数据库(子进程 CLI) |
+| 记忆 | tinykg 图数据库(authenticated Web/daemon；隔离开发可显式 CLI) |
 | 沙箱 | macOS Seatbelt SBPL |
 | 跨平台 | platform/ 抽象层(POSIX + NT),Windows 交叉编译门 |

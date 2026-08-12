@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 
@@ -1781,6 +1782,62 @@ class LeanSourceAuditTests(unittest.TestCase):
         )
         self.assertEqual([], rule_control.lean_proof_placeholders(source))
 
+
+class DaemonTransportSensorTests(unittest.TestCase):
+    def test_repository_daemon_transport_closes_ten_obligations(self) -> None:
+        observation = rule_control.observe_daemon_transport(PROJECT_ROOT)
+        self.assertTrue(observation.sensor_ok, observation.errors)
+        self.assertEqual(10, observation.declared)
+        self.assertEqual(10, observation.covered)
+
+    def test_removing_wall_clock_race_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative in (
+                "src/kg/transport.zig", "src/kg/client.zig",
+                "tests/helpers/kg_daemon_transport_probe.zig",
+                "scripts/test_kg_daemon_transport.py", "build.zig",
+            ):
+                source = PROJECT_ROOT / relative
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
+            transport = root / "src/kg/transport.zig"
+            transport.write_text(
+                transport.read_text(encoding="utf-8").replace(
+                    "std.Io.Select(PostRace)", "DisconnectedDeadlineRace"
+                ),
+                encoding="utf-8",
+            )
+            observation = rule_control.observe_daemon_transport(root)
+            self.assertFalse(observation.sensor_ok)
+            self.assertIn("end_to_end_wall_clock_deadline", observation.missing_declarations)
+
+    def test_removing_runtime_actuator_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative in (
+                "src/kg/transport.zig", "src/kg/client.zig",
+                "tests/helpers/kg_daemon_transport_probe.zig",
+                "scripts/test_kg_daemon_transport.py", "build.zig",
+            ):
+                source = PROJECT_ROOT / relative
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
+            build = root / "build.zig"
+            build.write_text(
+                build.read_text(encoding="utf-8").replace(
+                    "kg_transport_step.dependOn(&kg_transport_runtime.step)",
+                    "test_step.dependOn(&kg_transport_runtime.step)",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            observation = rule_control.observe_daemon_transport(root)
+            self.assertFalse(observation.sensor_ok)
+            self.assertIn("multi_process_one_store_actor_feedback", observation.missing_declarations)
+
     def test_executable_proof_placeholders_remain_visible(self) -> None:
         self.assertEqual(
             ["admit", "axiom", "sorry"],
@@ -2180,6 +2237,57 @@ class TopologyTests(unittest.TestCase):
             actuator_observed=True,
         )
         self.assertFalse(helper_only["feedback"])
+
+    def test_daemon_transport_rule_requires_ten_obligation_kernel_and_native_feedback(self) -> None:
+        rule = self.complete_rule()
+        rule["id"] = "tinykg.daemon-transport.l2"
+        rule["sensor"] = {
+            "adapter": "daemon_transport",
+            "schema_version": 1,
+        }
+        rule["decision"]["kernel"] = (
+            "MetaCodesControl.ClosedLoop.daemonTransportSignal"
+        )
+        rule["feedback"] = {
+            "kind": "python_l2_then_reobserve",
+            "reobserve": True,
+            "commands": [
+                [
+                    "python",
+                    "-m",
+                    "unittest",
+                    "scripts.tests.test_rule_control.DaemonTransportSensorTests",
+                ],
+                ["zig", "build", "test:kg-daemon-transport"],
+            ],
+        }
+        topology, errors = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertTrue(topology["sensor"], errors)
+        self.assertTrue(topology["decision"], errors)
+        self.assertTrue(topology["feedback"], errors)
+
+        rule["decision"]["kernel"] = "MetaCodesControl.ClosedLoop.signal"
+        weakened, _ = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertFalse(weakened["decision"])
+
+        rule["decision"]["kernel"] = (
+            "MetaCodesControl.ClosedLoop.daemonTransportSignal"
+        )
+        rule["feedback"]["commands"] = [rule["feedback"]["commands"][0]]
+        missing_native, _ = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertFalse(missing_native["feedback"])
 
     def test_release_gate_is_observed_from_build_ci_and_telemetry_wiring(self) -> None:
         temporary, workspace, repo, actuator = self.make_actuator_workspace()

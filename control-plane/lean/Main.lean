@@ -72,7 +72,10 @@ def main (args : List String) : IO UInt32 := do
           let treatmentActivationRule := ruleId == "eval.treatment-activation.l2"
           let memoryIsolationRule := ruleId == "eval.memory-local-store-isolation.l2"
           let paidBudgetRule := ruleId == "eval.paid-budget-journal-authorization.l2"
-          let controlSignal := if paidBudgetRule then
+          let daemonTransportRule := ruleId == "tinykg.daemon-transport.l2"
+          let controlSignal := if daemonTransportRule then
+            daemonTransportSignal topology observation
+          else if paidBudgetRule then
             paidBudgetSignal topology observation
           else if memoryIsolationRule then
             memoryIsolationSignal topology observation
@@ -88,7 +91,9 @@ def main (args : List String) : IO UInt32 := do
             executionProjectionSignal topology observation
           else
             signal topology observation
-          let state := if paidBudgetRule then
+          let state := if daemonTransportRule then
+            daemonTransportNextState topology observation
+          else if paidBudgetRule then
             paidBudgetNextState topology observation
           else if memoryIsolationRule then
             memoryIsolationNextState topology observation
@@ -104,7 +109,9 @@ def main (args : List String) : IO UInt32 := do
             executionProjectionNextState topology observation
           else
             nextState topology observation
-          let allowed := if paidBudgetRule then
+          let allowed := if daemonTransportRule then
+            daemonTransportReleaseAllowed topology observation
+          else if paidBudgetRule then
             paidBudgetReleaseAllowed topology observation
           else if memoryIsolationRule then
             memoryIsolationReleaseAllowed topology observation

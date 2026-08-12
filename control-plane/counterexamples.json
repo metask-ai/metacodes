@@ -850,6 +850,126 @@
       "feedback_status": "passed",
       "expected_signal": "block_release",
       "expected_state": "blocked"
+    },
+    {
+      "id": "tinykg-daemon-transport-closed-loop-pass",
+      "rule_ids": [
+        "tinykg.daemon-transport.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 10,
+      "covered": 10,
+      "feedback_status": "passed",
+      "expected_signal": "admit_release",
+      "expected_state": "compliant"
+    },
+    {
+      "id": "tinykg-daemon-transport-missing-obligation-blocks",
+      "rule_ids": [
+        "tinykg.daemon-transport.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 10,
+      "covered": 9,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "tinykg-daemon-transport-formalization-orphan-blocks",
+      "rule_ids": [
+        "tinykg.daemon-transport.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": false,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 10,
+      "covered": 10,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "tinykg-daemon-transport-failed-feedback-blocks",
+      "rule_ids": [
+        "tinykg.daemon-transport.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 10,
+      "covered": 10,
+      "feedback_status": "failed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "tinykg-daemon-transport-sensor-failure-blocks",
+      "rule_ids": [
+        "tinykg.daemon-transport.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": false,
+      "declared": 10,
+      "covered": 10,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "tinykg-daemon-transport-wrong-cardinality-blocks",
+      "rule_ids": [
+        "tinykg.daemon-transport.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 9,
+      "covered": 9,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
     }
   ]
 }
