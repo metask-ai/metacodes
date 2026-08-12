@@ -40,6 +40,8 @@ const terminal_title = @import("tui/terminal_title.zig");
 const goal_mod = @import("../core/goal.zig");
 const usage_mod = @import("../core/usage.zig");
 const types_mod = @import("../types.zig");
+const dialect_mod = @import("../api/dialect.zig");
+const request_overrides = @import("../api/request_overrides.zig");
 const util_time = @import("../util/time.zig");
 const model_command = @import("model_command.zig");
 const skill_cli_adapter = @import("../skills/cli_adapter.zig");
@@ -404,6 +406,18 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         if (std.mem.eql(u8, trimmed, "/model") or std.mem.startsWith(u8, trimmed, "/model ")) {
             const rest = std.mem.trim(u8, trimmed[6..], " \t");
             try handleModel(app, allocator, rest);
+            continue;
+        }
+        // /effort [level] —— 无参显示当前 reasoning_effort;有参切换(none|minimal|low|medium|high|xhigh)
+        if (std.mem.eql(u8, trimmed, "/effort") or std.mem.startsWith(u8, trimmed, "/effort ")) {
+            const rest = std.mem.trim(u8, trimmed[7..], " \t");
+            try handleEffort(app, allocator, rest);
+            continue;
+        }
+        // /overrides [field value | clear] —— 查看/清/单字段设方言覆盖
+        if (std.mem.eql(u8, trimmed, "/overrides") or std.mem.startsWith(u8, trimmed, "/overrides ")) {
+            const rest = std.mem.trim(u8, trimmed[10..], " \t");
+            try handleOverridesCmd(app, allocator, rest);
             continue;
         }
         // /resume [id] —— 无参列最近 10 个 session；有参加载
@@ -1834,6 +1848,114 @@ const INIT_PROMPT =
 ;
 
 /// /model：按分组/能力浏览模型，或切换当前 provider 内的模型。
+fn handleEffort(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
+    _ = allocator;
+    if (rest.len == 0) {
+        // 无参:显示当前
+        const cur = app.provider().reasoningEffort();
+        const cur_str = if (cur) |e| @tagName(e) else "default (none)";
+        std.debug.print("Current reasoning effort: {s}\n", .{cur_str});
+        std.debug.print("Usage: /effort <none|minimal|low|medium|high|xhigh>\n", .{});
+        return;
+    }
+    const effort = types_mod.ReasoningEffort.parse(rest) orelse {
+        std.debug.print("\x1b[31minvalid effort '{s}'. Valid: none|minimal|low|medium|high|xhigh\x1b[0m\n", .{rest});
+        return;
+    };
+    app.setReasoningEffort(effort) catch |err| {
+        std.debug.print("\x1b[31m/effort failed: {s}\x1b[0m\n", .{@errorName(err)});
+        return;
+    };
+    std.debug.print("reasoning effort set to {s}\n", .{@tagName(effort)});
+}
+
+fn handleOverridesCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
+    _ = allocator;
+    if (rest.len == 0) {
+        // 无参:显示当前所有 overrides
+        const o = app.provider().requestOverrides();
+        std.debug.print("Request overrides:\n", .{});
+        std.debug.print("  temperature: {s}\n", .{fmtOptF32(o.temperature)});
+        std.debug.print("  top_p:       {s}\n", .{fmtOptF32(o.top_p)});
+        std.debug.print("  prompt_cache_key: {s}\n", .{fmtOptStr(o.prompt_cache_key)});
+        std.debug.print("  parallel_tool_calls: {s}\n", .{fmtOptBool(o.parallel_tool_calls)});
+        const rf_str = if (o.response_format) |rf| switch (rf.kind) {
+            .json_object => "json_object",
+            .json_schema => "json_schema",
+            .none => "none",
+        } else "(none)";
+        std.debug.print("  response_format: {s}\n", .{rf_str});
+        std.debug.print("Usage: /overrides <field> <value> | clear\n", .{});
+        std.debug.print("  fields: temperature, top_p, prompt_cache_key, parallel_tool_calls, response_format\n", .{});
+        return;
+    }
+    if (std.mem.eql(u8, rest, "clear")) {
+        app.clearRequestOverrides();
+        std.debug.print("All overrides cleared.\n", .{});
+        return;
+    }
+    // /overrides <field> <value>
+    const space = std.mem.indexOfScalar(u8, rest, ' ') orelse {
+        std.debug.print("\x1b[31musage: /overrides <field> <value>\x1b[0m\n", .{});
+        return;
+    };
+    const field = rest[0..space];
+    const value = std.mem.trim(u8, rest[space + 1 ..], " \t");
+    var ov = app.provider().requestOverrides();
+    if (std.mem.eql(u8, field, "temperature")) {
+        ov.temperature = std.fmt.parseFloat(f32, value) catch {
+            std.debug.print("\x1b[31minvalid float: {s}\x1b[0m\n", .{value});
+            return;
+        };
+    } else if (std.mem.eql(u8, field, "top_p")) {
+        ov.top_p = std.fmt.parseFloat(f32, value) catch {
+            std.debug.print("\x1b[31minvalid float: {s}\x1b[0m\n", .{value});
+            return;
+        };
+    } else if (std.mem.eql(u8, field, "prompt_cache_key")) {
+        ov.prompt_cache_key = value;
+    } else if (std.mem.eql(u8, field, "parallel_tool_calls")) {
+        if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1")) {
+            ov.parallel_tool_calls = true;
+        } else if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0")) {
+            ov.parallel_tool_calls = false;
+        } else {
+            std.debug.print("\x1b[31minvalid bool: {s} (true|false)\x1b[0m\n", .{value});
+            return;
+        }
+    } else if (std.mem.eql(u8, field, "response_format")) {
+        const rf: dialect_mod.ResponseFormatRequest = if (std.mem.eql(u8, value, "json_object"))
+            .{ .kind = .json_object, .schema = null }
+        else if (std.mem.eql(u8, value, "json_schema"))
+            .{ .kind = .json_schema, .schema = null }
+        else {
+            std.debug.print("\x1b[31minvalid response_format: {s} (json_object|json_schema)\x1b[0m\n", .{value});
+            return;
+        };
+        ov.response_format = rf;
+    } else {
+        std.debug.print("\x1b[31munknown field: {s}. Valid: temperature, top_p, prompt_cache_key, parallel_tool_calls, response_format\x1b[0m\n", .{field});
+        return;
+    }
+    app.setRequestOverrides(ov) catch |err| {
+        std.debug.print("\x1b[31m/overrides failed (provider may not support dialect fields): {s}\x1b[0m\n", .{@errorName(err)});
+        return;
+    };
+    std.debug.print("{s} set to {s}\n", .{ field, value });
+}
+
+fn fmtOptF32(v: ?f32) []const u8 {
+    return if (v) |_| "(set)" else "(none)";
+}
+
+fn fmtOptStr(v: ?[]const u8) []const u8 {
+    return if (v) |s| s else "(none)";
+}
+
+fn fmtOptBool(v: ?bool) []const u8 {
+    return if (v) |b| if (b) "true" else "false" else "(none)";
+}
+
 fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
     const candidates = try model_command.collectCandidates(allocator, app.config.provider_kind, app.api_client.catalog.entries.items);
     defer allocator.free(candidates);

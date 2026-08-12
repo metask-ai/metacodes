@@ -545,6 +545,18 @@ fn nowMonoMs() i64 {
 /// tool_choice 由 dialect.serializeToolChoice 翻成 tool_config.function_calling_config。
 /// reasoning_effort 非 null → dialect.serializeThinking 翻成 generation_config.thinking_level。
 pub fn serializeGeminiRequest(allocator: std.mem.Allocator, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, cached_ref: ?[]const u8, model: []const u8, tool_choice: ?json_mod.ToolChoice, reasoning_effort: ?types.ReasoningEffort) ![]u8 {
+    // Legacy wrapper:包成 RequestOverrides 转给 WithOverrides 版。
+    return serializeGeminiRequestWithOverrides(allocator, messages, system, tools, cached_ref, model, .{
+        .reasoning_effort = reasoning_effort,
+        .tool_choice = tool_choice,
+    });
+}
+
+/// 完整方言字段入口的序列化(stage 3 接线 + stage 5 扩展)。
+/// overrides 非 null 字段 = 显式覆盖;null = dialect 按 profile 静态推断。
+/// Gemini 协议支持:thinking_level(thinking)/response_mime_type(response_format)/temperature/top_p。
+/// 不支持:prompt_cache_key(Gemini 用 cachedContent 机制)/parallel_tool_calls(无此概念)→ 忽略。
+pub fn serializeGeminiRequestWithOverrides(allocator: std.mem.Allocator, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, cached_ref: ?[]const u8, model: []const u8, overrides: request_overrides.RequestOverrides) ![]u8 {
     const dialect_mod = @import("dialect.zig");
     const adapter = @import("model_adapter.zig");
     const dialect = dialect_mod.dialectFor(.gemini, model);
@@ -589,22 +601,31 @@ pub fn serializeGeminiRequest(allocator: std.mem.Allocator, messages: []const ty
         }
     }
     // tool_choice:委托给 GeminiDialect 翻成 tool_config.function_calling_config。
-    // dialect.ToolChoice 是 api/request.zig ToolChoice 的 alias,直接传 json_mod.ToolChoice。
-    if (tool_choice) |tc| {
+    if (overrides.tool_choice) |tc| {
         _ = try dialect.serializeToolChoice(profile, tc, &out, allocator);
     }
-    // generation_config:合并 thinking_level + response_mime_type(都进 generation_config)。
-    // 先收集片段到 gen_cfg,再合并成一个 generation_config(避免两个 generation_config 键冲突)。
-    // 片段函数(serializeThinking / serializeResponseFormat)用"若 out 非空则加前导逗号"策略,
-    // 调用顺序无关。
+    // generation_config:合并 thinking_level + response_mime_type + temperature + top_p。
+    // 片段函数用"若 gen_cfg 非空则加前导逗号"策略,调用顺序无关。
     var gen_cfg: std.ArrayList(u8) = .empty;
     defer gen_cfg.deinit(allocator);
-    // thinking_level(M7 接线):dialect.serializeThinking 输出 "thinking_level":"low" 片段。
-    try dialect.serializeThinking(profile, reasoning_effort, &gen_cfg, allocator);
-    // 注:response_format 也进 generation_config(dialect.serializeResponseFormat 输出
-    // "response_mime_type":... 片段),但当前 serializeGeminiRequest 无 response_format 入参,
-    // 所以这里不调。若后续接 response_format,加参数 + 调 dialect.serializeResponseFormat
-    // 把片段并入 gen_cfg 即可(逗号策略已一致)。
+    // thinking_level:dialect.serializeThinking 输出 "thinking_level":"low" 片段。
+    try dialect.serializeThinking(profile, overrides.reasoning_effort, &gen_cfg, allocator);
+    // response_format:dialect.serializeResponseFormat 输出 "response_mime_type":... 片段。
+    if (overrides.response_format) |rf| {
+        _ = try dialect.serializeResponseFormat(profile, rf, &gen_cfg, allocator);
+    }
+    // temperature/top_p:通用采样参数,进 generation_config(Gemini 协议支持)。
+    if (overrides.temperature) |t| {
+        if (gen_cfg.items.len > 0) try gen_cfg.append(allocator, ',');
+        try gen_cfg.appendSlice(allocator, "\"temperature\":");
+        try util_json.serializeNumber(t, &gen_cfg, allocator);
+    }
+    if (overrides.top_p) |p| {
+        if (gen_cfg.items.len > 0) try gen_cfg.append(allocator, ',');
+        try gen_cfg.appendSlice(allocator, "\"top_p\":");
+        try util_json.serializeNumber(p, &gen_cfg, allocator);
+    }
+    // 注:prompt_cache_key / parallel_tool_calls Gemini 协议不支持,忽略(能力守门)。
     if (gen_cfg.items.len > 0) {
         try out.appendSlice(allocator, ",\"generation_config\":{");
         try out.appendSlice(allocator, gen_cfg.items);

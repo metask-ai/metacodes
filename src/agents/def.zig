@@ -6,6 +6,9 @@
 
 const std = @import("std");
 const types = @import("../types.zig");
+const request_overrides = @import("../api/request_overrides.zig");
+
+pub const RequestOverrides = request_overrides.RequestOverrides;
 
 pub const PermissionMode = enum {
     /// 与官方 default 对齐:细粒度 ask
@@ -63,6 +66,10 @@ pub const AgentDef = struct {
     background: bool,
     /// effort 等级。null = inherit；非法字符串在解析期拒绝，不能静默存入 struct。
     effort: ?types.ReasoningEffort,
+    /// per-subagent 方言字段覆盖(null = inherit 父 provider 的 overrides)。
+    /// 非 null 时,spawnAgent 在 subagent Provider 上临时覆盖,结束恢复。
+    /// 字符串字段(prompt_cache_key)owned,deinit 释放。
+    overrides: ?RequestOverrides,
     /// isolation。用 enum 让未知模式不可表示。
     isolation: Isolation,
     /// 颜色
@@ -89,6 +96,9 @@ pub const AgentDef = struct {
         allocator.free(self.mcp_servers);
         allocator.free(self.initial_prompt);
         allocator.free(self.source_path);
+        if (self.overrides) |o| {
+            if (o.prompt_cache_key) |k| allocator.free(k);
+        }
     }
 };
 
@@ -109,6 +119,12 @@ pub fn parseAgentMd(allocator: std.mem.Allocator, md: []const u8, source_path: [
     var isolation: Isolation = .none;
     var color_str: []const u8 = "";
     var initial_prompt_str: []const u8 = "";
+    // overrides 累积:任意字段设过 → 非 null。字符串(prompt_cache_key)延后 dupe。
+    var ov_temperature: ?f32 = null;
+    var ov_top_p: ?f32 = null;
+    var ov_prompt_cache_key: ?[]const u8 = null;
+    var ov_parallel_tool_calls: ?bool = null;
+    var ov_response_format: ?[]const u8 = null; // "json_object"/"json_schema"
     var body: []const u8 = md;
 
     if (std.mem.startsWith(u8, md, "---\n")) {
@@ -162,6 +178,18 @@ pub fn parseAgentMd(allocator: std.mem.Allocator, md: []const u8, source_path: [
                 } else if (std.mem.eql(u8, key, "prompt")) {
                     // CLI JSON 形式可能用 prompt 代替 body
                     body = value;
+                } else if (std.mem.eql(u8, key, "temperature")) {
+                    ov_temperature = std.fmt.parseFloat(f32, value) catch return error.InvalidAgentTemperature;
+                } else if (std.mem.eql(u8, key, "top_p") or std.mem.eql(u8, key, "topP")) {
+                    ov_top_p = std.fmt.parseFloat(f32, value) catch return error.InvalidAgentTopP;
+                } else if (std.mem.eql(u8, key, "prompt_cache_key") or std.mem.eql(u8, key, "promptCacheKey")) {
+                    ov_prompt_cache_key = value;
+                } else if (std.mem.eql(u8, key, "parallel_tool_calls") or std.mem.eql(u8, key, "parallelToolCalls")) {
+                    ov_parallel_tool_calls = parseBool(value) orelse return error.InvalidAgentParallelToolCalls;
+                } else if (std.mem.eql(u8, key, "response_format") or std.mem.eql(u8, key, "responseFormat")) {
+                    if (std.mem.eql(u8, value, "json_object") or std.mem.eql(u8, value, "json_schema")) {
+                        ov_response_format = value;
+                    } else return error.InvalidAgentResponseFormat;
                 }
             }
         }
@@ -197,6 +225,30 @@ pub fn parseAgentMd(allocator: std.mem.Allocator, md: []const u8, source_path: [
     const source_path_owned = try allocator.dupe(u8, source_path);
     errdefer allocator.free(source_path_owned);
 
+    // overrides:任一字段非 null → 构造。prompt_cache_key dupe 取所有权。
+    var overrides: ?RequestOverrides = null;
+    if (ov_temperature != null or ov_top_p != null or ov_prompt_cache_key != null or
+        ov_parallel_tool_calls != null or ov_response_format != null)
+    {
+        const rf_kind: @import("../api/dialect.zig").ResponseFormatKind = if (ov_response_format) |rf|
+            if (std.mem.eql(u8, rf, "json_schema")) .json_schema else .json_object
+        else
+            .none;
+        const rf: ?@import("../api/dialect.zig").ResponseFormatRequest = if (ov_response_format != null)
+            .{ .kind = rf_kind, .schema = null }
+        else
+            null;
+        const pck_owned = if (ov_prompt_cache_key) |k| try allocator.dupe(u8, k) else null;
+        errdefer if (pck_owned) |k| allocator.free(k);
+        overrides = .{
+            .temperature = ov_temperature,
+            .top_p = ov_top_p,
+            .prompt_cache_key = pck_owned,
+            .parallel_tool_calls = ov_parallel_tool_calls,
+            .response_format = rf,
+        };
+    }
+
     return .{
         .name = name_owned,
         .description = description_owned,
@@ -211,6 +263,7 @@ pub fn parseAgentMd(allocator: std.mem.Allocator, md: []const u8, source_path: [
         .memory_scope = memory_scope,
         .background = background,
         .effort = effort,
+        .overrides = overrides,
         .isolation = isolation,
         .color = color,
         .initial_prompt = initial_prompt_owned,

@@ -101,6 +101,8 @@ const api_keys_mod = @import("api/api_keys.zig");
 const openai_mod = @import("api/openai_client.zig");
 const gemini_mod = @import("api/gemini_client.zig");
 const provider_mod = @import("api/provider.zig");
+const request_overrides = @import("api/request_overrides.zig");
+const dialect_mod = @import("api/dialect.zig");
 const json_mod = @import("json.zig");
 const tools_mod = @import("tools.zig");
 const permission_mod = @import("permission.zig");
@@ -354,10 +356,12 @@ pub const App = struct {
         if (config.provider_kind == .openai) {
             app.openai_client = openai_mod.OpenAIClient.init(allocator, io, api_key, config.model, config.base_url);
             app.openai_client.?.reasoning_effort = config.reasoning_effort;
+            app.openai_client.?.overrides = buildOverridesFromConfig(config);
         }
         // Gemini 后端:仅当 provider_kind==.gemini 才建(讲 generateContent 协议 + 有状态缓存)。
         if (config.provider_kind == .gemini) {
             app.gemini_client = gemini_mod.GeminiClient.init(allocator, io, api_key, config.model, config.base_url);
+            app.gemini_client.?.overrides = buildOverridesFromConfig(config);
         }
 
         // 启动时由 canonical Runtime 解析 enterprise / personal / project
@@ -839,6 +843,37 @@ pub const App = struct {
         try app.provider().setReasoningEffort(effort);
         app.config.reasoning_effort = effort;
         app.emitConfig(.{ .reasoning = effort }); // U4:reasoning 单写侧 emit
+    }
+
+    /// 覆盖方言字段(temperature/top_p/prompt_cache_key/parallel_tool_calls/response_format)。
+    /// 非 null 字段 = 显式覆盖,null = 不变。provider 不支持(Anthropic)→ setRequestOverrides 返 error,
+    /// 上层打印警告。reasoning_effort 不走此(它有独立 setter,保持单写侧 emit 路径)。
+    pub fn setRequestOverrides(app: *App, o: request_overrides.RequestOverrides) !void {
+        try app.provider().setRequestOverrides(o);
+        // 同步 config(持久化 + /overrides 显示用)
+        if (o.temperature != null) app.config.temperature = o.temperature;
+        if (o.top_p != null) app.config.top_p = o.top_p;
+        if (o.prompt_cache_key != null) app.config.prompt_cache_key = o.prompt_cache_key;
+        if (o.parallel_tool_calls != null) app.config.parallel_tool_calls = o.parallel_tool_calls;
+        if (o.response_format != null) {
+            // response_format 是 enum,config 存字符串形式
+            const rf_str: ?[]const u8 = switch (o.response_format.?.kind) {
+                .json_object => "json_object",
+                .json_schema => "json_schema",
+                .none => null,
+            };
+            if (rf_str) |s| app.config.response_format = s;
+        }
+    }
+
+    /// 清所有方言覆盖(全 null)。provider 不支持则静默跳过(无覆盖可清)。
+    pub fn clearRequestOverrides(app: *App) void {
+        app.provider().setRequestOverrides(.{}) catch {};
+        app.config.temperature = null;
+        app.config.top_p = null;
+        app.config.prompt_cache_key = null;
+        app.config.parallel_tool_calls = null;
+        app.config.response_format = null;
     }
 
     pub fn persistLoginSelection(app: *App) void {
@@ -1688,6 +1723,27 @@ pub const App = struct {
         platform_signal.installInterrupt(onSigint);
     }
 };
+
+/// 从 Config 的方言字段构造 RequestOverrides(给 OpenAI/Gemini client 用)。
+/// reasoning_effort 不进 overrides(它有独立 legacy 字段 + setter,保持原路径)。
+/// Anthropic client 不用此函数(不支持方言字段,setRequestOverrides 留 null)。
+/// prompt_cache_key 借用 config 内存(App 生命周期有效,无需 dupe)。
+fn buildOverridesFromConfig(config: types.Config) request_overrides.RequestOverrides {
+    const rf: ?dialect_mod.ResponseFormatRequest = if (config.response_format) |rf_str|
+        .{
+            .kind = if (std.mem.eql(u8, rf_str, "json_schema")) .json_schema else .json_object,
+            .schema = null,
+        }
+    else
+        null;
+    return .{
+        .temperature = config.temperature,
+        .top_p = config.top_p,
+        .prompt_cache_key = config.prompt_cache_key,
+        .parallel_tool_calls = config.parallel_tool_calls,
+        .response_format = rf,
+    };
+}
 
 /// 中断回调(async-signal-safe:只置原子,不分配/不锁/不 IO)。取代旧 sigintHandler(sig)。
 /// **U9**:置进程级 shutdown flag(daemon 主循环 poll 它优雅关所有 session)+ 戳 g_abort_signal

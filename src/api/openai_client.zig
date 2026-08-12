@@ -151,7 +151,12 @@ pub const OpenAIClient = struct {
         _ = user_query; // OpenAI 无 server-tool web_search → 无需 query 透传
         const self = cast(ctx);
         const model = model_override orelse self.model;
-        const body = try serializeOpenAIRequest(self.allocator, model, messages, system, tools, self.reasoning_effort, tool_choice);
+        // overrides 从 provider 状态读(reasoning_effort 走 legacy 兜底,tool_choice 走 per-call 参数)。
+        // 这样 agent_loop 无需感知 overrides——provider 自己管方言字段。
+        var o = self.overrides;
+        if (o.reasoning_effort == null) o.reasoning_effort = self.reasoning_effort;
+        o.tool_choice = tool_choice;
+        const body = try serializeOpenAIRequestWithOverrides(self.allocator, model, messages, system, tools, o);
         defer self.allocator.free(body);
         return self.doStream(body, abort);
     }
