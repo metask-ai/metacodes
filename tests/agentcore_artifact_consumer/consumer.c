@@ -6,7 +6,7 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 7 must not retain historical callback aliases"
+#error "revision 8 must not retain historical callback aliases"
 #endif
 
 #if METASK_AGENTCORE_ABI_REVISION != 8u || \
