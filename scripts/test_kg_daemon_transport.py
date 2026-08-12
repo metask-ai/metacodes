@@ -62,6 +62,10 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(raw)
         request_id = body["requestId"]
         command = body.get("command", "__markdown__")
+        if command == "add-node" and self.server.mode == "service-unavailable":  # type: ignore[attr-defined]
+            self.send_response(503)
+            self.end_headers()
+            return
         if command == "slow":
             time.sleep(1.0)
         if command in {"stats", "add-node"} and self.server.mode == "backpressure":  # type: ignore[attr-defined]
@@ -183,6 +187,16 @@ def main() -> int:
         assert "ambiguous_write=observed" in ambiguous
         match = re.search(r"^request_id=([A-Za-z0-9_.:-]{1,128})$", ambiguous, re.MULTILINE)
         assert match is not None and match.group(1).startswith("metacodes-")
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.mode = "service-unavailable"  # type: ignore[attr-defined]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://127.0.0.1:{server.server_port}"
+        unavailable = run_probe(args.probe, url, "service-unavailable-write")
+        assert "ambiguous_write=observed" in unavailable
+        assert re.search(r"^request_id=metacodes-[A-Za-z0-9_.:-]+$", unavailable, re.MULTILINE)
+        server.shutdown()
+        server.server_close()
         print("kg_daemon_transport=pass")
         print(f"shared_generation={ACTOR.generation}")
         print("metacodes_processes=2")

@@ -3712,7 +3712,7 @@ def observe_daemon_transport(repo: Path) -> Observation:
             "recordAmbiguousRequestId(request_id)", "ambiguousRequestId()", '"ambiguous_write=observed',
             '"unavailable-write"', "^request_id=([A-Za-z0-9_.:-]{1,128})$",
             "provesNoCommit(err)", '"backpressure_write_no_commit=observed"',
-            '"unauthorized_write_no_commit=observed"',
+            '"unauthorized_write_no_commit=observed"', '"service-unavailable-write"',
         )),
         "generation_bound_sessions": all(marker in sources["transport"] + sources["runtime"] for marker in (
             "sessionId = session", "self.session_id", "self.last_generation = generation",

@@ -382,7 +382,6 @@ fn provesNoCommit(err: Error) bool {
         Error.AuthenticationFailed,
         Error.RequestIdConflict,
         Error.Backpressure,
-        Error.DaemonUnavailable,
         => true,
         else => false,
     };

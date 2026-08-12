@@ -76,7 +76,9 @@ pub fn main(init: std.process.Init) !void {
             transport.run("stats", &.{}, false),
         );
         try out.writeAll("unavailable_read=observed\n");
-    } else if (std.mem.eql(u8, action, "unavailable-write")) {
+    } else if (std.mem.eql(u8, action, "unavailable-write") or
+        std.mem.eql(u8, action, "service-unavailable-write"))
+    {
         try std.testing.expectError(
             cc.kg_transport.Error.AmbiguousCommit,
             transport.run("add-node", &.{ "observation", "unavailable" }, true),
