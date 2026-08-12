@@ -10,14 +10,41 @@ pub fn main(init: std.process.Init) !void {
     const schema_digest = args.next() orelse return error.MissingSchemaDigest;
     const action = args.next() orelse return error.MissingAction;
 
+    if (std.mem.eql(u8, action, "client-config") or std.mem.eql(u8, action, "client-config-degraded")) {
+        var client = try cc.kg_client.KgClient.init(init.gpa, .{
+            .home = "/unused-because-config-is-explicit",
+            .domain = "daemon-config-probe",
+            .io = init.io,
+        });
+        defer client.deinit();
+        client.ensureReady();
+        if (std.mem.eql(u8, action, "client-config")) {
+            try std.testing.expect(client.ready);
+            const stdout_file = std.Io.File.stdout();
+            var config_buffer: [512]u8 = undefined;
+            var config_writer = stdout_file.writer(init.io, &config_buffer);
+            try config_writer.interface.writeAll("canonical_remote_config=ready\n");
+            try config_writer.interface.flush();
+        } else {
+            try std.testing.expect(!client.ready);
+            const stdout_file = std.Io.File.stdout();
+            var config_buffer: [512]u8 = undefined;
+            var config_writer = stdout_file.writer(init.io, &config_buffer);
+            try config_writer.interface.writeAll("unsafe_remote_config=degraded\n");
+            try config_writer.interface.flush();
+        }
+        return;
+    }
+
     const timeout_ms: u64 = if (std.mem.eql(u8, action, "timeout")) 100 else 2_000;
     const effective_api_key = if (std.mem.eql(u8, action, "unauthorized-write")) "wrong-test-key" else api_key;
+    const effective_schema_digest = if (std.mem.eql(u8, action, "schema-drift-across-clone")) "" else schema_digest;
     var transport = try cc.kg_transport.WebTransport.init(init.gpa, .{
         .io = init.io,
         .url = url,
         .api_key = effective_api_key,
         .expected_build_id = build_id,
-        .expected_schema_digest = schema_digest,
+        .expected_schema_digest = effective_schema_digest,
         .timeout_ms = timeout_ms,
     });
     defer transport.deinit();
@@ -64,6 +91,42 @@ pub fn main(init: std.process.Init) !void {
         );
         try std.testing.expect(transport.ambiguousRequestId() == null);
         try out.writeAll("unauthorized_write_no_commit=observed\n");
+    } else if (std.mem.eql(u8, action, "ambiguous-blocks-writes")) {
+        // Clone before the uncertain attempt: subagent/teammate sessions must
+        // share the process-local write fence rather than receiving a fresh
+        // ambiguity latch that can bypass the lead's recovery stop.
+        var cloned = try transport.cloneForSession(init.gpa);
+        defer cloned.deinit();
+        try std.testing.expectError(
+            cc.kg_transport.Error.AmbiguousCommit,
+            transport.run("add-node", &.{ "observation", "one-attempt" }, true),
+        );
+        const request_id = transport.ambiguousRequestId() orelse return error.MissingAmbiguousRequestId;
+        // Reads through another session remain available for application-level
+        // re-observation, while writes through either handle are fenced.
+        const observed = try cloned.run("store-info", &.{}, false);
+        observed.deinit(init.gpa);
+        try std.testing.expectError(
+            cc.kg_transport.Error.AmbiguousCommit,
+            cloned.run("add-node", &.{ "observation", "clone-must-not-send" }, true),
+        );
+        try std.testing.expectError(
+            cc.kg_transport.Error.AmbiguousCommit,
+            transport.run("add-node", &.{ "observation", "lead-must-not-send" }, true),
+        );
+        try std.testing.expectEqualStrings(request_id, transport.ambiguousRequestId().?);
+        try std.testing.expectEqualStrings(request_id, cloned.ambiguousRequestId().?);
+        try out.print("ambiguous_write_blocked=observed\nrequest_id={s}\n", .{request_id});
+    } else if (std.mem.eql(u8, action, "schema-drift-across-clone")) {
+        var cloned = try transport.cloneForSession(init.gpa);
+        defer cloned.deinit();
+        const pinned = try transport.run("stats", &.{}, false);
+        pinned.deinit(init.gpa);
+        try std.testing.expectError(
+            cc.kg_transport.Error.IncompatibleDaemon,
+            cloned.run("schema-drift", &.{}, false),
+        );
+        try out.writeAll("shared_schema_pin=observed\n");
     } else if (std.mem.eql(u8, action, "conflict")) {
         try std.testing.expectError(
             cc.kg_transport.Error.RequestIdConflict,

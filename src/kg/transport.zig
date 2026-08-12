@@ -1,15 +1,20 @@
 //! Authenticated TinyKG Web transport.
 //!
 //! This is the only shared-Store transport. It binds every request to a
-//! unique id, retries the exact same envelope after an uncertain network
-//! outcome, validates the service/build/schema capability pins, and keeps a
+//! unique id, validates the service/build/schema capability pins, and keeps a
 //! generation-bound query session. It never accepts a client-selected Store.
+//! Reads may be retried within one wall-clock deadline. Writes are attempted
+//! exactly once: an uncertain result is returned to the Metacodes transaction
+//! controller with its request id and blocks later writes until re-observation.
 
 const std = @import("std");
 const rng = @import("platform").rng;
+const sync = @import("platform").sync;
 const time = @import("../util/time.zig");
+const ResponseStatus = @import("../api/http_status.zig").ResponseStatus;
 
 pub const protocol_version: u32 = 2;
+pub const control_plane_version: u32 = 1;
 pub const task_hierarchy_capability = "task-hierarchy-canonical-read-v1";
 pub const default_timeout_ms: u64 = 35_000;
 pub const max_response_bytes: usize = 16 * 1024 * 1024;
@@ -51,9 +56,85 @@ pub const Options = struct {
     url: []const u8,
     api_key: []const u8,
     expected_build_id: []const u8,
-    expected_schema_digest: []const u8,
+    /// Empty means pin the first authenticated response for this session.
+    expected_schema_digest: []const u8 = "",
     session_seed: ?[]const u8 = null,
     timeout_ms: u64 = default_timeout_ms,
+};
+
+/// Process-local write serialization and ambiguity fence shared by every
+/// session cloned from one `KgClient`.  This is deliberately not presented as
+/// a distributed transaction: independent Metacodes processes still require a
+/// TinyKG expected-generation/CAS primitive for cross-process linearization.
+const SharedWriteFence = struct {
+    ref_count: std.atomic.Value(u32) = .init(1),
+    write_mutex: sync.Mutex = .{},
+    schema_mutex: sync.Mutex = .{},
+    ambiguous_request_id: [128]u8 = undefined,
+    ambiguous_request_id_len: u8 = 0,
+    schema_digest: [64]u8 = undefined,
+    schema_digest_len: u8 = 0,
+
+    fn create(initial_schema_digest: []const u8) Error!*SharedWriteFence {
+        const fence = std.heap.c_allocator.create(SharedWriteFence) catch return Error.OutOfMemory;
+        fence.* = .{};
+        if (initial_schema_digest.len != 0) {
+            std.debug.assert(initial_schema_digest.len == fence.schema_digest.len);
+            @memcpy(fence.schema_digest[0..initial_schema_digest.len], initial_schema_digest);
+            fence.schema_digest_len = @intCast(initial_schema_digest.len);
+        }
+        return fence;
+    }
+
+    fn retain(self: *SharedWriteFence) Error!*SharedWriteFence {
+        const previous = self.ref_count.fetchAdd(1, .monotonic);
+        if (previous == 0 or previous == std.math.maxInt(u32)) {
+            _ = self.ref_count.fetchSub(1, .monotonic);
+            return Error.OutOfMemory;
+        }
+        return self;
+    }
+
+    fn release(self: *SharedWriteFence) void {
+        const previous = self.ref_count.fetchSub(1, .acq_rel);
+        std.debug.assert(previous != 0);
+        if (previous != 1) return;
+        std.heap.c_allocator.destroy(self);
+    }
+
+    /// Caller holds `mutex`. Preserve the first uncertain request: replacing
+    /// it would destroy the only recovery identity for the earlier write.
+    /// The id is copied into fixed storage so crossing into the uncertain
+    /// state cannot itself fail allocation and accidentally leave writes open.
+    fn recordAmbiguousLocked(self: *SharedWriteFence, request_id: []const u8) void {
+        if (self.ambiguous_request_id_len != 0) return;
+        std.debug.assert(request_id.len > 0 and request_id.len <= self.ambiguous_request_id.len);
+        @memcpy(self.ambiguous_request_id[0..request_id.len], request_id);
+        self.ambiguous_request_id_len = @intCast(request_id.len);
+    }
+
+    fn ambiguousRequestId(self: *SharedWriteFence) ?[]const u8 {
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        // The id is immutable until the last transport releases the fence, so
+        // this borrowed diagnostic remains valid for the caller's transport.
+        const len = self.ambiguous_request_id_len;
+        return if (len == 0) null else self.ambiguous_request_id[0..len];
+    }
+
+    /// Pin the first authenticated schema digest for the whole client family.
+    /// Cloned subagent/swarm sessions must not independently accept drift.
+    fn matchesOrPinsSchema(self: *SharedWriteFence, digest: []const u8) bool {
+        self.schema_mutex.lock();
+        defer self.schema_mutex.unlock();
+        if (self.schema_digest_len == 0) {
+            std.debug.assert(digest.len == self.schema_digest.len);
+            @memcpy(self.schema_digest[0..digest.len], digest);
+            self.schema_digest_len = @intCast(digest.len);
+            return true;
+        }
+        return std.mem.eql(u8, self.schema_digest[0..self.schema_digest_len], digest);
+    }
 };
 
 pub const WebTransport = struct {
@@ -63,21 +144,33 @@ pub const WebTransport = struct {
     markdown_url: []u8,
     api_key: []u8,
     expected_build_id: []u8,
-    expected_schema_digest: []u8,
     session_id: []u8,
     timeout_ms: u64,
     last_generation: u64 = 0,
-    last_ambiguous_request_id: ?[]u8 = null,
+    write_fence: *SharedWriteFence,
+    /// `KgClient` can be shared by the lead loop and in-process subagents.
+    /// std.http.Client, schema pinning, generation and the ambiguity latch are
+    /// one mutable transport session, so every request/state transition must
+    /// be serialized locally as well as by tinykgd's StoreActor.
+    request_mu: std.Io.Mutex = .init,
 
     pub fn init(allocator: std.mem.Allocator, options: Options) Error!WebTransport {
         if (options.url.len == 0 or options.api_key.len == 0 or
-            options.expected_build_id.len == 0 or options.expected_schema_digest.len == 0 or
+            options.expected_build_id.len == 0 or
             options.timeout_ms == 0 or options.timeout_ms > 3_600_000)
         {
             return Error.InvalidConfiguration;
         }
         const base = std.mem.trimEnd(u8, options.url, "/");
-        _ = std.Uri.parse(base) catch return Error.InvalidUrl;
+        const uri = std.Uri.parse(base) catch return Error.InvalidUrl;
+        if ((!std.mem.eql(u8, uri.scheme, "http") and !std.mem.eql(u8, uri.scheme, "https")) or
+            uri.host == null or uri.user != null or uri.password != null or
+            uri.query != null or uri.fragment != null or containsControl(base) or
+            containsControl(options.api_key) or !buildIdValid(options.expected_build_id) or
+            (options.expected_schema_digest.len != 0 and !lowerHexDigestValid(options.expected_schema_digest)))
+        {
+            return Error.InvalidConfiguration;
+        }
         const run_url = std.fmt.allocPrint(allocator, "{s}/api/run", .{base}) catch return Error.OutOfMemory;
         errdefer allocator.free(run_url);
         const markdown_url = std.fmt.allocPrint(allocator, "{s}/api/import-markdown", .{base}) catch return Error.OutOfMemory;
@@ -86,14 +179,14 @@ pub const WebTransport = struct {
         errdefer secureFree(allocator, api_key);
         const build_id = allocator.dupe(u8, options.expected_build_id) catch return Error.OutOfMemory;
         errdefer allocator.free(build_id);
-        const schema_digest = allocator.dupe(u8, options.expected_schema_digest) catch return Error.OutOfMemory;
-        errdefer allocator.free(schema_digest);
         const session_id = if (options.session_seed) |seed|
             allocator.dupe(u8, seed) catch return Error.OutOfMemory
         else
             makeIdentifier(allocator, "metacodes-session") catch return Error.OutOfMemory;
         errdefer allocator.free(session_id);
         if (!identifierValid(session_id)) return Error.InvalidConfiguration;
+        const write_fence = try SharedWriteFence.create(options.expected_schema_digest);
+        errdefer write_fence.release();
         return .{
             .allocator = allocator,
             .http_client = .{ .allocator = allocator, .io = options.io },
@@ -101,9 +194,9 @@ pub const WebTransport = struct {
             .markdown_url = markdown_url,
             .api_key = api_key,
             .expected_build_id = build_id,
-            .expected_schema_digest = schema_digest,
             .session_id = session_id,
             .timeout_ms = options.timeout_ms,
+            .write_fence = write_fence,
         };
     }
 
@@ -113,34 +206,59 @@ pub const WebTransport = struct {
         self.allocator.free(self.markdown_url);
         secureFree(self.allocator, self.api_key);
         self.allocator.free(self.expected_build_id);
-        self.allocator.free(self.expected_schema_digest);
         self.allocator.free(self.session_id);
-        if (self.last_ambiguous_request_id) |request_id| self.allocator.free(request_id);
+        self.write_fence.release();
     }
 
     pub fn cloneForSession(self: *const WebTransport, allocator: std.mem.Allocator) Error!WebTransport {
         const base_len = self.run_url.len - "/api/run".len;
-        return init(allocator, .{
+        var cloned = try init(allocator, .{
             .io = self.http_client.io,
             .url = self.run_url[0..base_len],
             .api_key = self.api_key,
             .expected_build_id = self.expected_build_id,
-            .expected_schema_digest = self.expected_schema_digest,
+            .expected_schema_digest = "",
             .timeout_ms = self.timeout_ms,
         });
+        errdefer cloned.deinit();
+        const shared_fence = try self.write_fence.retain();
+        cloned.write_fence.release();
+        cloned.write_fence = shared_fence;
+        return cloned;
     }
 
-    /// Same-id retry is deliberate: a write that lost its HTTP response is
-    /// replayed by StoreActor instead of being executed twice.
+    /// Generate a fresh request identity. Non-idempotent callers that persist
+    /// their own transaction id use `runWithRequestId` instead.
     pub fn run(self: *WebTransport, command: []const u8, args: []const []const u8, mutates: bool) Error!Result {
-        self.clearAmbiguousRequestId();
         const request_id = try makeIdentifier(self.allocator, "metacodes");
         defer self.allocator.free(request_id);
+        return self.runWithRequestId(command, args, mutates, request_id);
+    }
+
+    /// Execute exactly one semantic request identity. This method never
+    /// retries a write. Once a result becomes ambiguous, this client family is
+    /// intentionally poisoned for writes; a fresh process must first recover
+    /// that request id through an application-specific inspect/rollback path.
+    pub fn runWithRequestId(
+        self: *WebTransport,
+        command: []const u8,
+        args: []const []const u8,
+        mutates: bool,
+        request_id: []const u8,
+    ) Error!Result {
+        self.request_mu.lockUncancelable(self.http_client.io);
+        defer self.request_mu.unlock(self.http_client.io);
+        if (!identifierValid(request_id)) return Error.InvalidConfiguration;
+        if (mutates) {
+            // Serialize the check and complete write attempt across the lead,
+            // subagents and in-process swarm sessions cloned from this client.
+            self.write_fence.write_mutex.lock();
+            defer self.write_fence.write_mutex.unlock();
+            if (self.write_fence.ambiguous_request_id_len != 0)
+                return Error.AmbiguousCommit;
+        }
         const session = if (isQueryCommand(command)) self.session_id else null;
-        const required: []const []const u8 = if (requiresTaskHierarchy(command))
-            &.{task_hierarchy_capability}
-        else
-            &.{};
+        const required: []const []const u8 = &.{task_hierarchy_capability};
         const envelope = .{
             .protocolVersion = protocol_version,
             .requestId = request_id,
@@ -152,7 +270,7 @@ pub const WebTransport = struct {
         };
         const body = try stringifyAlloc(self.allocator, envelope);
         defer self.allocator.free(body);
-        return self.postWithSameIdRetry(self.run_url, body, request_id, mutates);
+        return self.postWithPolicy(self.run_url, body, request_id, mutates);
     }
 
     /// Markdown bytes are uploaded to the service; a client path is never
@@ -163,7 +281,11 @@ pub const WebTransport = struct {
         source_key: u64,
         source_label: ?[]const u8,
     ) Error!Result {
-        self.clearAmbiguousRequestId();
+        self.request_mu.lockUncancelable(self.http_client.io);
+        defer self.request_mu.unlock(self.http_client.io);
+        self.write_fence.write_mutex.lock();
+        defer self.write_fence.write_mutex.unlock();
+        if (self.write_fence.ambiguous_request_id_len != 0) return Error.AmbiguousCommit;
         const request_id = try makeIdentifier(self.allocator, "metacodes-md");
         defer self.allocator.free(request_id);
         var source_key_buffer: [16]u8 = undefined;
@@ -178,10 +300,10 @@ pub const WebTransport = struct {
         };
         const body = try stringifyAlloc(self.allocator, envelope);
         defer self.allocator.free(body);
-        return self.postWithSameIdRetry(self.markdown_url, body, request_id, true);
+        return self.postWithPolicy(self.markdown_url, body, request_id, true);
     }
 
-    fn postWithSameIdRetry(
+    fn postWithPolicy(
         self: *WebTransport,
         url: []const u8,
         body: []const u8,
@@ -191,26 +313,44 @@ pub const WebTransport = struct {
         const started_ms = time.nowMs();
         if (started_ms <= 0) return Error.RequestFailed;
         const deadline_ms = @as(i128, started_ms) + @as(i128, self.timeout_ms);
+        const max_attempts: u8 = if (mutates) 1 else 2;
         var attempt: u8 = 0;
-        while (attempt < 2) : (attempt += 1) {
+        while (attempt < max_attempts) : (attempt += 1) {
             const remaining_ms = remainingTimeoutMs(deadline_ms) orelse {
                 if (mutates) {
-                    try self.recordAmbiguousRequestId(request_id);
+                    self.recordAmbiguousRequestId(request_id);
                     return Error.AmbiguousCommit;
                 }
                 return Error.RequestTimedOut;
             };
             const response = self.postBeforeDeadline(url, body, request_id, remaining_ms) catch |err| {
-                if (!mutates or provesNoCommit(err)) return normalizeReadFailure(err);
-                if (attempt == 0 and remainingTimeoutMs(deadline_ms) != null) continue;
-                try self.recordAmbiguousRequestId(request_id);
+                if (mutates and provesNoCommit(err)) return err;
+                if (!mutates) {
+                    if (attempt + 1 < max_attempts and remainingTimeoutMs(deadline_ms) != null) continue;
+                    return normalizeReadFailure(err);
+                }
+                self.recordAmbiguousRequestId(request_id);
                 return Error.AmbiguousCommit;
             };
             if (response.commit_state == .ambiguous) {
                 response.deinit(self.allocator);
-                if (attempt == 0 and remainingTimeoutMs(deadline_ms) != null) continue;
-                try self.recordAmbiguousRequestId(request_id);
+                self.recordAmbiguousRequestId(request_id);
                 return Error.AmbiguousCommit;
+            }
+            if (mutates and ((response.commit_state == .committed and response.exit_code != 0) or
+                (response.commit_state == .none and response.exit_code == 0)))
+            {
+                // Either the write committed but its post-commit path failed,
+                // or the daemon acknowledged success without a commit receipt.
+                // Both require application-level re-observation before another
+                // mutation may be admitted.
+                response.deinit(self.allocator);
+                self.recordAmbiguousRequestId(request_id);
+                return Error.AmbiguousCommit;
+            }
+            if (!mutates and response.commit_state != .none) {
+                response.deinit(self.allocator);
+                return Error.IncompatibleDaemon;
             }
             return response;
         }
@@ -292,14 +432,16 @@ pub const WebTransport = struct {
         req.sendBodyComplete(@constCast(body)) catch return Error.RequestFailed;
         var redirect_buffer: [4096]u8 = undefined;
         const head = req.receiveHead(&redirect_buffer) catch return Error.RequestFailed;
+        const status = ResponseStatus.capture(&head);
         var transfer_buffer: [8192]u8 = undefined;
         const reader = req.reader.bodyReader(&transfer_buffer, head.head.transfer_encoding, head.head.content_length);
         const bytes = reader.allocRemaining(self.allocator, std.Io.Limit.limited(max_response_bytes)) catch
             return Error.ResponseTooLarge;
         defer self.allocator.free(bytes);
-        if (head.head.status == .unauthorized or head.head.status == .forbidden)
+        if (status.code == 401 or status.code == 403)
             return Error.AuthenticationFailed;
-        if (head.head.status == .service_unavailable) return Error.DaemonUnavailable;
+        if (status.code == 503) return Error.DaemonUnavailable;
+        if (!status.isOk()) return Error.InvalidResponse;
         return self.parseResponse(bytes, request_id);
     }
 
@@ -309,16 +451,26 @@ pub const WebTransport = struct {
         if (parsed.value != .object) return Error.InvalidResponse;
         const object = parsed.value.object;
         if (integer(object.get("protocolVersion")) != protocol_version or
+            integer(object.get("controlPlaneVersion")) != control_plane_version or
             !stringEquals(object.get("implementation"), "tinykg-web") or
+            !stringEquals(object.get("schemaMode"), "server-canonical") or
             !stringEquals(object.get("buildId"), self.expected_build_id) or
-            !stringEquals(object.get("schemaDigest"), self.expected_schema_digest) or
             !stringEquals(object.get("requestId"), request_id))
         {
             return Error.IncompatibleDaemon;
         }
         const engine = object.get("engine") orelse return Error.IncompatibleDaemon;
-        if (engine != .object or !stringEquals(engine.object.get("implementation"), "tinykg-cli"))
+        if (engine != .object or !stringEquals(engine.object.get("implementation"), "tinykg-cli") or
+            (string(engine.object.get("version")) orelse @as([]const u8, "")).len == 0 or
+            !lowerHexDigestValid(string(engine.object.get("binarySha256")) orelse @as([]const u8, "")) or
+            !boolean(engine.object.get("metadataValid")) or
+            !capabilitiesValid(object.get("capabilities")))
             return Error.IncompatibleDaemon;
+        const schema_digest = string(object.get("schemaDigest")) orelse return Error.IncompatibleDaemon;
+        if (!lowerHexDigestValid(schema_digest)) return Error.IncompatibleDaemon;
+        if (!self.write_fence.matchesOrPinsSchema(schema_digest)) {
+            return Error.IncompatibleDaemon;
+        }
         const stderr_raw = string(object.get("stderr")) orelse string(object.get("error")) orelse "";
         if (std.mem.indexOf(u8, stderr_raw, "RequestIdConflict") != null) return Error.RequestIdConflict;
         if (std.mem.indexOf(u8, stderr_raw, "DaemonQueueFull") != null) return Error.Backpressure;
@@ -332,6 +484,10 @@ pub const WebTransport = struct {
         else
             return Error.InvalidResponse;
         const generation = integer(object.get("generation")) orelse return Error.InvalidResponse;
+        const replayed = boolean(object.get("replayed"));
+        if (generation < self.last_generation or
+            (commit_state == .committed and generation <= self.last_generation and !replayed))
+            return Error.IncompatibleDaemon;
         if (object.get("session")) |session| {
             if (session != .object or
                 !stringEquals(session.object.get("sessionId"), self.session_id) or
@@ -350,22 +506,17 @@ pub const WebTransport = struct {
             .exit_code = if (boolean(object.get("ok"))) 0 else @intCast(integer(object.get("code")) orelse 1),
             .generation = generation,
             .commit_state = commit_state,
-            .replayed = boolean(object.get("replayed")),
+            .replayed = replayed,
         };
     }
 
     pub fn ambiguousRequestId(self: *const WebTransport) ?[]const u8 {
-        return self.last_ambiguous_request_id;
+        return self.write_fence.ambiguousRequestId();
     }
 
-    fn clearAmbiguousRequestId(self: *WebTransport) void {
-        if (self.last_ambiguous_request_id) |request_id| self.allocator.free(request_id);
-        self.last_ambiguous_request_id = null;
-    }
-
-    fn recordAmbiguousRequestId(self: *WebTransport, request_id: []const u8) Error!void {
-        self.clearAmbiguousRequestId();
-        self.last_ambiguous_request_id = self.allocator.dupe(u8, request_id) catch return Error.OutOfMemory;
+    fn recordAmbiguousRequestId(self: *WebTransport, request_id: []const u8) void {
+        // Mutating callers hold the shared fence across the complete attempt.
+        self.write_fence.recordAmbiguousLocked(request_id);
     }
 };
 
@@ -416,14 +567,41 @@ fn identifierValid(value: []const u8) bool {
     return true;
 }
 
-fn isQueryCommand(command: []const u8) bool {
-    return std.mem.eql(u8, command, "query") or std.mem.eql(u8, command, "query-explain");
+fn lowerHexDigestValid(value: []const u8) bool {
+    if (value.len != 64) return false;
+    for (value) |byte| switch (byte) {
+        '0'...'9', 'a'...'f' => {},
+        else => return false,
+    };
+    return true;
 }
 
-fn requiresTaskHierarchy(command: []const u8) bool {
-    const commands = [_][]const u8{ "task-packet", "task-frontier", "task-ancestry", "task-metrics", "task-close" };
-    for (commands) |item| if (std.mem.eql(u8, command, item)) return true;
+fn buildIdValid(value: []const u8) bool {
+    return value.len == "sha256:".len + 64 and
+        std.mem.startsWith(u8, value, "sha256:") and lowerHexDigestValid(value["sha256:".len..]);
+}
+
+fn containsControl(value: []const u8) bool {
+    for (value) |byte| if (byte <= 0x20 or byte == 0x7f) return true;
     return false;
+}
+
+fn capabilitiesValid(value: ?std.json.Value) bool {
+    const actual = value orelse return false;
+    if (actual != .array) return false;
+    var found_task_hierarchy = false;
+    for (actual.array.items, 0..) |item, index| {
+        if (item != .string or item.string.len == 0) return false;
+        for (actual.array.items[0..index]) |prior| {
+            if (prior == .string and std.mem.eql(u8, prior.string, item.string)) return false;
+        }
+        if (std.mem.eql(u8, item.string, task_hierarchy_capability)) found_task_hierarchy = true;
+    }
+    return found_task_hierarchy;
+}
+
+fn isQueryCommand(command: []const u8) bool {
+    return std.mem.eql(u8, command, "query") or std.mem.eql(u8, command, "query-explain");
 }
 
 fn string(value: ?std.json.Value) ?[]const u8 {
@@ -457,10 +635,14 @@ fn secureFree(allocator: std.mem.Allocator, value: []u8) void {
 test "transport command policies bind sessions and task capabilities" {
     try std.testing.expect(isQueryCommand("query"));
     try std.testing.expect(!isQueryCommand("search"));
-    try std.testing.expect(requiresTaskHierarchy("task-close"));
-    try std.testing.expect(!requiresTaskHierarchy("stats"));
     try std.testing.expect(identifierValid("metacodes-session-a1"));
     try std.testing.expect(!identifierValid("bad id"));
+    try std.testing.expect(lowerHexDigestValid("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    try std.testing.expect(!lowerHexDigestValid("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+    try std.testing.expect(buildIdValid("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    try std.testing.expect(!buildIdValid("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    try std.testing.expect(!containsControl("api-key"));
+    try std.testing.expect(containsControl("bad key"));
     try std.testing.expect(provesNoCommit(Error.AuthenticationFailed));
     try std.testing.expect(provesNoCommit(Error.Backpressure));
     try std.testing.expect(!provesNoCommit(Error.RequestTimedOut));

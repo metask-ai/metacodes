@@ -42,7 +42,7 @@ pub const KgError = error{
     Degraded,
     /// 数据:环检测/NotFound 等,模型可改参重试。detail 在 last_detail。
     Data,
-    /// 写请求在相同 request-id 重试后仍无法确认 commit 结果。
+    /// 写请求只尝试一次且无法确认 commit 结果；request id 保留供宿主重观测。
     AmbiguousCommit,
     /// daemon 的有界队列已满；调用方应退避而不是扩大并发。
     Backpressure,
@@ -306,17 +306,9 @@ pub const KgClient = struct {
             .exclusive_cli
         else remote: {
             const io = opts.io orelse break :remote .unconfigured;
-            const url = opts.remote_url orelse envGet("METACODES_KG_URL") orelse break :remote .unconfigured;
-            const key = opts.remote_api_key orelse envGet("METACODES_KG_API_KEY") orelse break :remote .unconfigured;
-            const build_id = opts.remote_expected_build_id orelse envGet("METACODES_KG_EXPECTED_BUILD_ID") orelse break :remote .unconfigured;
-            const schema_digest = opts.remote_expected_schema_digest orelse envGet("METACODES_KG_EXPECTED_SCHEMA_DIGEST") orelse break :remote .unconfigured;
-            break :remote .{ .remote = transport_mod.WebTransport.init(allocator, .{
-                .io = io,
-                .url = url,
-                .api_key = key,
-                .expected_build_id = build_id,
-                .expected_schema_digest = schema_digest,
-            }) catch break :remote .unconfigured };
+            const configured = initRemoteTransport(allocator, io, opts) catch
+                break :remote .unconfigured;
+            break :remote if (configured) |value| .{ .remote = value } else .unconfigured;
         };
         return .{
             .allocator = allocator,
@@ -516,6 +508,118 @@ pub const KgClient = struct {
         return std.mem.span(v);
     }
 
+    const RemoteFile = struct {
+        url: []const u8,
+        api_key: []const u8 = "",
+        expected_build_id: ?[]const u8 = null,
+    };
+
+    /// Reuse the TinyKG Skill's canonical user configuration instead of
+    /// inventing a second credential/address store. Environment overrides
+    /// follow the Skill names; legacy METACODES_KG_* variables remain an
+    /// all-or-nothing explicit override for compatibility.
+    fn initRemoteTransport(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        opts: ResolveOptions,
+    ) !?transport_mod.WebTransport {
+        const explicit_url = opts.remote_url orelse envGet("METACODES_KG_URL");
+        const explicit_key = opts.remote_api_key orelse envGet("METACODES_KG_API_KEY");
+        const explicit_build = opts.remote_expected_build_id orelse envGet("METACODES_KG_EXPECTED_BUILD_ID");
+        const explicit_schema = opts.remote_expected_schema_digest orelse envGet("METACODES_KG_EXPECTED_SCHEMA_DIGEST") orelse "";
+        if (explicit_url != null or explicit_key != null or explicit_build != null or explicit_schema.len != 0) {
+            return @as(?transport_mod.WebTransport, try transport_mod.WebTransport.init(allocator, .{
+                .io = io,
+                .url = explicit_url orelse return error.InvalidRemoteConfiguration,
+                .api_key = explicit_key orelse return error.InvalidRemoteConfiguration,
+                .expected_build_id = explicit_build orelse return error.InvalidRemoteConfiguration,
+                .expected_schema_digest = explicit_schema,
+            }));
+        }
+
+        const env_config_path = envGet("TINYKG_REMOTE_CONFIG");
+        const file_path = try remoteConfigPath(allocator, opts.home);
+        defer allocator.free(file_path);
+        const file = readRemoteConfig(allocator, file_path) catch |err| {
+            // A user-selected config is authoritative and must fail closed;
+            // the default path being absent means remote mode is simply not
+            // configured. Other open/stat failures remain unsafe.
+            if (err == error.FileNotFound and env_config_path == null) return null;
+            return err;
+        };
+        defer if (file) |*loaded| loaded.deinit();
+
+        const env_url = envGet("TINYKG_REMOTE_URL");
+        const env_key = envGet("TINYKG_API_KEY");
+        const env_build = envGet("TINYKG_REMOTE_EXPECTED_BUILD_ID");
+        if (file == null and env_url == null and env_key == null and env_build == null) return null;
+
+        const file_value: ?RemoteFile = if (file) |loaded| loaded.value else null;
+        const url = env_url orelse if (file_value) |value| value.url else return error.InvalidRemoteConfiguration;
+        const same_server = if (file_value) |value|
+            std.mem.eql(u8, std.mem.trimEnd(u8, value.url, "/"), std.mem.trimEnd(u8, url, "/"))
+        else
+            false;
+        // Never send a stored credential or build pin to a different env URL.
+        const key = env_key orelse if (same_server) file_value.?.api_key else return error.InvalidRemoteConfiguration;
+        const build_id = env_build orelse if (same_server) (file_value.?.expected_build_id orelse return error.InvalidRemoteConfiguration) else return error.InvalidRemoteConfiguration;
+        return @as(?transport_mod.WebTransport, try transport_mod.WebTransport.init(allocator, .{
+            .io = io,
+            .url = url,
+            .api_key = key,
+            .expected_build_id = build_id,
+            // The authenticated first response pins the canonical schema for
+            // this process. Subsequent drift fails closed.
+            .expected_schema_digest = "",
+        }));
+    }
+
+    fn remoteConfigPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
+        if (envGet("TINYKG_REMOTE_CONFIG")) |path| return allocator.dupe(u8, path);
+        return switch (@import("builtin").os.tag) {
+            .windows => if (envGet("APPDATA")) |base|
+                std.fmt.allocPrint(allocator, "{s}/tinykg/remote.json", .{base})
+            else
+                std.fmt.allocPrint(allocator, "{s}/AppData/Roaming/tinykg/remote.json", .{home}),
+            .macos, .ios => std.fmt.allocPrint(allocator, "{s}/Library/Application Support/tinykg/remote.json", .{home}),
+            else => if (envGet("XDG_CONFIG_HOME")) |base|
+                std.fmt.allocPrint(allocator, "{s}/tinykg/remote.json", .{base})
+            else
+                std.fmt.allocPrint(allocator, "{s}/.config/tinykg/remote.json", .{home}),
+        };
+    }
+
+    const ParsedRemoteFile = std.json.Parsed(RemoteFile);
+
+    fn readRemoteConfig(allocator: std.mem.Allocator, path: []const u8) !?ParsedRemoteFile {
+        const path_z = try allocator.dupeZ(u8, path);
+        defer allocator.free(path_z);
+        const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+        if (fd < 0) {
+            if (!pfs.exists(path_z.ptr)) return error.FileNotFound;
+            return error.InvalidRemoteConfiguration;
+        }
+        defer pfs.close(fd);
+        const info = pfs.fileInfo(fd) catch return error.InvalidRemoteConfiguration;
+        if (!info.is_regular or info.link_count != 1 or info.size > 64 * 1024)
+            return error.InvalidRemoteConfiguration;
+        if (@import("builtin").os.tag != .windows and (info.mode & 0o077) != 0)
+            return error.InvalidRemoteConfiguration;
+        const bytes = common.readAllFromFdCapped(fd, allocator, 64 * 1024) catch
+            return error.InvalidRemoteConfiguration;
+        defer allocator.free(bytes);
+        var parsed = std.json.parseFromSlice(RemoteFile, allocator, bytes, .{
+            .ignore_unknown_fields = false,
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        }) catch return error.InvalidRemoteConfiguration;
+        errdefer parsed.deinit();
+        if (parsed.value.url.len == 0 or parsed.value.api_key.len == 0 or
+            parsed.value.expected_build_id == null)
+            return error.InvalidRemoteConfiguration;
+        return parsed;
+    }
+
     fn isExecutable(path: []const u8) bool {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         if (path.len >= buf.len) return false;
@@ -534,7 +638,7 @@ pub const KgClient = struct {
         if (self.ready) return;
         switch (self.transport) {
             .unconfigured => {
-                self.setDegraded("TinyKG daemon transport 未配置。设置 METACODES_KG_URL、METACODES_KG_API_KEY、METACODES_KG_EXPECTED_BUILD_ID、METACODES_KG_EXPECTED_SCHEMA_DIGEST；共享 Store 禁止 CLI fallback", .{});
+                self.setDegraded("TinyKG daemon transport 未配置或配置不安全。先用 TinyKG Skill `remote set` 写入用户级 remote.json，或完整设置 TINYKG_REMOTE_URL/TINYKG_API_KEY/TINYKG_REMOTE_EXPECTED_BUILD_ID；共享 Store 禁止 CLI fallback", .{});
                 return;
             },
             .remote => |*remote| {

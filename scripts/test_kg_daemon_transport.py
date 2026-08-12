@@ -10,6 +10,8 @@ import re
 import subprocess
 import threading
 import time
+import tempfile
+import os
 
 
 BUILD_ID = "sha256:" + "a" * 64
@@ -25,6 +27,7 @@ class Actor:
         self.sessions: set[str] = set()
         self.lock = threading.Lock()
         self.markdown_uploads: list[dict] = []
+        self.request_count = 0
 
 
 ACTOR = Actor()
@@ -59,6 +62,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         raw = self.rfile.read(int(self.headers.get("content-length", "0")))
+        ACTOR.request_count += 1
         body = json.loads(raw)
         request_id = body["requestId"]
         command = body.get("command", "__markdown__")
@@ -104,10 +108,13 @@ class Handler(BaseHTTPRequestHandler):
                 response = self.response(body, True, 0, "import_md_doc document=42 nodes_imported=1\n", "", "committed")
             else:
                 response = self.response(body, True, 0, "nodes=1\nstorage_format_version=2\nschema_version=3\n", "", "none")
+                if command == "schema-drift":
+                    response["schemaDigest"] = "d" * 64
             ACTOR.receipts[request_id] = (raw, response)
-            # The first write commits then loses the response. The client must
-            # retry the byte-identical envelope and receive the replay receipt.
-            if command == "add-node" and request_id not in ACTOR.dropped:
+            # An acknowledged write can lose its response. Metacodes must not
+            # let the generic transport replay it; the transaction controller
+            # first records the ambiguous request and re-observes state.
+            if command == "add-node" and self.server.mode == "drop-write-response":  # type: ignore[attr-defined]
                 ACTOR.dropped.add(request_id)
                 self.connection.shutdown(2)
                 self.connection.close()
@@ -136,7 +143,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
-def run_probe(binary: str, url: str, action: str) -> str:
+def run_probe(binary: str, url: str, action: str, *, env: dict[str, str] | None = None) -> str:
     result = subprocess.run(
         [binary, url, API_KEY, BUILD_ID, SCHEMA_DIGEST, action],
         check=True,
@@ -144,6 +151,7 @@ def run_probe(binary: str, url: str, action: str) -> str:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=15,
+        env={**os.environ, **(env or {})},
     )
     return result.stdout
 
@@ -162,14 +170,40 @@ def main() -> int:
         second = run_probe(args.probe, url, "write")
         query = run_probe(args.probe, url, "query")
         markdown = run_probe(args.probe, url, "markdown")
-        assert "generation=1" in first and "replayed=true" in first and "commit=committed" in first
-        assert "generation=2" in second and "replayed=true" in second and "commit=committed" in second
+        assert "generation=1" in first and "replayed=false" in first and "commit=committed" in first
+        assert "generation=2" in second and "replayed=false" in second and "commit=committed" in second
         assert "generation=2" in query and len(ACTOR.sessions) == 1
         assert "markdown_upload=observed" in markdown
         assert len(ACTOR.markdown_uploads) == 1
         assert ACTOR.markdown_uploads[0]["markdown"] == "# Uploaded\n\nprivate bytes\n"
         assert ACTOR.markdown_uploads[0]["sourceKey"] == "000000000000002a"
         assert "path" not in ACTOR.markdown_uploads[0]
+        with tempfile.TemporaryDirectory() as config_dir:
+            config_path = os.path.join(config_dir, "remote.json")
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump({"url": url, "api_key": API_KEY, "expected_build_id": BUILD_ID}, handle)
+            os.chmod(config_path, 0o600)
+            configured = run_probe(
+                args.probe, url, "client-config",
+                env={"TINYKG_REMOTE_CONFIG": config_path},
+            )
+            assert "canonical_remote_config=ready" in configured
+            before_invalid = ACTOR.request_count
+            with open(config_path, "w", encoding="utf-8") as handle:
+                handle.write('{"url":')
+            degraded = run_probe(
+                args.probe, url, "client-config-degraded",
+                env={"TINYKG_REMOTE_CONFIG": config_path},
+            )
+            assert "unsafe_remote_config=degraded" in degraded
+            assert ACTOR.request_count == before_invalid
+            os.unlink(config_path)
+            missing = run_probe(
+                args.probe, url, "client-config-degraded",
+                env={"TINYKG_REMOTE_CONFIG": config_path},
+            )
+            assert "unsafe_remote_config=degraded" in missing
+            assert ACTOR.request_count == before_invalid
         server.mode = "backpressure"  # type: ignore[attr-defined]
         assert "backpressure=observed" in run_probe(args.probe, url, "backpressure")
         assert "backpressure_write_no_commit=observed" in run_probe(args.probe, url, "backpressure-write")
@@ -177,6 +211,14 @@ def main() -> int:
         assert "conflict=observed" in run_probe(args.probe, url, "conflict")
         server.mode = "normal"  # type: ignore[attr-defined]
         assert "unauthorized_write_no_commit=observed" in run_probe(args.probe, url, "unauthorized-write")
+        assert "shared_schema_pin=observed" in run_probe(args.probe, url, "schema-drift-across-clone")
+        server.mode = "drop-write-response"  # type: ignore[attr-defined]
+        ambiguous_once = run_probe(args.probe, url, "ambiguous-blocks-writes")
+        assert "ambiguous_write_blocked=observed" in ambiguous_once
+        # One semantic attempt crossed the actor; a forbidden transport replay
+        # would advance this by two or mark the receipt replayed.
+        assert ACTOR.generation == 4
+        server.mode = "normal"  # type: ignore[attr-defined]
         started = time.monotonic()
         assert "wall_clock_timeout=observed" in run_probe(args.probe, url, "timeout")
         assert time.monotonic() - started < 1.0
@@ -202,7 +244,11 @@ def main() -> int:
         print("metacodes_processes=2")
         print(f"store_actor_instances=1")
         print(f"generation_bound_sessions={len(ACTOR.sessions)}")
+        print("shared_schema_pin=pass")
         print(f"markdown_uploads={len(ACTOR.markdown_uploads)}")
+        print("write_transport_retries=0")
+        print("ambiguous_write_latch=pass")
+        print("canonical_remote_config=pass")
         return 0
     finally:
         if thread.is_alive():
