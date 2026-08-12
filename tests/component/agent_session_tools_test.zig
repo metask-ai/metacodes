@@ -22,6 +22,26 @@ const GLOB_TOOL_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+const WEB_SEARCH_TOOL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_web\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_search\",\"name\":\"WebSearch\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"zig language\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const ISOLATED_WEB_SEARCH_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_nested\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srv_1\",\"content\":[{\"type\":\"web_search_result\",\"title\":\"Zig Lang\",\"url\":\"https://ziglang.org\"}]}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"Zig is a systems language.\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
 fn readToolSse(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
         "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_read\",\"name\":\"Read\",\"input\":{{}}}}}}\n\n" ++
@@ -116,6 +136,47 @@ test "L2 AgentSession resolves selected built-in file tools against its workspac
     try std.testing.expect(std.mem.indexOf(u8, body, "agentcore-tool-ok") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, glob_probe_name) != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\\\"name\\\":\\\"Bash\\\"") == null and std.mem.indexOf(u8, body, "\"name\":\"Bash\"") == null);
+}
+
+test "L2 AgentSession exposes WebSearch as a builtin and dispatches its isolated provider search" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    const bodies = [_][]const u8{ WEB_SEARCH_TOOL_SSE, ISOLATED_WEB_SEARCH_SSE, FINAL_SSE };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{
+        .builtin_tools = &.{"WebSearch"},
+    });
+    defer runtime.destroy() catch unreachable;
+    const session = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = url,
+        .permission_mode = .bypass_permissions,
+        .workspace = .{ .root = root, .shell = .disabled },
+        .allowed_tools = &.{"WebSearch"},
+    });
+    defer session.destroy() catch unreachable;
+
+    var sink_state: u8 = 0;
+    const result = try session.runText(1, "search and fetch", 3, .{ .ctx = &sink_state, .emit = Sink.emit });
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
+
+    const body = (srv.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "WebSearch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Web search results for query") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "zig language") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "https://ziglang.org") != null);
 }
 
 test "L2 AgentSession rejects an unadvertised Runtime tool before prefetch or dispatch" {

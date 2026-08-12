@@ -31,11 +31,26 @@ const ToolExecutionPolicy = @import("../tools.zig").ToolExecutionPolicy;
 const ToolDispatcher = @import("../tools.zig").ToolDispatcher;
 const ToolDefinition = @import("../json.zig").ToolDefinition;
 
-pub const DEFAULT_BUILTIN_TOOLS = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Grep", "Bash", "BashOutput", "KillShell" };
+pub const DEFAULT_BUILTIN_TOOLS = [_][]const u8{
+    "Read",
+    "Write",
+    "Edit",
+    "Glob",
+    "Grep",
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "WebSearch",
+    "WebFetch",
+};
 /// Built-ins whose complete execution dependencies are owned by AgentSession.
 /// Process-level tools (Task, Cron, KG, MCP, worktree, notifications, etc.) are
 /// deliberately rejected at Runtime creation instead of being advertised with
 /// null Host state.
+/// WebSearch is a Session-owned network capability backed by the configured
+/// internal web service/provider. It is an ordinary function tool, not a
+/// provider-specific server-tool descriptor; AgentSession owns its
+/// implementation and the Host does not register an executor callback.
 pub const SESSION_BUILTIN_TOOLS = DEFAULT_BUILTIN_TOOLS ++ [_][]const u8{"AskUserQuestion"};
 
 pub fn isSessionBuiltin(name: []const u8) bool {
@@ -43,6 +58,18 @@ pub fn isSessionBuiltin(name: []const u8) bool {
         if (std.mem.eql(u8, supported, name)) return true;
     }
     return false;
+}
+
+test "WebSearch and WebFetch are AgentSession-owned builtins" {
+    try std.testing.expect(isSessionBuiltin("WebSearch"));
+    try std.testing.expect(isSessionBuiltin("WebFetch"));
+}
+
+test "default AgentRuntime catalog includes WebSearch and WebFetch" {
+    var runtime = try AgentRuntime.create(std.testing.allocator, .{});
+    defer runtime.destroy() catch unreachable;
+    try std.testing.expect(runtime.catalog.find("WebSearch") != null);
+    try std.testing.expect(runtime.catalog.find("WebFetch") != null);
 }
 
 pub const RuntimeConfig = struct {
