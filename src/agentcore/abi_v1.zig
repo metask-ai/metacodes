@@ -9000,6 +9000,21 @@ test "ABI Runtime rejects process-only built-ins as invalid input" {
     try std.testing.expect(runtime == null);
 }
 
+test "ABI Runtime accepts Session-owned WebSearch and WebFetch built-ins" {
+    const names = [_]wire.BytesViewV1{ view("WebSearch"), view("WebFetch") };
+    var config = std.mem.zeroes(wire.RuntimeConfigV1);
+    config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    config.builtin_tools = &names;
+    config.builtin_tool_count = names.len;
+    var runtime: ?*wire.RuntimeHandle = null;
+    var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+    defer bufferRelease(&diagnostic);
+
+    try std.testing.expectEqual(wire.STATUS_OK, runtimeCreate(&config, &runtime, &diagnostic));
+    try std.testing.expect(runtime != null);
+    try std.testing.expectEqual(wire.STATUS_OK, runtimeDestroy(runtime, &diagnostic));
+}
+
 test "ABI Runtime applies tool-name grammar to built-ins and Host tools" {
     const Probe = struct {
         fn execute(_: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1, _: ?*wire.OwnedBytesV1) callconv(.c) u32 {

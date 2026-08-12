@@ -780,7 +780,17 @@ Session permission modes are `default`, `accept_edits`, `auto`, `dont_ask`,
 and `full_access`, represented by the corresponding public constants.
 
 ABI v1 supports these built-in tools: `Read`, `Write`, `Edit`, `Glob`, `Grep`,
-`Bash`, `BashOutput`, `KillShell`, and `AskUserQuestion`. Runtime creation
+`Bash`, `BashOutput`, `KillShell`, `WebSearch`, `WebFetch`, and
+`AskUserQuestion`. `WebSearch` uses the Session's configured internal web
+service/provider; it is an ordinary function tool rather than a
+provider-specific server-tool descriptor. The Host may select `WebSearch` in
+`builtin_tools`, but does not provide or register an executor callback for it.
+`WebFetch` is also Session-available, but it currently uses the tool's direct
+HTTP/subprocess implementation rather than the Session provider; its network
+and redirect policy remains the owning tool's contract. Existing WebFetch
+permission-rule and streaming-prefetch behavior also remains in force; Hosts
+that need domain restriction must provide the corresponding `WebFetch(domain:…)`
+rule. Runtime creation
 rejects process-level tools whose dependencies are not owned by AgentSession,
 including Task, Cron, KG, MCP, worktree, and notification tools. Adding those
 requires a future explicit Host capability contract; they are not silently
