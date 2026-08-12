@@ -238,6 +238,7 @@ const Probe = struct {
     host_releases: usize = 0,
     saw_tool_start: bool = false,
     saw_tool_result: bool = false,
+    saw_run_state: bool = false,
 
     fn context(self: *Probe, run_ptr: ?*const wire.RunContextV1) ?sdk.RunContext {
         const run = sdk.validateRunContext(run_ptr) catch return null;
@@ -257,6 +258,7 @@ const Probe = struct {
             .known => |known_event| switch (known_event) {
                 .tool_start => self.saw_tool_start = true,
                 .tool_result => self.saw_tool_result = true,
+                .run_state => self.saw_run_state = true,
                 else => {},
             },
             .unknown => {},
@@ -4059,7 +4061,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     );
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
-    try std.testing.expect(probe.saw_tool_start and probe.saw_tool_result);
+    try std.testing.expect(probe.saw_tool_start and probe.saw_tool_result and probe.saw_run_state);
 
     const body = (server.lastRequest() orelse
         return error.NoRequestCaptured).body();
@@ -4435,7 +4437,7 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
     try std.testing.expectEqual(@as(usize, 1), probe.ui_releases);
     try std.testing.expectEqual(@as(usize, 1), probe.host_calls);
     try std.testing.expectEqual(@as(usize, 1), probe.host_releases);
-    try std.testing.expect(probe.saw_tool_start and probe.saw_tool_result);
+    try std.testing.expect(probe.saw_tool_start and probe.saw_tool_result and probe.saw_run_state);
     const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
     try std.testing.expect(std.mem.indexOf(u8, body, "Yes") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "host-ok") != null);
