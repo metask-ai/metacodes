@@ -176,7 +176,7 @@ fn runGit(a: std.mem.Allocator, cwd: []const u8, args: []const []const u8) bool 
     for (args) |ar| argv.append(a, (a.dupeZ(u8, ar) catch return false).ptr) catch return false;
     argv.append(a, null) catch return false;
     const common = cc.tools_common;
-    const out = common.spawnCaptureWithStderrTimed(argv.items, a, null, 15_000, null, common.MAX_SPAWN_CAPTURE_BYTES) catch return false;
+    const out = common.spawnCaptureWithStderrTimed(argv.items, a, null, 15_000, null, common.MAX_SPAWN_CAPTURE_BYTES, null) catch return false;
     defer a.free(out.stdout);
     defer a.free(out.stderr);
     return out.exit_code == 0;

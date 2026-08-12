@@ -142,7 +142,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             if (ctx.jobs) |registry| {
                 // 后台:profile 文件不能删(进程还在跑),detach
                 if (sandbox_wrap) |*sw| sw.detached = true;
-                const j = try registry.spawnBackground(command);
+                const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
+                const j = try registry.spawnBackground(command, cwd_opt);
                 return try std.fmt.allocPrint(allocator, "{{\"job_id\":\"{s}\",\"status\":\"started\",\"stdout_path\":\"{s}\",\"stderr_path\":\"{s}\"}}", .{ j.id[0..], j.stdout_path, j.stderr_path });
             }
         }
@@ -168,7 +169,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         // 走 job_registry:命令可能自动转后台,届时 profile 文件不能删 → detach。
         // 代价:即便命令同步完成,profile 也泄漏到 TMPDIR(系统/重启清理),换取正确性。
         if (sandbox_wrap) |*sw| sw.detached = true;
-        return try runAutoBackgroundable(allocator, registry, command, timeout_ms, ctx.abort);
+        const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
+        return try runAutoBackgroundable(allocator, registry, command, timeout_ms, ctx.abort, cwd_opt);
     }
 
     // 可移植 shell(复刻 codex):POSIX /bin/sh -c;Windows 原生 PowerShell/cmd,零 git-bash。
@@ -178,7 +180,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer allocator.free(cmd_z);
     var argv: [6]?[*:0]const u8 = undefined;
     shell_mod.deriveExecArgs(shell, cmd_z.ptr, &argv);
-    const out = try common.spawnCaptureWithStderrTimed(argv[0..], allocator, ctx.abort, timeout_ms, ctx.spawn_tick_fn, common.MAX_SPAWN_CAPTURE_BYTES);
+    const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
+    const out = try common.spawnCaptureWithStderrTimed(argv[0..], allocator, ctx.abort, timeout_ms, ctx.spawn_tick_fn, common.MAX_SPAWN_CAPTURE_BYTES, cwd_opt);
     defer allocator.free(out.stdout);
     defer allocator.free(out.stderr);
 
@@ -196,8 +199,9 @@ fn runAutoBackgroundable(
     command: []const u8,
     timeout_ms: u64,
     abort: ?*const @import("../util/abort.zig").AbortSignal,
+    cwd: ?[]const u8,
 ) ![]u8 {
-    const j_entry = try registry.spawnBackground(command);
+    const j_entry = try registry.spawnBackground(command, cwd);
     const job_id = j_entry.id; // 值拷贝，不持指针（registry 可能扩容移动）
 
     const effective_budget = @min(timeout_ms, AUTO_BACKGROUND_MS);
@@ -377,7 +381,7 @@ test "formatAutoBackgrounded 返回 stdout_path/stderr_path 供 Read 直接读" 
     const a = std.testing.allocator;
     var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
     defer registry.deinit();
-    const j = try registry.spawnBackground("echo hi; sleep 30");
+    const j = try registry.spawnBackground("echo hi; sleep 30", null);
     defer registry.kill(j.idSlice()) catch {};
     const result = try formatAutoBackgrounded(a, &j);
     defer a.free(result);

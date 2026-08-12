@@ -559,7 +559,10 @@ pub const App = struct {
 
         // 构造 system prompt（依赖 config.model）。# Using your tools 段按 enabled_tool_names
         // 动态裁剪（对应 cc getUsingYourToolsSection(enabledTools)）。失败仅 log，保持 null。
-        app.system_prompt = system_prompt_mod.buildFull(allocator, app.config.model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady()) catch |err| blk: {
+        // 环境段 cwd 用进程 cwd(CLI 语义);Session 库消费方用 workspace.root(见 agent_session)。
+        const cli_cwd = @import("util/fs.zig").getCwd(allocator) catch "";
+        defer if (cli_cwd.len > 0) allocator.free(cli_cwd);
+        app.system_prompt = system_prompt_mod.buildFull(allocator, app.config.model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), cli_cwd) catch |err| blk: {
             @import("util/log.zig").warn("sysprompt", "build failed: {s} (continuing without system prompt)", .{@errorName(err)});
             break :blk null;
         };
@@ -784,7 +787,9 @@ pub const App = struct {
         errdefer if (previous_model_copy) |m| app.allocator.free(m);
 
         const sp_mod = @import("core/system_prompt.zig");
-        const new_system_prompt = sp_mod.buildFull(app.allocator, model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady()) catch null;
+        const sw_cwd = @import("util/fs.zig").getCwd(app.allocator) catch "";
+        defer if (sw_cwd.len > 0) app.allocator.free(sw_cwd);
+        const new_system_prompt = sp_mod.buildFull(app.allocator, model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), sw_cwd) catch null;
 
         // U3:先同步全部 model 值镜像(seam,不含 config.model=启动快照/system_prompt=派生重建/
         // usage anchor=作废重建),**再** free 旧 model_switch_owned。

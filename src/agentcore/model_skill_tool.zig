@@ -390,6 +390,17 @@ pub const Environment = struct {
                 .host_session_ctx = host_ctx,
             } else null;
 
+        // 缺陷 A 修复:子 Agent 系统提示 = 静态字面量 + 环境段(cwd=workspace.root)。
+        // 与 abi_v1.zig 共用 buildSubagentSystemPrompt,确保两路径一致。
+        const sp_mod = @import("../core/system_prompt.zig");
+        const subagent_system_prompt = sp_mod.buildSubagentSystemPrompt(
+            self.allocator,
+            self.session.model,
+            self.session.workspace.root,
+        ) catch "You are a subagent. Complete the task and return a concise final answer.\n";
+        defer if (std.mem.indexOf(u8, subagent_system_prompt, "Environment") != null)
+            self.allocator.free(subagent_system_prompt);
+
         const child = core.subagent.spawnAgentSink(
             self.allocator,
             self.session.provider.provider(),
@@ -400,7 +411,7 @@ pub const Environment = struct {
             activation.rendered_body,
             .{
                 .max_turns = self.max_turns,
-                .system_prompt = "You are a subagent. Complete the task and return a concise final answer.\n",
+                .system_prompt = subagent_system_prompt,
                 .session = self.identity.session_id,
                 .agent_depth = child_depth,
                 .tool_dispatcher = child_environment.dispatcher(),

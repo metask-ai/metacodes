@@ -446,7 +446,7 @@ test "L2 KG governance: freshness and contradiction contract enters the actual A
     defer client.deinit();
 
     const names = [_][]const u8{ "KgRemember", "KgRecall", "KgContext", "TaskList", "TaskGet", "TaskUpdate" };
-    const system_prompt = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &names, "", true);
+    const system_prompt = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &names, "", true, "/tmp");
     defer a.free(system_prompt);
     // 生产 App 用 session arena 承载 defs + describe_fn 动态描述；测试保持同一生命周期，
     // 避免只 free defs slice 却漏掉各工具 owned description。
@@ -2432,7 +2432,7 @@ test "L2 KG experience feedback: claim exposes verified prior execution before w
     defer defs_arena.deinit();
     var prompt_context = cc.tools.PromptContext{ .enabled_tool_names = &enabled };
     const defs = try cc.tools.toToolDefinitionsFull(defs_arena.allocator(), null, &prompt_context);
-    const system_prompt = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &enabled, "", true);
+    const system_prompt = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &enabled, "", true, "/tmp");
     defer a.free(system_prompt);
     const permission = cc.permission.createContext(.bypass_permissions, a);
     var writer = cc.writer_backend.WriterBackend.initNull();

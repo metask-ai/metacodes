@@ -219,6 +219,9 @@ fn cloneValue(allocator: std.mem.Allocator, source: std.json.Value) std.mem.Allo
 
 pub const Selection = struct {
     allocator: std.mem.Allocator,
+    /// 持有 redescribeForContext 重写后的描述串(混合 comptime 静态串 + arena 新串)。
+    /// deinit 时先释放 arena(描述串),再释放 entries/definitions slice。
+    arena: *std.heap.ArenaAllocator,
     entries: []*const Entry,
     definitions: []json.ToolDefinition,
 
@@ -240,14 +243,40 @@ pub const Selection = struct {
         const entries_owned = try selected.toOwnedSlice(allocator);
         errdefer allocator.free(entries_owned);
         const definitions_owned = try definitions.toOwnedSlice(allocator);
+
+        // 缺陷 A 修复:调 redescribeForContext 就地重写描述为平台化动态长描述。
+        // 对 Host 工具(getTool 返 null)和无 describe_fn 的工具自动跳过,恰好"Host 描述不变"。
+        // 不调 overrideToolDesc(env A/B)——库不应受宿主进程环境变量摆布。
+        // 必须用 arena:definitions[i].description 会混三类指针(comptime 静态 / catalog arena /
+        // redescribe 新分配),逐个 free 会崩溃,arena 统一释放。
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer {
+            arena.deinit();
+            allocator.destroy(arena);
+        }
+
+        // PromptContext:enabled_tool_names 用 allowlist(让 USING_TOOLS 段按集裁剪)。
+        // 其余字段默认值对齐 CLI 路径(prompt_context.zig 默认)。
+        var prompt_ctx: @import("../tools.zig").PromptContext = .{};
+        const allowlist_dup = try arena.allocator().alloc([]const u8, allowlist.len);
+        for (allowlist, 0..) |n, i| allowlist_dup[i] = n; // 借用,不 dupe(arena 释放时切片失效,但 Selection 持有者生命周期更长——这里 allowlist 借调用方的,Selection 期间有效)
+        prompt_ctx.enabled_tool_names = allowlist_dup;
+
+        try @import("../tools.zig").redescribeForContext(arena.allocator(), definitions_owned, &prompt_ctx);
+
         return .{
             .allocator = allocator,
+            .arena = arena,
             .entries = entries_owned,
             .definitions = definitions_owned,
         };
     }
 
     pub fn deinit(self: *Selection) void {
+        // 顺序:先释放 arena(描述串指针指向的内存),再释放 slice(描述串已失效,free slice 本身)。
+        self.arena.deinit();
+        self.allocator.destroy(self.arena);
         self.allocator.free(self.entries);
         self.allocator.free(self.definitions);
         self.* = undefined;
@@ -347,6 +376,57 @@ test "Selection rejects names outside Runtime and dispatches only selected entri
     defer std.testing.allocator.free(names);
     try std.testing.expectEqualStrings("Read", names);
     try std.testing.expect(tools.suggestToolName(&ctx, "Grepp") == null);
+}
+
+test "Selection redescribes builtin tool descriptions via describe_fn (缺陷 A)" {
+    // 缺陷 A:Selection.init 必须调 redescribeForContext,让 describe_fn 生成平台化动态长描述,
+    // 而非静态短句(builtin.description)。Bash 的 describe_fn 输出 "Executes a given bash command"(POSIX)
+    // 或 "Runs a PowerShell command"(Windows),静态短句是 "Execute a bash command"。
+    var catalog = try Catalog.initBuiltins(std.testing.allocator, &.{ "Read", "Bash", "Grep" });
+    defer catalog.deinit();
+    var selection = try Selection.init(std.testing.allocator, &catalog, &.{ "Read", "Bash", "Grep" });
+    defer selection.deinit();
+
+    // 找 Bash 的 definition,断言描述已被 describe_fn 重写为长描述。
+    var bash_desc: []const u8 = "";
+    for (selection.definitions) |d| {
+        if (std.mem.eql(u8, d.name, "Bash")) bash_desc = d.description;
+    }
+    try std.testing.expect(bash_desc.len > 0);
+    // 静态短句是 "Execute a bash command";describe_fn 输出 "Executes a given bash command"(POSIX)
+    // 或 "Runs a PowerShell command"(Windows)。断言不再是静态短句。
+    try std.testing.expect(!std.mem.eql(u8, bash_desc, "Execute a bash command"));
+    // POSIX 上含 "Executes a given bash command";Windows 上含 "PowerShell"。
+    if (@import("builtin").os.tag == .windows) {
+        try std.testing.expect(std.mem.indexOf(u8, bash_desc, "PowerShell") != null);
+    } else {
+        try std.testing.expect(std.mem.indexOf(u8, bash_desc, "Executes a given bash command") != null);
+    }
+}
+
+test "Selection preserves Host tool descriptions (redescribe skips unknown tools)" {
+    // redescribeForContext 对 Host 工具(getTool 返 null)跳过,描述保持 Catalog clone 的原样。
+    // 这确保 Host 工具描述不被库改写——描述所有权归 Host。
+    var probe = HostProbe{};
+    const host_def = json.ToolDefinition{
+        .name = "host_probe",
+        .description = "Host-defined probe description",
+        .input_schema = .{ .type = .object, .properties = .empty, .required = .empty },
+    };
+    const host_tools = [_]HostSyncTool{
+        .{ .definition = host_def, .ctx = @ptrCast(&probe), .execute = HostProbe.execute },
+    };
+    var catalog = try Catalog.init(std.testing.allocator, &.{"Read"}, &host_tools);
+    defer catalog.deinit();
+    var selection = try Selection.init(std.testing.allocator, &catalog, &.{ "Read", "host_probe" });
+    defer selection.deinit();
+
+    for (selection.definitions) |d| {
+        if (std.mem.eql(u8, d.name, "host_probe")) {
+            // Host 工具描述保持原样,未被 redescribe 改写
+            try std.testing.expectEqualStrings("Host-defined probe description", d.description);
+        }
+    }
 }
 
 const HostProbe = struct {

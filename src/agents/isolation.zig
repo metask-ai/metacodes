@@ -109,7 +109,7 @@ fn gitOutput(
     try appendZ(allocator, &argv, cwd);
     for (args) |arg| try appendZ(allocator, &argv, arg);
     try argv.append(allocator, null);
-    const out = try common.spawnCaptureWithStderrTimed(argv.items, allocator, abort, 30_000, null, common.MAX_SPAWN_CAPTURE_BYTES);
+    const out = try common.spawnCaptureWithStderrTimed(argv.items, allocator, abort, 30_000, null, common.MAX_SPAWN_CAPTURE_BYTES, null);
     defer allocator.free(out.stderr);
     if (out.exit_code != 0) {
         allocator.free(out.stdout);

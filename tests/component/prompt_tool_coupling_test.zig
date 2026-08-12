@@ -236,14 +236,14 @@ test "L2: long-horizon arm gates TinyKG tools as one typed treatment" {
     } else false);
 
     const enabled_names = [_][]const u8{ "TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "KgRecall", "KgContext", "KgRemember" };
-    const tinykg_prompt = try cc.system_prompt.buildFull(a, "glm-5.2", null, null, &enabled_names, "", true);
+    const tinykg_prompt = try cc.system_prompt.buildFull(a, "glm-5.2", null, null, &enabled_names, "", true, "/tmp");
     defer a.free(tinykg_prompt);
     try std.testing.expect(std.mem.indexOf(u8, tinykg_prompt, "ACTIVATE:") != null);
     try std.testing.expect(std.mem.indexOf(u8, tinykg_prompt, "create exactly one persistent lifecycle anchor") != null);
     try std.testing.expect(std.mem.indexOf(u8, tinykg_prompt, "Require its result to contain a `kg-*` id and `persisted: true`") != null);
     try std.testing.expect(std.mem.indexOf(u8, tinykg_prompt, "after verifying the final artifacts") != null);
 
-    const baseline_prompt = try cc.system_prompt.buildFull(a, "glm-5.2", null, null, &enabled_names, "", false);
+    const baseline_prompt = try cc.system_prompt.buildFull(a, "glm-5.2", null, null, &enabled_names, "", false, "/tmp");
     defer a.free(baseline_prompt);
     try std.testing.expect(std.mem.indexOf(u8, baseline_prompt, "ACTIVATE:") == null);
 }
@@ -254,7 +254,7 @@ test "L2: buildUsingTools 段按工具集裁剪" {
 
     // 全量:含 Grep/Glob/TaskCreate 子条
     const full_names = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Grep", "Bash", "TaskCreate" };
-    const sp_full = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &full_names, "", false);
+    const sp_full = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &full_names, "", false, "/tmp");
     defer a.free(sp_full);
     try std.testing.expect(std.mem.indexOf(u8, sp_full, "use Grep instead of grep") != null);
     try std.testing.expect(std.mem.indexOf(u8, sp_full, "use Glob instead of find") != null);
@@ -262,7 +262,7 @@ test "L2: buildUsingTools 段按工具集裁剪" {
 
     // 裁剪:无 Grep / 无 TaskCreate
     const slim_names = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Bash" };
-    const sp_slim = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &slim_names, "", false);
+    const sp_slim = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &slim_names, "", false, "/tmp");
     defer a.free(sp_slim);
     try std.testing.expect(std.mem.indexOf(u8, sp_slim, "use Grep instead of grep") == null);
     try std.testing.expect(std.mem.indexOf(u8, sp_slim, "use Glob instead of find") != null); // Glob 仍在

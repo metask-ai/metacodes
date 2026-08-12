@@ -894,6 +894,17 @@ const ForkExecutorContext = struct {
         else
             self.activation.frame.executionPolicy();
 
+        // 缺陷 A 修复:子 Agent 系统提示 = 静态字面量 + 环境段(cwd=workspace.root)。
+        // 与 model_skill_tool.zig 共用 buildSubagentSystemPrompt,确保两路径一致。
+        const sp_mod = @import("../core/system_prompt.zig");
+        const subagent_system_prompt = sp_mod.buildSubagentSystemPrompt(
+            output_allocator,
+            self.session.model,
+            self.session.workspace.root,
+        ) catch "You are a subagent. Complete the task and return a concise final answer.\n";
+        defer if (std.mem.indexOf(u8, subagent_system_prompt, "Environment") != null)
+            output_allocator.free(subagent_system_prompt);
+
         const child = core.subagent.spawnAgentSink(
             output_allocator,
             self.session.provider.provider(),
@@ -904,7 +915,7 @@ const ForkExecutorContext = struct {
             self.activation.rendered_body,
             .{
                 .max_turns = self.max_turns,
-                .system_prompt = "You are a subagent. Complete the task and return a concise final answer.\n",
+                .system_prompt = subagent_system_prompt,
                 .session = identity.session_id,
                 .agent_depth = child_depth,
                 .tool_dispatcher = dispatcher,
