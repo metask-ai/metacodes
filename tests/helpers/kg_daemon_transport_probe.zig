@@ -23,14 +23,14 @@ pub fn main(init: std.process.Init) !void {
             const stdout_file = std.Io.File.stdout();
             var config_buffer: [512]u8 = undefined;
             var config_writer = stdout_file.writer(init.io, &config_buffer);
-            try config_writer.interface.writeAll("canonical_remote_config=ready\n");
+            try config_writer.interface.writeAll("metacodes_local_daemon_config=ready\n");
             try config_writer.interface.flush();
         } else {
             try std.testing.expect(!client.ready);
             const stdout_file = std.Io.File.stdout();
             var config_buffer: [512]u8 = undefined;
             var config_writer = stdout_file.writer(init.io, &config_buffer);
-            try config_writer.interface.writeAll("unsafe_remote_config=degraded\n");
+            try config_writer.interface.writeAll("unsafe_local_daemon_config=degraded\n");
             try config_writer.interface.flush();
         }
         return;

@@ -625,8 +625,8 @@
         "counterexample": true
       },
       "sensor_ok": true,
-      "declared": 6,
-      "covered": 6,
+      "declared": 7,
+      "covered": 7,
       "feedback_status": "passed",
       "expected_signal": "admit_release",
       "expected_state": "compliant"
@@ -645,8 +645,8 @@
         "counterexample": true
       },
       "sensor_ok": true,
-      "declared": 6,
-      "covered": 5,
+      "declared": 7,
+      "covered": 6,
       "feedback_status": "passed",
       "expected_signal": "block_release",
       "expected_state": "blocked"
@@ -665,8 +665,8 @@
         "counterexample": true
       },
       "sensor_ok": true,
-      "declared": 6,
-      "covered": 6,
+      "declared": 7,
+      "covered": 7,
       "feedback_status": "passed",
       "expected_signal": "block_release",
       "expected_state": "blocked"
@@ -685,8 +685,8 @@
         "counterexample": true
       },
       "sensor_ok": true,
-      "declared": 6,
-      "covered": 6,
+      "declared": 7,
+      "covered": 7,
       "feedback_status": "failed",
       "expected_signal": "block_release",
       "expected_state": "blocked"
@@ -705,8 +705,8 @@
         "counterexample": true
       },
       "sensor_ok": false,
-      "declared": 6,
-      "covered": 6,
+      "declared": 7,
+      "covered": 7,
       "feedback_status": "passed",
       "expected_signal": "block_release",
       "expected_state": "blocked"

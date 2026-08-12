@@ -723,6 +723,8 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         self.assertIn(
             'test -z "${TINYKG_REMOTE_URL+x}${TINYKG_API_KEY+x}'
             '${TINYKG_REMOTE_EXPECTED_BUILD_ID+x}${TINYKG_REMOTE_CONFIG+x}'
+            '${METACODES_KG_CONFIG+x}${METACODES_KG_URL+x}${METACODES_KG_API_KEY+x}'
+            '${METACODES_KG_EXPECTED_BUILD_ID+x}${METACODES_KG_EXPECTED_SCHEMA_DIGEST+x}'
             '${METASK_API_KEY+x}" || exit 84',
             command_fragment,
         )

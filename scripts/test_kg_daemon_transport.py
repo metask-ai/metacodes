@@ -144,6 +144,20 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run_probe(binary: str, url: str, action: str, *, env: dict[str, str] | None = None) -> str:
+    child_env = dict(os.environ)
+    for key in (
+        "METACODES_KG_CONFIG",
+        "METACODES_KG_URL",
+        "METACODES_KG_API_KEY",
+        "METACODES_KG_EXPECTED_BUILD_ID",
+        "METACODES_KG_EXPECTED_SCHEMA_DIGEST",
+        "TINYKG_REMOTE_CONFIG",
+        "TINYKG_REMOTE_URL",
+        "TINYKG_API_KEY",
+        "TINYKG_REMOTE_EXPECTED_BUILD_ID",
+    ):
+        child_env.pop(key, None)
+    child_env.update(env or {})
     result = subprocess.run(
         [binary, url, API_KEY, BUILD_ID, SCHEMA_DIGEST, action],
         check=True,
@@ -151,7 +165,7 @@ def run_probe(binary: str, url: str, action: str, *, env: dict[str, str] | None 
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=15,
-        env={**os.environ, **(env or {})},
+        env=child_env,
     )
     return result.stdout
 
@@ -179,30 +193,48 @@ def main() -> int:
         assert ACTOR.markdown_uploads[0]["sourceKey"] == "000000000000002a"
         assert "path" not in ACTOR.markdown_uploads[0]
         with tempfile.TemporaryDirectory() as config_dir:
-            config_path = os.path.join(config_dir, "remote.json")
+            config_path = os.path.join(config_dir, "metacodes-daemon.json")
             with open(config_path, "w", encoding="utf-8") as handle:
                 json.dump({"url": url, "api_key": API_KEY, "expected_build_id": BUILD_ID}, handle)
             os.chmod(config_path, 0o600)
+            skill_config_path = os.path.join(config_dir, "tinykg-skill-remote.json")
+            with open(skill_config_path, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "url": "http://127.0.0.1:1",
+                    "api_key": "must-not-be-used",
+                    "expected_build_id": "sha256:" + "f" * 64,
+                }, handle)
+            os.chmod(skill_config_path, 0o600)
             configured = run_probe(
                 args.probe, url, "client-config",
-                env={"TINYKG_REMOTE_CONFIG": config_path},
+                env={
+                    "METACODES_KG_CONFIG": config_path,
+                    "TINYKG_REMOTE_CONFIG": skill_config_path,
+                },
             )
-            assert "canonical_remote_config=ready" in configured
+            assert "metacodes_local_daemon_config=ready" in configured
+            before_skill_only = ACTOR.request_count
+            skill_only = run_probe(
+                args.probe, url, "client-config-degraded",
+                env={"TINYKG_REMOTE_CONFIG": skill_config_path},
+            )
+            assert "unsafe_local_daemon_config=degraded" in skill_only
+            assert ACTOR.request_count == before_skill_only
             before_invalid = ACTOR.request_count
             with open(config_path, "w", encoding="utf-8") as handle:
                 handle.write('{"url":')
             degraded = run_probe(
                 args.probe, url, "client-config-degraded",
-                env={"TINYKG_REMOTE_CONFIG": config_path},
+                env={"METACODES_KG_CONFIG": config_path},
             )
-            assert "unsafe_remote_config=degraded" in degraded
+            assert "unsafe_local_daemon_config=degraded" in degraded
             assert ACTOR.request_count == before_invalid
             os.unlink(config_path)
             missing = run_probe(
                 args.probe, url, "client-config-degraded",
-                env={"TINYKG_REMOTE_CONFIG": config_path},
+                env={"METACODES_KG_CONFIG": config_path},
             )
-            assert "unsafe_remote_config=degraded" in missing
+            assert "unsafe_local_daemon_config=degraded" in missing
             assert ACTOR.request_count == before_invalid
         server.mode = "backpressure"  # type: ignore[attr-defined]
         assert "backpressure=observed" in run_probe(args.probe, url, "backpressure")
@@ -248,7 +280,8 @@ def main() -> int:
         print(f"markdown_uploads={len(ACTOR.markdown_uploads)}")
         print("write_transport_retries=0")
         print("ambiguous_write_latch=pass")
-        print("canonical_remote_config=pass")
+        print("metacodes_local_daemon_config=pass")
+        print("skill_remote_config_ignored=pass")
         return 0
     finally:
         if thread.is_alive():

@@ -257,6 +257,11 @@ class LocalTinyKgNativeTest(unittest.TestCase):
                 "TINYKG_API_KEY": "must-not-reach-child",
                 "TINYKG_REMOTE_EXPECTED_BUILD_ID": "must-not-reach-child",
                 "TINYKG_REMOTE_CONFIG": str(remote_config),
+                "METACODES_KG_CONFIG": str(remote_config),
+                "METACODES_KG_URL": "http://127.0.0.1:1",
+                "METACODES_KG_API_KEY": "must-not-reach-child",
+                "METACODES_KG_EXPECTED_BUILD_ID": "must-not-reach-child",
+                "METACODES_KG_EXPECTED_SCHEMA_DIGEST": "must-not-reach-child",
             }
             with mock.patch.dict(os.environ, poisoned, clear=False):
                 trace = run_local_tinykg_smoke(

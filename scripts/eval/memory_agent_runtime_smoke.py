@@ -475,9 +475,17 @@ def main(argv: list[str] | None = None) -> int:
         remote_store.write_text("remote-store-must-not-change\n", encoding="utf-8")
         before_config = hashlib.sha256(remote_config.read_bytes()).hexdigest()
         before_store = hashlib.sha256(remote_store.read_bytes()).hexdigest()
-        previous = {key: os.environ.get(key) for key in ("TINYKG_REMOTE_CONFIG", "TINYKG_STORE")}
-        os.environ["TINYKG_REMOTE_CONFIG"] = str(remote_config)
-        os.environ["TINYKG_STORE"] = str(remote_store)
+        isolation_sentinels = {
+            "TINYKG_REMOTE_CONFIG": str(remote_config),
+            "TINYKG_STORE": str(remote_store),
+            "METACODES_KG_CONFIG": str(remote_config),
+            "METACODES_KG_URL": "http://127.0.0.1:1",
+            "METACODES_KG_API_KEY": "local-daemon-must-not-reach-child",
+            "METACODES_KG_EXPECTED_BUILD_ID": "sha256:" + "f" * 64,
+            "METACODES_KG_EXPECTED_SCHEMA_DIGEST": "e" * 64,
+        }
+        previous = {key: os.environ.get(key) for key in isolation_sentinels}
+        os.environ.update(isolation_sentinels)
         try:
             _run_fd_auth_https_environment_regression(root, metacodes)
             _run_fd_auth_seatbelt_smoke(root, metacodes)

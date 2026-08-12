@@ -2530,6 +2530,11 @@ def observe_memory_local_store_isolation(repo: Path) -> Observation:
         "TINYKG_API_KEY",
         "TINYKG_REMOTE_EXPECTED_BUILD_ID",
         "TINYKG_REMOTE_CONFIG",
+        "METACODES_KG_CONFIG",
+        "METACODES_KG_URL",
+        "METACODES_KG_API_KEY",
+        "METACODES_KG_EXPECTED_BUILD_ID",
+        "METACODES_KG_EXPECTED_SCHEMA_DIGEST",
     }
 
     def hash_hex(value: Any) -> bool:
@@ -2657,6 +2662,7 @@ def observe_memory_local_store_isolation(repo: Path) -> Observation:
                 marker in local_environment
                 for marker in (
                     'if not key.startswith("TINYKG_")',
+                    'and not key.startswith("METACODES_KG_")',
                     'key not in {"HOME", "TMPDIR", "TMP", "TEMP"}',
                     '"HOME": str(self.sealed_home)',
                     '"TMPDIR": str(self.child_tmp)',
@@ -2665,7 +2671,7 @@ def observe_memory_local_store_isolation(repo: Path) -> Observation:
             "runtime rejects leaked TinyKG keys": all(
                 marker in local_command
                 for marker in (
-                    'key.startswith("TINYKG_")',
+                    'key.startswith("TINYKG_") or key.startswith("METACODES_KG_")',
                     "contains forbidden keys",
                 )
             ),
@@ -3701,16 +3707,23 @@ def observe_daemon_transport(repo: Path) -> Observation:
     ensure_ready = zig_function_slice(sources["client"], "ensureReady") or ""
     remote_run = zig_function_slice(sources["client"], "runCheckedRetry") or ""
     policy = zig_function_slice(sources["transport"], "postWithPolicy") or ""
-    remote_config = zig_function_slice(sources["client"], "initRemoteTransport") or ""
+    daemon_config = zig_function_slice(sources["client"], "initDaemonTransport") or ""
     parse = zig_function_slice(sources["transport"], "parseResponse") or ""
     deadline = zig_function_slice(sources["transport"], "postBeforeDeadline") or ""
     markdown = zig_function_slice(sources["transport"], "importMarkdown") or ""
     step = build_step_slice(sources["build"], "test:kg-daemon-transport") or ""
 
     obligations = {
-        "authenticated_remote_default": all(marker in client_init + remote_config for marker in (
-            "TINYKG_REMOTE_URL", "TINYKG_API_KEY", "TINYKG_REMOTE_EXPECTED_BUILD_ID",
-            "remoteConfigPath", "transport_mod.WebTransport.init", ".unconfigured",
+        "authenticated_local_default_and_skill_isolation": all((
+            all(marker in client_init + daemon_config for marker in (
+                "METACODES_KG_CONFIG", "METACODES_KG_URL", "METACODES_KG_API_KEY",
+                "METACODES_KG_EXPECTED_BUILD_ID", "daemonConfigPath",
+                "transport_mod.WebTransport.init", ".unconfigured",
+            )),
+            'envGet("TINYKG_REMOTE_CONFIG")' not in daemon_config,
+            'envGet("TINYKG_REMOTE_URL")' not in daemon_config,
+            "skill_remote_config_ignored=pass" in sources["runtime"],
+            "metacodes_local_daemon_config=pass" in sources["runtime"],
         )),
         "explicit_exclusive_cli_compatibility": all(marker in client_init for marker in (
             "opts.exclusive_cli", 'std.mem.eql(u8, mode, "cli-exclusive")',
@@ -3722,8 +3735,8 @@ def observe_daemon_transport(repo: Path) -> Observation:
             ".unconfigured" in ensure_ready,
             "未打开本地 Store" in ensure_ready,
             "if (!self.ready)" in remote_run,
-            "self.transport == .remote" in remote_run,
-            "self.transport.remote.run(args[0], args[2..]" in remote_run,
+            "self.transport == .daemon" in remote_run,
+            "self.transport.daemon.run(args[0], args[2..]" in remote_run,
             '@import("../storage' not in sources["transport"],
         )),
         "request_identity_and_no_write_retry": all(marker in policy + parse + sources["runtime"] for marker in (

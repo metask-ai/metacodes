@@ -131,7 +131,8 @@ def buildTestReleaseAllowed
   buildTestSignal topology observation == .admitRelease
 
 /-- The memory-benchmark storage boundary has seven non-substitutable links:
-direct invocation of a hash-pinned TinyKG binary, a sealed child environment,
+direct invocation of a hash-pinned TinyKG binary, a sealed child environment
+that removes both Skill-remote and Metacodes-daemon authority,
 fresh run-local path containment, a raw store-digest read guard, native L2
 sentinel/fault feedback across all three adapters, a provenance-complete
 three-trace pin, and explicit `cli-exclusive` routing for the native runtime
@@ -152,8 +153,9 @@ def memoryIsolationReleaseAllowed
     (topology : Topology) (observation : Observation) : Bool :=
   memoryIsolationSignal topology observation == .admitRelease
 
-/-- The shared TinyKG daemon transport has ten non-substitutable obligations:
-authenticated remote-by-default routing, explicit exclusive CLI compatibility,
+/-- The local-runtime TinyKG daemon transport has ten non-substitutable obligations:
+Metacodes-owned authenticated routing with no remote Skill-config inheritance,
+explicit exclusive CLI compatibility,
 no shared raw Store fallback, request identity with no transport-level write
 retry, process-shared latched ambiguous writes, generation sessions, an end-to-end wall-clock
 deadline, bounded backpressure/unavailability, uploaded Markdown bytes rather than client paths,

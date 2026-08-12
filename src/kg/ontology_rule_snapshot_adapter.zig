@@ -59,17 +59,19 @@ pub const ReadTransport = struct {
         return self.build_sha256_fn(self.ptr);
     }
 
-    pub fn snapshot(
+    pub fn snapshotIdentity(
         self: ReadTransport,
         allocator: std.mem.Allocator,
-        request: Request,
+        project_node_id: u64,
+        project_sha256: [64]u8,
+        project_key: []const u8,
     ) ![]u8 {
         return self.snapshot_fn(
             self.ptr,
             allocator,
-            request.project_node_id,
-            request.project_sha256,
-            request.project_key,
+            project_node_id,
+            project_sha256,
+            project_key,
         );
     }
 };
@@ -90,7 +92,7 @@ pub const KgClientTransport = struct {
     }
 
     fn buildSha256(ptr: *anyopaque) ![64]u8 {
-        return cast(ptr).client.binarySha256();
+        return cast(ptr).client.controlPlaneBuildSha256();
     }
 
     fn snapshot(
@@ -113,12 +115,15 @@ pub const KgClientTransport = struct {
 
 pub const Prepared = struct {
     allocator: std.mem.Allocator,
+    project_node_id: u64,
+    project_key: []u8,
     source_snapshot: []u8,
     rendered_snapshot: []u8,
     projected: projection.Projection,
 
     pub fn deinit(self: *Prepared) void {
         self.projected.deinit();
+        self.allocator.free(self.project_key);
         self.allocator.free(self.source_snapshot);
         self.allocator.free(self.rendered_snapshot);
         self.* = undefined;
@@ -207,7 +212,12 @@ pub fn prepare(
     try validateRequest(request);
     const build_before = try transport.buildSha256();
     try requireNonzeroHex(build_before);
-    const source = try transport.snapshot(allocator, request);
+    const source = try transport.snapshotIdentity(
+        allocator,
+        request.project_node_id,
+        request.project_sha256,
+        request.project_key,
+    );
     errdefer allocator.free(source);
     var parsed = try parseSource(allocator, source, request, build_before);
     defer parsed.deinit();
@@ -242,7 +252,12 @@ pub fn prepare(
     );
     errdefer projected.deinit();
 
-    const reobserved = try transport.snapshot(allocator, request);
+    const reobserved = try transport.snapshotIdentity(
+        allocator,
+        request.project_node_id,
+        request.project_sha256,
+        request.project_key,
+    );
     defer allocator.free(reobserved);
     if (!std.mem.eql(u8, source, reobserved)) return error.OntologySourceDrift;
     const build_after = try transport.buildSha256();
@@ -250,8 +265,12 @@ pub fn prepare(
     var reparsed = try parseSource(allocator, reobserved, request, build_after);
     reparsed.deinit();
 
+    const project_key = try allocator.dupe(u8, request.project_key);
+    errdefer allocator.free(project_key);
     return .{
         .allocator = allocator,
+        .project_node_id = request.project_node_id,
+        .project_key = project_key,
         .source_snapshot = source,
         .rendered_snapshot = rendered.bytes,
         .projected = projected,
@@ -291,6 +310,39 @@ pub fn execute(
     var prepared = try prepare(allocator, transport, request);
     defer prepared.deinit();
     return persist(allocator, session_dir, &prepared);
+}
+
+/// Re-observe the exact canonical TinyKG source after an external operation
+/// such as rule authoring.  The initial validated bytes are the authority: a
+/// matching revision string with different facts is still rejected.  Two
+/// reads around the build identity close replacement/drift windows without
+/// writing to TinyKG.
+pub fn reobservePrepared(
+    allocator: std.mem.Allocator,
+    transport: ReadTransport,
+    prepared: *const Prepared,
+) !void {
+    const first = try transport.snapshotIdentity(
+        allocator,
+        prepared.project_node_id,
+        prepared.projected.project_sha256,
+        prepared.project_key,
+    );
+    defer allocator.free(first);
+    if (!std.mem.eql(u8, first, prepared.source_snapshot))
+        return error.OntologySourceDrift;
+    const build = try transport.buildSha256();
+    if (!std.mem.eql(u8, &build, &prepared.projected.tinykg_build_sha256))
+        return error.TinyKgBuildDrift;
+    const second = try transport.snapshotIdentity(
+        allocator,
+        prepared.project_node_id,
+        prepared.projected.project_sha256,
+        prepared.project_key,
+    );
+    defer allocator.free(second);
+    if (!std.mem.eql(u8, second, prepared.source_snapshot))
+        return error.OntologySourceDrift;
 }
 
 fn parseSource(

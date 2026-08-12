@@ -1,8 +1,10 @@
 //! TinyKG 集成客户端(设计:KG_DESIGN v3-final §1 D1/D2、§6)。
 //!
 //! tinykg = 跨会话真相源(记忆 + 计划任务 DAG),本模块是 metacodes 侧唯一入口。
-//! 默认 transport 是 authenticated TinyKG Web → one tinykgd → one StoreActor；
-//! 本地 CLI 只供显式 exclusive-store compatibility 与隔离测试使用。
+//! 默认 transport 是 Metacodes-owned local authenticated TinyKG Web → one
+//! tinykgd → one StoreActor；本地 CLI 只供显式 exclusive-store compatibility
+//! 与隔离测试使用。TinyKG Skill 的远程配置属于跨设备长期记忆平面，本
+//! runtime 客户端绝不隐式读取或复用它。
 //!
 //! 纪律(全部实证,见设计 §9 原语核对表):
 //! - spawn 超时 35s **必须大于** tinykg 30s 目录锁超时——绝不在锁等待中 killpg
@@ -167,7 +169,7 @@ pub const TaskStatus = enum {
 
 pub const KgClient = struct {
     const Transport = union(enum) {
-        remote: transport_mod.WebTransport,
+        daemon: transport_mod.WebTransport,
         exclusive_cli,
         unconfigured,
     };
@@ -242,7 +244,7 @@ pub const KgClient = struct {
 
     pub fn deinit(self: *KgClient) void {
         switch (self.transport) {
-            .remote => |*remote| remote.deinit(),
+            .daemon => |*daemon| daemon.deinit(),
             .exclusive_cli, .unconfigured => {},
         }
         if (self.bin_path) |p| self.allocator.free(p);
@@ -277,10 +279,10 @@ pub const KgClient = struct {
         /// App supplies process IO for authenticated Web transport.
         io: ?std.Io = null,
         /// Test/config injection. Production normally reads these env vars.
-        remote_url: ?[]const u8 = null,
-        remote_api_key: ?[]const u8 = null,
-        remote_expected_build_id: ?[]const u8 = null,
-        remote_expected_schema_digest: ?[]const u8 = null,
+        daemon_url: ?[]const u8 = null,
+        daemon_api_key: ?[]const u8 = null,
+        daemon_expected_build_id: ?[]const u8 = null,
+        daemon_expected_schema_digest: ?[]const u8 = null,
         /// Explicit compatibility escape hatch. It must own an isolated Store.
         exclusive_cli: bool = false,
     };
@@ -304,11 +306,11 @@ pub const KgClient = struct {
         const bin = if (use_cli) try resolveBinPath(allocator, opts) else null;
         const transport: Transport = if (use_cli)
             .exclusive_cli
-        else remote: {
-            const io = opts.io orelse break :remote .unconfigured;
-            const configured = initRemoteTransport(allocator, io, opts) catch
-                break :remote .unconfigured;
-            break :remote if (configured) |value| .{ .remote = value } else .unconfigured;
+        else daemon: {
+            const io = opts.io orelse break :daemon .unconfigured;
+            const configured = initDaemonTransport(allocator, io, opts) catch
+                break :daemon .unconfigured;
+            break :daemon if (configured) |value| .{ .daemon = value } else .unconfigured;
         };
         return .{
             .allocator = allocator,
@@ -329,15 +331,15 @@ pub const KgClient = struct {
     /// 客户端的执行,数据一致。self 的 store_path/domain/bin_path init 后不可变,并发读安全。
     /// 返回的 client 由调用线程 own(deinit 释放);未 ensureReady——调用方自行 ensureReady。
     pub fn cloneForThread(self: *const KgClient, allocator: std.mem.Allocator, home: []const u8) !KgClient {
-        if (self.transport == .remote) {
+        if (self.transport == .daemon) {
             const domain = try allocator.dupe(u8, self.domain);
             errdefer allocator.free(domain);
             const store = try allocator.dupe(u8, "daemon-owned");
             errdefer allocator.free(store);
-            const remote = try self.transport.remote.cloneForSession(allocator);
+            const daemon = try self.transport.daemon.cloneForSession(allocator);
             return .{
                 .allocator = allocator,
-                .transport = .{ .remote = remote },
+                .transport = .{ .daemon = daemon },
                 .bin_path = null,
                 .store_path = store,
                 .domain = domain,
@@ -508,25 +510,30 @@ pub const KgClient = struct {
         return std.mem.span(v);
     }
 
-    const RemoteFile = struct {
+    const DaemonFile = struct {
         url: []const u8,
         api_key: []const u8 = "",
         expected_build_id: ?[]const u8 = null,
+        expected_schema_digest: []const u8 = "",
     };
 
-    /// Reuse the TinyKG Skill's canonical user configuration instead of
-    /// inventing a second credential/address store. Environment overrides
-    /// follow the Skill names; legacy METACODES_KG_* variables remain an
-    /// all-or-nothing explicit override for compatibility.
-    fn initRemoteTransport(
+    /// Resolve only the Metacodes-owned local daemon configuration.  The
+    /// TinyKG Skill remote plane deliberately uses a different file and
+    /// TINYKG_REMOTE_* namespace; inheriting either here would couple local
+    /// runtime task/ontology state to cross-device long-term memory.
+    ///
+    /// METACODES_KG_* remains an all-or-nothing explicit injection surface for
+    /// tests and deliberate debugging against another endpoint. It is never
+    /// populated from the Skill's credential store.
+    fn initDaemonTransport(
         allocator: std.mem.Allocator,
         io: std.Io,
         opts: ResolveOptions,
     ) !?transport_mod.WebTransport {
-        const explicit_url = opts.remote_url orelse envGet("METACODES_KG_URL");
-        const explicit_key = opts.remote_api_key orelse envGet("METACODES_KG_API_KEY");
-        const explicit_build = opts.remote_expected_build_id orelse envGet("METACODES_KG_EXPECTED_BUILD_ID");
-        const explicit_schema = opts.remote_expected_schema_digest orelse envGet("METACODES_KG_EXPECTED_SCHEMA_DIGEST") orelse "";
+        const explicit_url = opts.daemon_url orelse envGet("METACODES_KG_URL");
+        const explicit_key = opts.daemon_api_key orelse envGet("METACODES_KG_API_KEY");
+        const explicit_build = opts.daemon_expected_build_id orelse envGet("METACODES_KG_EXPECTED_BUILD_ID");
+        const explicit_schema = opts.daemon_expected_schema_digest orelse envGet("METACODES_KG_EXPECTED_SCHEMA_DIGEST") orelse "";
         if (explicit_url != null or explicit_key != null or explicit_build != null or explicit_schema.len != 0) {
             return @as(?transport_mod.WebTransport, try transport_mod.WebTransport.init(allocator, .{
                 .io = io,
@@ -537,61 +544,35 @@ pub const KgClient = struct {
             }));
         }
 
-        const env_config_path = envGet("TINYKG_REMOTE_CONFIG");
-        const file_path = try remoteConfigPath(allocator, opts.home);
+        const env_config_path = envGet("METACODES_KG_CONFIG");
+        const file_path = try daemonConfigPath(allocator, opts.home);
         defer allocator.free(file_path);
-        const file = readRemoteConfig(allocator, file_path) catch |err| {
+        const file = readDaemonConfig(allocator, file_path) catch |err| {
             // A user-selected config is authoritative and must fail closed;
-            // the default path being absent means remote mode is simply not
+            // the default path being absent means daemon mode is simply not
             // configured. Other open/stat failures remain unsafe.
             if (err == error.FileNotFound and env_config_path == null) return null;
             return err;
         };
         defer if (file) |*loaded| loaded.deinit();
-
-        const env_url = envGet("TINYKG_REMOTE_URL");
-        const env_key = envGet("TINYKG_API_KEY");
-        const env_build = envGet("TINYKG_REMOTE_EXPECTED_BUILD_ID");
-        if (file == null and env_url == null and env_key == null and env_build == null) return null;
-
-        const file_value: ?RemoteFile = if (file) |loaded| loaded.value else null;
-        const url = env_url orelse if (file_value) |value| value.url else return error.InvalidRemoteConfiguration;
-        const same_server = if (file_value) |value|
-            std.mem.eql(u8, std.mem.trimEnd(u8, value.url, "/"), std.mem.trimEnd(u8, url, "/"))
-        else
-            false;
-        // Never send a stored credential or build pin to a different env URL.
-        const key = env_key orelse if (same_server) file_value.?.api_key else return error.InvalidRemoteConfiguration;
-        const build_id = env_build orelse if (same_server) (file_value.?.expected_build_id orelse return error.InvalidRemoteConfiguration) else return error.InvalidRemoteConfiguration;
+        const file_value: DaemonFile = if (file) |loaded| loaded.value else return null;
         return @as(?transport_mod.WebTransport, try transport_mod.WebTransport.init(allocator, .{
             .io = io,
-            .url = url,
-            .api_key = key,
-            .expected_build_id = build_id,
-            // The authenticated first response pins the canonical schema for
-            // this process. Subsequent drift fails closed.
-            .expected_schema_digest = "",
+            .url = file_value.url,
+            .api_key = file_value.api_key,
+            .expected_build_id = file_value.expected_build_id orelse return error.InvalidRemoteConfiguration,
+            .expected_schema_digest = file_value.expected_schema_digest,
         }));
     }
 
-    fn remoteConfigPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
-        if (envGet("TINYKG_REMOTE_CONFIG")) |path| return allocator.dupe(u8, path);
-        return switch (@import("builtin").os.tag) {
-            .windows => if (envGet("APPDATA")) |base|
-                std.fmt.allocPrint(allocator, "{s}/tinykg/remote.json", .{base})
-            else
-                std.fmt.allocPrint(allocator, "{s}/AppData/Roaming/tinykg/remote.json", .{home}),
-            .macos, .ios => std.fmt.allocPrint(allocator, "{s}/Library/Application Support/tinykg/remote.json", .{home}),
-            else => if (envGet("XDG_CONFIG_HOME")) |base|
-                std.fmt.allocPrint(allocator, "{s}/tinykg/remote.json", .{base})
-            else
-                std.fmt.allocPrint(allocator, "{s}/.config/tinykg/remote.json", .{home}),
-        };
+    fn daemonConfigPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
+        if (envGet("METACODES_KG_CONFIG")) |path| return allocator.dupe(u8, path);
+        return std.fmt.allocPrint(allocator, "{s}/.metacodes/kg/daemon.json", .{home});
     }
 
-    const ParsedRemoteFile = std.json.Parsed(RemoteFile);
+    const ParsedDaemonFile = std.json.Parsed(DaemonFile);
 
-    fn readRemoteConfig(allocator: std.mem.Allocator, path: []const u8) !?ParsedRemoteFile {
+    fn readDaemonConfig(allocator: std.mem.Allocator, path: []const u8) !?ParsedDaemonFile {
         const path_z = try allocator.dupeZ(u8, path);
         defer allocator.free(path_z);
         const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
@@ -608,7 +589,7 @@ pub const KgClient = struct {
         const bytes = common.readAllFromFdCapped(fd, allocator, 64 * 1024) catch
             return error.InvalidRemoteConfiguration;
         defer allocator.free(bytes);
-        var parsed = std.json.parseFromSlice(RemoteFile, allocator, bytes, .{
+        var parsed = std.json.parseFromSlice(DaemonFile, allocator, bytes, .{
             .ignore_unknown_fields = false,
             .allocate = .alloc_always,
             .duplicate_field_behavior = .@"error",
@@ -638,11 +619,11 @@ pub const KgClient = struct {
         if (self.ready) return;
         switch (self.transport) {
             .unconfigured => {
-                self.setDegraded("TinyKG daemon transport 未配置或配置不安全。先用 TinyKG Skill `remote set` 写入用户级 remote.json，或完整设置 TINYKG_REMOTE_URL/TINYKG_API_KEY/TINYKG_REMOTE_EXPECTED_BUILD_ID；共享 Store 禁止 CLI fallback", .{});
+                self.setDegraded("Metacodes 本地 TinyKG daemon 未配置或配置不安全。写入 ~/.metacodes/kg/daemon.json（或 METACODES_KG_CONFIG），也可完整设置 METACODES_KG_URL/METACODES_KG_API_KEY/METACODES_KG_EXPECTED_BUILD_ID；TinyKG Skill remote.json 不属于本地 runtime，且共享 Store 禁止 CLI fallback", .{});
                 return;
             },
-            .remote => |*remote| {
-                const result = remote.run("store-info", &.{}, false) catch |err| {
+            .daemon => |*daemon| {
+                const result = daemon.run("store-info", &.{}, false) catch |err| {
                     self.setDegraded("TinyKG daemon preflight 失败: {s}；未打开本地 Store", .{@errorName(err)});
                     return;
                 };
@@ -1197,8 +1178,8 @@ pub const KgClient = struct {
     }
 
     fn importMarkdownDocAtLabeled(self: *KgClient, markdown: []const u8, path_key: u64, attach: bool, source_label: ?[]const u8) KgError!u64 {
-        if (self.transport == .remote) {
-            const result = self.transport.remote.importMarkdown(markdown, path_key, source_label) catch |err|
+        if (self.transport == .daemon) {
+            const result = self.transport.daemon.importMarkdown(markdown, path_key, source_label) catch |err|
                 return self.mapTransportError(err);
             defer result.deinit(self.allocator);
             if (result.exit_code != 0) {
@@ -1549,6 +1530,19 @@ pub const KgClient = struct {
         return self.allocator.dupe(u8, snapshot) catch KgError.OutOfMemory;
     }
 
+    /// Identity of the TinyKG control plane that produced canonical snapshot
+    /// artifacts.  Exclusive mode hashes the actual executable; daemon mode
+    /// returns the authenticated build pin used for every request.  Keeping
+    /// this transport-neutral is required for ontology governance to work
+    /// with multiple Metacodes clients behind one tinykgd StoreActor.
+    pub fn controlPlaneBuildSha256(self: *KgClient) KgError![64]u8 {
+        return switch (self.transport) {
+            .daemon => |*daemon| daemon.buildSha256() catch KgError.Degraded,
+            .exclusive_cli => self.binarySha256(),
+            .unconfigured => KgError.Degraded,
+        };
+    }
+
     /// Content identity used by read-only control-plane adapters. The file is
     /// opened without following the final symlink and hashed from one stable
     /// descriptor; callers still re-hash after the child exits to detect a
@@ -1582,6 +1576,32 @@ pub const KgClient = struct {
         var digest: [32]u8 = undefined;
         hasher.final(&digest);
         return std.fmt.bytesToHex(digest, .lower);
+    }
+
+    /// Read-only project lookup for host control-plane adapters.  It never
+    /// creates a project node: ontology/rule evolution must not mutate TinyKG
+    /// merely because an evaluation trigger fired.
+    pub fn existingProjectNodeId(self: *KgClient) KgError!?u64 {
+        return self.projectNodeId(false, false);
+    }
+
+    /// Fresh read-only lookup for governance snapshots. Unlike ordinary
+    /// recall, this deliberately bypasses the session negative cache because
+    /// another Metacodes process may have created the project through the
+    /// shared daemon since the last lookup.
+    pub fn reobserveExistingProjectNodeId(self: *KgClient) KgError!?u64 {
+        const found = try self.lookupProjectNodeId(self.domain);
+        self.cacheLock();
+        defer self.cacheUnlock();
+        self.project_node_id = found;
+        self.project_miss = found == null;
+        return found;
+    }
+
+    /// Stable project key already selected by App/KgClient initialization.
+    /// Borrowed for the client lifetime.
+    pub fn projectKey(self: *const KgClient) []const u8 {
+        return self.domain;
     }
 
     /// Agent-facing bounded packet. Unlike the text packet used by taskStatus,
@@ -2329,9 +2349,9 @@ pub const KgClient = struct {
 
     /// 跑一条 tinykg 命令(不做 ready 检查——ensureReady 自己用)。
     fn runRaw(self: *KgClient, args: []const []const u8) !Out {
-        if (self.transport == .remote) {
+        if (self.transport == .daemon) {
             if (args.len < 2 or !std.mem.eql(u8, args[1], self.store_path)) return error.InvalidRemoteCommandShape;
-            const result = try self.transport.remote.run(args[0], args[2..], false);
+            const result = try self.transport.daemon.run(args[0], args[2..], false);
             return .{ .stdout = result.stdout, .stderr = result.stderr, .exit_code = result.exit_code };
         }
         const bin = self.bin_path orelse return error.NoBin;
@@ -2372,10 +2392,10 @@ pub const KgClient = struct {
     }
     fn runCheckedRetry(self: *KgClient, args: []const []const u8, retry: bool) KgError!Out {
         if (!self.ready) return KgError.Degraded;
-        if (self.transport == .remote) {
+        if (self.transport == .daemon) {
             if (args.len < 2 or !std.mem.eql(u8, args[1], self.store_path))
                 return self.dataError("invalid remote command shape", .{});
-            const result = self.transport.remote.run(args[0], args[2..], !retry) catch |err|
+            const result = self.transport.daemon.run(args[0], args[2..], !retry) catch |err|
                 return self.mapTransportError(err);
             const out: Out = .{ .stdout = result.stdout, .stderr = result.stderr, .exit_code = result.exit_code };
             if (out.exit_code == 0) return out;
@@ -2478,7 +2498,7 @@ pub const KgClient = struct {
 
     fn mapTransportError(self: *KgClient, err: transport_mod.Error) KgError {
         if (err == transport_mod.Error.AmbiguousCommit) {
-            const request_id = self.transport.remote.ambiguousRequestId() orelse "unavailable";
+            const request_id = self.transport.daemon.ambiguousRequestId() orelse "unavailable";
             self.setDetail("TinyKG daemon transport: AmbiguousCommit request_id={s}", .{request_id});
             return KgError.AmbiguousCommit;
         }

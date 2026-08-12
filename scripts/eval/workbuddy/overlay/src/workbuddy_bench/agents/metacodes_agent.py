@@ -44,6 +44,11 @@ _REMOTE_TINYKG_ENV = (
     "TINYKG_API_KEY",
     "TINYKG_REMOTE_EXPECTED_BUILD_ID",
     "TINYKG_REMOTE_CONFIG",
+    "METACODES_KG_CONFIG",
+    "METACODES_KG_URL",
+    "METACODES_KG_API_KEY",
+    "METACODES_KG_EXPECTED_BUILD_ID",
+    "METACODES_KG_EXPECTED_SCHEMA_DIGEST",
     "METASK_API_KEY",
 )
 
@@ -243,9 +248,13 @@ class MetacodesAgent(BaseInstalledAgent):
             'test "${#kernel_sha}" -eq 64 || exit 71; '
             'export METACODES_FORMAL_KERNEL_SHA256="$kernel_sha"; '
             "unset TINYKG_REMOTE_URL TINYKG_API_KEY TINYKG_REMOTE_EXPECTED_BUILD_ID "
-            "TINYKG_REMOTE_CONFIG METASK_API_KEY; "
+            "TINYKG_REMOTE_CONFIG METACODES_KG_CONFIG METACODES_KG_URL "
+            "METACODES_KG_API_KEY METACODES_KG_EXPECTED_BUILD_ID "
+            "METACODES_KG_EXPECTED_SCHEMA_DIGEST METASK_API_KEY; "
             'test -z "${TINYKG_REMOTE_URL+x}${TINYKG_API_KEY+x}'
             '${TINYKG_REMOTE_EXPECTED_BUILD_ID+x}${TINYKG_REMOTE_CONFIG+x}'
+            '${METACODES_KG_CONFIG+x}${METACODES_KG_URL+x}${METACODES_KG_API_KEY+x}'
+            '${METACODES_KG_EXPECTED_BUILD_ID+x}${METACODES_KG_EXPECTED_SCHEMA_DIGEST+x}'
             '${METASK_API_KEY+x}" || exit 84; '
             'test ! -e "$METACODES_KG_STORE" || exit 85; '
             f"printf '%s\\n' {shlex.quote(runtime_contract)} > "

@@ -3,8 +3,9 @@
 This module deliberately does not import or execute the TinyKG skill harness.
 Every child process receives an absolute TinyKG binary, an explicit store path
 inside a fresh run directory, a sealed HOME, and no ``TINYKG_*`` environment
-variables.  Read-only retrieval is guarded by a content digest of the complete
-store before and after search/traversal.
+variables, including Metacodes' own local-daemon namespace. Read-only retrieval
+is guarded by a content digest of the complete store before and after
+search/traversal.
 
 The smoke proves corpus materialization, lexical retrieval plumbing, graph
 traversal, and local-store isolation.  It does not claim benchmark accuracy.
@@ -41,6 +42,11 @@ REMOTE_ENV_KEYS = (
     "TINYKG_REMOTE_EXPECTED_BUILD_ID",
     "TINYKG_REMOTE_CONFIG",
     "TINYKG_STORE",
+    "METACODES_KG_CONFIG",
+    "METACODES_KG_URL",
+    "METACODES_KG_API_KEY",
+    "METACODES_KG_EXPECTED_BUILD_ID",
+    "METACODES_KG_EXPECTED_SCHEMA_DIGEST",
 )
 
 
@@ -439,7 +445,9 @@ class LocalTinyKg:
                 directory.mkdir()
         self.timeout_seconds = timeout_seconds
         self.parent_tinykg_env_keys = sorted(
-            key for key in os.environ if key.startswith("TINYKG_")
+            key
+            for key in os.environ
+            if key.startswith("TINYKG_") or key.startswith("METACODES_KG_")
         )
         self.commands: List[Mapping[str, Any]] = []
 
@@ -448,6 +456,7 @@ class LocalTinyKg:
             key: value
             for key, value in os.environ.items()
             if not key.startswith("TINYKG_")
+            and not key.startswith("METACODES_KG_")
             and key not in {"HOME", "TMPDIR", "TMP", "TEMP"}
         }
         env.update(
@@ -484,7 +493,11 @@ class LocalTinyKg:
             raise ValidationError("local TinyKG store escapes the isolated store root") from exc
         argv = [str(self.binary), action, str(resolved_store), *map(str, extra)]
         env = self._environment()
-        leaked = sorted(key for key in env if key.startswith("TINYKG_"))
+        leaked = sorted(
+            key
+            for key in env
+            if key.startswith("TINYKG_") or key.startswith("METACODES_KG_")
+        )
         if leaked:
             _fail("local TinyKG child environment", f"contains forbidden keys: {leaked}")
         try:

@@ -16,6 +16,7 @@ const ResponseStatus = @import("../api/http_status.zig").ResponseStatus;
 pub const protocol_version: u32 = 2;
 pub const control_plane_version: u32 = 1;
 pub const task_hierarchy_capability = "task-hierarchy-canonical-read-v1";
+pub const ontology_rule_snapshot_capability = "tinykg-ontology-rule-snapshot-v1";
 pub const default_timeout_ms: u64 = 35_000;
 pub const max_response_bytes: usize = 16 * 1024 * 1024;
 
@@ -227,6 +228,20 @@ pub const WebTransport = struct {
         return cloned;
     }
 
+    /// Authenticated, configuration-pinned TinyKG build identity.  This is
+    /// the daemon-mode equivalent of hashing the exclusive local executable;
+    /// callers still validate every response against the same build id.
+    pub fn buildSha256(self: *const WebTransport) Error![64]u8 {
+        const prefix = "sha256:";
+        if (!std.mem.startsWith(u8, self.expected_build_id, prefix))
+            return Error.InvalidConfiguration;
+        const raw = self.expected_build_id[prefix.len..];
+        if (!lowerHexDigestValid(raw)) return Error.InvalidConfiguration;
+        var out: [64]u8 = undefined;
+        @memcpy(&out, raw);
+        return out;
+    }
+
     /// Generate a fresh request identity. Non-idempotent callers that persist
     /// their own transaction id use `runWithRequestId` instead.
     pub fn run(self: *WebTransport, command: []const u8, args: []const []const u8, mutates: bool) Error!Result {
@@ -258,7 +273,10 @@ pub const WebTransport = struct {
                 return Error.AmbiguousCommit;
         }
         const session = if (isQueryCommand(command)) self.session_id else null;
-        const required: []const []const u8 = &.{task_hierarchy_capability};
+        const required: []const []const u8 = if (std.mem.eql(u8, command, "ontology-rule-snapshot"))
+            &.{ task_hierarchy_capability, ontology_rule_snapshot_capability }
+        else
+            &.{task_hierarchy_capability};
         const envelope = .{
             .protocolVersion = protocol_version,
             .requestId = request_id,

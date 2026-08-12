@@ -19,10 +19,15 @@ zig build                                     # 产出 zig-out/bin/metacodes + z
 
 **零下载依赖**:`highlight-zig`(高亮)与 `tinykg`(KG 记忆引擎)的源码作为**快照 vendored 在 `lib/`**(非 submodule,因更新频度低——plain clone 即可构建)。主构建从 `lib/tinykg/src/main.zig` 编译兼容 CLI，不依赖上游仓库的 `build.zig`。`zig build` 随 `-Dtarget` **交叉编译**它们:tinykg 装到 `zig-out/vendor/tinykg/tinykg`。更新依赖用 `scripts/vendor-deps.sh`。跳过 tinykg 构建:`-Dtinykg=false`。
 
-共享 TinyKG Store 默认只经 authenticated Web → `tinykgd` → 单一 `StoreActor` 访问。
-Metacodes 复用 TinyKG Skill 的用户级 `remote.json`（用该 Skill 的 `remote set` 管理），
-也接受同名 `TINYKG_REMOTE_*` 环境覆盖；build identity 必须已 pin，schema digest 在
-首次认证响应后锁定到本进程。无安全配置会 fail closed 为 KG degraded，不会回退为直接打开共享 Store。仅隔离的单进程
+Metacodes 的本地 runtime TinyKG Store 默认只经 authenticated Web → `tinykgd` → 单一
+`StoreActor` 访问。其配置由 Metacodes 自己拥有：`~/.metacodes/kg/daemon.json`（或
+`METACODES_KG_CONFIG`），也可完整设置 `METACODES_KG_URL`、`METACODES_KG_API_KEY` 和
+`METACODES_KG_EXPECTED_BUILD_ID`。build identity 必须已 pin，schema digest 在首次认证
+响应后锁定到本进程。无安全配置会 fail closed 为 KG degraded，不会回退为直接打开共享 Store。
+
+TinyKG Skill 的远程 Store 是另一实例：只用于跨设备 roadmap、长期记忆和精炼 provenance。
+Metacodes runtime 不读取 Skill 的 `remote.json` 或 `TINYKG_REMOTE_*`，两类 Store 分别绑定
+identity/generation；memory benchmark 仍只使用 fresh 隔离本地 Store。仅隔离的单进程
 开发 Store 可显式设置 `METACODES_KG_TRANSPORT=cli-exclusive`，并用
 `METACODES_KG_BIN` / `METACODES_KG_STORE` 指向该独占实例；不要把 canonical Store
 用于这个兼容模式。
@@ -101,6 +106,6 @@ C ABI(`sdk/metacodes_agentcore.h`)刻意只导出单入口 `metacodes_agentcore_
 | 语言 | Zig 0.16-dev |
 | 内存 | 命名 allocators(gpa / arena / scratch / c_allocator) |
 | 高亮 | highlight-zig(纯 Zig submodule,取代 tree-sitter) |
-| 记忆 | tinykg 图数据库(authenticated Web/daemon；隔离开发可显式 CLI) |
+| 记忆 | 本地 runtime tinykgd + 独立远程 TinyKG Skill；隔离开发可显式 CLI |
 | 沙箱 | macOS Seatbelt SBPL |
 | 跨平台 | platform/ 抽象层(POSIX + NT),Windows 交叉编译门 |
