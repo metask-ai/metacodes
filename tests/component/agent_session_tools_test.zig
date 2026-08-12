@@ -168,10 +168,10 @@ test "L2 AgentSession Bash 子进程 cwd 绑 workspace.root(缺陷 B 回归)" {
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
-    for (root_buf[0..root_len]) |*c| {
-        if (c.* == '\\') c.* = '/';
-    }
     const root = root_buf[0..root_len];
+    // JSON 会转义 Windows 路径中的反斜杠；basename 在两平台都无需路径
+    // 归一化，并且 std.testing.tmpDir 生成的名字足够区分父进程 cwd。
+    const root_basename = std.fs.path.basename(root);
 
     const tool_sse = try bashToolSse(a, "pwd");
     defer a.free(tool_sse);
@@ -201,6 +201,9 @@ test "L2 AgentSession Bash 子进程 cwd 绑 workspace.root(缺陷 B 回归)" {
     try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
 
     // 下一请求 body 应含 tool_result,其 stdout 含 workspace.root(子进程在 root 下跑 pwd)。
+    // 用 count >= 2 区分:system_prompt 的 environment 段含 basename 一次(永远存在),
+    // tool_result 的 pwd 输出含 basename 一次(仅当子进程真 chdir 到 root)。若 chdir 没接线,
+    // tool_result 的 pwd 是测试进程 cwd(≠ root),count 仅 1 → 测试 FAIL。Linus R21。
     const body = (srv.lastRequest() orelse return error.NoRequestCaptured).body();
-    try std.testing.expect(std.mem.indexOf(u8, body, root) != null);
+    try std.testing.expect(std.mem.count(u8, body, root_basename) >= 2);
 }

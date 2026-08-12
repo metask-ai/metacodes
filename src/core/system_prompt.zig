@@ -255,15 +255,17 @@ pub fn build(allocator: std.mem.Allocator, model: []const u8, cwd: []const u8) !
     return buildWithSkills(allocator, model, null, cwd);
 }
 
+/// 子 Agent 系统提示静态段(缺陷 A)。两处 fallback 共用(Linus R11 常量化)。
+pub const SUBAGENT_LITERAL = "You are a subagent. Complete the task and return a concise final answer.\n";
+
 /// 子 Agent 系统提示:静态字面量 + 环境段(缺陷 A 修复)。
 /// 两处启动点(abi_v1 / model_skill_tool)共用此函数,确保环境段一致。
 /// cwd 用 workspace.root(非进程 cwd——子 Agent 继承父 Session 的 workspace 隔离)。
 /// 不含工具段——子 Agent 工具描述经 tool_defs 透传,无需在 system_prompt 重复。
 pub fn buildSubagentSystemPrompt(allocator: std.mem.Allocator, model: []const u8, cwd: []const u8) ![]u8 {
-    const literal = "You are a subagent. Complete the task and return a concise final answer.\n";
     const env = try buildEnvSection(allocator, model, cwd);
     defer allocator.free(env);
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ literal, env });
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ SUBAGENT_LITERAL, env });
 }
 
 /// 同 build，外加 skills section（让模型知道有哪些 Skill 可激活、何时激活）。

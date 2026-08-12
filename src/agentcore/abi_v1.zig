@@ -904,7 +904,7 @@ const ForkExecutorContext = struct {
         ) catch null;
         defer if (owned_subagent_system_prompt) |prompt| output_allocator.free(prompt);
         const subagent_system_prompt = owned_subagent_system_prompt orelse
-            "You are a subagent. Complete the task and return a concise final answer.\n";
+            sp_mod.SUBAGENT_LITERAL;
 
         const child = core.subagent.spawnAgentSink(
             output_allocator,

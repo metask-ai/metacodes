@@ -260,8 +260,10 @@ pub const Selection = struct {
         // PromptContext:enabled_tool_names 用 allowlist(让 USING_TOOLS 段按集裁剪)。
         // 其余字段默认值对齐 CLI 路径(prompt_context.zig 默认)。
         var prompt_ctx: @import("../tools.zig").PromptContext = .{};
+        // allowlist_dup 只供 redescribeForContext 在本 init 内同步消费；因此仅
+        // 复制 slice 表，不复制调用方拥有的字符串内容。
         const allowlist_dup = try arena.allocator().alloc([]const u8, allowlist.len);
-        for (allowlist, 0..) |n, i| allowlist_dup[i] = n; // 借用,不 dupe(arena 释放时切片失效,但 Selection 持有者生命周期更长——这里 allowlist 借调用方的,Selection 期间有效)
+        for (allowlist, 0..) |n, i| allowlist_dup[i] = n;
         prompt_ctx.enabled_tool_names = allowlist_dup;
 
         try @import("../tools.zig").redescribeForContext(arena.allocator(), definitions_owned, &prompt_ctx);
