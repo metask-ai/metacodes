@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import re
 import subprocess
 import threading
 import time
@@ -176,7 +177,10 @@ def main() -> int:
         server.shutdown()
         server.server_close()
         assert "unavailable_read=observed" in run_probe(args.probe, url, "unavailable-read")
-        assert "ambiguous_write=observed" in run_probe(args.probe, url, "unavailable-write")
+        ambiguous = run_probe(args.probe, url, "unavailable-write")
+        assert "ambiguous_write=observed" in ambiguous
+        match = re.search(r"^request_id=([A-Za-z0-9_.:-]{1,128})$", ambiguous, re.MULTILINE)
+        assert match is not None and match.group(1).startswith("metacodes-")
         print("kg_daemon_transport=pass")
         print(f"shared_generation={ACTOR.generation}")
         print("metacodes_processes=2")

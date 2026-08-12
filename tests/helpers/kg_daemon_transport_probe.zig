@@ -66,7 +66,8 @@ pub fn main(init: std.process.Init) !void {
             cc.kg_transport.Error.AmbiguousCommit,
             transport.run("add-node", &.{ "observation", "unavailable" }, true),
         );
-        try out.writeAll("ambiguous_write=observed\n");
+        const request_id = transport.ambiguousRequestId() orelse return error.MissingAmbiguousRequestId;
+        try out.print("ambiguous_write=observed\nrequest_id={s}\n", .{request_id});
     } else if (std.mem.eql(u8, action, "timeout")) {
         try std.testing.expectError(
             cc.kg_transport.Error.RequestTimedOut,

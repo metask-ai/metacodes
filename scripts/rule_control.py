@@ -3705,18 +3705,19 @@ def observe_daemon_transport(repo: Path) -> Observation:
             '@import("../storage' not in sources["transport"],
         )),
         "request_identity_replay_and_conflict": all(marker in retry + parse + sources["runtime"] for marker in (
-            "self.postBeforeDeadline(url, body, request_id)", "attempt == 0",
+            "self.postBeforeDeadline(url, body, request_id, remaining_ms)", "attempt == 0",
             "RequestIdConflict", '"conflict=observed"',
         )),
         "ambiguous_write_outcome": all(marker in retry + sources["probe"] + sources["runtime"] for marker in (
-            "Error.AmbiguousCommit", '"ambiguous_write=observed', '"unavailable-write"',
+            "recordAmbiguousRequestId(request_id)", "ambiguousRequestId()", '"ambiguous_write=observed',
+            '"unavailable-write"', "^request_id=([A-Za-z0-9_.:-]{1,128})$",
         )),
         "generation_bound_sessions": all(marker in sources["transport"] + sources["runtime"] for marker in (
             "sessionId = session", "self.session_id", "self.last_generation = generation",
             "generation_bound_sessions", "len(ACTOR.sessions) == 1",
         )),
-        "end_to_end_wall_clock_deadline": all(marker in deadline + sources["probe"] + sources["runtime"] for marker in (
-            "std.Io.Select(PostRace)", "deadlineTask", "Error.RequestTimedOut",
+        "end_to_end_wall_clock_deadline": all(marker in retry + deadline + sources["probe"] + sources["runtime"] for marker in (
+            "std.Io.Select(PostRace)", "deadlineTask", "remainingTimeoutMs", "Error.RequestTimedOut",
             '"wall_clock_timeout=observed', "time.monotonic() - started < 1.0",
         )),
         "bounded_backpressure_and_unavailability": all(marker in parse + sources["probe"] + sources["runtime"] for marker in (

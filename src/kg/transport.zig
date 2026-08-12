@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const rng = @import("platform").rng;
+const time = @import("../util/time.zig");
 
 pub const protocol_version: u32 = 2;
 pub const task_hierarchy_capability = "task-hierarchy-canonical-read-v1";
@@ -66,6 +67,7 @@ pub const WebTransport = struct {
     session_id: []u8,
     timeout_ms: u64,
     last_generation: u64 = 0,
+    last_ambiguous_request_id: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, options: Options) Error!WebTransport {
         if (options.url.len == 0 or options.api_key.len == 0 or
@@ -113,6 +115,7 @@ pub const WebTransport = struct {
         self.allocator.free(self.expected_build_id);
         self.allocator.free(self.expected_schema_digest);
         self.allocator.free(self.session_id);
+        if (self.last_ambiguous_request_id) |request_id| self.allocator.free(request_id);
     }
 
     pub fn cloneForSession(self: *const WebTransport, allocator: std.mem.Allocator) Error!WebTransport {
@@ -130,6 +133,7 @@ pub const WebTransport = struct {
     /// Same-id retry is deliberate: a write that lost its HTTP response is
     /// replayed by StoreActor instead of being executed twice.
     pub fn run(self: *WebTransport, command: []const u8, args: []const []const u8, mutates: bool) Error!Result {
+        self.clearAmbiguousRequestId();
         const request_id = try makeIdentifier(self.allocator, "metacodes");
         defer self.allocator.free(request_id);
         const session = if (isQueryCommand(command)) self.session_id else null;
@@ -159,6 +163,7 @@ pub const WebTransport = struct {
         source_key: u64,
         source_label: ?[]const u8,
     ) Error!Result {
+        self.clearAmbiguousRequestId();
         const request_id = try makeIdentifier(self.allocator, "metacodes-md");
         defer self.allocator.free(request_id);
         var source_key_buffer: [16]u8 = undefined;
@@ -183,18 +188,33 @@ pub const WebTransport = struct {
         request_id: []const u8,
         mutates: bool,
     ) Error!Result {
+        const started_ms = time.nowMs();
+        if (started_ms <= 0) return Error.RequestFailed;
+        const deadline_ms = @as(i128, started_ms) + @as(i128, self.timeout_ms);
         var attempt: u8 = 0;
         while (attempt < 2) : (attempt += 1) {
-            const response = self.postBeforeDeadline(url, body, request_id) catch |err| {
-                if (attempt == 0) continue;
-                return if (mutates) Error.AmbiguousCommit else switch (err) {
+            const remaining_ms = remainingTimeoutMs(deadline_ms) orelse {
+                if (mutates) {
+                    try self.recordAmbiguousRequestId(request_id);
+                    return Error.AmbiguousCommit;
+                }
+                return Error.RequestTimedOut;
+            };
+            const response = self.postBeforeDeadline(url, body, request_id, remaining_ms) catch |err| {
+                if (attempt == 0 and remainingTimeoutMs(deadline_ms) != null) continue;
+                if (mutates) {
+                    try self.recordAmbiguousRequestId(request_id);
+                    return Error.AmbiguousCommit;
+                }
+                return switch (err) {
                     Error.AuthenticationFailed, Error.IncompatibleDaemon, Error.InvalidResponse, Error.RequestIdConflict, Error.Backpressure, Error.RequestTimedOut => err,
                     else => Error.DaemonUnavailable,
                 };
             };
             if (response.commit_state == .ambiguous) {
                 response.deinit(self.allocator);
-                if (attempt == 0) continue;
+                if (attempt == 0 and remainingTimeoutMs(deadline_ms) != null) continue;
+                try self.recordAmbiguousRequestId(request_id);
                 return Error.AmbiguousCommit;
             }
             return response;
@@ -216,13 +236,14 @@ pub const WebTransport = struct {
         url: []const u8,
         body: []const u8,
         request_id: []const u8,
+        timeout_ms: u64,
     ) Error!Result {
         var results: [2]PostRace = undefined;
         var race = std.Io.Select(PostRace).init(self.http_client.io, &results);
         errdefer race.cancelDiscard();
         race.concurrent(.response, postTask, .{ self, url, body, request_id }) catch
             return Error.RequestFailed;
-        race.concurrent(.deadline, deadlineTask, .{ self.http_client.io, self.timeout_ms }) catch
+        race.concurrent(.deadline, deadlineTask, .{ self.http_client.io, timeout_ms }) catch
             return Error.RequestFailed;
 
         const first = race.await() catch return Error.RequestFailed;
@@ -337,7 +358,27 @@ pub const WebTransport = struct {
             .replayed = boolean(object.get("replayed")),
         };
     }
+
+    pub fn ambiguousRequestId(self: *const WebTransport) ?[]const u8 {
+        return self.last_ambiguous_request_id;
+    }
+
+    fn clearAmbiguousRequestId(self: *WebTransport) void {
+        if (self.last_ambiguous_request_id) |request_id| self.allocator.free(request_id);
+        self.last_ambiguous_request_id = null;
+    }
+
+    fn recordAmbiguousRequestId(self: *WebTransport, request_id: []const u8) Error!void {
+        self.clearAmbiguousRequestId();
+        self.last_ambiguous_request_id = self.allocator.dupe(u8, request_id) catch return Error.OutOfMemory;
+    }
 };
+
+fn remainingTimeoutMs(deadline_ms: i128) ?u64 {
+    const now_ms = time.nowMs();
+    if (now_ms <= 0 or @as(i128, now_ms) >= deadline_ms) return null;
+    return @intCast(deadline_ms - @as(i128, now_ms));
+}
 
 fn stringifyAlloc(allocator: std.mem.Allocator, value: anytype) Error![]u8 {
     var output = std.Io.Writer.Allocating.init(allocator);

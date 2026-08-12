@@ -2373,9 +2373,14 @@ pub const KgClient = struct {
     }
 
     fn mapTransportError(self: *KgClient, err: transport_mod.Error) KgError {
+        if (err == transport_mod.Error.AmbiguousCommit) {
+            const request_id = self.transport.remote.ambiguousRequestId() orelse "unavailable";
+            self.setDetail("TinyKG daemon transport: AmbiguousCommit request_id={s}", .{request_id});
+            return KgError.AmbiguousCommit;
+        }
         self.setDetail("TinyKG daemon transport: {s}", .{@errorName(err)});
         return switch (err) {
-            transport_mod.Error.AmbiguousCommit => KgError.AmbiguousCommit,
+            transport_mod.Error.AmbiguousCommit => unreachable,
             transport_mod.Error.Backpressure => KgError.Backpressure,
             transport_mod.Error.OutOfMemory => KgError.OutOfMemory,
             transport_mod.Error.AuthenticationFailed, transport_mod.Error.IncompatibleDaemon, transport_mod.Error.InvalidConfiguration, transport_mod.Error.InvalidUrl => blk: {
