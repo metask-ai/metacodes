@@ -46,6 +46,7 @@ test {
     _ = @import("component/kg_integration_test.zig");
     _ = @import("component/kg_task_projection_test.zig");
     _ = @import("component/formal_kernel_test.zig");
+    _ = @import("component/memory_migration_adapter_test.zig");
     _ = @import("component/goal_state_test.zig");
     _ = @import("component/auth_test.zig");
     _ = @import("component/schema_validation_test.zig");

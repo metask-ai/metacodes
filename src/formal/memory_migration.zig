@@ -62,6 +62,7 @@ pub const CommitGate = enum {
     checker_blocked,
     provenance_invalid,
     stale_revision,
+    snapshot_drift,
     cas_unavailable,
 };
 
@@ -105,6 +106,33 @@ pub const Evaluation = struct {
         if (!cas_available) return .cas_unavailable;
         return .ready_for_cas;
     }
+
+    /// Reopen the complete TinyKG snapshot immediately before commit.  A
+    /// revision-only comparison is insufficient evidence when a broken or
+    /// incompatible sensor could reuse a revision for different node facts.
+    /// The actuator therefore requires both the semantic revision and the
+    /// canonical snapshot hash to match the exact input checked by Lean.
+    pub fn commitGateSnapshot(
+        self: *const Evaluation,
+        allocator: std.mem.Allocator,
+        encoded_snapshot: []const u8,
+        cas_available: bool,
+    ) !CommitGate {
+        if (self.invocation.failure != .none or !self.invocation.checkerAdmitted())
+            return .checker_blocked;
+        if (self.provenance == null) return .provenance_invalid;
+        const canonical = try canonicalizeSnapshot(allocator, encoded_snapshot);
+        defer allocator.free(canonical);
+        var parsed = try parseSnapshot(allocator, canonical);
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.revision[0..], self.snapshot_revision[0..]))
+            return .stale_revision;
+        const observed_hash = sha256Hex(canonical);
+        if (!std.mem.eql(u8, observed_hash[0..], self.snapshot_sha256[0..]))
+            return .snapshot_drift;
+        if (!cas_available) return .cas_unavailable;
+        return .ready_for_cas;
+    }
 };
 
 pub const PersistedEvidence = struct {
@@ -142,6 +170,54 @@ const RawProposal = struct {
     snapshot_revision: []const u8,
 };
 
+const ParsedSnapshot = std.json.Parsed(Snapshot);
+
+fn parseSnapshot(allocator: std.mem.Allocator, encoded: []const u8) !ParsedSnapshot {
+    if (encoded.len == 0 or encoded.len > MAX_INPUT_BYTES) return error.InvalidSnapshot;
+    var parsed = std.json.parseFromSlice(RawSnapshot, allocator, encoded, .{
+        .ignore_unknown_fields = false,
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSnapshot,
+    };
+    errdefer parsed.deinit();
+    const validated = try validateSnapshot(parsed.value);
+    // Snapshot borrows the strings owned by `parsed`; transfer the arena while
+    // changing only the statically known value type.
+    return .{ .arena = parsed.arena, .value = validated };
+}
+
+/// Strictly validate and render the TinyKG sensor response.  This is shared by
+/// the first observation and the pre-commit re-observation so callers cannot
+/// accidentally compare raw JSON formatting instead of semantic bytes.
+pub fn canonicalizeSnapshot(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    var parsed = try parseSnapshot(allocator, encoded);
+    defer parsed.deinit();
+    return renderSnapshot(allocator, parsed.value);
+}
+
+/// The model chooses the three role ids presented to the TinyKG snapshot
+/// primitive.  The host then constructs the only supported mutation shape;
+/// the model never supplies effect, rollback, or revision strings.
+pub fn buildProposalForSnapshot(allocator: std.mem.Allocator, encoded_snapshot: []const u8) ![]u8 {
+    var parsed = try parseSnapshot(allocator, encoded_snapshot);
+    defer parsed.deinit();
+    return renderProposal(allocator, .{
+        .source_id = parsed.value.source.id,
+        .replacement_id = parsed.value.replacement.id,
+        .evidence_id = parsed.value.evidence.id,
+        .effect = EFFECT,
+        .rollback = ROLLBACK,
+        .snapshot_revision = parsed.value.revision,
+    });
+}
+
+pub fn payloadSha256(payload: []const u8) [64]u8 {
+    return sha256Hex(payload);
+}
+
 pub fn evaluate(
     allocator: std.mem.Allocator,
     encoded_snapshot: []const u8,
@@ -154,16 +230,9 @@ pub fn evaluate(
     if (encoded_proposal.len == 0 or encoded_proposal.len > MAX_INPUT_BYTES)
         return error.InvalidProposal;
 
-    var parsed_snapshot = std.json.parseFromSlice(RawSnapshot, allocator, encoded_snapshot, .{
-        .ignore_unknown_fields = false,
-        .allocate = .alloc_always,
-        .duplicate_field_behavior = .@"error",
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidSnapshot,
-    };
+    var parsed_snapshot = try parseSnapshot(allocator, encoded_snapshot);
     defer parsed_snapshot.deinit();
-    const snapshot = try validateSnapshot(parsed_snapshot.value);
+    const snapshot = parsed_snapshot.value;
 
     var parsed_proposal = std.json.parseFromSlice(RawProposal, allocator, encoded_proposal, .{
         .ignore_unknown_fields = false,

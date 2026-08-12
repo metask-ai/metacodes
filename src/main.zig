@@ -69,6 +69,7 @@ pub const formal_artifact_store = @import("formal/artifact_store.zig");
 pub const formal_provenance = @import("formal/provenance.zig");
 pub const formal_task_audit = @import("formal/task_audit.zig");
 pub const formal_memory_migration = @import("formal/memory_migration.zig");
+pub const kg_memory_migration_adapter = @import("kg/memory_migration_adapter.zig");
 pub const formal_artifact_verification = @import("formal/artifact_verification.zig");
 pub const kg_tools = @import("tools/kg_tools.zig");
 pub const kg_lexical_query_plan = @import("kg/lexical_query_plan.zig");
