@@ -35,7 +35,11 @@ fn configure() -> Result<(), String> {
         "cargo:rustc-link-search=native={}",
         library_path.parent().unwrap().display()
     );
-    println!("cargo:rustc-link-lib=static=metask_agentcore");
+    // The Windows GNU bundle deliberately uses the `.lib` artifact name as
+    // part of the published manifest.  Ask rustc to keep that filename
+    // verbatim; otherwise its GNU naming probe only looks for
+    // `libmetask_agentcore.a` and rejects the valid bundle.
+    println!("cargo:rustc-link-lib=static:+verbatim={library_file}");
     for (kind, name) in link_directives {
         match kind {
             "library" => println!("cargo:rustc-link-lib={name}"),
