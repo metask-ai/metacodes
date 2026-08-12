@@ -1,0 +1,7 @@
+[dataset]
+id = "metacodes-w05-synthetic"
+version = "1.0"
+
+[runtime]
+harness_delivery = "split-mount"
+requires_harness_mount = true

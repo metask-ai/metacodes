@@ -29,14 +29,31 @@ from workbuddy_bench.agents._metacodes_trace import (
     TraceError,
     load_control_metrics,
     load_trace_ir,
+    project_state_hash,
 )
 
 
 _OUTPUT_FILENAME = "metacodes-output.jsonl"
 _TRANSCRIPT_FILENAME = "metacodes-transcript.jsonl"
+_RUNTIME_CONTRACT_FILENAME = "metacodes-runtime-contract.json"
 _DEFAULT_DISABLED_TOOLS = (
     "Agent,Task,TaskBatch,TeamCreate,TeamDelete,SendMessage"
 )
+_REMOTE_TINYKG_ENV = (
+    "TINYKG_REMOTE_URL",
+    "TINYKG_API_KEY",
+    "TINYKG_REMOTE_EXPECTED_BUILD_ID",
+    "TINYKG_REMOTE_CONFIG",
+    "METASK_API_KEY",
+)
+
+
+def _relative_mount_path(value: object, label: str) -> str:
+    raw = str(value or "")
+    path = Path(raw)
+    if not raw or path.is_absolute() or ".." in path.parts or "." in path.parts:
+        raise ValueError(f"{label} must be a normalized relative mount path")
+    return path.as_posix()
 
 
 class MetacodesAgent(BaseInstalledAgent):
@@ -49,6 +66,22 @@ class MetacodesAgent(BaseInstalledAgent):
         self._mount_path = str(kwargs.pop("mount_path", None) or "/opt/metacodes")
         self._disabled_tools = str(
             kwargs.pop("METACODES_DISALLOWED_TOOLS", _DEFAULT_DISABLED_TOOLS)
+        )
+        project_rules = kwargs.pop("METACODES_PROJECT_RULES_RELATIVE", None)
+        project_kernel = kwargs.pop("METACODES_PROJECT_KERNEL_RELATIVE", None)
+        if (project_rules is None) != (project_kernel is None):
+            raise ValueError(
+                "metacodes project rules and project kernel must be configured together"
+            )
+        self._project_rules_relative = (
+            _relative_mount_path(project_rules, "project rules")
+            if project_rules is not None
+            else None
+        )
+        self._project_kernel_relative = (
+            _relative_mount_path(project_kernel, "project kernel")
+            if project_kernel is not None
+            else None
         )
         model_params = kwargs.pop("model_params", None) or {}
         max_output = model_params.get("max_output_tokens")
@@ -87,6 +120,12 @@ class MetacodesAgent(BaseInstalledAgent):
 
     async def install(self, environment: BaseEnvironment) -> None:
         mount = shlex.quote(self._mount_path.rstrip("/"))
+        project_check = ""
+        if self._project_kernel_relative is not None and self._project_rules_relative is not None:
+            project_check = (
+                f"; test -x {shlex.quote(self._mount_path.rstrip('/') + '/' + self._project_kernel_relative)}"
+                f"; test -f {shlex.quote(self._mount_path.rstrip('/') + '/' + self._project_rules_relative + '/active.json')}"
+            )
         await self.exec_as_root(
             environment,
             command=(
@@ -95,7 +134,8 @@ class MetacodesAgent(BaseInstalledAgent):
                 "test -f share/metacodes/SHA256SUMS; "
                 "sha256sum -c share/metacodes/SHA256SUMS; "
                 "test -x bin/metacodes; test -x bin/tinykg; "
-                "test -x libexec/metacodes-formal-kernel; "
+                "test -x libexec/metacodes-formal-kernel"
+                f"{project_check}; "
                 "ln -sf \"$PWD/bin/metacodes\" /usr/local/bin/metacodes; "
                 "ln -sf \"$PWD/bin/tinykg\" /usr/local/bin/tinykg"
             ),
@@ -130,6 +170,7 @@ class MetacodesAgent(BaseInstalledAgent):
         output_path = f"/logs/agent/{_OUTPUT_FILENAME}"
         transcript_path = f"/logs/agent/{_TRANSCRIPT_FILENAME}"
         observation_path = f"/logs/agent/{OBSERVATION_FILENAME}"
+        runtime_contract_path = f"/logs/agent/{_RUNTIME_CONTRACT_FILENAME}"
         flags = [
             "--model", escaped_model,
             "--permission", "bypassPermissions",
@@ -139,6 +180,52 @@ class MetacodesAgent(BaseInstalledAgent):
         if self._max_output_tokens is not None:
             flags += ["--max-tokens", str(self._max_output_tokens)]
 
+        project_setup = ""
+        project_contract = {
+            "configured": False,
+            "project_state_hash": None,
+        }
+        if self._project_kernel_relative is not None and self._project_rules_relative is not None:
+            project_hash = project_state_hash("/workspace")
+            project_contract = {
+                "configured": True,
+                "project_state_hash": project_hash,
+            }
+            project_source = mount + "/" + self._project_rules_relative
+            project_kernel = mount + "/" + self._project_kernel_relative
+            project_setup = (
+                f'project_state="$HOME/.metacodes/projects/{project_hash}"; '
+                'mkdir -p "$project_state" || exit 77; '
+                f'project_source={shlex.quote(project_source)}; '
+                'test -d "$project_source" || exit 78; '
+                'test -z "$(find "$project_source" -type l -print -quit)" || exit 79; '
+                'test ! -e "$project_state/project-rules" || exit 80; '
+                'cp -R -- "$project_source" "$project_state/project-rules" || exit 81; '
+                'chmod -R u=rwX,go= "$project_state/project-rules" || exit 82; '
+                f'export METACODES_PROJECT_KERNEL_PATH={shlex.quote(project_kernel)}; '
+                'project_kernel_sha="$(sha256sum "$METACODES_PROJECT_KERNEL_PATH" | cut -d" " -f1)"; '
+                'test "${#project_kernel_sha}" -eq 64 || exit 83; '
+                'export METACODES_PROJECT_KERNEL_SHA256="$project_kernel_sha"; '
+            )
+
+        remote_tinykg_env_absent = all(name not in env for name in _REMOTE_TINYKG_ENV)
+        if not remote_tinykg_env_absent:
+            raise ValueError("metacodes WorkBuddy trial received remote TinyKG authority")
+        runtime_contract = json.dumps(
+            {
+                "schema_version": "metacodes-workbuddy-runtime-contract-v1",
+                "quality_evidence": False,
+                "fresh_home": True,
+                "local_tinykg": True,
+                "remote_tinykg_env_absent": remote_tinykg_env_absent,
+                "tinykg_store_absent_before_first_provider_request": True,
+                "credential_delivery": "anonymous-fd-route-token",
+                "project_control": project_contract,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
         # Bash is intentional: WorkBuddy's installed-agent contract already
         # uses shell commands, and anonymous-FD handoff plus PIPESTATUS need a
         # real shell.  No credential value is interpolated into this command.
@@ -147,6 +234,7 @@ class MetacodesAgent(BaseInstalledAgent):
             'run_home="/tmp/metacodes-workbuddy-home"; '
             'test ! -e "$run_home" || { echo "fresh HOME already exists" >&2; exit 70; }; '
             'mkdir -p "$run_home" || exit 70; export HOME="$run_home"; '
+            f"{project_setup}"
             f'export METACODES_KG_BIN={shlex.quote(mount + "/bin/tinykg")}; '
             'export METACODES_KG_STORE="$HOME/.local/share/tinykg/store"; '
             f'export METACODES_FORMAL_KERNEL_PATH={shlex.quote(mount + "/libexec/metacodes-formal-kernel")}; '
@@ -155,6 +243,13 @@ class MetacodesAgent(BaseInstalledAgent):
             'export METACODES_FORMAL_KERNEL_SHA256="$kernel_sha"; '
             "unset TINYKG_REMOTE_URL TINYKG_API_KEY TINYKG_REMOTE_EXPECTED_BUILD_ID "
             "TINYKG_REMOTE_CONFIG METASK_API_KEY; "
+            'test -z "${TINYKG_REMOTE_URL+x}${TINYKG_API_KEY+x}'
+            '${TINYKG_REMOTE_EXPECTED_BUILD_ID+x}${TINYKG_REMOTE_CONFIG+x}'
+            '${METASK_API_KEY+x}" || exit 84; '
+            'test ! -e "$METACODES_KG_STORE" || exit 85; '
+            f"printf '%s\\n' {shlex.quote(runtime_contract)} > "
+            f"{shlex.quote(runtime_contract_path)} || exit 86; "
+            f"chmod 0600 {shlex.quote(runtime_contract_path)} || exit 87; "
             'exec 9<<<"$METACODES_ROUTE_TOKEN"; unset METACODES_ROUTE_TOKEN; '
             "export METACODES_API_KEY_FD=9; "
             f"metacodes {' '.join(flags)} -p {escaped_instruction} --json "

@@ -16,6 +16,7 @@ from scripts.eval.workbuddy.launch_gate import (
     PROVIDER_KEY_ENV,
     SCHEMA_VERSION,
     HOST_CONTROL_PLANE_MODULES,
+    _artifact_contract,
     _paid_host_guard,
     _official_task_identity,
     _collect_usage,
@@ -34,6 +35,7 @@ from scripts.eval.workbuddy.trace import (
 )
 from scripts.eval.workbuddy import WORKBUDDY_PINNED_COMMIT
 from scripts.eval.workbuddy.install_overlay import _digest
+from scripts.eval.workbuddy.stage_artifacts import stage
 
 
 def digest(label: str) -> str:
@@ -93,6 +95,64 @@ class _Server:
 
 
 class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
+    def test_artifact_contract_recomputes_project_kernel_and_rule_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            elf = root / "fixture-elf"
+            header = bytearray(20)
+            header[:7] = b"\x7fELF\x02\x01\x01"
+            header[18:20] = (62).to_bytes(2, "little")
+            elf.write_bytes(header + b"fixture\n")
+            elf.chmod(0o755)
+            license_file = root / "LICENSE"
+            license_file.write_text("fixture license\n", encoding="utf-8")
+            rules = root / "rules"
+            rules.mkdir()
+            kernel_sha = hashlib.sha256(elf.read_bytes()).hexdigest()
+            project_sha = hashlib.sha256(
+                b"metacodes-project-identity-v1\x00/workspace"
+            ).hexdigest()
+            (rules / "active.json").write_text(
+                json.dumps(
+                    {
+                        "body": {
+                            "project_sha256": project_sha,
+                            "kernel_sha256": kernel_sha,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (rules / "bundle.json").write_text("{}\n", encoding="utf-8")
+            output = root / "stage"
+            stage(
+                output=output,
+                metacodes=elf,
+                tinykg=elf,
+                formal_kernel=elf,
+                project_kernel=elf,
+                project_rules=rules,
+                metacodes_commit="0" * 40,
+                tinykg_commit="1" * 40,
+                licenses=(
+                    ("metacodes", "NOASSERTION", license_file),
+                    ("tinykg", "Apache-2.0", license_file),
+                    ("lean4", "Apache-2.0", license_file),
+                ),
+            )
+            manifest = output / "share/metacodes/artifact-manifest.json"
+            observed = _artifact_contract(manifest)
+            self.assertEqual(observed["project_control"]["kernel"]["sha256"], kernel_sha)
+            self.assertEqual(observed["project_control"]["rules"]["files"], 2)
+
+            staged_bundle = (
+                output
+                / "share/metacodes/workbuddy-w05/project-rules/bundle.json"
+            )
+            staged_bundle.write_text('{"tampered":true}\n', encoding="utf-8")
+            with self.assertRaisesRegex(LaunchError, "tree identity drifted"):
+                _artifact_contract(manifest)
+
     def _manifest(
         self, root: Path, *, quality_evidence_on_commit: bool = False
     ) -> Path:

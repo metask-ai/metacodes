@@ -1,0 +1,1 @@
+Create `/workspace/result.txt` containing exactly `metacodes workbuddy w05 ok` followed by one newline. Preserve `seed.txt` exactly. This is a synthetic control-plane wiring task, not memory-quality evidence.

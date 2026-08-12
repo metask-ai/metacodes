@@ -1,10 +1,11 @@
-"""Deterministic Anthropic-SSE provider for the official WorkBuddy L2.
+"""Deterministic Anthropic-SSE provider for official WorkBuddy L2 runs.
 
-This server is infrastructure evidence only: it returns a final text answer and
-cannot solve benchmark tasks.  Its purpose is to exercise the real
-WorkBuddy runner, job-private proxy, credential-FD resolver, containerized
-metacodes binary, trace adapter, scorer, and paid-journal receipt without a
-paid provider request.
+The default scenario returns one final answer and preserves the original proxy
+and adapter smoke test.  ``control-plane-v1`` is a stricter zero-paid scripted
+actor: each accepted request must contain the exact previous tool result before
+the next tool call is issued.  It exercises real metacodes tool dispatch,
+TinyKG, task-DAG and project-Lean paths without pretending to solve a benchmark
+task or emitting any control-plane metric itself.
 """
 
 from __future__ import annotations
@@ -16,12 +17,21 @@ import os
 import stat
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 
-SCHEMA_VERSION = "metacodes-workbuddy-mock-provider-v1"
+SCHEMA_VERSION = "metacodes-workbuddy-mock-provider-v2"
 MOCK_CREDENTIAL = "metacodes-workbuddy-mock-only"
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
+SCENARIOS = ("final-v1", "control-plane-v1")
+CONTROL_MEMORY = (
+    "workbuddy-w05-control-marker: real local TinyKG and project Lean gate "
+    "must be observed before quality evaluation"
+)
+
+
+class ScenarioError(ValueError):
+    """The caller drifted from the frozen zero-paid scripted interaction."""
 
 
 def _write_all(descriptor: int, payload: bytes) -> None:
@@ -59,7 +69,14 @@ def _private_new(path: Path, payload: bytes) -> None:
         os.close(parent_descriptor)
 
 
-def _sse(request_number: int) -> bytes:
+def _events_sse(events: list[dict[str, Any]]) -> bytes:
+    return b"".join(
+        b"data: " + json.dumps(event, separators=(",", ":")).encode("utf-8") + b"\n\n"
+        for event in events
+    )
+
+
+def _final_sse(request_number: int, text: str) -> bytes:
     message_id = f"msg_workbuddy_mock_{request_number}"
     events: list[dict[str, Any]] = [
         {
@@ -86,7 +103,7 @@ def _sse(request_number: int) -> bytes:
             "index": 0,
             "delta": {
                 "type": "text_delta",
-                "text": "Mock L2 completed without modifying the benchmark workspace.",
+                "text": text,
             },
         },
         {"type": "content_block_stop", "index": 0},
@@ -97,10 +114,275 @@ def _sse(request_number: int) -> bytes:
         },
         {"type": "message_stop"},
     ]
-    return b"".join(
-        b"data: " + json.dumps(event, separators=(",", ":")).encode("utf-8") + b"\n\n"
-        for event in events
+    return _events_sse(events)
+
+
+def _tool_sse(request_number: int, call_id: str, name: str, value: Mapping[str, Any]) -> bytes:
+    message_id = f"msg_workbuddy_mock_{request_number}"
+    compact = json.dumps(dict(value), separators=(",", ":"), ensure_ascii=False)
+    return _events_sse(
+        [
+            {
+                "type": "message_start",
+                "message": {
+                    "id": message_id,
+                    "role": "assistant",
+                    "model": "glm-5.2",
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": 64,
+                        "cache_creation_input_tokens": 8,
+                    },
+                },
+            },
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": name,
+                    "input": {},
+                },
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": compact},
+            },
+            {"type": "content_block_stop", "index": 0},
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                "usage": {"output_tokens": 8},
+            },
+            {"type": "message_stop"},
+        ]
     )
+
+
+def _blocks(message: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    return [item for item in content if isinstance(item, Mapping)]
+
+
+def _tool_names(request: Mapping[str, Any]) -> set[str]:
+    tools = request.get("tools")
+    if not isinstance(tools, list):
+        return set()
+    return {
+        str(tool["name"])
+        for tool in tools
+        if isinstance(tool, Mapping) and isinstance(tool.get("name"), str)
+    }
+
+
+def _result_text(request: Mapping[str, Any], call_id: str) -> tuple[str, bool]:
+    messages = request.get("messages")
+    if not isinstance(messages, list):
+        raise ScenarioError("request messages are missing")
+    matches: list[Mapping[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        for block in _blocks(message):
+            if block.get("type") == "tool_result" and block.get("tool_use_id") == call_id:
+                matches.append(block)
+    if len(matches) != 1:
+        raise ScenarioError(f"expected exactly one result for {call_id}")
+    block = matches[0]
+    is_error = block.get("is_error", False)
+    if not isinstance(is_error, bool):
+        raise ScenarioError(f"tool result {call_id} has an invalid error marker")
+    content = block.get("content")
+    if isinstance(content, str):
+        return content, is_error
+    if isinstance(content, list):
+        texts = [
+            item.get("text")
+            for item in content
+            if isinstance(item, Mapping)
+            and item.get("type") == "text"
+            and isinstance(item.get("text"), str)
+        ]
+        if len(texts) == 1:
+            return str(texts[0]), is_error
+    raise ScenarioError(f"tool result {call_id} has unsupported content")
+
+
+def _result_object(request: Mapping[str, Any], call_id: str) -> dict[str, Any]:
+    text, is_error = _result_text(request, call_id)
+    if is_error:
+        raise ScenarioError(f"tool result {call_id} reported an error")
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ScenarioError(f"tool result {call_id} is not JSON") from exc
+    if not isinstance(value, dict):
+        raise ScenarioError(f"tool result {call_id} is not an object")
+    return value
+
+
+def _require_tools(request: Mapping[str, Any], *names: str) -> None:
+    missing = set(names) - _tool_names(request)
+    if missing:
+        raise ScenarioError(f"scripted tools are unavailable: {sorted(missing)}")
+
+
+def _control_plane_sse(request_number: int, request: Mapping[str, Any]) -> bytes:
+    """Advance only after the real previous tool outcome is observable."""
+
+    _require_tools(
+        request,
+        "KgRemember",
+        "KgRecall",
+        "KgContext",
+        "TaskCreate",
+        "TaskUpdate",
+        "Write",
+    )
+    if request_number == 1:
+        return _tool_sse(
+            request_number,
+            "w05-remember",
+            "KgRemember",
+            {"text": CONTROL_MEMORY, "kind": "decision", "scope": "project"},
+        )
+    if request_number == 2:
+        remembered = _result_object(request, "w05-remember")
+        remembered_node = remembered.get("remembered")
+        node_id = (
+            remembered_node.get("node_id")
+            if isinstance(remembered_node, Mapping)
+            else None
+        )
+        if isinstance(node_id, bool) or not isinstance(node_id, int) or node_id <= 0:
+            raise ScenarioError("KgRemember did not return a positive node_id")
+        return _tool_sse(
+            request_number,
+            "w05-recall",
+            "KgRecall",
+            {
+                "query": CONTROL_MEMORY,
+                "lexical_plan": {
+                    "schema_version": "lexical-query-plan-v1",
+                    "intent": "fact_lookup",
+                    "stage": "seed",
+                    "variants": [{"kind": "exact", "text": CONTROL_MEMORY}],
+                    "variant_index": 0,
+                    "seen_node_ids": [],
+                },
+            },
+        )
+    if request_number == 3:
+        recalled = _result_object(request, "w05-recall")
+        hits = recalled.get("hits")
+        count = recalled.get("count")
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or count <= 0
+            or not isinstance(hits, list)
+            or len(hits) != count
+            or not isinstance(hits[0], Mapping)
+        ):
+            raise ScenarioError("KgRecall did not return a consistent non-empty hit set")
+        node_id = hits[0].get("node_id")
+        if isinstance(node_id, bool) or not isinstance(node_id, int) or node_id <= 0:
+            raise ScenarioError("KgRecall hit has no positive node_id")
+        return _tool_sse(
+            request_number,
+            "w05-context",
+            "KgContext",
+            {"node_id": node_id, "limit": 12},
+        )
+    if request_number == 4:
+        context = _result_object(request, "w05-context")
+        governance = context.get("knowledge_governance")
+        if not isinstance(governance, Mapping) or governance.get("schema_version") != (
+            "metacodes-knowledge-governance-v1"
+        ):
+            raise ScenarioError("KgContext did not return governed knowledge evidence")
+        return _tool_sse(
+            request_number,
+            "w05-task-create",
+            "TaskCreate",
+            {
+                "subject": "WorkBuddy W0.5 real control plane",
+                "description": "Close only after the governed output is written.",
+            },
+        )
+    if request_number == 5:
+        created = _result_object(request, "w05-task-create")
+        task = created.get("task")
+        task_id = task.get("id") if isinstance(task, Mapping) else None
+        if not isinstance(task_id, str) or not task_id.startswith("kg-"):
+            raise ScenarioError("TaskCreate did not persist a TinyKG task")
+        return _tool_sse(
+            request_number,
+            "w05-task-claim",
+            "TaskUpdate",
+            {"taskId": task_id, "status": "in_progress"},
+        )
+    if request_number == 6:
+        claimed = _result_object(request, "w05-task-claim")
+        if claimed.get("claimed") is not True or not isinstance(
+            claimed.get("claimed_by"), str
+        ):
+            raise ScenarioError("TaskUpdate did not claim the TinyKG task")
+        return _tool_sse(
+            request_number,
+            "w05-write",
+            "Write",
+            {
+                "file_path": "/workspace/result.txt",
+                "content": "metacodes workbuddy w05 ok\n",
+            },
+        )
+    if request_number == 7:
+        _write_result, write_is_error = _result_text(request, "w05-write")
+        if write_is_error:
+            raise ScenarioError("Write reported an error")
+        created = _result_object(request, "w05-task-create")
+        task = created.get("task")
+        task_id = task.get("id") if isinstance(task, Mapping) else None
+        if not isinstance(task_id, str) or not task_id.startswith("kg-"):
+            raise ScenarioError("TaskCreate identity disappeared before completion")
+        return _tool_sse(
+            request_number,
+            "w05-task-complete",
+            "TaskUpdate",
+            {
+                "taskId": task_id,
+                "status": "completed",
+                "conclusion": "W0.5 governed artifact was written and reobserved.",
+                "produces": ["/workspace/result.txt"],
+                "uses": ["TinyKG", "project Lean gate"],
+            },
+        )
+    if request_number == 8:
+        completed = _result_object(request, "w05-task-complete")
+        if completed.get("closed") is not True:
+            raise ScenarioError("TaskUpdate did not commit the terminal TinyKG state")
+        return _final_sse(
+            request_number,
+            "W0.5 completed through real TinyKG, task-DAG and project-rule control paths.",
+        )
+    raise ScenarioError("control-plane-v1 received more than eight requests")
+
+
+def _scenario_sse(scenario: str, request_number: int, request: Mapping[str, Any]) -> bytes:
+    if scenario == "final-v1":
+        return _final_sse(
+            request_number,
+            "Mock L2 completed without modifying the benchmark workspace.",
+        )
+    if scenario == "control-plane-v1":
+        return _control_plane_sse(request_number, request)
+    raise ScenarioError(f"unsupported scenario: {scenario}")
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -131,21 +413,27 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_error(400)
             return
         with self.server.state_lock:  # type: ignore[attr-defined]
-            self.server.requests += 1  # type: ignore[attr-defined]
-            number = self.server.requests  # type: ignore[attr-defined]
+            number = self.server.requests + 1  # type: ignore[attr-defined]
+            try:
+                payload = _scenario_sse(self.server.scenario, number, request)  # type: ignore[attr-defined]
+            except ScenarioError as exc:
+                self.send_error(409, str(exc))
+                return
+            self.server.requests = number  # type: ignore[attr-defined]
             row = {
                 "schema_version": SCHEMA_VERSION,
+                "scenario": self.server.scenario,  # type: ignore[attr-defined]
                 "request_number": number,
                 "path": self.path,
                 "body_sha256": hashlib.sha256(body).hexdigest(),
                 "model": request.get("model"),
                 "stream": request.get("stream"),
+                "control_metrics_absent": b"control_metrics" not in body,
             }
             with self.server.request_log.open("ab") as handle:  # type: ignore[attr-defined]
                 handle.write(json.dumps(row, sort_keys=True).encode("utf-8") + b"\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-        payload = _sse(number)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Content-Length", str(len(payload)))
@@ -156,20 +444,25 @@ class _Handler(BaseHTTPRequestHandler):
         return
 
 
-def serve(*, ready: Path, request_log: Path, port: int) -> None:
+def serve(*, ready: Path, request_log: Path, port: int, scenario: str = "final-v1") -> None:
     import threading
 
     server = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
     server.state_lock = threading.Lock()  # type: ignore[attr-defined]
     server.requests = 0  # type: ignore[attr-defined]
     server.request_log = request_log  # type: ignore[attr-defined]
+    server.scenario = scenario  # type: ignore[attr-defined]
     try:
         _private_new(request_log, b"")
         _private_new(
             ready,
             (
                 json.dumps(
-                    {"schema_version": SCHEMA_VERSION, "port": server.server_port}
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "scenario": scenario,
+                        "port": server.server_port,
+                    }
                 )
                 + "\n"
             ).encode("utf-8"),
@@ -188,8 +481,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ready", required=True, type=Path)
     parser.add_argument("--request-log", required=True, type=Path)
     parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--scenario", choices=SCENARIOS, default="final-v1")
     args = parser.parse_args(argv)
-    serve(ready=args.ready, request_log=args.request_log, port=args.port)
+    serve(
+        ready=args.ready,
+        request_log=args.request_log,
+        port=args.port,
+        scenario=args.scenario,
+    )
     return 0
 
 

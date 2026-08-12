@@ -38,6 +38,35 @@ Run the zero-provider W0 vertical slice:
 python3 -m scripts.eval.workbuddy.run_w0 /path/to/workbuddy-bench
 ```
 
+Run the first WorkBuddy W0.5 real-control slice with a fresh checkout.  It is
+still a local scripted-provider test, not a memory-quality score: it proves
+the official Harbor/Docker path, real TinyKG and project Lean gate, and a
+single synthetic task while making zero external/paid requests.  The runner
+retains only a hash-bound receipt and derived control metrics; raw traces stay
+in the isolated local checkout.  The pinned Harbor Docker backend on macOS
+does not implement allowlist/no-network phase policies, so W0.5 must use its
+`public` mode to reach the host proxy; the only configured upstream route is
+the runner-owned loopback scripted provider and the receipt audits all eight
+requests.
+
+```bash
+python3 -m scripts.eval.workbuddy.run_w05 /path/to/fresh-workbuddy-bench \
+  --metacodes /path/to/linux-amd64/metacodes \
+  --tinykg /path/to/linux-amd64/tinykg \
+  --formal-kernel /path/to/linux-amd64/metacodes-formal-kernel \
+  --project-kernel /path/to/linux-amd64/metacodes-project-kernel \
+  --project-rules /path/to/promoted/project-rules \
+  --metacodes-commit <40-hex> --tinykg-commit <40-hex> \
+  --metacodes-license /path/to/METACODES-NOASSERTION.txt \
+  --tinykg-license /path/to/tinykg/LICENSE \
+  --lean-license /path/to/lean4/LICENSE
+```
+
+The W0.5 receipt must remain `quality_evidence=false`.  Do not reuse its
+synthetic task or scripted request log as a memory benchmark result, and do
+not widen the sample until its negative/tamper gates and the next wave have
+been reviewed.
+
 Freeze the official task cohorts before inspecting any task body:
 
 ```bash

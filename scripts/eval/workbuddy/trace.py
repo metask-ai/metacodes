@@ -32,10 +32,78 @@ OBSERVATION_FILENAME = "metacodes-tool-observations.jsonl"
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _KG_TOOLS = {"KgRemember", "KgRecall", "KgContext"}
 _TASK_DAG_TOOLS = {"TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskStop"}
+_MASK64 = (1 << 64) - 1
 
 
 class TraceError(ValueError):
     """The captured headless output cannot support an auditable trajectory."""
+
+
+def _rotl64(value: int, bits: int) -> int:
+    return ((value << bits) | (value >> (64 - bits))) & _MASK64
+
+
+def _xxhash64(value: bytes, seed: int = 0) -> int:
+    """Match ``std.hash.XxHash64`` used by metacodes project state paths."""
+
+    p1, p2 = 11400714785074694791, 14029467366897019727
+    p3, p4, p5 = 1609587929392839161, 9650029242287828579, 2870177450012600261
+
+    def round_(accumulator: int, lane: int) -> int:
+        accumulator = (accumulator + lane * p2) & _MASK64
+        return (_rotl64(accumulator, 31) * p1) & _MASK64
+
+    offset = 0
+    if len(value) >= 32:
+        lanes = [
+            (seed + p1 + p2) & _MASK64,
+            (seed + p2) & _MASK64,
+            seed & _MASK64,
+            (seed - p1) & _MASK64,
+        ]
+        limit = len(value) - 32
+        while offset <= limit:
+            for index in range(4):
+                lane = int.from_bytes(
+                    value[offset + index * 8 : offset + (index + 1) * 8], "little"
+                )
+                lanes[index] = round_(lanes[index], lane)
+            offset += 32
+        result = sum(
+            _rotl64(lane, rotation)
+            for lane, rotation in zip(lanes, (1, 7, 12, 18))
+        ) & _MASK64
+        for lane in lanes:
+            result ^= round_(0, lane)
+            result = (result * p1 + p4) & _MASK64
+    else:
+        result = (seed + p5) & _MASK64
+
+    result = (result + len(value)) & _MASK64
+    while offset + 8 <= len(value):
+        result ^= round_(0, int.from_bytes(value[offset : offset + 8], "little"))
+        result = (_rotl64(result, 27) * p1 + p4) & _MASK64
+        offset += 8
+    if offset + 4 <= len(value):
+        result ^= (int.from_bytes(value[offset : offset + 4], "little") * p1) & _MASK64
+        result = (_rotl64(result, 23) * p2 + p3) & _MASK64
+        offset += 4
+    while offset < len(value):
+        result ^= (value[offset] * p5) & _MASK64
+        result = (_rotl64(result, 11) * p1) & _MASK64
+        offset += 1
+    result ^= result >> 33
+    result = (result * p2) & _MASK64
+    result ^= result >> 29
+    result = (result * p3) & _MASK64
+    result ^= result >> 32
+    return result & _MASK64
+
+
+def project_state_hash(project_root: str) -> str:
+    """Return the exact 16-hex project directory key used by the Zig runtime."""
+
+    return f"{_xxhash64(project_root.encode('utf-8')):016x}"
 
 
 def _read_regular_bytes(path: Path, *, limit: int = MAX_TRACE_BYTES) -> bytes:
@@ -477,6 +545,20 @@ def _tool_control_metrics(messages: Iterable[Mapping[str, Any]]) -> Dict[str, An
             if not failed:
                 payload = _result_object(result["content"], name)
                 kg_status = payload.get("kg_status")
+                if kg_status is None and name == "TaskCreate":
+                    task = payload.get("task")
+                    task_id = task.get("id") if isinstance(task, dict) else None
+                    if isinstance(task_id, str) and task_id.startswith("kg-"):
+                        kg_status = "open"
+                if kg_status is None and name == "TaskUpdate":
+                    if payload.get("claimed") is True and isinstance(
+                        payload.get("claimed_by"), str
+                    ):
+                        kg_status = "claimed"
+                    elif payload.get("closed") is True:
+                        kg_status = "completed"
+                    elif payload.get("failed") is True:
+                        kg_status = "failed"
                 if kg_status is not None:
                     if kg_status not in {"open", "claimed", "completed", "failed"}:
                         raise TraceError(f"{name} kg_status is malformed")

@@ -37,6 +37,7 @@ from scripts.eval.workbuddy.trace import (
     TraceError,
     final_result,
     load_control_metrics,
+    project_state_hash,
     read_json_lines,
     transcript_ir,
 )
@@ -68,6 +69,9 @@ class WorkBuddyTraceTest(unittest.TestCase):
             }
             for sequence, payload in enumerate(payloads)
         ]
+
+    def test_project_state_hash_matches_zig_xxhash64(self):
+        self.assertEqual(project_state_hash("/workspace"), "5807156ecf67bb70")
 
     def test_transcript_maps_calls_results_and_cache_metrics_without_dropping_provenance(self):
         result = final_result(
@@ -268,8 +272,12 @@ class WorkBuddyTraceTest(unittest.TestCase):
                 "schema_version": "metacodes-knowledge-governance-v1",
                 "trust_state": "evidence_connected_candidate",
             }}),
-            ("remember", "KgRemember", {"node_id": 9}),
-            ("task", "TaskUpdate", {"kg_status": "completed"}),
+            ("remember", "KgRemember", {"remembered": {"node_id": 9}}),
+            ("task-create", "TaskCreate", {"task": {"id": "kg-10"}}),
+            ("task-claim", "TaskUpdate", {
+                "claimed": True, "claimed_by": "agent-l2"
+            }),
+            ("task-complete", "TaskUpdate", {"closed": True}),
         ]
         transcript_rows = [
             {"role": "assistant", "blocks": [
@@ -297,7 +305,8 @@ class WorkBuddyTraceTest(unittest.TestCase):
         self.assertEqual(tinykg["recall_repeated_nodes"], 1)
         self.assertEqual(tinykg["context_evidence_connected"], 1)
         self.assertEqual(tinykg["remember_succeeded"], 1)
-        self.assertEqual(tinykg["task_dag_calls"], 1)
+        self.assertEqual(tinykg["task_dag_calls"], 3)
+        self.assertEqual(tinykg["task_tinykg_status_results"], 3)
         self.assertEqual(tinykg["task_terminal_commits"], 1)
 
     def test_control_metrics_reject_sequence_identity_pairing_and_recall_drift(self):
@@ -398,6 +407,75 @@ class WorkBuddyArtifactStageTest(unittest.TestCase):
                     metacodes=executable,
                     tinykg=executable,
                     formal_kernel=executable,
+                    metacodes_commit=ZERO_COMMIT,
+                    tinykg_commit=ONE_COMMIT,
+                    licenses=(
+                        ("metacodes", "NOASSERTION", license_file),
+                        ("tinykg", "Apache-2.0", license_file),
+                        ("lean4", "Apache-2.0", license_file),
+                    ),
+                    allow_synthetic_fixtures=True,
+                )
+
+    def test_stage_binds_optional_project_control_template(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "fixture-bin"
+            executable.write_bytes(b"fixture project kernel\n")
+            license_file = root / "LICENSE"
+            license_file.write_text("fixture license\n", encoding="utf-8")
+            rules = root / "project-rules"
+            rules.mkdir()
+            project_sha = hashlib.sha256(
+                b"metacodes-project-identity-v1\x00/workspace"
+            ).hexdigest()
+            kernel_sha = hashlib.sha256(executable.read_bytes()).hexdigest()
+            (rules / "active.json").write_text(
+                json.dumps(
+                    {
+                        "body": {
+                            "project_sha256": project_sha,
+                            "kernel_sha256": kernel_sha,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (rules / "bundle.json").write_text("{}\n", encoding="utf-8")
+            output = root / "stage"
+            manifest = stage(
+                output=output,
+                metacodes=executable,
+                tinykg=executable,
+                formal_kernel=executable,
+                project_kernel=executable,
+                project_rules=rules,
+                metacodes_commit=ZERO_COMMIT,
+                tinykg_commit=ONE_COMMIT,
+                licenses=(
+                    ("metacodes", "NOASSERTION", license_file),
+                    ("tinykg", "Apache-2.0", license_file),
+                    ("lean4", "Apache-2.0", license_file),
+                ),
+                allow_synthetic_fixtures=True,
+            )
+            control = manifest["project_control"]
+            self.assertEqual(control["kernel"]["sha256"], kernel_sha)
+            self.assertEqual(control["rules"]["project_sha256"], project_sha)
+            self.assertEqual(control["rules"]["files"], 2)
+            sums = (output / "share/metacodes/SHA256SUMS").read_text(
+                encoding="ascii"
+            )
+            self.assertIn("libexec/metacodes-project-kernel", sums)
+            self.assertIn("workbuddy-w05/project-rules/active.json", sums)
+
+            with self.assertRaisesRegex(StageError, "together"):
+                stage(
+                    output=root / "missing-rules",
+                    metacodes=executable,
+                    tinykg=executable,
+                    formal_kernel=executable,
+                    project_kernel=executable,
                     metacodes_commit=ZERO_COMMIT,
                     tinykg_commit=ONE_COMMIT,
                     licenses=(
@@ -623,6 +701,37 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
 
 
 class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
+    def test_adapter_remote_environment_assertion_is_one_shell_operand(self):
+        source = (
+            Path(__file__).parents[1]
+            / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
+        ).read_text(encoding="utf-8")
+        compiled = compile(source, "<metacodes-agent>", "exec")
+        strings = []
+
+        def collect(code):
+            for value in code.co_consts:
+                if isinstance(value, str):
+                    strings.append(value)
+                elif hasattr(value, "co_consts"):
+                    collect(value)
+
+        collect(compiled)
+        command_fragment = next(
+            value for value in strings if "TINYKG_REMOTE_URL+x" in value
+        )
+        self.assertIn(
+            'test -z "${TINYKG_REMOTE_URL+x}${TINYKG_API_KEY+x}'
+            '${TINYKG_REMOTE_EXPECTED_BUILD_ID+x}${TINYKG_REMOTE_CONFIG+x}'
+            '${METASK_API_KEY+x}" || exit 84',
+            command_fragment,
+        )
+        self.assertIn("remote_tinykg_env_absent", source)
+        self.assertIn(
+            'raise ValueError("metacodes WorkBuddy trial received remote TinyKG authority")',
+            source,
+        )
+
     def test_overlay_patches_resolve_and_prepare_with_one_mount_contract(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -684,6 +793,17 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         config = (task / "task.toml").read_text(encoding="utf-8")
         self.assertIn("network_mode: none", compose)
         self.assertEqual(config.count('network_mode = "public"'), 3)
+
+    def test_w05_uses_docker_supported_public_network_for_loopback_proxy(self):
+        task = (
+            Path(__file__).parents[1]
+            / "workbuddy/overlay/datasets/metacodes-w05-synthetic/tasks"
+            / "metacodes-w05-control/task.toml"
+        )
+        config = task.read_text(encoding="utf-8")
+        self.assertEqual(config.count('network_mode = "public"'), 3)
+        self.assertNotIn('network_mode = "no-network"', config)
+        self.assertNotIn('network_mode = "allowlist"', config)
 
     def test_paid_code_canary_is_frozen_to_first_three_code_dev_tasks(self):
         root = Path(__file__).parents[1] / "workbuddy"

@@ -106,11 +106,24 @@ _METACODES_RUNTIME_BUILDER = '''def _build_metacodes_runtime_config(
         "METACODES_FORMAL_KERNEL_PATH": "/opt/metacodes/libexec/metacodes-formal-kernel",
         "METACODES_FORMAL_KERNEL_SHA256": "<verified-mount-sha256>",
     })
+    project_rules = harness_params.get("METACODES_PROJECT_RULES_RELATIVE")
+    project_kernel = harness_params.get("METACODES_PROJECT_KERNEL_RELATIVE")
+    if project_rules or project_kernel:
+        env.update({
+            "METACODES_PROJECT_RULES_SOURCE": (
+                f"/opt/metacodes/{project_rules}" if project_rules else "<missing>"
+            ),
+            "METACODES_PROJECT_KERNEL_PATH": (
+                f"/opt/metacodes/{project_kernel}" if project_kernel else "<missing>"
+            ),
+            "METACODES_PROJECT_KERNEL_SHA256": "<verified-mount-sha256>",
+        })
     return {
         "harness": "metacodes",
         "connection_policy": "local-proxy-only",
         "credential_delivery": "anonymous-fd-route-token",
         "disabled_tools": harness_params.get("METACODES_DISALLOWED_TOOLS"),
+        "project_control_configured": bool(project_rules and project_kernel),
         "translated_env": {key: value for key, value in env.items() if value},
         "cleared_env": [
             "TINYKG_REMOTE_URL",

@@ -39,7 +39,13 @@ from .environment_preflight import (
 )
 from .install_overlay import OverlayError, validate_installed_overlay
 from .key_fd import MAX_CREDENTIAL_BYTES
-from .stage_artifacts import ELF_MACHINE_X86_64, TARGET_PLATFORM, _elf_machine
+from .stage_artifacts import (
+    ELF_MACHINE_X86_64,
+    MAX_PROJECT_RULE_BYTES,
+    MAX_PROJECT_RULE_FILES,
+    TARGET_PLATFORM,
+    _elf_machine,
+)
 from .trace import (
     CONTROL_METRICS_SCHEMA,
     OBSERVATION_FILENAME,
@@ -266,10 +272,107 @@ def _artifact_contract(path: Path) -> Dict[str, object]:
             )
         identity["elf_machine"] = machine
         observed[name] = identity
-    return {
+    result: Dict[str, object] = {
         "manifest": _identity(path),
         "target_platform": TARGET_PLATFORM,
         "executables": observed,
+    }
+    project = manifest.get("project_control")
+    if project is not None:
+        if not isinstance(project, dict) or project.get("schema_version") != (
+            "metacodes-workbuddy-project-control-v1"
+        ):
+            raise LaunchError("split-mount project control manifest is malformed")
+        kernel = project.get("kernel")
+        rules = project.get("rules")
+        if not isinstance(kernel, dict) or not isinstance(rules, dict):
+            raise LaunchError("split-mount project control identity is incomplete")
+        kernel_relative = _stage_relative_path(
+            kernel.get("relative_path"), "project kernel"
+        )
+        rules_relative = _stage_relative_path(
+            rules.get("relative_path"), "project rules"
+        )
+        kernel_path = stage / kernel_relative
+        kernel_identity = _identity(kernel_path, maximum=512 * 1024 * 1024)
+        if (
+            kernel_identity["sha256"] != kernel.get("sha256")
+            or _elf_machine(kernel_path) != ELF_MACHINE_X86_64
+            or kernel.get("elf_machine") != ELF_MACHINE_X86_64
+        ):
+            raise LaunchError("split-mount project kernel identity drifted")
+        rules_identity = _project_rule_tree(stage / rules_relative)
+        for key in ("files", "bytes", "tree_sha256"):
+            if rules_identity[key] != rules.get(key):
+                raise LaunchError("split-mount project-rules tree identity drifted")
+        if rules.get("active_kernel_sha256") != kernel_identity["sha256"]:
+            raise LaunchError("split-mount active project rules bind another kernel")
+        result["project_control"] = {
+            "schema_version": "metacodes-workbuddy-project-control-v1",
+            "kernel": {**kernel_identity, "elf_machine": ELF_MACHINE_X86_64},
+            "rules": rules_identity,
+        }
+    return result
+
+
+def _stage_relative_path(value: object, label: str) -> Path:
+    if not isinstance(value, str):
+        raise LaunchError(f"split-mount {label} path is missing")
+    relative = Path(value)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or "." in relative.parts
+        or ".." in relative.parts
+        or relative.as_posix() != value
+    ):
+        raise LaunchError(f"split-mount {label} path is not normalized")
+    return relative
+
+
+def _project_rule_tree(root: Path) -> Dict[str, object]:
+    if root.is_symlink() or not root.is_dir():
+        raise LaunchError("split-mount project-rules path is not a real directory")
+    rows: list[tuple[str, Dict[str, object]]] = []
+    total = 0
+    for candidate in sorted(root.rglob("*")):
+        relative = candidate.relative_to(root)
+        info = candidate.lstat()
+        if candidate.is_symlink():
+            raise LaunchError(
+                f"split-mount project-rules contains a symlink: {relative}"
+            )
+        if stat.S_ISDIR(info.st_mode):
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise LaunchError(
+                f"split-mount project-rules contains a linked/non-regular file: {relative}"
+            )
+        if len(rows) >= MAX_PROJECT_RULE_FILES:
+            raise LaunchError("split-mount project-rules exceeds the file-count bound")
+        total += info.st_size
+        if total > MAX_PROJECT_RULE_BYTES:
+            raise LaunchError("split-mount project-rules exceeds the byte bound")
+        rows.append(
+            (
+                relative.as_posix(),
+                _identity(candidate, maximum=MAX_PROJECT_RULE_BYTES),
+            )
+        )
+    if not rows:
+        raise LaunchError("split-mount project-rules tree is empty")
+    digest = hashlib.sha256()
+    for relative, identity in rows:
+        name = relative.encode("utf-8")
+        digest.update(len(name).to_bytes(4, "big"))
+        digest.update(name)
+        digest.update(int(identity["bytes"]).to_bytes(8, "big"))
+        digest.update(bytes.fromhex(str(identity["sha256"])))
+    return {
+        "path": str(root.resolve()),
+        "files": len(rows),
+        "bytes": total,
+        "tree_sha256": digest.hexdigest(),
     }
 
 
@@ -654,6 +757,16 @@ def _reobserve_launch_inputs(manifest: Mapping[str, Any]) -> None:
         _reobserve_identity(row, f"split-mount {name}", maximum=512 * 1024 * 1024)
         if _elf_machine(Path(row["path"])) != ELF_MACHINE_X86_64:
             raise LaunchError(f"split-mount {name} ELF architecture drifted")
+    project = manifest["artifacts"].get("project_control")
+    if project is not None:
+        _reobserve_identity(
+            project["kernel"],
+            "split-mount project kernel",
+            maximum=512 * 1024 * 1024,
+        )
+        observed_rules = _project_rule_tree(Path(project["rules"]["path"]))
+        if observed_rules != project["rules"]:
+            raise LaunchError("split-mount project-rules changed after manifest creation")
     preflight_row = manifest["environment_preflight"]
     _reobserve_identity(
         preflight_row["receipt"],
