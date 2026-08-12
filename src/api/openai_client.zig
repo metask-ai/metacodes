@@ -38,6 +38,7 @@ const api_stream = @import("stream.zig");
 const provider_mod = @import("provider.zig");
 const capability = @import("capability.zig");
 const cache = @import("cache.zig");
+const request_overrides = @import("request_overrides.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
 const StreamEvent = api_stream.StreamEvent;
@@ -57,6 +58,8 @@ pub const OpenAIClient = struct {
     max_tokens: u32 = 4096,
     context_window: u32 = 128_000,
     reasoning_effort: ?types.ReasoningEffort = null,
+    /// 方言字段覆盖(null = profile 默认)。来源:计划 jolly-glacier。
+    overrides: request_overrides.RequestOverrides = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8, base_url: ?[]const u8) OpenAIClient {
         return .{
@@ -85,6 +88,8 @@ pub const OpenAIClient = struct {
             .maxInputTokensFn = &pMaxInputTokens,
             .reasoningEffortFn = &pReasoningEffort,
             .setReasoningEffortFn = &pSetReasoningEffort,
+            .requestOverridesFn = &pRequestOverrides,
+            .setRequestOverridesFn = &pSetRequestOverrides,
             .supportsFn = &pSupports,
         };
     }
@@ -93,6 +98,20 @@ pub const OpenAIClient = struct {
     }
     fn pModel(ctx: *anyopaque) []const u8 {
         return cast(ctx).model;
+    }
+    /// Provider.requestOverrides() 返回 Client.overrides;同步也镜像 reasoning_effort
+    /// 进 overrides.reasoning_effort(若 overrides 未显式设,从 legacy 字段兜底),
+    /// 让 serialize 经统一入口拿到 effort。
+    fn pRequestOverrides(ctx: *anyopaque) request_overrides.RequestOverrides {
+        const self = cast(ctx);
+        var o = self.overrides;
+        if (o.reasoning_effort == null) o.reasoning_effort = self.reasoning_effort;
+        return o;
+    }
+    fn pSetRequestOverrides(ctx: *anyopaque, o: request_overrides.RequestOverrides) void {
+        cast(ctx).overrides = o;
+        // 同步 reasoning_effort(若 o 显式设了),保持 legacy 字段一致
+        if (o.reasoning_effort) |e| cast(ctx).reasoning_effort = e;
     }
     fn pMaxTokens(ctx: *anyopaque) u32 {
         return cast(ctx).max_tokens;
@@ -609,6 +628,18 @@ fn extractDeltaReasoning(data: []const u8) ?[]const u8 {
 /// 按 model 查 ModelProfile 决定 thinking wire 格式(GLM prompt 标签 / K3 extra_body / DeepSeek 顶层 / OpenAI effort)。
 /// tool_choice 由 dialect.serializeToolChoice 翻译成 OpenAI wire(Anthropic 语义→OpenAI 语义)。
 pub fn serializeOpenAIRequest(allocator: std.mem.Allocator, model: []const u8, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, reasoning_effort: ?types.ReasoningEffort, tool_choice: ?json_mod.ToolChoice) ![]u8 {
+    // Legacy 签名 wrapper:把散落的 reasoning_effort + tool_choice 包成 RequestOverrides
+    // 转给 serializeOpenAIRequestWithOverrides。保留向后兼容(既有测试/调用方不动)。
+    return serializeOpenAIRequestWithOverrides(allocator, model, messages, system, tools, .{
+        .reasoning_effort = reasoning_effort,
+        .tool_choice = tool_choice,
+    });
+}
+
+/// 完整方言字段入口的序列化(阶段 3:接线 dead code)。
+/// overrides 非 null 字段 = 显式覆盖;null 字段 = dialect 按 profile 静态推断(现状)。
+/// 来源:计划 jolly-glacier(2026-08-11)。
+pub fn serializeOpenAIRequestWithOverrides(allocator: std.mem.Allocator, model: []const u8, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, overrides: request_overrides.RequestOverrides) ![]u8 {
     const adapter = @import("model_adapter.zig");
     const dialect_mod = @import("dialect.zig");
     const profile = adapter.profileFor(.openai, model);
@@ -618,18 +649,27 @@ pub fn serializeOpenAIRequest(allocator: std.mem.Allocator, model: []const u8, m
     try out.appendSlice(allocator, "{\"model\":");
     try util_json.serializeString(model, &out, allocator);
     // thinking 控制:委托给 dialect(按 model 选 wire 格式)。
-    try dialect.serializeThinking(profile, reasoning_effort, &out, allocator);
+    try dialect.serializeThinking(profile, overrides.reasoning_effort, &out, allocator);
+    // 通用采样参数(不经 dialect,所有 OpenAI 协议都认)。
+    if (overrides.temperature) |t| {
+        try out.appendSlice(allocator, ",\"temperature\":");
+        try util_json.serializeNumber(t, &out, allocator);
+    }
+    if (overrides.top_p) |p| {
+        try out.appendSlice(allocator, ",\"top_p\":");
+        try util_json.serializeNumber(p, &out, allocator);
+    }
     // stream_options.include_usage=true:OpenAI 默认流式不发 usage,显式要求才在末尾发一个
     // {choices:[],usage:{...}} chunk。缓存命中(cached_tokens)就在这个 usage 里。
     try out.appendSlice(allocator, ",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
     var first = true;
-    // system → 首条 {role:"system"}。dialect 可注入厂商特定标签(如 GLM-5 <reasoning_effort>)。
+    // system → 首条 {role:"system"}。dialect 可注入厂商特定标签(如旧 GLM-4.6 <reasoning_effort>;新 dialect 不调)。
     if (system) |sys| {
         try out.appendSlice(allocator, "{\"role\":\"system\",\"content\":");
         var sys_buf: std.ArrayList(u8) = .empty;
         defer sys_buf.deinit(allocator);
         try sys_buf.appendSlice(allocator, sys);
-        try dialect.injectSystemMods(profile, reasoning_effort, &sys_buf, allocator);
+        try dialect.injectSystemMods(profile, overrides.reasoning_effort, &sys_buf, allocator);
         try util_json.serializeString(sys_buf.items, &out, allocator);
         try out.append(allocator, '}');
         first = false;
@@ -652,10 +692,20 @@ pub fn serializeOpenAIRequest(allocator: std.mem.Allocator, model: []const u8, m
         }
     }
     // tool_choice:委托给 dialect(按 model 翻译 + 能力降级 GLM-5)。
-    // dialect 返回 false 表示未序列化(如 tool_choice=null),true 表示已追加 wire 片段。
-    // dialect.ToolChoice 是 api/request.zig ToolChoice 的 alias,直接传 json_mod.ToolChoice。
-    if (tool_choice) |tc| {
+    if (overrides.tool_choice) |tc| {
         _ = try dialect.serializeToolChoice(profile, tc, &out, allocator);
+    }
+    // response_format:阶段 3 接线(此前 dead code)。能力守门在 dialect 内(GLM-5 json_schema→json_object)。
+    if (overrides.response_format) |rf| {
+        _ = try dialect.serializeResponseFormat(profile, rf, &out, allocator);
+    }
+    // prompt_cache_key:阶段 3 接线。能力守门(supports_prompt_cache_key=false 的 dialect 返 false 不发)。
+    if (overrides.prompt_cache_key) |key| {
+        _ = try dialect.serializePromptCacheKey(profile, key, &out, allocator);
+    }
+    // parallel_tool_calls:阶段 3 接线。能力守门(supports_parallel_tool_calls=false 的 dialect 返 false 不发)。
+    if (overrides.parallel_tool_calls) |b| {
+        _ = try dialect.serializeParallelToolCalls(profile, b, &out, allocator);
     }
     try out.append(allocator, '}');
     return out.toOwnedSlice(allocator);

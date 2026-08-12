@@ -308,6 +308,8 @@ pub const Client = struct {
             .maxInputTokensFn = &pMaxInputTokens,
             .reasoningEffortFn = &pReasoningEffort,
             .setReasoningEffortFn = &pSetReasoningEffort,
+            // Anthropic 不支持方言字段覆盖(Claude 无 prompt_cache_key/parallel_tool_calls/response_format 方言字段);
+            // requestOverridesFn 走 default(返全 null),setRequestOverridesFn 留 null(setter 调用返 error)
             .supportsFn = &pSupports,
         };
     }

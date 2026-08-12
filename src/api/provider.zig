@@ -19,6 +19,7 @@ const std = @import("std");
 const types = @import("../types.zig");
 const json_mod = @import("../json.zig");
 const api_stream = @import("stream.zig");
+const request_overrides = @import("request_overrides.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const sync = @import("platform").sync;
 
@@ -203,6 +204,13 @@ pub const Provider = struct {
     /// cannot affect the request.
     setReasoningEffortFn: ?*const fn (ctx: *anyopaque, effort: ?types.ReasoningEffort) void = null,
 
+    /// 当前生效的方言字段覆盖(null 字段 = profile 默认,即 dialect 静态推断)。
+    /// 默认实现返全 null(等价"无覆盖",保持现状)。TUI / Config / AgentDef 可经
+    /// setRequestOverridesFn 覆盖。来源:计划 jolly-glacier(2026-08-11)。
+    requestOverridesFn: *const fn (ctx: *anyopaque) request_overrides.RequestOverrides = defaultRequestOverrides,
+    /// 可选 setter;不支持配置方言字段的 provider 可不实现(返 error.OverridesUnsupportedProvider)。
+    setRequestOverridesFn: ?*const fn (ctx: *anyopaque, o: request_overrides.RequestOverrides) void = null,
+
     /// 能力查询(P2 真接表;P0 实现可恒按 Anthropic 能力答)。
     supportsFn: *const fn (ctx: *anyopaque, cap: Capability) bool,
 
@@ -238,12 +246,25 @@ pub const Provider = struct {
         const setter = self.setReasoningEffortFn orelse return error.AgentEffortUnsupportedProvider;
         setter(self.ctx, effort);
     }
+    pub inline fn requestOverrides(self: Provider) request_overrides.RequestOverrides {
+        return self.requestOverridesFn(self.ctx);
+    }
+    pub inline fn setRequestOverrides(self: Provider, o: request_overrides.RequestOverrides) !void {
+        const setter = self.setRequestOverridesFn orelse return error.OverridesUnsupportedProvider;
+        setter(self.ctx, o);
+    }
     pub inline fn supports(self: Provider, cap: Capability) bool {
         return self.supportsFn(self.ctx, cap);
     }
 };
 
 fn noopCancel(_: *anyopaque, _: *const AbortSignal) void {}
+
+/// 默认 requestOverrides 实现:返全 null(等价"无覆盖",走 profile 默认)。
+/// 既有 provider 若不实现 requestOverridesFn,自动用此 default,行为不变。
+fn defaultRequestOverrides(_: *anyopaque) request_overrides.RequestOverrides {
+    return .{};
+}
 
 test "Capability enum + StreamHandle 可表达" {
     try std.testing.expect(Capability.web_search != Capability.prompt_cache);

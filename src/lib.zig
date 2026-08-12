@@ -63,6 +63,7 @@ pub const api_openai = @import("api/openai_client.zig");
 pub const api_gemini = @import("api/gemini_client.zig"); // 第三 provider:Gemini + 有状态缓存
 pub const api_dialect = @import("api/dialect.zig"); // 方言 vtable(模型 wire 格式适配)
 pub const api_request = @import("api/request.zig"); // Anthropic 请求序列化
+pub const api_request_overrides = @import("api/request_overrides.zig"); // 方言字段统一配置入口
 pub const model_adapter = @import("api/model_adapter.zig"); // ModelProfile 能力探测
 pub const json = @import("json.zig");
 pub const types = @import("types.zig");

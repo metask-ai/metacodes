@@ -40,6 +40,7 @@ const api_stream = @import("stream.zig");
 const provider_mod = @import("provider.zig");
 const capability = @import("capability.zig");
 const cache = @import("cache.zig");
+const request_overrides = @import("request_overrides.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
 const StreamEvent = api_stream.StreamEvent;
@@ -75,6 +76,8 @@ pub const GeminiClient = struct {
     /// 非null → serializeGeminiRequest 经 GeminiDialect.serializeThinking 翻成
     /// generation_config.thinking_level(low/high)。
     reasoning_effort: ?types.ReasoningEffort = null,
+    /// 方言字段覆盖(null = profile 默认)。来源:计划 jolly-glacier。
+    overrides: request_overrides.RequestOverrides = .{},
 
     /// 有状态缓存句柄表(GeminiClient 私有,不上浮中立契约)。
     /// prepareCache 据 system+tools 的 prefix 哈希查表命中则引用,未命中/过期则(MVP)走隐式。
@@ -141,6 +144,8 @@ pub const GeminiClient = struct {
             .maxTokensFn = &pMaxTokens,
             .maxInputTokensFn = &pMaxInputTokens,
             .reasoningEffortFn = &pReasoningEffort,
+            .requestOverridesFn = &pRequestOverrides,
+            .setRequestOverridesFn = &pSetRequestOverrides,
             .supportsFn = &pSupports,
         };
     }
@@ -149,6 +154,17 @@ pub const GeminiClient = struct {
     }
     fn pModel(ctx: *anyopaque) []const u8 {
         return cast(ctx).model;
+    }
+    /// Provider.requestOverrides() 返回 Client.overrides;镜像 reasoning_effort 兜底。
+    fn pRequestOverrides(ctx: *anyopaque) request_overrides.RequestOverrides {
+        const self = cast(ctx);
+        var o = self.overrides;
+        if (o.reasoning_effort == null) o.reasoning_effort = self.reasoning_effort;
+        return o;
+    }
+    fn pSetRequestOverrides(ctx: *anyopaque, o: request_overrides.RequestOverrides) void {
+        cast(ctx).overrides = o;
+        if (o.reasoning_effort) |e| cast(ctx).reasoning_effort = e;
     }
     fn pMaxTokens(ctx: *anyopaque) u32 {
         return cast(ctx).max_tokens;
