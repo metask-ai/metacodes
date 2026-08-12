@@ -254,11 +254,15 @@ fn formatAutoBackgrounded(allocator: std.mem.Allocator, j: *const @import("../co
     defer aw.deinit();
     try aw.writer.writeAll("{\"auto_backgrounded\":true,\"job_id\":");
     try std.json.Stringify.encodeJsonString(j.id[0..], .{}, &aw.writer);
+    try aw.writer.writeAll(",\"stdout_path\":");
+    try std.json.Stringify.encodeJsonString(j.stdout_path, .{}, &aw.writer);
+    try aw.writer.writeAll(",\"stderr_path\":");
+    try std.json.Stringify.encodeJsonString(j.stderr_path, .{}, &aw.writer);
     try aw.writer.writeAll(",\"partial_stdout\":");
     try std.json.Stringify.encodeJsonString(out_trunc, .{}, &aw.writer);
     try aw.writer.writeAll(",\"partial_stderr\":");
     try std.json.Stringify.encodeJsonString(err_trunc, .{}, &aw.writer);
-    try aw.writer.writeAll(",\"note\":\"Command exceeded 15s; moved to background. Use BashOutput to poll or KillShell to terminate.\"}");
+    try aw.writer.writeAll(",\"note\":\"Command exceeded 15s; moved to background. Use BashOutput to poll, or Read on stdout_path/stderr_path to read captured output directly.\"}");
     return try aw.toOwnedSlice();
 }
 
@@ -365,6 +369,25 @@ test "BashTool auto-backgrounds after 15s" {
     for (registry.jobs.items) |*j| {
         if (j.status == .running) registry.kill(j.idSlice()) catch {};
     }
+}
+
+test "formatAutoBackgrounded 返回 stdout_path/stderr_path 供 Read 直接读" {
+    // 对齐 cc: auto-backgrounded 响应必须含 stdout_path/stderr_path,
+    // 否则模型被迫 BashOutput 轮询,长任务时陷入"轮询无果"死循环。
+    const a = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer registry.deinit();
+    const j = try registry.spawnBackground("echo hi; sleep 30");
+    defer registry.kill(j.idSlice()) catch {};
+    const result = try formatAutoBackgrounded(a, &j);
+    defer a.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"auto_backgrounded\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"job_id\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"stdout_path\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"stderr_path\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "partial_stdout") != null);
+    // note 应引导模型用 Read 读 path
+    try std.testing.expect(std.mem.indexOf(u8, result, "Read on stdout_path") != null);
 }
 
 test "truncateHead: 小输出原样,大输出截断 + 标记" {
