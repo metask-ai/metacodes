@@ -15,6 +15,7 @@ pub const mcp_checkpoint = @import("mcp_checkpoint.zig");
 pub const mcp_canonical = @import("mcp_canonical.zig");
 const builtin = @import("builtin");
 const sync = @import("platform").sync;
+const process = @import("platform").process;
 const wire = @import("metask_agentcore_types");
 const public_protocol = @import("metask_agentcore_protocol");
 const core = @import("metacodes-core");
@@ -34,6 +35,10 @@ const model_binding = @import("model_binding.zig");
 const sandbox_admission = @import("sandbox_admission.zig");
 
 const allocator = std.heap.c_allocator;
+const test_long_running_command = if (builtin.os.tag == .windows)
+    "ping -n 30 127.0.0.1"
+else
+    "sleep 30";
 
 comptime {
     if (wire.MAX_TOOL_ERROR_PAYLOAD_BYTES_V1 != @as(u64, core.tool_exec.MAX_TOOL_ERROR_PAYLOAD_BYTES_V1))
@@ -1538,7 +1543,7 @@ const AbiSession = struct {
     /// long as no Core Run is active; no sink, generation commit or hidden
     /// compaction occurs.
     fn measureDurableUsage(self: *AbiSession) !session_checkpoint.Usage {
-        var lease = try self.core_session.snapshotCommitted();
+        var lease = try self.core_session.snapshotCommittedForRunMeasurement();
         defer lease.deinit();
         const binding_snapshot = if (self.skill_binding) |*binding|
             binding.snapshot()
@@ -1654,7 +1659,7 @@ const AbiSession = struct {
         controller: *session_budget.Controller,
     ) void {
         if (self.core_session.isPoisoned()) return;
-        var lease = self.core_session.snapshotCommitted() catch return;
+        var lease = self.core_session.snapshotCommittedForRunMeasurement() catch return;
         const run_was_consumed = lease.last_run_id == run_id;
         lease.deinit();
         if (!run_was_consumed) return;
@@ -9688,6 +9693,97 @@ test "checkpoint budget rejects text before consuming run identity" {
         session_budget.Outcome.budget_required,
         facade.budget_state.last_outcome,
     );
+}
+
+test "budgeted Run completes with an active background job" {
+    // Regression invariant: Run finalization may measure durable state while a
+    // runtime job exists; the checkpoint export eligibility contract remains
+    // enforced by snapshotCommitted() on the explicit export path.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const cwd = root_buffer[0..root_len];
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{"Bash"} },
+    );
+    defer native_runtime.destroy() catch unreachable;
+    const native_session = try native_runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd, .shell = .unrestricted },
+        .allowed_tools = &.{"Bash"},
+    });
+    defer native_session.destroy() catch unreachable;
+    const active_job = try native_session.jobs.?.spawnBackground(test_long_running_command, cwd);
+    native_session.jobs.?.reapExited();
+    try std.testing.expectEqual(
+        process.ReapStatus.running,
+        process.reapNonblock(native_session.jobs.?.get(active_job.idSlice()).?.proc),
+    );
+    try std.testing.expectEqual(
+        core.job_registry.JobStatus.running,
+        native_session.jobs.?.get(active_job.idSlice()).?.status,
+    );
+
+    var facade = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = native_session,
+        .budget_state = try session_budget.SessionState.init(.{
+            .hard_bytes = 1 << 20,
+            .soft_bytes = (1 << 20) - 1,
+            .input_cap_bytes = 4096,
+            .provider_request_cap_bytes = 64 * 1024,
+            .provider_result_cap_bytes = 4096,
+            .tool_result_cap_bytes = 4096,
+            .mcp_result_cap_bytes = 4096,
+            .audit_reserve_bytes = 64,
+            .terminal_reserve_bytes = 128,
+        }),
+    };
+    var test_provider = CompactBudgetTestProvider{
+        .allocator = std.testing.allocator,
+        .payload_bytes = 0,
+    };
+    const prompt = "complete while server runs";
+    const preflight = try facade.preflightRootRecords(&.{prompt});
+    var controller = session_budget.Controller.init(
+        std.testing.allocator,
+        facade.budget_state.profile,
+        preflight,
+    );
+    var budget_provider = session_budget.BudgetedProvider{
+        .allocator = std.testing.allocator,
+        .controller = &controller,
+        .base = test_provider.provider(),
+    };
+    var admitted = try native_session.admitRun(
+        1,
+        .{ .ctx = &facade, .emit = AbiSession.emit },
+    );
+    const surface = core.agent_session.RunToolSurface{
+        .definitions = native_session.tools.definitions,
+        .dispatcher = native_session.tools.dispatcher(),
+    };
+    var budget_tools = session_budget.ToolEnvironment{
+        .controller = &controller,
+        .base = surface,
+    };
+    const result = try admitted.runUserMessagesWithToolSurfaceUsingProvider(
+        &.{prompt},
+        1,
+        null,
+        budget_tools.surface(),
+        budget_provider.provider(),
+    );
+    _ = try facade.finishBudgetedRun(1, &controller);
+    try std.testing.expect(result.stop_reason == .end_turn);
+    try std.testing.expect(!facade.facade_poisoned.load(.acquire));
+    try std.testing.expect(facade.budget_state.durable_usage_bytes != 0);
 }
 
 test "Permission Session grant reserves durable bytes before publication" {

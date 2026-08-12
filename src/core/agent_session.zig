@@ -856,6 +856,20 @@ pub const AgentSession = struct {
     /// Conversation. The dedicated lifecycle state prevents every mutation
     /// until the caller releases the returned lease.
     pub fn snapshotCommitted(self: *AgentSession) CheckpointError!CheckpointLease {
+        return self.snapshotCommittedWithJobs(false);
+    }
+
+    /// Run-budget finalization only needs a coherent durable-state read.
+    /// Runtime jobs are intentionally excluded from the checkpoint payload and
+    /// do not participate in this internal measurement boundary.
+    pub fn snapshotCommittedForRunMeasurement(self: *AgentSession) CheckpointError!CheckpointLease {
+        return self.snapshotCommittedWithJobs(true);
+    }
+
+    fn snapshotCommittedWithJobs(
+        self: *AgentSession,
+        allow_runtime_jobs: bool,
+    ) CheckpointError!CheckpointLease {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.in_flight_provider_cancels != 0)
@@ -871,8 +885,10 @@ pub const AgentSession = struct {
             => return error.SessionBusy,
             .poisoned, .destroying => return error.InvalidSessionState,
         }
-        if (self.jobs) |*registry| {
-            if (registry.activeCount() != 0) return error.SessionBusy;
+        if (!allow_runtime_jobs) {
+            if (self.jobs) |*registry| {
+                if (registry.activeCount() != 0) return error.SessionBusy;
+            }
         }
         self.state = .checkpointing;
         return .{
