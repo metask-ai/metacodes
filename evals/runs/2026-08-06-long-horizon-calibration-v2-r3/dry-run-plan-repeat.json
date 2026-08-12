@@ -1,0 +1,430 @@
+{
+  "arm_config_ids": {
+    "claude_style": "metacodes-long-horizon-three-arm-calibration-v2:claude_style:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+    "codex_style": "metacodes-long-horizon-three-arm-calibration-v2:codex_style:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+    "tinykg": "metacodes-long-horizon-three-arm-calibration-v2:tinykg:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20"
+  },
+  "budget_carryover": {
+    "aggregate_remaining_cost_usd_before_promotion": 996.6461866,
+    "aggregate_remaining_tokens_before_promotion": 87780707,
+    "stage_remaining_cost_usd": 96.6461866,
+    "stage_remaining_tokens": 21780707,
+    "stage_used_cost_usd": 3.3538134,
+    "stage_used_tokens": 2219293
+  },
+  "execution_identity": {
+    "formal_kernel": {
+      "artifact_fingerprint": "f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+      "build_receipt_path": "/private/tmp/metacodes-formal-identity.rYnKXY/metacodes/zig-out/libexec/metacodes/metacodes-formal-kernel.build-receipt.json",
+      "build_receipt_sha256": "5144dce359f0deac5ad96db5ac96601faeb88a963d01e4a283eff48b10388466",
+      "bytes": 6542888,
+      "checker_version": "metacodes-formal-kernel-v2",
+      "path": "/private/tmp/metacodes-formal-identity.rYnKXY/metacodes/zig-out/libexec/metacodes/metacodes-formal-kernel",
+      "provenance_path": "/private/tmp/metacodes-formal-identity.rYnKXY/metacodes/zig-out/libexec/metacodes/metacodes-formal-kernel.provenance.json",
+      "provenance_sha256": "f4190a3779ae54935c96effa0b6135bbadb6a441da84d7b8206a2c407b215c10",
+      "sha256": "1fb436a9fdcc300f94519dfea7d999a1fd94a1dd1da9d8cf91fdb1b09450b838"
+    },
+    "metacodes": {
+      "path": "/private/tmp/metacodes-formal-identity.rYnKXY/metacodes/zig-out/bin/metacodes",
+      "sha256": "e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748"
+    },
+    "revision": "a5f21240a654ffd7b68f072071421334129e7b1f",
+    "tinykg": {
+      "path": "/private/tmp/metacodes-formal-identity.rYnKXY/metacodes/zig-out/vendor/tinykg/tinykg",
+      "sha256": "66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee",
+      "version": "tinykg 0.1.0"
+    }
+  },
+  "experiment_fingerprint": "600772f9af665667",
+  "experiment_id": "metacodes-long-horizon-three-arm-calibration-v2",
+  "model": {
+    "id": "glm-5.2",
+    "provider": "anthropic"
+  },
+  "paid_rollouts_enabled": true,
+  "plan_fingerprint": "a22a7d8541fcd9d7",
+  "program_id": "metacodes-long-horizon-pk-v2",
+  "promotion_receipt_required": false,
+  "rollout_count": 18,
+  "rows": [
+    {
+      "arm_id": "codex_style",
+      "harness_config_id": "metacodes-long-horizon-three-arm-calibration-v2:codex_style:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+      "order_position": 0,
+      "runtime_budget": {
+        "max_cost_usd": 2.0,
+        "max_metered_tokens": 1200000
+      },
+      "runtime_env": {
+        "METACODES_FORCE_COMPACT_AT": "128",
+        "METACODES_FORCE_COMPACT_KEEP": "2",
+        "METACODES_LONG_HORIZON_ARM": "codex_style",
+        "METACODES_MAX_TURNS": "80"
+      },
+      "sequence": 0,
+      "task_id": "80_lh_contract_recovery",
+      "timeout_seconds": 900,
+      "trial": 0
+    },
+    {
+      "arm_id": "claude_style",
+      "harness_config_id": "metacodes-long-horizon-three-arm-calibration-v2:claude_style:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+      "order_position": 1,
+      "runtime_budget": {
+        "max_cost_usd": 2.0,
+        "max_metered_tokens": 1200000
+      },
+      "runtime_env": {
+        "METACODES_FORCE_COMPACT_AT": "128",
+        "METACODES_FORCE_COMPACT_KEEP": "2",
+        "METACODES_LONG_HORIZON_ARM": "claude_style",
+        "METACODES_MAX_TURNS": "80"
+      },
+      "sequence": 1,
+      "task_id": "80_lh_contract_recovery",
+      "timeout_seconds": 900,
+      "trial": 0
+    },
+    {
+      "arm_id": "tinykg",
+      "harness_config_id": "metacodes-long-horizon-three-arm-calibration-v2:tinykg:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+      "order_position": 2,
+      "runtime_budget": {
+        "max_cost_usd": 2.0,
+        "max_metered_tokens": 1200000
+      },
+      "runtime_env": {
+        "METACODES_FORCE_COMPACT_AT": "128",
+        "METACODES_FORCE_COMPACT_KEEP": "2",
+        "METACODES_FORMAL_KERNEL_PATH": "/private/tmp/metacodes-formal-identity.rYnKXY/metacodes/zig-out/libexec/metacodes/metacodes-formal-kernel",
+        "METACODES_FORMAL_KERNEL_SHA256": "1fb436a9fdcc300f94519dfea7d999a1fd94a1dd1da9d8cf91fdb1b09450b838",
+        "METACODES_KG_BIN": "/private/tmp/metacodes-formal-identity.rYnKXY/metacodes/zig-out/vendor/tinykg/tinykg",
+        "METACODES_LONG_HORIZON_ARM": "tinykg",
+        "METACODES_MAX_TURNS": "80"
+      },
+      "sequence": 2,
+      "task_id": "80_lh_contract_recovery",
+      "timeout_seconds": 900,
+      "trial": 0
+    },
+    {
+      "arm_id": "claude_style",
+      "harness_config_id": "metacodes-long-horizon-three-arm-calibration-v2:claude_style:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+      "order_position": 0,
+      "runtime_budget": {
+        "max_cost_usd": 2.0,
+        "max_metered_tokens": 1200000
+      },
+      "runtime_env": {
+        "METACODES_FORCE_COMPACT_AT": "128",
+        "METACODES_FORCE_COMPACT_KEEP": "2",
+        "METACODES_LONG_HORIZON_ARM": "claude_style",
+        "METACODES_MAX_TURNS": "80"
+      },
+      "sequence": 3,
+      "task_id": "80_lh_contract_recovery",
+      "timeout_seconds": 900,
+      "trial": 1
+    },
+    {
+      "arm_id": "tinykg",
+      "harness_config_id": "metacodes-long-horizon-three-arm-calibration-v2:tinykg:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+      "order_position": 1,
+      "runtime_budget": {
+        "max_cost_usd": 2.0,
+        "max_metered_tokens": 1200000
+      },
+      "runtime_env": {
+        "METACODES_FORCE_COMPACT_AT": "128",
+        "METACODES_FORCE_COMPACT_KEEP": "2",
+        "METACODES_FORMAL_KERNEL_PATH": "/private/tmp/metacodes-formal-identity.rYnKXY/metacodes/zig-out/libexec/metacodes/metacodes-formal-kernel",
+        "METACODES_FORMAL_KERNEL_SHA256": "1fb436a9fdcc300f94519dfea7d999a1fd94a1dd1da9d8cf91fdb1b09450b838",
+        "METACODES_KG_BIN": "/private/tmp/metacodes-formal-identity.rYnKXY/metacodes/zig-out/vendor/tinykg/tinykg",
+        "METACODES_LONG_HORIZON_ARM": "tinykg",
+        "METACODES_MAX_TURNS": "80"
+      },
+      "sequence": 4,
+      "task_id": "80_lh_contract_recovery",
+      "timeout_seconds": 900,
+      "trial": 1
+    },
+    {
+      "arm_id": "codex_style",
+      "harness_config_id": "metacodes-long-horizon-three-arm-calibration-v2:codex_style:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+      "order_position": 2,
+      "runtime_budget": {
+        "max_cost_usd": 2.0,
+        "max_metered_tokens": 1200000
+      },
+      "runtime_env": {
+        "METACODES_FORCE_COMPACT_AT": "128",
+        "METACODES_FORCE_COMPACT_KEEP": "2",
+        "METACODES_LONG_HORIZON_ARM": "codex_style",
+        "METACODES_MAX_TURNS": "80"
+      },
+      "sequence": 5,
+      "task_id": "80_lh_contract_recovery",
+      "timeout_seconds": 900,
+      "trial": 1
+    },
+    {
+      "arm_id": "tinykg",
+      "harness_config_id": "metacodes-long-horizon-three-arm-calibration-v2:tinykg:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+      "order_position": 0,
+      "runtime_budget": {
+        "max_cost_usd": 2.0,
+        "max_metered_tokens": 1200000
+      },
+      "runtime_env": {
+        "METACODES_FORCE_COMPACT_AT": "128",
+        "METACODES_FORCE_COMPACT_KEEP": "2",
+        "METACODES_FORMAL_KERNEL_PATH": "/private/tmp/metacodes-formal-identity.rYnKXY/metacodes/zig-out/libexec/metacodes/metacodes-formal-kernel",
+        "METACODES_FORMAL_KERNEL_SHA256": "1fb436a9fdcc300f94519dfea7d999a1fd94a1dd1da9d8cf91fdb1b09450b838",
+        "METACODES_KG_BIN": "/private/tmp/metacodes-formal-identity.rYnKXY/metacodes/zig-out/vendor/tinykg/tinykg",
+        "METACODES_LONG_HORIZON_ARM": "tinykg",
+        "METACODES_MAX_TURNS": "80"
+      },
+      "sequence": 6,
+      "task_id": "80_lh_contract_recovery",
+      "timeout_seconds": 900,
+      "trial": 2
+    },
+    {
+      "arm_id": "codex_style",
+      "harness_config_id": "metacodes-long-horizon-three-arm-calibration-v2:codex_style:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+      "order_position": 1,
+      "runtime_budget": {
+        "max_cost_usd": 2.0,
+        "max_metered_tokens": 1200000
+      },
+      "runtime_env": {
+        "METACODES_FORCE_COMPACT_AT": "128",
+        "METACODES_FORCE_COMPACT_KEEP": "2",
+        "METACODES_LONG_HORIZON_ARM": "codex_style",
+        "METACODES_MAX_TURNS": "80"
+      },
+      "sequence": 7,
+      "task_id": "80_lh_contract_recovery",
+      "timeout_seconds": 900,
+      "trial": 2
+    },
+    {
+      "arm_id": "claude_style",
+      "harness_config_id": "metacodes-long-horizon-three-arm-calibration-v2:claude_style:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+      "order_position": 2,
+      "runtime_budget": {
+        "max_cost_usd": 2.0,
+        "max_metered_tokens": 1200000
+      },
+      "runtime_env": {
+        "METACODES_FORCE_COMPACT_AT": "128",
+        "METACODES_FORCE_COMPACT_KEEP": "2",
+        "METACODES_LONG_HORIZON_ARM": "claude_style",
+        "METACODES_MAX_TURNS": "80"
+      },
+      "sequence": 8,
+      "task_id": "80_lh_contract_recovery",
+      "timeout_seconds": 900,
+      "trial": 2
+    },
+    {
+      "arm_id": "codex_style",
+      "harness_config_id": "metacodes-long-horizon-three-arm-calibration-v2:codex_style:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+      "order_position": 0,
+      "runtime_budget": {
+        "max_cost_usd": 2.0,
+        "max_metered_tokens": 1200000
+      },
+      "runtime_env": {
+        "METACODES_FORCE_COMPACT_AT": "128",
+        "METACODES_FORCE_COMPACT_KEEP": "2",
+        "METACODES_LONG_HORIZON_ARM": "codex_style",
+        "METACODES_MAX_TURNS": "80"
+      },
+      "sequence": 9,
+      "task_id": "80_lh_contract_recovery",
+      "timeout_seconds": 900,
+      "trial": 3
+    },
+    {
+      "arm_id": "tinykg",
+      "harness_config_id": "metacodes-long-horizon-three-arm-calibration-v2:tinykg:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+      "order_position": 1,
+      "runtime_budget": {
+        "max_cost_usd": 2.0,
+        "max_metered_tokens": 1200000
+      },
+      "runtime_env": {
+        "METACODES_FORCE_COMPACT_AT": "128",
+        "METACODES_FORCE_COMPACT_KEEP": "2",
+        "METACODES_FORMAL_KERNEL_PATH": "/private/tmp/metacodes-formal-identity.rYnKXY/metacodes/zig-out/libexec/metacodes/metacodes-formal-kernel",
+        "METACODES_FORMAL_KERNEL_SHA256": "1fb436a9fdcc300f94519dfea7d999a1fd94a1dd1da9d8cf91fdb1b09450b838",
+        "METACODES_KG_BIN": "/private/tmp/metacodes-formal-identity.rYnKXY/metacodes/zig-out/vendor/tinykg/tinykg",
+        "METACODES_LONG_HORIZON_ARM": "tinykg",
+        "METACODES_MAX_TURNS": "80"
+      },
+      "sequence": 10,
+      "task_id": "80_lh_contract_recovery",
+      "timeout_seconds": 900,
+      "trial": 3
+    },
+    {
+      "arm_id": "claude_style",
+      "harness_config_id": "metacodes-long-horizon-three-arm-calibration-v2:claude_style:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+      "order_position": 2,
+      "runtime_budget": {
+        "max_cost_usd": 2.0,
+        "max_metered_tokens": 1200000
+      },
+      "runtime_env": {
+        "METACODES_FORCE_COMPACT_AT": "128",
+        "METACODES_FORCE_COMPACT_KEEP": "2",
+        "METACODES_LONG_HORIZON_ARM": "claude_style",
+        "METACODES_MAX_TURNS": "80"
+      },
+      "sequence": 11,
+      "task_id": "80_lh_contract_recovery",
+      "timeout_seconds": 900,
+      "trial": 3
+    },
+    {
+      "arm_id": "tinykg",
+      "harness_config_id": "metacodes-long-horizon-three-arm-calibration-v2:tinykg:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+      "order_position": 0,
+      "runtime_budget": {
+        "max_cost_usd": 2.0,
+        "max_metered_tokens": 1200000
+      },
+      "runtime_env": {
+        "METACODES_FORCE_COMPACT_AT": "128",
+        "METACODES_FORCE_COMPACT_KEEP": "2",
+        "METACODES_FORMAL_KERNEL_PATH": "/private/tmp/metacodes-formal-identity.rYnKXY/metacodes/zig-out/libexec/metacodes/metacodes-formal-kernel",
+        "METACODES_FORMAL_KERNEL_SHA256": "1fb436a9fdcc300f94519dfea7d999a1fd94a1dd1da9d8cf91fdb1b09450b838",
+        "METACODES_KG_BIN": "/private/tmp/metacodes-formal-identity.rYnKXY/metacodes/zig-out/vendor/tinykg/tinykg",
+        "METACODES_LONG_HORIZON_ARM": "tinykg",
+        "METACODES_MAX_TURNS": "80"
+      },
+      "sequence": 12,
+      "task_id": "80_lh_contract_recovery",
+      "timeout_seconds": 900,
+      "trial": 4
+    },
+    {
+      "arm_id": "claude_style",
+      "harness_config_id": "metacodes-long-horizon-three-arm-calibration-v2:claude_style:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+      "order_position": 1,
+      "runtime_budget": {
+        "max_cost_usd": 2.0,
+        "max_metered_tokens": 1200000
+      },
+      "runtime_env": {
+        "METACODES_FORCE_COMPACT_AT": "128",
+        "METACODES_FORCE_COMPACT_KEEP": "2",
+        "METACODES_LONG_HORIZON_ARM": "claude_style",
+        "METACODES_MAX_TURNS": "80"
+      },
+      "sequence": 13,
+      "task_id": "80_lh_contract_recovery",
+      "timeout_seconds": 900,
+      "trial": 4
+    },
+    {
+      "arm_id": "codex_style",
+      "harness_config_id": "metacodes-long-horizon-three-arm-calibration-v2:codex_style:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+      "order_position": 2,
+      "runtime_budget": {
+        "max_cost_usd": 2.0,
+        "max_metered_tokens": 1200000
+      },
+      "runtime_env": {
+        "METACODES_FORCE_COMPACT_AT": "128",
+        "METACODES_FORCE_COMPACT_KEEP": "2",
+        "METACODES_LONG_HORIZON_ARM": "codex_style",
+        "METACODES_MAX_TURNS": "80"
+      },
+      "sequence": 14,
+      "task_id": "80_lh_contract_recovery",
+      "timeout_seconds": 900,
+      "trial": 4
+    },
+    {
+      "arm_id": "claude_style",
+      "harness_config_id": "metacodes-long-horizon-three-arm-calibration-v2:claude_style:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+      "order_position": 0,
+      "runtime_budget": {
+        "max_cost_usd": 2.0,
+        "max_metered_tokens": 1200000
+      },
+      "runtime_env": {
+        "METACODES_FORCE_COMPACT_AT": "128",
+        "METACODES_FORCE_COMPACT_KEEP": "2",
+        "METACODES_LONG_HORIZON_ARM": "claude_style",
+        "METACODES_MAX_TURNS": "80"
+      },
+      "sequence": 15,
+      "task_id": "80_lh_contract_recovery",
+      "timeout_seconds": 900,
+      "trial": 5
+    },
+    {
+      "arm_id": "codex_style",
+      "harness_config_id": "metacodes-long-horizon-three-arm-calibration-v2:codex_style:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+      "order_position": 1,
+      "runtime_budget": {
+        "max_cost_usd": 2.0,
+        "max_metered_tokens": 1200000
+      },
+      "runtime_env": {
+        "METACODES_FORCE_COMPACT_AT": "128",
+        "METACODES_FORCE_COMPACT_KEEP": "2",
+        "METACODES_LONG_HORIZON_ARM": "codex_style",
+        "METACODES_MAX_TURNS": "80"
+      },
+      "sequence": 16,
+      "task_id": "80_lh_contract_recovery",
+      "timeout_seconds": 900,
+      "trial": 5
+    },
+    {
+      "arm_id": "tinykg",
+      "harness_config_id": "metacodes-long-horizon-three-arm-calibration-v2:tinykg:600772f9af665667:mc-e6bf14a75b3f283153ba1bb0a57c1d1efa413fac3cf42032a337d37db047f748:kg-66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee:fk-f31732c0ca524e376fe20867b5d407f9da318c4e838702d30e1dd6f914247e20",
+      "order_position": 2,
+      "runtime_budget": {
+        "max_cost_usd": 2.0,
+        "max_metered_tokens": 1200000
+      },
+      "runtime_env": {
+        "METACODES_FORCE_COMPACT_AT": "128",
+        "METACODES_FORCE_COMPACT_KEEP": "2",
+        "METACODES_FORMAL_KERNEL_PATH": "/private/tmp/metacodes-formal-identity.rYnKXY/metacodes/zig-out/libexec/metacodes/metacodes-formal-kernel",
+        "METACODES_FORMAL_KERNEL_SHA256": "1fb436a9fdcc300f94519dfea7d999a1fd94a1dd1da9d8cf91fdb1b09450b838",
+        "METACODES_KG_BIN": "/private/tmp/metacodes-formal-identity.rYnKXY/metacodes/zig-out/vendor/tinykg/tinykg",
+        "METACODES_LONG_HORIZON_ARM": "tinykg",
+        "METACODES_MAX_TURNS": "80"
+      },
+      "sequence": 17,
+      "task_id": "80_lh_contract_recovery",
+      "timeout_seconds": 900,
+      "trial": 5
+    }
+  ],
+  "schedule_capacity": {
+    "available_cost_usd": 96.6461866,
+    "available_tokens": 21780707,
+    "fixed_rollout_cost_usd": 2.0,
+    "fixed_rollout_tokens": 1200000,
+    "required_cost_reserve_usd": 36.0,
+    "required_token_reserve": 21600000,
+    "strictly_feasible": true
+  },
+  "schema_version": 1,
+  "stage": {
+    "id": "calibration",
+    "purpose": "infrastructure_calibration",
+    "scoring": "non_confirmatory"
+  },
+  "task_ids": [
+    "80_lh_contract_recovery"
+  ],
+  "trials": 6
+}

@@ -44,6 +44,9 @@ const MCP_PROBE_SSE = TOOL_USE_PREFIX ++
 const BG_PROBE_SSE = TOOL_USE_PREFIX ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"BgProbe\",\"input\":{}}}\n\n" ++
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n" ++ TOOL_USE_SUFFIX;
+const FIELD_PROBE_SSE = TOOL_USE_PREFIX ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"FieldProbe\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n" ++ TOOL_USE_SUFFIX;
 const LOCK_WORKTREE_SSE = TOOL_USE_PREFIX ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"LockWorktree\",\"input\":{}}}\n\n" ++
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n" ++ TOOL_USE_SUFFIX;
@@ -72,6 +75,12 @@ fn baseContext(
         .agents = agents,
         .parent_model = "claude-sonnet-4-20250514",
     };
+}
+
+fn fieldProbe(ctx: *const cc.tool_context.ToolContext, _: []const u8, state_ptr: ?*anyopaque) anyerror![]u8 {
+    const calls: *usize = @ptrCast(@alignCast(state_ptr.?));
+    calls.* += 1;
+    return ctx.allocator.dupe(u8, "{\"ok\":true}");
 }
 
 test "L2 AgentDef.background=true: Task 未传 run_in_background 仍返回 agent_job_id" {
@@ -145,7 +154,7 @@ test "L2 Task preserves proxy-spaced text_delta in final_text" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"final_text\":\"PROXY_FINAL_TEXT\"") != null);
 }
 
-test "L2 AgentDef.effort=high: OpenAI-compatible 子请求含 reasoning_effort 且父 Provider 恢复" {
+test "L2 AgentDef.effort=high: GLM-5.2 effort 走顶层 reasoning_effort body 且父 Provider 恢复" {
     const a = std.testing.allocator;
     var srv = try harness.MockServer.start(OPENAI_END_TURN_SSE, 0);
     defer srv.stop();
@@ -171,11 +180,126 @@ test "L2 AgentDef.effort=high: OpenAI-compatible 子请求含 reasoning_effort �
     const out = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"deliberate-openai\",\"prompt\":\"go\"}");
     defer a.free(out);
     const body = (srv.lastRequest() orelse return error.NoRequestCaptured).body();
+    // GLM-5.2:顶层 reasoning_effort body 字段(7 档透传)+ thinking:{type:enabled}。
+    // 来源:docs.z.ai/guides/capabilities/thinking(2026-08 KnowForge 调研)。
+    // 不再注入 <reasoning_effort> system 标签(那是旧 GLM-4.6 时代格式)。
+    try std.testing.expect(std.mem.indexOf(u8, body, "<reasoning_effort>") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"}") != null);
     try std.testing.expect(client.reasoning_effort == null);
 }
 
-test "L2 AgentDef.disallowed_tools: frontmatter 黑名单裁剪真实子请求 tools" {
+test "L2 AgentDef.overrides: frontmatter reaches child request and preserves parent cache policy" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.start(OPENAI_END_TURN_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.api_openai.OpenAIClient.init(a, io_rt.io(), "k", "gpt-4o", url);
+    defer client.deinit();
+    client.overrides = .{ .temperature = 0.7, .top_p = 0.8 };
+    var agents = cc.agents_set.AgentSet.init(a);
+    defer agents.deinit();
+    try addAgent(a, &agents, "---\nname: sampled-agent\ntemperature: 0.5\n---\nUse the scoped sampling policy.");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    const ctx = cc.tool_context.ToolContext{
+        .allocator = a,
+        .provider = client.provider(),
+        .tool_defs = &.{},
+        .permission_ctx = @constCast(&perm),
+        .agents = &agents,
+        .parent_model = "gpt-4o",
+    };
+
+    const out = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"sampled-agent\",\"prompt\":\"go\"}");
+    defer a.free(out);
+    const body = (srv.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":0.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"top_p\":0.8") != null);
+    try std.testing.expectEqual(@as(f32, 0.7), client.overrides.temperature.?);
+    try std.testing.expectEqual(@as(f32, 0.8), client.overrides.top_p.?);
+}
+
+test "L2 AgentDef.model=haiku: Task 解析配置并覆盖真实子请求 model" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.start(END_TURN_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    var agents = cc.agents_set.AgentSet.init(a);
+    defer agents.deinit();
+    try addAgent(a, &agents, "---\nname: haiku-agent\nmodel: haiku\n---\nUse the configured model.");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    const ctx = baseContext(a, &client, &agents, &perm, &.{});
+
+    const out = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"haiku-agent\",\"prompt\":\"go\"}");
+    defer a.free(out);
+    const model = (srv.lastRequest() orelse return error.NoRequestCaptured).jsonField("model") orelse return error.ModelFieldMissing;
+    try std.testing.expectEqualStrings("\"claude-3-5-haiku-20241022\"", model);
+}
+
+test "L2 AgentDef.permission_mode=plan: Task 注入真实子请求 Plan Mode" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.start(END_TURN_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    var agents = cc.agents_set.AgentSet.init(a);
+    defer agents.deinit();
+    try addAgent(a, &agents, "---\nname: planning-agent\npermissionMode: plan\n---\nPlan without changing files.");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    const ctx = baseContext(a, &client, &agents, &perm, &.{});
+
+    const out = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"planning-agent\",\"prompt\":\"go\"}");
+    defer a.free(out);
+    const system = (srv.lastRequest() orelse return error.NoRequestCaptured).jsonField("system") orelse return error.SystemFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, system, "# Plan Mode (active)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, system, "<proposed_plan>") != null);
+}
+
+test "L2 AgentDef.max_turns=1: Task 在一次真实 tool_use 后停止" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(&.{FIELD_PROBE_SSE}, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    var agents = cc.agents_set.AgentSet.init(a);
+    defer agents.deinit();
+    try addAgent(a, &agents, "---\nname: one-turn-agent\ntools: FieldProbe\nmaxTurns: 1\n---\nCall the probe once.");
+
+    var calls: usize = 0;
+    var dyn = cc.tools_dynamic.DynRegistry.init(a);
+    defer dyn.deinit();
+    try dyn.register("FieldProbe", "count a real child tool call", &.{}, fieldProbe, &calls, false);
+    const defs = try cc.tools.toToolDefinitionsFull(a, &dyn, null);
+    defer a.free(defs);
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var ctx = baseContext(a, &client, &agents, &perm, defs);
+    ctx.dyn_registry = &dyn;
+
+    const out = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"one-turn-agent\",\"prompt\":\"go\"}");
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"stop_reason\":\"max_turns\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"turns\":1") != null);
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+}
+
+test "L2 AgentDef.tools/disallowed_tools: 白名单与黑名单共同裁剪真实子请求" {
     const a = std.testing.allocator;
     var srv = try harness.MockServer.start(END_TURN_SSE, 0);
     defer srv.stop();
@@ -199,6 +323,39 @@ test "L2 AgentDef.disallowed_tools: frontmatter 黑名单裁剪真实子请求 t
     try std.testing.expect(std.mem.indexOf(u8, tools, "\"name\":\"Read\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools, "\"name\":\"Grep\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools, "\"name\":\"Write\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tools, "\"name\":\"Bash\"") == null);
+}
+
+test "L2 Plan runtime tool snapshot keeps TinyKG capability and system prompt aligned" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.start(END_TURN_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    var agents = cc.agents_set.AgentSet.init(a);
+    defer agents.deinit();
+    try agents.loadFromStandardPaths("");
+
+    const prompt_ctx = cc.tools.PromptContext{ .tinykg_enabled = false };
+    var defs_arena = std.heap.ArenaAllocator.init(a);
+    defer defs_arena.deinit();
+    const defs = try cc.tools.toToolDefinitionsFull(defs_arena.allocator(), null, &prompt_ctx);
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    const ctx = baseContext(a, &client, &agents, &perm, defs);
+
+    const out = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"Plan\",\"prompt\":\"inspect\"}");
+    defer a.free(out);
+    const cap = srv.lastRequest() orelse return error.NoRequestCaptured;
+    const tools = cap.jsonField("tools") orelse return error.ToolsFieldMissing;
+    const system = cap.jsonField("system") orelse return error.SystemFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, tools, "\"name\":\"KgRecall\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tools, "\"name\":\"KgContext\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, system, "- Allowed tools: Read, Glob, Grep\\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, system, "- Allowed tools: Read, Glob, Grep, KgRecall") == null);
 }
 
 test "L2 AgentDef.preload_skills: skill 正文进入真实子请求 system" {
@@ -696,7 +853,7 @@ fn runGit(a: std.mem.Allocator, cwd: []const u8, args: []const []const u8) bool 
     argv.append(a, (a.dupeZ(u8, cwd) catch return false).ptr) catch return false;
     for (args) |arg| argv.append(a, (a.dupeZ(u8, arg) catch return false).ptr) catch return false;
     argv.append(a, null) catch return false;
-    const out = cc.tools_common.spawnCaptureWithStderrTimed(argv.items, a, null, 15_000, null, cc.tools_common.MAX_SPAWN_CAPTURE_BYTES) catch return false;
+    const out = cc.tools_common.spawnCaptureWithStderrTimed(argv.items, a, null, 15_000, null, cc.tools_common.MAX_SPAWN_CAPTURE_BYTES, null) catch return false;
     defer a.free(out.stdout);
     defer a.free(out.stderr);
     return out.exit_code == 0;

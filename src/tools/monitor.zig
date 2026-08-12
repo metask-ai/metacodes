@@ -20,6 +20,12 @@ const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
+    // Monitor is detached by definition.  Until background workers own an
+    // independent durable RunControl/journal, it cannot participate in a
+    // governed Run without making the post verdict lie about quiescence.
+    // Reject before sandbox profile creation or process spawn.
+    if (ctx.project_rule_gate != null)
+        return error.ProjectRulesRequireSynchronousExecution;
     const command = common.extractJsonArg(args, "command") orelse return error.MissingCommand;
     if (command.len == 0) return error.EmptyCommand;
     const description = common.extractJsonArg(args, "description") orelse "background monitor";
@@ -55,12 +61,13 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     if (sandbox_wrap) |*sw| sw.detached = true; // 后台:profile 不能随本函数返回删
 
     // 启动后台 job(已 sandbox 包裹)
-    const entry = jobs.spawnBackground(eff_command) catch |err| {
-        return try std.fmt.allocPrint(ctx.allocator,
-            "{{\"error\":\"spawn_failed\",\"message\":\"{s}\"}}", .{@errorName(err)});
+    const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
+    const entry = jobs.spawnBackground(eff_command, cwd_opt) catch |err| {
+        return try std.fmt.allocPrint(ctx.allocator, "{{\"error\":\"spawn_failed\",\"message\":\"{s}\"}}", .{@errorName(err)});
     };
 
-    return try std.fmt.allocPrint(ctx.allocator,
+    return try std.fmt.allocPrint(
+        ctx.allocator,
         "{{\"job_id\":\"{s}\",\"status\":\"running\",\"description\":\"{s}\",\"hint\":\"Use BashOutput(job_id) to read streamed lines; KillShell(job_id) to stop.\"}}",
         .{ entry.id[0..], description },
     );
@@ -137,6 +144,10 @@ test "Monitor: sandbox 开启时命令被 sandbox-exec 包裹(cwd 外写被拦,t
     while (waited < 2000) : (waited += 20) {
         jobs.reapExited();
         if (pfs.exists(escape)) break; // 出现(不该)
+        // Success means the sandboxed command exits without creating the
+        // escape file. The old loop only broke on failure, so every successful
+        // run paid the full 2 s deadline despite already having a reaped job.
+        if (jobs.activeCount() == 0) break;
         var ts = std.c.timespec{ .sec = 0, .nsec = 20 * 1_000_000 };
         var rem: std.c.timespec = undefined;
         _ = std.c.nanosleep(&ts, &rem);

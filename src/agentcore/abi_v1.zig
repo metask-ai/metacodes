@@ -3074,6 +3074,19 @@ const ForkExecutorContext = struct {
 
         self.facade.active_mcp_environment = if (mcp_environment) |*mcp_env| mcp_env else null;
         defer self.facade.active_mcp_environment = null;
+
+        // 缺陷 A 修复:子 Agent 系统提示 = 静态字面量 + 环境段(cwd=workspace.root)。
+        // 与 model_skill_tool.zig 共用 buildSubagentSystemPrompt,确保两路径一致。
+        const sp_mod = core.system_prompt;
+        const owned_subagent_system_prompt = sp_mod.buildSubagentSystemPrompt(
+            output_allocator,
+            self.session.model,
+            self.session.workspace.root,
+        ) catch null;
+        defer if (owned_subagent_system_prompt) |prompt| output_allocator.free(prompt);
+        const subagent_system_prompt = owned_subagent_system_prompt orelse
+            sp_mod.SUBAGENT_LITERAL;
+
         const child = core.subagent.spawnAgentSink(
             output_allocator,
             self.budget_provider.provider(),
@@ -3084,7 +3097,7 @@ const ForkExecutorContext = struct {
             self.activation.rendered_body,
             .{
                 .max_turns = self.max_turns,
-                .system_prompt = "You are a subagent. Complete the task and return a concise final answer.\n",
+                .system_prompt = subagent_system_prompt,
                 .session = identity.session_id,
                 .agent_depth = child_depth,
                 .tool_dispatcher = child_surface.dispatcher,

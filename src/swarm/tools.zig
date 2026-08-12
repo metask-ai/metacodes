@@ -45,6 +45,10 @@ pub const SWARM_ADDENDUM =
 /// {name:str(必需), description:str(可选)} → 建 team 目录 + config.json + teammates registry。
 /// 一 lead 一队:已有 team → error.TeamAlreadyExists。
 pub fn executeTeamCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
+    // Teammates outlive the parent Run and therefore cannot borrow its journal
+    // or RuntimeGate. Until each worker owns an independent durable RunControl,
+    // enabling a project rule makes detached swarm creation fail closed.
+    if (ctx.project_rule_gate != null) return error.ProjectRulesRequireSynchronousAgent;
     const sw = ctx.swarm orelse return error.SwarmUnavailable;
     if (!sw.is_lead) return error.NotTeamLead;
     if (sw.home.len == 0) return error.SwarmUnavailable;

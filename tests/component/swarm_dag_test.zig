@@ -92,6 +92,8 @@ test "L2 SW3: 两 teammate 从共享 frontier 自领任务,租约互斥不撞车
     try std.testing.expect(claimed2.task_id != claimed3.task_id);
     // 是 assigned-task 信封。
     try std.testing.expect(std.mem.indexOf(u8, claimed1.prompt, "<assigned-task") != null);
+    try std.testing.expect(std.mem.indexOf(u8, claimed1.prompt, "<task-packet>{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, claimed1.prompt, "\"mode\":\"task-packet\"") != null);
     // 三任务全被领走后,第四次自领无可领 → null。
     try std.testing.expect(teammate.tryClaimFrontierTask(a, &kg, projects_dir, "agent-four") == null);
 
@@ -103,9 +105,28 @@ test "L2 SW3: 两 teammate 从共享 frontier 自领任务,租约互斥不撞车
     }
     var claimed_leaves: usize = 0;
     for (rows) |*r| {
-        if (r.role == .leaf and r.claimed_by != null) claimed_leaves += 1;
+        if (r.role == .leaf and r.status == .claimed and r.claimed_by != null) claimed_leaves += 1;
     }
     try std.testing.expectEqual(@as(usize, 3), claimed_leaves);
+
+    // Regression: self-claim holder and TaskUpdate closer must be the same
+    // host-injected name@team string. The old split used agent-one to claim but
+    // a random SessionId to close, which task-status-v1 correctly rejects.
+    var tasks = cc.core_task_store.TaskStore.init(a);
+    defer tasks.deinit();
+    const ctx = cc.tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &tasks,
+        .kg = &kg,
+        .kg_projects_dir = projects_dir,
+        .kg_agent_ident = "agent-one",
+    };
+    const close_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"completed\",\"conclusion\":\"agent-one verified completion\"}}", .{claimed1.task_id});
+    defer a.free(close_args);
+    const closed = try cc.task_tools.executeUpdate(&ctx, close_args);
+    defer a.free(closed);
+    try std.testing.expect(std.mem.indexOf(u8, closed, "\"closed\":true") != null);
+    try std.testing.expectEqual(cc.kg_client.TaskStatus.completed, try kg.taskStatus(claimed1.task_id));
 }
 
 test "L2 SW3 F1: 同一任务二次 claim 直接 ClaimHeld(租约互斥硬证)" {

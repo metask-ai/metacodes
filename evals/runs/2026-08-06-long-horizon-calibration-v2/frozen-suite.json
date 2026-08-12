@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "suite_id": "metacodes-long-horizon-calibration-v2",
+  "description": "One non-confirmatory mechanism task calibrates infrastructure, telemetry, and checkpoint reliability before held-out repository scoring.",
+  "tasks": [
+    {
+      "id": "80_lh_contract_recovery",
+      "scenario": "tests/e2e/scenarios/80_lh_contract_recovery.txt",
+      "layers": ["E", "T", "C", "L", "O", "V"],
+      "environment": {"kind": "isolated_workspace", "reset": "fresh_home_and_workdir"},
+      "tools": {"profile": "metacodes-long-horizon-common-v1", "required": ["Write", "Read"]},
+      "constraints": {"timeout_seconds": 900, "permission_mode": "bypassPermissions"},
+      "success": {
+        "checks": [
+          {"type": "file_exists", "path": "lh-contract/config.json", "description": "final config exists"},
+          {"type": "file_exists", "path": "lh-contract/OPERATIONS.md", "description": "operations note exists"},
+          {"type": "contains", "path": "lh-contract/config.json", "text": "ORCHID-731", "description": "opaque codename survives"},
+          {"type": "contains", "path": "lh-contract/config.json", "text": "4317", "description": "port survives"},
+          {"type": "contains", "path": "lh-contract/config.json", "text": "X-Metacodes-Trace", "description": "header survives"},
+          {"type": "contains", "path": "lh-contract/config.json", "text": "EMBER-29", "description": "latest transport wins"},
+          {"type": "not_contains", "path": "lh-contract/config.json", "text": "QUARTZ-17", "description": "obsolete transport removed"},
+          {"type": "contains", "path": "lh-contract/OPERATIONS.md", "text": "retry", "description": "operations note retains retry rule"},
+          {"type": "contains", "path": "lh-contract/OPERATIONS.md", "text": "7", "description": "retry ceiling survives"}
+        ]
+      },
+      "trajectory_constraints": {"required_tools": ["Write", "Read"], "max_turns": 24, "max_tool_calls": 24, "max_model_tool_errors": 4, "max_harness_tool_errors": 0},
+      "trajectory_rationale": {
+        "required_tools": "The calibration artifact must be written and verified through tools common to every arm.",
+        "max_turns": "Three phases plus persistence and verification remain bounded.",
+        "max_tool_calls": "Allows persistence work and artifact verification without loops.",
+        "max_model_tool_errors": "A few recoverable argument corrections are tolerated.",
+        "max_harness_tool_errors": "Infrastructure errors invalidate calibration."
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "long-horizon-v1"}
+    }
+  ]
+}

@@ -857,7 +857,8 @@ fn waitForMail(a: std.mem.Allocator, e: *TeammateEntry, kg: ?*@import("../kg/cli
         if (kg != null and now_ms - last_claim_poll_ms >= claim_backoff_ms) {
             last_claim_poll_ms = now_ms;
             // 用 human agent_id(name@team)做 claim 身份 → kanban 的 claimed_by 直接是队友名
-            // (PM F3e:agent_ident 随机 hash 无法关联到人)。closeTask 不校验身份,完成正常。
+            // (PM F3e:agent_ident 随机 hash 无法关联到人)。后续 TaskUpdate/TaskStop
+            // 经 kg_agent_ident 注入同一 name@team，task-close 会校验有效租约 holder。
             if (tryClaimFrontierTask(a, kg.?, kg_projects_dir, e.agent_id)) |claim| {
                 // SW4 seam(PM F4):记下持有的 task_id,shutdown 时释放租约防卡 7200s。
                 e.lockPublic();
@@ -876,9 +877,16 @@ fn waitForMail(a: std.mem.Allocator, e: *TeammateEntry, kg: ?*@import("../kg/cli
 
 pub const ClaimResult = struct { task_id: u64, prompt: []u8 };
 
+/// The file backlog is mutually exclusive with a live TinyKG control plane.
+/// Public for the focused degraded-frontier L2 that guards stale mirror leakage.
+pub fn shouldUseDegradedTaskMirror(shared_kg_ready: bool, kg_projects_dir: []const u8) bool {
+    return !shared_kg_ready and kg_projects_dir.len > 0;
+}
+
 /// SW3 自领:解析共享 inbox root(lead 的 TaskCreate 落此)→ frontier → 领第一个 ready
 /// 无主叶子(claimTask 原子租约)→ 组装成下一轮 prompt(owned)。无可领 → null。
-/// 只领 role=leaf & readiness=ready & claimed_by=null 的行(有序边/未完依赖不 ready)。
+/// 只领 role=leaf & status=open & readiness=ready & claimed_by=null 的行
+/// (failed/claimed 绝不进入候选；有序边/未完依赖不 ready)。
 pub fn tryClaimFrontierTask(a: std.mem.Allocator, kg: *@import("../kg/client.zig").KgClient, kg_projects_dir: []const u8, claim_agent: []const u8) ?ClaimResult {
     if (!kg.ready or kg_projects_dir.len == 0) return null;
     const inject = @import("../kg/inject.zig");
@@ -890,15 +898,24 @@ pub fn tryClaimFrontierTask(a: std.mem.Allocator, kg: *@import("../kg/client.zig
     }
     for (rows) |*r| {
         if (r.role != .leaf) continue;
+        if (r.status != .open) continue;
         if (r.readiness != .ready) continue;
         if (r.claimed_by != null) continue; // 已有主(未过期租约)
         // 尝试原子领取——被别的 teammate 抢先则 ClaimHeld,跳下一个。
         kg.claimTask(r.task_id, claim_agent) catch continue;
-        // 组装 prompt(把 task 正文交给模型;它用 TaskUpdate(completed) 闭合)。
+        // Claim 之后立刻取 bounded packet。只给一行标题会丢掉父目标、依赖与既有证据；
+        // packet 失败则释放租约，绝不让 teammate 在不完整上下文里盲做。
+        const packet = kg.taskPacketMeta(r.task_id, 12, 8_000) catch {
+            kg.releaseTask(r.task_id, claim_agent) catch {};
+            continue;
+        };
+        defer kg.allocator.free(packet);
+        // 组装 prompt(正文 + metadata-first packet；成功 completed，确认不可恢复则 failed；
+        // 两者都保留稳定 task id，绝不把持久任务 deleted)。
         const prompt = std.fmt.allocPrint(
             a,
-            "<assigned-task id=\"kg-{d}\">You have claimed this task from the team's shared task list. Complete it, then close it with TaskUpdate(taskId: \"kg-{d}\", status: \"completed\").\n\n{s}\n</assigned-task>",
-            .{ r.task_id, r.task_id, r.text },
+            "<assigned-task id=\"kg-{d}\">You have claimed this task from the team's shared task list as {s}. Read the bounded TinyKG packet before working. Complete it, then close it with TaskUpdate(taskId: \"kg-{d}\", status: \"completed\", conclusion: \"<concise verified result>\"). If verified evidence shows it cannot be completed, use status: \"failed\" with a concise conclusion instead. Never delete a persistent KG task.\n\n{s}\n<task-packet>{s}</task-packet>\n</assigned-task>",
+            .{ r.task_id, claim_agent, r.task_id, r.text, packet },
         ) catch {
             // 组装失败:释放租约免得任务卡住。
             kg.releaseTask(r.task_id, claim_agent) catch {};
@@ -971,17 +988,40 @@ fn teammateThreadMain(input: *TeammateInput) void {
     // (自领关闭,mailbox 派活仍工作)。self-claim 与 teammate 的 task 工具都用它。
     var own_kg: ?@import("../kg/client.zig").KgClient = null;
     if (input.kg) |shared| {
-        if (shared.cloneForThread(std.heap.c_allocator, input.home)) |c| {
-            own_kg = c;
-            own_kg.?.ensureReady();
-            if (!own_kg.?.ready) {
-                own_kg.?.deinit();
-                own_kg = null;
-            }
-        } else |_| {}
+        // Keep the whole session on one control plane. A degraded lead publishes the
+        // file fallback; a teammate must not independently revive TinyKG and split the
+        // backlog between graph and mirror.
+        if (shared.ready) {
+            if (shared.cloneForThread(std.heap.c_allocator, input.home)) |c| {
+                own_kg = c;
+                own_kg.?.ensureReady();
+                if (!own_kg.?.ready) {
+                    own_kg.?.deinit();
+                    own_kg = null;
+                }
+            } else |_| {}
+        }
     }
     defer if (own_kg) |*k| k.deinit();
     const kg_ptr: ?*@import("../kg/client.zig").KgClient = if (own_kg) |*k| k else null;
+
+    // Only a lead that started degraded publishes `{kg_projects_dir}/tasks.json`.
+    // Never open an old mirror while the lead's TinyKG is authoritative: a stale file
+    // from an earlier degraded session would otherwise leak numeric tasks into TaskList
+    // and teammate writes would recreate a second truth source beside TinyKG.
+    const shared_kg_ready = if (input.kg) |shared| shared.ready else false;
+    if (shouldUseDegradedTaskMirror(shared_kg_ready, input.kg_projects_dir)) {
+        const mirror_path = std.fmt.allocPrint(a, "{s}/tasks.json", .{input.kg_projects_dir}) catch null;
+        if (mirror_path) |mp| {
+            defer a.free(mp);
+            sub_tasks.setMirror(mp) catch |err| {
+                log.warn("swarm", "teammate task mirror setup failed: {s}", .{@errorName(err)});
+            };
+            sub_tasks.loadFromMirror() catch |err| {
+                log.warn("swarm", "teammate task mirror reopen failed: {s}", .{@errorName(err)});
+            };
+        }
+    }
 
     // 每 teammate 一个 SwarmContext(is_lead=false):让 teammate 的 SendMessage 能回 lead/peer
     // (Linus/PM F1)。team_sanitized 借 entry.team、home 借 input.home——**不 deinit 本地 sw**
@@ -1003,6 +1043,11 @@ fn teammateThreadMain(input: *TeammateInput) void {
     };
 
     while (true) {
+        // Degraded mode refreshes the complete locked snapshot each turn; when TinyKG is
+        // authoritative mirror_path is null and this is a zero-cost no-op.
+        sub_tasks.loadFromMirror() catch |err| {
+            log.warn("swarm", "teammate task mirror refresh failed: {s}", .{@errorName(err)});
+        };
         e.setStatus(.working);
         // 首轮此写与 spawn 的 addMember(is_active=true)重复,曾试图"只在值变化时写"去重——
         // 撤销(2026-07-18 实测):这次写恰好是 turn 前的天然停顿,满编 spawn 时把线程拖到
@@ -1034,6 +1079,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
                 .kg_projects_dir = input.kg_projects_dir,
                 .swarm = &teammate_sw, // teammate→lead/peer SendMessage(Linus/PM F1)
                 .agent_ident = e.agent_ident, // 跨 turn 稳定(KG 租约连续)
+                .kg_agent_ident = e.agent_id, // 与 tryClaimFrontierTask 的 name@team holder 完全一致
                 .colorize = false,
                 // task#12(Linus review):teammate Bash 继承父 sandbox(第三处后门堵上)。
                 .sandbox = input.sandbox,

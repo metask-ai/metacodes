@@ -1538,7 +1538,7 @@ fn isJsonSummaryTool(tool_name: []const u8) bool {
         "CronCreate",           "CronDelete",          "CronList",
         "EnterWorktree",        "ExitWorktree",        "PushNotification",
         "ListMcpResourcesTool", "ReadMcpResourceTool", "ToolSearch",
-        "KgRemember",           "KgRecall",
+        "KgRemember",           "KgRecall",            "KgContext",
     };
     for (names) |n| if (std.mem.eql(u8, tool_name, n)) return true;
     return false;
@@ -1615,6 +1615,12 @@ fn renderJsonToolSummary(
             if (extractRawField(output_text, "kg_unavailable") != null) break :blk "KG unavailable";
             const cnt = extractRawField(output_text, "count") orelse "0";
             break :blk std.fmt.bufPrint(&line_buf, "recalled {s} memory(ies)", .{cnt}) catch "recalled";
+        }
+        if (std.mem.eql(u8, tool_name, "KgContext")) {
+            if (extractRawField(output_text, "kg_unavailable") != null) break :blk "KG unavailable";
+            const nid = extractRawField(output_text, "node_id") orelse "?";
+            const cnt = extractRawField(output_text, "graph_node_count") orelse "0";
+            break :blk std.fmt.bufPrint(&line_buf, "context #{s} ({s} graph node(s))", .{ nid, cnt }) catch "KG context";
         }
         break :blk "done";
     };
@@ -1942,8 +1948,10 @@ test "resultRenderMode: 故意 hidden vs 应显示" {
     // 回归守卫:kg_tools.zig 头注释声称"禁 hidden 已在注册处保证",此断言即那条保证。
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("KgRemember"));
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("KgRecall"));
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("KgContext"));
     try testing.expect(showStartCard("KgRemember")); // ⏺ 起始卡也要打
     try testing.expect(showStartCard("KgRecall"));
+    try testing.expect(showStartCard("KgContext"));
 }
 
 test "KG 工具卡人话渲染:remembered/recalled/unavailable" {
@@ -1962,6 +1970,12 @@ test "KG 工具卡人话渲染:remembered/recalled/unavailable" {
         defer out.deinit(a);
         try renderJsonToolSummary(a, th, "KgRecall", "{\"hits\":[{}],\"count\":3}", &out, .{});
         try testing.expect(std.mem.indexOf(u8, out.items, "recalled 3") != null);
+    }
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try renderJsonToolSummary(a, th, "KgContext", "{\"node_id\":42,\"graph_node_count\":3}", &out, .{});
+        try testing.expect(std.mem.indexOf(u8, out.items, "context #42 (3 graph node(s))") != null);
     }
     {
         var out: std.ArrayList(u8) = .empty;
@@ -2336,6 +2350,5 @@ test "actionLabel: 超长 CJK 参数按显示宽截断且不切碎 UTF-8" {
     try testing.expect(std.mem.startsWith(u8, s, "Read("));
     try testing.expect(std.mem.endsWith(u8, s, ")"));
 }
-
 
 

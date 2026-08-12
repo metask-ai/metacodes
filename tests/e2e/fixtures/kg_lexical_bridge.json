@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "nodes": [
+    {
+      "kind": "observation",
+      "schema_type": "observation",
+      "text": "任务中断后重新接续、恢复、断点续跑、continue after interruption 的精确并发规则使用内部 canonical alias orion-k9；最终 tuple 的三项依次表示运行模式、过期秒数、释放者身份。"
+    },
+    {
+      "kind": "observation",
+      "schema_type": "observation",
+      "text": "历史调查：长期任务中断恢复、断点续跑、并发防撞曾讨论日志重放，但该记录不是最终规则。"
+    },
+    {
+      "kind": "observation",
+      "schema_type": "observation",
+      "text": "历史调查：continue after interruption 与 resume workflow 曾考虑文件锁，此方案后来未采用。"
+    },
+    {
+      "kind": "observation",
+      "schema_type": "observation",
+      "text": "历史调查：任务恢复、重新接续、checkpoint concurrency 曾评估进程互斥，但没有形成最终参数。"
+    },
+    {
+      "kind": "observation",
+      "schema_type": "observation",
+      "text": "历史调查：断点恢复和重复执行防撞曾尝试 session token，此记录仅为旧实验。"
+    },
+    {
+      "kind": "observation",
+      "schema_type": "observation",
+      "text": "历史调查：long-running task resume 与 concurrent recovery 的早期草案依赖时间戳，已废弃。"
+    },
+    {
+      "kind": "observation",
+      "schema_type": "observation",
+      "text": "历史调查：中断后继续执行、恢复任务、并发认领防撞的旧提案使用随机退避，不是最终决定。"
+    },
+    {
+      "kind": "observation",
+      "schema_type": "observation",
+      "text": "历史调查：resume checkpoint 和 interruption recovery 曾讨论 owner、timeout 与 release，但本条不含批准值。"
+    },
+    {
+      "kind": "observation",
+      "schema_type": "observation",
+      "text": "历史调查：任务断点续跑、并发恢复、重复工作防护的候选方案已被最终 policy 取代。"
+    },
+    {
+      "kind": "observation",
+      "schema_type": "observation",
+      "text": "历史调查：restart、resume、恢复与接续的兼容层只负责命名，不是精确并发机制。"
+    },
+    {
+      "kind": "decision",
+      "schema_type": "decision",
+      "text": "orion-k9 tuple=quartz-17|7200|same-holder"
+    }
+  ]
+}

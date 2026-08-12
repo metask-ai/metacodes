@@ -6,6 +6,7 @@ const path_mod = @import("../util/path.zig");
 const util_json = @import("../util/json.zig");
 const read_state = @import("../core/read_state.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const observation = @import("observation.zig");
 const tt = @import("test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
@@ -48,14 +49,27 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         }
     }
 
+    // 写前抓旧内容（同时用于 structuredPatch / gitDiff 与 typed observation）。
+    // 只有明确的 ENOENT 才能声称 missing；权限、类型、过大或读取失败都是
+    // unknown，不能为了生成一条好看的 effect 而伪造旧状态。
+    const before = captureBeforeContent(allocator, path);
+    defer switch (before) {
+        .known => |bytes| allocator.free(bytes),
+        else => {},
+    };
+    const old_content: ?[]const u8 = switch (before) {
+        .known => |bytes| bytes,
+        else => null,
+    };
+
     // 自动建父目录（对齐 TS：Write 到不存在的目录会先 mkdir -p）。
     try mkdirParents(path);
 
-    // 写前抓旧内容（用于 structuredPatch / gitDiff）。文件不存在 → 旧内容为空。
-    const old_content = readExisting(allocator, path) catch null;
-    defer if (old_content) |oc| allocator.free(oc);
-
-    const fd = pfs.openZ(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o666) catch return error.WriteError;
+    const write_flags: pfs.O = if (ctx.project_write_exclusive_create)
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .EXCL = true }
+    else
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
+    const fd = pfs.openZ(path, write_flags, 0o666) catch return error.WriteError;
     defer _ = pfs.close(fd);
 
     var pos: usize = 0;
@@ -65,6 +79,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (n <= 0) return error.WriteError;
         pos += @as(usize, @intCast(n));
     }
+
+    ctx.reportFileMutation(path, before, content);
 
     // 写完后刷新 ReadState 的 mtime + content_hash，让紧接着的 Edit/Write 不误报 stale。
     if (ctx.read_state) |rs| {
@@ -90,11 +106,17 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 /// 超此值 readAllFromFdCapped 返 error → caller catch null → 无 diff,Write 仍正常写。10MB 对齐 Read 快路径门槛。
 const MAX_WRITE_OLD_SIZE: usize = 10 * 1024 * 1024;
 
-/// 读已存在文件全文（不存在/过大返 error）。供 Write 计算 diff。走轴A统一入口 readAllFromFdCapped。
-fn readExisting(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
+/// Capture the exact bytes observed immediately before Write opens the target
+/// with TRUNC. This is evidence of the tool's observation, not a claim that the
+/// path stayed unchanged across the unavoidable open/read/write interval.
+fn captureBeforeContent(allocator: std.mem.Allocator, path: []const u8) observation.BeforeContent {
+    const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch {
+        const errno: std.c.E = @enumFromInt(std.c._errno().*);
+        return if (errno == .NOENT) .missing else .unknown;
+    };
     defer _ = pfs.close(fd);
-    return try common.readAllFromFdCapped(fd, allocator, MAX_WRITE_OLD_SIZE);
+    const bytes = common.readAllFromFdCapped(fd, allocator, MAX_WRITE_OLD_SIZE) catch return .unknown;
+    return .{ .known = bytes };
 }
 
 /// 渲染 Write 成功结果：success + path + structuredPatch + gitDiff (+ lspDiagnostics)。

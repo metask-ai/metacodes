@@ -203,6 +203,15 @@ pub fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('"');
 }
 
+/// 序列化浮点数为 JSON number,追加到 buf。
+/// 用 std.fmt 整数+小数形式,避免科学计数法(JSON number 接受但厂商兼容性差)。
+pub fn serializeNumber(v: anytype, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    // 用 std.fmt.formatType 走 Zig 默认浮点格式(非科学计数法)。
+    var tmp: [64]u8 = undefined;
+    const formatted = try std.fmt.bufPrint(&tmp, "{d}", .{v});
+    try buf.appendSlice(allocator, formatted);
+}
+
 /// 从 JSON 对象字符串中查找 `"field":"value"` 形式的字符串值。
 /// 不反转义返回值（调用方按需调 unescapeString）。
 pub fn extractStringField(data: []const u8, field: []const u8) ?[]const u8 {

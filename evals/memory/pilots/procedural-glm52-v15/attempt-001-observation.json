@@ -1,0 +1,185 @@
+{
+  "schema_version": 1,
+  "manifest_id": "coding-intent-families-2026080820-1",
+  "artifact_provenance": {
+    "budget_checkpoint_sha256": "1b99d0f66b4af694c4f6ccc95cc733b3a94728efe683853955150e1d2656aa04",
+    "local_only_artifact_tree": "~/.local/state/metacodes/memory-pilots/procedural-glm52-v15/artifacts/run-001",
+    "local_only_artifact_tree_bytes": 46977832,
+    "local_only_artifact_tree_files": 515,
+    "local_only_artifact_tree_sha256": "6312a81b93412a37949a5b6cb363a8aaed9e7d97f8bd4c385cb8b1bcde5522d4",
+    "metacodes_binary_sha256": "80d10a08698a3f820dc260d98e1394056bd87c9fd7fb48fedabb4b3b125952aa",
+    "observations_file_sha256": "8ea882decce6fd70dddc4790a4cde0885a94db44a902176cc34d32b966cb9426",
+    "pilot_freeze_commit": "ca6125b",
+    "query_plan_report_sha256": "68c4199c8753127a25a4cf8d4477ab54e7c2d1993f57ea23dcac9d53ec7d231e",
+    "report_sha256": "57fcf1920502187e0bc58bc877bb6df5ed6477efc9b40f28c801e6a58b3200d3",
+    "results_sha256": "544f3286fc2bc32b49302a376036ff84bb8b1482ddf4b43b07111f9d6fe5c901",
+    "ripgrep_snapshot_sha256": "882ee4837235e252ce5ffecc3c1707f6d5b7db0054b7922301b5dc0f466a0fed",
+    "runtime_receipt_sha256": "ac3bc976f0ef9c5b8eb52a23c6c2009811e1d93c2a72f22f0e9ba7abcd14e7b4",
+    "tinykg_binary_sha256": "66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee"
+  },
+  "budget_journal": {
+    "committed_cost_usd": 0.628663,
+    "committed_metered_tokens": 836593,
+    "estimated_cost_usd": 0.628659,
+    "head_sha256": "a646b1489ab44827e800847376cd4f700ebb7223d63bf2f97ffdcc1dadd54c10",
+    "journal_id": "5278e368c3bd202cd7ceaaf9e396d2c9c7b2b0826cbcc208d9bee62eb84c3ebf",
+    "revision": 27,
+    "sha256": "1b99d0f66b4af694c4f6ccc95cc733b3a94728efe683853955150e1d2656aa04",
+    "uncertain_authorized_transactions": 0
+  },
+  "evaluator_validation": {
+    "all_rows_ready": true,
+    "format_insensitive_structured_checks": true,
+    "no_memory_failure_modes": [
+      "one offline rollout made no changes because the latent protocol was unavailable",
+      "one offline rollout invented a different alias, phase order, and retry policy"
+    ],
+    "surface_form_failure_observed": false
+  },
+  "outcome": {
+    "canonical_runtime_receipt_published": true,
+    "committed_rollout_transactions": 9,
+    "provider_http_requests": 80,
+    "quality_evidence": false,
+    "status": "completed-pilot-signal",
+    "uncertain_authorized_transactions": 0
+  },
+  "pilot_signal": {
+    "caveats": [
+      "one model, one family, one trial, and only two offline cases per arm",
+      "the result is suitable for design iteration but not a confirmatory memory-quality claim",
+      "Markdown has no graph evidence identifiers; TinyKG evidence verification was explicit on only one of two offline cases"
+    ],
+    "markdown_memory": {
+      "offline_cost_usd": 0.1119732,
+      "offline_mean_exposed_tokens": 819.5,
+      "offline_mean_turns": 7.5,
+      "offline_successes": 2,
+      "offline_trials": 2
+    },
+    "no_memory": {
+      "offline_cost_usd": 0.1989828,
+      "offline_mean_exposed_tokens": 0.0,
+      "offline_mean_turns": 14.5,
+      "offline_successes": 0,
+      "offline_trials": 2
+    },
+    "online_successes_all_arms": 3,
+    "online_trials_all_arms": 3,
+    "tinykg_lexical": {
+      "offline_cost_usd": 0.1926054,
+      "offline_evidence_precision_at_k": 1.0,
+      "offline_evidence_recall_at_k": 1.0,
+      "offline_mean_exposed_tokens": 1755.5,
+      "offline_mean_turns": 10.5,
+      "offline_successes": 2,
+      "offline_trials": 2,
+      "offline_verified_evidence_recall_at_k": 0.5
+    }
+  },
+  "program_authority": {
+    "conservative_cost_usd_after_attempt": 11.1064308,
+    "conservative_metered_tokens_after_attempt": 7548227,
+    "user_authorization_max_cost_usd": 1000.0
+  },
+  "query_plan_diagnostic": {
+    "explicit_plan_verified": 1,
+    "host_recall_satisfied": 2,
+    "invalid": 0,
+    "not_applicable": 6,
+    "verified_explicit_plan_new_hits": 7,
+    "verified_explicit_plan_repeated_hits": 0
+  },
+  "rollouts": [
+    {
+      "actual_cost_usd": 0.034356,
+      "actual_metered_tokens": 36351,
+      "arm": "no_memory",
+      "case_id": "coding:recovery-receipt-transfer-v3:artifact-snapshot",
+      "provider_http_requests": 5,
+      "sequence": 0,
+      "success": true,
+      "transaction_id": "78f08d321f5c25bef195ff6c238955d344cda866300ce65628e2158171a76f69"
+    },
+    {
+      "actual_cost_usd": 0.040733,
+      "actual_metered_tokens": 41595,
+      "arm": "markdown_memory",
+      "case_id": "coding:recovery-receipt-transfer-v3:artifact-snapshot",
+      "provider_http_requests": 5,
+      "sequence": 1,
+      "success": true,
+      "transaction_id": "a374589cd4f345b00878b7a51bfee4b10b5f1475d4b7223c6da2ee4188e7eb07"
+    },
+    {
+      "actual_cost_usd": 0.05001,
+      "actual_metered_tokens": 58490,
+      "arm": "tinykg_lexical",
+      "case_id": "coding:recovery-receipt-transfer-v3:artifact-snapshot",
+      "provider_http_requests": 5,
+      "sequence": 2,
+      "success": true,
+      "transaction_id": "94da5d999bd13e8a4c0446eb289d7402b2a6d73fa5309776d9837bbc39754da0"
+    },
+    {
+      "actual_cost_usd": 0.042975,
+      "actual_metered_tokens": 43804,
+      "arm": "markdown_memory",
+      "case_id": "coding:recovery-receipt-transfer-v3:budget-reservation",
+      "provider_http_requests": 5,
+      "sequence": 3,
+      "success": true,
+      "transaction_id": "0546e5b4a83568d8858639d05ceefe8af7b0cc589032a79ff4a7db86cd4e5c3b"
+    },
+    {
+      "actual_cost_usd": 0.097259,
+      "actual_metered_tokens": 139998,
+      "arm": "tinykg_lexical",
+      "case_id": "coding:recovery-receipt-transfer-v3:budget-reservation",
+      "provider_http_requests": 10,
+      "sequence": 4,
+      "success": true,
+      "transaction_id": "5d243b6472ec9b365529f6a90212ae83ce62cc01853967c695de2c2bb5563898"
+    },
+    {
+      "actual_cost_usd": 0.086334,
+      "actual_metered_tokens": 125501,
+      "arm": "no_memory",
+      "case_id": "coding:recovery-receipt-transfer-v3:budget-reservation",
+      "provider_http_requests": 14,
+      "sequence": 5,
+      "success": false,
+      "transaction_id": "4dc7c620091a50b1146cc74235ba73d76b78aaeb396bc62606226ba25d7252f7"
+    },
+    {
+      "actual_cost_usd": 0.095347,
+      "actual_metered_tokens": 142851,
+      "arm": "tinykg_lexical",
+      "case_id": "coding:recovery-receipt-transfer-v3:memory-migration",
+      "provider_http_requests": 11,
+      "sequence": 6,
+      "success": true,
+      "transaction_id": "0c2e4ffcfc815b8e40b2ad6007644ccadb27459153cc5ea9639395dde56b2dcb"
+    },
+    {
+      "actual_cost_usd": 0.11265,
+      "actual_metered_tokens": 159877,
+      "arm": "no_memory",
+      "case_id": "coding:recovery-receipt-transfer-v3:memory-migration",
+      "provider_http_requests": 15,
+      "sequence": 7,
+      "success": false,
+      "transaction_id": "4e78cb81b7fecab12d613b26e1f89b9f56f4d82f3bc431335882901f9488a092"
+    },
+    {
+      "actual_cost_usd": 0.068999,
+      "actual_metered_tokens": 88126,
+      "arm": "markdown_memory",
+      "case_id": "coding:recovery-receipt-transfer-v3:memory-migration",
+      "provider_http_requests": 10,
+      "sequence": 8,
+      "success": true,
+      "transaction_id": "b21a0c2ed8f125c0e278610e252b8ad09a7c1ff7af0c38369067e115743429f7"
+    }
+  ]
+}

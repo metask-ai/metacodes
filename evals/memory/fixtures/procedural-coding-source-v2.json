@@ -1,0 +1,248 @@
+{
+  "schema_version": 1,
+  "dataset_id": "coding-intent-transfer-v2",
+  "dataset_revision": "checked-in-fixture-v2",
+  "families": [
+    {
+      "id": "audit-receipt-transfer",
+      "procedure_evidence_id": "procedure:audit-receipt-transfer:v2",
+      "intent_template": "Register sibling audit receipt `{name}`. {instruction}",
+      "cases": [
+        {
+          "id": "evidence-snapshot",
+          "split": "online",
+          "bindings": {
+            "instruction": "Establish this family's audit receipt protocol: use stable alias AUDIT_<UPPER_SNAKE_NAME>_V2, phase order capture > verify > seal, and documentation line - <name> => <alias> [capture > verify > seal]. Update the receipt registry, stable alias map, phase map, docs, and JSON contract.",
+            "name": "evidence_snapshot"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/audit-receipts.md",
+                "content": "# Audit receipts\n\n- inspect => INSPECT_V1 [observe > report]\n"
+              },
+              {
+                "path": "src/audit_receipts.py",
+                "content": "RECEIPTS = [\"inspect\"]\nSTABLE_ALIAS = {\"inspect\": \"INSPECT_V1\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"]}\n"
+              },
+              {
+                "path": "tests/audit-receipts.json",
+                "content": "{\"receipts\":[{\"name\":\"inspect\",\"stable_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/audit-receipts.md",
+              "src/audit_receipts.py",
+              "tests/audit-receipts.json"
+            ],
+            "required_changed_paths": [
+              "docs/audit-receipts.md",
+              "src/audit_receipts.py",
+              "tests/audit-receipts.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/audit_receipts.py",
+                "value": "RECEIPTS = [\"inspect\", \"evidence_snapshot\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/audit_receipts.py",
+                "value": "\"evidence_snapshot\": \"AUDIT_EVIDENCE_SNAPSHOT_V2\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/audit_receipts.py",
+                "value": "\"evidence_snapshot\": [\"capture\", \"verify\", \"seal\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/audit-receipts.md",
+                "value": "- evidence_snapshot => AUDIT_EVIDENCE_SNAPSHOT_V2 [capture > verify > seal]"
+              },
+              {
+                "kind": "equals",
+                "path": "tests/audit-receipts.json",
+                "value": "{\"receipts\":[{\"name\":\"inspect\",\"stable_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]},{\"name\":\"evidence_snapshot\",\"stable_alias\":\"AUDIT_EVIDENCE_SNAPSHOT_V2\",\"phases\":[\"capture\",\"verify\",\"seal\"]}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/audit-receipts.md",
+              "content": "# Audit receipts\n\n- inspect => INSPECT_V1 [observe > report]\n- evidence_snapshot => AUDIT_EVIDENCE_SNAPSHOT_V2 [capture > verify > seal]\n"
+            },
+            {
+              "path": "src/audit_receipts.py",
+              "content": "RECEIPTS = [\"inspect\", \"evidence_snapshot\"]\nSTABLE_ALIAS = {\"inspect\": \"INSPECT_V1\", \"evidence_snapshot\": \"AUDIT_EVIDENCE_SNAPSHOT_V2\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"], \"evidence_snapshot\": [\"capture\", \"verify\", \"seal\"]}\n"
+            },
+            {
+              "path": "tests/audit-receipts.json",
+              "content": "{\"receipts\":[{\"name\":\"inspect\",\"stable_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]},{\"name\":\"evidence_snapshot\",\"stable_alias\":\"AUDIT_EVIDENCE_SNAPSHOT_V2\",\"phases\":[\"capture\",\"verify\",\"seal\"]}]}\n"
+            }
+          ]
+        },
+        {
+          "id": "budget-commit",
+          "split": "offline",
+          "bindings": {
+            "instruction": "Reuse the previously established family audit receipt protocol for this sibling. Update the receipt registry, stable alias map, phase map, docs, and JSON contract.",
+            "name": "budget_commit"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/audit-receipts.md",
+                "content": "# Audit receipts\n\n- inspect => INSPECT_V1 [observe > report]\n"
+              },
+              {
+                "path": "src/audit_receipts.py",
+                "content": "RECEIPTS = [\"inspect\"]\nSTABLE_ALIAS = {\"inspect\": \"INSPECT_V1\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"]}\n"
+              },
+              {
+                "path": "tests/audit-receipts.json",
+                "content": "{\"receipts\":[{\"name\":\"inspect\",\"stable_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/audit-receipts.md",
+              "src/audit_receipts.py",
+              "tests/audit-receipts.json"
+            ],
+            "required_changed_paths": [
+              "docs/audit-receipts.md",
+              "src/audit_receipts.py",
+              "tests/audit-receipts.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/audit_receipts.py",
+                "value": "RECEIPTS = [\"inspect\", \"budget_commit\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/audit_receipts.py",
+                "value": "\"budget_commit\": \"AUDIT_BUDGET_COMMIT_V2\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/audit_receipts.py",
+                "value": "\"budget_commit\": [\"capture\", \"verify\", \"seal\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/audit-receipts.md",
+                "value": "- budget_commit => AUDIT_BUDGET_COMMIT_V2 [capture > verify > seal]"
+              },
+              {
+                "kind": "equals",
+                "path": "tests/audit-receipts.json",
+                "value": "{\"receipts\":[{\"name\":\"inspect\",\"stable_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]},{\"name\":\"budget_commit\",\"stable_alias\":\"AUDIT_BUDGET_COMMIT_V2\",\"phases\":[\"capture\",\"verify\",\"seal\"]}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/audit-receipts.md",
+              "content": "# Audit receipts\n\n- inspect => INSPECT_V1 [observe > report]\n- budget_commit => AUDIT_BUDGET_COMMIT_V2 [capture > verify > seal]\n"
+            },
+            {
+              "path": "src/audit_receipts.py",
+              "content": "RECEIPTS = [\"inspect\", \"budget_commit\"]\nSTABLE_ALIAS = {\"inspect\": \"INSPECT_V1\", \"budget_commit\": \"AUDIT_BUDGET_COMMIT_V2\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"], \"budget_commit\": [\"capture\", \"verify\", \"seal\"]}\n"
+            },
+            {
+              "path": "tests/audit-receipts.json",
+              "content": "{\"receipts\":[{\"name\":\"inspect\",\"stable_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]},{\"name\":\"budget_commit\",\"stable_alias\":\"AUDIT_BUDGET_COMMIT_V2\",\"phases\":[\"capture\",\"verify\",\"seal\"]}]}\n"
+            }
+          ]
+        },
+        {
+          "id": "memory-migrate",
+          "split": "offline",
+          "bindings": {
+            "instruction": "Reuse the previously established family audit receipt protocol for this sibling. Update the receipt registry, stable alias map, phase map, docs, and JSON contract.",
+            "name": "memory_migrate"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/audit-receipts.md",
+                "content": "# Audit receipts\n\n- inspect => INSPECT_V1 [observe > report]\n"
+              },
+              {
+                "path": "src/audit_receipts.py",
+                "content": "RECEIPTS = [\"inspect\"]\nSTABLE_ALIAS = {\"inspect\": \"INSPECT_V1\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"]}\n"
+              },
+              {
+                "path": "tests/audit-receipts.json",
+                "content": "{\"receipts\":[{\"name\":\"inspect\",\"stable_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/audit-receipts.md",
+              "src/audit_receipts.py",
+              "tests/audit-receipts.json"
+            ],
+            "required_changed_paths": [
+              "docs/audit-receipts.md",
+              "src/audit_receipts.py",
+              "tests/audit-receipts.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/audit_receipts.py",
+                "value": "RECEIPTS = [\"inspect\", \"memory_migrate\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/audit_receipts.py",
+                "value": "\"memory_migrate\": \"AUDIT_MEMORY_MIGRATE_V2\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/audit_receipts.py",
+                "value": "\"memory_migrate\": [\"capture\", \"verify\", \"seal\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/audit-receipts.md",
+                "value": "- memory_migrate => AUDIT_MEMORY_MIGRATE_V2 [capture > verify > seal]"
+              },
+              {
+                "kind": "equals",
+                "path": "tests/audit-receipts.json",
+                "value": "{\"receipts\":[{\"name\":\"inspect\",\"stable_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]},{\"name\":\"memory_migrate\",\"stable_alias\":\"AUDIT_MEMORY_MIGRATE_V2\",\"phases\":[\"capture\",\"verify\",\"seal\"]}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/audit-receipts.md",
+              "content": "# Audit receipts\n\n- inspect => INSPECT_V1 [observe > report]\n- memory_migrate => AUDIT_MEMORY_MIGRATE_V2 [capture > verify > seal]\n"
+            },
+            {
+              "path": "src/audit_receipts.py",
+              "content": "RECEIPTS = [\"inspect\", \"memory_migrate\"]\nSTABLE_ALIAS = {\"inspect\": \"INSPECT_V1\", \"memory_migrate\": \"AUDIT_MEMORY_MIGRATE_V2\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"], \"memory_migrate\": [\"capture\", \"verify\", \"seal\"]}\n"
+            },
+            {
+              "path": "tests/audit-receipts.json",
+              "content": "{\"receipts\":[{\"name\":\"inspect\",\"stable_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]},{\"name\":\"memory_migrate\",\"stable_alias\":\"AUDIT_MEMORY_MIGRATE_V2\",\"phases\":[\"capture\",\"verify\",\"seal\"]}]}\n"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

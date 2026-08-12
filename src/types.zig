@@ -6,6 +6,15 @@ pub const Config = struct {
     model: []const u8 = "claude-sonnet-4-20250514",
     model_explicit: bool = false,
     reasoning_effort: ?ReasoningEffort = null,
+    /// 方言字段覆盖(null = profile 默认,见 RequestOverrides)。
+    /// CLI --temperature/--top-p/--prompt-cache-key/--parallel-tool-calls/--response-format 填充。
+    /// App.init 塞 OpenAIClient/GeminiClient.overrides(Anthropic 不支持方言字段,忽略)。
+    temperature: ?f32 = null,
+    top_p: ?f32 = null,
+    prompt_cache_key: ?[]const u8 = null,
+    parallel_tool_calls: ?bool = null,
+    /// "json_object" / "json_schema"。null = 不发 response_format。
+    response_format: ?[]const u8 = null,
     /// 每次请求的 max_tokens。null = 根据 model 自动挑（util/model.zig 查表）；
     /// 非 null = 用户 CLI 明确指定的值，尊重覆盖。
     max_tokens: ?u32 = null,
@@ -17,6 +26,10 @@ pub const Config = struct {
     /// Swarm(teams/teammates):`--agent-teams` 开启。opt-in——默认关,不污染单 agent 会话
     /// 的工具菜单(对齐 cc agentSwarmsEnabled 门)。
     agent_teams: bool = false,
+    /// Long-horizon evaluation ablation. `native` preserves the product's normal
+    /// behavior; the three explicit arms are injected only by the evaluation
+    /// runner so one binary can be compared without revision drift.
+    long_horizon_arm: LongHorizonArm = .native,
     /// SW6 进程外 teammate 身份(lead fork+exec 时经 CLI 注入;非 null → 进 teammate 进程模式,
     /// 不进 REPL)。teammate_name 非空即触发。cwd 非空则启动时 chdir(worktree 隔离)。
     teammate_name: []const u8 = "",
@@ -89,6 +102,38 @@ pub const Config = struct {
     /// gpt*/o1*/o3* → openai(讲 chat/completions 协议)。**只在 App 组装层据此选 Client,
     /// core/UI 零感知**(多 Provider 重构 P3)。
     provider_kind: ProviderKind = .anthropic,
+};
+
+/// A single tagged treatment prevents invalid combinations such as "TinyKG on
+/// but graph tools hidden".  Swarm is intentionally outside this first-stage
+/// single-agent experiment and remains controlled by `agent_teams`.
+pub const LongHorizonArm = enum {
+    native,
+    codex_style,
+    claude_style,
+    tinykg,
+
+    pub fn parse(value: []const u8) ?LongHorizonArm {
+        inline for (std.meta.fields(LongHorizonArm)) |field| {
+            if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+        }
+        return null;
+    }
+
+    pub fn usesAutoMemory(self: LongHorizonArm, native_enabled: bool) bool {
+        return switch (self) {
+            .native => native_enabled,
+            .codex_style => false,
+            .claude_style, .tinykg => true,
+        };
+    }
+
+    pub fn usesTinyKg(self: LongHorizonArm) bool {
+        return switch (self) {
+            .native, .tinykg => true,
+            .codex_style, .claude_style => false,
+        };
+    }
 };
 
 /// LLM 后端协议种类(App 组装层据此选具体 Client;core 只见中立 Provider)。
@@ -184,6 +229,8 @@ pub const ApiMessage = struct {
 /// API 内容块
 pub const ApiContent = union(enum) {
     text: []const u8,
+    /// Anthropic preserved thinking block(原样回传,对齐 Claude 4.x)
+    thinking: []const u8,
     tool_use: ToolUseBlock,
     tool_result: ToolResultBlock,
 };

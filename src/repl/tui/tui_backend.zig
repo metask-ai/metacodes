@@ -182,6 +182,7 @@ pub const TuiBackend = struct {
                 self.region.beginGenAssistant();
             },
             .text_chunk => |t| self.region.writeGenAssistantText(t),
+            .thinking_chunk => |t| self.region.writeGenAssistantText(t), // TUI 暂与 text 同渲染(后续可折叠)
             .tool_start => |s| {
                 // backend 据 tool_card 分类自决渲染(层泄漏修复:agent_loop 无条件发,不碰 tool_card)。
                 if (tool_card.usesDynamicCard(s.name)) {
@@ -216,8 +217,8 @@ pub const TuiBackend = struct {
                 self.spinner_fed = false; // 本轮结束,重置喂 spinner 标志。
             },
             .tool_result => |r| {
-                // backend 自决三分支(P2.1:agent_loop 现每工具只发一条真 content 的 tool_result,
-                // 不再有空 content 双发 → 无需 content.len>0 去重):
+                // P2.1:agent_loop 每工具只发一条真 content 的 tool_result,无需 content.len>0 去重。
+                // backend 自决三分支:
                 //  ① 类A(usesLiveCard):commit 动态卡进 scrollback(过去式标题)。
                 //  ② WebSearch(hasProgressCard):完成只移除动态卡(结果走助手文本)。
                 //  ③ 其余(类B 等):renderResult 写 scrollback(不变)。
@@ -287,7 +288,7 @@ pub const TuiBackend = struct {
                 // TUI 是同步前端(走阻塞 requestUi,恒 .answered,从不挂起)→ 此事件不会发给它,no-op。
             },
             // L4 诊断事件:DiagnosticsBackend 专属(经 TeeBackend 旁挂),TUI 不渲染,no-op。
-            .diag_turn_begin, .diag_turn_end, .diag_model_request, .diag_tool_stage, .diag_breaker_tripped, .diag_cache_break, .diag_continuation, .policy_decision, .diag_run_end => {},
+            .diag_turn_begin, .diag_turn_end, .diag_model_request, .diag_compact_request, .diag_tool_stage, .diag_breaker_tripped, .diag_cache_break, .diag_continuation, .context_projection, .policy_decision, .diag_run_end => {},
         }
     }
 

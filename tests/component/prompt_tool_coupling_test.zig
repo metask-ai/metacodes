@@ -27,6 +27,10 @@ fn findDef(defs: []const cc.json_mod.ToolDefinition, name: []const u8) ?cc.json_
     return null;
 }
 
+fn deferredProbe(_: *const cc.tool_context.ToolContext, _: []const u8, _: ?*anyopaque) anyerror![]u8 {
+    return error.ProbeNotExecutable;
+}
+
 // ① 核心工具长描述进 defs(对比:无 context 时是短描述)。
 test "L2: toToolDefinitionsFull 给核心工具动态长描述" {
     const a = std.testing.allocator;
@@ -68,13 +72,193 @@ test "L2: 无 context 回退短描述 + Monitor 恒静态" {
     try std.testing.expect(std.mem.indexOf(u8, monitor.description, "background monitor") != null);
 }
 
+test "L2: KgRecall and KgContext schemas carry the staged semantic-neighborhood contract" {
+    const kg_recall = cc.tools.getTool("KgRecall") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, kg_recall.description, "no embeddings and computes no vector distance") != null);
+    const required = kg_recall.input_schema.required orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), required.len);
+    try std.testing.expectEqualStrings("query", required[0]);
+    try std.testing.expectEqualStrings("lexical_plan", required[1]);
+
+    const props = kg_recall.input_schema.prop_specs orelse return error.TestUnexpectedResult;
+    var query_description: ?[]const u8 = null;
+    for (props) |prop| {
+        if (std.mem.eql(u8, prop.name, "query")) query_description = prop.description;
+    }
+    const description = query_description orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, description, "exact/high-precision query") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "ONE compact semantic variant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "2-4 separate variants") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "at most four variant calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "FIRST inspect automatic recall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "MUST contain ONLY that exact term") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "mechanism/symptom/outcome/nearby implementation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "broader or narrower concept") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "Do not combine all variants into one keyword bag") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "Extra keywords are safe") == null);
+
+    var type_description: ?[]const u8 = null;
+    for (props) |prop| {
+        if (std.mem.eql(u8, prop.name, "type")) type_description = prop.description;
+    }
+    const type_desc = type_description orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, type_desc, "Omit on the exact/high-precision seed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, type_desc, "observation or module") != null);
+
+    const kg_context = cc.tools.getTool("KgContext") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, kg_context.description, "authoritative node text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kg_context.description, "connected evidence") != null);
+    const context_props = kg_context.input_schema.prop_specs orelse return error.TestUnexpectedResult;
+    var saw_node_id = false;
+    var saw_limit = false;
+    var saw_offset = false;
+    var saw_text_limit = false;
+    for (context_props) |prop| {
+        if (std.mem.eql(u8, prop.name, "node_id")) saw_node_id = true;
+        if (std.mem.eql(u8, prop.name, "limit")) saw_limit = true;
+        if (std.mem.eql(u8, prop.name, "text_offset")) saw_offset = true;
+        if (std.mem.eql(u8, prop.name, "text_limit")) saw_text_limit = true;
+    }
+    try std.testing.expect(saw_node_id and saw_limit and saw_offset and saw_text_limit);
+}
+
+test "L2: ToolSearch tells the model to call visible KgRecall directly" {
+    const tool_search = cc.tools.getTool("ToolSearch") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, tool_search.description, "NEVER call ToolSearch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tool_search.description, "including KgRecall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tool_search.description, "call that tool directly") != null);
+}
+
+test "L2: ToolSearch enters the API tool set only when a deferred tool exists" {
+    const a = std.testing.allocator;
+    // Dynamic descriptions are owned independently of the outer definitions
+    // slice. Production keeps both in the session arena; mirror that here.
+    var definitions_arena = std.heap.ArenaAllocator.init(a);
+    defer definitions_arena.deinit();
+    const definitions_allocator = definitions_arena.allocator();
+    var no_tinykg = cc.tools.PromptContext{ .tinykg_enabled = false };
+
+    // TinyKG 治理核未启用、无动态工具：ToolSearch 没有工作可做，必须不广告。
+    const core_only = try cc.tools.toToolDefinitionsFull(definitions_allocator, null, &no_tinykg);
+    try std.testing.expect(findDef(core_only, "KgRecall") == null);
+    try std.testing.expect(findDef(core_only, "Write") != null);
+    try std.testing.expect(findDef(core_only, "ToolSearch") == null);
+
+    var dyn = cc.tools_dynamic.DynRegistry.init(a);
+    defer dyn.deinit();
+    // 常驻 Skill 类动态工具不需要激活，仍不应引入 ToolSearch。
+    try dyn.register("always_visible", "always visible helper", &.{}, deferredProbe, null, false);
+    const visible_dyn = try cc.tools.toToolDefinitionsFull(definitions_allocator, &dyn, &no_tinykg);
+    try std.testing.expect(findDef(visible_dyn, "always_visible") != null);
+    try std.testing.expect(findDef(visible_dyn, "ToolSearch") == null);
+
+    // MCP 工具 deferred=true：此时 ToolSearch 才是必要能力并随工具表进入请求。
+    try dyn.registerMcp("demo__lookup", "deferred MCP lookup", &.{}, deferredProbe, null, "demo");
+    const with_deferred = try cc.tools.toToolDefinitionsFull(definitions_allocator, &dyn, &no_tinykg);
+    try std.testing.expect(findDef(with_deferred, "ToolSearch") != null);
+    const deferred = findDef(with_deferred, "demo__lookup") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(deferred.deferred);
+}
+
+test "L2: long-horizon arm gates TinyKG tools as one typed treatment" {
+    const a = std.testing.allocator;
+
+    const codex = cc.types_mod.LongHorizonArm.codex_style;
+    try std.testing.expect(!codex.usesAutoMemory(true));
+    try std.testing.expect(!codex.usesTinyKg());
+    const claude = cc.types_mod.LongHorizonArm.claude_style;
+    try std.testing.expect(claude.usesAutoMemory(false));
+    try std.testing.expect(!claude.usesTinyKg());
+    const tinykg = cc.types_mod.LongHorizonArm.tinykg;
+    try std.testing.expect(tinykg.usesAutoMemory(false));
+    try std.testing.expect(tinykg.usesTinyKg());
+
+    var without_kg = cc.tools.PromptContext{ .tinykg_enabled = false };
+    const baseline_defs = try cc.tools.toToolDefinitionsFull(a, null, &without_kg);
+    defer {
+        for (baseline_defs) |def| {
+            if (cc.tools.getTool(def.name)) |tool| {
+                if (tool.describe_fn != null) a.free(@constCast(def.description));
+            }
+        }
+        a.free(baseline_defs);
+    }
+    try std.testing.expect(findDef(baseline_defs, "KgRemember") == null);
+    try std.testing.expect(findDef(baseline_defs, "KgRecall") == null);
+    try std.testing.expect(findDef(baseline_defs, "KgContext") == null);
+    try std.testing.expect(findDef(baseline_defs, "FormalAuditTask") == null);
+    try std.testing.expect(findDef(baseline_defs, "ToolSearch") == null);
+    const baseline_create = findDef(baseline_defs, "TaskCreate") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, baseline_create.description, "in-session task list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, baseline_create.description, "TinyKG") == null);
+    try std.testing.expect(findDef(baseline_defs, "TaskList") != null);
+    const baseline_get = findDef(baseline_defs, "TaskGet") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, baseline_get.description, "TinyKG") == null);
+    try std.testing.expect(std.mem.indexOf(u8, baseline_get.description, "kg-*") == null);
+    try std.testing.expect(std.mem.indexOf(u8, baseline_get.description, "do not persist after this session") != null);
+    const baseline_update = findDef(baseline_defs, "TaskUpdate") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, baseline_update.description, "persistent") == null);
+    const baseline_props = baseline_update.input_schema.prop_specs orelse return error.TestUnexpectedResult;
+    var saw_status = false;
+    for (baseline_props) |prop| {
+        try std.testing.expect(!std.mem.eql(u8, prop.name, "conclusion"));
+        try std.testing.expect(!std.mem.eql(u8, prop.name, "acts_on"));
+        try std.testing.expect(!std.mem.eql(u8, prop.name, "uses"));
+        try std.testing.expect(!std.mem.eql(u8, prop.name, "produces"));
+        if (std.mem.eql(u8, prop.name, "status")) {
+            saw_status = true;
+            const values = prop.enum_values orelse return error.TestUnexpectedResult;
+            for (values) |value| try std.testing.expect(!std.mem.eql(u8, value, "failed"));
+        }
+    }
+    try std.testing.expect(saw_status);
+
+    var with_kg = cc.tools.PromptContext{ .tinykg_enabled = true };
+    const tinykg_defs = try cc.tools.toToolDefinitionsFull(a, null, &with_kg);
+    defer {
+        for (tinykg_defs) |def| {
+            if (cc.tools.getTool(def.name)) |tool| {
+                if (tool.describe_fn != null) a.free(@constCast(def.description));
+            }
+        }
+        a.free(tinykg_defs);
+    }
+    try std.testing.expect(findDef(tinykg_defs, "KgRemember") != null);
+    try std.testing.expect(findDef(tinykg_defs, "KgRecall") != null);
+    try std.testing.expect(findDef(tinykg_defs, "KgContext") != null);
+    const formal_audit = findDef(tinykg_defs, "FormalAuditTask") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(formal_audit.deferred);
+    try std.testing.expect(findDef(tinykg_defs, "ToolSearch") != null);
+    const tinykg_create = findDef(tinykg_defs, "TaskCreate") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, tinykg_create.description, "persistent task in TinyKG") != null);
+    const tinykg_get = findDef(tinykg_defs, "TaskGet") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, tinykg_get.description, "TinyKG") != null);
+    const tinykg_update = findDef(tinykg_defs, "TaskUpdate") orelse return error.TestUnexpectedResult;
+    const tinykg_props = tinykg_update.input_schema.prop_specs orelse return error.TestUnexpectedResult;
+    try std.testing.expect(for (tinykg_props) |prop| {
+        if (std.mem.eql(u8, prop.name, "conclusion")) break true;
+    } else false);
+
+    const enabled_names = [_][]const u8{ "TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "KgRecall", "KgContext", "KgRemember" };
+    const tinykg_prompt = try cc.system_prompt.buildFull(a, "glm-5.2", null, null, &enabled_names, "", true, "/tmp");
+    defer a.free(tinykg_prompt);
+    try std.testing.expect(std.mem.indexOf(u8, tinykg_prompt, "ACTIVATE:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tinykg_prompt, "create exactly one persistent lifecycle anchor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tinykg_prompt, "Require its result to contain a `kg-*` id and `persisted: true`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tinykg_prompt, "after verifying the final artifacts") != null);
+
+    const baseline_prompt = try cc.system_prompt.buildFull(a, "glm-5.2", null, null, &enabled_names, "", false, "/tmp");
+    defer a.free(baseline_prompt);
+    try std.testing.expect(std.mem.indexOf(u8, baseline_prompt, "ACTIVATE:") == null);
+}
+
 // ② 动态耦合:USING_TOOLS 段按工具集裁剪。
 test "L2: buildUsingTools 段按工具集裁剪" {
     const a = std.testing.allocator;
 
     // 全量:含 Grep/Glob/TaskCreate 子条
     const full_names = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Grep", "Bash", "TaskCreate" };
-    const sp_full = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &full_names, "", false);
+    const sp_full = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &full_names, "", false, "/tmp");
     defer a.free(sp_full);
     try std.testing.expect(std.mem.indexOf(u8, sp_full, "use Grep instead of grep") != null);
     try std.testing.expect(std.mem.indexOf(u8, sp_full, "use Glob instead of find") != null);
@@ -82,7 +266,7 @@ test "L2: buildUsingTools 段按工具集裁剪" {
 
     // 裁剪:无 Grep / 无 TaskCreate
     const slim_names = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Bash" };
-    const sp_slim = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &slim_names, "", false);
+    const sp_slim = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &slim_names, "", false, "/tmp");
     defer a.free(sp_slim);
     try std.testing.expect(std.mem.indexOf(u8, sp_slim, "use Grep instead of grep") == null);
     try std.testing.expect(std.mem.indexOf(u8, sp_slim, "use Glob instead of find") != null); // Glob 仍在

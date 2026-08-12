@@ -1,7 +1,14 @@
 import copy
 import unittest
 
-from scripts.eval.analysis import compare, gate, summarize, validate_release_contract
+from scripts.eval.analysis import (
+    compare,
+    compare_multi_arm,
+    gate,
+    render_multi_arm_markdown,
+    summarize,
+    validate_release_contract,
+)
 from scripts.eval.model import ValidationError
 
 
@@ -103,6 +110,21 @@ class AnalysisTest(unittest.TestCase):
         self.assertEqual(result["paired_delta"]["tool_parallelism_factor"]["mean"], 0.0)
         self.assertEqual(len(result["task_trial_contributions"]), 3)
         self.assertEqual(result["task_contributions"][0]["task_id"], "task")
+
+    def test_three_arm_report_contains_all_summaries_and_pairwise_results(self):
+        arms = {
+            "codex_style": [rollout("task", False, "codex")],
+            "claude_style": [rollout("task", True, "claude")],
+            "tinykg": [rollout("task", True, "tinykg")],
+        }
+        result = compare_multi_arm(arms)
+        self.assertEqual(set(result["arms"]), set(arms))
+        self.assertEqual(len(result["pairwise"]), 3)
+        markdown = render_multi_arm_markdown(result)
+        self.assertIn("codex_style → tinykg", markdown)
+        self.assertIn("claude_style → tinykg", markdown)
+        with self.assertRaisesRegex(ValidationError, "requires exactly"):
+            compare_multi_arm({"codex_style": arms["codex_style"]})
 
     def test_comparison_fails_closed_when_cost_or_latency_is_missing(self):
         baseline = [rollout("task", True, "old")]

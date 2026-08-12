@@ -18,15 +18,45 @@ const client_mod = @import("client.zig");
 const conv_mod = @import("../core/conversation.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const log = @import("../util/log.zig");
+const retrieval_protocol = @import("retrieval_protocol.zig");
 
 const MIN_QUERY_LEN = 16; // 琐碎接话轮门(下界)
 const MAX_QUERY_LEN = 400; // BM25 query 上界(避免粘贴长文变噪声 query)
+// 自动命中既是上下文，也是 lexical→semantic 的桥。100 bytes 会把中文记忆压到约 33 字，
+// canonical alias/代码符号常在句尾被截掉，迫使模型重新宽搜。3 条×320B 仍是有界小预算。
+const MAX_HIT_TEXT_BYTES = 320;
 const TOP_K = 3;
 const REL_RATIO: f64 = 0.5; // 相对门:只留 ≥ top×0.5 的命中
 // 绝对地板(BM25;启发式,可 METACODES_RECALL_FLOOR 校准)。实测数据定初值:相关 query top≈7,
 // 无关 query top≈2.7 → 3.0 分界(auto-inject 精度优先,宁漏勿噪——PM:注入无关记忆=负价值)。
 // BM25 分跨 query 不可比,固定地板固有不精确;仪器日志(injected/top_score)供持续校准。
 const DEFAULT_ABS_FLOOR: f64 = 3.0;
+
+pub const RECEIPT_SCHEMA_VERSION = "metacodes-scoped-recall-v1";
+
+/// Redacted execution receipt for evaluation. It commits to the exact query
+/// and synthetic block without exposing either one in the native event log.
+/// Counts remain zero on every non-injection path, so replay can distinguish a
+/// real host recall miss from a missing/forged activation claim.
+pub const Receipt = struct {
+    schema_version: []const u8 = RECEIPT_SCHEMA_VERSION,
+    status: []const u8,
+    query_sha256: [64]u8 = .{'0'} ** 64,
+    result_count: usize = 0,
+    injected_count: usize = 0,
+    injected_bytes: usize = 0,
+    injection_sha256: [64]u8 = .{'0'} ** 64,
+};
+
+pub const BuildResult = struct {
+    text: ?[]u8,
+    receipt: Receipt,
+
+    pub fn deinit(self: *BuildResult, allocator: std.mem.Allocator) void {
+        if (self.text) |text| allocator.free(text);
+        self.* = undefined;
+    }
+};
 
 /// 相关性门 + 动态条数。best-effort:kg 未就绪 / 关闭 / 无末条 user 文本 / 消息琐碎 / 无相关命中
 /// → null(不注入)。返回 error 仅内部分配失败(调用方 `catch null` 兜底,等价不注入)。owned。
@@ -36,19 +66,36 @@ pub fn build(
     conversation: *const conv_mod.Conversation,
     abort: *const AbortSignal,
 ) !?[]u8 {
-    if (disabled()) return null; // escape hatch(解耦 KG)
-    if (!kg.ready) return null;
-    const raw = lastUserText(conversation) orelse return null;
-    if (raw.len < MIN_QUERY_LEN) return null; // 琐碎轮不召回
+    const result = try buildWithReceipt(allocator, kg, conversation, abort);
+    return result.text;
+}
+
+pub fn buildWithReceipt(
+    allocator: std.mem.Allocator,
+    kg: *client_mod.KgClient,
+    conversation: *const conv_mod.Conversation,
+    abort: *const AbortSignal,
+) !BuildResult {
+    if (disabled()) return noInjection("disabled"); // escape hatch(解耦 KG)
+    if (!kg.ready) return noInjection("kg_not_ready");
+    const raw = lastUserText(conversation) orelse return noInjection("no_user_text");
+    if (raw.len < MIN_QUERY_LEN) return noInjection("query_too_short"); // 琐碎轮不召回
     const query = raw[0..@min(raw.len, MAX_QUERY_LEN)]; // 上界截断
+    const query_sha256 = sha256Hex(query);
 
     kg.setAbort(abort); // ESC 可中断
-    const hits = kg.recall(query, TOP_K, false) catch return null;
+    const hits = kg.recall(query, TOP_K, false) catch return .{
+        .text = null,
+        .receipt = .{ .status = "search_error", .query_sha256 = query_sha256 },
+    };
     defer {
         for (hits) |*h| h.deinit(allocator);
         allocator.free(hits);
     }
-    if (hits.len == 0) return null;
+    if (hits.len == 0) return .{
+        .text = null,
+        .receipt = .{ .status = "no_hits", .query_sha256 = query_sha256 },
+    };
 
     // 相关性门:top 分做绝对地板(答案缺席→0 条)+ 相对衰减(留 ≥top×REL)。
     var top: f64 = 0;
@@ -58,7 +105,14 @@ pub fn build(
     const floor = absFloor();
     if (top < floor) {
         log.info("kg", "scoped_recall injected=0 top_score={d:.2} (below floor {d:.2})", .{ top, floor });
-        return null; // 最相关的都弱 → 判为答案缺席,不注入噪声
+        return .{
+            .text = null,
+            .receipt = .{
+                .status = "below_floor",
+                .query_sha256 = query_sha256,
+                .result_count = hits.len,
+            },
+        }; // 最相关的都弱 → 判为答案缺席,不注入噪声
     }
     const keep_min = top * REL_RATIO;
 
@@ -67,22 +121,47 @@ pub fn build(
     // 无 errdefer(本函数返回 !?[]u8;分配失败走 error 路径,显式 deinit 防泄漏——Linus 抓的死 errdefer)。
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "<system-reminder>\n# 相关持久记忆(按你的请求自动召回,可能不全)\n");
+    try out.appendSlice(allocator, retrieval_protocol.AUTO_RECALL_NOTE);
+    try out.appendSlice(allocator, "\n");
     for (hits) |h| {
         if (h.score < keep_min) continue; // 相对门:丢明显弱于最佳的
         const type_str = if (h.schema_type.len > 0) h.schema_type else h.kind;
         // 带来源的 hit(记忆 markdown)标注文件名:模型更新该文件而非另存(PM P0-2)。
         const line = if (h.source_label.len > 0)
-            try std.fmt.allocPrint(allocator, "- [{s}:{s}] {s}\n", .{ type_str, h.source_label, firstLine(h.text) })
+            try std.fmt.allocPrint(allocator, "- [node_id={d} {s}:{s}] {s}\n", .{ h.node_id, type_str, h.source_label, firstLine(h.text) })
         else
-            try std.fmt.allocPrint(allocator, "- [{s}] {s}\n", .{ type_str, firstLine(h.text) });
+            try std.fmt.allocPrint(allocator, "- [node_id={d} {s}] {s}\n", .{ h.node_id, type_str, firstLine(h.text) });
         defer allocator.free(line);
         try out.appendSlice(allocator, line);
         injected += 1;
     }
+    try out.appendSlice(allocator, retrieval_protocol.AUTO_RECALL_NEXT_ACTION);
+    try out.appendSlice(allocator, "\n");
     try out.appendSlice(allocator, "</system-reminder>");
 
+    const text = try out.toOwnedSlice(allocator);
     log.info("kg", "scoped_recall injected={d} top_score={d:.2} query_len={d}", .{ injected, top, query.len });
-    return try out.toOwnedSlice(allocator);
+    return .{
+        .text = text,
+        .receipt = .{
+            .status = "injected",
+            .query_sha256 = query_sha256,
+            .result_count = hits.len,
+            .injected_count = injected,
+            .injected_bytes = text.len,
+            .injection_sha256 = sha256Hex(text),
+        },
+    };
+}
+
+fn noInjection(status: []const u8) BuildResult {
+    return .{ .text = null, .receipt = .{ .status = status } };
+}
+
+fn sha256Hex(bytes: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 fn disabled() bool {
@@ -118,9 +197,16 @@ fn lastUserText(conversation: *const conv_mod.Conversation) ?[]const u8 {
 
 fn firstLine(text: []const u8) []const u8 {
     const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
-    var n = @min(end, 100);
+    var n = @min(end, MAX_HIT_TEXT_BYTES);
     while (n > 0 and (text[n - 1] & 0xC0) == 0x80) n -= 1; // 不切半个 CJK 字
     return text[0..n];
+}
+
+test "firstLine keeps a canonical bridge placed after the old 100-byte cutoff" {
+    const text = "长期任务被中断以后重新接续时，先从历史记录恢复精确并发规则；该规则的 canonical alias 是 orion-k9，后续应使用它聚焦检索。";
+    try std.testing.expect(text.len > 100);
+    const visible = firstLine(text);
+    try std.testing.expect(std.mem.indexOf(u8, visible, "orion-k9") != null);
 }
 
 test "build:kg 未就绪 → null(不阻塞)" {

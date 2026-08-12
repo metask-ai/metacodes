@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "suite_id": "metacodes-long-horizon-repository-pk-v1",
+  "description": "Held-out confirmatory tasks replay three real metacodes history snapshots and grade the repaired repository without exposing arm identity.",
+  "tasks": [
+    {
+      "id": "83_repo_posix_hup_drain",
+      "scenario": "tests/e2e/scenarios/83_repo_posix_hup_drain.txt",
+      "layers": ["E", "T", "C", "L", "O", "V"],
+      "environment": {
+        "kind": "isolated_git_workspace",
+        "reset": "fresh_home_workdir_and_repository_snapshot",
+        "repository_snapshot": {
+          "revision": "7b7d6468748dd4adcff5d6a4f850b81c6bf91b62",
+          "prefix": "metacodes",
+          "paths": ["src/platform/process.zig"]
+        }
+      },
+      "tools": {"profile": "metacodes-long-horizon-common-v1", "required": ["Read", "Edit", "Bash"]},
+      "constraints": {"timeout_seconds": 900, "permission_mode": "bypassPermissions"},
+      "success": {"checks": [{"type": "validator", "validator": "evals/validators/83_posix_hup_drain.py", "timeout_seconds": 30, "description": "POSIX pipe drain semantics and handoff pass the hidden validator"}]},
+      "trajectory_constraints": {"required_tools": ["Read", "Edit", "Bash"], "max_turns": 40, "max_tool_calls": 80, "max_model_tool_errors": 6, "max_harness_tool_errors": 0},
+      "trajectory_rationale": {
+        "required_tools": "A real code snapshot must be inspected, patched, and diff-verified through the common tool surface.",
+        "max_turns": "Audit, implementation, and final verification span three bounded phases.",
+        "max_tool_calls": "The single-file production fix and regression test fit comfortably without search loops.",
+        "max_model_tool_errors": "A small number of recoverable edit corrections is tolerated.",
+        "max_harness_tool_errors": "Harness failures invalidate a comparison."
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "long-horizon-repository-v1"}
+    },
+    {
+      "id": "84_repo_windows_lock_liveness",
+      "scenario": "tests/e2e/scenarios/84_repo_windows_lock_liveness.txt",
+      "layers": ["E", "T", "C", "L", "O", "V"],
+      "environment": {
+        "kind": "isolated_git_workspace",
+        "reset": "fresh_home_workdir_and_repository_snapshot",
+        "repository_snapshot": {
+          "revision": "36637f314c0f1c41bb1a2267ced7ad6a46100003",
+          "prefix": "metacodes",
+          "paths": ["src/swarm/file_lock.zig", "src/swarm/teammate.zig", "tests/component/teammate_runtime_test.zig"]
+        }
+      },
+      "tools": {"profile": "metacodes-long-horizon-common-v1", "required": ["Read", "Edit", "Bash"]},
+      "constraints": {"timeout_seconds": 900, "permission_mode": "bypassPermissions"},
+      "success": {"checks": [{"type": "validator", "validator": "evals/validators/84_windows_lock_liveness.py", "timeout_seconds": 30, "description": "Windows lock liveness and teardown semantics pass the hidden validator"}]},
+      "trajectory_constraints": {"required_tools": ["Read", "Edit", "Bash"], "max_turns": 48, "max_tool_calls": 100, "max_model_tool_errors": 8, "max_harness_tool_errors": 0},
+      "trajectory_rationale": {
+        "required_tools": "The concurrency repair crosses implementation and component-test files and must be diff-verified.",
+        "max_turns": "Three phases allow audit, implementation, and teardown review.",
+        "max_tool_calls": "The multi-file repair needs bounded navigation headroom without permitting unbounded retries.",
+        "max_model_tool_errors": "Several recoverable edits are tolerated for the larger change.",
+        "max_harness_tool_errors": "Harness failures invalidate a comparison."
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "long-horizon-repository-v1"}
+    },
+    {
+      "id": "85_repo_skill_catalog_identity",
+      "scenario": "tests/e2e/scenarios/85_repo_skill_catalog_identity.txt",
+      "layers": ["E", "T", "C", "L", "O", "V"],
+      "environment": {
+        "kind": "isolated_git_workspace",
+        "reset": "fresh_home_workdir_and_repository_snapshot",
+        "repository_snapshot": {
+          "revision": "576b0a2791e904f01257c6f7fe17e9b43d8154d0",
+          "prefix": "metacodes",
+          "paths": ["src/skills/runtime/catalog.zig", "sdk/zig/protocol.zig", "sdk/zig/types.zig", "src/agentcore/abi_v1.zig", "tests/component/agentcore_abi_test.zig"]
+        }
+      },
+      "tools": {"profile": "metacodes-long-horizon-common-v1", "required": ["Read", "Edit", "Bash"]},
+      "constraints": {"timeout_seconds": 900, "permission_mode": "bypassPermissions"},
+      "success": {"checks": [{"type": "validator", "validator": "evals/validators/85_skill_catalog_identity.py", "timeout_seconds": 30, "description": "Skill identity is coherent across producer, SDK, ABI, and L2"}]},
+      "trajectory_constraints": {"required_tools": ["Read", "Edit", "Bash"], "max_turns": 56, "max_tool_calls": 120, "max_model_tool_errors": 10, "max_harness_tool_errors": 0},
+      "trajectory_rationale": {
+        "required_tools": "The public identity contract spans producer, SDK, ABI, and L2 source files.",
+        "max_turns": "The broadest snapshot still remains a bounded three-phase change.",
+        "max_tool_calls": "Cross-layer navigation and verification require more headroom than the other held-out tasks.",
+        "max_model_tool_errors": "Recoverable multi-file edit corrections are tolerated.",
+        "max_harness_tool_errors": "Harness failures invalidate a comparison."
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "long-horizon-repository-v1"}
+    }
+  ]
+}

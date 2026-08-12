@@ -173,12 +173,15 @@ fn rejectUnsupportedOrderBy(env: TypeEnv, query: ast.Query) !void {
 fn nodePredicatePropertySupported(property: []const u8) bool {
     return std.mem.eql(u8, property, "name") or
         std.mem.eql(u8, property, "text") or
+        std.mem.eql(u8, property, "status") or
+        std.mem.eql(u8, property, "claimed_by") or
         std.mem.eql(u8, property, "schema_type") or
         std.mem.eql(u8, property, "summary") or
         std.mem.eql(u8, property, "retrieval_hints") or
         std.mem.eql(u8, property, "task_recorded_ns") or
         std.mem.eql(u8, property, "task_created_ns") or
         std.mem.eql(u8, property, "task_completed_ns") or
+        std.mem.eql(u8, property, "claim_expires_ns") or
         std.mem.eql(u8, property, "task_event_ns") or
         std.mem.eql(u8, property, "task_root_id") or
         std.mem.eql(u8, property, "task_id");
@@ -202,6 +205,8 @@ fn nodeProjectionPropertySupported(property: []const u8) bool {
         std.mem.eql(u8, property, "text") or
         std.mem.eql(u8, property, "retrieval_hints") or
         std.mem.eql(u8, property, "schema_type") or
+        std.mem.eql(u8, property, "status") or
+        std.mem.eql(u8, property, "claimed_by") or
         std.mem.eql(u8, property, "external_key") or
         std.mem.eql(u8, property, "content_hash") or
         std.mem.eql(u8, property, "task_event_type") or
@@ -213,6 +218,7 @@ fn predicateNumericRangeSupported(property: []const u8) bool {
     return std.mem.eql(u8, property, "task_recorded_ns") or
         std.mem.eql(u8, property, "task_created_ns") or
         std.mem.eql(u8, property, "task_completed_ns") or
+        std.mem.eql(u8, property, "claim_expires_ns") or
         std.mem.eql(u8, property, "task_event_ns") or
         std.mem.eql(u8, property, "task_root_id") or
         std.mem.eql(u8, property, "task_id");

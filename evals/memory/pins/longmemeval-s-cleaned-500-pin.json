@@ -1,0 +1,59 @@
+{
+  "adapter": {
+    "commit": "ac0e5be31330f18bc9dc0a8d659e2411cf1ac8e1",
+    "id": "longmemeval-s-cleaned",
+    "revision": "official-cleaned-session-v1"
+  },
+  "dataset": {
+    "case_count": 500,
+    "code_repository": "https://github.com/xiaowu0162/LongMemEval",
+    "code_revision": "9e0b455f4ef0e2ab8f2e582289761153549043fc",
+    "id": "longmemeval-s-cleaned",
+    "repository": "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned",
+    "revision": "98d7416c24c778c2fee6e6f3006e7a073259d48f",
+    "source_bytes": 277383467,
+    "source_path": "longmemeval_s_cleaned.json",
+    "source_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+    "source_url": "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/98d7416c24c778c2fee6e6f3006e7a073259d48f/longmemeval_s_cleaned.json"
+  },
+  "observed_source_edge_cases": {
+    "empty_turn_contents": 12,
+    "integer_answers_normalized_to_decimal_strings": 32,
+    "question_date_is_reasoning_reference_not_transaction_cutoff": true,
+    "session_array_order_preserved": true
+  },
+  "outputs": {
+    "manifest_bytes": 512042,
+    "manifest_sha256": "aa46d6958bb9f8b81879738670faa1a78d738468dfdb48d6db0457db34b3f1cc",
+    "source_slice_bytes": 304512804,
+    "source_slice_sha256": "356696cfd879ad64a196046060093c27e61cb340140c8bd7f4429f0998fa4df3"
+  },
+  "runtime": {
+    "execution_fixture": "evals/memory/fixtures/hotpot-adapter-smoke-execution.json",
+    "execution_fixture_sha256": "4564fe380075604d117bd52a6dbaa88b7d87800d8fffe3eb9699f2cf67c5a0c3",
+    "network_calls_during_adapter": 0,
+    "paid_model_calls": 0
+  },
+  "schema_version": 1,
+  "selection": {
+    "algorithm": "sha256-seed-null-question-id-v1",
+    "category_counts": {
+      "knowledge-update": 78,
+      "multi-session": 133,
+      "single-session-assistant": 56,
+      "single-session-preference": 30,
+      "single-session-user": 70,
+      "temporal-reasoning": 133
+    },
+    "limit": 500,
+    "ordered_question_digest_sha256": "488d6630fcf69faf57c785fc52ee7e6dbc5a41d6d9fecd31f0d6eccc6320238f",
+    "ordered_schedule_tsv_sha256": "dff259a315aca4e1ae7bbb7dc21da99d8347456375b44bb5400bf178cbe7776f",
+    "schedule_rows": 1000,
+    "split_seed": 20260806
+  },
+  "structure": {
+    "evidence_sessions": 948,
+    "sessions": 23867,
+    "turns": 246750
+  }
+}

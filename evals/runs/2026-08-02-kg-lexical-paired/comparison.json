@@ -1,0 +1,210 @@
+{
+  "baseline_success_rate": 0.0,
+  "baseline_successes": 0,
+  "candidate_success_rate": 1.0,
+  "candidate_successes": 2,
+  "causal_warning": null,
+  "discordant_improvements": 2,
+  "discordant_regressions": 0,
+  "excluded_pairs": [],
+  "factor": "harness",
+  "latency_attribution_pairs": 2,
+  "mcnemar_exact_p": 0.5,
+  "mean_paired_delta": {
+    "cost_usd": -0.005375700000000011,
+    "harness_time_ms": -4.5,
+    "model_request_time_ms": -4979.5,
+    "model_tool_errors": 0.0,
+    "network_errors": 0.0,
+    "retries": 0.0,
+    "tool_calls": -2.0,
+    "tool_parallelism_factor": 0.0,
+    "tool_stage_time_ms": -40.5,
+    "tool_time_ms": -40.5,
+    "total_tokens": -32619.5,
+    "wall_time_ms": -5024.5
+  },
+  "paired_delta": {
+    "cost_usd": {
+      "ci95": [
+        -0.26198988779999965,
+        0.2512384877999996
+      ],
+      "mean": -0.005375700000000011,
+      "p50": -0.005375700000000011,
+      "p95": 0.012800969999999964,
+      "variance": 0.0008157810673799978
+    },
+    "harness_time_ms": {
+      "ci95": [
+        -36.265,
+        27.265
+      ],
+      "mean": -4.5,
+      "p50": -4.5,
+      "p95": -2.25,
+      "variance": 12.5
+    },
+    "model_request_time_ms": {
+      "ci95": [
+        -82200.215,
+        72241.215
+      ],
+      "mean": -4979.5,
+      "p50": -4979.5,
+      "p95": 490.24999999999943,
+      "variance": 73872012.5
+    },
+    "model_tool_errors": {
+      "ci95": [
+        0.0,
+        0.0
+      ],
+      "mean": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "variance": 0.0
+    },
+    "network_errors": {
+      "ci95": [
+        0.0,
+        0.0
+      ],
+      "mean": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "variance": 0.0
+    },
+    "retries": {
+      "ci95": [
+        0.0,
+        0.0
+      ],
+      "mean": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "variance": 0.0
+    },
+    "tool_calls": {
+      "ci95": [
+        -27.412,
+        23.412
+      ],
+      "mean": -2.0,
+      "p50": -2.0,
+      "p95": -0.20000000000000018,
+      "variance": 8.0
+    },
+    "tool_parallelism_factor": {
+      "ci95": [
+        0.0,
+        0.0
+      ],
+      "mean": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "variance": 0.0
+    },
+    "tool_stage_time_ms": {
+      "ci95": [
+        -262.855,
+        181.855
+      ],
+      "mean": -40.5,
+      "p50": -40.5,
+      "p95": -24.75,
+      "variance": 612.5
+    },
+    "tool_time_ms": {
+      "ci95": [
+        -262.855,
+        181.855
+      ],
+      "mean": -40.5,
+      "p50": -40.5,
+      "p95": -24.75,
+      "variance": 612.5
+    },
+    "total_tokens": {
+      "ci95": [
+        -569378.117,
+        504139.11699999997
+      ],
+      "mean": -32619.5,
+      "p50": -32619.5,
+      "p95": 5400.5499999999965,
+      "variance": 3569195560.5
+    },
+    "wall_time_ms": {
+      "ci95": [
+        -82435.805,
+        72386.805
+      ],
+      "mean": -5024.5,
+      "p50": -5024.5,
+      "p95": 458.74999999999943,
+      "variance": 74237112.5
+    }
+  },
+  "paired_rollouts": 2,
+  "risk_frontier": "candidate_dominates",
+  "success_rate_delta": 1.0,
+  "task_contributions": [
+    {
+      "cost_usd": -0.005375700000000011,
+      "harness_time_ms": -4.5,
+      "model_request_time_ms": -4979.5,
+      "model_tool_errors": 0.0,
+      "network_errors": 0.0,
+      "pairs": 2,
+      "retries": 0.0,
+      "task_id": "70_kg_lexical_bridge",
+      "tool_calls": -2.0,
+      "tool_parallelism_factor": 0.0,
+      "tool_stage_time_ms": -40.5,
+      "tool_time_ms": -40.5,
+      "total_tokens": -32619.5,
+      "trustworthy_improvements": 2,
+      "trustworthy_regressions": 0,
+      "wall_time_ms": -5024.5
+    }
+  ],
+  "task_trial_contributions": [
+    {
+      "baseline_trustworthy_success": false,
+      "candidate_trustworthy_success": true,
+      "cost_usd": -0.025571999999999984,
+      "harness_time_ms": -2.0,
+      "model_request_time_ms": -11057.0,
+      "model_tool_errors": 0,
+      "network_errors": 0.0,
+      "retries": 0.0,
+      "task_id": "70_kg_lexical_bridge",
+      "tool_calls": -4,
+      "tool_parallelism_factor": 0.0,
+      "tool_stage_time_ms": -58.0,
+      "tool_time_ms": -58.0,
+      "total_tokens": -74864,
+      "trial": 1,
+      "wall_time_ms": -11117.0
+    },
+    {
+      "baseline_trustworthy_success": false,
+      "candidate_trustworthy_success": true,
+      "cost_usd": 0.014820599999999962,
+      "harness_time_ms": -7.0,
+      "model_request_time_ms": 1098.0,
+      "model_tool_errors": 0,
+      "network_errors": 0.0,
+      "retries": 0.0,
+      "task_id": "70_kg_lexical_bridge",
+      "tool_calls": 0,
+      "tool_parallelism_factor": 0.0,
+      "tool_stage_time_ms": -23.0,
+      "tool_time_ms": -23.0,
+      "total_tokens": 9625,
+      "trial": 0,
+      "wall_time_ms": 1068.0
+    }
+  ]
+}

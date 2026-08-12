@@ -21,6 +21,12 @@ const builtin = @import("builtin");
 
 const is_windows = builtin.os.tag == .windows;
 
+/// Whether opening the final path component with `NOFOLLOW` is one atomic OS
+/// operation. MSVCRT has no O_NOFOLLOW; its defensive attribute precheck is
+/// useful for ordinary callers but cannot authorize a security-sensitive
+/// read/compare/write transaction across a path-swap race.
+pub const atomic_final_nofollow = !is_windows;
+
 /// 文件 fd 类型。两平台皆 c_int:POSIX 天然 fd;Windows 走 MSVCRT `_open`(返回 CRT 层
 /// int fd,非内核 HANDLE),故模型一致。**勿用 `std.c.fd_t`**——它在 Windows 是 HANDLE
 /// (*anyopaque),会与 pfs.open 返回的 c_int 冲突(-1 哨兵无法赋值)。
@@ -63,6 +69,7 @@ extern "c" fn _close(fd: c_int) c_int;
 extern "c" fn _lseek(fd: c_int, offset: c_long, origin: c_int) c_long;
 extern "c" fn _lseeki64(fd: c_int, offset: i64, origin: c_int) i64; // Win64:64 位 offset(_lseek 仅 32 位)
 extern "c" fn _commit(fd: c_int) c_int; // MSVCRT:等价 fsync(刷到磁盘)
+extern "c" fn _chsize_s(fd: c_int, size: i64) c_int;
 extern "c" fn _fullpath(absPath: ?[*]u8, relPath: [*:0]const u8, maxLength: usize) ?[*:0]u8; // MSVCRT:规范化路径
 
 fn windowsOflag(flags: WindowsO) c_int {
@@ -104,6 +111,13 @@ const S_IFREG: u32 = 0o100000;
 pub const FileInfo = struct {
     size: u64,
     is_regular: bool,
+    link_count: u64,
+    mode: u32,
+    /// Stable identity for one open file while the descriptor remains live.
+    /// Security-sensitive pathname re-observation must compare both fields;
+    /// matching size/content alone cannot detect a same-byte final-path swap.
+    device: u64,
+    inode: u64,
 };
 
 /// 对已打开 fd 做类型与大小检查。安全敏感读取必须先 open(O_NOFOLLOW)，再 fstat fd，
@@ -115,6 +129,10 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
         return .{
             .size = @intCast(st.st_size),
             .is_regular = (@as(u32, st.st_mode) & S_IFMT) == S_IFREG,
+            .link_count = @intCast(@max(st.st_nlink, 0)),
+            .mode = @intCast(st.st_mode),
+            .device = @intCast(st.st_dev),
+            .inode = @intCast(st.st_ino),
         };
     }
     if (builtin.os.tag == .linux) {
@@ -126,6 +144,10 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
         return .{
             .size = stx.size,
             .is_regular = (@as(u32, stx.mode) & S_IFMT) == S_IFREG,
+            .link_count = stx.nlink,
+            .mode = stx.mode,
+            .device = (@as(u64, stx.dev_major) << 32) | @as(u64, stx.dev_minor),
+            .inode = stx.ino,
         };
     }
     var st: std.c.Stat = undefined;
@@ -133,6 +155,10 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
     return .{
         .size = @intCast(st.size),
         .is_regular = (@as(u32, @intCast(st.mode)) & S_IFMT) == S_IFREG,
+        .link_count = @intCast(st.nlink),
+        .mode = @intCast(st.mode),
+        .device = @intCast(st.dev),
+        .inode = @intCast(st.ino),
     };
 }
 
@@ -213,10 +239,28 @@ pub fn write(fd: c_int, buf: []const u8) isize {
 
 /// 刷盘。POSIX fsync / Windows _commit。
 pub fn fsync(fd: c_int) void {
+    fsyncChecked(fd) catch {};
+}
+
+/// 可观测的刷盘结果。安全控制面不能用上面的 best-effort 包装，否则磁盘错误会被
+/// 误报成“授权/观测已经持久化”。
+pub fn fsyncChecked(fd: c_int) error{SyncFailed}!void {
     if (is_windows) {
-        _ = _commit(fd);
+        if (_commit(fd) != 0) return error.SyncFailed;
     } else {
-        _ = std.c.fsync(fd);
+        if (std.c.fsync(fd) != 0) return error.SyncFailed;
+    }
+}
+
+/// Resize one already-open regular file descriptor.  Security-sensitive
+/// read/compare/write paths use this instead of reopening the pathname with
+/// O_TRUNC, which would reintroduce a path-swap race after validation.
+pub fn setSize(fd: Fd, size: u64) error{ResizeFailed}!void {
+    if (size > std.math.maxInt(i64)) return error.ResizeFailed;
+    if (is_windows) {
+        if (_chsize_s(fd, @intCast(size)) != 0) return error.ResizeFailed;
+    } else {
+        if (std.c.ftruncate(fd, @intCast(size)) != 0) return error.ResizeFailed;
     }
 }
 
@@ -263,6 +307,23 @@ pub fn exists(path: [*:0]const u8) bool {
     return std.c.access(path, std.c.F_OK) == 0;
 }
 extern "kernel32" fn GetFileAttributesW(lpFileName: [*:0]const u16) callconv(.winapi) u32;
+extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+
+/// 删除一个已解析的普通文件路径。控制面 lease 用它显式释放独占标记；失败必须由
+/// 调用方处理，不能把“仍被占用”静默解释成成功。
+pub fn unlinkPath(path: [*:0]const u8) error{UnlinkFailed}!void {
+    if (is_windows) {
+        var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        const u8p = std.mem.span(path);
+        const wlen = std.unicode.utf8ToUtf16Le(&wbuf, u8p) catch return error.UnlinkFailed;
+        if (wlen >= wbuf.len) return error.UnlinkFailed;
+        wbuf[wlen] = 0;
+        if (DeleteFileW(@ptrCast(&wbuf)) == 0) return error.UnlinkFailed;
+        return;
+    }
+    if (std.c.unlink(path) != 0) return error.UnlinkFailed;
+}
+extern "kernel32" fn DeleteFileW(lpFileName: [*:0]const u16) callconv(.winapi) c_int;
 
 // ── 可移植 stat（文件类型探测）─────────────────────────────────────────────
 // POSIX 文件类型位（S_IFMT 家族，macOS/Linux 值一致）。用字面量避开 `std.posix.S`
@@ -270,6 +331,90 @@ extern "kernel32" fn GetFileAttributesW(lpFileName: [*:0]const u16) callconv(.wi
 const S_IFMT: u32 = 0o170000;
 const S_IFSOCK: u32 = 0o140000;
 const S_IFLNK: u32 = 0o120000;
+
+/// Bounded lstat-style classification for pre-dispatch policy sensors. It
+/// distinguishes a proven absence from lookup failure so a caller may allow
+/// creation only for `.missing` while failing closed on ambiguous state.
+pub const PathKind = enum {
+    missing,
+    regular,
+    other,
+    unavailable,
+};
+
+pub fn pathKindNoFollow(path_z: [*:0]const u8) PathKind {
+    if (is_windows) {
+        var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        const wlen = std.unicode.utf8ToUtf16Le(&wbuf, std.mem.span(path_z)) catch
+            return .unavailable;
+        if (wlen >= wbuf.len) return .unavailable;
+        wbuf[wlen] = 0;
+        const attr = GetFileAttributesW(@ptrCast(&wbuf));
+        if (attr == 0xFFFF_FFFF) {
+            const code = GetLastError();
+            return if (code == 2 or code == 3) .missing else .unavailable;
+        }
+        // Reparse points and directories exist, but they are not regular file
+        // targets and must never be confused with a safe new-file creation.
+        if ((attr & 0x400) != 0 or (attr & 0x10) != 0) return .other;
+        return .regular;
+    } else if (builtin.os.tag == .linux) {
+        var stx: std.os.linux.Statx = undefined;
+        const AT_FDCWD: i32 = -100;
+        const rc = std.os.linux.statx(
+            AT_FDCWD,
+            path_z,
+            0x100, // AT_SYMLINK_NOFOLLOW
+            std.os.linux.STATX.BASIC_STATS,
+            &stx,
+        );
+        const signed: isize = @bitCast(rc);
+        if (signed < 0) {
+            const code: c_int = @intCast(-signed);
+            return if (code == @intFromEnum(std.c.E.NOENT) or
+                code == @intFromEnum(std.c.E.NOTDIR)) .missing else .unavailable;
+        }
+        return if ((@as(u32, stx.mode) & S_IFMT) == S_IFREG) .regular else .other;
+    } else {
+        var st: std.c.Stat = undefined;
+        if (std.c.fstatat(std.c.AT.FDCWD, path_z, &st, @as(u32, std.c.AT.SYMLINK_NOFOLLOW)) != 0) {
+            const code = std.c._errno().*;
+            return if (code == @intFromEnum(std.c.E.NOENT) or
+                code == @intFromEnum(std.c.E.NOTDIR)) .missing else .unavailable;
+        }
+        return if ((@as(u32, @intCast(st.mode)) & S_IFMT) == S_IFREG) .regular else .other;
+    }
+}
+
+test "pathKindNoFollow distinguishes missing regular directory and symlink" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const regular = try std.fmt.allocPrintSentinel(allocator, "{s}/regular", .{root}, 0);
+    defer allocator.free(regular);
+    const missing = try std.fmt.allocPrintSentinel(allocator, "{s}/missing", .{root}, 0);
+    defer allocator.free(missing);
+    const root_z = try allocator.dupeZ(u8, root);
+    defer allocator.free(root_z);
+    const fd = open(regular.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o600);
+    try std.testing.expect(fd >= 0);
+    close(fd);
+    try std.testing.expectEqual(PathKind.regular, pathKindNoFollow(regular.ptr));
+    try std.testing.expectEqual(PathKind.missing, pathKindNoFollow(missing.ptr));
+    try std.testing.expectEqual(PathKind.other, pathKindNoFollow(root_z.ptr));
+    if (is_windows) {
+        // Reparse-point coverage belongs to the native Windows gate.
+    } else {
+        const link = try std.fmt.allocPrintSentinel(allocator, "{s}/link", .{root}, 0);
+        defer allocator.free(link);
+        if (std.c.symlink(regular.ptr, link.ptr) != 0) return error.SymlinkFailed;
+        defer unlinkPath(link.ptr) catch {};
+        try std.testing.expectEqual(PathKind.other, pathKindNoFollow(link.ptr));
+    }
+}
 
 /// 取 path 的 st_mode（含 S_IFMT 类型位），无法 stat 返 null。
 /// follow=true 跟随 symlink（stat 语义），false 不跟随（lstat 语义）。
@@ -361,6 +506,12 @@ test "open/write/lseek/read/close 文件往返" {
     const n = read(fd, buf[0..]);
     try std.testing.expectEqual(@as(isize, msg.len), n); // _O_BINARY：无 CRLF 膨胀，长度精确
     try std.testing.expectEqualStrings(msg, buf[0..@intCast(n)]);
+
+    try setSize(fd, 5);
+    try std.testing.expectEqual(@as(i64, 0), lseek(fd, 0, .set));
+    const shortened = read(fd, buf[0..]);
+    try std.testing.expectEqual(@as(isize, 5), shortened);
+    try std.testing.expectEqualStrings("hello", buf[0..@intCast(shortened)]);
     close(fd);
 }
 

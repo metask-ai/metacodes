@@ -35,11 +35,14 @@ const writer_backend_mod = @import("../core/writer_backend.zig");
 const tee_backend_mod = @import("../core/tee_backend.zig");
 const diagnostics_backend_mod = @import("../core/diagnostics_backend.zig");
 const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
+const project_activation = @import("../core/project_rule_activation.zig");
 const tui_backend_mod = @import("tui/tui_backend.zig");
 const terminal_title = @import("tui/terminal_title.zig");
 const goal_mod = @import("../core/goal.zig");
 const usage_mod = @import("../core/usage.zig");
 const types_mod = @import("../types.zig");
+const dialect_mod = @import("../api/dialect.zig");
+const request_overrides = @import("../api/request_overrides.zig");
 const util_time = @import("../util/time.zig");
 const model_command = @import("model_command.zig");
 const skill_cli_adapter = @import("../skills/cli_adapter.zig");
@@ -61,6 +64,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     // any rollout can be mistaken for comparable evidence.
     var eval_runtime = try evaluation_backend_mod.RuntimeConfig.fromEnvironment(allocator);
     defer if (eval_runtime) |*runtime| runtime.deinit();
+    const eval_execution_policy = if (eval_runtime) |*runtime|
+        runtime.toolExecutionPolicy()
+    else
+        null;
 
     printStartupBanner(app);
 
@@ -406,6 +413,18 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             try handleModel(app, allocator, rest);
             continue;
         }
+        // /effort [level] —— 无参显示当前 reasoning_effort;有参切换(none|minimal|low|medium|high|xhigh)
+        if (std.mem.eql(u8, trimmed, "/effort") or std.mem.startsWith(u8, trimmed, "/effort ")) {
+            const rest = std.mem.trim(u8, trimmed[7..], " \t");
+            try handleEffort(app, allocator, rest);
+            continue;
+        }
+        // /overrides [field value | clear] —— 查看/清/单字段设方言覆盖
+        if (std.mem.eql(u8, trimmed, "/overrides") or std.mem.startsWith(u8, trimmed, "/overrides ")) {
+            const rest = std.mem.trim(u8, trimmed[10..], " \t");
+            try handleOverridesCmd(app, allocator, rest);
+            continue;
+        }
         // /resume [id] —— 无参列最近 10 个 session；有参加载
         if (std.mem.startsWith(u8, trimmed, "/resume")) {
             const rest = std.mem.trim(u8, trimmed[7..], " \t");
@@ -594,15 +613,50 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             }
         };
 
+        // Actual dispatch evidence is a product-level session artifact, not a
+        // UI projection and not an evaluation-only stream. Open and validate it
+        // before the provider can run; corruption or durability failure ends
+        // the run fail-closed.
+        const run_control: ?*project_activation.RunControl = if (app.sessionDir()) |dir|
+            try project_activation.RunControl.init(
+                allocator,
+                dir,
+                app.session_id,
+                if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
+                &app.abort,
+            )
+        else
+            null;
+        defer if (run_control) |control| control.deinit();
+        if (run_control) |control| control.requireDetachedIdle(
+            (if (app.jobs) |*jobs| jobs.runningCount() else 0) +|
+                (if (app.agent_jobs) |*jobs| jobs.runningCount() else 0),
+            app.swarm.hasTeam(),
+        ) catch |err| {
+            try control.finishRun(@errorName(err));
+            std.debug.print("\x1b[31m项目形式化规则拒绝启动本轮: {s}\x1b[0m\n", .{@errorName(err)});
+            continue;
+        };
+
         // Native evaluation events are a second decorator over the normal UI
         // (and optional diagnostics decorator). Each user submission is one
         // invocation inside the execution-grounded scenario rollout.
-        var eval_be: ?evaluation_backend_mod.EvaluationBackend = if (eval_runtime) |*runtime|
-            evaluation_backend_mod.EvaluationBackend.init(allocator, runtime.nextMetadata(
+        var eval_be: ?evaluation_backend_mod.EvaluationBackend = if (eval_runtime) |*runtime| blk: {
+            const active_provider = app.provider();
+            runtime.configureBudgetReserve(
+                active_provider.maxInputTokens(),
+                active_provider.maxTokens(),
+                app.activeModel(),
+            );
+            const evaluation = try runtime.initEvaluation(allocator, runtime.nextMetadata(
                 @tagName(app.config.provider_kind),
                 app.activeModel(),
                 @tagName(app.permission_ctx.modeValue()),
-            ))
+            ));
+            break :blk evaluation;
+        } else null;
+        const eval_request_gate = if (eval_runtime) |*runtime|
+            runtime.requestGate(&app.abort)
         else
             null;
         defer if (eval_be) |*evaluation| {
@@ -641,10 +695,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             app.provider(),
             app.tool_defs,
             &app.permission_ctx,
-            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .lsp = app.lsp_service, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .swarm = &app.swarm, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = scoped_recall, .max_turns = maxTurnsFromEnv(), .cost_budget_usd = costBudgetFromEnv(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.activeModel(), .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
+            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .request_gate = eval_request_gate, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .lsp = app.lsp_service, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .swarm = &app.swarm, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = scoped_recall, .max_turns = maxTurnsFromEnv(), .cost_budget_usd = costBudgetFromEnv(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .execution_policy = eval_execution_policy, .tool_observer = if (run_control) |control| control.observer() else null, .project_rule_gate = if (run_control) |control| control.formalGate() else null, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.activeModel(), .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
             effective_be,
             allocator,
         ) catch |err| {
+            if (run_control) |control| try control.finishRun(@errorName(err));
             // 停 watcher + 清 stdin 缓冲
             if (tui_be) |*tb| tb.stopInput();
             if (gen_region) |*r| r.leaveGenerating(app);
@@ -654,6 +709,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             std.debug.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
             continue;
         };
+        if (run_control) |control| try control.finishRun(@tagName(result.stop_reason));
         app.clearPendingModelSwitchCompact();
         accountGoalUsageAfterRun(app, usage_before, mode_before, started_ns);
         // 停 watcher + 清 stdin 缓冲（生成期间用户可能误按的键，别污染下一轮）
@@ -679,6 +735,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // footer/border/statusline 都读 app.permMode()(=ctx),工具改 ctx 即时反映,无需回同步。
         // (旧版双存储靠此 hack 补,web 侧漏了它→/state 陈旧 bug task#14;单一源后根治。)
 
+        if (app.abort.reason() == .evaluation_budget)
+            return error.EvaluationBudgetExhausted;
+
         if (result.stop_reason == .aborted) {
             std.debug.print("\x1b[33m^C (cancelled)\x1b[0m\n", .{});
             app.abort.resetForTesting();
@@ -692,10 +751,6 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             std.debug.print("\x1b[33m已达 {d} 轮上限(共 {d} 次工具调用)。任务可能未完成——这可能是合法长任务,也可能在原地打转。\x1b[0m\n", .{ result.turns, result.tool_calls });
             if (bd) |b| std.debug.print("\x1b[33m  动作分布:{s}\x1b[0m\n", .{b});
             std.debug.print("\x1b[33m直接输入你的下一步(如\"继续\")续接对话,或调整方向。\x1b[0m\n", .{});
-        }
-        // 打转熔断(零增益重复 / 连续同错):明确告知,非静默。
-        if (result.stop_reason == .tool_loop) {
-            std.debug.print("\x1b[33m检测到重复无效动作(同操作反复无信息增益,或连续同错),已中止本轮以防打转。\n调整方向后输入下一步可继续。\x1b[0m\n", .{});
         }
         // 模型 API 撞墙:带真实错误现场告知(HTTP 状态 + body 摘要),不许塌缩成猜谜文案——
         // 2026-07-12 NUL 字节 bug 排障靠抓包才看到 "Failed to parse request body" 的教训。
@@ -721,9 +776,13 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 成功才 reset 前台开新会话。顺序铁律:先 clone 再 spawn 再 reset(失败不 reset,保留对话重试)。
         if (result.stop_reason == .backgrounded) {
             app.background_request.store(false, .monotonic); // 复位信号(否则下一轮 run 立即又转后台)
-            backgroundCurrentSession(app) catch |err| {
-                std.debug.print("\x1b[31m转后台失败: {s}(对话保留前台)\x1b[0m\n", .{@errorName(err)});
-            };
+            if (run_control != null and run_control.?.project_gate != null) {
+                std.debug.print("\x1b[33m项目形式化规则已启用；当前版本拒绝把受治理 Run 转为脱离 journal 生命周期的后台任务。\x1b[0m\n", .{});
+            } else {
+                backgroundCurrentSession(app) catch |err| {
+                    std.debug.print("\x1b[31m转后台失败: {s}(对话保留前台)\x1b[0m\n", .{@errorName(err)});
+                };
+            }
         }
     }
 }
@@ -1825,6 +1884,114 @@ const INIT_PROMPT =
 ;
 
 /// /model：按分组/能力浏览模型，或切换当前 provider 内的模型。
+fn handleEffort(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
+    _ = allocator;
+    if (rest.len == 0) {
+        // 无参:显示当前
+        const cur = app.provider().reasoningEffort();
+        const cur_str = if (cur) |e| @tagName(e) else "default (none)";
+        std.debug.print("Current reasoning effort: {s}\n", .{cur_str});
+        std.debug.print("Usage: /effort <none|minimal|low|medium|high|xhigh>\n", .{});
+        return;
+    }
+    const effort = types_mod.ReasoningEffort.parse(rest) orelse {
+        std.debug.print("\x1b[31minvalid effort '{s}'. Valid: none|minimal|low|medium|high|xhigh\x1b[0m\n", .{rest});
+        return;
+    };
+    app.setReasoningEffort(effort) catch |err| {
+        std.debug.print("\x1b[31m/effort failed: {s}\x1b[0m\n", .{@errorName(err)});
+        return;
+    };
+    std.debug.print("reasoning effort set to {s}\n", .{@tagName(effort)});
+}
+
+fn handleOverridesCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
+    _ = allocator;
+    if (rest.len == 0) {
+        // 无参:显示当前所有 overrides
+        const o = app.provider().requestOverrides();
+        std.debug.print("Request overrides:\n", .{});
+        std.debug.print("  temperature: {s}\n", .{fmtOptF32(o.temperature)});
+        std.debug.print("  top_p:       {s}\n", .{fmtOptF32(o.top_p)});
+        std.debug.print("  prompt_cache_key: {s}\n", .{fmtOptStr(o.prompt_cache_key)});
+        std.debug.print("  parallel_tool_calls: {s}\n", .{fmtOptBool(o.parallel_tool_calls)});
+        const rf_str = if (o.response_format) |rf| switch (rf.kind) {
+            .json_object => "json_object",
+            .json_schema => "json_schema",
+            .none => "none",
+        } else "(none)";
+        std.debug.print("  response_format: {s}\n", .{rf_str});
+        std.debug.print("Usage: /overrides <field> <value> | clear\n", .{});
+        std.debug.print("  fields: temperature, top_p, prompt_cache_key, parallel_tool_calls, response_format\n", .{});
+        return;
+    }
+    if (std.mem.eql(u8, rest, "clear")) {
+        app.clearRequestOverrides();
+        std.debug.print("All overrides cleared.\n", .{});
+        return;
+    }
+    // /overrides <field> <value>
+    const space = std.mem.indexOfScalar(u8, rest, ' ') orelse {
+        std.debug.print("\x1b[31musage: /overrides <field> <value>\x1b[0m\n", .{});
+        return;
+    };
+    const field = rest[0..space];
+    const value = std.mem.trim(u8, rest[space + 1 ..], " \t");
+    var ov = app.provider().requestOverrides();
+    if (std.mem.eql(u8, field, "temperature")) {
+        ov.temperature = std.fmt.parseFloat(f32, value) catch {
+            std.debug.print("\x1b[31minvalid float: {s}\x1b[0m\n", .{value});
+            return;
+        };
+    } else if (std.mem.eql(u8, field, "top_p")) {
+        ov.top_p = std.fmt.parseFloat(f32, value) catch {
+            std.debug.print("\x1b[31minvalid float: {s}\x1b[0m\n", .{value});
+            return;
+        };
+    } else if (std.mem.eql(u8, field, "prompt_cache_key")) {
+        ov.prompt_cache_key = value;
+    } else if (std.mem.eql(u8, field, "parallel_tool_calls")) {
+        if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1")) {
+            ov.parallel_tool_calls = true;
+        } else if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0")) {
+            ov.parallel_tool_calls = false;
+        } else {
+            std.debug.print("\x1b[31minvalid bool: {s} (true|false)\x1b[0m\n", .{value});
+            return;
+        }
+    } else if (std.mem.eql(u8, field, "response_format")) {
+        const rf: dialect_mod.ResponseFormatRequest = if (std.mem.eql(u8, value, "json_object"))
+            .{ .kind = .json_object, .schema = null }
+        else if (std.mem.eql(u8, value, "json_schema"))
+            .{ .kind = .json_schema, .schema = null }
+        else {
+            std.debug.print("\x1b[31minvalid response_format: {s} (json_object|json_schema)\x1b[0m\n", .{value});
+            return;
+        };
+        ov.response_format = rf;
+    } else {
+        std.debug.print("\x1b[31munknown field: {s}. Valid: temperature, top_p, prompt_cache_key, parallel_tool_calls, response_format\x1b[0m\n", .{field});
+        return;
+    }
+    app.setRequestOverrides(ov) catch |err| {
+        std.debug.print("\x1b[31m/overrides failed (provider may not support dialect fields): {s}\x1b[0m\n", .{@errorName(err)});
+        return;
+    };
+    std.debug.print("{s} set to {s}\n", .{ field, value });
+}
+
+fn fmtOptF32(v: ?f32) []const u8 {
+    return if (v) |_| "(set)" else "(none)";
+}
+
+fn fmtOptStr(v: ?[]const u8) []const u8 {
+    return if (v) |s| s else "(none)";
+}
+
+fn fmtOptBool(v: ?bool) []const u8 {
+    return if (v) |b| if (b) "true" else "false" else "(none)";
+}
+
 fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
     const candidates = try model_command.collectCandidates(allocator, app.config.provider_kind, app.api_client.catalog.entries.items);
     defer allocator.free(candidates);
@@ -2204,29 +2371,29 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
     }
 
     if (std.mem.eql(u8, arg, "plan")) {
-        // P3 D3:把持久计划渲染成人类可读 markdown + **叠加进度**(✓完成/○ready/⊘阻塞)。
+        // TinyKG task graph is the sole progress source. `kg_plan_doc` is a
+        // legacy approved-plan artifact, never an authority for lifecycle.
         const inject = @import("../kg/inject.zig");
-        const doc = if (app.kg_projects_dir.len > 0) inject.readIdPointer(allocator, app.kg_projects_dir, "kg_plan_doc") else null;
-        if (doc) |doc_id| {
-            const md = kg.renderMarkdownDoc(doc_id) catch {
-                std.debug.print("(计划文档渲染失败)\n", .{});
-                return;
-            };
-            defer allocator.free(md);
-            // 取 kg_root frontier(开放步骤 + readiness)叠加进度标记。root 缺失/空 → 纯渲染。
-            // overlay 匹配按步骤文本;锚根 rows 是超集(多计划+inbox),匹配语义不变。
-            const root = inject.readIdPointer(allocator, app.kg_projects_dir, "kg_task_anchor") orelse
-                inject.readIdPointer(allocator, app.kg_projects_dir, "kg_root");
-            const rows: []@import("../kg/client.zig").FrontierRow = if (root) |r| (kg.frontier(r, 100) catch &.{}) else &.{};
-            defer {
-                // kg 内存契约:kg.allocator 释放(见 KgClient 顶注)。
-                for (rows) |*fr| fr.deinit(kg.allocator);
-                if (rows.len > 0) kg.allocator.free(rows);
+        const root = if (app.kg_projects_dir.len > 0)
+            inject.readIdPointer(allocator, app.kg_projects_dir, "kg_root")
+        else
+            null;
+        const root_id = root orelse {
+            std.debug.print("(本项目缺少 kg_root；无法从 TinyKG 生成计划投影)\n", .{});
+            return;
+        };
+        const md = @import("../kg/plan_view.zig").render(allocator, kg, root_id) catch |err| {
+            const detail = kg.detail();
+            if (detail.len > 0) {
+                std.debug.print("(TinyKG 计划投影失败:{s}: {s})\n", .{ @errorName(err), detail });
+            } else {
+                std.debug.print("(TinyKG 计划投影失败:{s})\n", .{@errorName(err)});
             }
-            printPlanWithProgress(md, rows);
-        } else {
-            std.debug.print("(本项目无持久计划文档;plan 模式批准计划后从此可见)\n", .{});
-        }
+            return;
+        };
+        defer allocator.free(md);
+        std.debug.print("{s}", .{md});
+        if (md.len == 0 or md[md.len - 1] != '\n') std.debug.print("\n", .{});
         return;
     }
 
@@ -2511,66 +2678,6 @@ fn toolCallBreakdown(app: *app_mod.App, allocator: std.mem.Allocator) ?[]u8 {
 
 const scoped_recall_mod = @import("../kg/scoped_recall.zig");
 
-/// 渲染计划 markdown + 叠加进度标记(✓完成 / ○ready / ⊘阻塞)。
-/// 步骤行(列表项 `- ` / `* ` / `N. `)按文本匹配 open frontier:命中→○/⊘,未命中→✓ 完成。
-/// 非步骤行(标题/散文)原样输出。frontier 空(全做完或无 root)→ 步骤全 ✓。
-fn printPlanWithProgress(md: []const u8, rows: []const @import("../kg/client.zig").FrontierRow) void {
-    var total: usize = 0;
-    var done: usize = 0;
-    // 第一遍:计数(供进度头)。
-    var it0 = std.mem.splitScalar(u8, md, '\n');
-    while (it0.next()) |line| {
-        if (stepContent(line) != null) total += 1;
-    }
-    var it1 = std.mem.splitScalar(u8, md, '\n');
-    while (it1.next()) |line| {
-        if (stepContent(line)) |content| {
-            // 匹配 open frontier(readiness)。v2 深遍历下 branch 行也在 frontier,
-            // "不在 frontier = 已完成"的推断对复合步骤同样成立。
-            var mark: []const u8 = "✓"; // 默认:不在 frontier = 已完成
-            for (rows) |r| {
-                if (frontierMatches(r.text, content)) {
-                    mark = if (r.role == .branch) "▹" else switch (r.readiness) {
-                        .ready => "○",
-                        .blocked => "⊘",
-                        .missing_dependencies => "…",
-                    };
-                    break;
-                }
-            }
-            if (std.mem.eql(u8, mark, "✓")) done += 1;
-            std.debug.print("  {s} {s}\n", .{ mark, content });
-        } else {
-            std.debug.print("{s}\n", .{line});
-        }
-    }
-    if (total > 0) std.debug.print("\n进度:{d}/{d} 完成\n", .{ done, total });
-}
-
-/// 若 line 是列表步骤项,返回去掉标记后的内容(trim);否则 null。
-fn stepContent(line: []const u8) ?[]const u8 {
-    const t = std.mem.trim(u8, line, " \t\r");
-    if (t.len < 2) return null;
-    // `- ` / `* ` / `+ `
-    if ((t[0] == '-' or t[0] == '*' or t[0] == '+') and t[1] == ' ') {
-        return std.mem.trim(u8, t[2..], " \t\r");
-    }
-    // `N. ` / `N) `(可多位数字)
-    var i: usize = 0;
-    while (i < t.len and t[i] >= '0' and t[i] <= '9') i += 1;
-    if (i > 0 and i + 1 < t.len and (t[i] == '.' or t[i] == ')') and t[i + 1] == ' ') {
-        return std.mem.trim(u8, t[i + 2 ..], " \t\r");
-    }
-    return null;
-}
-
-/// frontier 步骤文本 vs markdown 步骤内容是否同一步骤(首行 + 双向包含,容忍标记/截断差异)。
-fn frontierMatches(frontier_text: []const u8, md_content: []const u8) bool {
-    const ft = std.mem.trim(u8, firstLine(frontier_text), " \t\r");
-    if (ft.len == 0 or md_content.len == 0) return false;
-    return std.mem.indexOf(u8, md_content, ft) != null or std.mem.indexOf(u8, ft, md_content) != null;
-}
-
 /// 打印某个 root(kg_root/kg_inbox)的 frontier。返回是否显示了内容(供"全空"提示)。
 fn printKgRootFrontier(allocator: std.mem.Allocator, kg: anytype, projects_dir: []const u8, pointer: []const u8, label: []const u8) bool {
     const inject = @import("../kg/inject.zig");
@@ -2586,10 +2693,14 @@ fn printKgRootFrontier(allocator: std.mem.Allocator, kg: anytype, projects_dir: 
     for (rows) |r| {
         if (r.role != .branch) actionable += 1;
     }
-    std.debug.print("{s} root {d} — {d} 个开放:\n", .{ label, root, actionable });
+    std.debug.print("{s} root {d} — {d} 个未完成/失败任务:\n", .{ label, root, actionable });
     for (rows) |r| {
         // branch = 开放复合节点(等子树闭合)→ ▹;缩进按 depth 呈现树形。
-        const mark = if (r.role == .branch) "▹" else switch (r.readiness) {
+        const mark = if (r.status == .failed)
+            "✗"
+        else if (r.role == .branch)
+            "▹"
+        else switch (r.readiness) {
             .ready => "○",
             .blocked => "⊘",
             .missing_dependencies => "…",
@@ -3723,28 +3834,4 @@ test "/goal accounting delta charges only input plus output usage" {
         .cache_creation_input_tokens = 999,
     };
     try std.testing.expectEqual(@as(u64, 12), goalBudgetTokenDelta(before, after));
-}
-
-test "stepContent: 识别列表步骤项 / 跳过标题散文" {
-    // 数字列表(单/多位 + . 或 ))。
-    try std.testing.expectEqualStrings("步骤一:读代码", stepContent("1. 步骤一:读代码").?);
-    try std.testing.expectEqualStrings("第十步", stepContent("10) 第十步").?);
-    // 无序列表 - * +。
-    try std.testing.expectEqualStrings("做事", stepContent("- 做事").?);
-    try std.testing.expectEqualStrings("做事", stepContent("  * 做事").?); // 带缩进
-    // 非步骤:标题 / 散文 / 空。
-    try std.testing.expect(stepContent("# 重构计划") == null);
-    try std.testing.expect(stepContent("这是一段说明") == null);
-    try std.testing.expect(stepContent("") == null);
-    try std.testing.expect(stepContent("1.没空格不算") == null); // N. 后必须空格
-}
-
-test "frontierMatches: 首行 + 双向包含匹配同一步骤" {
-    // frontier 文本(可能多行)vs markdown 步骤内容:同一步骤应匹配。
-    try std.testing.expect(frontierMatches("步骤二:写实现", "步骤二:写实现"));
-    try std.testing.expect(frontierMatches("步骤二:写实现\n第二行细节", "步骤二:写实现")); // frontier 多行取首行
-    try std.testing.expect(frontierMatches("步骤二", "步骤二:写实现")); // frontier 是 md 的前缀
-    // 不同步骤不匹配。
-    try std.testing.expect(!frontierMatches("步骤三:测试", "步骤二:写实现"));
-    try std.testing.expect(!frontierMatches("", "步骤二"));
 }

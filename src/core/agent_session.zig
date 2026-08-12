@@ -1263,6 +1263,27 @@ pub const AgentSession = struct {
             surface.dispatcher
         else
             self.tools.dispatcher();
+
+        // 缺陷 A 修复:主 Agent 注入环境段 + 工具段 system_prompt。
+        // 环境段 cwd 用 workspace.root(非进程 cwd——Session 隔离);工具段按 enabled_tool_names 裁剪。
+        // skills/agents/kg/memory 传 null/空(Session 当前无这些配置,传 null 等价不追加)。
+        // runLoop 内分配,run 结束 free。
+        const sp_mod = @import("system_prompt.zig");
+        const sp_names = try self.allocator.alloc([]const u8, tool_definitions.len);
+        defer self.allocator.free(sp_names);
+        for (tool_definitions, 0..) |d, i| sp_names[i] = d.name;
+        const system_prompt = sp_mod.buildFull(
+            self.allocator,
+            self.model,
+            null,
+            null,
+            sp_names,
+            "",
+            false,
+            self.workspace.root,
+        ) catch null;
+        defer if (system_prompt) |sp| self.allocator.free(sp);
+
         var native_result = agent_loop.run(
             &self.conversation,
             provider_override orelse self.provider.provider(),
@@ -1293,6 +1314,7 @@ pub const AgentSession = struct {
                 .sandbox = self.workspace.sandbox(),
                 .parent_model = self.model,
                 .colorize = false,
+                .system_prompt = system_prompt,
             },
             &backend,
             self.allocator,

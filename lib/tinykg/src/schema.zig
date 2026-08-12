@@ -9,6 +9,15 @@ pub const node_descendant_fast_cap: u16 = 128;
 pub const relation_descendant_fast_cap: u16 = 64;
 pub const max_traits: u16 = 64;
 pub const max_traits_per_node: u8 = 8;
+pub const max_enum_values: u8 = 32;
+pub const max_enum_value_bytes: u8 = 63;
+
+pub const task_status_enum_values = [_][]const u8{
+    "open",
+    "claimed",
+    "completed",
+    "failed",
+};
 
 pub const md_rel_h1_id: u16 = 3000;
 pub const md_rel_h2_id: u16 = 3001;
@@ -35,16 +44,37 @@ pub const md_rel_text_chunk_id: u16 = 3023;
 /// 否则 comptime 单测(cli composition membership)红——防"新 md rel 静默漏出 search --project
 /// membership"(markdown 召回全灭 bug 的复刻)。精确集合而非区间:3006..3009 空隙不误染。
 pub const md_projection_rel_ids = [_]u16{
-    md_rel_h1_id,             md_rel_h2_id,        md_rel_h3_id,    md_rel_h4_id,
-    md_rel_h5_id,             md_rel_h6_id,        md_rel_paragraph_id, md_rel_code_block_id,
-    md_rel_image_id,          md_rel_list_id,      md_rel_blockquote_id, md_rel_html_block_id,
-    md_rel_footnote_def_id,   md_rel_link_reference_id, md_rel_thematic_break_id, md_rel_raw_block_id,
-    md_rel_table_id,          md_rel_table_row_id, md_rel_table_cell_id, md_rel_text_chunk_id,
+    md_rel_h1_id,           md_rel_h2_id,             md_rel_h3_id,             md_rel_h4_id,
+    md_rel_h5_id,           md_rel_h6_id,             md_rel_paragraph_id,      md_rel_code_block_id,
+    md_rel_image_id,        md_rel_list_id,           md_rel_blockquote_id,     md_rel_html_block_id,
+    md_rel_footnote_def_id, md_rel_link_reference_id, md_rel_thematic_break_id, md_rel_raw_block_id,
+    md_rel_table_id,        md_rel_table_row_id,      md_rel_table_cell_id,     md_rel_text_chunk_id,
+};
+
+/// Only occurrence-producing relations own their destination lifecycle.
+/// Content observations and images may be shared or referenced independently,
+/// so treating every md:* destination kind as owned would create orphan noise.
+pub const md_owner_projection_rel_ids = [_]u16{
+    md_rel_h1_id,
+    md_rel_h2_id,
+    md_rel_h3_id,
+    md_rel_h4_id,
+    md_rel_h5_id,
+    md_rel_h6_id,
+    md_rel_table_id,
+    md_rel_table_row_id,
 };
 
 /// rel 是否 md:* 投影关系(document→heading→paragraph 结构边)。
 pub fn isMdProjectionRelId(rel: u16) bool {
     inline for (md_projection_rel_ids) |id| {
+        if (rel == id) return true;
+    }
+    return false;
+}
+
+pub fn isMdOwnerProjectionRelId(rel: u16) bool {
+    inline for (md_owner_projection_rel_ids) |id| {
         if (rel == id) return true;
     }
     return false;
@@ -62,6 +92,8 @@ pub const Error = error{
     TooManyParents,
     InheritanceTooDeep,
     DescendantSetTooBroad,
+    InvalidEnumValues,
+    InvalidProfileContractVersion,
 };
 
 pub const BuiltinProfile = enum {
@@ -83,6 +115,18 @@ pub const BuiltinProfile = enum {
         };
     }
 };
+
+pub const agent_dag_profile_contract_version_legacy: u16 = 1;
+pub const agent_dag_profile_contract_version: u16 = 2;
+pub const markdown_document_profile_contract_version_legacy: u16 = 1;
+pub const markdown_document_profile_contract_version: u16 = 2;
+
+pub fn builtinProfileContractVersion(profile: BuiltinProfile) u16 {
+    return switch (profile) {
+        .agent_dag => agent_dag_profile_contract_version,
+        .markdown_document => markdown_document_profile_contract_version,
+    };
+}
 
 pub fn FixedTypeSet(comptime max_types: u16) type {
     const word_count = (@as(usize, max_types) + 63) / 64;
@@ -125,6 +169,13 @@ pub fn FixedTypeSet(comptime max_types: u16) type {
             }
         }
 
+        pub fn isSubsetOf(self: Self, other: Self) bool {
+            for (self.words, other.words) |word, other_word| {
+                if (word & ~other_word != 0) return false;
+            }
+            return true;
+        }
+
         pub fn count(self: Self) u16 {
             var total: u16 = 0;
             for (self.words) |word| {
@@ -137,6 +188,77 @@ pub fn FixedTypeSet(comptime max_types: u16) type {
 
 pub const NodeTypeSet = FixedTypeSet(max_node_types);
 pub const RelationTypeSet = FixedTypeSet(max_relation_types);
+
+pub const shared_references_source_kinds = [_]core.NodeKind{
+    .document,
+    .concept,
+    .decision,
+    .fix,
+    .verification,
+    .command,
+    .error_event,
+    .user_preference,
+    .task,
+    .observation,
+};
+
+pub const shared_references_target_kinds = [_]core.NodeKind{
+    .evidence,
+    .image,
+    .project,
+    .task,
+    .decision,
+    .verification,
+    .observation,
+    .command,
+    .concept,
+    .document,
+    .user_preference,
+};
+
+pub const shared_based_on_source_kinds = [_]core.NodeKind{
+    .concept,
+    .decision,
+    .fix,
+    .verification,
+    .command,
+    .error_event,
+    .user_preference,
+    .task,
+    .observation,
+    .document,
+};
+
+pub const shared_based_on_target_kinds = [_]core.NodeKind{
+    .evidence,
+    .task,
+    .decision,
+    .verification,
+    .observation,
+    .concept,
+    .user_preference,
+    .document,
+};
+
+fn nodeKindSet(kinds: []const core.NodeKind) !NodeTypeSet {
+    var set = NodeTypeSet.empty();
+    for (kinds) |kind| try set.insert(@intFromEnum(kind));
+    return set;
+}
+
+pub fn sharedReferencesEndpointRule() !RelationEndpointRule {
+    return .{
+        .src = try nodeKindSet(&shared_references_source_kinds),
+        .dst = try nodeKindSet(&shared_references_target_kinds),
+    };
+}
+
+pub fn sharedBasedOnEndpointRule() !RelationEndpointRule {
+    return .{
+        .src = try nodeKindSet(&shared_based_on_source_kinds),
+        .dst = try nodeKindSet(&shared_based_on_target_kinds),
+    };
+}
 
 pub const NodeTypeFilter = union(enum) {
     any,
@@ -207,7 +329,7 @@ const TypeDef = struct {
 
     fn deinit(self: *TypeDef, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
-        for (self.properties.items) |property| allocator.free(property.name);
+        for (self.properties.items) |property| deinitPropertyMeta(allocator, property);
         self.properties.deinit(allocator);
     }
 
@@ -307,6 +429,9 @@ pub const PropertyType = enum(u8) {
 pub const PropertyMeta = struct {
     name: []const u8,
     value_type: PropertyType = .string,
+    /// Closed string domain for enum properties. Empty is accepted only for
+    /// catalogs written before enum domains were persisted.
+    enum_values: []const []const u8 = &.{},
     required: bool = false,
     nullable: bool = true,
     agent_fillable: bool = false,
@@ -314,6 +439,17 @@ pub const PropertyMeta = struct {
     indexed: bool = false,
     searchable: bool = false,
     returned_by_default: bool = false,
+
+    pub fn enumAllows(self: PropertyMeta, value: []const u8) bool {
+        if (self.value_type != .@"enum") return false;
+        // Legacy v2 catalogs had an enum tag but no persisted domain. Keep
+        // those readable; newly parsed schemas require a non-empty domain.
+        if (self.enum_values.len == 0) return true;
+        for (self.enum_values) |candidate| {
+            if (std.mem.eql(u8, candidate, value)) return true;
+        }
+        return false;
+    }
 };
 
 pub const CompositionCardinality = enum(u8) {
@@ -581,14 +717,97 @@ pub const Registry = struct {
     }
 
     pub fn addBuiltinProfile(self: *Registry, profile: BuiltinProfile) !void {
+        return try self.addBuiltinProfileForSchemaVersionAndContractVersion(
+            profile,
+            3,
+            builtinProfileContractVersion(profile),
+        );
+    }
+
+    /// Build the profile contract promised by a store manifest. Schema v2
+    /// predates durable task lifecycle properties; schema v3 makes `status`
+    /// required and adds lease/timestamp fields. Storage-only compatibility
+    /// migrations must not publish the v3 contract under a v2 manifest.
+    pub fn addBuiltinProfileForSchemaVersion(self: *Registry, profile: BuiltinProfile, schema_version: u32) !void {
+        return self.addBuiltinProfileForSchemaVersionAndContractVersion(
+            profile,
+            schema_version,
+            builtinProfileContractVersion(profile),
+        );
+    }
+
+    /// Profile metadata evolves independently from persisted store schema.
+    /// Schema files may pin an older profile contract so endpoint and
+    /// composition semantics are not silently reinterpreted after upgrade.
+    pub fn addBuiltinProfileForSchemaVersionAndContractVersion(
+        self: *Registry,
+        profile: BuiltinProfile,
+        schema_version: u32,
+        profile_contract_version: u16,
+    ) !void {
+        if (schema_version < 1 or schema_version > 3) return error.InvalidSchemaVersion;
         return switch (profile) {
-            .agent_dag => self.addAgentDagProfile(),
-            .markdown_document => self.addMarkdownDocumentProfile(),
+            .agent_dag => if (profile_contract_version == agent_dag_profile_contract_version_legacy or
+                profile_contract_version == agent_dag_profile_contract_version)
+                self.addAgentDagProfile(schema_version >= 3, profile_contract_version)
+            else
+                Error.InvalidProfileContractVersion,
+            .markdown_document => if (profile_contract_version == markdown_document_profile_contract_version_legacy or
+                profile_contract_version == markdown_document_profile_contract_version)
+                self.addMarkdownDocumentProfile(profile_contract_version)
+            else
+                Error.InvalidProfileContractVersion,
         };
     }
 
-    fn addAgentDagProfile(self: *Registry) !void {
+    /// Install the canonical task lifecycle properties on an already
+    /// registered task type.  Store migrations use this narrower operation
+    /// to upgrade an embedded catalog without re-adding every agent-dag type
+    /// and relation (which may include project-specific extensions).
+    pub fn setTaskLifecycleProperties(self: *Registry) !void {
+        const task_type = @intFromEnum(core.NodeKind.task);
+        if (!self.hasNodeTypeId(task_type)) return Error.UnknownParentType;
+        try self.setNodeProperty(task_type, .{
+            .name = "status",
+            .value_type = .@"enum",
+            .enum_values = &task_status_enum_values,
+            .required = true,
+            .nullable = false,
+            .indexed = true,
+            .returned_by_default = true,
+        });
+        try self.setNodeProperty(task_type, .{
+            .name = "claimed_by",
+            .value_type = .string,
+            .required = false,
+            .nullable = true,
+            .indexed = true,
+            .returned_by_default = true,
+        });
+        try self.setNodeProperty(task_type, .{
+            .name = "claim_expires_ns",
+            .value_type = .uint,
+            .required = false,
+            .nullable = true,
+            .indexed = false,
+        });
+        inline for (.{ "task_recorded_ns", "task_created_ns", "task_completed_ns" }) |property_name| {
+            try self.setNodeProperty(task_type, .{
+                .name = property_name,
+                .value_type = .uint,
+                .required = false,
+                .nullable = true,
+                .indexed = true,
+            });
+        }
+    }
+
+    fn addAgentDagProfile(self: *Registry, include_task_lifecycle: bool, profile_contract_version: u16) !void {
         try self.addNodeType("task", @intFromEnum(core.NodeKind.task), &.{kernel_node_type_id});
+        // Lifecycle is a property, never a node-kind transition. The v3
+        // schema requires `status`; pre-v3 stores remain readable through the
+        // task compatibility path until an explicit migration materializes it.
+        if (include_task_lifecycle) try self.setTaskLifecycleProperties();
         try self.addNodeType("decision", @intFromEnum(core.NodeKind.decision), &.{kernel_node_type_id});
         try self.addNodeType("evidence", @intFromEnum(core.NodeKind.evidence), &.{kernel_node_type_id});
         try self.addNodeType("verification", @intFromEnum(core.NodeKind.verification), &.{kernel_node_type_id});
@@ -605,12 +824,35 @@ pub const Registry = struct {
         try self.addRelationTypeWithMetadata("blocks", @intFromEnum(core.RelKind.blocks), &.{kernel_edge_type_id}, .{}, .task);
         try self.addRelationTypeWithMetadata("evidences", @intFromEnum(core.RelKind.evidences), &.{kernel_edge_type_id}, .{}, .prov);
         try self.addRelationTypeWithMetadata("verified_by", @intFromEnum(core.RelKind.verified_by), &.{kernel_edge_type_id}, .{}, .prov);
-        try self.addRelationTypeWithMetadata("based_on", @intFromEnum(core.RelKind.based_on), &.{kernel_edge_type_id}, .{}, .prov);
+        const shared_provenance_contract = profile_contract_version == agent_dag_profile_contract_version;
+        const based_on_endpoint_rule = if (shared_provenance_contract)
+            try sharedBasedOnEndpointRule()
+        else
+            RelationEndpointRule{};
+        try self.addRelationTypeWithMetadata("based_on", @intFromEnum(core.RelKind.based_on), &.{kernel_edge_type_id}, based_on_endpoint_rule, .prov);
+        if (shared_provenance_contract) {
+            try self.addRelationTypeWithMetadata(
+                "references",
+                @intFromEnum(core.RelKind.references),
+                &.{kernel_edge_type_id},
+                try sharedReferencesEndpointRule(),
+                .prov,
+            );
+        }
         // derived_from:溯源关系(记忆/分类纠正的 error_event derived_from 任务)。与 resolved_by
         // 对称注册,免得 schema-aware 校验收 resolved_by 却拒 derived_from(Linus #6)。
         try self.addRelationTypeWithMetadata("derived_from", @intFromEnum(core.RelKind.derived_from), &.{kernel_edge_type_id}, .{}, .prov);
         try self.addRelationTypeWithMetadata("resolved_by", @intFromEnum(core.RelKind.resolved_by), &.{kernel_edge_type_id}, .{}, .task);
         try self.addRelationTypeWithMetadata("task_event", @intFromEnum(core.RelKind.task_event), &.{kernel_edge_type_id}, .{}, .task);
+
+        // Engine-native navigation and lifecycle relations use fixed RelKind
+        // ids and are emitted or consumed by canonical agent-memory commands.
+        // Keep them in the application profile as explicit unconstrained
+        // system relations: endpoint kinds vary by workflow, while exact
+        // name/id identity remains mandatory at write time.
+        inline for (core.native_agent_relation_kinds) |rel| {
+            try self.addRelationTypeWithMetadata(@tagName(rel), @intFromEnum(rel), &.{kernel_edge_type_id}, .{}, .sys);
+        }
 
         // 跨模块引用关系(RelationClass .ref):任务闭合投影。src 限 task,dst 松(不约束——
         // 目标可以是 concept/observation/file/symbol 等多种,宁松不错拒;裸库 add-edge 本就不校验)。
@@ -622,32 +864,50 @@ pub const Registry = struct {
         try self.addRelationTypeWithMetadata("about", @intFromEnum(core.RelKind.about), &.{kernel_edge_type_id}, .{ .src = task_src }, .ref);
     }
 
-    fn addMarkdownDocumentProfile(self: *Registry) !void {
+    fn addMarkdownDocumentProfile(self: *Registry, profile_contract_version: u16) !void {
         try self.addNodeType("document", @intFromEnum(core.NodeKind.document), &.{kernel_node_type_id});
         try self.addNodeType("document_section", @intFromEnum(core.NodeKind.document_section), &.{kernel_node_type_id});
         try self.addNodeType("image", @intFromEnum(core.NodeKind.image), &.{kernel_node_type_id});
         try self.addNodeType("media", @intFromEnum(core.NodeKind.media), &.{kernel_node_type_id});
-        try self.addMarkdownDocumentRelationTypes();
+        if (self.findNodeType("observation")) |existing_id| {
+            if (existing_id != @intFromEnum(core.NodeKind.observation)) return Error.DuplicateTypeName;
+        } else {
+            try self.addNodeType("observation", @intFromEnum(core.NodeKind.observation), &.{kernel_node_type_id});
+        }
+        try self.addMarkdownDocumentRelationTypes(profile_contract_version);
     }
 
-    fn addMarkdownDocumentRelationTypes(self: *Registry) !void {
+    fn addMarkdownDocumentRelationTypes(self: *Registry, profile_contract_version: u16) !void {
         const document_src = try markdownProjectionDocumentSourceTypes();
         const image_dst = try NodeTypeSet.singleton(@intFromEnum(core.NodeKind.image));
         const occurrence_dst = try NodeTypeSet.singleton(@intFromEnum(core.NodeKind.document_section));
         const occurrence_src = try NodeTypeSet.singleton(@intFromEnum(core.NodeKind.document_section));
-        const text_or_occurrence_dst = occurrence_dst;
+        const observation_dst = try NodeTypeSet.singleton(@intFromEnum(core.NodeKind.observation));
+        var text_or_occurrence_dst = occurrence_dst;
+        text_or_occurrence_dst.merge(observation_dst);
 
-        try self.addRelationTypeWithMetadata("contains", @intFromEnum(core.RelKind.contains), &.{kernel_edge_type_id}, .{ .src = document_src, .dst = occurrence_dst }, .sys);
+        const legacy_profile_contract = profile_contract_version == markdown_document_profile_contract_version_legacy;
+        const contains_endpoint_rule = if (legacy_profile_contract)
+            RelationEndpointRule{ .src = document_src, .dst = occurrence_dst }
+        else
+            RelationEndpointRule{};
+        try self.addRelationTypeWithMetadata("contains", @intFromEnum(core.RelKind.contains), &.{kernel_edge_type_id}, contains_endpoint_rule, .sys);
         try self.setRelationProperty(@intFromEnum(core.RelKind.contains), .{ .name = "order_key", .value_type = .uint, .required = false, .nullable = true, .indexed = true });
-        try self.setRelationComposition(@intFromEnum(core.RelKind.contains), .{ .enabled = true, .owner = true, .cardinality = .many, .ordered_by = "order_key" });
-        try self.addRelationTypeWithMetadata("precedes", @intFromEnum(core.RelKind.precedes), &.{kernel_edge_type_id}, .{ .src = occurrence_src, .dst = occurrence_dst }, .sys);
+        if (legacy_profile_contract) {
+            try self.setRelationComposition(@intFromEnum(core.RelKind.contains), .{ .enabled = true, .owner = true, .cardinality = .many, .ordered_by = "order_key" });
+        }
+        const precedes_endpoint_rule = if (legacy_profile_contract)
+            RelationEndpointRule{ .src = occurrence_src, .dst = occurrence_dst }
+        else
+            RelationEndpointRule{};
+        try self.addRelationTypeWithMetadata("precedes", @intFromEnum(core.RelKind.precedes), &.{kernel_edge_type_id}, precedes_endpoint_rule, .sys);
 
-        try self.addRelationTypeWithMetadata("md:h1", md_rel_h1_id, &.{kernel_edge_type_id}, .{ .src = document_src, .dst = text_or_occurrence_dst }, .md);
-        try self.addRelationTypeWithMetadata("md:h2", md_rel_h2_id, &.{kernel_edge_type_id}, .{ .src = document_src, .dst = text_or_occurrence_dst }, .md);
-        try self.addRelationTypeWithMetadata("md:h3", md_rel_h3_id, &.{kernel_edge_type_id}, .{ .src = document_src, .dst = text_or_occurrence_dst }, .md);
-        try self.addRelationTypeWithMetadata("md:h4", md_rel_h4_id, &.{kernel_edge_type_id}, .{ .src = document_src, .dst = text_or_occurrence_dst }, .md);
-        try self.addRelationTypeWithMetadata("md:h5", md_rel_h5_id, &.{kernel_edge_type_id}, .{ .src = document_src, .dst = text_or_occurrence_dst }, .md);
-        try self.addRelationTypeWithMetadata("md:h6", md_rel_h6_id, &.{kernel_edge_type_id}, .{ .src = document_src, .dst = text_or_occurrence_dst }, .md);
+        try self.addRelationTypeWithMetadata("md:h1", md_rel_h1_id, &.{kernel_edge_type_id}, .{ .src = document_src, .dst = occurrence_dst }, .md);
+        try self.addRelationTypeWithMetadata("md:h2", md_rel_h2_id, &.{kernel_edge_type_id}, .{ .src = document_src, .dst = occurrence_dst }, .md);
+        try self.addRelationTypeWithMetadata("md:h3", md_rel_h3_id, &.{kernel_edge_type_id}, .{ .src = document_src, .dst = occurrence_dst }, .md);
+        try self.addRelationTypeWithMetadata("md:h4", md_rel_h4_id, &.{kernel_edge_type_id}, .{ .src = document_src, .dst = occurrence_dst }, .md);
+        try self.addRelationTypeWithMetadata("md:h5", md_rel_h5_id, &.{kernel_edge_type_id}, .{ .src = document_src, .dst = occurrence_dst }, .md);
+        try self.addRelationTypeWithMetadata("md:h6", md_rel_h6_id, &.{kernel_edge_type_id}, .{ .src = document_src, .dst = occurrence_dst }, .md);
         try self.addRelationTypeWithMetadata("md:paragraph", md_rel_paragraph_id, &.{kernel_edge_type_id}, .{ .src = document_src, .dst = text_or_occurrence_dst }, .md);
         try self.addRelationTypeWithMetadata("md:code_block", md_rel_code_block_id, &.{kernel_edge_type_id}, .{ .src = document_src, .dst = text_or_occurrence_dst }, .md);
         try self.addRelationTypeWithMetadata("md:image", md_rel_image_id, &.{kernel_edge_type_id}, .{ .src = document_src, .dst = image_dst }, .md);
@@ -662,6 +922,13 @@ pub const Registry = struct {
         try self.addRelationTypeWithMetadata("md:table_row", md_rel_table_row_id, &.{kernel_edge_type_id}, .{ .src = occurrence_src, .dst = occurrence_dst }, .md);
         try self.addRelationTypeWithMetadata("md:table_cell", md_rel_table_cell_id, &.{kernel_edge_type_id}, .{ .src = occurrence_src, .dst = text_or_occurrence_dst }, .md);
         try self.addRelationTypeWithMetadata("md:text_chunk", md_rel_text_chunk_id, &.{kernel_edge_type_id}, .{ .src = occurrence_src, .dst = text_or_occurrence_dst }, .md);
+
+        if (!legacy_profile_contract) {
+            inline for (md_projection_rel_ids) |relation_id| {
+                try self.setRelationProperty(relation_id, .{ .name = "order_key", .value_type = .uint, .required = false, .nullable = true, .indexed = true });
+                try self.setRelationComposition(relation_id, .{ .enabled = true, .owner = isMdOwnerProjectionRelId(relation_id), .cardinality = .many, .ordered_by = "order_key" });
+            }
+        }
     }
 
     fn addType(self: *Registry, types: *std.ArrayList(TypeDef), comptime max_types: u16, name: []const u8, id: u16, parents: []const u16, endpoint_rule: RelationEndpointRule, relation_class: RelationClass) !void {
@@ -744,20 +1011,30 @@ pub const Registry = struct {
 
     fn setTypeProperty(self: *Registry, types: *std.ArrayList(TypeDef), lookup: *std.StringHashMap(PropertyMeta), comptime prefix: []const u8, id: u16, property: PropertyMeta) !void {
         try validatePropertyName(property.name);
+        try validatePropertyEnumValues(property);
         const type_def = findTypePtrById(types.items, id) orelse return Error.UnknownParentType;
         for (type_def.properties.items) |*existing| {
             if (!std.ascii.eqlIgnoreCase(existing.name, property.name)) continue;
-            const old_name = existing.name;
-            existing.* = property;
-            existing.name = old_name;
-            try self.putCompiledProperty(lookup, prefix, id, existing.*);
+            var canonical_property = property;
+            canonical_property.name = existing.name;
+            const owned = try clonePropertyMeta(self.allocator, canonical_property);
+            errdefer deinitPropertyMeta(self.allocator, owned);
+            const old = existing.*;
+            existing.* = owned;
+            self.putCompiledProperty(lookup, prefix, id, existing.*) catch |err| {
+                existing.* = old;
+                return err;
+            };
+            deinitPropertyMeta(self.allocator, old);
             return;
         }
-        var owned = property;
-        owned.name = try self.allocator.dupe(u8, property.name);
-        errdefer self.allocator.free(owned.name);
+        const owned = try clonePropertyMeta(self.allocator, property);
+        errdefer deinitPropertyMeta(self.allocator, owned);
         try type_def.properties.append(self.allocator, owned);
-        try self.putCompiledProperty(lookup, prefix, id, owned);
+        self.putCompiledProperty(lookup, prefix, id, owned) catch |err| {
+            _ = type_def.properties.pop();
+            return err;
+        };
     }
 
     fn putCompiledProperty(self: *Registry, lookup: *std.StringHashMap(PropertyMeta), comptime prefix: []const u8, type_id: u16, property: PropertyMeta) !void {
@@ -782,6 +1059,47 @@ const max_property_name_bytes = 128;
 
 fn validatePropertyName(name: []const u8) !void {
     if (name.len == 0 or name.len > max_property_name_bytes) return Error.InvalidPropertyName;
+}
+
+fn validatePropertyEnumValues(property: PropertyMeta) !void {
+    if (property.value_type != .@"enum") {
+        if (property.enum_values.len != 0) return Error.InvalidEnumValues;
+        return;
+    }
+    if (property.enum_values.len > max_enum_values) return Error.InvalidEnumValues;
+    for (property.enum_values, 0..) |value, index| {
+        if (value.len == 0 or value.len > max_enum_value_bytes) return Error.InvalidEnumValues;
+        for (property.enum_values[0..index]) |previous| {
+            if (std.mem.eql(u8, previous, value)) return Error.InvalidEnumValues;
+        }
+    }
+}
+
+fn clonePropertyMeta(allocator: std.mem.Allocator, property: PropertyMeta) !PropertyMeta {
+    var owned = property;
+    owned.name = try allocator.dupe(u8, property.name);
+    errdefer allocator.free(owned.name);
+    if (property.enum_values.len == 0) {
+        owned.enum_values = &.{};
+        return owned;
+    }
+    const values = try allocator.alloc([]const u8, property.enum_values.len);
+    errdefer allocator.free(values);
+    var cloned: usize = 0;
+    errdefer for (values[0..cloned]) |value| allocator.free(value);
+    for (property.enum_values, 0..) |value, index| {
+        values[index] = try allocator.dupe(u8, value);
+        cloned += 1;
+    }
+    owned.enum_values = values;
+    return owned;
+}
+
+fn deinitPropertyMeta(allocator: std.mem.Allocator, property: PropertyMeta) void {
+    allocator.free(property.name);
+    if (property.enum_values.len == 0) return;
+    for (property.enum_values) |value| allocator.free(value);
+    allocator.free(property.enum_values);
 }
 
 fn typeInfo(type_def: *const TypeDef) TypeInfo {
@@ -1064,10 +1382,19 @@ test "schema kernel is clean and builtin profiles are explicit" {
 
     try registry.addBuiltinProfile(.agent_dag);
     try std.testing.expectEqual(RelationClass.prov, registry.relationClassById(@intFromEnum(core.RelKind.based_on)).?);
+    try std.testing.expectEqual(RelationClass.prov, registry.relationClassById(@intFromEnum(core.RelKind.references)).?);
     try std.testing.expectEqual(RelationClass.task, registry.relationClassById(@intFromEnum(core.RelKind.depends_on)).?);
     try std.testing.expect(registry.findNodeType("task") != null);
     try std.testing.expect(registry.findNodeType("user_preference") == null);
     try std.testing.expect(registry.findRelationType("governs") == null);
+    try std.testing.expectEqual(
+        try sharedReferencesEndpointRule(),
+        registry.relationEndpointRuleById(@intFromEnum(core.RelKind.references)).?,
+    );
+    try std.testing.expectEqual(
+        try sharedBasedOnEndpointRule(),
+        registry.relationEndpointRuleById(@intFromEnum(core.RelKind.based_on)).?,
+    );
     // 跨模块引用关系(.ref):acts_on/uses/produces/about 注册 + 归 .ref 类。
     try std.testing.expect(registry.findRelationType("acts_on") != null);
     try std.testing.expect(registry.findRelationType("uses") != null);
@@ -1075,6 +1402,18 @@ test "schema kernel is clean and builtin profiles are explicit" {
     try std.testing.expect(registry.findRelationType("about") != null);
     try std.testing.expectEqual(RelationClass.ref, registry.relationClassById(@intFromEnum(core.RelKind.acts_on)).?);
     try std.testing.expectEqual(RelationClass.ref, registry.relationClassById(@intFromEnum(core.RelKind.produces)).?);
+    // Engine-native lifecycle/navigation relations are part of the canonical
+    // agent contract.  Governance and schema-aware writes must not have to
+    // treat fixed core ids as unknown merely because the profile omitted them.
+    inline for (.{
+        .{ "related_to", core.RelKind.related_to },
+        .{ "deprecated_by", core.RelKind.deprecated_by },
+        .{ "merged_into", core.RelKind.merged_into },
+    }) |entry| {
+        try std.testing.expectEqual(@intFromEnum(entry.@"1"), registry.findRelationType(entry.@"0").?);
+        try std.testing.expectEqual(RelationClass.sys, registry.relationClassById(@intFromEnum(entry.@"1")).?);
+        try std.testing.expect((registry.relationEndpointRuleById(@intFromEnum(entry.@"1")).?).isEmpty());
+    }
     // concept 现在随 agent-dag 注册(ref 边的 dst 目标类型)。
     try std.testing.expect(registry.findNodeType("concept") != null);
     // acts_on endpoint:src 限 task(dst 松 = null 不约束)。
@@ -1092,6 +1431,173 @@ test "schema kernel is clean and builtin profiles are explicit" {
     const info = registry.relationTypeInfo(registry.relationTypeCount() - 1).?;
     try std.testing.expectEqual(@as(u16, 3500), info.id);
     try std.testing.expectEqual(RelationClass.md, info.class);
+}
+
+test "agent DAG profile v2 governs shared provenance and markerless v1 stays compatible" {
+    var current = Registry.init(std.testing.allocator);
+    defer current.deinit();
+    try current.addDefaultTypes();
+    try current.addBuiltinProfileForSchemaVersionAndContractVersion(
+        .agent_dag,
+        3,
+        agent_dag_profile_contract_version,
+    );
+    try std.testing.expectEqual(
+        try sharedReferencesEndpointRule(),
+        current.relationEndpointRuleById(@intFromEnum(core.RelKind.references)).?,
+    );
+    try std.testing.expectEqual(
+        try sharedBasedOnEndpointRule(),
+        current.relationEndpointRuleById(@intFromEnum(core.RelKind.based_on)).?,
+    );
+
+    var legacy = Registry.init(std.testing.allocator);
+    defer legacy.deinit();
+    try legacy.addDefaultTypes();
+    try legacy.addBuiltinProfileForSchemaVersionAndContractVersion(
+        .agent_dag,
+        3,
+        agent_dag_profile_contract_version_legacy,
+    );
+    try std.testing.expect(legacy.findRelationType("references") == null);
+    try std.testing.expect((legacy.relationEndpointRuleById(@intFromEnum(core.RelKind.based_on)) orelse unreachable).isEmpty());
+
+    var invalid = Registry.init(std.testing.allocator);
+    defer invalid.deinit();
+    try invalid.addDefaultTypes();
+    try std.testing.expectError(
+        Error.InvalidProfileContractVersion,
+        invalid.addBuiltinProfileForSchemaVersionAndContractVersion(.agent_dag, 3, 99),
+    );
+}
+
+test "markdown profile contract v2 governs projections and preserves markerless v1 shared relation semantics" {
+    var current = Registry.init(std.testing.allocator);
+    defer current.deinit();
+    try current.addDefaultTypes();
+    try current.addBuiltinProfile(.markdown_document);
+
+    const contains_id = @intFromEnum(core.RelKind.contains);
+    const precedes_id = @intFromEnum(core.RelKind.precedes);
+    try std.testing.expect((current.relationEndpointRuleById(contains_id) orelse unreachable).isEmpty());
+    try std.testing.expect(current.relationCompositionById(contains_id) == null);
+    try std.testing.expect((current.relationEndpointRuleById(precedes_id) orelse unreachable).isEmpty());
+    try std.testing.expect(current.relationPropertyByTypeId(contains_id, "order_key") != null);
+    inline for (md_projection_rel_ids) |relation_id| {
+        const composition = current.relationCompositionById(relation_id) orelse return error.TestExpectedEqual;
+        try std.testing.expect(composition.enabled);
+        try std.testing.expectEqual(isMdOwnerProjectionRelId(relation_id), composition.owner);
+        try std.testing.expectEqual(CompositionCardinality.many, composition.cardinality);
+        try std.testing.expectEqualStrings("order_key", composition.ordered_by.?);
+        try std.testing.expectEqual(PropertyType.uint, current.relationPropertyByTypeId(relation_id, "order_key").?.value_type);
+    }
+
+    var legacy = Registry.init(std.testing.allocator);
+    defer legacy.deinit();
+    try legacy.addDefaultTypes();
+    try legacy.addBuiltinProfileForSchemaVersionAndContractVersion(
+        .markdown_document,
+        3,
+        markdown_document_profile_contract_version_legacy,
+    );
+    const legacy_rule = legacy.relationEndpointRuleById(contains_id) orelse unreachable;
+    try std.testing.expect(legacy_rule.src != null);
+    try std.testing.expect(legacy_rule.dst != null);
+    const legacy_precedes_rule = legacy.relationEndpointRuleById(precedes_id) orelse unreachable;
+    try std.testing.expect(legacy_precedes_rule.src != null);
+    try std.testing.expect(legacy_precedes_rule.dst != null);
+    try std.testing.expectEqual(@as(u16, 1), legacy_precedes_rule.src.?.count());
+    try std.testing.expectEqual(@as(u16, 1), legacy_precedes_rule.dst.?.count());
+    try std.testing.expect(legacy_precedes_rule.src.?.containsNodeKind(.document_section));
+    try std.testing.expect(legacy_precedes_rule.dst.?.containsNodeKind(.document_section));
+    try std.testing.expect((legacy.relationCompositionById(contains_id) orelse unreachable).enabled);
+    inline for (md_projection_rel_ids) |relation_id| {
+        try std.testing.expect(legacy.relationCompositionById(relation_id) == null);
+    }
+
+    var invalid = Registry.init(std.testing.allocator);
+    defer invalid.deinit();
+    try invalid.addDefaultTypes();
+    try std.testing.expectError(
+        Error.InvalidProfileContractVersion,
+        invalid.addBuiltinProfileForSchemaVersionAndContractVersion(.markdown_document, 3, 99),
+    );
+}
+
+test "agent dag task schema exposes lifecycle properties without changing kind" {
+    var registry = Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.addDefaultTypes();
+    try registry.addBuiltinProfile(.agent_dag);
+
+    const task_type = @intFromEnum(core.NodeKind.task);
+    const status = registry.nodePropertyByTypeId(task_type, "status").?;
+    try std.testing.expectEqual(PropertyType.@"enum", status.value_type);
+    try std.testing.expect(status.indexed);
+    try std.testing.expect(status.returned_by_default);
+    try std.testing.expect(status.required);
+    try std.testing.expectEqual(task_status_enum_values.len, status.enum_values.len);
+    for (&task_status_enum_values, status.enum_values) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+    try std.testing.expect(status.enumAllows("open"));
+    try std.testing.expect(status.enumAllows("failed"));
+    try std.testing.expect(!status.enumAllows("done-ish"));
+    try std.testing.expectEqual(PropertyType.string, registry.nodePropertyByTypeId(task_type, "claimed_by").?.value_type);
+    try std.testing.expectEqual(PropertyType.uint, registry.nodePropertyByTypeId(task_type, "claim_expires_ns").?.value_type);
+    try std.testing.expectEqual(PropertyType.uint, registry.nodePropertyByTypeId(task_type, "task_completed_ns").?.value_type);
+}
+
+test "schema enum domains are owned inherited and validated" {
+    var registry = Registry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registry.addNodeType("Workflow", 100, &.{});
+    try registry.setNodeProperty(100, .{
+        .name = "state",
+        .value_type = .@"enum",
+        .enum_values = &.{ "draft", "published" },
+    });
+    try registry.addNodeType("Article", 101, &.{100});
+
+    const inherited = registry.nodePropertyByTypeId(101, "state").?;
+    try std.testing.expect(inherited.enumAllows("draft"));
+    try std.testing.expect(!inherited.enumAllows("deleted"));
+    try std.testing.expectError(Error.InvalidEnumValues, registry.setNodeProperty(100, .{
+        .name = "bad",
+        .value_type = .string,
+        .enum_values = &.{"unexpected"},
+    }));
+    try std.testing.expectError(Error.InvalidEnumValues, registry.setNodeProperty(100, .{
+        .name = "duplicate",
+        .value_type = .@"enum",
+        .enum_values = &.{ "same", "same" },
+    }));
+}
+
+test "case-insensitive property replacement preserves canonical lookup ownership" {
+    var registry = Registry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registry.addNodeType("Workflow", 100, &.{});
+    try registry.setNodeProperty(100, .{
+        .name = "State",
+        .value_type = .@"enum",
+        .enum_values = &.{"draft"},
+    });
+    const property_count = registry.nodePropertyCount(100);
+    try registry.setNodeProperty(100, .{
+        .name = "state",
+        .value_type = .@"enum",
+        .enum_values = &.{"published"},
+    });
+
+    try std.testing.expectEqual(property_count, registry.nodePropertyCount(100));
+    const state = registry.nodePropertyByTypeId(100, "State").?;
+    try std.testing.expectEqualStrings("State", state.name);
+    try std.testing.expect(state.enumAllows("published"));
+    try std.testing.expect(!state.enumAllows("draft"));
+    try std.testing.expect(registry.nodePropertyByTypeId(100, "state") == null);
 }
 
 test "schema filters preserve single-type fast path and support descendant sets" {

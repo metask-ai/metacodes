@@ -1,0 +1,52 @@
+//! TinyKG 无向量检索的模型侧 semantic-neighborhood 协议。
+//!
+//! TinyKG 只负责确定性的 BM25/图检索；LLM 负责按意图生成少量分离的词法探针、
+//! 合并候选并验证节点/证据。协议同时接到 system prompt、工具 schema、自动召回提醒
+//! 和工具结果，避免不同 agent 入口退化成单条裸 query 或一个超大关键词袋。
+
+/// system prompt 中的强制协议。“语义邻域”是模型主动推理，不暗示底层计算向量距离。
+pub const SYSTEM_RULES =
+    \\Lexical retrieval algorithm (mandatory whenever KgRecall is warranted; follow in order):
+    \\- TinyKG uses lexical BM25 and computes no embeddings or vector distance. A lexical miss is not proof that the knowledge is absent; BM25 hits are candidates, not facts.
+    \\- Step 1 — SCAN FIRST: inspect any automatically recalled memory lines before forming a query. Track node_id values returned under each fixed lexical plan; do not invent, omit, or carry ids from a different plan.
+    \\- Step 2A — ALIAS BRANCH HAS PRIORITY: if an automatic hit contains an exact canonical alias or code symbol, the first explicit query MUST contain only that exact term plus field names already requested by the user, and MUST omit `type`. This focused alias lookup is the high-precision fast path; do not widen before reading it.
+    \\- Step 2B — EXACT/HIGH-PRECISION SEED: if no alias was exposed, first issue one compact, untyped KgRecall using the user's exact wording and discriminating field names. Do not mix speculative semantic variants into this seed.
+    \\- Step 2C — RECORD THE PLAN: in normal agent use, attach `lexical_plan` with schema_version lexical-query-plan-v1 to every KgRecall. A seed plan has exactly one exact/alias variant. If the seed is insufficient, begin a new expansion plan with an empty seen_node_ids list, fix one list of 2-4 typed non-exact variants, reuse that identical list on each later call, select one variant_index at a time, and carry forward exactly the up-to-32 deduplicated node ids returned under that fixed plan. The run-scoped host ledger rejects invented, omitted, cross-plan, or stale ids before search and returns a stable plan_sha256 plus host-measured new/repeated hit counts. Query-only calls remain a compatibility path, not the governed default.
+    \\- Step 3 — BOUNDED SEMANTIC NEIGHBORHOOD: only if the seed is insufficient, infer 2-4 separate compact semantic variants for this specific intent. Fix that list once; make at most four semantic-variant calls, and never regenerate another batch. Each KgRecall contains ONE variant, not a combined keyword bag. Choose useful dimensions rather than mechanically using all of them: (a) synonym/paraphrase; (b) Chinese/English form, abbreviation, old/new name, or code identifier; (c) mechanism, symptom, desired outcome, or nearby implementation term; (d) one plausible broader or narrower concept. Run variants in stages and reassess after each result.
+    \\- Step 4 — MERGE AND VERIFY: semantically judge hits. Deduplicate candidates by node_id across every call. Memory is a candidate, not a current fact. Prefer exact aliases and authoritative nodes, but never treat score or wording overlap as correctness. Call KgContext on the best seed to read its authoritative node text and bounded graph neighborhood.
+    \\- Step 5 — GOVERN EVIDENCE AND FRESHNESS: inspect verified_by or evidences links, provenance, and any deprecated_by, resolved_by, and contradiction signal exposed by KgContext. A current-generation node with connected evidence is still only a candidate: TinyKG has no universal freshness clock. If evidence is missing, the graph is truncated, the node is superseded/conflicted, or the claim is time-sensitive, do not use memory as a current fact; verify it against current code, git, tests, or external state.
+    \\- Step 6 — STOP OR REPORT UNCERTAINTY: Stop as soon as authoritative evidence and any required current-state check are sufficient. If the bounded variants and graph inspection remain insufficient, say so; do not infer absence from lexical misses and do not invent a fact.
+;
+
+pub const TOOL_DESCRIPTION =
+    "Search the knowledge graph for durable memories (decisions, preferences, project facts) from this and past sessions. " ++
+    "Use when the user refers to prior decisions/context or when continuing cross-session work. Retrieval is LEXICAL BM25: TinyKG has no embeddings and computes no vector distance. Start exact, then if needed issue 2-4 separate compact semantic variants and judge them yourself; never combine the whole neighborhood into one keyword bag. " ++
+    "Attach lexical_plan (lexical-query-plan-v1) so the chosen intent, fixed variants, selected index, host-verified seen IDs, and information gain are replayable. " ++
+    "Deduplicate node_id values across calls, then use KgContext to read authoritative node text and structured evidence/freshness/supersession signals. Memory hits are candidates, never automatically current facts. Hits carrying a \"source\" field come from a memory markdown file; update that file instead of KgRemembering a duplicate.";
+
+pub const QUERY_DESCRIPTION =
+    "FIRST inspect automatic recall. If it exposed an exact canonical alias/code symbol, this query MUST contain ONLY that exact term plus user-requested field names; OMIT type. Otherwise begin with one compact exact/high-precision query using user wording. If that is insufficient, fix a list of 2-4 separate variants once and put ONE compact semantic variant in each later call (at most four variant calls): a synonym/paraphrase; Chinese/English, abbreviation, old/new name, or code identifier; a mechanism/symptom/outcome/nearby implementation term; or one plausible broader or narrower concept. Choose only intent-relevant dimensions. Do not combine all variants into one keyword bag or regenerate another batch. When lexical_plan is present, query must exactly equal variants[variant_index].text. Reassess after each call, deduplicate node_id values across calls, and stop when authoritative evidence is sufficient. A lexical miss does not prove absence.";
+
+pub const PLAN_DESCRIPTION =
+    "Governed, machine-observable lexical-query-plan-v1 artifact. Use it in normal agent calls. Seed: one exact/alias variant, index 0, no type filter. Expansion: after an insufficient seed, start with empty seen_node_ids, freeze 2-4 typed non-exact variants, and repeat the identical list while advancing variant_index one call at a time. On later calls carry exactly the deduplicated prior node IDs returned under that same fixed plan; invented, omitted, stale, or cross-plan IDs are rejected before search. The run-scoped host ledger, not the model declaration, measures new vs repeated hits. This records the LLM's semantic choices; TinyKG still performs lexical BM25 only.";
+
+pub const TYPE_DESCRIPTION =
+    "Optional facet filter: decision | user_preference | module | bug | observation. Omit on the exact/high-precision seed because a bridge to the final decision may itself be an observation or module. Use only on a later focused call when an earlier untyped hit explicitly justifies the facet.";
+
+pub const CONTEXT_DESCRIPTION =
+    "Read one TinyKG candidate's authoritative node text, bounded local graph neighborhood, and structured knowledge_governance signals. Use after KgRecall to verify the selected node; inspect verified_by/evidences provenance plus deprecated_by/resolved_by/contradiction signals. Page long node text with text_offset/text_limit; call KgContext on important connected evidence nodes before relying on them. Time-sensitive claims still require current code/git/test/external-state verification. This is deterministic graph traversal, not semantic or vector search.";
+
+pub const CONTEXT_RESULT_GUIDANCE =
+    "Inspect connected evidence nodes with KgContext when they support the conclusion. Verify authoritative text, track node_id values already inspected, and follow only relevant edges. Treat knowledge_governance as a fail-closed status: if evidence is missing, graph_truncated is true, current_generation is false, or contradiction signals exist, do not use memory as a current fact. Even evidence_connected_candidate has unknown freshness; verify time-sensitive claims against current code, git, tests, or external state. A graph edge alone does not prove the neighboring text is applicable.";
+
+/// 自动召回使用原始 user 文本，未经过 LLM 扩词；明确说明它不是权威缺席判断。
+pub const AUTO_RECALL_NOTE =
+    "This automatic recall was one untyped raw-message lexical BM25 probe (no LLM expansion, no embeddings). Every line is a candidate, not a current fact, and carries a stable node_id for KgContext(node_id). Treat absence or partial coverage as non-authoritative. If a hit exposes an exact canonical alias/symbol, use it directly in one focused untyped KgRecall with only user-requested field names. Otherwise begin with one compact exact/high-precision query; only if it is insufficient should you try 2-4 separate compact semantic variants.";
+
+/// 放在自动命中之后：让模型在决策点最后读到下一步，而非被 hit 正文冲淡。
+pub const AUTO_RECALL_NEXT_ACTION =
+    "强制下一步 / MANDATORY NEXT ACTION: 先检查上面的命中。只要任一命中给出 canonical alias 或代码符号，下一次 KgRecall 就必须是无 type 的聚焦查询，且只能包含该精确词和用户已要求的字段名。否则先做一个精确/高精度查询；仅在不足时生成 2-4 个彼此分开的紧凑语义变体，按意图选近义改写、中英/缩写/旧名、机制、症状、期望结果、邻近实现或一个合理的上下位概念，每次只查一个变体。跨调用按 node_id 去重，随后用 KgContext 读取最佳节点及相连证据。";
+
+/// 每次 KgRecall 结果都携带：把下一步决策放在使用时点，而非只依赖 system prompt。
+pub const RESULT_GUIDANCE =
+    "Semantically judge these lexical candidates and deduplicate node_id values across calls. If an exact alias was exposed, use one focused untyped KgRecall containing only that alias and requested fields. Otherwise, if evidence is still insufficient, issue 2-4 separate compact variants one at a time (paraphrase/alias, mechanism or symptom or outcome or nearby implementation, or one broader/narrower concept); never merge them into one keyword bag. Use KgContext on the best candidate to read authoritative text and knowledge_governance signals. Never promote a hit to a current fact without evidence/freshness/supersession checks; lexical misses do not prove absence.";

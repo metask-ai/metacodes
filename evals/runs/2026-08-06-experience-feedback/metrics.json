@@ -1,0 +1,74 @@
+{
+  "schema_version": "metacodes-experience-feedback-evidence-v1",
+  "recorded_at": "2026-08-06T16:15:12+08:00",
+  "purpose": "Mechanism evidence for verified TinyKG execution history entering the next long-horizon agent decision before work",
+  "environment": {
+    "host": "Darwin 25.5.0 arm64",
+    "zig": "0.16.0",
+    "repository_head_before_changes": "c37181beb1f90b8850333911bf6acd8ea1fc47ed",
+    "tinykg_source_commit": "93d89bcd4d0208c994da3632fb6166efffcc86e7",
+    "verification_context": "clean clone with only the staged experience-feedback patch"
+  },
+  "command": "METACODES_PRINT_EXPERIENCE_METRICS=1 zig build test:kg-experience-feedback -j2 --summary all",
+  "fixture": {
+    "query_task": "diagnose parser checkpoint recovery regression",
+    "verified_completed_task": "repair parser checkpoint recovery corruption",
+    "unfinished_decoy": "parser checkpoint recovery unfinished decoy",
+    "mixed_kind_exact_decision_decoy": "diagnose parser checkpoint recovery regression",
+    "associations": [
+      "acts_on:src/parser_checkpoint.zig:tentative",
+      "uses:checkpoint-replay:tentative",
+      "produces:verified-parser-recovery-playbook:confirmed"
+    ]
+  },
+  "packet_observation": {
+    "search_hits": 4,
+    "task_candidates": 4,
+    "accepted_tasks": 1,
+    "accepted_associations": 3,
+    "accepted_tentative": 2,
+    "accepted_confirmed": 1,
+    "rejected_not_completed": 2,
+    "subprocess_calls_lower_bound": 9,
+    "subprocess_calls_upper_bound": 36,
+    "subprocess_count_exact": false,
+    "retrieval_elapsed_ms": 58,
+    "packet_bytes": 2150
+  },
+  "snapshot_consistency": "multi_read_reverify_required",
+  "delivery_observation": {
+    "provider_requests": 2,
+    "prior_history_absent_from_first_request": true,
+    "experience_packet_present_in_second_request": true,
+    "verified_task_text_present_in_second_request": true,
+    "semantic_expansion_contract_present_in_request": true
+  },
+  "formal_gate": {
+    "rule_id": "ontology.experience-feedback.l2",
+    "obligations": [
+      "bounded_task_only_exact_retrieval",
+      "lifecycle_evidence_state_gate",
+      "pre_work_tool_result_actuator",
+      "lexical_semantic_expansion_contract",
+      "focused_l2_feedback"
+    ],
+    "latest_decision": "admit_release",
+    "observation_stable_during_feedback": true
+  },
+  "integrity_constraints": [
+    "TinyKG kind=task filtering occurs before result-window truncation",
+    "Only current completed tasks with current verification evidence are eligible",
+    "Tentative and confirmed association states remain distinct",
+    "Retrieved task text and labels are untrusted candidate data, never instructions",
+    "A lexical miss is not treated as proof of absence",
+    "An insufficient exact probe requires 2-4 separate LLM-generated semantic variants before work"
+  ],
+  "limitations": [
+    "This is mechanism and delivery evidence, not evidence that the model selected a better action or improved task outcome",
+    "The deterministic fixture contains one accepted completed task and is not a recall-quality benchmark",
+    "Subprocess count is conservatively bracketed because KgClient retries and project/global lookup caches are internal",
+    "Task packet, neighbor state, and target labels are bounded separate reads rather than one atomic TinyKG snapshot; every accepted item remains candidate-only and requires current-state verification",
+    "The retrieval latency is a single warm-artifact observation and must not be generalized as a distribution",
+    "Adoption, rejection reasons, tool choice, rework, and outcome lift require controlled GLM-5.2 rollouts"
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "schema_version": 2,
+  "program_id": "metacodes-long-horizon-pk-v2",
+  "experiment_id": "metacodes-long-horizon-three-arm-calibration-v2",
+  "stage": {"id": "calibration", "purpose": "infrastructure_calibration", "scoring": "non_confirmatory"},
+  "suite": "evals/suites/long-horizon-calibration.json",
+  "model": {"provider": "anthropic", "id": "glm-5.2"},
+  "trials": 6,
+  "arms": [
+    {"id": "codex_style", "treatment": {"transcript": true, "compact_summary": true, "memory_markdown": false, "tinykg": false, "task_dag": false, "formal_audit": false, "swarm": false}},
+    {"id": "claude_style", "treatment": {"transcript": true, "compact_summary": true, "memory_markdown": true, "tinykg": false, "task_dag": false, "formal_audit": false, "swarm": false}},
+    {"id": "tinykg", "treatment": {"transcript": true, "compact_summary": true, "memory_markdown": true, "tinykg": true, "task_dag": true, "formal_audit": true, "swarm": false}}
+  ],
+  "common_runtime": {"agent_teams": false, "forced_compact_at_tokens": 128, "forced_compact_keep_recent": 2, "max_turns": 80},
+  "schedule": {"kind": "balanced_williams", "complete_blocks_only": true, "task_order": "sorted"},
+  "grading": {"blind": true, "arm_identity_visible_to_grader": false},
+  "invalid_policy": {"exclude_from_scoring": true, "abort_after_invalid": true},
+  "budget": {"max_rollout_cost_usd": 2.0, "max_rollout_tokens": 1200000, "max_stage_cost_usd": 100.0, "max_stage_tokens": 25000000, "max_aggregate_cost_usd": 1000.0, "max_aggregate_tokens": 90000000, "paid_rollouts_enabled": true},
+  "promotion": {"requires_receipt": false, "source_experiment_id": null, "source_experiment": null, "source_experiment_fingerprint": null, "gate": {"required_valid_rollouts": 18, "max_invalid_rollouts": 0, "require_complete_schedule": true, "require_cost_telemetry": true, "require_token_telemetry": true}},
+  "stop_rules": {"on_budget_reached": "stop_before_next_rollout", "on_invalid_rollout": "checkpoint_then_abort", "on_infrastructure_failure": "mark_invalid_then_abort"}
+}

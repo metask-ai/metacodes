@@ -49,6 +49,9 @@ pub const CaptureOpts = struct {
     abort_poll: ?*const fn (?*const anyopaque) bool = null,
     tick_ctx: ?*const anyopaque = null,
     tick_cb: ?*const fn (?*const anyopaque, elapsed_ms: u64, label: []const u8) void = null,
+    /// 非 null → 子进程在 spawn 时 chdir 到此目录(仅影响子进程,父进程 cwd 不变)。
+    /// null → 继承父进程 cwd。借用切片,spawn 时消费,不持有。
+    cwd: ?[]const u8 = null,
 };
 
 pub const Captured = struct {
@@ -212,12 +215,12 @@ pub const PipeChild = struct {
 };
 
 /// spawn 长连接子进程，返回持久 stdin(父写)/stdout(父读) 端点。stderr 丢弃（→null/NUL）。
-pub fn spawnPipes(argv: []const ?[*:0]const u8, inherit_env: bool) CaptureError!PipeChild {
-    if (is_windows) return spawnPipesWindows(argv);
-    return spawnPipesPosix(argv, inherit_env);
+pub fn spawnPipes(argv: []const ?[*:0]const u8, inherit_env: bool, cwd: ?[]const u8) CaptureError!PipeChild {
+    if (is_windows) return spawnPipesWindows(argv, cwd);
+    return spawnPipesPosix(argv, inherit_env, cwd);
 }
 
-fn spawnPipesPosix(argv: []const ?[*:0]const u8, inherit_env: bool) CaptureError!PipeChild {
+fn spawnPipesPosix(argv: []const ?[*:0]const u8, inherit_env: bool, cwd: ?[]const u8) CaptureError!PipeChild {
     var in_pipe: [2]std.c.fd_t = undefined; // 父写 → 子读
     var out_pipe: [2]std.c.fd_t = undefined; // 子写 → 父读
     if (std.c.pipe(&in_pipe) != 0) return error.PipeFailed;
@@ -247,6 +250,8 @@ fn spawnPipesPosix(argv: []const ?[*:0]const u8, inherit_env: bool) CaptureError
             _ = std.c.dup2(devnull, 2);
             if (devnull != 2) _ = std.c.close(devnull);
         }
+        // 缺陷 B 修复:子进程 chdir。
+        if (!chdirChild(cwd)) std.c._exit(127);
         const argv0 = argv[0] orelse std.c._exit(127);
         const envp: [*:null]const ?[*:0]const u8 = if (inherit_env) @ptrCast(std.c.environ) else &.{null};
         _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), envp);
@@ -258,13 +263,16 @@ fn spawnPipesPosix(argv: []const ?[*:0]const u8, inherit_env: bool) CaptureError
     return .{ .proc = pid, .stdin_h = in_pipe[1], .stdout_h = out_pipe[0] };
 }
 
-fn spawnPipesWindows(argv: []const ?[*:0]const u8) CaptureError!PipeChild {
+fn spawnPipesWindows(argv: []const ?[*:0]const u8, cwd: ?[]const u8) CaptureError!PipeChild {
     // cmdline 在建任何可继承句柄**之前**构造(review-2 F1):它可失败(argv 含非法
     // UTF-8 即可,非只 OOM),若在句柄之后 early-return 会把可继承写端永久泄漏——
     // 之后任何 bInheritHandles spawn 都会把它塞给不相干子进程,capture 永不 EOF。
     const a = std.heap.page_allocator;
     const cmdline = buildWindowsCmdline(a, argv) catch return error.SpawnFailed;
     defer a.free(cmdline);
+    // 缺陷 B 修复:cwd 转 UTF-16(Windows CreateProcessW 第 8 参数 lpCurrentDirectory)。
+    const cwd_w: ?[:0]u16 = if (cwd) |c| (std.unicode.utf8ToUtf16LeAllocZ(a, c) catch return error.SpawnFailed) else null;
+    defer if (cwd_w) |w| a.free(w);
     // 可继承句柄窗口期串行(见 g_spawn_serial)。
     g_spawn_serial.lock();
     var spawn_locked = true;
@@ -288,7 +296,8 @@ fn spawnPipesWindows(argv: []const ?[*:0]const u8) CaptureError!PipeChild {
     si.hStdOutput = out_wr;
     si.hStdError = null;
     var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
-    const created = win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{}, null, null, &si, &pi);
+    const cwd_ptr: ?[*:0]u16 = if (cwd_w) |w| w.ptr else null;
+    const created = win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{}, null, cwd_ptr, &si, &pi);
     win.CloseHandle(in_rd); // 父端关子进程侧
     win.CloseHandle(out_wr);
     g_spawn_serial.unlock(); // 可继承句柄的父端副本已全关
@@ -324,7 +333,8 @@ pub fn currentPid() i32 {
 /// spawn 后台子进程，stdout→out_fd、stderr→err_fd（已 open 的文件 fd），返回进程句柄。
 /// POSIX：fork+setpgid+dup2+execve；Windows：_get_osfhandle+CreateProcessW(CREATE_NO_WINDOW)。
 /// inherit_env=true（bg job 需 PATH 等）。argv 须 null 结尾。
-pub fn spawnToFiles(argv: []const ?[*:0]const u8, out_fd: c_int, err_fd: c_int) CaptureError!ProcHandle {
+/// cwd 非 null → 子进程在 spawn 时 chdir(借用,spawn 时消费)。
+pub fn spawnToFiles(argv: []const ?[*:0]const u8, out_fd: c_int, err_fd: c_int, cwd: ?[]const u8) CaptureError!ProcHandle {
     if (is_windows) {
         const out_raw = _get_osfhandle(out_fd);
         const err_raw = _get_osfhandle(err_fd);
@@ -334,6 +344,9 @@ pub fn spawnToFiles(argv: []const ?[*:0]const u8, out_fd: c_int, err_fd: c_int) 
         const a = std.heap.page_allocator;
         const cmdline = buildWindowsCmdline(a, argv) catch return error.SpawnFailed;
         defer a.free(cmdline);
+        // 缺陷 B 修复:cwd 转 UTF-16。
+        const cwd_w: ?[:0]u16 = if (cwd) |c| (std.unicode.utf8ToUtf16LeAllocZ(a, c) catch return error.SpawnFailed) else null;
+        defer if (cwd_w) |w| a.free(w);
         // 可继承句柄窗口期串行(见 g_spawn_serial);spawn 后立即撤销落盘 fd 的可继承标记
         // ——fd 生命周期远长于本次 spawn,留着会泄给后续任何 bInheritHandles 子进程。
         g_spawn_serial.lock();
@@ -353,7 +366,8 @@ pub fn spawnToFiles(argv: []const ?[*:0]const u8, out_fd: c_int, err_fd: c_int) 
         si.hStdError = err_h;
         si.hStdInput = null;
         var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
-        const created = win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{ .create_no_window = true }, null, null, &si, &pi);
+        const cwd_ptr: ?win.LPCWSTR = if (cwd_w) |w| w.ptr else null;
+        const created = win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{ .create_no_window = true }, null, cwd_ptr, &si, &pi);
         _ = SetHandleInformation(out_h, HANDLE_FLAG_INHERIT, 0);
         _ = SetHandleInformation(err_h, HANDLE_FLAG_INHERIT, 0);
         g_spawn_serial.unlock();
@@ -369,6 +383,8 @@ pub fn spawnToFiles(argv: []const ?[*:0]const u8, out_fd: c_int, err_fd: c_int) 
         _ = std.c.dup2(err_fd, 2);
         _ = std.c.close(out_fd);
         _ = std.c.close(err_fd);
+        // 缺陷 B 修复:子进程 chdir。
+        if (!chdirChild(cwd)) std.c._exit(127);
         const argv0 = argv[0] orelse std.c._exit(127);
         _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), @ptrCast(std.c.environ));
         std.c._exit(127);
@@ -462,6 +478,18 @@ fn killGroupPosix(pgid: std.c.pid_t) void {
     _ = std.c.kill(-pgid, std.c.SIG.KILL);
 }
 
+/// fork-child 内 chdir(缺陷 B)。异步信号安全:仅栈 buffer + chdir,无 malloc/lock。
+/// 成功返 true;失败或 cwd 过长返 false(调用方 _exit(127))。
+/// 三处 spawn 原语共用,避免 7 行代码重复(Linus R2)。
+fn chdirChild(cwd: ?[]const u8) bool {
+    const c = cwd orelse return true;
+    if (c.len >= std.fs.max_path_bytes) return false;
+    var cwd_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    @memcpy(cwd_z[0..c.len], c);
+    cwd_z[c.len] = 0;
+    return std.c.chdir(&cwd_z) == 0;
+}
+
 fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts: CaptureOpts) CaptureError!Captured {
     var out_pipe: [2]std.c.fd_t = undefined;
     if (std.c.pipe(&out_pipe) != 0) return error.PipeFailed;
@@ -521,6 +549,8 @@ fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts
             }
         }
         _ = std.c.close(out_pipe[1]);
+        // 缺陷 B 修复:子进程 chdir(仅影响本子进程,父进程 cwd 不变)。
+        if (!chdirChild(opts.cwd)) std.c._exit(127);
         const argv0 = argv[0] orelse std.c._exit(127);
         const envp: [*:null]const ?[*:0]const u8 = if (opts.inherit_env) @ptrCast(std.c.environ) else &.{null};
         _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), envp);
@@ -707,6 +737,9 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
     // 若在句柄之后 early-return 会把可继承写端永久泄漏 → 后续任意 capture 永不 EOF。
     const cmdline = buildWindowsCmdline(allocator, argv) catch return error.SpawnFailed;
     defer allocator.free(cmdline);
+    // 缺陷 B 修复:cwd 转 UTF-16。
+    const cwd_w: ?[:0]u16 = if (opts.cwd) |c| (std.unicode.utf8ToUtf16LeAllocZ(allocator, c) catch return error.SpawnFailed) else null;
+    defer if (cwd_w) |w| allocator.free(w);
     // 可继承句柄窗口期串行(见 g_spawn_serial);锁外做 stdin 写与读取/等待。
     g_spawn_serial.lock();
     var spawn_locked = true;
@@ -766,7 +799,8 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
     si.hStdInput = in_rd; // null → 子进程无 stdin（inherit_env 在 Windows 恒继承 env，此为 stdin）
 
     var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
-    const created = win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{}, null, null, &si, &pi);
+    const cwd_ptr: ?win.LPCWSTR = if (cwd_w) |w| w.ptr else null;
+    const created = win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{}, null, cwd_ptr, &si, &pi);
     // 父端**先**关掉全部可继承句柄副本(out_wr/in_rd/err_wr)再解串行锁——锁窗口 = 可继承
     // 句柄存活期。stdin 写(in_wr 不可继承)移到锁外,大输入阻塞不占全局锁。
     win.CloseHandle(out_wr);
@@ -1005,6 +1039,24 @@ test "capture stdin_data 喂入子进程 stdin" {
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "piped-input-42") != null);
 }
 
+test "capture cwd:子进程 pwd 在指定 cwd 而非父进程 cwd" {
+    // 缺陷 B 回归测试:capture opts.cwd 非 null → 子进程 chdir 后再 exec。
+    if (!procSpawnTestsEnabled()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    // 选一个肯定存在、非当前 cwd 的目录:/tmp(POSIX) 或 %TEMP%(Windows)。
+    const target_dir: []const u8 = if (is_windows) std.process.getEnvVarOwned(a, "TEMP") catch "/Temp" else "/tmp";
+    defer if (is_windows) a.free(target_dir);
+    const argv: []const ?[*:0]const u8 = if (is_windows)
+        &.{ "cmd.exe", "/c", "cd", null }
+    else
+        &.{ "/bin/sh", "-c", "pwd", null };
+    const r = try capture(argv, a, .{ .cwd = target_dir, .want_stderr = false, .timeout_ms = 10_000 });
+    defer a.free(r.stdout);
+    defer a.free(r.stderr);
+    // stdout 应含 target_dir(子进程在 target_dir 下跑 pwd)。
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, target_dir) != null);
+}
+
 test "capture 超时返 error.Timeout（有缓冲输出，验不 double-free）" {
     if (!procSpawnTestsEnabled()) return error.SkipZigTest;
     const a = std.testing.allocator; // testing.allocator 会捕获 double-free/leak
@@ -1022,7 +1074,7 @@ test "spawnPipes 双向 echo（写 stdin 读回 stdout）" {
         &.{ "cmd.exe", "/c", "more", null }
     else
         &.{ "/bin/sh", "-c", "cat", null };
-    const child = try spawnPipes(argv, true);
+    const child = try spawnPipes(argv, true, null);
     const msg = "ping-pong-99\n";
     _ = child.write(msg);
     child.closeStdin(); // EOF → cat/more 回显后退出

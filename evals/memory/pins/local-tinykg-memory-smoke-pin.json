@@ -1,0 +1,85 @@
+{
+  "implementation": {
+    "commit": "b109f8279083aa51087d78fc09626b9d3cd6058e",
+    "entrypoint": "scripts.eval.cli smoke-local-tinykg-memory",
+    "trace_schema_version": 1
+  },
+  "isolation": {
+    "child_home": "sealed run-local home",
+    "direct_cli": true,
+    "external_store_sentinel_unchanged_in_l2": true,
+    "read_phase_raw_store_digest_guard": true,
+    "read_phase_write_fault_injection_rejected": true,
+    "remote_api_calls": 0,
+    "remote_environment_removed": true,
+    "remote_store_writes": 0,
+    "skill_harness_invocations": 0,
+    "stores_below_fresh_run_directory": true
+  },
+  "schema_version": 1,
+  "tinykg": {
+    "binary": "zig-out/vendor/tinykg/tinykg",
+    "binary_sha256": "ca13030fa8ff33d597119fdc4c04705b47133bbfb20f4527df8c81cedaeafb70",
+    "storage_format_version": 2
+  },
+  "traces": [
+    {
+      "adapter_id": "coding-intent-families",
+      "batch_sha256": "85a14b19476365c4ccbef0738db53788636ed844d5a4517bdb9b3f7869a20c23",
+      "case_id": "coding:error-contract-propagation:quota-exceeded",
+      "edges": 1,
+      "graph_probe_edges": 1,
+      "graph_probe_nodes": 2,
+      "graph_revision": "3b734ed258b6a83043c1f262f263de55a18ddcb2fce88d09d7c34a006e854d8a",
+      "manifest_sha256": "c956eb5ae4159ff7b4f2c03d912c9ba23ff74774a85c7be1fab6380ef29ad421",
+      "nodes": 2,
+      "query_case_id": "coding:error-contract-propagation:invalid-lease",
+      "read_only_preserved": true,
+      "retrieval_hits": 2,
+      "source_sha256": "b2042faea02dc0c1a9bd00c5304ede9153807a83c8f240ed17cfa3118c880b76",
+      "trace_bytes": 4501,
+      "trace_repeat_sha256": "478683237bf819280f7e7eac5cd59cca3c16f031cb8b9cce594fc65630a6397c",
+      "trace_sha256": "478683237bf819280f7e7eac5cd59cca3c16f031cb8b9cce594fc65630a6397c"
+    },
+    {
+      "adapter_id": "hotpotqa-distractor",
+      "batch_sha256": "8695a75b20cfa45943952367e39a6a47807f6b9d76a94846adda90013c2f2bff",
+      "case_id": "hotpot:5a75e62f5542992d0ec06013",
+      "edges": 39,
+      "graph_probe_edges": 4,
+      "graph_probe_nodes": 5,
+      "graph_revision": "666edb70ea70f48e190e8bf8a33492dc6f493f19915d93c73bf3e7a1be792674",
+      "manifest_sha256": "e2f82cddaa73b346bf691a0439fdba9b9bc04eb3a0d2df715faaa38f8319f4fb",
+      "nodes": 49,
+      "query_case_id": "hotpot:5a75e62f5542992d0ec06013",
+      "read_only_preserved": true,
+      "retrieval_hits": 10,
+      "source_sha256": "4014a2210c47f11f644a04b0907400141bca9af4a6a82aba26134623c2736d36",
+      "trace_bytes": 5653,
+      "trace_sha256": "3ae63255047a3ceb14845660339029edd6dd0c165d5308dfe8d08a38c1c61fea"
+    },
+    {
+      "adapter_id": "longmemeval-s-cleaned",
+      "batch_sha256": "c8c2630510998db9a59dfcd99b7aaf381b51e937c1413f61156df3e948ec50d8",
+      "case_id": "longmem:multi-session:c63d180d7e7bcd21539f7440c18eef0b",
+      "edges": 451,
+      "graph_probe_edges": 10,
+      "graph_probe_nodes": 11,
+      "graph_revision": "1bba33497581b464f75192008c8027be6f52a7b47f877fbddfc0c29aca5085cd",
+      "manifest_sha256": "aa46d6958bb9f8b81879738670faa1a78d738468dfdb48d6db0457db34b3f1cc",
+      "nodes": 499,
+      "query_case_id": "longmem:multi-session:c63d180d7e7bcd21539f7440c18eef0b",
+      "read_only_preserved": true,
+      "retrieval_hits": 10,
+      "source_sha256": "356696cfd879ad64a196046060093c27e61cb340140c8bd7f4429f0998fa4df3",
+      "trace_bytes": 6212,
+      "trace_sha256": "3c3a3a1e0ff7ba1691a85a95a7a028a1cda9a784bf4c03e4bbf0ca1589c7621e"
+    }
+  ],
+  "verification": {
+    "native_local_tinykg_cases": 1,
+    "targeted_tests_passed": 7,
+    "targeted_tests_skipped": 0,
+    "trace_command_count_per_case": 6
+  }
+}

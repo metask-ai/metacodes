@@ -179,13 +179,14 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
                 // cwd_abs/home_dir/additional_dirs,漏 .sandbox → ctx.sandbox=null → wrapCommand 被跳过,
                 // Bash 脱管("共享 App 就以为共享沙箱"的假设缺口)。App 已从 settings 载 sandbox,直接接上。
                 .sandbox = app.sandboxPtr(),
-                .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(),
+                .cwd_abs = app.cwdAbs(),
+                .additional_dirs = app.additionalDirs(),
                 .home_dir = home,
-                // agent_ident = 进程自己的 session id(24-hex 值类型,存不下 name@team)。
-                // Linus MED-3:in-process 的 self-claim 用 e.agent_id(name@team 字符串)是**另一条**
-                // 路径(tryClaimFrontierTask 的 claim_agent 参数),非 agent_ident;进程外 self-claim
-                // 归 SW7,届时同样传 agent_id 字符串。模型自身 TaskUpdate 用 hex(与 in-process 同)。
+                // agent_ident 仍是进程自己的 24-hex session id，用于通用
+                // agent-loop 身份。TinyKG 租约单独使用 name@team，保证宿主自领与
+                // 模型后续 TaskUpdate/TaskStop 共用完全相同的 holder 字符串。
                 .agent_ident = app.session_id,
+                .kg_agent_ident = agent_id,
                 .colorize = false,
             },
             &backend,
@@ -362,7 +363,7 @@ pub fn createWorktree(a: std.mem.Allocator, wt_path: []const u8, branch: []const
     }
     for ([_][]const u8{ "worktree", "add", "-b", branch, wt_path, base }) |w| try appendZ(a, &argv, w);
     try argv.append(a, null);
-    const out = try common.spawnCaptureWithStderrTimed(argv.items, a, abort, 30_000, null, common.MAX_SPAWN_CAPTURE_BYTES);
+    const out = try common.spawnCaptureWithStderrTimed(argv.items, a, abort, 30_000, null, common.MAX_SPAWN_CAPTURE_BYTES, null);
     defer a.free(out.stdout);
     defer a.free(out.stderr);
     if (out.exit_code != 0) return error.WorktreeAddFailed;
@@ -399,7 +400,7 @@ pub fn removeWorktreeStrict(a: std.mem.Allocator, wt_path: []const u8, repo: []c
     }
     for ([_][]const u8{ "worktree", "remove", "--force", wt_path }) |w| try appendZ(a, &argv, w);
     try argv.append(a, null);
-    const out = try common.spawnCaptureWithStderrTimed(argv.items, a, abort, 30_000, null, common.MAX_SPAWN_CAPTURE_BYTES);
+    const out = try common.spawnCaptureWithStderrTimed(argv.items, a, abort, 30_000, null, common.MAX_SPAWN_CAPTURE_BYTES, null);
     defer a.free(out.stdout);
     defer a.free(out.stderr);
     if (out.exit_code != 0) return error.WorktreeRemoveFailed;

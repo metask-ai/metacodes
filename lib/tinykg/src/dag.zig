@@ -4,35 +4,18 @@ const graph_mod = @import("graph.zig");
 const index = @import("index.zig");
 const query = @import("query.zig");
 const storage = @import("storage.zig");
+const in_memory = @import("dag/in_memory.zig");
+const traversal = @import("dag/traversal_state.zig").Support;
 
-pub const RelationPolicy = enum {
-    cyclic_allowed,
-    dag,
-};
-
-pub fn relationPolicy(rel: core.RelKind) RelationPolicy {
-    return switch (rel) {
-        // contain(治理归属:project 树/锚/成员)进 DAG 集:嵌套 project 是树目录语义,
-        // 环 = 归属悖论(A 属 B 且 B 属 A)——membership BFS 有 visited 不至死循环,
-        // 但限域搜索的"子树"概念会塌。写时拒绝。
-        .contains, .depends_on, .blocks, .precedes, .derived_from, .summarizes, .contain => .dag,
-        else => .cyclic_allowed,
-    };
-}
-
-pub fn isDagRelation(rel: core.RelKind) bool {
-    return relationPolicy(rel) == .dag;
-}
-
-pub fn reachable(graph: *const graph_mod.Graph, from: core.NodeId, to: core.NodeId, rel: core.RelKind, budget: core.QueryBudget) !bool {
-    var mem_index = try index.MemoryIndex.init(graph.allocator, graph);
-    defer mem_index.deinit();
-    return reachableWithIndex(graph, &mem_index, from, to, rel, budget);
-}
-
-pub fn reachableWithIndex(graph: *const graph_mod.Graph, mem_index: *index.MemoryIndex, from: core.NodeId, to: core.NodeId, rel: core.RelKind, budget: core.QueryBudget) !bool {
-    return reachableWithCursor(graph.allocator, graph, mem_index, .{ .memory = .{ .mem_index = mem_index } }, from, to, rel, budget);
-}
+/// Stable DAG façade aliases for the storage-independent in-memory owner.
+pub const RelationPolicy = in_memory.RelationPolicy;
+pub const relationPolicy = in_memory.relationPolicy;
+pub const isDagRelation = in_memory.isDagRelation;
+pub const reachable = in_memory.reachable;
+pub const reachableWithIndex = in_memory.reachableWithIndex;
+pub const wouldCreateCycle = in_memory.wouldCreateCycle;
+pub const wouldCreateCycleWithIndex = in_memory.wouldCreateCycleWithIndex;
+pub const addEdgeChecked = in_memory.addEdgeChecked;
 
 pub fn reachableWithCursor(
     allocator: std.mem.Allocator,
@@ -44,16 +27,16 @@ pub fn reachableWithCursor(
     rel: core.RelKind,
     budget: core.QueryBudget,
 ) !bool {
-    if (isReservedNodeId(from) or isReservedNodeId(to)) return core.Error.InvalidId;
-    if (budgetTimedOutImmediately(budget)) return core.Error.BudgetExceeded;
-    if (from.toInt() != to.toInt() and reachableNodeBudgetExhausted(budget)) return core.Error.BudgetExceeded;
+    if (traversal.isReservedNodeId(from) or traversal.isReservedNodeId(to)) return core.Error.InvalidId;
+    if (traversal.timedOutImmediately(budget)) return core.Error.BudgetExceeded;
+    if (from.toInt() != to.toInt() and traversal.nodeBudgetExhausted(budget)) return core.Error.BudgetExceeded;
     if (mem_index.getNode(graph, from) == null or mem_index.getNode(graph, to) == null) return core.Error.NotFound;
     if (from.toInt() == to.toInt()) return true;
-    var node_state = try TraversalNodeState.init(allocator, graphMaxNodeIdHint(graph), budget);
+    var node_state = try traversal.NodeState.init(allocator, traversal.graphMaxNodeIdHint(graph.next_node_id), budget);
     defer node_state.deinit(allocator);
     var frontier = std.ArrayList(core.NodeId).empty;
     defer frontier.deinit(allocator);
-    const prealloc_nodes = traversalPreallocNodeCapacity(budget);
+    const prealloc_nodes = traversal.preallocNodeCapacity(budget);
     try frontier.ensureTotalCapacity(allocator, prealloc_nodes);
     try frontier.append(allocator, from);
     try node_state.putDepth(from.toInt(), 0);
@@ -87,7 +70,7 @@ const ReachableExploreContext = struct {
     allocator: std.mem.Allocator,
     graph: *const graph_mod.Graph,
     mem_index: *index.MemoryIndex,
-    node_state: *TraversalNodeState,
+    node_state: *traversal.NodeState,
     frontier: *std.ArrayList(core.NodeId),
     to: core.NodeId,
     current_depth: u8,
@@ -97,7 +80,7 @@ const ReachableExploreContext = struct {
 
 fn exploreReachableEdge(ctx: *ReachableExploreContext, edge: index.EdgeRef) !bool {
     if (ctx.edges_visited.* >= ctx.budget.max_visited_edges) return core.Error.BudgetExceeded;
-    ctx.edges_visited.* = try incrementTraversalCounter(ctx.edges_visited.*);
+    ctx.edges_visited.* = try traversal.incrementCounter(ctx.edges_visited.*);
     if (ctx.current_depth >= ctx.budget.max_depth) return core.Error.BudgetExceeded;
     if (edge.dst.toInt() == ctx.to.toInt()) return true;
     if (try ctx.node_state.containsVisited(edge.dst.toInt())) return false;
@@ -106,21 +89,6 @@ fn exploreReachableEdge(ctx: *ReachableExploreContext, edge: index.EdgeRef) !boo
     try ctx.node_state.putDepth(edge.dst.toInt(), ctx.current_depth + 1);
     try ctx.frontier.append(ctx.allocator, edge.dst);
     return false;
-}
-
-pub fn wouldCreateCycle(graph: *const graph_mod.Graph, src: core.NodeId, dst: core.NodeId, rel: core.RelKind, budget: core.QueryBudget) !bool {
-    var mem_index = try index.MemoryIndex.init(graph.allocator, graph);
-    defer mem_index.deinit();
-    return wouldCreateCycleWithIndex(graph, &mem_index, src, dst, rel, budget);
-}
-
-pub fn addEdgeChecked(graph: *graph_mod.Graph, src: core.NodeId, rel: core.RelKind, dst: core.NodeId, budget: core.QueryBudget) !core.EdgeId {
-    if (try wouldCreateCycle(graph, src, dst, rel, budget)) return core.Error.CycleDetected;
-    return graph.addEdgeUnchecked(src, rel, dst);
-}
-
-pub fn wouldCreateCycleWithIndex(graph: *const graph_mod.Graph, mem_index: *index.MemoryIndex, src: core.NodeId, dst: core.NodeId, rel: core.RelKind, budget: core.QueryBudget) !bool {
-    return wouldCreateCycleWithCursor(graph.allocator, graph, mem_index, .{ .memory = .{ .mem_index = mem_index } }, src, dst, rel, budget);
 }
 
 pub fn wouldCreateCycleWithCursor(
@@ -133,7 +101,7 @@ pub fn wouldCreateCycleWithCursor(
     rel: core.RelKind,
     budget: core.QueryBudget,
 ) !bool {
-    if (isReservedNodeId(src) or isReservedNodeId(dst)) return core.Error.InvalidId;
+    if (traversal.isReservedNodeId(src) or traversal.isReservedNodeId(dst)) return core.Error.InvalidId;
     if (!isDagRelation(rel)) return false;
     return reachableWithCursor(allocator, graph, mem_index, edge_cursor, dst, src, rel, budget) catch |err| switch (err) {
         core.Error.BudgetExceeded => return core.Error.CycleCheckUncertain,
@@ -229,10 +197,10 @@ fn reachableWithPersistentStoreOnceMeasured(
     budget: core.QueryBudget,
     stats: *index.QueryStats,
 ) !bool {
-    if (isReservedNodeId(from) or isReservedNodeId(to)) return core.Error.InvalidId;
+    if (traversal.isReservedNodeId(from) or traversal.isReservedNodeId(to)) return core.Error.InvalidId;
     const deadline = core.QueryDeadline.fromIo(store.io, budget.timeout_ms);
     if (deadline.expired()) return core.Error.BudgetExceeded;
-    if (from.toInt() != to.toInt() and reachableNodeBudgetExhausted(budget)) return core.Error.BudgetExceeded;
+    if (from.toInt() != to.toInt() and traversal.nodeBudgetExhausted(budget)) return core.Error.BudgetExceeded;
     var node_view = try store.openNodeByIdIndexView();
     defer node_view.deinit();
     if (!try node_view.nodeExists(from) or !try node_view.nodeExists(to)) return core.Error.NotFound;
@@ -243,11 +211,11 @@ fn reachableWithPersistentStoreOnceMeasured(
         .edge_retention_registry = edge_retention_registry,
     } };
 
-    var node_state = try TraversalNodeState.init(allocator, node_view.max_node_id, budget);
+    var node_state = try traversal.NodeState.init(allocator, node_view.max_node_id, budget);
     defer node_state.deinit(allocator);
     var frontier = std.ArrayList(core.NodeId).empty;
     defer frontier.deinit(allocator);
-    const prealloc_nodes = traversalPreallocNodeCapacity(budget);
+    const prealloc_nodes = traversal.preallocNodeCapacity(budget);
     try frontier.ensureTotalCapacity(allocator, prealloc_nodes);
     try frontier.append(allocator, from);
     try node_state.putDepth(from.toInt(), 0);
@@ -283,7 +251,7 @@ fn reachableWithPersistentStoreOnceMeasured(
 const PersistentReachableExploreContext = struct {
     allocator: std.mem.Allocator,
     node_view: *const storage.Store.NodeByIdIndexView,
-    node_state: *TraversalNodeState,
+    node_state: *traversal.NodeState,
     frontier: *std.ArrayList(core.NodeId),
     to: core.NodeId,
     current_depth: u8,
@@ -296,7 +264,7 @@ const PersistentReachableExploreContext = struct {
 fn explorePersistentReachableEdge(ctx: *PersistentReachableExploreContext, edge: index.EdgeRef) !bool {
     if (ctx.deadline.expired()) return core.Error.BudgetExceeded;
     if (ctx.edges_visited.* >= ctx.budget.max_visited_edges) return core.Error.BudgetExceeded;
-    ctx.edges_visited.* = try incrementTraversalCounter(ctx.edges_visited.*);
+    ctx.edges_visited.* = try traversal.incrementCounter(ctx.edges_visited.*);
     try index.addVisitedEdges(ctx.stats, 1);
     if (ctx.current_depth >= ctx.budget.max_depth) return core.Error.BudgetExceeded;
     if (edge.dst.toInt() == ctx.to.toInt()) return true;
@@ -316,182 +284,12 @@ pub fn wouldCreateCycleWithPersistentStore(
     rel: core.RelKind,
     budget: core.QueryBudget,
 ) !bool {
-    if (isReservedNodeId(src) or isReservedNodeId(dst)) return core.Error.InvalidId;
+    if (traversal.isReservedNodeId(src) or traversal.isReservedNodeId(dst)) return core.Error.InvalidId;
     if (!isDagRelation(rel)) return false;
     return reachableWithPersistentStore(allocator, store, dst, src, rel, budget) catch |err| switch (err) {
         core.Error.BudgetExceeded => return core.Error.CycleCheckUncertain,
         else => |e| return e,
     };
-}
-
-fn isReservedNodeId(id: core.NodeId) bool {
-    return id == .none or id.toInt() == std.math.maxInt(u64);
-}
-
-fn budgetTimedOutImmediately(budget: core.QueryBudget) bool {
-    return budget.timeout_ms == 0;
-}
-
-fn reachableNodeBudgetExhausted(budget: core.QueryBudget) bool {
-    return budget.max_visited_nodes == 0;
-}
-
-fn traversalPreallocNodeCapacity(budget: core.QueryBudget) usize {
-    const max_prealloc_nodes: usize = 16 * 1024;
-    const wanted = std.math.add(usize, budget.max_visited_nodes, 1) catch max_prealloc_nodes;
-    return @min(wanted, max_prealloc_nodes);
-}
-
-const traversal_dense_max_id: u64 = 4 * 1024 * 1024;
-const traversal_dense_min_id: u64 = 64 * 1024;
-const traversal_dense_budget_ratio: u64 = 64;
-
-const TraversalNodeState = union(enum) {
-    dense: Dense,
-    sparse: Sparse,
-
-    const Dense = struct {
-        visited: std.DynamicBitSetUnmanaged,
-        discovered: std.DynamicBitSetUnmanaged,
-        depths: []u8,
-        visited_count: usize = 0,
-    };
-
-    const Sparse = struct {
-        visited: std.AutoHashMap(u64, void),
-        depths: std.AutoHashMap(u64, u8),
-    };
-
-    fn init(allocator: std.mem.Allocator, max_node_id: u64, budget: core.QueryBudget) !TraversalNodeState {
-        if (try shouldUseDense(max_node_id, budget)) {
-            const bit_count = std.math.cast(usize, max_node_id) orelse return error.RecordTooLarge;
-            var visited = try std.DynamicBitSetUnmanaged.initEmpty(allocator, bit_count);
-            errdefer visited.deinit(allocator);
-            var discovered = try std.DynamicBitSetUnmanaged.initEmpty(allocator, bit_count);
-            errdefer discovered.deinit(allocator);
-            const depths = try allocator.alloc(u8, bit_count);
-            @memset(depths, 0);
-            return .{ .dense = .{
-                .visited = visited,
-                .discovered = discovered,
-                .depths = depths,
-            } };
-        }
-
-        var visited = std.AutoHashMap(u64, void).init(allocator);
-        errdefer visited.deinit();
-        var depths = std.AutoHashMap(u64, u8).init(allocator);
-        errdefer depths.deinit();
-        const prealloc_nodes = traversalPreallocNodeCapacity(budget);
-        try visited.ensureTotalCapacity(@intCast(prealloc_nodes));
-        try depths.ensureTotalCapacity(@intCast(prealloc_nodes));
-        return .{ .sparse = .{
-            .visited = visited,
-            .depths = depths,
-        } };
-    }
-
-    fn deinit(self: *TraversalNodeState, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .dense => |*dense| {
-                dense.visited.deinit(allocator);
-                dense.discovered.deinit(allocator);
-                allocator.free(dense.depths);
-            },
-            .sparse => |*sparse| {
-                sparse.visited.deinit();
-                sparse.depths.deinit();
-            },
-        }
-    }
-
-    fn visitedCount(self: *const TraversalNodeState) usize {
-        return switch (self.*) {
-            .dense => |*dense| dense.visited_count,
-            .sparse => |*sparse| sparse.visited.count(),
-        };
-    }
-
-    fn containsVisited(self: *const TraversalNodeState, id: u64) !bool {
-        return switch (self.*) {
-            .dense => |*dense| {
-                const index_id = denseIndex(id) orelse return false;
-                if (index_id >= dense.visited.capacity()) return false;
-                return dense.visited.isSet(index_id);
-            },
-            .sparse => |*sparse| sparse.visited.contains(id),
-        };
-    }
-
-    fn markVisited(self: *TraversalNodeState, id: u64) !void {
-        switch (self.*) {
-            .dense => |*dense| {
-                const index_id = denseIndex(id) orelse return error.InvalidRecord;
-                if (index_id >= dense.visited.capacity()) return error.InvalidRecord;
-                if (!dense.visited.isSet(index_id)) {
-                    dense.visited.set(index_id);
-                    dense.visited_count = std.math.add(usize, dense.visited_count, 1) catch return core.Error.BudgetExceeded;
-                }
-            },
-            .sparse => |*sparse| try sparse.visited.put(id, {}),
-        }
-    }
-
-    fn hasDepth(self: *const TraversalNodeState, id: u64) !bool {
-        return switch (self.*) {
-            .dense => |*dense| {
-                const index_id = denseIndex(id) orelse return false;
-                if (index_id >= dense.discovered.capacity()) return false;
-                return dense.discovered.isSet(index_id);
-            },
-            .sparse => |*sparse| sparse.depths.contains(id),
-        };
-    }
-
-    fn putDepth(self: *TraversalNodeState, id: u64, depth: u8) !void {
-        switch (self.*) {
-            .dense => |*dense| {
-                const index_id = denseIndex(id) orelse return error.InvalidRecord;
-                if (index_id >= dense.discovered.capacity()) return error.InvalidRecord;
-                dense.discovered.set(index_id);
-                dense.depths[index_id] = depth;
-            },
-            .sparse => |*sparse| try sparse.depths.put(id, depth),
-        }
-    }
-
-    fn getDepth(self: *const TraversalNodeState, id: u64) !?u8 {
-        return switch (self.*) {
-            .dense => |*dense| {
-                const index_id = denseIndex(id) orelse return null;
-                if (index_id >= dense.discovered.capacity() or !dense.discovered.isSet(index_id)) return null;
-                return dense.depths[index_id];
-            },
-            .sparse => |*sparse| sparse.depths.get(id),
-        };
-    }
-
-    fn shouldUseDense(max_node_id: u64, budget: core.QueryBudget) !bool {
-        if (max_node_id == 0 or max_node_id > traversal_dense_max_id) return false;
-        if (budget.max_visited_nodes == 0) return false;
-        const expected = std.math.cast(u64, budget.max_visited_nodes) orelse traversal_dense_max_id;
-        const scaled = std.math.mul(u64, expected, traversal_dense_budget_ratio) catch traversal_dense_max_id;
-        return max_node_id <= @max(traversal_dense_min_id, scaled);
-    }
-
-    fn denseIndex(id: u64) ?usize {
-        if (id == 0 or id == std.math.maxInt(u64)) return null;
-        return std.math.cast(usize, id - 1) orelse null;
-    }
-};
-
-fn graphMaxNodeIdHint(graph: *const graph_mod.Graph) u64 {
-    if (graph.next_node_id == 0) return std.math.maxInt(u64);
-    return graph.next_node_id - 1;
-}
-
-fn incrementTraversalCounter(current: usize) !usize {
-    return std.math.add(usize, current, 1) catch return core.Error.BudgetExceeded;
 }
 
 pub fn appendEdgeCheckedWithPersistentStore(allocator: std.mem.Allocator, store: storage.Store, edge: graph_mod.Edge, budget: core.QueryBudget) !void {
@@ -768,7 +566,7 @@ test "reachability exhausted node budget returns before traversal allocation" {
 }
 
 test "reachability traversal node state uses dense storage for dense ids" {
-    var state = try TraversalNodeState.init(std.testing.allocator, 64, .{ .max_visited_nodes = 16 });
+    var state = try traversal.NodeState.init(std.testing.allocator, 64, .{ .max_visited_nodes = 16 });
     defer state.deinit(std.testing.allocator);
 
     switch (state) {
@@ -789,7 +587,8 @@ test "reachability traversal node state uses dense storage for dense ids" {
 }
 
 test "reachability traversal node state falls back for sparse high ids" {
-    var state = try TraversalNodeState.init(std.testing.allocator, traversal_dense_max_id + 1, .{ .max_visited_nodes = 16 });
+    const sparse_high_id: u64 = 4 * 1024 * 1024 + 1;
+    var state = try traversal.NodeState.init(std.testing.allocator, sparse_high_id, .{ .max_visited_nodes = 16 });
     defer state.deinit(std.testing.allocator);
 
     switch (state) {
@@ -797,7 +596,7 @@ test "reachability traversal node state falls back for sparse high ids" {
         .sparse => {},
     }
 
-    const high_id = traversal_dense_max_id + 1;
+    const high_id = sparse_high_id;
     try std.testing.expect(!try state.hasDepth(high_id));
     try state.putDepth(high_id, 1);
     try std.testing.expectEqual(@as(?u8, 1), try state.getDepth(high_id));
@@ -1319,8 +1118,10 @@ test "checked persistent edge append repairs corrupt node catalog before direct 
     const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
     defer std.testing.allocator.free(store_path);
 
-    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
-    store.options.validate_indexes_on_read = true;
+    var store = try storage.Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .primary_text_write_mode = .bulk_ingest,
+        .validate_indexes_on_read = true,
+    });
     defer store.deinit();
     try store.createEmpty();
 
@@ -1463,9 +1264,9 @@ test "topological sort indegree increment rejects overflow" {
 }
 
 test "traversal counter increment rejects overflow" {
-    try std.testing.expectEqual(@as(usize, 1), try incrementTraversalCounter(0));
-    try std.testing.expectEqual(std.math.maxInt(usize), try incrementTraversalCounter(std.math.maxInt(usize) - 1));
-    try std.testing.expectError(core.Error.BudgetExceeded, incrementTraversalCounter(std.math.maxInt(usize)));
+    try std.testing.expectEqual(@as(usize, 1), try traversal.incrementCounter(0));
+    try std.testing.expectEqual(std.math.maxInt(usize), try traversal.incrementCounter(std.math.maxInt(usize) - 1));
+    try std.testing.expectError(core.Error.BudgetExceeded, traversal.incrementCounter(std.math.maxInt(usize)));
 }
 
 test "topological sort rejects non-DAG relations" {

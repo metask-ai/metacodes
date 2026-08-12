@@ -18,6 +18,7 @@ const std = @import("std");
 const time = @import("../util/time.zig");
 const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
+const project_activation = @import("../core/project_rule_activation.zig");
 const journal_mod = @import("journal.zig");
 const backend_mod = @import("backend.zig");
 const server_mod = @import("server.zig");
@@ -325,20 +326,60 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
         state_src.generating.store(true, .release);
         defer state_src.generating.store(false, .release);
 
+        const run_control: ?*project_activation.RunControl = if (app.sessionDir()) |dir|
+            project_activation.RunControl.init(
+                allocator,
+                dir,
+                app.session_id,
+                if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
+                &app.abort,
+            ) catch |err| {
+                log.err("web", "run control failed closed: {s}", .{@errorName(err)});
+                announceRunDone(&journal, web_alloc, "error", @errorName(err));
+                exit_code = 1;
+                continue;
+            }
+        else
+            null;
+        defer if (run_control) |control| control.deinit();
+        if (run_control) |control| control.requireDetachedIdle(
+            (if (app.jobs) |*jobs| jobs.runningCount() else 0) +|
+                (if (app.agent_jobs) |*jobs| jobs.runningCount() else 0),
+            app.swarm.hasTeam(),
+        ) catch |err| {
+            control.finishRun(@errorName(err)) catch {};
+            log.err("web", "project rules rejected detached workers: {s}", .{@errorName(err)});
+            announceRunDone(&journal, web_alloc, "error", @errorName(err));
+            exit_code = 1;
+            continue;
+        };
+
         // scoped 自动召回(对齐 headless.zig:按请求装配相关记忆,cache-safe 尾注入)
         const scoped_recall = if (app.kg) |*k| (@import("../kg/scoped_recall.zig").build(allocator, k, &app.conversation, &app.abort) catch null) else null;
         defer if (scoped_recall) |s| allocator.free(s);
 
+        var options = buildWebOptions(app, &wb, scoped_recall);
+        options.tool_observer = if (run_control) |control| control.observer() else null;
+        options.project_rule_gate = if (run_control) |control| control.formalGate() else null;
         const result = agent_loop.run(
             &app.conversation,
             app.provider(),
             app.tool_defs,
             &app.permission_ctx,
-            buildWebOptions(app, &wb, scoped_recall),
+            options,
             &be,
             allocator,
         ) catch |err| {
+            if (run_control) |control| control.finishRun(@errorName(err)) catch |finish_err| {
+                log.err("web", "run control finish failed: {s}", .{@errorName(finish_err)});
+            };
             log.err("web", "agent_loop failed: {s}", .{@errorName(err)});
+            announceRunDone(&journal, web_alloc, "error", @errorName(err));
+            exit_code = 1;
+            continue;
+        };
+        if (run_control) |control| control.finishRun(@tagName(result.stop_reason)) catch |err| {
+            log.err("web", "run control finish failed: {s}", .{@errorName(err)});
             announceRunDone(&journal, web_alloc, "error", @errorName(err));
             exit_code = 1;
             continue;

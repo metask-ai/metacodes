@@ -1,0 +1,21 @@
+{
+  "model_id": "adapter-smoke-no-rollout",
+  "model_fingerprint": "ac670f80f4941ef56bbf62f9da7c6d7ca853c1f1eb51db78ff6bd610bb085b4f",
+  "harness_revision": "procedural-adapter-smoke-no-rollout",
+  "arms": [
+    {
+      "id": "no_memory",
+      "fingerprint": "4bcaa801efdb993cd53b94c815c05c09856a9f4d8b5d195ad3aeb68cea1a9bb8"
+    },
+    {
+      "id": "tinykg_lexical",
+      "fingerprint": "568ed5a8d41c7cea24652124dd1625f8e7a1bdc2980a4ff16faa573b941d4e46"
+    }
+  ],
+  "trials": 1,
+  "retrieval_limits": {
+    "max_k": 10,
+    "max_hops": 3,
+    "max_semantic_variants": 4
+  }
+}

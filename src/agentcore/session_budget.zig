@@ -1035,7 +1035,7 @@ const MeasuredPayload = struct { payload: u64, durable: u64 };
 
 fn measureStreamEvent(event: core.api_stream.StreamEvent) Error!MeasuredPayload {
     return switch (event) {
-        .text => |bytes| .{
+        .text, .thinking => |bytes| .{
             .payload = @intCast(bytes.len),
             .durable = try checkedAdd(bytes.len, 14),
         },
@@ -1088,7 +1088,7 @@ fn deinitStreamEvent(
     event: core.api_stream.StreamEvent,
 ) void {
     switch (event) {
-        .text => |bytes| allocator.free(bytes),
+        .text, .thinking => |bytes| allocator.free(bytes),
         .tool_use_start => |tool| {
             allocator.free(tool.id);
             allocator.free(tool.name);
@@ -1268,6 +1268,7 @@ const TestProvider = struct {
     allocator: std.mem.Allocator,
     calls: u32 = 0,
     payload_bytes: usize = 0,
+    stream_event_kind: TestStream.EventKind = .text,
     stream: TestStream = undefined,
 
     fn provider(self: *TestProvider) core.api_provider.Provider {
@@ -1304,6 +1305,7 @@ const TestProvider = struct {
             .allocator = self.allocator,
             .payload_bytes = self.payload_bytes,
             .request_id = core.util_log.genRequestId(),
+            .event_kind = self.stream_event_kind,
         };
         return self.stream.handle();
     }
@@ -1363,9 +1365,12 @@ const TestProvider = struct {
 };
 
 const TestStream = struct {
+    const EventKind = enum { text, thinking };
+
     allocator: std.mem.Allocator,
     payload_bytes: usize,
     request_id: core.util_log.RequestId,
+    event_kind: EventKind = .text,
     emitted: bool = false,
 
     fn handle(self: *TestStream) core.api_provider.StreamHandle {
@@ -1384,7 +1389,10 @@ const TestStream = struct {
         self.emitted = true;
         const bytes = try self.allocator.alloc(u8, self.payload_bytes);
         @memset(bytes, 'x');
-        return .{ .text = bytes };
+        return switch (self.event_kind) {
+            .text => .{ .text = bytes },
+            .thinking => .{ .thinking = bytes },
+        };
     }
 
     fn deinit(_: *anyopaque) void {}
@@ -1475,6 +1483,36 @@ test "oversized Provider stream is never released to the agent loop" {
     var base = TestProvider{
         .allocator = std.testing.allocator,
         .payload_bytes = 65,
+    };
+    var decorated = BudgetedProvider{
+        .allocator = std.testing.allocator,
+        .controller = &controller,
+        .base = base.provider(),
+    };
+    var stream = try decorated.provider().sendStream(
+        &.{},
+        null,
+        null,
+        null,
+        null,
+        null,
+        "",
+    );
+    defer stream.deinit();
+    try std.testing.expectEqual(@as(?core.api_stream.StreamEvent, null), try stream.next());
+    try std.testing.expectEqual(@as(u32, 1), base.calls);
+    try std.testing.expectEqual(Outcome.resource_limit, controller.outcome());
+}
+
+test "thinking stream is charged as durable payload and freed when over limit" {
+    var profile = smallTestProfile();
+    profile.provider_result_cap_bytes = 64;
+    const admitted = try preflight(profile, 1000, &.{"x"});
+    var controller = Controller.init(std.testing.allocator, profile, admitted);
+    var base = TestProvider{
+        .allocator = std.testing.allocator,
+        .payload_bytes = 65,
+        .stream_event_kind = .thinking,
     };
     var decorated = BudgetedProvider{
         .allocator = std.testing.allocator,

@@ -1,0 +1,67 @@
+{
+  "adapter": {
+    "commit": "1149d4e67b83043d72265140c501e9315fcd42c3",
+    "id": "hotpotqa-distractor",
+    "revision": "official-json-hash-subset-v2"
+  },
+  "conversion": {
+    "adapter_source_revision": "hf-1908d6afbbead072334abe2965f91bd2709910ab-parquet-to-official-json-v1",
+    "adapter_source_url": "https://huggingface.co/datasets/hotpotqa/hotpot_qa/resolve/1908d6afbbead072334abe2965f91bd2709910ab/distractor/validation-00000-of-00001.parquet",
+    "algorithm": "hf-parquet-row-to-official-json-v1",
+    "output_bytes": 45931343,
+    "output_sha256": "a72c0b457742cf975df43a907c321a8d6dc8e23a5ab54d2ff44c97dc68c46cf1",
+    "pyarrow_version": "21.0.0",
+    "serializer": "json.dumps(ensure_ascii=false,separators=comma-colon)+newline"
+  },
+  "dataset": {
+    "case_count": 7405,
+    "id": "hotpotqa-distractor-dev-v1",
+    "official_code_revision": "3635853403a8735609ee997664e1528f4480762a",
+    "official_homepage": "https://hotpotqa.github.io/",
+    "official_release": "hotpot_dev_distractor_v1"
+  },
+  "distribution": {
+    "bytes": 27452575,
+    "path": "distractor/validation-00000-of-00001.parquet",
+    "repository": "https://huggingface.co/datasets/hotpotqa/hotpot_qa",
+    "revision": "1908d6afbbead072334abe2965f91bd2709910ab",
+    "sha256": "c20b638ca82b21d04fe12e14ff417ad05153d4d215a65de54497fca4e972f7c6"
+  },
+  "outputs": {
+    "manifest_bytes": 848364,
+    "manifest_sha256": "e2f82cddaa73b346bf691a0439fdba9b9bc04eb3a0d2df715faaa38f8319f4fb",
+    "source_slice_bytes": 13249648,
+    "source_slice_sha256": "4014a2210c47f11f644a04b0907400141bca9af4a6a82aba26134623c2736d36"
+  },
+  "policy": {
+    "excluded_cases": 1,
+    "path": "evals/memory/pins/hotpotqa-dev-distractor-v1-source-policy.json",
+    "sha256": "d8741ffd5ec607a43aecbfbcdd9521f4a77fc975021dd5744dcc609a284b8d28"
+  },
+  "runtime": {
+    "execution_fixture": "evals/memory/fixtures/hotpot-adapter-smoke-execution.json",
+    "execution_fixture_sha256": "4564fe380075604d117bd52a6dbaa88b7d87800d8fffe3eb9699f2cf67c5a0c3",
+    "network_calls_during_adapter": 0,
+    "paid_model_calls": 0
+  },
+  "schema_version": 1,
+  "selection": {
+    "algorithm": "sha256-seed-null-source-id-v1",
+    "eligible_cases": 7404,
+    "level_counts": {
+      "hard": 1000
+    },
+    "limit": 1000,
+    "ordered_source_ids_sha256": "d36f9217feb8dd52679f773cea29aca5c75a7a9db0bcf01cf54b4c5021909677",
+    "split_seed": 20260806,
+    "type_counts": {
+      "bridge": 794,
+      "comparison": 206
+    }
+  },
+  "structure": {
+    "documents": 9937,
+    "sentences": 41464,
+    "supporting_facts": 2431
+  }
+}

@@ -77,6 +77,7 @@ pub const WriterBackend = struct {
                 if (self.colorize) self.emit("\x1b[32m");
             },
             .text_chunk => |t| self.emit(t),
+            .thinking_chunk => {}, // headless/job sink 不显示思考过程(agent_loop 已存 conversation)
             .tool_start => |s| {
                 // verbose 普通工具行(对齐旧 agent_loop:387)。WriterBackend 是 core 层,
                 // 不 import UI widget tool_card 做分类(层泄漏);verbose 下打所有工具名即可
@@ -126,7 +127,7 @@ pub const WriterBackend = struct {
             // print-only sink 不收这些(旧 @hasDecl 守卫即编译期消失):
             // ui_request_pending:异步前端专属;print-only(headless/后台 job)不投递,no-op。
             // diag_*:L4 诊断事件,DiagnosticsBackend 专属,渲染后端 no-op。
-            .set_current_tool, .clear_current_tool, .tool_progress, .progress, .tool_result, .config_changed, .session_lifecycle, .agent_lifecycle, .tasks_changed, .ui_request_pending, .diag_turn_begin, .diag_turn_end, .diag_model_request, .diag_tool_stage, .diag_breaker_tripped, .diag_cache_break, .diag_continuation, .policy_decision, .diag_run_end => {},
+            .set_current_tool, .clear_current_tool, .tool_progress, .progress, .tool_result, .config_changed, .session_lifecycle, .agent_lifecycle, .tasks_changed, .ui_request_pending, .diag_turn_begin, .diag_turn_end, .diag_model_request, .diag_compact_request, .diag_tool_stage, .diag_breaker_tripped, .diag_cache_break, .diag_continuation, .context_projection, .policy_decision, .diag_run_end => {},
         }
     }
 };

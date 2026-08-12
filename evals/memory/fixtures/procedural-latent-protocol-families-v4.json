@@ -1,0 +1,299 @@
+{
+  "schema_version": 1,
+  "dataset_id": "coding-intent-transfer-v4",
+  "dataset_revision": "checked-in-latent-protocol-families-v4",
+  "families": [
+    {
+      "id": "checkpoint-capsule-transfer-v4",
+      "procedure_evidence_id": "procedure:checkpoint-capsule-transfer:v4",
+      "intent_template": "Register checkpoint capsule `{name}`. {instruction}",
+      "cases": [
+        {
+          "id": "artifact-index",
+          "split": "online",
+          "bindings": {
+            "instruction": "Establish this family's protocol: append the capsule name; derive alias CAP4_<UPPER_SNAKE_NAME>; use stage order freeze > hash_bind > publish; and set recovery policy manual_reconcile. Update the Python registry.",
+            "name": "artifact_index"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "src/protocol.py",
+                "content": "ITEMS = [\"inspect\"]\nALIASES = {\"inspect\": \"INSPECT_V1\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"]}\nPOLICY = {\"inspect\": \"automatic\"}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": ["src/protocol.py"],
+            "required_changed_paths": ["src/protocol.py"],
+            "checks": [
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ITEMS\",\"value\":[\"inspect\",\"artifact_index\"]}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ALIASES\",\"value\":{\"artifact_index\":\"CAP4_ARTIFACT_INDEX\",\"inspect\":\"INSPECT_V1\"}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"STAGES\",\"value\":{\"artifact_index\":[\"freeze\",\"hash_bind\",\"publish\"],\"inspect\":[\"observe\",\"report\"]}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"POLICY\",\"value\":{\"artifact_index\":\"manual_reconcile\",\"inspect\":\"automatic\"}}"}
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "src/protocol.py",
+              "content": "ITEMS = [\"inspect\", \"artifact_index\"]\nALIASES = {\"inspect\": \"INSPECT_V1\", \"artifact_index\": \"CAP4_ARTIFACT_INDEX\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"], \"artifact_index\": [\"freeze\", \"hash_bind\", \"publish\"]}\nPOLICY = {\"inspect\": \"automatic\", \"artifact_index\": \"manual_reconcile\"}\n"
+            }
+          ]
+        },
+        {
+          "id": "budget-ledger",
+          "split": "offline",
+          "bindings": {
+            "instruction": "Reuse the previously established family protocol for this sibling. Update the Python registry.",
+            "name": "budget_ledger"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "src/protocol.py",
+                "content": "ITEMS = [\"inspect\"]\nALIASES = {\"inspect\": \"INSPECT_V1\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"]}\nPOLICY = {\"inspect\": \"automatic\"}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": ["src/protocol.py"],
+            "required_changed_paths": ["src/protocol.py"],
+            "checks": [
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ITEMS\",\"value\":[\"inspect\",\"budget_ledger\"]}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ALIASES\",\"value\":{\"budget_ledger\":\"CAP4_BUDGET_LEDGER\",\"inspect\":\"INSPECT_V1\"}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"STAGES\",\"value\":{\"budget_ledger\":[\"freeze\",\"hash_bind\",\"publish\"],\"inspect\":[\"observe\",\"report\"]}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"POLICY\",\"value\":{\"budget_ledger\":\"manual_reconcile\",\"inspect\":\"automatic\"}}"}
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "src/protocol.py",
+              "content": "ITEMS = [\"inspect\", \"budget_ledger\"]\nALIASES = {\"inspect\": \"INSPECT_V1\", \"budget_ledger\": \"CAP4_BUDGET_LEDGER\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"], \"budget_ledger\": [\"freeze\", \"hash_bind\", \"publish\"]}\nPOLICY = {\"inspect\": \"automatic\", \"budget_ledger\": \"manual_reconcile\"}\n"
+            }
+          ]
+        },
+        {
+          "id": "task-frontier",
+          "split": "offline",
+          "bindings": {
+            "instruction": "Reuse the previously established family protocol for this sibling. Update the Python registry.",
+            "name": "task_frontier"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "src/protocol.py",
+                "content": "ITEMS = [\"inspect\"]\nALIASES = {\"inspect\": \"INSPECT_V1\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"]}\nPOLICY = {\"inspect\": \"automatic\"}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": ["src/protocol.py"],
+            "required_changed_paths": ["src/protocol.py"],
+            "checks": [
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ITEMS\",\"value\":[\"inspect\",\"task_frontier\"]}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ALIASES\",\"value\":{\"inspect\":\"INSPECT_V1\",\"task_frontier\":\"CAP4_TASK_FRONTIER\"}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"STAGES\",\"value\":{\"inspect\":[\"observe\",\"report\"],\"task_frontier\":[\"freeze\",\"hash_bind\",\"publish\"]}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"POLICY\",\"value\":{\"inspect\":\"automatic\",\"task_frontier\":\"manual_reconcile\"}}"}
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "src/protocol.py",
+              "content": "ITEMS = [\"inspect\", \"task_frontier\"]\nALIASES = {\"inspect\": \"INSPECT_V1\", \"task_frontier\": \"CAP4_TASK_FRONTIER\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"], \"task_frontier\": [\"freeze\", \"hash_bind\", \"publish\"]}\nPOLICY = {\"inspect\": \"automatic\", \"task_frontier\": \"manual_reconcile\"}\n"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lease-release-transfer-v4",
+      "procedure_evidence_id": "procedure:lease-release-transfer:v4",
+      "intent_template": "Register lease release `{name}`. {instruction}",
+      "cases": [
+        {
+          "id": "worker-alpha",
+          "split": "online",
+          "bindings": {
+            "instruction": "Establish this family's protocol: append the release name; derive alias LEASE4_<UPPER_SNAKE_NAME>; use stage order inspect_owner > revoke > confirm; and set timeout policy deny_on_timeout. Update the Python registry.",
+            "name": "worker_alpha"
+          },
+          "workspace": {"files": [{"path": "src/protocol.py", "content": "ITEMS = [\"inspect\"]\nALIASES = {\"inspect\": \"INSPECT_V1\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"]}\nPOLICY = {\"inspect\": \"automatic\"}\n"}]},
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": ["src/protocol.py"],
+            "required_changed_paths": ["src/protocol.py"],
+            "checks": [
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ITEMS\",\"value\":[\"inspect\",\"worker_alpha\"]}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ALIASES\",\"value\":{\"inspect\":\"INSPECT_V1\",\"worker_alpha\":\"LEASE4_WORKER_ALPHA\"}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"STAGES\",\"value\":{\"inspect\":[\"observe\",\"report\"],\"worker_alpha\":[\"inspect_owner\",\"revoke\",\"confirm\"]}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"POLICY\",\"value\":{\"inspect\":\"automatic\",\"worker_alpha\":\"deny_on_timeout\"}}"}
+            ]
+          },
+          "oracle_files": [{"path": "src/protocol.py", "content": "ITEMS = [\"inspect\", \"worker_alpha\"]\nALIASES = {\"inspect\": \"INSPECT_V1\", \"worker_alpha\": \"LEASE4_WORKER_ALPHA\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"], \"worker_alpha\": [\"inspect_owner\", \"revoke\", \"confirm\"]}\nPOLICY = {\"inspect\": \"automatic\", \"worker_alpha\": \"deny_on_timeout\"}\n"}]
+        },
+        {
+          "id": "worker-beta",
+          "split": "offline",
+          "bindings": {"instruction": "Reuse the previously established family protocol for this sibling. Update the Python registry.", "name": "worker_beta"},
+          "workspace": {"files": [{"path": "src/protocol.py", "content": "ITEMS = [\"inspect\"]\nALIASES = {\"inspect\": \"INSPECT_V1\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"]}\nPOLICY = {\"inspect\": \"automatic\"}\n"}]},
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": ["src/protocol.py"],
+            "required_changed_paths": ["src/protocol.py"],
+            "checks": [
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ITEMS\",\"value\":[\"inspect\",\"worker_beta\"]}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ALIASES\",\"value\":{\"inspect\":\"INSPECT_V1\",\"worker_beta\":\"LEASE4_WORKER_BETA\"}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"STAGES\",\"value\":{\"inspect\":[\"observe\",\"report\"],\"worker_beta\":[\"inspect_owner\",\"revoke\",\"confirm\"]}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"POLICY\",\"value\":{\"inspect\":\"automatic\",\"worker_beta\":\"deny_on_timeout\"}}"}
+            ]
+          },
+          "oracle_files": [{"path": "src/protocol.py", "content": "ITEMS = [\"inspect\", \"worker_beta\"]\nALIASES = {\"inspect\": \"INSPECT_V1\", \"worker_beta\": \"LEASE4_WORKER_BETA\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"], \"worker_beta\": [\"inspect_owner\", \"revoke\", \"confirm\"]}\nPOLICY = {\"inspect\": \"automatic\", \"worker_beta\": \"deny_on_timeout\"}\n"}]
+        },
+        {
+          "id": "worker-gamma",
+          "split": "offline",
+          "bindings": {"instruction": "Reuse the previously established family protocol for this sibling. Update the Python registry.", "name": "worker_gamma"},
+          "workspace": {"files": [{"path": "src/protocol.py", "content": "ITEMS = [\"inspect\"]\nALIASES = {\"inspect\": \"INSPECT_V1\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"]}\nPOLICY = {\"inspect\": \"automatic\"}\n"}]},
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": ["src/protocol.py"],
+            "required_changed_paths": ["src/protocol.py"],
+            "checks": [
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ITEMS\",\"value\":[\"inspect\",\"worker_gamma\"]}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ALIASES\",\"value\":{\"inspect\":\"INSPECT_V1\",\"worker_gamma\":\"LEASE4_WORKER_GAMMA\"}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"STAGES\",\"value\":{\"inspect\":[\"observe\",\"report\"],\"worker_gamma\":[\"inspect_owner\",\"revoke\",\"confirm\"]}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"POLICY\",\"value\":{\"inspect\":\"automatic\",\"worker_gamma\":\"deny_on_timeout\"}}"}
+            ]
+          },
+          "oracle_files": [{"path": "src/protocol.py", "content": "ITEMS = [\"inspect\", \"worker_gamma\"]\nALIASES = {\"inspect\": \"INSPECT_V1\", \"worker_gamma\": \"LEASE4_WORKER_GAMMA\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"], \"worker_gamma\": [\"inspect_owner\", \"revoke\", \"confirm\"]}\nPOLICY = {\"inspect\": \"automatic\", \"worker_gamma\": \"deny_on_timeout\"}\n"}]
+        }
+      ]
+    },
+    {
+      "id": "evidence-route-transfer-v4",
+      "procedure_evidence_id": "procedure:evidence-route-transfer:v4",
+      "intent_template": "Register evidence route `{name}`. {instruction}",
+      "cases": [
+        {
+          "id": "causal-trace",
+          "split": "online",
+          "bindings": {"instruction": "Establish this family's protocol: append the route name; derive alias EVID4_<UPPER_SNAKE_NAME>; use stage order seed > bridge > attest; and set gap policy abstain_on_gap. Update the Python registry.", "name": "causal_trace"},
+          "workspace": {"files": [{"path": "src/protocol.py", "content": "ITEMS = [\"inspect\"]\nALIASES = {\"inspect\": \"INSPECT_V1\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"]}\nPOLICY = {\"inspect\": \"automatic\"}\n"}]},
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": ["src/protocol.py"],
+            "required_changed_paths": ["src/protocol.py"],
+            "checks": [
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ITEMS\",\"value\":[\"inspect\",\"causal_trace\"]}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ALIASES\",\"value\":{\"causal_trace\":\"EVID4_CAUSAL_TRACE\",\"inspect\":\"INSPECT_V1\"}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"STAGES\",\"value\":{\"causal_trace\":[\"seed\",\"bridge\",\"attest\"],\"inspect\":[\"observe\",\"report\"]}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"POLICY\",\"value\":{\"causal_trace\":\"abstain_on_gap\",\"inspect\":\"automatic\"}}"}
+            ]
+          },
+          "oracle_files": [{"path": "src/protocol.py", "content": "ITEMS = [\"inspect\", \"causal_trace\"]\nALIASES = {\"inspect\": \"INSPECT_V1\", \"causal_trace\": \"EVID4_CAUSAL_TRACE\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"], \"causal_trace\": [\"seed\", \"bridge\", \"attest\"]}\nPOLICY = {\"inspect\": \"automatic\", \"causal_trace\": \"abstain_on_gap\"}\n"}]
+        },
+        {
+          "id": "temporal-fact",
+          "split": "offline",
+          "bindings": {"instruction": "Reuse the previously established family protocol for this sibling. Update the Python registry.", "name": "temporal_fact"},
+          "workspace": {"files": [{"path": "src/protocol.py", "content": "ITEMS = [\"inspect\"]\nALIASES = {\"inspect\": \"INSPECT_V1\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"]}\nPOLICY = {\"inspect\": \"automatic\"}\n"}]},
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": ["src/protocol.py"],
+            "required_changed_paths": ["src/protocol.py"],
+            "checks": [
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ITEMS\",\"value\":[\"inspect\",\"temporal_fact\"]}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ALIASES\",\"value\":{\"inspect\":\"INSPECT_V1\",\"temporal_fact\":\"EVID4_TEMPORAL_FACT\"}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"STAGES\",\"value\":{\"inspect\":[\"observe\",\"report\"],\"temporal_fact\":[\"seed\",\"bridge\",\"attest\"]}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"POLICY\",\"value\":{\"inspect\":\"automatic\",\"temporal_fact\":\"abstain_on_gap\"}}"}
+            ]
+          },
+          "oracle_files": [{"path": "src/protocol.py", "content": "ITEMS = [\"inspect\", \"temporal_fact\"]\nALIASES = {\"inspect\": \"INSPECT_V1\", \"temporal_fact\": \"EVID4_TEMPORAL_FACT\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"], \"temporal_fact\": [\"seed\", \"bridge\", \"attest\"]}\nPOLICY = {\"inspect\": \"automatic\", \"temporal_fact\": \"abstain_on_gap\"}\n"}]
+        },
+        {
+          "id": "entity-alias",
+          "split": "offline",
+          "bindings": {"instruction": "Reuse the previously established family protocol for this sibling. Update the Python registry.", "name": "entity_alias"},
+          "workspace": {"files": [{"path": "src/protocol.py", "content": "ITEMS = [\"inspect\"]\nALIASES = {\"inspect\": \"INSPECT_V1\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"]}\nPOLICY = {\"inspect\": \"automatic\"}\n"}]},
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": ["src/protocol.py"],
+            "required_changed_paths": ["src/protocol.py"],
+            "checks": [
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ITEMS\",\"value\":[\"inspect\",\"entity_alias\"]}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ALIASES\",\"value\":{\"entity_alias\":\"EVID4_ENTITY_ALIAS\",\"inspect\":\"INSPECT_V1\"}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"STAGES\",\"value\":{\"entity_alias\":[\"seed\",\"bridge\",\"attest\"],\"inspect\":[\"observe\",\"report\"]}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"POLICY\",\"value\":{\"entity_alias\":\"abstain_on_gap\",\"inspect\":\"automatic\"}}"}
+            ]
+          },
+          "oracle_files": [{"path": "src/protocol.py", "content": "ITEMS = [\"inspect\", \"entity_alias\"]\nALIASES = {\"inspect\": \"INSPECT_V1\", \"entity_alias\": \"EVID4_ENTITY_ALIAS\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"], \"entity_alias\": [\"seed\", \"bridge\", \"attest\"]}\nPOLICY = {\"inspect\": \"automatic\", \"entity_alias\": \"abstain_on_gap\"}\n"}]
+        }
+      ]
+    },
+    {
+      "id": "rollback-ticket-transfer-v4",
+      "procedure_evidence_id": "procedure:rollback-ticket-transfer:v4",
+      "intent_template": "Register rollback ticket `{name}`. {instruction}",
+      "cases": [
+        {
+          "id": "schema-upgrade",
+          "split": "online",
+          "bindings": {"instruction": "Establish this family's protocol: append the ticket name; derive alias ROLL4_<UPPER_SNAKE_NAME>; use stage order snapshot > restore > reobserve; and set release policy operator_ack. Update the Python registry.", "name": "schema_upgrade"},
+          "workspace": {"files": [{"path": "src/protocol.py", "content": "ITEMS = [\"inspect\"]\nALIASES = {\"inspect\": \"INSPECT_V1\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"]}\nPOLICY = {\"inspect\": \"automatic\"}\n"}]},
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": ["src/protocol.py"],
+            "required_changed_paths": ["src/protocol.py"],
+            "checks": [
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ITEMS\",\"value\":[\"inspect\",\"schema_upgrade\"]}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ALIASES\",\"value\":{\"inspect\":\"INSPECT_V1\",\"schema_upgrade\":\"ROLL4_SCHEMA_UPGRADE\"}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"STAGES\",\"value\":{\"inspect\":[\"observe\",\"report\"],\"schema_upgrade\":[\"snapshot\",\"restore\",\"reobserve\"]}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"POLICY\",\"value\":{\"inspect\":\"automatic\",\"schema_upgrade\":\"operator_ack\"}}"}
+            ]
+          },
+          "oracle_files": [{"path": "src/protocol.py", "content": "ITEMS = [\"inspect\", \"schema_upgrade\"]\nALIASES = {\"inspect\": \"INSPECT_V1\", \"schema_upgrade\": \"ROLL4_SCHEMA_UPGRADE\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"], \"schema_upgrade\": [\"snapshot\", \"restore\", \"reobserve\"]}\nPOLICY = {\"inspect\": \"automatic\", \"schema_upgrade\": \"operator_ack\"}\n"}]
+        },
+        {
+          "id": "memory-merge",
+          "split": "offline",
+          "bindings": {"instruction": "Reuse the previously established family protocol for this sibling. Update the Python registry.", "name": "memory_merge"},
+          "workspace": {"files": [{"path": "src/protocol.py", "content": "ITEMS = [\"inspect\"]\nALIASES = {\"inspect\": \"INSPECT_V1\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"]}\nPOLICY = {\"inspect\": \"automatic\"}\n"}]},
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": ["src/protocol.py"],
+            "required_changed_paths": ["src/protocol.py"],
+            "checks": [
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ITEMS\",\"value\":[\"inspect\",\"memory_merge\"]}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ALIASES\",\"value\":{\"inspect\":\"INSPECT_V1\",\"memory_merge\":\"ROLL4_MEMORY_MERGE\"}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"STAGES\",\"value\":{\"inspect\":[\"observe\",\"report\"],\"memory_merge\":[\"snapshot\",\"restore\",\"reobserve\"]}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"POLICY\",\"value\":{\"inspect\":\"automatic\",\"memory_merge\":\"operator_ack\"}}"}
+            ]
+          },
+          "oracle_files": [{"path": "src/protocol.py", "content": "ITEMS = [\"inspect\", \"memory_merge\"]\nALIASES = {\"inspect\": \"INSPECT_V1\", \"memory_merge\": \"ROLL4_MEMORY_MERGE\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"], \"memory_merge\": [\"snapshot\", \"restore\", \"reobserve\"]}\nPOLICY = {\"inspect\": \"automatic\", \"memory_merge\": \"operator_ack\"}\n"}]
+        },
+        {
+          "id": "harness-release",
+          "split": "offline",
+          "bindings": {"instruction": "Reuse the previously established family protocol for this sibling. Update the Python registry.", "name": "harness_release"},
+          "workspace": {"files": [{"path": "src/protocol.py", "content": "ITEMS = [\"inspect\"]\nALIASES = {\"inspect\": \"INSPECT_V1\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"]}\nPOLICY = {\"inspect\": \"automatic\"}\n"}]},
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": ["src/protocol.py"],
+            "required_changed_paths": ["src/protocol.py"],
+            "checks": [
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ITEMS\",\"value\":[\"inspect\",\"harness_release\"]}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"ALIASES\",\"value\":{\"harness_release\":\"ROLL4_HARNESS_RELEASE\",\"inspect\":\"INSPECT_V1\"}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"STAGES\",\"value\":{\"harness_release\":[\"snapshot\",\"restore\",\"reobserve\"],\"inspect\":[\"observe\",\"report\"]}}"},
+              {"kind": "python_assignment_equals", "path": "src/protocol.py", "value": "{\"name\":\"POLICY\",\"value\":{\"harness_release\":\"operator_ack\",\"inspect\":\"automatic\"}}"}
+            ]
+          },
+          "oracle_files": [{"path": "src/protocol.py", "content": "ITEMS = [\"inspect\", \"harness_release\"]\nALIASES = {\"inspect\": \"INSPECT_V1\", \"harness_release\": \"ROLL4_HARNESS_RELEASE\"}\nSTAGES = {\"inspect\": [\"observe\", \"report\"], \"harness_release\": [\"snapshot\", \"restore\", \"reobserve\"]}\nPOLICY = {\"inspect\": \"automatic\", \"harness_release\": \"operator_ack\"}\n"}]
+        }
+      ]
+    }
+  ]
+}

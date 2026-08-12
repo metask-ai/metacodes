@@ -1,5 +1,5 @@
-vendored from: https://github.com/shuzuan-org/tinykg
-commit: f35e4823481953015158926e113f4ffa9002c2a4
-storage_format_version: 2
-note: 源码快照(非 submodule),build.zig 从 src/main.zig 交叉编译产 vendor/tinykg/tinykg。
-      更新用 scripts/vendor-deps.sh;格式版本变更须同步 kg/client.zig EXPECTED_STORAGE_FORMAT_VERSION。
+vendored from: https://github.com/shuzuan-org/tinykg.git
+commit: 5505b06b8eab8eb0612abf80d2044141dd66ba44
+note: 源码快照(非 submodule)。更新用 scripts/vendor-deps.sh。
+storage_format_version: 2  # 变更须同步 src/kg/client.zig EXPECTED_STORAGE_FORMAT_VERSION
+schema_version: 3  # 变更须同步 src/kg/client.zig EXPECTED_SCHEMA_VERSION

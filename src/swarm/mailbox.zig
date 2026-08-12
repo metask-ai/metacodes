@@ -564,9 +564,26 @@ test "deliver 邮箱体积上限:未读永不丢" {
     var pbuf: [256]u8 = undefined;
     const path = try testInbox(&pbuf);
     defer rmTestRoot(path);
-    // 投 MAILBOX_MAX_MESSAGES + 5 条全未读 → 不裁(未读不丢),条数超阈值也保留。
+    // 一次写入边界前状态，再走 5 次真实 deliver 穿过软顶。旧测试用 deliver 从 0
+    // 搭到 505；由于生产协议要求每次锁内全量读-改-写，那是在重复测 O(n²) 的 fixture
+    // 构造成本，而非新增语义，单测耗时约 22 秒。
+    try ensureInbox(path);
+    var seeded = MessageList{ .allocator = a };
+    defer seeded.deinit();
     var i: usize = 0;
-    while (i < MAILBOX_MAX_MESSAGES + 5) : (i += 1) {
+    while (i < MAILBOX_MAX_MESSAGES) : (i += 1) {
+        try seeded.items.append(a, .{
+            .from = try a.dupe(u8, "x"),
+            .text = try a.dupe(u8, "unread"),
+            .timestamp = try a.dupe(u8, "2026-08-06T00:00:00.000Z"),
+            .read = false,
+            .file_index = i,
+        });
+    }
+    try writeAllUnlocked(a, path, &seeded);
+
+    i = 0;
+    while (i < 5) : (i += 1) {
         try deliver(a, path, "x", "unread", null, null);
     }
     var all = try readAll(a, path);

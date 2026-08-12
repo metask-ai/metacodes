@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "pilot_id": "procedural-glm52-v16",
+  "manifest_id": "coding-intent-families-2026080816-4",
+  "outcome": {
+    "status": "halted-runner-misclassification",
+    "quality_evidence": false,
+    "canonical_runtime_receipt_published": false,
+    "completed_rollout_transactions": 12,
+    "scheduled_rollouts": 144,
+    "uncertain_authorized_transactions": 0
+  },
+  "failure": {
+    "sequence": 11,
+    "case_id": "coding:evidence-route-transfer-v4:causal-trace",
+    "trial": 1,
+    "arm": "no_memory",
+    "classification": "safely-contained-model-tool-attempt-misclassified-as-infrastructure-failure",
+    "attempted_tool": "Task",
+    "unique_tool_use_ids": 1,
+    "denial": {
+      "code": "permission_denied",
+      "category": "safety",
+      "recoverable": false,
+      "tool_executed": false
+    },
+    "journal_settled": true,
+    "automatic_retry_performed": false,
+    "query_plan_sidecar_missing_for_failed_sequence": true,
+    "fix_commits": [
+      "a055c78",
+      "80b3430"
+    ]
+  },
+  "partial_signal": {
+    "interpretation": "exploratory incident evidence only; the frozen schedule did not complete",
+    "online_successes": 6,
+    "online_trials": 6,
+    "offline": {
+      "no_memory": {"successes": 0, "trials": 2},
+      "markdown_memory": {"successes": 2, "trials": 2},
+      "tinykg_lexical": {"successes": 2, "trials": 2}
+    },
+    "query_plan_sidecars": 11
+  },
+  "budget_journal": {
+    "revision": 36,
+    "head_sha256": "b41026345f5f19bc3bf61a5fb116735cbac6d8fdeb9e39edd5fc856e0098e3f7",
+    "sha256": "7fcbee433ae06834830e3af1b86131dca7a6bc566b314799717a05650f9d0585",
+    "committed_cost_usd": 0.896485,
+    "committed_metered_tokens": 1323282,
+    "transaction_states": {"committed": 12}
+  },
+  "artifact_provenance": {
+    "local_only_artifact_tree": "~/.local/state/metacodes/memory-pilots/procedural-glm52-v16/artifacts/run-001",
+    "local_only_artifact_tree_files": 745,
+    "local_only_artifact_tree_bytes": 61955106,
+    "local_only_artifact_tree_sha256": "932ee151af6ce81dfd7d2d2e7232789b61ea7453dcdee98065239853fab1779e",
+    "failed_run_diagnostic_sha256": "544a579fd73003fac00ab0649f42d63ea08bbb4b0e2bd9ff7dabf59c14b3335a",
+    "failed_run_budget_checkpoint_sha256": "7fcbee433ae06834830e3af1b86131dca7a6bc566b314799717a05650f9d0585",
+    "retroactive_checkpoint_from_unchanged_journal_and_artifacts": true,
+    "pilot_freeze_commit": "942d237",
+    "metacodes_binary_sha256": "80d10a08698a3f820dc260d98e1394056bd87c9fd7fb48fedabb4b3b125952aa",
+    "tinykg_binary_sha256": "66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee",
+    "ripgrep_snapshot_sha256": "882ee4837235e252ce5ffecc3c1707f6d5b7db0054b7922301b5dc0f466a0fed"
+  },
+  "isolation": {
+    "benchmark_tinykg": "fresh local stores only",
+    "skill_harness_invocations": 0,
+    "remote_api_calls": 0,
+    "remote_store_writes": 0,
+    "raw_artifacts_uploaded": false
+  },
+  "program_authority": {
+    "conservative_cost_usd_after_attempt": 12.0029158,
+    "conservative_metered_tokens_after_attempt": 8871509,
+    "user_authorization_max_cost_usd": 1000.0
+  },
+  "rollouts": [
+    {"sequence": 0, "cost_usd": 0.02713, "metered_tokens": 41728, "transaction_id": "ec1fb9b67e60efba7d24fc00b948a35720fa984e279af8b4b11db43715cf7e93"},
+    {"sequence": 1, "cost_usd": 0.068122, "metered_tokens": 81356, "transaction_id": "cd56e106f400ce198cc1d1678eeb10e496e2ca2e2f26ceb9f02182a2b42407f1"},
+    {"sequence": 2, "cost_usd": 0.049328, "metered_tokens": 69597, "transaction_id": "66c030a2f9a9d1f30882dcb5a16edb2f4d1ec026c1a8fd80814eacf5fca1b9dd"},
+    {"sequence": 3, "cost_usd": 0.029365, "metered_tokens": 33945, "transaction_id": "700dbb732bff0c556ddb066f3671052bef5ca18a29cad4c66ceb0e9404083435"},
+    {"sequence": 4, "cost_usd": 0.076577, "metered_tokens": 119036, "transaction_id": "46167855e5ee4ae9a2f9c7bba9b58164abc24bb38882c10d34a210f1f86fd39d"},
+    {"sequence": 5, "cost_usd": 0.119468, "metered_tokens": 211249, "transaction_id": "22c2614c2bc1d7b24a64d4335b5d6baaed6dea27383e6898f430284f390ccc37"},
+    {"sequence": 6, "cost_usd": 0.085481, "metered_tokens": 128720, "transaction_id": "bbb520e7883d74c44474d5521fa40564a3a630f63c650fcf087de3e55b9fca43"},
+    {"sequence": 7, "cost_usd": 0.22512, "metered_tokens": 382875, "transaction_id": "f2af8a4acb65756d0b57932226a4deb896c38ac10cdce9b6d7fd31ad8f93b2b9"},
+    {"sequence": 8, "cost_usd": 0.035754, "metered_tokens": 43641, "transaction_id": "8c749445663c3d839a10eeb8eac80644226fa9444e6a5b2c76190f636318c6a3"},
+    {"sequence": 9, "cost_usd": 0.040109, "metered_tokens": 61007, "transaction_id": "c378dfed97ee02850714dd48009a65cbc68ed9e815b5d8f954d1a507543e1107"},
+    {"sequence": 10, "cost_usd": 0.105476, "metered_tokens": 106753, "transaction_id": "00f4f9896d6f2e111622a6cba8fd3676aaf166bcaf5155dac1f3b855160dceed"},
+    {"sequence": 11, "cost_usd": 0.034555, "metered_tokens": 43375, "transaction_id": "5b860dae8ae693b90120dacc2d8447026c4364f62bb9598fd35efe95c092a729"}
+  ]
+}

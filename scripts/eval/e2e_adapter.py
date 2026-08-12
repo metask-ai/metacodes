@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import platform
 import re
 import stat
+import subprocess
+import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -21,6 +25,7 @@ EVALUATION_CONTRACT_VERSION = 3
 NATIVE_EVENT_SCHEMA_VERSION = EVALUATION_CONTRACT_VERSION
 MAX_NATIVE_EVENT_BYTES = 64 * 1024 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
+MAX_VALIDATOR_OUTPUT_BYTES = 1024 * 1024
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -89,14 +94,33 @@ def _fingerprint(value: Any) -> str:
     return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()[:16]
 
 
-def _grader_fingerprint(task: Dict[str, Any]) -> str:
-    return _fingerprint(
-        {
-            "evaluation_contract_version": EVALUATION_CONTRACT_VERSION,
-            "grader": task["grader"],
-            "checks": task["success"]["checks"],
-        }
-    )
+def _validator_hashes(task: Dict[str, Any], repo_root: Path) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for check in task["success"]["checks"]:
+        if check.get("type") != "validator":
+            continue
+        path = (repo_root / check["validator"]).resolve()
+        try:
+            relative = path.relative_to(repo_root.resolve()).as_posix()
+            if path.is_symlink() or not path.is_file():
+                raise OSError("validator is not a regular file")
+            payload = path.read_bytes()
+        except (OSError, ValueError) as exc:
+            raise ValidationError(f"cannot fingerprint validator {path}: {exc}") from exc
+        result[relative] = hashlib.sha256(payload).hexdigest()
+    return dict(sorted(result.items()))
+
+
+def _grader_fingerprint(task: Dict[str, Any], repo_root: Path) -> str:
+    payload = {
+        "evaluation_contract_version": EVALUATION_CONTRACT_VERSION,
+        "grader": task["grader"],
+        "checks": task["success"]["checks"],
+    }
+    validator_sha256 = _validator_hashes(task, repo_root)
+    if validator_sha256:
+        payload["validator_sha256"] = validator_sha256
+    return _fingerprint(payload)
 
 
 def _execution_input_hashes(task: Dict[str, Any], repo_root: Path) -> Dict[str, str]:
@@ -108,6 +132,9 @@ def _execution_input_hashes(task: Dict[str, Any], repo_root: Path) -> Dict[str, 
         paths.append(companion)
     for fixture in task.get("environment", {}).get("fixtures", []):
         paths.append(repo_root / fixture)
+    for check in task["success"]["checks"]:
+        if check.get("type") == "validator":
+            paths.append(repo_root / check["validator"])
     result: Dict[str, str] = {}
     for path in paths:
         try:
@@ -116,6 +143,60 @@ def _execution_input_hashes(task: Dict[str, Any], repo_root: Path) -> Dict[str, 
         except (OSError, ValueError) as exc:
             raise ValidationError(f"cannot fingerprint execution input {path}: {exc}") from exc
         result[relative] = hashlib.sha256(payload).hexdigest()
+    snapshot = task.get("environment", {}).get("repository_snapshot")
+    if snapshot is not None:
+        revision = snapshot["revision"]
+        prefix = snapshot["prefix"].strip("/")
+        archive_paths = [f"{prefix}/{item.strip('/')}" for item in snapshot["paths"]]
+        try:
+            git_root = subprocess.run(
+                ["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            ).stdout.strip()
+            verified = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    git_root,
+                    "rev-parse",
+                    "--verify",
+                    f"{revision}^{{commit}}",
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            ).stdout.strip()
+            listing = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    git_root,
+                    "ls-tree",
+                    "-r",
+                    "--full-tree",
+                    revision,
+                    "--",
+                    *archive_paths,
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=20,
+            ).stdout
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ValidationError(f"cannot fingerprint repository snapshot: {exc}") from exc
+        if verified != revision or not listing:
+            raise ValidationError("repository snapshot revision or sparse paths are unavailable")
+        for line in listing.splitlines():
+            if line.startswith(b"120000 ") or b" commit " in line:
+                raise ValidationError("repository snapshot may contain regular files only")
+        result[f"git:{revision}:{prefix}"] = hashlib.sha256(listing).hexdigest()
     return dict(sorted(result.items()))
 
 
@@ -145,6 +226,8 @@ def prepare_runtime_metadata(
     harness_revision: str,
     permission_mode: str,
     binary_path: Path,
+    max_metered_tokens: Optional[int] = None,
+    max_cost_usd: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """Freeze comparison-critical identities before the child process starts.
 
@@ -165,6 +248,21 @@ def prepare_runtime_metadata(
         binary_path=binary_path,
     )
     permission_mode = identity["permission_mode"]
+    if (max_metered_tokens is None) != (max_cost_usd is None):
+        raise ValidationError("runtime budget requires both token and cost caps")
+    if max_metered_tokens is not None and (
+        not isinstance(max_metered_tokens, int)
+        or isinstance(max_metered_tokens, bool)
+        or max_metered_tokens <= 0
+    ):
+        raise ValidationError("runtime max_metered_tokens must be an integer > 0")
+    if max_cost_usd is not None and (
+        not isinstance(max_cost_usd, (int, float))
+        or isinstance(max_cost_usd, bool)
+        or not math.isfinite(float(max_cost_usd))
+        or float(max_cost_usd) <= 0
+    ):
+        raise ValidationError("runtime max_cost_usd must be finite and > 0")
     metadata = {
         "schema_version": NATIVE_EVENT_SCHEMA_VERSION,
         "events_path": events_path,
@@ -183,6 +281,10 @@ def prepare_runtime_metadata(
         "environment_fingerprint": identity["environment_fingerprint"],
         "grader_fingerprint": identity["grader_fingerprint"],
     }
+    if max_metered_tokens is not None:
+        metadata["max_metered_tokens"] = max_metered_tokens
+    if max_cost_usd is not None:
+        metadata["max_cost_usd"] = float(max_cost_usd)
     _write_new_private_file(
         output,
         (json.dumps(metadata, ensure_ascii=False, sort_keys=True) + "\n").encode(
@@ -286,7 +388,7 @@ def comparison_fingerprints(
                 "execution_inputs": execution_inputs,
             }
         ),
-        "grader_fingerprint": _grader_fingerprint(task),
+        "grader_fingerprint": _grader_fingerprint(task, repo_root),
         "model_fingerprint": _fingerprint(
             {"provider": model_provider, "id": model_id}
         ),
@@ -322,7 +424,7 @@ def grounding_fingerprints(task: Dict[str, Any], repo_root: Path) -> Dict[str, s
         "task_fingerprint": _fingerprint(
             {"task": task, "execution_inputs": execution_inputs}
         ),
-        "grader_fingerprint": _grader_fingerprint(task),
+        "grader_fingerprint": _grader_fingerprint(task, repo_root),
         "environment_fingerprint": _fingerprint(
             {
                 "environment": task["environment"],
@@ -518,6 +620,9 @@ def _trace_metrics(debug_log: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]
         "model_request_time_ms": None,
         "model_request_count": None,
         "model_request_outcomes": None,
+        "compact_request_count": None,
+        "compact_request_time_ms": None,
+        "compact_request_outcomes": None,
         "tool_time_ms": sum(duration for _name, duration in tool_done)
         + sum(duration for _name, _error, duration in failures),
         "tool_stage_time_ms": None,
@@ -572,19 +677,136 @@ def _count_policy_violations(
     )
 
 
+def _run_validator_capped(
+    command: List[str],
+    *,
+    cwd: Path,
+    env: Dict[str, str],
+    timeout_seconds: int,
+) -> Tuple[int, int, str, bool, bool]:
+    """Drain validator output without allowing an unbounded pipe allocation."""
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    assert process.stdout is not None
+    tail = bytearray()
+    state: Dict[str, Any] = {"bytes": 0, "overflow": False, "error": None}
+
+    def drain() -> None:
+        try:
+            while True:
+                chunk = process.stdout.read(64 * 1024)
+                if not chunk:
+                    return
+                state["bytes"] += len(chunk)
+                tail.extend(chunk)
+                if len(tail) > 4000:
+                    del tail[:-4000]
+                if state["bytes"] > MAX_VALIDATOR_OUTPUT_BYTES:
+                    state["overflow"] = True
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    return
+        except OSError as exc:
+            state["error"] = exc
+        finally:
+            process.stdout.close()
+
+    reader = threading.Thread(target=drain, name="eval-validator-output", daemon=True)
+    reader.start()
+    timed_out = False
+    try:
+        returncode = process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        process.kill()
+        returncode = process.wait()
+    reader.join(timeout=2)
+    if reader.is_alive():
+        process.stdout.close()
+        reader.join(timeout=1)
+    if reader.is_alive():
+        raise OSError("validator output pipe did not close after process exit")
+    if state["error"] is not None and not timed_out and not state["overflow"]:
+        raise OSError(f"cannot read validator output: {state['error']}")
+    combined = bytes(tail).decode("utf-8", "replace").strip()
+    return (
+        returncode,
+        int(state["bytes"]),
+        combined,
+        bool(state["overflow"]),
+        timed_out,
+    )
+
+
 def _evaluate_check(
-    check: Dict[str, Any], workspace: Path, log_text: str, debug_log_text: str = ""
+    check: Dict[str, Any],
+    workspace: Path,
+    log_text: str,
+    debug_log_text: str = "",
+    *,
+    repo_root: Optional[Path] = None,
 ) -> Dict[str, Any]:
     kind = check["type"]
     description = check.get("description") or kind
     target: Optional[Path] = None
     target_text: Optional[str] = None
     read_error: Optional[str] = None
-    if kind not in {
+    passed = False
+    detail = ""
+    if kind == "validator":
+        if repo_root is None:
+            read_error = "validator check requires an explicit repository root"
+        else:
+            validator = (repo_root / check["validator"]).resolve()
+            try:
+                validator.relative_to(repo_root.resolve())
+                if validator.is_symlink() or not validator.is_file():
+                    raise OSError("validator is not a regular file")
+                returncode, output_bytes, combined, overflow, timed_out = (
+                    _run_validator_capped(
+                        [
+                            sys.executable,
+                            "-I",
+                            str(validator),
+                            str(workspace.resolve()),
+                        ],
+                        cwd=workspace,
+                        env={
+                            "PATH": os.environ.get("PATH", ""),
+                            "LANG": "C.UTF-8",
+                            "LC_ALL": "C.UTF-8",
+                        },
+                        timeout_seconds=check.get("timeout_seconds", 30),
+                    )
+                )
+                if timed_out:
+                    read_error = f"validator exceeded {check.get('timeout_seconds', 30)}s"
+                elif overflow:
+                    read_error = (
+                        f"validator output exceeds {MAX_VALIDATOR_OUTPUT_BYTES} byte limit"
+                    )
+                else:
+                    passed = returncode == 0
+                detail = (
+                    f"{check['validator']} exited {returncode} "
+                    f"output_bytes={output_bytes}: {combined}"
+                )
+            except (OSError, ValueError) as exc:
+                read_error = f"cannot execute validator: {exc}"
+    elif kind not in {
         "log_contains",
         "log_not_contains",
         "debug_log_contains",
         "debug_log_not_contains",
+        "debug_tool_input_contains",
+        "debug_tool_input_not_contains",
         "assistant_contains",
     }:
         target, read_error = _workspace_target(workspace, check["path"])
@@ -620,9 +842,9 @@ def _evaluate_check(
             except OSError as exc:
                 read_error = str(exc)
 
-    passed = False
-    detail = ""
-    if kind == "file_exists":
+    if kind == "validator":
+        pass
+    elif kind == "file_exists":
         passed = bool(target and read_error is None and target.is_file())
         detail = f"{check['path']} {'exists' if passed else 'is missing'}"
     elif kind == "file_absent":
@@ -639,6 +861,21 @@ def _evaluate_check(
         contains = target_text is not None and needle in target_text
         passed = contains if kind == "contains" else target_text is not None and not contains
         detail = f"{check['path']} {'contains' if contains else 'does not contain'} {needle!r}"
+    elif kind in {"contains_casefold", "not_contains_casefold"}:
+        needle = check["text"]
+        contains = (
+            target_text is not None
+            and needle.casefold() in target_text.casefold()
+        )
+        passed = (
+            contains
+            if kind == "contains_casefold"
+            else target_text is not None and not contains
+        )
+        detail = (
+            f"{check['path']} "
+            f"{'contains' if contains else 'does not contain'} {needle!r} (casefold)"
+        )
     elif kind == "contains_any":
         haystack = target_text.lower() if target_text is not None else ""
         matched = [needle for needle in check["texts"] if needle.lower() in haystack]
@@ -656,6 +893,14 @@ def _evaluate_check(
         contains = check["text"] in debug_log_text
         passed = contains if kind == "debug_log_contains" else not contains
         detail = f"debug log {'contains' if contains else 'does not contain'} {check['text']!r}"
+    elif kind in {"debug_tool_input_contains", "debug_tool_input_not_contains"}:
+        inputs = _debug_tool_inputs(debug_log_text, check["tool"])
+        contains = any(check["text"] in item for item in inputs)
+        passed = contains if kind == "debug_tool_input_contains" else not contains
+        detail = (
+            f"{check['tool']} inputs {'contain' if contains else 'do not contain'} "
+            f"{check['text']!r} across {len(inputs)} call(s)"
+        )
     elif kind == "assistant_contains":
         contains = target_text is not None and check["text"] in target_text
         passed = contains
@@ -670,6 +915,56 @@ def _evaluate_check(
         "detail": detail,
         "evaluator_error": read_error,
     }
+
+
+def _debug_tool_inputs(debug_log: str, tool_name: str) -> List[str]:
+    """Extract complete model-supplied JSON inputs for one tool from debug logs.
+
+    The stream logger emits a `tool_use complete ... name=X` line followed by
+    `tool_use input_json=...`. Large JSON strings may continue on physical
+    lines, so collect until the next structured log prefix. This intentionally
+    ignores model thinking/text deltas: a retrieval contract concerns the
+    query actually sent to the tool, not vocabulary the model considered and
+    rejected in hidden reasoning.
+    """
+    clean = ANSI_RE.sub("", debug_log)
+    complete_re = re.compile(
+        r"tool_use complete id=\S+ name=([A-Za-z0-9_]+) input_bytes=\d+"
+    )
+    log_prefix_re = re.compile(r"^\[(?:DEBUG|INFO|WARN|ERROR)\b")
+    marker = "tool_use input_json="
+    pending_tool: Optional[str] = None
+    collecting_tool: Optional[str] = None
+    payload: List[str] = []
+    collected: List[Tuple[str, str]] = []
+
+    def flush() -> None:
+        nonlocal collecting_tool, payload
+        if collecting_tool is not None:
+            collected.append((collecting_tool, "\n".join(payload)))
+        collecting_tool = None
+        payload = []
+
+    for line in clean.splitlines():
+        match = complete_re.search(line)
+        if match:
+            flush()
+            pending_tool = match.group(1)
+            continue
+        marker_pos = line.find(marker)
+        if marker_pos >= 0 and pending_tool is not None:
+            flush()
+            collecting_tool = pending_tool
+            pending_tool = None
+            payload = [line[marker_pos + len(marker) :]]
+            continue
+        if collecting_tool is not None:
+            if log_prefix_re.match(line):
+                flush()
+            else:
+                payload.append(line)
+    flush()
+    return [value for name, value in collected if name == tool_name]
 
 
 def _trajectory_judgement(
@@ -836,7 +1131,10 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
     text, artifact_error = _read_regular_text_capped(path, MAX_NATIVE_EVENT_BYTES)
     if artifact_error is not None or text is None:
         return None, artifact_error
+    if text and not text.endswith("\n"):
+        return None, "native event artifact ends with a partial line"
     events: List[Tuple[str, Dict[str, Any], int, str]] = []
+    event_elapsed_ns: List[int] = []
     try:
         for line_no, line in enumerate(text.splitlines(), 1):
             if not line.strip():
@@ -850,9 +1148,11 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
             kind, payload = next(iter(tagged.items()))
             known_kinds = {
                 "run_started",
+                "scoped_recall",
                 "turn_started",
                 "turn_finished",
                 "model_request_finished",
+                "compact_request_finished",
                 "tool_stage_finished",
                 "tool_started",
                 "tool_finished",
@@ -863,6 +1163,7 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
                 "cache_break",
                 "continuation",
                 "auto_compact",
+                "context_projection",
                 "run_finished",
             }
             if kind not in known_kinds:
@@ -877,7 +1178,15 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
                 raise ValueError(f"line {line_no}: invalid sequence")
             if not isinstance(session_id, str) or not session_id:
                 raise ValueError(f"line {line_no}: invalid session_id")
+            monotonic_elapsed_ns = envelope.get("monotonic_elapsed_ns")
+            if (
+                not isinstance(monotonic_elapsed_ns, int)
+                or isinstance(monotonic_elapsed_ns, bool)
+                or monotonic_elapsed_ns < 0
+            ):
+                raise ValueError(f"line {line_no}: invalid monotonic_elapsed_ns")
             events.append((kind, payload, sequence, session_id))
+            event_elapsed_ns.append(monotonic_elapsed_ns)
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         return None, str(exc)
     if not events:
@@ -918,6 +1227,20 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
         or metadata["trial"] < 0
     ):
         return None, "run_started metadata has invalid trial"
+    max_metered_tokens = metadata.get("max_metered_tokens")
+    max_cost_usd = metadata.get("max_cost_usd")
+    if (max_metered_tokens is None) != (max_cost_usd is None):
+        return None, "run_started metadata has incomplete runtime budget"
+    if max_metered_tokens is not None and (
+        not isinstance(max_metered_tokens, int)
+        or isinstance(max_metered_tokens, bool)
+        or max_metered_tokens <= 0
+        or not isinstance(max_cost_usd, (int, float))
+        or isinstance(max_cost_usd, bool)
+        or not math.isfinite(float(max_cost_usd))
+        or float(max_cost_usd) <= 0
+    ):
+        return None, "run_started metadata has invalid runtime budget"
     identity_keys = {
         "run_id",
         "trial",
@@ -936,6 +1259,8 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
         "runtime_permission_mode",
         "environment_fingerprint",
         "grader_fingerprint",
+        "max_metered_tokens",
+        "max_cost_usd",
     }
     for start in starts[1:]:
         other = start.get("metadata", {})
@@ -953,6 +1278,7 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
             "turn_started": ("depth", "turn"),
             "turn_finished": ("depth", "turn", "tool_calls"),
             "model_request_finished": ("depth", "turn", "attempt", "elapsed_ms"),
+            "compact_request_finished": ("depth", "turn", "elapsed_ms"),
             "tool_stage_finished": ("depth", "turn", "tool_calls", "elapsed_ms"),
             "tool_started": ("input_bytes",),
             "tool_finished": ("elapsed_ms", "result_bytes"),
@@ -968,7 +1294,18 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
             "cache_break": ("depth", "cache_read", "cache_creation"),
             "continuation": ("depth", "n", "max"),
             "auto_compact": ("dropped", "kept", "before_tokens", "after_tokens"),
+            "context_projection": (
+                "changed_items",
+                "bytes_before",
+                "bytes_after",
+                "active_messages",
+            ),
             "run_finished": ("depth", "turns", "tool_calls", "wall_time_ms", "dropped_events"),
+            "scoped_recall": (
+                "result_count",
+                "injected_count",
+                "injected_bytes",
+            ),
         }.get(kind, ())
         for field in integer_fields:
             value = payload.get(field)
@@ -982,6 +1319,32 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
                 or cost < 0
             ):
                 return None, "usage has invalid estimated_cost_usd"
+        if kind == "scoped_recall":
+            if payload.get("schema_version") != "metacodes-scoped-recall-v1":
+                return None, "scoped_recall has unsupported schema_version"
+            status = payload.get("status")
+            if status not in {
+                "injected",
+                "disabled",
+                "kg_not_ready",
+                "no_user_text",
+                "query_too_short",
+                "search_error",
+                "no_hits",
+                "below_floor",
+            }:
+                return None, "scoped_recall has invalid status"
+            for field in ("query_sha256", "injection_sha256"):
+                digest = payload.get(field)
+                if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                    return None, f"scoped_recall has invalid {field}"
+            injected = status == "injected"
+            if injected != (
+                payload.get("injected_count", 0) > 0
+                and payload.get("injected_bytes", 0) > 0
+                and payload.get("injection_sha256") != "0" * 64
+            ):
+                return None, "scoped_recall injection fields contradict status"
         if kind == "tool_finished" and not isinstance(payload.get("is_error"), bool):
             return None, "tool_finished has invalid is_error"
         if kind == "policy_decision":
@@ -989,10 +1352,28 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
                 return None, "policy_decision has invalid allowed"
             if not isinstance(payload.get("id"), str) or not payload.get("id"):
                 return None, "policy_decision has invalid id"
-        if kind == "model_request_finished" and not isinstance(
+        if kind in {"model_request_finished", "compact_request_finished"} and not isinstance(
             payload.get("outcome"), str
         ):
-            return None, "model_request_finished has invalid outcome"
+            return None, f"{kind} has invalid outcome"
+        if kind == "compact_request_finished" and (
+            not isinstance(payload.get("cause"), str) or not payload.get("cause")
+        ):
+            return None, "compact_request_finished has invalid cause"
+        if kind == "context_projection":
+            projection_kind = payload.get("kind")
+            if projection_kind not in {
+                "large_tool_result_truncation",
+                "stale_tool_result_microcompact",
+            }:
+                return None, "context_projection has invalid kind"
+            if (
+                payload.get("changed_items", 0) < 1
+                or payload.get("bytes_after", 0) >= payload.get("bytes_before", 0)
+                or not isinstance(payload.get("cause"), str)
+                or not payload.get("cause")
+            ):
+                return None, "context_projection does not describe a real reduction"
         if kind == "run_finished" and (
             not isinstance(payload.get("stop_reason"), str)
             or not payload.get("stop_reason")
@@ -1013,6 +1394,8 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
     stop_reasons: List[str] = []
     dropped_events_total = 0
     dropped_events_max = 0
+    incomplete_trace_ids: set[str] = set()
+    last_trace_id = str(events[-1][1].get("trace_id", ""))
     for trace_id, trace in trace_events.items():
         sequences = [event[2] for event in trace]
         if sequences != list(range(len(sequences))):
@@ -1022,23 +1405,36 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
             structural_errors.append(f"trace {trace_id}: session_id changed")
         trace_starts = [payload for kind, payload, _seq, _session in trace if kind == "run_started"]
         trace_finishes = [payload for kind, payload, _seq, _session in trace if kind == "run_finished"]
-        if len(trace_starts) != 1 or len(trace_finishes) != 1:
+        if len(trace_starts) != 1:
             structural_errors.append(
-                f"trace {trace_id}: expected one run_started and one run_finished"
+                f"trace {trace_id}: expected one run_started"
             )
             continue
-        if trace[0][0] != "run_started" or trace[-1][0] != "run_finished":
+        incomplete = len(trace_finishes) == 0 and trace_id == last_trace_id
+        if incomplete:
+            incomplete_trace_ids.add(trace_id)
+        elif len(trace_finishes) != 1:
+            structural_errors.append(
+                f"trace {trace_id}: expected one run_finished"
+            )
+            continue
+        if trace[0][0] != "run_started" or (not incomplete and trace[-1][0] != "run_finished"):
             structural_errors.append(
                 f"trace {trace_id}: run lifecycle does not bound the trace"
             )
-        reason = str(trace_finishes[0].get("stop_reason", "unknown"))
+        reason = (
+            "incomplete"
+            if incomplete
+            else str(trace_finishes[0].get("stop_reason", "unknown"))
+        )
         stop_reasons.append(reason)
-        dropped = trace_finishes[0].get("dropped_events")
-        if not isinstance(dropped, int) or dropped < 0:
-            structural_errors.append(f"trace {trace_id}: invalid dropped_events")
-        else:
-            dropped_events_total += dropped
-            dropped_events_max = max(dropped_events_max, dropped)
+        if not incomplete:
+            dropped = trace_finishes[0].get("dropped_events")
+            if not isinstance(dropped, int) or dropped < 0:
+                structural_errors.append(f"trace {trace_id}: invalid dropped_events")
+            else:
+                dropped_events_total += dropped
+                dropped_events_max = max(dropped_events_max, dropped)
 
         started_tools: Dict[Tuple[str, str], Tuple[str, int]] = {}
         finished_tools: Dict[
@@ -1059,7 +1455,7 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
                 started_tools[key] = (name, sequence)
             else:
                 finished_tools[key] = (name, sequence, payload)
-        if set(started_tools) != set(finished_tools):
+        if not incomplete and set(started_tools) != set(finished_tools):
             structural_errors.append(f"trace {trace_id}: unpaired tool lifecycle")
         for key in set(started_tools) & set(finished_tools):
             started_name, started_sequence = started_tools[key]
@@ -1111,12 +1507,32 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
     model_requests = [
         payload for kind, payload, _seq, _session in events if kind == "model_request_finished"
     ]
+    compact_requests = [
+        payload
+        for kind, payload, _seq, _session in events
+        if kind == "compact_request_finished"
+    ]
+    all_model_requests = model_requests + compact_requests
     tool_stages = [
         payload for kind, payload, _seq, _session in events if kind == "tool_stage_finished"
     ]
     tool_starts = [payload for kind, payload, _seq, _session in events if kind == "tool_started"]
     tool_finishes = [payload for kind, payload, _seq, _session in events if kind == "tool_finished"]
     policies = [payload for kind, payload, _seq, _session in events if kind == "policy_decision"]
+    scoped_recalls = [
+        payload for kind, payload, _seq, _session in events if kind == "scoped_recall"
+    ]
+    context_projections = [
+        payload for kind, payload, _seq, _session in events if kind == "context_projection"
+    ]
+    cache_breaks = [
+        payload for kind, payload, _seq, _session in events if kind == "cache_break"
+    ]
+    auto_compacts = [
+        payload for kind, payload, _seq, _session in events if kind == "auto_compact"
+    ]
+    if len(scoped_recalls) > len(starts):
+        return None, "native trace has more scoped recall receipts than invocations"
     failures = [item for item in tool_finishes if item.get("is_error")]
     model_failures = [
         item
@@ -1136,10 +1552,12 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
     policy_violations = _count_policy_violations(tool_starts, policies)
     model_request_outcomes = {
         outcome: sum(
-            1 for item in model_requests if str(item.get("outcome", "unknown")) == outcome
+            1
+            for item in all_model_requests
+            if str(item.get("outcome", "unknown")) == outcome
         )
         for outcome in sorted(
-            {str(item.get("outcome", "unknown")) for item in model_requests}
+            {str(item.get("outcome", "unknown")) for item in all_model_requests}
         )
     }
     failed_model_requests = sum(
@@ -1150,13 +1568,38 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
         for outcome, count in model_request_outcomes.items()
         if outcome in {"api_error", "stream_error"}
     )
-    complete = True
-    wall_time_ms = sum(int(item.get("wall_time_ms", 0)) for item in finishes)
+    complete = not incomplete_trace_ids
+    partial_wall_time_ms = sum(
+        max(
+            (
+                elapsed_ns
+                for event, elapsed_ns in zip(events, event_elapsed_ns)
+                if event[1].get("trace_id") == trace_id
+            ),
+            default=0,
+        )
+        // 1_000_000
+        for trace_id in incomplete_trace_ids
+    )
+    wall_time_ms = (
+        sum(int(item.get("wall_time_ms", 0)) for item in finishes)
+        + partial_wall_time_ms
+    )
     model_request_time_ms = (
-        sum(int(item.get("elapsed_ms", 0)) for item in model_requests)
-        if model_requests
+        sum(int(item.get("elapsed_ms", 0)) for item in all_model_requests)
+        if all_model_requests
         else None
     )
+    compact_request_outcomes = {
+        outcome: sum(
+            1
+            for item in compact_requests
+            if str(item.get("outcome", "unknown")) == outcome
+        )
+        for outcome in sorted(
+            {str(item.get("outcome", "unknown")) for item in compact_requests}
+        )
+    }
     total_tool_calls = sum(int(item.get("tool_calls", 0)) for item in finishes)
     tool_stage_time_ms = (
         sum(int(item.get("elapsed_ms", 0)) for item in tool_stages)
@@ -1191,8 +1634,20 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
         "wall_time_ms": wall_time_ms,
         "model_header_latency_ms": None,
         "model_request_time_ms": model_request_time_ms,
-        "model_request_count": len(model_requests) if model_requests else None,
-        "model_request_outcomes": model_request_outcomes if model_requests else None,
+        "model_request_count": len(all_model_requests) if all_model_requests else None,
+        "model_request_outcomes": model_request_outcomes if all_model_requests else None,
+        "compact_request_count": len(compact_requests),
+        "compact_request_time_ms": sum(
+            int(item.get("elapsed_ms", 0)) for item in compact_requests
+        ),
+        "compact_request_outcomes": compact_request_outcomes,
+        "cache_break_count": len(cache_breaks),
+        "auto_compact_event_count": len(auto_compacts),
+        "context_projection_count": len(context_projections),
+        "context_projected_bytes": sum(
+            int(item["bytes_before"]) - int(item["bytes_after"])
+            for item in context_projections
+        ),
         "tool_time_ms": tool_time_ms,
         "tool_stage_time_ms": tool_stage_time_ms,
         "tool_parallelism_factor": tool_parallelism_factor,
@@ -1222,6 +1677,13 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
         "policy_decisions": len(policies),
         "retries": sum(1 for kind, _payload, _seq, _session in events if kind == "retry"),
         "tool_distribution": starts_by_tool,
+        "scoped_recall_count": len(scoped_recalls),
+        "scoped_recall_injected_count": sum(
+            int(item.get("injected_count", 0)) for item in scoped_recalls
+        ),
+        "scoped_recall_injected_bytes": sum(
+            int(item.get("injected_bytes", 0)) for item in scoped_recalls
+        ),
     }
     return {
         "metadata": metadata,
@@ -1241,6 +1703,7 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
             }
             for item in failures
         ],
+        "scoped_recalls": scoped_recalls,
     }, None
 
 
@@ -1340,7 +1803,7 @@ def import_run(
         task_fingerprint_provenance = "inferred_from_current_suite"
         rollout_run_id = f"{run_dir.name}:{task_id}:0"
         rollout_trial = 0
-        grader_fingerprint = _grader_fingerprint(task)
+        grader_fingerprint = _grader_fingerprint(task, repo_root)
         if native is not None:
             native_meta = native["metadata"]
             metrics = native["metrics"]
@@ -1362,6 +1825,11 @@ def import_run(
                 "permission_mode": native_meta["permission_mode"],
                 "environment_fingerprint": native_meta["environment_fingerprint"],
             }
+            if native_meta.get("max_metered_tokens") is not None:
+                harness["runtime_budget"] = {
+                    "max_metered_tokens": native_meta["max_metered_tokens"],
+                    "max_cost_usd": native_meta["max_cost_usd"],
+                }
             identity_matches = (
                 native_meta.get("suite_id") == suite["suite_id"]
                 and native_meta.get("task_id") == task_id
@@ -1371,7 +1839,7 @@ def import_run(
                 and native_meta.get("runtime_permission_mode")
                 == native_meta.get("permission_mode")
                 and grader_fingerprint
-                == _grader_fingerprint(task)
+                == _grader_fingerprint(task, repo_root)
             )
             readiness_checks.append(
                 {
@@ -1382,7 +1850,13 @@ def import_run(
             )
 
         outcome_checks = [
-            _evaluate_check(check, workspace, log_text, debug_text)
+            _evaluate_check(
+                check,
+                workspace,
+                log_text,
+                debug_text,
+                repo_root=repo_root,
+            )
             for check in task["success"]["checks"]
         ]
         evaluator_errors = [

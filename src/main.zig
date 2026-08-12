@@ -19,8 +19,13 @@ pub const api_provider = @import("api/provider.zig");
 pub const api_provider_factory = @import("api/provider_factory.zig");
 pub const api_capability = @import("api/capability.zig");
 pub const api_cache = @import("api/cache.zig");
+pub const api_http_status = @import("api/http_status.zig");
 pub const api_openai = @import("api/openai_client.zig");
 pub const api_gemini = @import("api/gemini_client.zig");
+pub const api_dialect = @import("api/dialect.zig");
+pub const api_request = @import("api/request.zig");
+pub const api_request_overrides = @import("api/request_overrides.zig");
+pub const model_adapter = @import("api/model_adapter.zig");
 pub const client_mod = client; // alias for L2 component tests
 pub const types_mod = types;
 pub const json_mod = @import("json.zig");
@@ -35,6 +40,7 @@ pub const tool_catalog = @import("core/tool_catalog.zig");
 pub const workspace_policy = @import("core/workspace_policy.zig");
 pub const core_subagent = @import("core/subagent.zig");
 pub const agent_job_registry = @import("core/agent_job_registry.zig");
+pub const job_registry = @import("core/job_registry.zig");
 pub const util_time = @import("util/time.zig");
 pub const tools = @import("tools.zig");
 pub const tool_prompt_ctx = @import("tools/prompt_context.zig");
@@ -56,7 +62,16 @@ pub const kg_inject = @import("kg/inject.zig");
 pub const kg_scoped_recall = @import("kg/scoped_recall.zig");
 pub const abort = @import("util/abort.zig");
 pub const kg_plan_commit = @import("kg/plan_commit.zig");
+pub const kg_plan_view = @import("kg/plan_view.zig");
+pub const kg_task_projection = @import("kg/task_projection.zig");
+pub const formal_runtime = @import("formal/runtime.zig");
+pub const formal_artifact_store = @import("formal/artifact_store.zig");
+pub const formal_provenance = @import("formal/provenance.zig");
+pub const formal_task_audit = @import("formal/task_audit.zig");
+pub const formal_memory_migration = @import("formal/memory_migration.zig");
+pub const formal_artifact_verification = @import("formal/artifact_verification.zig");
 pub const kg_tools = @import("tools/kg_tools.zig");
+pub const kg_lexical_query_plan = @import("kg/lexical_query_plan.zig");
 pub const core_goal = @import("core/goal.zig");
 pub const core_auth = auth;
 pub const core_read_state = @import("core/read_state.zig");
@@ -71,6 +86,7 @@ pub const repl_headless = @import("repl/headless.zig");
 pub const repl_loop = @import("repl/loop.zig");
 pub const app_module = @import("app.zig");
 pub const tool_context = @import("tools/context.zig");
+pub const project_rule_gate_protocol = @import("tools/project_rule_gate.zig");
 pub const tool_error = @import("core/tool_error.zig");
 pub const bash = @import("tools/bash.zig");
 pub const grep = @import("tools/grep.zig");
@@ -118,6 +134,23 @@ pub const suspend_state = @import("core/suspend_state.zig");
 pub const tee_backend = @import("core/tee_backend.zig");
 pub const diagnostics_backend = @import("core/diagnostics_backend.zig");
 pub const evaluation_backend = @import("core/evaluation_backend.zig");
+pub const tool_observation_journal = @import("core/tool_observation_journal.zig");
+pub const rule_impact_stats = @import("core/rule_impact_stats.zig");
+pub const rule_impact_evidence = @import("core/rule_impact_evidence.zig");
+pub const rule_impact_receipt = @import("core/rule_impact_receipt.zig");
+pub const rule_impact_aggregate_receipt = @import("core/rule_impact_aggregate_receipt.zig");
+pub const ontology_rule_projection = @import("core/ontology_rule_projection.zig");
+pub const rule_author = @import("core/rule_author.zig");
+pub const rule_source_receipt = @import("core/rule_source_receipt.zig");
+pub const project_rule_spec = @import("core/project_rule_spec.zig");
+pub const rule_candidate = @import("core/rule_candidate.zig");
+pub const rule_lifecycle = @import("core/rule_lifecycle.zig");
+pub const rule_build_bundle = @import("core/rule_build_bundle.zig");
+pub const rule_evaluation = @import("core/rule_evaluation.zig");
+pub const project_harness_runtime = @import("formal/project_harness_runtime.zig");
+pub const project_rule_bundle = @import("core/project_rule_bundle.zig");
+pub const project_rule_gate = @import("core/project_rule_gate.zig");
+pub const project_rule_activation = @import("core/project_rule_activation.zig");
 pub const repl_msg_queue = @import("repl/msg_queue.zig");
 pub const web_journal = @import("web/journal.zig");
 pub const web_backend = @import("web/backend.zig");
@@ -258,6 +291,13 @@ pub fn main(init: std.process.Init) !void {
     if (config.record_dir == null) {
         if (std.c.getenv("METACODES_RECORD_DIR")) |c| config.record_dir = std.mem.span(c);
     }
+    if (std.c.getenv("METACODES_LONG_HORIZON_ARM")) |c| {
+        const value = std.mem.span(c);
+        config.long_horizon_arm = types.LongHorizonArm.parse(value) orelse {
+            std.debug.print("error: invalid METACODES_LONG_HORIZON_ARM '{s}'\n", .{value});
+            std.process.exit(2);
+        };
+    }
 
     // --- provider 选择:env METACODES_PROVIDER 显式优先,否则据 model 前缀推断 ---
     // (gpt*/o1*/o3* → openai,gemini* → gemini)。只在此组装层据此选 Client;core/UI 零感知。
@@ -281,7 +321,9 @@ pub fn main(init: std.process.Init) !void {
     // --- record/replay cassette 录制目录(Stage 7)---
     if (config.record_dir) |dir| recorder.setDir(dir);
 
-    var resolved_credential = auth.resolveCredential(allocator, config.api_key, config.auth_precedence) catch |err| {
+    // Runtime resolution consumes one-shot FD authority before App/job/tool
+    // subprocesses exist. Ordinary env auth retains legacy teammate inheritance.
+    var resolved_credential = auth.resolveRuntimeCredential(allocator, config.api_key, config.auth_precedence) catch |err| {
         @import("util/log.zig").err("auth", "credential resolution failed: {s}", .{@errorName(err)});
         std.debug.print(
             \\Authentication required.
@@ -376,14 +418,20 @@ pub fn main(init: std.process.Init) !void {
 
     // U8:`--resume-response <json>` → 恢复挂起的 session(read suspend.json→resumeRun),不进 REPL。
     if (config.resume_response) |resp| {
-        const code = @import("repl/headless.zig").resumeSuspended(app, allocator, resp, config.json_output) catch 1;
+        const code = @import("repl/headless.zig").resumeSuspended(app, allocator, resp, config.json_output) catch |err| blk: {
+            std.debug.print("error: headless resume setup failed: {s}\n", .{@errorName(err)});
+            break :blk 1;
+        };
         app.deinit(); // 同上:reap MCP/LSP 子进程(恢复运行已结束,quiescent)
         std.process.exit(code);
     }
 
     // Headless 模式：`-p "..."` / stdin pipe → 跑单次 prompt 后退出，不进 REPL。
     if (config.prompt) |p| {
-        const code = @import("repl/headless.zig").run(app, allocator, p, config.json_output) catch 1;
+        const code = @import("repl/headless.zig").run(app, allocator, p, config.json_output) catch |err| blk: {
+            std.debug.print("error: headless setup failed: {s}\n", .{@errorName(err)});
+            break :blk 1;
+        };
         app.deinit(); // 同上:headless 一样跑 MCP/LSP,同款孤儿病(agent loop 已结束,quiescent)
         std.process.exit(code);
     }
@@ -779,7 +827,7 @@ fn applyStoredLoginSelection(allocator: std.mem.Allocator, config: *types.Config
 
 fn isUsableConfiguredSession(config: types.Config, source: auth.CredentialSource) bool {
     return switch (source) {
-        .cli_api_key, .env_api_key => true,
+        .cli_api_key, .fd_api_key, .env_api_key => true,
         .stored_api_key => config.model_explicit and config.reasoning_effort != null,
         .stored_oauth => false,
     };
@@ -806,6 +854,22 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             }
         } else if (std.mem.eql(u8, arg, "--reasoning-effort") or std.mem.eql(u8, arg, "--thinking")) {
             if (args.next()) |e| config.reasoning_effort = types.ReasoningEffort.parse(e);
+        } else if (std.mem.eql(u8, arg, "--temperature")) {
+            if (args.next()) |s| config.temperature = std.fmt.parseFloat(f32, s) catch null;
+        } else if (std.mem.eql(u8, arg, "--top-p")) {
+            if (args.next()) |s| config.top_p = std.fmt.parseFloat(f32, s) catch null;
+        } else if (std.mem.eql(u8, arg, "--prompt-cache-key")) {
+            if (args.next()) |s| config.prompt_cache_key = allocator.dupe(u8, s) catch s;
+        } else if (std.mem.eql(u8, arg, "--parallel-tool-calls")) {
+            if (args.next()) |s| {
+                if (std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "1")) config.parallel_tool_calls = true else if (std.mem.eql(u8, s, "false") or std.mem.eql(u8, s, "0")) config.parallel_tool_calls = false;
+            }
+        } else if (std.mem.eql(u8, arg, "--response-format")) {
+            if (args.next()) |s| {
+                if (std.mem.eql(u8, s, "json_object") or std.mem.eql(u8, s, "json_schema")) {
+                    config.response_format = allocator.dupe(u8, s) catch s;
+                }
+            }
         } else if (std.mem.eql(u8, arg, "--api-key")) {
             if (args.next()) |k| config.api_key = allocator.dupe(u8, k) catch k;
         } else if (std.mem.eql(u8, arg, "--permission") or std.mem.eql(u8, arg, "--permission-mode")) {
@@ -969,6 +1033,11 @@ fn printHelp() void {
         \\  --resume-response <j> Resume a suspended session with a late tool response (@file to read from a file)
         \\  --model <model>       Model (default: claude-sonnet-4-20250514)
         \\  --reasoning-effort <e> none|minimal|low|medium|high|xhigh
+        \\  --temperature <f>    Override sampling temperature (dialect-gated fields)
+        \\  --top-p <f>          Override nucleus sampling top_p
+        \\  --prompt-cache-key <k>  Kimi K2.6 cache hint (gated by dialect capability)
+        \\  --parallel-tool-calls <bool>  Mistral explicit parallel tools (dialect-gated)
+        \\  --response-format <json_object|json_schema>  Structured output (dialect-gated)
         \\  --api-key <key>       API key (overrides stored credentials by default)
         \\  --permission <mode>   default | acceptEdits | plan | auto | dontAsk | bypassPermissions
         \\  --settings <path>     Extra settings JSON (CLI layer)

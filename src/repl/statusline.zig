@@ -51,12 +51,22 @@ pub fn render(app: *const app_mod.App) void {
     const team_seg = teamSegmentFor(app.swarm.teammates, &tb);
     extra = std.fmt.bufPrint(&extra_buf, "{s}{s}", .{ jobs_seg, team_seg }) catch jobs_seg;
 
+    // effort 段:非 null 时显示在 model 后(对齐 plan 模式的显式努力档位)。
+    // 读 config.reasoning_effort(直接字段,render 是 *const App,不能调 provider())。
+    const effort = app.config.reasoning_effort;
+    var eb: [16]u8 = undefined;
+    const effort_seg: []const u8 = if (effort) |e|
+        std.fmt.bufPrint(&eb, " | {s}", .{@tagName(e)}) catch ""
+    else
+        "";
+
     // 一次性拼接成一行(theme.dim + 内容 + reset + 换行)再写
     const th = app.theme;
     var line_buf: [384]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "{s}[{s} | {s} | {s} tok | ${d:.4}{s}]{s}\n", .{
+    const line = std.fmt.bufPrint(&line_buf, "{s}[{s}{s} | {s} | {s} tok | ${d:.4}{s}]{s}\n", .{
         th.dim,
         app.activeModel(),
+        effort_seg,
         mode_str,
         tok_str,
         cost,

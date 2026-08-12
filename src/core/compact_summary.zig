@@ -175,6 +175,7 @@ pub fn summarizeAbortable(
                 defer allocator.free(bytes);
                 text.appendSlice(allocator, bytes) catch return null;
             },
+            .thinking => |bytes| allocator.free(bytes), // 思考过程不进 summary
             .usage => |delta| accumulateUsage(usage_out, delta),
             .tool_use_start => |tool| {
                 allocator.free(tool.id);

@@ -6,7 +6,9 @@
 //! 纪律(全部实证,见设计 §9 原语核对表):
 //! - spawn 超时 35s **必须大于** tinykg 30s 目录锁超时——绝不在锁等待中 killpg
 //!   制造无主锁(无主锁要等满 30s 才能被下一个调用者回收)。
-//! - 版本门:store-info 的 storage_format_version 必须 = 2;不符 → degraded,
+//! - 版本门:store-info 的 storage_format_version 必须 = 2、schema_version 必须 = 3;
+//!   manifest-less legacy store 在 host migration lock 下自动 copy-on-write 迁移并保留
+//!   rollback backup；其它不匹配（包括 schema v2）仍明确 degraded。
 //!   绝不用不匹配的二进制碰 store(格式 skew 实证:直接 FileNotFound/损坏风险)。
 //! - degraded 后不再 spawn:后续调用直接返回降级说明(防反复失败撞熔断器)。
 //! - KG 是增强非依赖:任何失败都不影响 cc-zig 其余功能。
@@ -21,8 +23,11 @@ const sync = @import("platform").sync;
 const common = @import("../tools/common.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const log = @import("../util/log.zig");
+const execution_knowledge = @import("execution_knowledge.zig");
+const file_lock = @import("../swarm/file_lock.zig");
 
 pub const EXPECTED_STORAGE_FORMAT_VERSION = "2";
+pub const EXPECTED_SCHEMA_VERSION = "3";
 /// > tinykg 目录锁 30s 超时(cli.zig:1733-1857)。
 pub const SPAWN_TIMEOUT_MS: u64 = 35_000;
 const TRANSIENT_RETRIES: u32 = 2;
@@ -112,6 +117,7 @@ fn isValidCustomSchemaType(t: []const u8) bool {
 
 pub const FrontierRow = struct {
     task_id: u64,
+    status: TaskStatus = .open,
     readiness: Readiness,
     /// v2 深遍历角色:leaf=可执行叶子(child_task)/ branch=开放复合节点(branch_task,
     /// 有开放子任务,靠子树闭合而闭合)/ related=关联任务(related_task,单层)。
@@ -122,12 +128,32 @@ pub const FrontierRow = struct {
     text: []u8, // owned(unescaped)
 
     pub const Readiness = enum { ready, blocked, missing_dependencies };
-    pub const Role = enum { leaf, branch, related };
+    pub const Role = enum { leaf, branch, related, failed, related_failed };
 
     pub fn deinit(self: *const FrontierRow, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
         if (self.claimed_by) |c| allocator.free(c);
         if (self.path) |p| allocator.free(p);
+    }
+};
+
+/// TinyKG 的 canonical task 生命周期。kind 与生命周期正交，task id 从创建到终态
+/// 始终可用于 task-packet / task-ancestry。
+pub const TaskStatus = enum {
+    open,
+    claimed,
+    completed,
+    failed,
+
+    pub fn parse(raw: []const u8) ?TaskStatus {
+        inline for (@typeInfo(TaskStatus).@"enum".fields) |field| {
+            if (std.mem.eql(u8, raw, field.name)) return @enumFromInt(field.value);
+        }
+        return null;
+    }
+
+    pub fn isTerminal(self: TaskStatus) bool {
+        return self == .completed or self == .failed;
     }
 };
 
@@ -178,6 +204,10 @@ pub const KgClient = struct {
     /// 人类需知道"有料可结晶"才会去 /kg refs 审阅/确认,否则 tentative 边永远无人 crystallize）。
     /// cache_mu 保护;over-inclusive 无害(是"去看看"的提示,真相以 /kg refs 当场查为准)。
     pending_ref_tasks: std.AutoHashMap(u64, void) = undefined,
+    /// 宿主观测的成功执行事实。只保存 bounded task/relation/sanitized-label，
+    /// 不保存命令、query、工具正文或结果；与其它 session 缓存共用 cache_mu，
+    /// 因为主 loop 的 arena allocator 本身不保证多线程安全。
+    execution_ledger: execution_knowledge.Ledger = undefined,
     /// project 三锚 id 缓存(乙方案):[scope_global 0/1][AnchorKind]。写路径 lazy ensure;
     /// 失效纪律同 project 缓存:挂接失败清对应槽,下次写重新 ensure(stale 自愈)。
     anchor_ids: [2][3]?u64 = .{ .{ null, null, null }, .{ null, null, null } },
@@ -206,6 +236,7 @@ pub const KgClient = struct {
         while (kit.next()) |k| self.allocator.free(k.*);
         self.scoped_types.deinit();
         self.pending_ref_tasks.deinit();
+        self.execution_ledger.deinit();
     }
 
     // ── 路径解析(设计 §1 D2)─────────────────────────────────────────
@@ -240,6 +271,7 @@ pub const KgClient = struct {
             .domain = domain,
             .scoped_types = std.StringHashMap(void).init(allocator),
             .pending_ref_tasks = std.AutoHashMap(u64, void).init(allocator),
+            .execution_ledger = execution_knowledge.Ledger.init(allocator),
         };
     }
 
@@ -280,6 +312,48 @@ pub const KgClient = struct {
         var it = self.pending_ref_tasks.keyIterator();
         while (it.next()) |k| : (i += 1) out[i] = k.*;
         return out;
+    }
+
+    /// Record only a host-authorized, successful tool invocation against the
+    /// one active persistent task selected by the caller. This is best-effort:
+    /// bounded drops are counted in the ledger and surfaced at task closure.
+    pub fn observeSuccessfulExecution(
+        self: *KgClient,
+        task_id: u64,
+        tool_name: []const u8,
+        input_json: []const u8,
+        project_dir: []const u8,
+    ) void {
+        self.cacheLock();
+        defer self.cacheUnlock();
+        self.execution_ledger.observeSuccessfulTool(task_id, tool_name, input_json, project_dir);
+    }
+
+    pub fn executionKnowledgeSnapshot(
+        self: *KgClient,
+        allocator: std.mem.Allocator,
+        task_id: u64,
+    ) !execution_knowledge.Snapshot {
+        self.cacheLock();
+        defer self.cacheUnlock();
+        return self.execution_ledger.snapshot(allocator, task_id);
+    }
+
+    pub fn acknowledgeExecutionFact(
+        self: *KgClient,
+        task_id: u64,
+        relation: execution_knowledge.Relation,
+        value: []const u8,
+    ) bool {
+        self.cacheLock();
+        defer self.cacheUnlock();
+        return self.execution_ledger.acknowledge(task_id, relation, value);
+    }
+
+    pub fn pendingExecutionFacts(self: *KgClient, task_id: u64) usize {
+        self.cacheLock();
+        defer self.cacheUnlock();
+        return self.execution_ledger.pendingForTask(task_id);
     }
 
     fn resolveStorePath(allocator: std.mem.Allocator, opts: ResolveOptions) ![]u8 {
@@ -325,6 +399,8 @@ pub const KgClient = struct {
                 allocator.free(dev);
             }
         }
+        // tinykg 已内置:build.zig 从 lib/tinykg/src/ 编译到 <prefix>/vendor/tinykg/tinykg,
+        // findVendoredUpward 已能找到。不再兜底 $PATH(内置即基础特性,无需 PATH 查找)。
         return null;
     }
 
@@ -384,10 +460,17 @@ pub const KgClient = struct {
     pub fn ensureReady(self: *KgClient) void {
         if (self.ready) return;
         const bin = self.bin_path orelse {
-            self.setDegraded("tinykg 二进制未找到。跑 `zig build`(会从 lib/tinykg 源交叉编译到 <prefix>/vendor/tinykg/tinykg),或设 METACODES_KG_BIN=<path>(dev 树用 METACODES_KG_DEV=1 显式开启)", .{});
+            self.setDegraded("tinykg 二进制未找到。已查找:vendored(<exe_dir>/vendor/tinykg/,build.zig 从 lib/tinykg/src/ 编译)、METACODES_KG_BIN、METACODES_KG_DEV。修复:跑 `zig build`(从 lib/tinykg 源编译到 vendor/tinykg/),或设 METACODES_KG_BIN=<path>", .{});
             return;
         };
         // store 缺 → init(先建父目录)。
+        if (!dirExists(self.store_path)) {
+            switch (self.recoverInterruptedAutoMigration(bin)) {
+                .not_needed => {},
+                .recovered => {},
+                .failed => return,
+            }
+        }
         if (!dirExists(self.store_path)) {
             ensureParentDir(self.allocator, self.store_path) catch {};
             const out = self.runRaw(&.{ "init", self.store_path }) catch {
@@ -400,23 +483,167 @@ pub const KgClient = struct {
                 return;
             }
         }
-        // 版本门。
+        // 版本门(含 legacy 自动 migrate)。
+        if (!self.checkStoreVersionOrMigrate(bin)) return;
+        self.ready = true;
+        log.info("kg", "ready bin={s} store={s} domain={s}", .{ bin, self.store_path, self.domain });
+    }
+
+    /// 版本门检查;legacy store 自动 migrate 到 v2 后重新验证。true=通过,false=已 setDegraded。
+    fn checkStoreVersionOrMigrate(self: *KgClient, bin: []const u8) bool {
         const out = self.runRaw(&.{ "store-info", self.store_path }) catch {
             self.setDegraded("tinykg store-info 失败(bin={s} store={s})", .{ bin, self.store_path });
-            return;
+            return false;
         };
         defer self.freeOut(out);
         if (out.exit_code != 0) {
             self.setDegraded("tinykg store-info 退出码 {d}: {s}", .{ out.exit_code, trimForLog(out.stderr) });
-            return;
+            return false;
         }
         const ver = extractInfoField(out.stdout, "storage_format_version") orelse "missing";
-        if (!std.mem.eql(u8, ver, EXPECTED_STORAGE_FORMAT_VERSION)) {
-            self.setDegraded("store 格式版本不符:期望 {s} 实际 {s}(bin={s} store={s});见 vendor/tinykg/VERSION.txt,勿混用二进制版本", .{ EXPECTED_STORAGE_FORMAT_VERSION, ver, bin, self.store_path });
-            return;
+        if (std.mem.eql(u8, ver, EXPECTED_STORAGE_FORMAT_VERSION)) {
+            // Normal startup stays one subprocess: the same store-info already carries
+            // schema_version. A second probe here doubled every session's KG startup cost.
+            const schema_ver = extractInfoField(out.stdout, "schema_version") orelse "missing";
+            if (!std.mem.eql(u8, schema_ver, EXPECTED_SCHEMA_VERSION)) {
+                self.setDegraded(
+                    "store schema 版本不符:期望 {s} 实际 {s}(store={s})。不要原地改 canonical store;请先运行 `tinykg migrate-store-v2 {s} <new-store> --task-status-v1 --verify`,核验后再切换 store",
+                    .{ EXPECTED_SCHEMA_VERSION, schema_ver, self.store_path, self.store_path },
+                );
+                return false;
+            }
+            return true;
         }
-        self.ready = true;
-        log.info("kg", "ready bin={s} store={s} domain={s}", .{ bin, self.store_path, self.domain });
+        // storage_format 不符:仅 legacy 自动 migrate,其它版本直接 degraded
+        if (!std.mem.eql(u8, ver, "legacy")) {
+            self.setDegraded("store 格式版本不符:期望 {s} 实际 {s}(bin={s} store={s});非 legacy 无法自动 migrate,见 lib/tinykg/SOURCE.txt", .{ EXPECTED_STORAGE_FORMAT_VERSION, ver, bin, self.store_path });
+            return false;
+        }
+        // legacy → v2 自动 migrate(本机 KG 是基础特性,不应让用户手动跑 tinykg 命令)
+        if (!self.autoMigrateLegacyStore()) {
+            self.setDegraded("store legacy→v2 自动 migrate 失败(bin={s} store={s});手动跑 `tinykg migrate-store-v2 {s} <new> --task-status-v1 --verify` 后替换", .{ bin, self.store_path, self.store_path });
+            return false;
+        }
+        log.info("kg", "legacy→v2 自动 migrate 成功 store={s}", .{self.store_path});
+        // autoMigrateLegacyStore only returns true after probeStore reopens canonical
+        // and sees the exact 2/3 pair; do not add a third redundant subprocess here.
+        return true;
+    }
+
+    const StoreProbe = enum { expected, legacy, incompatible, unavailable };
+    const MigrationRecovery = enum { not_needed, recovered, failed };
+
+    fn probeStore(self: *KgClient, path: []const u8) StoreProbe {
+        const out = self.runRaw(&.{ "store-info", path }) catch return .unavailable;
+        defer self.freeOut(out);
+        if (out.exit_code != 0) return .unavailable;
+        const storage_ver = extractInfoField(out.stdout, "storage_format_version") orelse return .incompatible;
+        const schema_ver = extractInfoField(out.stdout, "schema_version") orelse return .incompatible;
+        if (std.mem.eql(u8, storage_ver, EXPECTED_STORAGE_FORMAT_VERSION) and
+            std.mem.eql(u8, schema_ver, EXPECTED_SCHEMA_VERSION)) return .expected;
+        if (std.mem.eql(u8, storage_ver, "legacy")) return .legacy;
+        return .incompatible;
+    }
+
+    fn migrationBackupPath(self: *KgClient) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}.legacy.bak", .{self.store_path});
+    }
+
+    fn migrationLockTarget(self: *KgClient) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}.metacodes-auto-migrate", .{self.store_path});
+    }
+
+    fn acquireMigrationLock(self: *KgClient) !file_lock.Lock {
+        const target = try self.migrationLockTarget();
+        defer self.allocator.free(target);
+        // tinykg subprocess timeout is 35s. The host lock must not be stolen while that
+        // child is alive, while a crashed holder must still be recoverable within the
+        // waiter's retry budget (~52s > 45s stale threshold).
+        return file_lock.acquire(target, .{ .retries = 520, .stale_ms = 45_000 });
+    }
+
+    /// Crash recovery runs before `init`: if canonical disappeared after legacy→backup,
+    /// resume TinyKG's idempotent migration rather than creating a new empty store.
+    fn recoverInterruptedAutoMigration(self: *KgClient, bin: []const u8) MigrationRecovery {
+        const backup = self.migrationBackupPath() catch {
+            self.setDegraded("legacy migrate recovery path allocation failed(store={s})", .{self.store_path});
+            return .failed;
+        };
+        defer self.allocator.free(backup);
+        if (!dirExists(backup)) return .not_needed;
+
+        var lock = self.acquireMigrationLock() catch |err| {
+            self.setDegraded("legacy migrate recovery lock failed: {s}(store={s})", .{ @errorName(err), self.store_path });
+            return .failed;
+        };
+        defer lock.release();
+        if (dirExists(self.store_path)) return .recovered; // another process completed while we waited
+        if (self.probeStore(backup) != .legacy) {
+            self.setDegraded("legacy migrate recovery found an incompatible rollback artifact(bin={s} backup={s})", .{ bin, backup });
+            return .failed;
+        }
+        if (self.migrateBackupToCanonical(backup)) return .recovered;
+        if (!dirExists(self.store_path)) {
+            if (!renamePath(backup, self.store_path)) {
+                self.setDegraded("legacy migrate recovery failed and rollback rename failed(bin={s} backup={s} store={s})", .{ bin, backup, self.store_path });
+                return .failed;
+            }
+        }
+        self.setDegraded("legacy migrate recovery failed; original store restored, automatic retry disabled for this session(bin={s} store={s})", .{ bin, self.store_path });
+        return .failed;
+    }
+
+    /// legacy → v2/v3：先在 host lock 内把 canonical 原子改名为 rollback backup，
+    /// 再让 TinyKG 自己从 backup 事务化发布 canonical target。这样只有一个 host rename，
+    /// 发布、verify、staging recovery 仍由 TinyKG 原生实现；backup 始终保留可回滚原店。
+    fn autoMigrateLegacyStore(self: *KgClient) bool {
+        var lock = self.acquireMigrationLock() catch return false;
+        defer lock.release();
+
+        // Another metacodes process may have completed while this one waited.
+        switch (self.probeStore(self.store_path)) {
+            .expected => return true,
+            .legacy => {},
+            else => return false,
+        }
+        const backup = self.migrationBackupPath() catch return false;
+        defer self.allocator.free(backup);
+        // Never rotate or overwrite an unknown rollback artifact automatically.
+        if (dirExists(backup)) return false;
+        if (!renamePath(self.store_path, backup)) return false;
+
+        if (self.migrateBackupToCanonical(backup)) {
+            log.info("kg", "auto migrate: verified legacy backup retained at {s}", .{backup});
+            return true;
+        }
+        // A failed/timeout migration is allowed to have published already; only restore
+        // when canonical is still absent. Never overwrite a possibly committed target.
+        if (!dirExists(self.store_path)) _ = renamePath(backup, self.store_path);
+        return false;
+    }
+
+    fn migrateBackupToCanonical(self: *KgClient, backup: []const u8) bool {
+        const out = self.runRaw(&.{ "migrate-store-v2", backup, self.store_path, "--task-status-v1", "--verify" }) catch {
+            return self.probeStore(self.store_path) == .expected;
+        };
+        defer self.freeOut(out);
+        if (out.exit_code != 0) {
+            log.warn("kg", "auto migrate subprocess failed exit={d}: {s}", .{ out.exit_code, trimForLog(out.stderr) });
+            return self.probeStore(self.store_path) == .expected;
+        }
+        return self.probeStore(self.store_path) == .expected;
+    }
+
+    /// 同父目录 rename；canonical 缺失时 POSIX/Windows 都是原子路径切换。
+    fn renamePath(from: []const u8, to: []const u8) bool {
+        var from_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+        var to_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+        if (from.len >= from_buf.len or to.len >= to_buf.len) return false;
+        @memcpy(from_buf[0..from.len], from);
+        from_buf[from.len] = 0;
+        @memcpy(to_buf[0..to.len], to);
+        to_buf[to.len] = 0;
+        return pfs.renameReplace(@ptrCast(&from_buf), @ptrCast(&to_buf)) == 0;
     }
 
     fn setDegraded(self: *KgClient, comptime fmt: []const u8, args: anytype) void {
@@ -787,7 +1014,7 @@ pub const KgClient = struct {
         return doc_id;
     }
 
-    /// 渲染文档回 markdown(/kg plan 人类可见)。owned。
+    /// 渲染 legacy markdown document artifact。任务进度投影不得走此入口。owned。
     pub fn renderMarkdownDoc(self: *KgClient, doc_id: u64) KgError![]u8 {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{doc_id}) catch unreachable;
@@ -797,8 +1024,9 @@ pub const KgClient = struct {
     }
 
     // ── 任务 DAG(P2:write-through + plan 落图 + 图驱动)──────────────
-    // 契约见设计 §9 核对表:depends_on 串行、单次 revise 闭合;frontier v2 深遍历
-    // (可执行叶子集:branch/leaf 角色 + 祖先聚合 readiness + path + claim 租约)。
+    // 契约见设计 §9 核对表:depends_on 串行、task-close 终态闭合且 task id/kind 稳定；
+    // frontier 深遍历(可执行叶子集:branch/leaf/failed 角色 + canonical status +
+    // 祖先聚合 readiness + path + claim 租约)。
 
     /// 建任务节点(schema_type=todo|plan_step)。返回 node id。best-effort provenance。
     /// 挂接进项目子树(list-recent --project / search --project 可见)。
@@ -853,9 +1081,18 @@ pub const KgClient = struct {
     /// **写入容忍模糊**:闭合投影默认 tentative(agent 执行中打的);人类确认/纠正后落 confirmed。
     /// 拿回 add-edge 返回的 edge id 后 set-edge-property state。
     /// state 是**一个 bit 的两态**(tentative|confirmed),不是连续置信度(禁)。
-    /// 注:add-edge 去重按节点 external key,concept 节点未必有 → 同 (src,rel,dst) 可能重复建边;
-    /// 闭合投影每任务一次,可接受;确认既有分类走 correctClassification(old==new 分支)以定位原边。
+    /// 幂等:任务终态可能已发布，而闭合投影只写了一部分；甚至 add-edge
+    /// 已成功但 set-edge-property 失败留下裸边。重试必须补齐缺失 state，
+    /// tentative 只可升级为 confirmed，confirmed 绝不降级，也不叠重复边。
     pub fn addRefEdge(self: *KgClient, src: u64, rel: []const u8, dst: u64, confirmed: bool) KgError!void {
+        if (try self.findEdge(src, rel, dst)) |existing| {
+            return switch (existing.state) {
+                .missing => self.setEdgeState(existing.id, confirmed), // repair a partial prior write
+                .tentative => if (confirmed) self.setEdgeState(existing.id, true) else {},
+                .confirmed => {}, // monotonic:agent retry never downgrades human confirmation
+                .invalid => self.dataError("edge {d} 存在非法 state，拒绝覆盖", .{existing.id}),
+            };
+        }
         var sbuf: [24]u8 = undefined;
         var dbuf: [24]u8 = undefined;
         const s_str = std.fmt.bufPrint(&sbuf, "{d}", .{src}) catch unreachable;
@@ -898,24 +1135,44 @@ pub const KgClient = struct {
         return parseNodeIdLine(out.stdout) orelse self.dataError("add-node {s} 输出不可解析: {s}", .{ kind_label, trimForLog(out.stdout) });
     }
 
-    /// 查 (src,rel,dst) 出边 id。null=无此边(非错误——供幂等探测,不污染 last_detail);
+    const RefEdgeState = enum { missing, tentative, confirmed, invalid };
+    const RefEdgeMatch = struct { id: u64, state: RefEdgeState };
+
+    /// 查 (src,rel,dst) 出边及其两态属性。null=无此边(非错误——供幂等探测,
+    /// 不污染 last_detail)；
     /// 仅 subprocess/JSON 解析失败才返 error。**不能靠 add-edge 幂等**(去重按节点 external key,
     /// concept 节点未必有 → 盲加会重复建边)。**按 rel 过滤 neighbors**:只回该 rel 类的边,
     /// 高出度任务(结构边多)也不会把 ref 边挤出 --limit 预算(Linus #4)。
-    fn findEdgeId(self: *KgClient, src: u64, rel: []const u8, dst: u64) KgError!?u64 {
+    fn findEdge(self: *KgClient, src: u64, rel: []const u8, dst: u64) KgError!?RefEdgeMatch {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{src}) catch unreachable;
         const out = try self.runChecked(&.{ "neighbors", self.store_path, id_str, rel, "--limit", "200", "--format", "json" });
         defer self.freeOut(out);
-        const Edge = struct { id: u64, rel: []const u8, dst: u64 };
+        const Props = struct { state: ?[]const u8 = null };
+        const Edge = struct { id: u64, rel: []const u8, dst: u64, props: Props = .{} };
         const Doc = struct { edges: []const Edge };
         const parsed = std.json.parseFromSlice(Doc, self.allocator, out.stdout, .{ .ignore_unknown_fields = true }) catch
-            return self.dataError("findEdgeId 解析 neighbors 失败", .{});
+            return self.dataError("findEdge 解析 neighbors 失败", .{});
         defer parsed.deinit();
         for (parsed.value.edges) |e| {
-            if (e.dst == dst and std.mem.eql(u8, e.rel, rel)) return e.id;
+            if (e.dst != dst or !std.mem.eql(u8, e.rel, rel)) continue;
+            const state: RefEdgeState = if (e.props.state) |value|
+                if (std.mem.eql(u8, value, "tentative"))
+                    .tentative
+                else if (std.mem.eql(u8, value, "confirmed"))
+                    .confirmed
+                else
+                    .invalid
+            else
+                .missing;
+            return .{ .id = e.id, .state = state };
         }
         return null;
+    }
+
+    fn findEdgeId(self: *KgClient, src: u64, rel: []const u8, dst: u64) KgError!?u64 {
+        const match = try self.findEdge(src, rel, dst);
+        return if (match) |edge| edge.id else null;
     }
 
     /// 定位既有边 id(找不到 → data 错,带 src/rel/dst)。幂等探测用 findEdgeId。
@@ -1005,19 +1262,118 @@ pub const KgClient = struct {
         return self.allocator.dupe(u8, out.stdout) catch KgError.OutOfMemory;
     }
 
-    /// 闭合任务:`revise <id> verification "<evidence>"`(单步,解锁依赖链+出 frontier)。
+    /// 取有界 task packet。终态 task 仍保持 kind=task，因此 fresh restart 后仍能按原 id
+    /// 恢复目标、父子关系、依赖和 verified_by evidence。
+    pub fn taskPacket(self: *KgClient, task_id: u64, limit: usize) KgError![]u8 {
+        var idbuf: [24]u8 = undefined;
+        var limbuf: [16]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{task_id}) catch unreachable;
+        const lim_str = std.fmt.bufPrint(&limbuf, "{d}", .{limit}) catch unreachable;
+        const out = try self.runChecked(&.{ "task-packet", self.store_path, id_str, "--limit", lim_str });
+        defer self.freeOut(out);
+        return self.allocator.dupe(u8, out.stdout) catch KgError.OutOfMemory;
+    }
+
+    /// Fetch one bounded, deterministic task-subgraph snapshot under TinyKG's
+    /// store lock. The JSON is intentionally left opaque here; the independent
+    /// task_projection module owns schema and referential-integrity validation.
+    pub fn taskSnapshot(self: *KgClient, root_id: u64) KgError![]u8 {
+        var idbuf: [24]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{root_id}) catch unreachable;
+        const out = try self.runChecked(&.{
+            "task-snapshot", self.store_path, id_str,
+            "--max-tasks",   "256",           "--max-edges",
+            "1024",          "--max-chars",   "200000",
+        });
+        defer self.freeOut(out);
+        const snapshot = std.mem.trim(u8, out.stdout, " \r\n\t");
+        if (snapshot.len < 2 or snapshot[0] != '{' or snapshot[snapshot.len - 1] != '}')
+            return self.dataError("task-snapshot {d} 非 JSON object: {s}", .{ root_id, trimForLog(snapshot) });
+        return self.allocator.dupe(u8, snapshot) catch KgError.OutOfMemory;
+    }
+
+    /// Agent-facing bounded packet. Unlike the text packet used by taskStatus,
+    /// this returns TinyKG's metadata-first JSON envelope: parent goal,
+    /// dependencies, evidence links, truncation diagnostics and continuations,
+    /// without dumping every node body into the model context.
+    pub fn taskPacketMeta(
+        self: *KgClient,
+        task_id: u64,
+        limit: usize,
+        max_chars: usize,
+    ) KgError![]u8 {
+        var idbuf: [24]u8 = undefined;
+        var limbuf: [16]u8 = undefined;
+        var charsbuf: [16]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{task_id}) catch unreachable;
+        const lim_str = std.fmt.bufPrint(&limbuf, "{d}", .{limit}) catch unreachable;
+        const chars_str = std.fmt.bufPrint(&charsbuf, "{d}", .{max_chars}) catch unreachable;
+        const out = try self.runChecked(&.{
+            "task-packet", self.store_path, id_str,
+            "--limit",     lim_str,         "--format",
+            "json",        "--meta",        "--max-nodes",
+            "16",          "--max-edges",   "24",
+            "--max-chars", chars_str,
+        });
+        defer self.freeOut(out);
+        const packet = std.mem.trim(u8, out.stdout, " \r\n\t");
+        if (packet.len < 2 or packet[0] != '{' or packet[packet.len - 1] != '}')
+            return self.dataError("task-packet meta {d} 非 JSON object: {s}", .{ task_id, trimForLog(packet) });
+        return self.allocator.dupe(u8, packet) catch KgError.OutOfMemory;
+    }
+
+    /// 读取 TinyKG effective status；claimed 租约过期时由 TinyKG 返回 open。
+    pub fn taskStatus(self: *KgClient, task_id: u64) KgError!TaskStatus {
+        const packet = try self.taskPacket(task_id, 1);
+        defer self.allocator.free(packet);
+        return parseTaskPacketStatus(packet) orelse
+            self.dataError("task-packet {d} 缺失/包含非法 status: {s}", .{ task_id, trimForLog(packet) });
+    }
+
+    /// 无租约身份的兼容入口；用于未 claim 的内部计划和既有调用点。
     pub fn closeTask(self: *KgClient, task_id: u64, evidence: []const u8) KgError!void {
+        return self.closeTaskWithIdentity(task_id, .completed, evidence, null);
+    }
+
+    /// 带宿主注入 agent identity 的关闭入口。TaskUpdate/TaskStop 必须走这里，确保只能
+    /// 关闭自己持有的有效租约；身份从程序上下文注入，不由 LLM 编造。
+    pub fn closeTaskAs(self: *KgClient, task_id: u64, evidence: []const u8, agent_ident: []const u8) KgError!void {
+        return self.closeTaskWithIdentity(task_id, .completed, evidence, agent_ident);
+    }
+
+    /// 显式失败终态；failed 不满足依赖，也不会被误当作已完成。
+    pub fn failTask(self: *KgClient, task_id: u64, evidence: []const u8) KgError!void {
+        return self.closeTaskWithIdentity(task_id, .failed, evidence, null);
+    }
+
+    pub fn failTaskAs(self: *KgClient, task_id: u64, evidence: []const u8, agent_ident: []const u8) KgError!void {
+        return self.closeTaskWithIdentity(task_id, .failed, evidence, agent_ident);
+    }
+
+    fn closeTaskWithIdentity(self: *KgClient, task_id: u64, terminal: TaskStatus, evidence: []const u8, agent_ident: ?[]const u8) KgError!void {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{task_id}) catch unreachable;
-        // 新 tinykg revise 无 --domain(实证 UnknownOption);挂接沿袭原节点(revise 是版本追加)。
-        const out = try self.runCheckedWrite(&.{
-            "revise",        self.store_path, id_str, "verification",
-            evidence,        "--schema-type", "verification",
+
+        // Inline evidence is authorized and materialized by task-close under
+        // one TinyKG store lock. The old client-side ensure-node call happened
+        // before lease validation, so a wrong holder left orphan verification
+        // nodes and added an avoidable subprocess/TOCTOU window.
+        const verification_text = std.fmt.allocPrint(
+            self.allocator,
+            "task {d} {s} evidence: {s}",
+            .{ task_id, if (terminal == .completed) "completion" else "failure", evidence },
+        ) catch return KgError.OutOfMemory;
+        defer self.allocator.free(verification_text);
+        const terminal_str = @tagName(terminal);
+        const out = if (agent_ident) |by| try self.runCheckedWrite(&.{
+            "task-close", self.store_path, id_str, terminal_str, "--by", by, "--evidence-text", verification_text,
+        }) else try self.runCheckedWrite(&.{
+            "task-close", self.store_path, id_str, terminal_str, "--evidence-text", verification_text,
         });
         self.freeOut(out);
     }
 
-    /// 删任务(TaskUpdate deleted → delete-node)。
+    /// 显式治理删除。TaskUpdate 不调用：持久 task 的 failed/cancelled 必须保留稳定 id。
     pub fn deleteTask(self: *KgClient, task_id: u64) KgError!void {
         return self.forget(task_id);
     }
@@ -1051,11 +1407,30 @@ pub const KgClient = struct {
         return self.recallTyped(query, limit, include_tasks, null);
     }
 
+    /// Retrieve only task nodes.  Experience feedback cannot rely on the
+    /// ordinary mixed-kind result window: a dense set of decisions/concepts
+    /// may otherwise crowd every completed task out before client filtering.
+    /// The kind restriction is pushed into TinyKG's text-search plan.
+    pub fn recallTasks(self: *KgClient, query: []const u8, limit: usize) KgError![]RecallHit {
+        return self.recallFiltered(query, limit, true, null, "task");
+    }
+
     /// type_filter 非 null 时按 schema_type 过滤(typed recall)。
     /// **best-effort 契约(Linus HIGH-2)**:BM25 按相关度排序不按类型,稀有类型可能全排在超采窗口外
     /// → 库里有该类型却返空。拉高超采倍数缓解,但不保证:typed recall 可能少返相关度低的同类节点。
     /// 正解是 tinykg server-side --schema-type 下推(本切片 defer)。空返 ≠ 库中无该类型。
     pub fn recallTyped(self: *KgClient, query: []const u8, limit: usize, include_tasks: bool, type_filter: ?[]const u8) KgError![]RecallHit {
+        return self.recallFiltered(query, limit, include_tasks, type_filter, null);
+    }
+
+    fn recallFiltered(
+        self: *KgClient,
+        query: []const u8,
+        limit: usize,
+        include_tasks: bool,
+        type_filter: ?[]const u8,
+        kind_filter: ?[]const u8,
+    ) KgError![]RecallHit {
         // project-containment 召回:项目子树 + global 子树各一次 search --project(图拓扑隔离,
         // 取代旧 domain_id 属性客户端过滤)。读路径不创建 project 节点:两个子树都不存在
         // (库中无任何挂接记忆)→ 零 spawn 返空。
@@ -1066,10 +1441,10 @@ pub const KgClient = struct {
         }
         const proj_id = try self.projectNodeId(false, false);
         const glob_id = try self.projectNodeId(true, false);
-        if (proj_id) |pid| try self.searchSubtreeInto(&results, pid, self.domain, query, limit, include_tasks, type_filter);
+        if (proj_id) |pid| try self.searchSubtreeInto(&results, pid, self.domain, query, limit, include_tasks, type_filter, kind_filter);
         if (glob_id) |gid| {
             if (proj_id == null or gid != proj_id.?) // domain=="global" 时两者同节点,防重扫
-                try self.searchSubtreeInto(&results, gid, "global", query, limit, include_tasks, type_filter);
+                try self.searchSubtreeInto(&results, gid, "global", query, limit, include_tasks, type_filter, kind_filter);
         }
         // 两路合并:按 BM25 分数降序(同库同查询,分数可比),截 limit。
         std.mem.sort(RecallHit, results.items, {}, recallHitScoreDescLessThan);
@@ -1096,6 +1471,7 @@ pub const KgClient = struct {
         limit: usize,
         include_tasks: bool,
         type_filter: ?[]const u8,
+        kind_filter: ?[]const u8,
     ) KgError!void {
         var limbuf: [16]u8 = undefined;
         var pbuf: [24]u8 = undefined;
@@ -1107,10 +1483,11 @@ pub const KgClient = struct {
         var argv = std.ArrayList([]const u8).empty;
         defer argv.deinit(self.allocator);
         argv.appendSlice(self.allocator, &.{
-            "search",    self.store_path, query,    "--project",      p_str, "--limit", raw_limit,
-            "--profile", "agent-memory",  "--format", "json",         "--include-text",
+            "search",    self.store_path, query,      "--project", p_str,            "--limit", raw_limit,
+            "--profile", "agent-memory",  "--format", "json",      "--include-text",
         }) catch return KgError.OutOfMemory;
         if (type_filter) |tf| argv.appendSlice(self.allocator, &.{ "--schema-type", tf }) catch return KgError.OutOfMemory;
+        if (kind_filter) |kind| argv.appendSlice(self.allocator, &.{ "--kind", kind }) catch return KgError.OutOfMemory;
         const out = try self.runChecked(argv.items);
         defer self.freeOut(out);
 
@@ -1128,6 +1505,10 @@ pub const KgClient = struct {
             const node = node_v.object;
 
             const kind = jsonStr(node.get("kind")) orelse continue;
+            // Treat the server-side filter as a contract, not as permission to
+            // trust malformed output from a skewed TinyKG binary.
+            if (kind_filter) |expected_kind|
+                if (!std.mem.eql(u8, kind, expected_kind)) continue;
             const schema_v = node.get("schema");
             const schema_type = if (schema_v != null and schema_v.? == .object)
                 (jsonStr(schema_v.?.object.get("schema_type")) orelse "")
@@ -1288,20 +1669,52 @@ pub const KgClient = struct {
         return self.allocator.dupe(u8, std.mem.trim(u8, out.stdout, " \r\n")) catch KgError.OutOfMemory;
     }
 
-    /// 取节点全文(`get <id>` TSV 第 3 列,已 unescape)。owned;NotFound 返 error.Data。
-    pub fn fetchNodeText(self: *KgClient, node_id: u64) KgError![]u8 {
+    const NodeRecord = struct {
+        kind: []u8,
+        text: []u8,
+
+        fn deinit(self: *NodeRecord, allocator: std.mem.Allocator) void {
+            allocator.free(self.kind);
+            allocator.free(self.text);
+        }
+    };
+
+    /// 取节点 kind + 全文(`get <id>` TSV,已 unescape)。owned;NotFound 返 error.Data。
+    fn fetchNodeRecord(self: *KgClient, node_id: u64) KgError!NodeRecord {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{node_id}) catch unreachable;
         const out = try self.runChecked(&.{ "get", self.store_path, id_str });
         defer self.freeOut(out);
-        // TSV: id\tkind\ttext(text 可能多列——取第 3 列到行尾)。
         const line_end = std.mem.indexOfScalar(u8, out.stdout, '\n') orelse out.stdout.len;
         const line = out.stdout[0..line_end];
         var cols = std.mem.splitScalar(u8, line, '\t');
-        _ = cols.next(); // id
-        _ = cols.next(); // kind
-        const text_col = cols.rest();
-        return unescapeTsv(self.allocator, text_col) catch KgError.OutOfMemory;
+        _ = cols.next() orelse return self.dataError("get {d} 输出缺 id", .{node_id});
+        const kind_col = cols.next() orelse return self.dataError("get {d} 输出缺 kind", .{node_id});
+        const kind = self.allocator.dupe(u8, kind_col) catch return KgError.OutOfMemory;
+        errdefer self.allocator.free(kind);
+        const text = unescapeTsv(self.allocator, cols.rest()) catch return KgError.OutOfMemory;
+        return .{ .kind = kind, .text = text };
+    }
+
+    /// 取节点全文(`get <id>` TSV 第 3 列,已 unescape)。owned;NotFound 返 error.Data。
+    pub fn fetchNodeText(self: *KgClient, node_id: u64) KgError![]u8 {
+        const record = try self.fetchNodeRecord(node_id);
+        self.allocator.free(record.kind);
+        return record.text;
+    }
+
+    /// 取节点版本化 metadata JSON。KgContext 用它读取 current_generation/deprecated_by，
+    /// 因为 TinyKG 会有意把历史节点从 neighbors 子图中省略为 history continuation。
+    /// include_text=true 时同一次 subprocess 带权威正文，避免 metadata + get 双调用。
+    pub fn nodeMetadataJson(self: *KgClient, node_id: u64, include_text: bool) KgError![]u8 {
+        var idbuf: [24]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{node_id}) catch unreachable;
+        const out = if (include_text)
+            try self.runChecked(&.{ "get", self.store_path, id_str, "--format", "json", "--meta", "--include-text" })
+        else
+            try self.runChecked(&.{ "get", self.store_path, id_str, "--format", "json", "--meta" });
+        defer self.freeOut(out);
+        return self.allocator.dupe(u8, std.mem.trim(u8, out.stdout, " \t\r\n")) catch KgError.OutOfMemory;
     }
 
     /// task-frontier(注入段/看板用)。返回 owned rows。
@@ -1322,14 +1735,18 @@ pub const KgClient = struct {
         }
         var it = std.mem.splitScalar(u8, out.stdout, '\n');
         while (it.next()) |line| {
-            // 行格式 v2(深遍历):<role>\t<edge>\t<rel>\t<task_id>\treadiness=<r>\tdepth=<n>\tclaimed_by=<v>\tpath=<v>\t<escaped text>
-            // v1 兼容:readiness 后直接是 text(缺 depth= 列)。
+            // 行格式 v3(稳定 task kind):<role>\t<edge>\t<rel>\t<task_id>\tstatus=<s>\treadiness=<r>\tdepth=<n>\tclaimed_by=<v>\tpath=<v>\t<escaped text>
+            // v2 兼容:缺 status=；v1 兼容:readiness 后直接是 text(缺 depth= 列)。
             const role: FrontierRow.Role = if (std.mem.startsWith(u8, line, "child_task\t"))
                 .leaf
             else if (std.mem.startsWith(u8, line, "branch_task\t"))
                 .branch
+            else if (std.mem.startsWith(u8, line, "related_failed_task\t"))
+                .related_failed
             else if (std.mem.startsWith(u8, line, "related_task\t"))
                 .related
+            else if (std.mem.startsWith(u8, line, "failed_task\t"))
+                .failed
             else
                 continue;
             var cols = std.mem.splitScalar(u8, line, '\t');
@@ -1337,9 +1754,16 @@ pub const KgClient = struct {
             _ = cols.next(); // edge id
             _ = cols.next(); // rel
             const id_col = cols.next() orelse continue;
-            const ready_col = cols.next() orelse continue;
+            const lifecycle_or_ready_col = cols.next() orelse continue;
 
             const task_id = std.fmt.parseInt(u64, id_col, 10) catch continue;
+            var has_explicit_status = false;
+            var status: TaskStatus = .open;
+            const ready_col: []const u8 = if (std.mem.startsWith(u8, lifecycle_or_ready_col, "status=")) blk: {
+                has_explicit_status = true;
+                status = TaskStatus.parse(lifecycle_or_ready_col["status=".len..]) orelse continue;
+                break :blk cols.next() orelse continue;
+            } else lifecycle_or_ready_col;
             const readiness: FrontierRow.Readiness = blk: {
                 const v = if (std.mem.startsWith(u8, ready_col, "readiness=")) ready_col["readiness=".len..] else ready_col;
                 if (std.mem.eql(u8, v, "ready")) break :blk .ready;
@@ -1348,10 +1772,8 @@ pub const KgClient = struct {
             };
 
             var depth: usize = 1;
-            var claimed_by: ?[]u8 = null;
-            errdefer if (claimed_by) |c| self.allocator.free(c);
-            var path: ?[]u8 = null;
-            errdefer if (path) |p| self.allocator.free(p);
+            var claimed_raw: ?[]const u8 = null;
+            var path_raw: ?[]const u8 = null;
             var text_col: []const u8 = undefined;
             const after_ready = cols.rest();
             if (std.mem.startsWith(u8, after_ready, "depth=")) {
@@ -1360,21 +1782,27 @@ pub const KgClient = struct {
                 const claim_col = cols.next() orelse continue;
                 if (std.mem.startsWith(u8, claim_col, "claimed_by=")) {
                     const v = claim_col["claimed_by=".len..];
-                    if (v.len > 0 and !std.mem.eql(u8, v, "-")) claimed_by = try unescapeTsv(self.allocator, v);
+                    if (v.len > 0 and !std.mem.eql(u8, v, "-")) claimed_raw = v;
                 }
                 const path_col = cols.next() orelse continue;
                 if (std.mem.startsWith(u8, path_col, "path=")) {
                     const v = path_col["path=".len..];
-                    if (v.len > 0 and !std.mem.eql(u8, v, "-")) path = try unescapeTsv(self.allocator, v);
+                    if (v.len > 0 and !std.mem.eql(u8, v, "-")) path_raw = v;
                 }
                 text_col = cols.rest();
             } else {
                 text_col = after_ready;
             }
 
+            const claimed_by = if (claimed_raw) |raw| try unescapeTsv(self.allocator, raw) else null;
+            errdefer if (claimed_by) |c| self.allocator.free(c);
+            const path = if (path_raw) |raw| try unescapeTsv(self.allocator, raw) else null;
+            errdefer if (path) |p| self.allocator.free(p);
+            if (!has_explicit_status and claimed_by != null) status = .claimed;
             const text = try unescapeTsv(self.allocator, text_col);
             rows.append(self.allocator, .{
                 .task_id = task_id,
+                .status = status,
                 .readiness = readiness,
                 .role = role,
                 .depth = depth,
@@ -1632,7 +2060,7 @@ pub const KgClient = struct {
             };
         }
         try argv.append(self.allocator, null);
-        return common.spawnCaptureWithStderrTimed(argv.items, self.allocator, self.abort, SPAWN_TIMEOUT_MS, null, common.MAX_SPAWN_CAPTURE_BYTES);
+        return common.spawnCaptureWithStderrTimed(argv.items, self.allocator, self.abort, SPAWN_TIMEOUT_MS, null, common.MAX_SPAWN_CAPTURE_BYTES, null);
     }
 
     /// ready 检查 + 瞬时重试 + 错误分类。exit!=0 时按 stderr 分类:
@@ -1697,7 +2125,24 @@ pub const KgClient = struct {
         // project / project 树约束),**重试无用**,且必须让 .data 分支 setDetail 把原因写进
         // last_detail,否则 remember 的 scope 违规检测(找 "SchemaProjectScopeViolation" 串)匹配
         // 不上 → 孤儿清理+清晰错误全失效,agent 只收到空的 "(Transient: )"(PM 终审抓的接线漏)。
-        const data_errors = [_][]const u8{ "NotFound", "InvalidId", "InvalidNodeKind", "InvalidRelKind", "CycleDetected", "WouldCreateCycle", "InvalidRecord", "ClaimHeld", "SchemaProjectScopeViolation", "ProjectTreeViolation" };
+        const data_errors = [_][]const u8{
+            "NotFound",
+            "InvalidId",
+            "InvalidNodeKind",
+            "InvalidRelKind",
+            "CycleDetected",
+            "WouldCreateCycle",
+            "InvalidRecord",
+            "InvalidTaskTransition",
+            "TaskHasOpenChildren",
+            "TaskNotReady",
+            "ClaimHeld",
+            "SchemaProjectScopeViolation",
+            "ProjectTreeViolation",
+            // Deterministic capability/index-state failure.  Retrying the
+            // exact search only burns turns and is not lock contention.
+            "Unsupported",
+        };
         for (data_errors) |d| {
             if (std.ascii.eqlIgnoreCase(name, d)) return .data;
         }
@@ -1724,6 +2169,22 @@ pub const KgClient = struct {
 };
 
 // ── 纯函数区(可单测)──────────────────────────────────────────────
+
+/// `task_packet\t<ID>\tstatus=<state>...` 首行解析。只接受 canonical 四态；
+/// 不从 kind 或证据节点猜生命周期。
+pub fn parseTaskPacketStatus(output: []const u8) ?TaskStatus {
+    const line_end = std.mem.indexOfScalar(u8, output, '\n') orelse output.len;
+    const line = output[0..line_end];
+    if (!std.mem.startsWith(u8, line, "task_packet\t")) return null;
+    var cols = std.mem.splitScalar(u8, line, '\t');
+    _ = cols.next(); // task_packet
+    _ = cols.next() orelse return null; // task id
+    while (cols.next()) |col| {
+        if (!std.mem.startsWith(u8, col, "status=")) continue;
+        return TaskStatus.parse(col["status=".len..]);
+    }
+    return null;
+}
 
 /// tinykg TSV 转义(cli.zig:11001-11014 writeEscapedText)的逆:
 /// `\\ \: \, \t \n \r \xNN` → 原字节。未知转义序列原样保留(容错)。
@@ -1939,10 +2400,20 @@ test "extractStatField 解析空格分隔 stats 行(memoryCount DoD,回归防注
 }
 
 test "extractInfoField 提取 store-info 键值" {
-    const info = "db=/x/y\nnodes=26\nstorage_format_version=2\nschema_version=2\n";
+    const info = "db=/x/y\nnodes=26\nstorage_format_version=2\nschema_version=3\n";
     try testing.expectEqualStrings("2", extractInfoField(info, "storage_format_version").?);
+    try testing.expectEqualStrings("3", extractInfoField(info, "schema_version").?);
     try testing.expectEqualStrings("26", extractInfoField(info, "nodes").?);
     try testing.expect(extractInfoField(info, "missing") == null);
+}
+
+test "task packet status 只接受 canonical 四态" {
+    try testing.expectEqual(TaskStatus.open, parseTaskPacketStatus("task_packet\t7\tstatus=open\treadiness=ready\tlimit=1\n").?);
+    try testing.expectEqual(TaskStatus.claimed, parseTaskPacketStatus("task_packet\t7\tstatus=claimed\treadiness=ready\tlimit=1\n").?);
+    try testing.expectEqual(TaskStatus.completed, parseTaskPacketStatus("task_packet\t7\tstatus=completed\treadiness=-\tlimit=1\n").?);
+    try testing.expectEqual(TaskStatus.failed, parseTaskPacketStatus("task_packet\t7\tstatus=failed\treadiness=-\tlimit=1\n").?);
+    try testing.expect(parseTaskPacketStatus("task_packet\t7\tstatus=done\n") == null);
+    try testing.expect(parseTaskPacketStatus("not_a_packet\t7\tstatus=open\n") == null);
 }
 
 test "MemoryKind parse 大小写不敏感 + 白名单外拒绝" {
@@ -2014,6 +2485,7 @@ test "classifyCliError 三类归一" {
     try testing.expectEqual(KgClient.ErrClass.data, KgClient.classifyCliError("WouldCreateCycle"));
     try testing.expectEqual(KgClient.ErrClass.transient, KgClient.classifyCliError("Timeout"));
     try testing.expectEqual(KgClient.ErrClass.transient, KgClient.classifyCliError("SomethingNew"));
+    try testing.expectEqual(KgClient.ErrClass.data, KgClient.classifyCliError("Unsupported"));
     // 项目级 schema:确定性结构违规归 data(重试无用 + 让 .data 分支 setDetail 兜住原因,
     // 否则 remember 的 scope 违规检测匹配不上 → agent 收到空 Transient。PM 终审接线漏抓)。
     try testing.expectEqual(KgClient.ErrClass.data, KgClient.classifyCliError("SchemaProjectScopeViolation"));

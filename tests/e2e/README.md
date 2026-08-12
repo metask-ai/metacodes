@@ -5,6 +5,15 @@
 > ⚠️ 这不是单元/L2 测试。它需要**真网络 + 真 token**、消耗真实 model 用量,**不进默认 CI**。
 > 单元/L2 测试仍走 `zig build test`。
 
+TinyKG 另有一个不调用模型的真进程启动恢复烟测：
+
+```bash
+tests/e2e/process_dag_resume_smoke.sh
+```
+
+它用两个全新的 metacodes 进程和同一个宿主注入 session id，断言第二个进程在
+`--dump-prompt` 阶段已从持久 store 恢复当前租约的 bounded task packet。
+
 ## 它怎么工作
 
 cc-zig 的 REPL 在**非 tty(stdin 是管道)** 下走 `readLineBuffered` 干净逐行读取,
@@ -74,6 +83,7 @@ DISALLOWED_TOOLS=Write                  # --disallowedTools
 ADD_DIR=/tmp/extra                      # --add-dir(可重复)
 ANSWERS=fixtures/answers_x.txt          # --answers-file
 GIT_INIT=1                              # 框架预先 git init + 初始 commit(worktree 用)
+KG_SEED=fixtures/kg_fixture.json        # 向本场景 fake HOME 的 global TinyKG 子树预置记忆
 EXPECT_FILE=path/to/file
 EXPECT_CONTAINS=path:substring
 EXPECT_MIN_LINES=path:N

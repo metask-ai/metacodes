@@ -258,6 +258,8 @@ pub fn spawnCaptureWithStderrTimed(
     tick_fn: ?*const fn (elapsed_ms: u64, argv0: []const u8) void,
     /// 捕获字节上限(stdout+stderr 合计);达此值 killpg + 返回已读部分。0 = 不限。
     max_bytes: usize,
+    /// 缺陷 B 修复:子进程 cwd(null=继承父进程 cwd)。
+    cwd: ?[]const u8,
 ) !SpawnOut {
     logSpawnArgv(argv, timeout_ms);
     // 委托可移植 platform/process.zig(POSIX fork+poll / Windows CreateProcessW+reader线程)。
@@ -285,6 +287,7 @@ pub fn spawnCaptureWithStderrTimed(
         .abort_poll = if (abort != null) AbortBridge.poll else null,
         .tick_ctx = if (tick_bridge) |*t| @ptrCast(t) else null,
         .tick_cb = if (tick_bridge != null) TickBridge.cb else null,
+        .cwd = cwd,
     }) catch |e| switch (e) {
         error.Timeout => return error.Timeout,
         error.Aborted => return error.Aborted,
@@ -454,7 +457,7 @@ test "spawnCaptureWithStderrTimed:max_bytes 封顶无限输出 killpg 止血不�
     const t0 = nowMs();
     // `yes` 无限打印 stdout;无 cap 会挂到 timeout;cap=32KB → 读够即 killpg,快速返回 ≤ 略多于 32KB。
     var argv = [_]?[*:0]const u8{ "/usr/bin/yes", "abcdefgh", null };
-    const out = spawnCaptureWithStderrTimed(argv[0..argv.len], a, null, 8000, null, 32 * 1024) catch |e| {
+    const out = spawnCaptureWithStderrTimed(argv[0..argv.len], a, null, 8000, null, 32 * 1024, null) catch |e| {
         if (e == error.SpawnError) return; // 环境无 yes → 跳过
         return e;
     };

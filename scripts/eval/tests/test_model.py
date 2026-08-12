@@ -11,6 +11,10 @@ SUITES = (
     ROOT / "evals" / "suites" / "core-e2e.json",
     ROOT / "evals" / "suites" / "agentdef-release.json",
     ROOT / "evals" / "suites" / "websearch-concurrency.json",
+    ROOT / "evals" / "suites" / "kg-lexical-bridge.json",
+    ROOT / "evals" / "suites" / "long-horizon-control-plane.json",
+    ROOT / "evals" / "suites" / "long-horizon-calibration.json",
+    ROOT / "evals" / "suites" / "long-horizon-repository-pk.json",
 )
 
 
@@ -63,6 +67,22 @@ class SuiteValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "safe workspace-relative"):
             validate_suite(broken, ROOT)
 
+    def test_debug_tool_input_check_requires_a_named_tool(self):
+        suite = load_json(SUITES[0])
+        for invalid in (None, ""):
+            with self.subTest(invalid=invalid):
+                broken = copy.deepcopy(suite)
+                check = {
+                    "type": "debug_tool_input_not_contains",
+                    "text": "TTL",
+                    "description": "query must stay lexical",
+                }
+                if invalid is not None:
+                    check["tool"] = invalid
+                broken["tasks"][0]["success"]["checks"].append(check)
+                with self.assertRaisesRegex(ValidationError, "tool"):
+                    validate_suite(broken, ROOT)
+
     def test_fixture_path_cannot_escape_or_be_missing(self):
         suite = load_json(SUITES[1])
         escaped = copy.deepcopy(suite)
@@ -73,6 +93,32 @@ class SuiteValidationTest(unittest.TestCase):
         missing["tasks"][0]["environment"]["fixtures"] = ["tests/no-such-fixture"]
         with self.assertRaisesRegex(ValidationError, "file does not exist"):
             validate_suite(missing, ROOT)
+
+    def test_repository_snapshot_and_validator_paths_fail_closed(self):
+        suite = load_json(SUITES[-1])
+        short_revision = copy.deepcopy(suite)
+        short_revision["tasks"][0]["environment"]["repository_snapshot"]["revision"] = "abc123"
+        with self.assertRaisesRegex(ValidationError, "full lowercase Git commit"):
+            validate_suite(short_revision, ROOT)
+
+        escaped_snapshot = copy.deepcopy(suite)
+        escaped_snapshot["tasks"][0]["environment"]["repository_snapshot"]["paths"] = ["../secret"]
+        with self.assertRaisesRegex(ValidationError, "safe paths"):
+            validate_suite(escaped_snapshot, ROOT)
+
+        for ambiguous in ("src/./main.zig", "src//main.zig", "src\\main.zig"):
+            with self.subTest(ambiguous=ambiguous):
+                noncanonical = copy.deepcopy(suite)
+                noncanonical["tasks"][0]["environment"]["repository_snapshot"][
+                    "paths"
+                ] = [ambiguous]
+                with self.assertRaisesRegex(ValidationError, "safe paths"):
+                    validate_suite(noncanonical, ROOT)
+
+        escaped_validator = copy.deepcopy(suite)
+        escaped_validator["tasks"][0]["success"]["checks"][0]["validator"] = "../validator.py"
+        with self.assertRaisesRegex(ValidationError, "below evals/validators"):
+            validate_suite(escaped_validator, ROOT)
 
     def test_rollout_rejects_inconsistent_trustworthy_success(self):
         from scripts.eval.tests.test_analysis import rollout

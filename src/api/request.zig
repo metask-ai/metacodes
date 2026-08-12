@@ -130,12 +130,12 @@ pub fn serializeMessagesRequest(req: MessagesRequest, allocator: std.mem.Allocat
     }
 
     if (req.reasoning_effort) |effort| {
-        if (effort.active()) {
-            try result.appendSlice(allocator, ",\"output_config\":{\"effort\":");
-            try util_json.serializeString(effort.name(), &result, allocator);
-            try result.append(allocator, '}');
-            try result.appendSlice(allocator, ",\"thinking\":{\"type\":\"adaptive\"}");
-        }
+        // 委托给 ClaudeDialect 序列化 thinking 控制(对齐 metacodes 既有 wire 格式)。
+        // dialect 产出 `,"output_config":{"effort":"..."},"thinking":{"type":"adaptive"}` 片段。
+        const dialect_mod = @import("dialect.zig");
+        const dialect = dialect_mod.dialectFor(.anthropic, req.model);
+        const profile = @import("model_adapter.zig").profileFor(.anthropic, req.model);
+        try dialect.serializeThinking(profile, effort, &result, allocator);
     }
 
     if (req.cache_control) |cc| {
@@ -177,6 +177,14 @@ fn serializeContent(content: []const types.ApiContent, buf: *std.ArrayList(u8), 
             .text => |t| {
                 try buf.append(allocator, '{');
                 try buf.appendSlice(allocator, "\"type\":\"text\",\"text\":");
+                try util_json.serializeString(t, buf, allocator);
+                try buf.append(allocator, '}');
+            },
+            .thinking => |t| {
+                // preserved thinking 回传(Anthropic):thinking block 必须原样、按序回传。
+                // 对齐 Claude Opus 4.5+:保留 thinking 提升多轮推理质量。
+                try buf.append(allocator, '{');
+                try buf.appendSlice(allocator, "\"type\":\"thinking\",\"thinking\":");
                 try util_json.serializeString(t, buf, allocator);
                 try buf.append(allocator, '}');
             },

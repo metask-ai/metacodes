@@ -1,0 +1,10 @@
+model:
+  name: glm-5.2
+  protocols: [anthropic]
+  backend_url_env: METACODES_W05_MOCK_BASE_URL
+  backend_key_env: METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF
+  context_window: 200000
+  max_concurrent: 1
+  params:
+    max_output_tokens: 1024
+    temperature: 0.0

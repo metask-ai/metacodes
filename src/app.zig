@@ -101,6 +101,8 @@ const api_keys_mod = @import("api/api_keys.zig");
 const openai_mod = @import("api/openai_client.zig");
 const gemini_mod = @import("api/gemini_client.zig");
 const provider_mod = @import("api/provider.zig");
+const request_overrides = @import("api/request_overrides.zig");
+const dialect_mod = @import("api/dialect.zig");
 const json_mod = @import("json.zig");
 const tools_mod = @import("tools.zig");
 const permission_mod = @import("permission.zig");
@@ -354,10 +356,12 @@ pub const App = struct {
         if (config.provider_kind == .openai) {
             app.openai_client = openai_mod.OpenAIClient.init(allocator, io, api_key, config.model, config.base_url);
             app.openai_client.?.reasoning_effort = config.reasoning_effort;
+            app.openai_client.?.overrides = buildOverridesFromConfig(config);
         }
         // Gemini 后端:仅当 provider_kind==.gemini 才建(讲 generateContent 协议 + 有状态缓存)。
         if (config.provider_kind == .gemini) {
             app.gemini_client = gemini_mod.GeminiClient.init(allocator, io, api_key, config.model, config.base_url);
+            app.gemini_client.?.overrides = buildOverridesFromConfig(config);
         }
 
         // 启动时由 canonical Runtime 解析 enterprise / personal / project
@@ -434,7 +438,10 @@ pub const App = struct {
         // arena allocator：第一次的临时 defs 随 session 释放，不单独 free。
         // probe pass 用 teams-aware bootstrap ctx,让 enabled_names 与最终 tool_defs 的
         // swarm 门控一致(否则 --agent-teams 开时 "Using your tools" 段漏列 swarm 工具)。
-        const probe_ctx = tools_mod.PromptContext{ .agent_teams = config.agent_teams };
+        const probe_ctx = tools_mod.PromptContext{
+            .agent_teams = config.agent_teams,
+            .tinykg_enabled = config.long_horizon_arm.usesTinyKg(),
+        };
         const probe_defs = try tools_mod.toToolDefinitionsFull(allocator, &app.dyn_registry, &probe_ctx);
         const enabled_names = try allocator.alloc([]const u8, probe_defs.len);
         for (probe_defs, 0..) |d, i| enabled_names[i] = d.name;
@@ -446,6 +453,7 @@ pub const App = struct {
             .agent_type = "", // 主对话
             .include_git = true,
             .agent_teams = config.agent_teams, // F5:门控 swarm 工具进 tool_defs
+            .tinykg_enabled = config.long_horizon_arm.usesTinyKg(),
         };
         app.tool_defs = try tools_mod.toToolDefinitionsFull(allocator, &app.dyn_registry, &prompt_ctx);
         _ = skill_cli_adapter.applyModelToolSchema(app.tool_defs);
@@ -490,7 +498,7 @@ pub const App = struct {
         app.initMemdir();
 
         // 初始化 TinyKG(记忆/计划/DAG 真相源)。best-effort:失败 → kg=null/degraded,
-        // KG 工具不注册、注入段不出现——KG 是增强非依赖(设计 §6)。
+        // 注入段不出现；允许 TinyKG 的 treatment 仍广告工具并显式返回 kg_unavailable。
         app.initKg();
 
         // 从 config.json 加载 permission_rules（旧 schema，向后兼容）
@@ -551,7 +559,10 @@ pub const App = struct {
 
         // 构造 system prompt（依赖 config.model）。# Using your tools 段按 enabled_tool_names
         // 动态裁剪（对应 cc getUsingYourToolsSection(enabledTools)）。失败仅 log，保持 null。
-        app.system_prompt = system_prompt_mod.buildFull(allocator, app.config.model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady()) catch |err| blk: {
+        // 环境段 cwd 用进程 cwd(CLI 语义);Session 库消费方用 workspace.root(见 agent_session)。
+        const cli_cwd = @import("util/fs.zig").getCwd(allocator) catch "";
+        defer if (cli_cwd.len > 0) allocator.free(cli_cwd);
+        app.system_prompt = system_prompt_mod.buildFull(allocator, app.config.model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), cli_cwd) catch |err| blk: {
             @import("util/log.zig").warn("sysprompt", "build failed: {s} (continuing without system prompt)", .{@errorName(err)});
             break :blk null;
         };
@@ -776,7 +787,9 @@ pub const App = struct {
         errdefer if (previous_model_copy) |m| app.allocator.free(m);
 
         const sp_mod = @import("core/system_prompt.zig");
-        const new_system_prompt = sp_mod.buildFull(app.allocator, model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady()) catch null;
+        const sw_cwd = @import("util/fs.zig").getCwd(app.allocator) catch "";
+        defer if (sw_cwd.len > 0) app.allocator.free(sw_cwd);
+        const new_system_prompt = sp_mod.buildFull(app.allocator, model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), sw_cwd) catch null;
 
         // U3:先同步全部 model 值镜像(seam,不含 config.model=启动快照/system_prompt=派生重建/
         // usage anchor=作废重建),**再** free 旧 model_switch_owned。
@@ -835,6 +848,37 @@ pub const App = struct {
         try app.provider().setReasoningEffort(effort);
         app.config.reasoning_effort = effort;
         app.emitConfig(.{ .reasoning = effort }); // U4:reasoning 单写侧 emit
+    }
+
+    /// 覆盖方言字段(temperature/top_p/prompt_cache_key/parallel_tool_calls/response_format)。
+    /// 非 null 字段 = 显式覆盖,null = 不变。provider 不支持(Anthropic)→ setRequestOverrides 返 error,
+    /// 上层打印警告。reasoning_effort 不走此(它有独立 setter,保持单写侧 emit 路径)。
+    pub fn setRequestOverrides(app: *App, o: request_overrides.RequestOverrides) !void {
+        try app.provider().setRequestOverrides(o);
+        // 同步 config(持久化 + /overrides 显示用)
+        if (o.temperature != null) app.config.temperature = o.temperature;
+        if (o.top_p != null) app.config.top_p = o.top_p;
+        if (o.prompt_cache_key != null) app.config.prompt_cache_key = o.prompt_cache_key;
+        if (o.parallel_tool_calls != null) app.config.parallel_tool_calls = o.parallel_tool_calls;
+        if (o.response_format != null) {
+            // response_format 是 enum,config 存字符串形式
+            const rf_str: ?[]const u8 = switch (o.response_format.?.kind) {
+                .json_object => "json_object",
+                .json_schema => "json_schema",
+                .none => null,
+            };
+            if (rf_str) |s| app.config.response_format = s;
+        }
+    }
+
+    /// 清所有方言覆盖(全 null)。provider 不支持则静默跳过(无覆盖可清)。
+    pub fn clearRequestOverrides(app: *App) void {
+        app.provider().setRequestOverrides(.{}) catch {};
+        app.config.temperature = null;
+        app.config.top_p = null;
+        app.config.prompt_cache_key = null;
+        app.config.parallel_tool_calls = null;
+        app.config.response_format = null;
     }
 
     pub fn persistLoginSelection(app: *App) void {
@@ -933,7 +977,7 @@ pub const App = struct {
     /// memdir 禁用(env)或无 home/cwd → 留空串(降级:不豁免、不注入 AutoMem)。
     fn initMemdir(app: *App) void {
         const memdir = @import("core/memory/memdir.zig");
-        if (!memdir.isEnabled()) return;
+        if (!app.config.long_horizon_arm.usesAutoMemory(memdir.isEnabled())) return;
         const home = app.homeDir();
         const cwd = app.cwdAbs();
         if (home.len == 0 or cwd.len == 0) return;
@@ -946,8 +990,8 @@ pub const App = struct {
         app.permission_ctx.memdir_abs = app.memdir_abs;
     }
 
-    /// KG 就绪判定(kg 非 null 且 ready)。**仅 system prompt 门控用**(tool_defs 在
-    /// initKg 之前构建,不做注册过滤——工具恒注册,degraded 时返回 kg_unavailable)。
+    /// KG 就绪判定(kg 非 null 且 ready)。system prompt 用它决定是否声明图谱与
+    /// Markdown→KG 投影；工具广告则由 long_horizon_arm 的 typed treatment 门控。
     pub fn kgReady(app: *const App) bool {
         if (app.kg) |*k| return k.ready;
         return false;
@@ -957,6 +1001,7 @@ pub const App = struct {
     /// P1:同步 ensureReady + 同步注入摘要(本地未竞争 store 为毫秒级)。
     /// **P2 待办**:移到后台线程(锁竞争最坏 35s;设计 §5 要求启动零阻塞)——已记账。
     fn initKg(app: *App) void {
+        if (!app.config.long_horizon_arm.usesTinyKg()) return;
         const home = app.homeDir();
         const cwd = app.cwdAbs();
         if (home.len == 0 or cwd.len == 0) return;
@@ -973,7 +1018,14 @@ pub const App = struct {
         mkdirKgProjectsDir(app.allocator, home, anchor_hash);
 
         // domain = git 根 basename + git 根 hash 前 8(可读 + 防撞)。
-        const domain = app.computeKgDomain(anchor, anchor_hash) catch return;
+        const domain_override: ?[]const u8 = if (std.c.getenv("METACODES_KG_DOMAIN")) |value|
+            std.mem.span(value)
+        else
+            null;
+        const domain = app.computeKgDomain(anchor, anchor_hash, domain_override) catch |err| {
+            @import("util/log.zig").warn("kg", "project domain override rejected: {s}", .{@errorName(err)});
+            return;
+        };
         defer app.allocator.free(domain);
 
         var client = @import("kg/client.zig").KgClient.init(app.allocator, .{
@@ -989,13 +1041,33 @@ pub const App = struct {
         // 注入摘要(空态零输出)。
         if (client.ready) {
             const inject = @import("kg/inject.zig");
-            if (inject.buildSummary(app.allocator, &app.kg.?, app.kg_projects_dir)) |sum| {
+            if (inject.buildSummaryForAgent(app.allocator, &app.kg.?, app.kg_projects_dir, app.session_id.asSlice())) |sum| {
                 app.kg_summary = sum;
             }
             // 跨会话重建 TaskTab 显示缓存:把 inbox 里未完成的 todo 镜像进内存 store,
             // 让上次会话建的持久任务重启后仍在面板/TaskList 可见(PM P0-A:图为真相,
             // store 为显示缓存;不重建 → 重启后面板空、跨会话连续性只在图里用户看不见)。
             rebuildInboxMirror(app);
+        } else {
+            // KG 降级:启用 TaskStore 文件镜像,让 swarm teammate 看到 lead 的任务
+            // (Bug ② 修复:KG 降级时 TaskCreate 退内存 store,而内存 store 进程隔离 →
+            // teammate 永远看不到 lead 任务。mirror 文件作 KG 降级时的共享后备)。
+            // 路径与 kg_projects_dir 同目录,文件名 tasks.json。
+            const mirror_path = std.fmt.allocPrint(
+                app.allocator,
+                "{s}/tasks.json",
+                .{app.kg_projects_dir},
+            ) catch return;
+            defer app.allocator.free(mirror_path);
+            app.tasks.setMirror(mirror_path) catch |err| {
+                @import("util/log.zig").warn("kg", "degraded task mirror setup failed: {s}", .{@errorName(err)});
+                return;
+            };
+            // 启动时重开共享 mirror；损坏时保留 mirror 配置，让后续 Task* 在写前
+            // fail closed，而不是用局部状态覆盖仍可取证的坏文件。
+            app.tasks.loadFromMirror() catch |err| {
+                @import("util/log.zig").warn("kg", "degraded task mirror reopen failed: {s}", .{@errorName(err)});
+            };
         }
     }
 
@@ -1012,11 +1084,12 @@ pub const App = struct {
         }
         for (rows) |r| {
             if (r.role == .branch) continue; // 复合节点非可执行项,镜像只收叶子
+            if (r.status.isTerminal()) continue; // failed 仍在 frontier 作阻塞上下文，不镜像成 pending。
             var idbuf: [24]u8 = undefined;
             const kg_id = std.fmt.bufPrint(&idbuf, "kg-{d}", .{r.task_id}) catch continue;
             const nl = std.mem.indexOfScalar(u8, r.text, '\n');
             const subject = if (nl) |i| r.text[0..i] else r.text;
-            const status: @import("core/task_store.zig").TaskStatus = if (r.readiness == .ready) .pending else .pending;
+            const status: @import("core/task_store.zig").TaskStatus = if (r.status == .claimed) .in_progress else .pending;
             app.tasks.createWithId(kg_id, subject, r.text, status) catch {};
         }
     }
@@ -1039,8 +1112,19 @@ pub const App = struct {
         _ = std.c.mkdir(fz, 0o700);
     }
 
-    /// domain id:锚点(git 根/cwd)basename + 锚点 hash 前 8(可读 + 防撞)。
-    fn computeKgDomain(app: *App, anchor: []const u8, anchor_hash: [16]u8) ![]u8 {
+    /// domain id:默认由锚点(git 根/cwd)basename + hash 前 8 生成。隔离 worktree
+    /// 可由可信 host 显式绑定同一 logical project；值只允许短 ASCII identifier，
+    /// 防止换行/路径等外部输入进入 TinyKG project name。
+    fn computeKgDomain(app: *App, anchor: []const u8, anchor_hash: [16]u8, override: ?[]const u8) ![]u8 {
+        if (override) |value| {
+            if (value.len == 0 or value.len > 128) return error.InvalidKgDomainOverride;
+            for (value) |character| {
+                if (!(std.ascii.isAlphanumeric(character) or character == '-' or character == '_' or character == '.')) {
+                    return error.InvalidKgDomainOverride;
+                }
+            }
+            return app.allocator.dupe(u8, value);
+        }
         const base = std.fs.path.basename(anchor);
         const safe_base = if (base.len == 0) "root" else base;
         return std.fmt.allocPrint(app.allocator, "{s}-{s}", .{ safe_base, anchor_hash[0..8] });
@@ -1665,6 +1749,27 @@ pub const App = struct {
     }
 };
 
+/// 从 Config 的方言字段构造 RequestOverrides(给 OpenAI/Gemini client 用)。
+/// reasoning_effort 不进 overrides(它有独立 legacy 字段 + setter,保持原路径)。
+/// Anthropic client 不用此函数(不支持方言字段,setRequestOverrides 留 null)。
+/// prompt_cache_key 借用 config 内存(App 生命周期有效,无需 dupe)。
+fn buildOverridesFromConfig(config: types.Config) request_overrides.RequestOverrides {
+    const rf: ?dialect_mod.ResponseFormatRequest = if (config.response_format) |rf_str|
+        .{
+            .kind = if (std.mem.eql(u8, rf_str, "json_schema")) .json_schema else .json_object,
+            .schema = null,
+        }
+    else
+        null;
+    return .{
+        .temperature = config.temperature,
+        .top_p = config.top_p,
+        .prompt_cache_key = config.prompt_cache_key,
+        .parallel_tool_calls = config.parallel_tool_calls,
+        .response_format = rf,
+    };
+}
+
 /// 中断回调(async-signal-safe:只置原子,不分配/不锁/不 IO)。取代旧 sigintHandler(sig)。
 /// **U9**:置进程级 shutdown flag(daemon 主循环 poll 它优雅关所有 session)+ 戳 g_abort_signal
 /// (唤醒 N=1 宿主的 run,兼容既有行为;daemon 未绑单 session 时此指针为 null,靠 accept EINTR 醒)。
@@ -1961,6 +2066,29 @@ test "U2 S1: toggleVim 翻转 config.vim_mode 返回新值" {
     try std.testing.expect(app.config.vim_mode);
     try std.testing.expect(!app.toggleVim()); // → false
     try std.testing.expect(!app.config.vim_mode);
+}
+
+test "KG domain override binds isolated worktrees and rejects unsafe identifiers" {
+    var app: App = undefined;
+    app.allocator = std.testing.allocator;
+    const anchor_hash: [16]u8 = "0123456789abcdef".*;
+
+    const fallback = try app.computeKgDomain("/tmp/repo", anchor_hash, null);
+    defer app.allocator.free(fallback);
+    try std.testing.expectEqualStrings("repo-01234567", fallback);
+
+    const shared = try app.computeKgDomain("/tmp/worktree-a", anchor_hash, "project-deadbeef");
+    defer app.allocator.free(shared);
+    try std.testing.expectEqualStrings("project-deadbeef", shared);
+
+    try std.testing.expectError(
+        error.InvalidKgDomainOverride,
+        app.computeKgDomain("/tmp/worktree-b", anchor_hash, "project\nother"),
+    );
+    try std.testing.expectError(
+        error.InvalidKgDomainOverride,
+        app.computeKgDomain("/tmp/worktree-b", anchor_hash, ""),
+    );
 }
 
 test "U2 S1: compactWindow 结构化返回 {dropped,before,after}(loop/web 共用)" {

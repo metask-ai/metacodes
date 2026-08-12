@@ -6,17 +6,23 @@
 //!   运行结束后从 conversation 提取最后一条 assistant 的文本，干净地打到 stdout。
 //! - `--json`：改为 NDJSON 事件流（每行一个 JSON），便于 CI/脚本消费。
 //!
-//! 退出码：end_turn / max_turns → 0；api_error / tool_error / aborted → 1。
+//! 退出码：end_turn / max_turns / budget / tool_loop → 0；
+//! api_error / tool_error / aborted → 1。tool_loop 保留在 result.stop_reason
+//! 供上游区分，但它和其它受控软停一样不把已有产出判成进程失败。
 
 const std = @import("std");
 const pfs = @import("platform").fs;
 const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
+const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
+const project_activation = @import("../core/project_rule_activation.zig");
+const request_gate_mod = @import("../core/request_gate.zig");
+const tee_backend_mod = @import("../core/tee_backend.zig");
+const ui_backend_mod = @import("../core/protocol/ui_backend.zig");
 const writer_backend = @import("../core/writer_backend.zig");
 
 /// headless 用 WriterBackend null-sink:吞掉 agent_loop 的流式输出（ANSI + tool 注解），
 /// 只要最终文本。工具卡事件 no-op,text_chunk/颜色括号全丢弃。
-
 /// 跑单次 prompt。返回进程退出码。
 pub fn run(
     app: *app_mod.App,
@@ -32,23 +38,107 @@ pub fn run(
 
     try app.conversation.appendText(.user, trimmed);
 
+    // Headless is the benchmark/CI entry point, so evaluation cannot remain a
+    // REPL-only decorator.  Metadata and event fds are host-owned; malformed
+    // grounding fails before the provider or any tool can run.
+    var eval_runtime = try evaluation_backend_mod.RuntimeConfig.fromEnvironment(allocator);
+    defer if (eval_runtime) |*runtime| runtime.deinit();
+
     var wb = writer_backend.WriterBackend.initNullWithUsage(&app.usage);
-    const be = wb.backend();
+    var be = wb.backend();
+    const run_control: ?*project_activation.RunControl = if (app.sessionDir()) |dir|
+        try project_activation.RunControl.init(
+            allocator,
+            dir,
+            app.session_id,
+            if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
+            &app.abort,
+        )
+    else
+        null;
+    defer if (run_control) |control| control.deinit();
+    if (run_control) |control| control.requireDetachedIdle(
+        (if (app.jobs) |*jobs| jobs.runningCount() else 0) +|
+            (if (app.agent_jobs) |*jobs| jobs.runningCount() else 0),
+        app.swarm.hasTeam(),
+    ) catch |err| {
+        try control.finishRun(@errorName(err));
+        return err;
+    };
+    var eval_be: ?evaluation_backend_mod.EvaluationBackend = if (eval_runtime) |*runtime| blk: {
+        const active_provider = app.provider();
+        runtime.configureBudgetReserve(
+            active_provider.maxInputTokens(),
+            active_provider.maxTokens(),
+            app.activeModel(),
+        );
+        break :blk try runtime.initEvaluation(allocator, runtime.nextMetadata(
+            @tagName(app.config.provider_kind),
+            app.activeModel(),
+            @tagName(app.permission_ctx.modeValue()),
+        ));
+    } else null;
+    const eval_request_gate = if (eval_runtime) |*runtime|
+        runtime.requestGate(&app.abort)
+    else
+        null;
+    const eval_execution_policy = if (eval_runtime) |*runtime|
+        runtime.toolExecutionPolicy()
+    else
+        null;
+    defer if (eval_be) |*evaluation| evaluation.deinit();
+    var eval_ui: ui_backend_mod.UiBackend = if (eval_be) |*evaluation| evaluation.backend() else be;
+    var eval_tee = tee_backend_mod.TeeBackend{ .primary = &be, .secondary = &eval_ui };
+    const eval_tee_ui = eval_tee.backend();
+    const effective_be: *const ui_backend_mod.UiBackend = if (eval_be != null) &eval_tee_ui else &be;
     // scoped 自动召回(一等公民 P1):headless 单次 prompt 也按请求装配相关记忆(cache-safe 尾注入)。
-    const scoped_recall = if (app.kg) |*k| (@import("../kg/scoped_recall.zig").build(allocator, k, &app.conversation, &app.abort) catch null) else null;
-    defer if (scoped_recall) |s| allocator.free(s);
+    const scoped_recall_mod = @import("../kg/scoped_recall.zig");
+    var scoped_recall_result: ?scoped_recall_mod.BuildResult = if (app.kg) |*k|
+        (scoped_recall_mod.buildWithReceipt(allocator, k, &app.conversation, &app.abort) catch null)
+    else
+        null;
+    defer if (scoped_recall_result) |*result| result.deinit(allocator);
+    if (eval_be) |*evaluation| if (scoped_recall_result) |result| {
+        try evaluation.setScopedRecallEvidence(.{
+            .schema_version = result.receipt.schema_version,
+            .status = result.receipt.status,
+            .query_sha256 = result.receipt.query_sha256,
+            .result_count = result.receipt.result_count,
+            .injected_count = result.receipt.injected_count,
+            .injected_bytes = result.receipt.injected_bytes,
+            .injection_sha256 = result.receipt.injection_sha256,
+        });
+    };
+    const scoped_recall = if (scoped_recall_result) |result| result.text else null;
     const result = agent_loop.run(
         &app.conversation,
         app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        buildOptions(app, scoped_recall),
-        &be,
+        buildOptions(
+            app,
+            scoped_recall,
+            eval_request_gate,
+            eval_execution_policy,
+            eval_be != null,
+            if (run_control) |control| control.observer() else null,
+            if (run_control) |control| control.formalGate() else null,
+        ),
+        effective_be,
         allocator,
     ) catch |err| {
+        if (run_control) |control| try control.finishRun(@errorName(err));
         std.debug.print("error: {s}\n", .{@errorName(err)});
         return 1;
     };
+    if (run_control) |control| try control.finishRun(@tagName(result.stop_reason));
+
+    // Streaming writes every complete event as it is emitted; the final flush
+    // is still mandatory so a short write or transient sink error cannot leave
+    // a successful headless result backed by an incomplete artifact.
+    if (eval_be) |*evaluation| {
+        if (eval_runtime) |*runtime| try runtime.appendEvaluation(evaluation);
+    }
 
     app.persistTranscript();
 
@@ -94,7 +184,15 @@ fn pendingRequestFn(
 }
 var pending_requester_dummy: u8 = 0;
 
-fn buildOptions(app: *app_mod.App, scoped_recall: ?[]const u8) agent_loop.Options {
+fn buildOptions(
+    app: *app_mod.App,
+    scoped_recall: ?[]const u8,
+    request_gate: ?request_gate_mod.Gate,
+    execution_policy: ?@import("../tools/context.zig").ToolExecutionPolicy,
+    emit_semantic_tool_events: bool,
+    tool_observer: ?@import("../tools/context.zig").ToolObservationSink,
+    project_rule_gate: ?@import("../tools/context.zig").ProjectRuleGate,
+) agent_loop.Options {
     return .{
         // task#20:--suspendable 时装恒 .pending requester → headless 遇 UI 工具挂起而非 NotATty。
         .ui_requester = if (app.config.suspendable)
@@ -103,6 +201,14 @@ fn buildOptions(app: *app_mod.App, scoped_recall: ?[]const u8) agent_loop.Option
             null,
         .verbose = app.config.verbose,
         .abort = &app.abort,
+        .request_gate = request_gate,
+        .execution_policy = execution_policy,
+        .tool_observer = tool_observer,
+        .project_rule_gate = project_rule_gate,
+        // Tool lifecycle events are part of the evaluation protocol even
+        // though the null writer renders no cards.  Leaving this false made
+        // headless traces contain policy decisions without tool attempts.
+        .emit_tool_cards = emit_semantic_tool_events,
         .read_state = &app.read_state,
         .lsp = app.lsp_service, // Y2:headless 也接 LSP 诊断
         .jobs = if (app.jobs) |*j| j else null,
@@ -170,6 +276,22 @@ pub fn resumeSuspended(
 
     var wb = writer_backend.WriterBackend.initNullWithUsage(&app.usage);
     const be = wb.backend();
+    var run_control = try project_activation.RunControl.init(
+        allocator,
+        dir,
+        app.session_id,
+        if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
+        &app.abort,
+    );
+    defer run_control.deinit();
+    run_control.requireDetachedIdle(
+        (if (app.jobs) |*jobs| jobs.runningCount() else 0) +|
+            (if (app.agent_jobs) |*jobs| jobs.runningCount() else 0),
+        app.swarm.hasTeam(),
+    ) catch |err| {
+        try run_control.finishRun(@errorName(err));
+        return err;
+    };
 
     // suspend_state.CompletedResult → agent_loop.SuspendInfo.CompletedResult(同形状,异 nominal 类型)。
     const CR = agent_loop.SuspendInfo.CompletedResult;
@@ -190,13 +312,15 @@ pub fn resumeSuspended(
         state.tool_use_id,
         response_json,
         crs,
-        buildOptions(app, null), // resume 不重新召回
+        buildOptions(app, null, null, null, false, run_control.observer(), run_control.formalGate()), // resume 不重新召回;fresh eval metadata 已在原进程消费
         &be,
         allocator,
     ) catch |err| {
+        try run_control.finishRun(@errorName(err));
         std.debug.print("error: resumeRun 失败({s})\n", .{@errorName(err)});
         return 1;
     };
+    try run_control.finishRun(@tagName(result.stop_reason));
 
     app.persistTranscript();
 
@@ -223,7 +347,7 @@ pub fn resumeSuspended(
 }
 
 /// 把 conversation 最后一条 assistant message 的所有 text block 拼起来（owned）。
-fn lastAssistantText(conv: *const @import("../core/conversation.zig").Conversation, allocator: std.mem.Allocator) ![]const u8 {
+pub fn lastAssistantText(conv: *const @import("../core/conversation.zig").Conversation, allocator: std.mem.Allocator) ![]const u8 {
     var i: usize = conv.messages.items.len;
     while (i > 0) {
         i -= 1;
@@ -236,6 +360,13 @@ fn lastAssistantText(conv: *const @import("../core/conversation.zig").Conversati
                 .text => |t| try buf.appendSlice(allocator, t),
                 else => {},
             }
+        }
+        // A breaker finalization provider may ignore the empty tool set and
+        // return only tool_use. Fall back to the preceding assistant prose
+        // instead of replacing useful partial work with an empty final result.
+        if (buf.items.len == 0) {
+            buf.deinit(allocator);
+            continue;
         }
         return buf.toOwnedSlice(allocator);
     }
@@ -279,18 +410,27 @@ pub fn buildResultLine(
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.print(
-        \\{{"type":"result","stop_reason":"{s}","turns":{d},"tool_calls":{d},"input_tokens":{d},"output_tokens":{d},"cost_usd":{d:.6},"text":
-    , .{ stop, result.turns, result.tool_calls, usage.input_tokens, usage.output_tokens, cost });
+        \\{{"type":"result","stop_reason":"{s}","turns":{d},"tool_calls":{d},"input_tokens":{d},"output_tokens":{d},"cache_read_input_tokens":{d},"cache_creation_input_tokens":{d},"cost_usd":{d:.6},"text":
+    , .{
+        stop,
+        result.turns,
+        result.tool_calls,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_read_input_tokens,
+        usage.cache_creation_input_tokens,
+        cost,
+    });
     try std.json.Stringify.encodeJsonString(final_text, .{}, &aw.writer);
     try aw.writer.writeAll("}\n");
     return try aw.toOwnedSlice();
 }
 
-/// 退出码逻辑(提 pub 供 L2):end_turn/max_turns → 0;suspended → 2(挂起待恢复,非失败);
-/// 其它(error/loop/aborted)→ 1。
+/// 退出码逻辑(提 pub 供 L2):受控停止 → 0;suspended → 2(挂起待恢复,非失败);
+/// 其它(api/tool error 或 aborted)→ 1。
 pub fn exitCodeFor(stop_reason: agent_loop.StopReason) u8 {
     return switch (stop_reason) {
-        .end_turn, .max_turns, .budget => 0, // budget/max_turns=受控停(非失败),同 end_turn
+        .end_turn, .max_turns, .budget, .tool_loop => 0,
         .suspended => 2, // 挂起待恢复:区别于完成(0)与失败(1)
         else => 1,
     };

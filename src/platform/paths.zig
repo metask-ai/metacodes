@@ -66,10 +66,18 @@ pub fn setEnv(name: [*:0]const u8, value: [*:0]const u8) void {
 }
 
 pub fn unsetEnv(name: [*:0]const u8) void {
+    _ = unsetEnvChecked(name);
+}
+
+/// 删除一个环境变量并报告 libc/MSVCRT 是否接受了操作。
+///
+/// 凭证等安全边界不能沿用 `unsetEnv` 的 best-effort 语义：若删除失败，调用方必须
+/// fail closed，而不是继续启动会继承父环境的工具子进程。
+pub fn unsetEnvChecked(name: [*:0]const u8) bool {
     if (is_windows) {
-        _ = _putenv_s(name, ""); // 空值 = 删除
+        return _putenv_s(name, "") == 0; // 空值 = 删除
     } else {
-        _ = unsetenv(name);
+        return unsetenv(name) == 0;
     }
 }
 

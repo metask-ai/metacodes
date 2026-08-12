@@ -392,8 +392,16 @@ pub const Client = struct {
     }
 
     pub fn shutdown(self: *Client) void {
+        self.shutdownWithTimeout(2000);
+    }
+
+    /// Shared lifecycle implementation. Production keeps the conservative 2 s
+    /// LSP grace period; the stubborn-server regression injects a shorter
+    /// finite deadline so it proves timeout -> TERM -> KILL escalation without
+    /// turning the suite into a timer benchmark.
+    fn shutdownWithTimeout(self: *Client, request_timeout_ms: u64) void {
         // 发 shutdown + exit(best-effort),再终止子进程 → reader EOF → join → 才关 fd(顺序防 UAF)。
-        const resp = self.sendRequest("shutdown", null, 2000) catch null;
+        const resp = self.sendRequest("shutdown", null, request_timeout_ms) catch null;
         if (resp) |r| self.allocator.free(r);
         self.sendNotification("exit", null) catch {};
         self.transport.terminate(); // 杀子进程(TERM→KILL 升级)→ 子进程死 → reader 的 read 返 EOF
@@ -585,7 +593,7 @@ test "Client: shutdown 对 ignore-SIGTERM server 升级 SIGKILL 不挂死(Linus 
     const argv = [_]?[*:0]const u8{ MOCK_LSP_STUBBORN, null };
     var cl = Client.create(a, argv[0..], false, null) catch return;
     try cl.initialize("file:///tmp/proj");
-    // 顽固 server 吞 SIGTERM 且不响应 shutdown:sendRequest(shutdown) 2s 超时 → terminate SIGTERM 被吞 →
+    // 顽固 server 吞 SIGTERM 且不响应 shutdown:短 deadline 超时 → terminate SIGTERM 被吞 →
     // WNOHANG 查未死 → SIGKILL 强杀 → reader EOF → join **有界返回**。到这行没挂死即证升级生效。
-    cl.shutdown();
+    cl.shutdownWithTimeout(100);
 }

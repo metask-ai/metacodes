@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "protocol_id": "metacodes-memory-maturation-v1",
+  "manifest_id": "memory-maturation-smoke-v1",
+  "dataset": {
+    "id": "memory-maturation-smoke-v1",
+    "source_sha256": "f06680d8589f572c2f1bfaa9734d45de3fdb2d2daf0f107ab4041272f2c53820",
+    "adapter_id": "synthetic-replay",
+    "adapter_revision": "memory-replay-v1",
+    "split_seed": 20260806
+  },
+  "execution": {
+    "model_id": "fixture-model",
+    "model_fingerprint": "9372c470eeadd5ecd9c3c74c2b3cb633f8e2f2fad799250a0f70d652b6b825e4",
+    "harness_revision": "fixture-replay-v1",
+    "arms": [
+      {
+        "id": "no_memory",
+        "fingerprint": "f1cdfee9c65d357f1d94ae9eb9a84eb41802329c5acfb401d34d13b6958a2e43"
+      },
+      {
+        "id": "tinykg_lexical",
+        "fingerprint": "c9c35f091308fabff2b2fbb7638de61a01b11e070d639452b4f23771a9466f5c"
+      }
+    ],
+    "trials": 1,
+    "retrieval_limits": {
+      "max_k": 10,
+      "max_hops": 3,
+      "max_semantic_variants": 4
+    }
+  },
+  "cases": [
+    {
+      "id": "episodic-preference-1",
+      "benchmark": "episodic_recall",
+      "split": "test",
+      "prompt": "Which color did the user choose for routine warning labels? Answer with only the color.",
+      "gold_answers": ["amber"],
+      "expected_evidence_ids": ["episode:preference:1"],
+      "grader": {
+        "kind": "normalized_exact_match",
+        "fingerprint": "eb075832bfc23fb7064e5affea2503c5b1751cbdd49368745003794f0e5e6789"
+      },
+      "family_id": null
+    },
+    {
+      "id": "multihop-config-1",
+      "benchmark": "multihop_retrieval",
+      "split": "test",
+      "prompt": "On which port does the service identified by codename ORCHID-731 listen? Answer with only the number.",
+      "gold_answers": ["4317"],
+      "expected_evidence_ids": ["fact:bridge:1", "fact:bridge:2"],
+      "grader": {
+        "kind": "normalized_exact_match",
+        "fingerprint": "eb075832bfc23fb7064e5affea2503c5b1751cbdd49368745003794f0e5e6789"
+      },
+      "family_id": null
+    },
+    {
+      "id": "procedural-config-online-1",
+      "benchmark": "procedural_transfer",
+      "split": "online",
+      "prompt": "Rename the legacy traceHeader configuration field to requestHeader and make the repository checks pass.",
+      "gold_answers": [],
+      "expected_evidence_ids": ["procedure:config-migration:1"],
+      "grader": {
+        "kind": "deterministic_validator",
+        "fingerprint": "7a73e7fd4fe4bbeebe819c7b525b339a8ccbe3e91bcf5fe10a11a2984f9c6ef4"
+      },
+      "family_id": "config-key-migration"
+    },
+    {
+      "id": "procedural-config-offline-1",
+      "benchmark": "procedural_transfer",
+      "split": "offline",
+      "prompt": "Rename the legacy retryCap configuration field to maxRetries and make the repository checks pass.",
+      "gold_answers": [],
+      "expected_evidence_ids": ["procedure:config-migration:1"],
+      "grader": {
+        "kind": "deterministic_validator",
+        "fingerprint": "7a73e7fd4fe4bbeebe819c7b525b339a8ccbe3e91bcf5fe10a11a2984f9c6ef4"
+      },
+      "family_id": "config-key-migration"
+    }
+  ],
+  "schedule": [
+    {"sequence": 0, "case_id": "episodic-preference-1", "trial": 0, "arm": "no_memory"},
+    {"sequence": 1, "case_id": "episodic-preference-1", "trial": 0, "arm": "tinykg_lexical"},
+    {"sequence": 2, "case_id": "multihop-config-1", "trial": 0, "arm": "no_memory"},
+    {"sequence": 3, "case_id": "multihop-config-1", "trial": 0, "arm": "tinykg_lexical"},
+    {"sequence": 4, "case_id": "procedural-config-online-1", "trial": 0, "arm": "no_memory"},
+    {"sequence": 5, "case_id": "procedural-config-online-1", "trial": 0, "arm": "tinykg_lexical"},
+    {"sequence": 6, "case_id": "procedural-config-offline-1", "trial": 0, "arm": "no_memory"},
+    {"sequence": 7, "case_id": "procedural-config-offline-1", "trial": 0, "arm": "tinykg_lexical"}
+  ]
+}

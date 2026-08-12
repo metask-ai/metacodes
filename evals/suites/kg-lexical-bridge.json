@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "suite_id": "metacodes-kg-lexical-bridge-v1",
+  "description": "验证无向量 TinyKG 下，模型能否从用户措辞做受限扩词，并利用首轮图内 canonical term 完成唯一一次聚焦复查。",
+  "tasks": [
+    {
+      "id": "70_kg_lexical_bridge",
+      "scenario": "tests/e2e/scenarios/70_kg_lexical_bridge.txt",
+      "layers": ["T", "C", "L", "O", "V"],
+      "environment": {
+        "kind": "isolated_workspace",
+        "reset": "fresh_home_workdir_and_seeded_global_kg",
+        "fixtures": ["tests/e2e/fixtures/kg_lexical_bridge.json"]
+      },
+      "tools": {"profile": "metacodes-runtime-default-v1", "required": ["KgRecall", "Write"]},
+      "constraints": {"timeout_seconds": 600, "permission_mode": "bypassPermissions"},
+      "success": {
+        "checks": [
+          {"type": "file_exists", "path": "answer.txt", "description": "模型写出从图中恢复的规则"},
+          {"type": "contains", "path": "answer.txt", "text": "mode=quartz-17", "description": "恢复 opaque mode 原值"},
+          {"type": "contains", "path": "answer.txt", "text": "expiry_seconds=7200", "description": "恢复精确过期时间"},
+          {"type": "contains", "path": "answer.txt", "text": "release_auth=same-holder", "description": "恢复精确释放身份规则"},
+          {"type": "debug_tool_input_not_contains", "tool": "KgRecall", "text": "TTL", "description": "不得把未经命中支持的 TTL 机制猜测塞进扩词"},
+          {"type": "debug_tool_input_not_contains", "tool": "KgRecall", "text": "claimTask", "description": "不得把未经命中支持的 claimTask 实现名塞进扩词"},
+          {"type": "debug_tool_input_not_contains", "tool": "KgRecall", "text": "task-claim", "description": "不得把未经命中支持的 task-claim 命令名塞进扩词"},
+          {"type": "debug_tool_input_not_contains", "tool": "KgRecall", "text": "releaseTask", "description": "不得把未经命中支持的 releaseTask 实现名塞进扩词"},
+          {"type": "debug_tool_input_not_contains", "tool": "KgRecall", "text": "租约", "description": "不得把未经命中支持的租约机制猜测塞进扩词"}
+        ]
+      },
+      "trajectory_constraints": {
+        "required_tools": ["KgRecall", "Write"],
+        "forbidden_tools": ["Bash", "Read", "Grep", "Glob"],
+        "min_tool_counts": {"KgRecall": 1},
+        "max_turns": 6,
+        "max_tool_calls": 3,
+        "max_model_tool_errors": 1,
+        "max_harness_tool_errors": 0
+      },
+      "trajectory_rationale": {
+        "required_tools": "任务专门验证 KgRecall 两阶段检索并要求 Write 落确定性产物，两者都是被测能力。",
+        "forbidden_tools": "禁止绕过产品检索面直接读取或搜索 TinyKG store。",
+        "min_tool_counts": "首轮 raw-message 自动召回只暴露 opaque canonical token；模型必须据此至少做一次聚焦 KgRecall 才能取得最终 tuple。",
+        "max_turns": "两次检索加一次写入应在短而有界的 agent loop 内完成。",
+        "max_tool_calls": "正常路径是一轮自动召回、一次 KgRecall、一次 Write；额外只留一次有限自纠空间，禁止无界扩词循环。",
+        "max_model_tool_errors": "允许一次参数自纠，但不容忍持续错误调用。",
+        "max_harness_tool_errors": "本地确定性 KG 夹具不应产生 harness 工具失败。"
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "kg-lexical-bridge-v3"}
+    }
+  ]
+}

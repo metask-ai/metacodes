@@ -15,6 +15,7 @@
 const std = @import("std");
 
 pub const VERSION = "0.1.0";
+pub const util_fs = @import("util/fs.zig");
 
 // ── 引擎 ─────────────────────────────────────────────────────────────────
 pub const agent_loop = @import("core/agent_loop.zig"); // run(), Options, RunResult, StopReason
@@ -27,6 +28,24 @@ pub const compact_kernel = @import("core/compact_kernel.zig");
 pub const message = @import("core/message.zig");
 pub const subagent = @import("core/subagent.zig");
 pub const tool_exec = @import("core/tool_exec.zig");
+pub const tool_observation_journal = @import("core/tool_observation_journal.zig");
+pub const rule_impact_stats = @import("core/rule_impact_stats.zig");
+pub const rule_impact_evidence = @import("core/rule_impact_evidence.zig");
+pub const rule_impact_receipt = @import("core/rule_impact_receipt.zig");
+pub const rule_impact_aggregate_receipt = @import("core/rule_impact_aggregate_receipt.zig");
+pub const ontology_rule_projection = @import("core/ontology_rule_projection.zig");
+pub const rule_author = @import("core/rule_author.zig");
+pub const project_rule_gate_protocol = @import("tools/project_rule_gate.zig");
+pub const rule_source_receipt = @import("core/rule_source_receipt.zig");
+pub const project_rule_spec = @import("core/project_rule_spec.zig");
+pub const rule_candidate = @import("core/rule_candidate.zig");
+pub const rule_lifecycle = @import("core/rule_lifecycle.zig");
+pub const rule_build_bundle = @import("core/rule_build_bundle.zig");
+pub const rule_evaluation = @import("core/rule_evaluation.zig");
+pub const project_harness_runtime = @import("formal/project_harness_runtime.zig");
+pub const project_rule_bundle = @import("core/project_rule_bundle.zig");
+pub const project_rule_gate = @import("core/project_rule_gate.zig");
+pub const project_rule_activation = @import("core/project_rule_activation.zig");
 pub const message_repair = @import("core/message_repair.zig");
 pub const tool_error = @import("core/tool_error.zig");
 pub const read_state = @import("core/read_state.zig");
@@ -42,6 +61,15 @@ pub const system_prompt = @import("core/system_prompt.zig");
 pub const answer_queue = @import("core/answer_queue.zig");
 pub const recorder = @import("core/recorder.zig");
 pub const context_pressure = @import("core/context_pressure.zig");
+pub const kg_task_projection = @import("kg/task_projection.zig"); // pure TinyKG snapshot/Markdown contract
+pub const kg_experience_packet = @import("kg/experience_packet.zig"); // prior execution feedback at claim boundary
+pub const kg_lexical_query_plan = @import("kg/lexical_query_plan.zig"); // governed vector-free query plans + host ledger
+pub const formal_runtime = @import("formal/runtime.zig"); // precompiled Lean sidecar trust boundary
+pub const formal_artifact_store = @import("formal/artifact_store.zig"); // immutable research evidence bundles
+pub const formal_provenance = @import("formal/provenance.zig"); // strict sidecar build identity
+pub const formal_task_audit = @import("formal/task_audit.zig"); // TinyKG task-audit sensor/receipt
+pub const formal_memory_migration = @import("formal/memory_migration.zig"); // Lean-derived mutating memory gate
+pub const formal_artifact_verification = @import("formal/artifact_verification.zig"); // governed artifact verify/repair lifecycle
 
 // ── API / client / 配置 ─────────────────────────────────────────────────
 pub const client = @import("client.zig");
@@ -52,8 +80,13 @@ pub const api_provider = @import("api/provider.zig"); // 多 provider vtable
 pub const api_provider_factory = @import("api/provider_factory.zig");
 pub const api_capability = @import("api/capability.zig");
 pub const api_cache = @import("api/cache.zig"); // 多 provider 缓存扩展点契约
+pub const auth = @import("core/auth.zig");
 pub const api_openai = @import("api/openai_client.zig");
 pub const api_gemini = @import("api/gemini_client.zig"); // 第三 provider:Gemini + 有状态缓存
+pub const api_dialect = @import("api/dialect.zig"); // 方言 vtable(模型 wire 格式适配)
+pub const api_request = @import("api/request.zig"); // Anthropic 请求序列化
+pub const api_request_overrides = @import("api/request_overrides.zig"); // 方言字段统一配置入口
+pub const model_adapter = @import("api/model_adapter.zig"); // ModelProfile 能力探测
 pub const json = @import("json.zig");
 pub const types = @import("types.zig");
 pub const config = @import("app/config.zig");

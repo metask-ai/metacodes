@@ -12,7 +12,13 @@ pub fn main(init: std.process.Init) !void {
     const stdout = &stdout_file_writer.interface;
 
     tinykg.cli.run(args, stdout, allocator, init.io) catch |err| {
-        try stdout.flush();
+        // A command that fails after buffering output must not have that
+        // partial result published by the error path.  In particular,
+        // schema-reconcile flushes its success receipt inside the guarded
+        // transaction; if that flush fails it rolls the catalog back before
+        // returning here.  Retrying the stale stdout buffer would otherwise
+        // acknowledge a mutation that no longer exists.
+        stdout.end = 0;
         var stderr_buffer: [1024]u8 = undefined;
         var stderr_file_writer: std.Io.File.Writer = .init(.stderr(), init.io, &stderr_buffer);
         const stderr = &stderr_file_writer.interface;

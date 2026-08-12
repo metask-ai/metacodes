@@ -50,7 +50,7 @@ E2E_LOG_SPEC="agent:debug,client:debug,stream:debug,tool:debug,permission:debug,
 # ============================================================================
 # 设置的变量(调用方读):
 #   CONF_PERMISSION CONF_SETTINGS CONF_ALLOWED_TOOLS CONF_DISALLOWED_TOOLS
-#   CONF_ADD_DIR(换行分隔多条) CONF_ANSWERS CONF_GIT_INIT CONF_MCP_MOCK_SERVERS CONF_TIMEOUT
+#   CONF_ADD_DIR(换行分隔多条) CONF_ANSWERS CONF_GIT_INIT CONF_MCP_MOCK_SERVERS CONF_KG_SEED CONF_TIMEOUT
 #   CONF_EXPECT(换行分隔多条 EXPECT_* 原始行) CONF_EXPECT_HARD
 load_conf() {
   local conf_file="$1"
@@ -62,6 +62,7 @@ load_conf() {
   CONF_ANSWERS=""
   CONF_GIT_INIT=""
   CONF_MCP_MOCK_SERVERS=""
+  CONF_KG_SEED=""
   CONF_TIMEOUT=""
   CONF_EXPECT=""
   CONF_EXPECT_HARD="0"
@@ -87,6 +88,7 @@ load_conf() {
       ANSWERS)           CONF_ANSWERS="$val" ;;
       GIT_INIT)          CONF_GIT_INIT="$val" ;;
       MCP_MOCK_SERVERS)  CONF_MCP_MOCK_SERVERS="$val" ;;
+      KG_SEED)           CONF_KG_SEED="$val" ;;
       TIMEOUT)           CONF_TIMEOUT="$val" ;;
       EXPECT_FILE|EXPECT_CONTAINS|EXPECT_MIN_LINES|EXPECT_ABSENT)
                          CONF_EXPECT="${CONF_EXPECT}${key}=${val}"$'\n' ;;
@@ -121,9 +123,39 @@ run_session() {
 
   mkdir -p "$workdir"
 
+  # --- 真实仓库稀疏快照:由 scored suite 冻结完整 commit id + 路径清单。---
+  # materializer 只接受 Git regular files，限制文件数/总字节，并拒绝路径逃逸与链接。
+  # suite 外的普通探索场景不含 task 条目，helper 会直接 no-op。
+  python3 "$E2E_DIR/materialize_repo_snapshot.py" \
+    --suite "${E2E_EVAL_SUITE:-$ZIG_ROOT/evals/suites/core-e2e.json}" \
+    --task "$(basename "$workdir")" \
+    --repo-root "$ZIG_ROOT" \
+    --workspace "$workdir" || {
+      echo "repository snapshot materialization failed" >&2
+      echo 93
+      return 0
+    }
+
   # --- HOME 隔离:每场景独立 fake HOME,隔离一切 HOME 级副作用 ---
   local fake_home="$workdir/.home"
   setup_fake_home "$fake_home"
+
+  # --- TinyKG 夹具:只向本场景 fake HOME 的全新 store 写入,以 global project 供任意
+  # workdir domain 只读召回。fixture 路径同时在 eval suite environment.fixtures 中冻结。---
+  if [[ -n "$CONF_KG_SEED" ]]; then
+    local tinykg_bin="$ZIG_ROOT/zig-out/vendor/tinykg/tinykg"
+    local kg_fixture="$E2E_DIR/$CONF_KG_SEED"
+    if [[ ! -x "$tinykg_bin" || ! -f "$kg_fixture" ]]; then
+      echo "KG fixture dependency missing: $tinykg_bin or $kg_fixture" >&2
+      echo 94
+      return 0
+    fi
+    python3 "$E2E_DIR/seed_kg_fixture.py" \
+      "$tinykg_bin" "$fake_home/.metacodes/kg/store.kg" "$kg_fixture" || {
+        echo 94
+        return 0
+      }
+  fi
 
   # --- 场景级预置夹具:fixtures/agents → fake HOME(供 22_subagent_custom 等)---
   if [[ -d "$E2E_DIR/fixtures/agents" ]]; then
@@ -161,6 +193,7 @@ PY
       git init -q 2>/dev/null
       git config user.email e2e@cc-zig.local 2>/dev/null
       git config user.name "cc-zig e2e" 2>/dev/null
+      printf '.home/\n' > .git/info/exclude
       # 放个种子文件,保证有东西可 commit
       printf 'cc-zig e2e worktree fixture\n' > .gitseed
       git add -A 2>/dev/null
@@ -189,10 +222,16 @@ PY
   [[ -n "$CONF_ANSWERS" ]] && cli_args+=(--answers-file "$E2E_DIR/$CONF_ANSWERS")
 
   # --- 真实模型认证:fake HOME 不复制用户 auth.json。---
-  # 优先继承显式 METASK_API_KEY；否则从 E2E_AUTH_FILE（默认宿主 auth.json）只读 api_key。
+  # 付费控制面传入匿名 fd；普通手工 E2E 保留旧的 env/auth-file 兼容路径。
+  local runtime_api_key_fd="${E2E_API_KEY_FD:-}"
   local eval_api_key="${METASK_API_KEY:-}"
   local auth_source="${E2E_AUTH_FILE:-${E2E_HOST_HOME:+$E2E_HOST_HOME/.metacodes/auth.json}}"
-  if [[ -z "$eval_api_key" && -n "$auth_source" && -f "$auth_source" ]]; then
+  if [[ -n "$runtime_api_key_fd" && -n "$eval_api_key" ]]; then
+    echo "ambiguous E2E provider credentials" >&2
+    echo 96
+    return 0
+  fi
+  if [[ -z "$runtime_api_key_fd" && -z "$eval_api_key" && -n "$auth_source" && -f "$auth_source" ]]; then
     eval_api_key="$(python3 - "$auth_source" <<'PY'
 import json
 import sys
@@ -206,7 +245,13 @@ PY
 )"
   fi
   local -a auth_env=()
-  [[ -n "$eval_api_key" ]] && auth_env+=("METASK_API_KEY=$eval_api_key")
+  if [[ -n "$runtime_api_key_fd" ]]; then
+    [[ "$runtime_api_key_fd" =~ ^[0-9]+$ ]] || { echo "invalid E2E_API_KEY_FD" >&2; echo 96; return 0; }
+    auth_env+=("METACODES_API_KEY_FD=$runtime_api_key_fd")
+    unset E2E_API_KEY_FD
+  elif [[ -n "$eval_api_key" ]]; then
+    auth_env+=("METASK_API_KEY=$eval_api_key")
+  fi
 
   # --- record 模式(Stage 7):E2E_RECORD=1 时录 cassette 到 <workdir>/cassette/ ---
   if [[ "${E2E_RECORD:-0}" == "1" ]]; then
@@ -228,6 +273,13 @@ PY
   else
     eval_revision="$(git -C "$ZIG_ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown')"
   fi
+  local -a eval_budget_args=()
+  if [[ -n "${E2E_MAX_METERED_TOKENS:-}" ]]; then
+    eval_budget_args+=("--max-metered-tokens" "$E2E_MAX_METERED_TOKENS")
+  fi
+  if [[ -n "${E2E_MAX_COST_USD:-}" ]]; then
+    eval_budget_args+=("--max-cost-usd" "$E2E_MAX_COST_USD")
+  fi
   python3 "$ZIG_ROOT/scripts/eval/cli.py" prepare-e2e \
     --suite "${E2E_EVAL_SUITE:-$ZIG_ROOT/evals/suites/core-e2e.json}" \
     --task "$eval_task" \
@@ -240,7 +292,11 @@ PY
     --harness-config-id "${E2E_HARNESS_CONFIG_ID:-metacodes-e2e-native-v1}" \
     --harness-revision "$eval_revision" \
     --permission-mode "$CONF_PERMISSION" \
-    --binary "$BIN" >/dev/null || return 98
+    --binary "$BIN" \
+    "${eval_budget_args[@]}" >/dev/null || return 98
+  # Budget inputs are now sealed in the inherited metadata fd. Do not expose
+  # runner control state to the model or its tools through the child env.
+  unset E2E_MAX_METERED_TOKENS E2E_MAX_COST_USD
   local eval_enabled=0
   [[ -f "$eval_metadata" ]] && eval_enabled=1
 

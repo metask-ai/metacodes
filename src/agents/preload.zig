@@ -34,6 +34,9 @@ pub const ContextOptions = struct {
     additional_dirs: []const []const u8 = &.{},
     /// AgentDef.memory 解析后的专属目录。为空表示 memory 未启用。
     memory_dir: []const u8 = "",
+    /// AgentDef 白名单经过父运行时能力门与永久禁用集后的真实快照。
+    /// null 保持 def.tools 语义；非 null 时绝不能把已过滤工具写成 Allowed tools。
+    allowed_tool_names: ?[]const []const u8 = null,
 };
 
 pub fn buildSubagentContext(
@@ -57,9 +60,10 @@ pub fn buildSubagentContext(
     else
         def.model;
     if (effective_model.len > 0) try out.writer.print("- Model: {s}\n", .{effective_model});
-    if (def.tools.len > 0) {
+    const allowed_tools = opts.allowed_tool_names orelse def.tools;
+    if (allowed_tools.len > 0) {
         try out.writer.writeAll("- Allowed tools: ");
-        for (def.tools, 0..) |t, i| {
+        for (allowed_tools, 0..) |t, i| {
             if (i > 0) try out.writer.writeAll(", ");
             try out.writer.writeAll(t);
         }
@@ -244,6 +248,16 @@ test "buildSubagentContext: tools listed" {
     defer a.free(ctx);
     try testing.expect(std.mem.indexOf(u8, ctx, "Allowed tools: Read, Grep") != null);
     try testing.expect(std.mem.indexOf(u8, ctx, "Disallowed tools: Write") != null);
+}
+
+test "buildSubagentContext: runtime tool snapshot cannot advertise filtered capabilities" {
+    const a = testing.allocator;
+    var d = try parseAgentMd(a, "---\nname: planner\ntools: Read, KgRecall, KgContext\n---\nPlan safely.", "/x", .builtin);
+    defer d.deinit(a);
+    const ctx = try buildSubagentContext(a, &d, .{ .allowed_tool_names = &.{"Read"} });
+    defer a.free(ctx);
+    try testing.expect(std.mem.indexOf(u8, ctx, "- Allowed tools: Read\n") != null);
+    try testing.expect(std.mem.indexOf(u8, ctx, "- Allowed tools: Read, KgRecall") == null);
 }
 
 test "buildSubagentContext: skip_codebase_context omits CLAUDE.md/git" {

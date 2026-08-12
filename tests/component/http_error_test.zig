@@ -45,7 +45,8 @@ test "L2 Stage6: HTTP 401 → error.Unauthorized 且 body 进日志" {
     try std.testing.expect(fd >= 0);
     defer pfs.close(fd);
     defer _ = std.c.unlink(full_path.ptr);
-    cc.util_log.setLogFileFdForTest(fd);
+    const previous_log_state = cc.util_log.setLogFileFdForTest(fd);
+    defer cc.util_log.restoreForTest(previous_log_state);
     cc.util_log.setLevel(.debug);
 
     // 2) 起 401 mock(纯 JSON body)

@@ -1,0 +1,88 @@
+{
+  "artifact_provenance": {
+    "local_only_artifact_tree": "~/.local/state/metacodes/memory-pilots/procedural-glm52-v9/artifacts/run-001",
+    "local_only_artifact_tree_bytes": 32813113,
+    "local_only_artifact_tree_files": 175,
+    "local_only_artifact_tree_sha256": "39df9bcca9e58deddb3622a86a1e2a1af2114cd2127659ac69a88b6ee8919f09",
+    "metacodes_binary_sha256": "32c0d1d103ad84c396e966dbb93c88b32c8a6464c6ebfc029d9739488e646c22",
+    "pilot_freeze_commit": "5fa7f9a",
+    "ripgrep_snapshot_mode": "0500",
+    "ripgrep_snapshot_sha256": "2fb61b6e5b3e2d89b115fe6c18fd8805670fdf4bdfde85954d40855a76830e5f",
+    "tinykg_binary_sha256": "66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee"
+  },
+  "budget_journal": {
+    "committed_cost_usd": 0.19427,
+    "committed_metered_tokens": 220721,
+    "conservative_exposure_cost_usd": 0.19427,
+    "conservative_exposure_metered_tokens": 220721,
+    "head_sha256": "f455b2f75fae7132f8c261397c99045abc3954a9a3d36139bef99c06681d136d",
+    "journal_id": "58891c6f5cef54f423f24af4da2c891c46636d53ce6768cbc3defedb9c08a448",
+    "revision": 12,
+    "sha256": "9b5454d27c443841373c4e25d92276cfebd6ed412cf4d2d4443934cb61025cd7",
+    "uncertain_authorized_transactions": 0
+  },
+  "failure": {
+    "classification": "offline-markdown-treatment-mutation",
+    "detail": "The offline Markdown arm created journal-repair-registration.md inside its sealed-home memory directory; the post-provider tree digest rejected the rollout after its budget transaction was committed.",
+    "root_cause": "The product memory system prompt advertised writable durable memory while the production Seatbelt profile restored write access to the whole rollout directory. The host had a postcondition but no pre-request read-only enforcement or matching execution policy.",
+    "sequence": 3
+  },
+  "manifest_id": "coding-intent-families-2026080811-1",
+  "outcome": {
+    "automatic_retry_forbidden": true,
+    "canonical_runtime_receipt_published": false,
+    "committed_rollout_transactions": 4,
+    "provider_http_requests_in_committed_transactions": 24,
+    "quality_evidence": false,
+    "remaining_rollouts_not_started": 5,
+    "status": "halted",
+    "uncertain_authorized_transactions": 0
+  },
+  "program_authority": {
+    "conservative_cost_usd_after_attempt": 5.7920468,
+    "conservative_metered_tokens_after_attempt": 3670041,
+    "user_authorization_max_cost_usd": 1000.0
+  },
+  "rollouts": [
+    {
+      "actual_cost_usd": 0.036234,
+      "actual_metered_tokens": 38258,
+      "arm": "no_memory",
+      "provider_http_requests": 5,
+      "sequence": 0,
+      "transaction_id": "ea79413c768dfa0d2b0c91d2adc860617451e6d8e76384122c1578247774bc93",
+      "workspace_deterministic_success": true
+    },
+    {
+      "actual_cost_usd": 0.043842,
+      "actual_metered_tokens": 55645,
+      "arm": "markdown_memory",
+      "provider_http_requests": 7,
+      "sequence": 1,
+      "transaction_id": "f99fa093c082ed7e445fc6eb2637d9e89a3c65e8b2f7e10cc6ad8f04c939f6ef",
+      "workspace_deterministic_success": true
+    },
+    {
+      "actual_cost_usd": 0.040241,
+      "actual_metered_tokens": 45995,
+      "arm": "tinykg_lexical",
+      "provider_http_requests": 4,
+      "query_plan_status": "invalid",
+      "scoped_recall_status": "no_hits",
+      "sequence": 2,
+      "transaction_id": "955e90f108b0d76faa7caecc61d690cdfc7774450882cd22752b6a9623a184fc",
+      "workspace_deterministic_success": true
+    },
+    {
+      "actual_cost_usd": 0.073953,
+      "actual_metered_tokens": 80823,
+      "arm": "markdown_memory",
+      "memory_mutation": "created journal-repair-registration.md",
+      "provider_http_requests": 8,
+      "sequence": 3,
+      "transaction_id": "4d09a2a9741ac970e83c7a9112c35da8b81b1d239d3e0900d21bafba101a4735",
+      "workspace_deterministic_success": false
+    }
+  ],
+  "schema_version": 1
+}

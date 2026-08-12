@@ -139,6 +139,10 @@ pub const CoreEvent = union(enum) {
     /// assistant 文本流(进 scrollback)。borrow slice。
     text_chunk: []const u8,
 
+    /// 思考过程流(reasoning_content / thinking_delta)。borrow slice。
+    /// 与 text_chunk 分离:UI 折叠显示,不混入最终回答;多轮 preserved thinking 回传需要它。
+    thinking_chunk: []const u8,
+
     /// 一轮流式输出开始(取代 agent_loop 旧 `if(colorize) print("\x1b[32m")`)。
     /// backend 决定是否开颜色括号。
     stream_begin,
@@ -228,6 +232,19 @@ pub const CoreEvent = union(enum) {
         cause: []const u8 = "trigger",
     },
 
+    /// 本地上下文投影：没有发 compact-summary 请求，但活跃 provider 上下文已被
+    /// 截断或把旧 tool_result 替换成 stub。原始 transcript 仍可保留；该事件只说明
+    /// 下一次模型请求看到的上下文发生了有损变化，供评测禁止静默宣称保真/cache 优势。
+    context_projection: struct {
+        /// large_tool_result_truncation | stale_tool_result_microcompact
+        kind: []const u8,
+        changed_items: u32,
+        bytes_before: u64,
+        bytes_after: u64,
+        active_messages: u32,
+        cause: []const u8,
+    },
+
     /// 流式建连重试提示(第 attempt/max 次,退避 delay_ms)。
     retry_notice: struct {
         attempt: u32,
@@ -261,6 +278,9 @@ pub const CoreEvent = union(enum) {
     diag_turn_end: struct { trace_id: [12]u8, depth: u8, turn: u32, tool_calls: u32 },
     /// 评估:一次 provider 请求（含建连重试与完整 stream 消费）的阻塞墙钟。
     diag_model_request: struct { trace_id: [12]u8, depth: u8, turn: u32, attempt: u32, elapsed_ms: u64, outcome: []const u8 },
+    /// 评估:一次真实 compact-summary provider 请求。仅在跨过 provider
+    /// 边界后发出；纯本地 optimistic preview 不产生该事件。
+    diag_compact_request: struct { trace_id: [12]u8, depth: u8, turn: u32, elapsed_ms: u64, outcome: []const u8, cause: []const u8 },
     /// 评估:模型 stream 完成后，本轮权限/Hook/工具执行关键路径的墙钟。
     /// 与 model request 串行，因此两者可从 run wall time 中相减得到 harness residual。
     diag_tool_stage: struct { trace_id: [12]u8, depth: u8, turn: u32, tool_calls: u32, elapsed_ms: u64 },

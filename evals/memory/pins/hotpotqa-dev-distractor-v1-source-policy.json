@@ -1,0 +1,13 @@
+{
+  "dataset_sha256": "a72c0b457742cf975df43a907c321a8d6dc8e23a5ab54d2ff44c97dc68c46cf1",
+  "exclusions": [
+    {
+      "issue": "support_sentence_out_of_range",
+      "observed_sentence_count": 5,
+      "sentence_id": 902,
+      "source_id": "5ae61bfd5542992663a4f261",
+      "title": "Jimmy Butler (basketball)"
+    }
+  ],
+  "schema_version": 1
+}

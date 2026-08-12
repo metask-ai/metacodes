@@ -1,0 +1,691 @@
+{
+  "schema_version": 1,
+  "rules": [
+    {
+      "id": "declaration.agentdef-task-required.l2",
+      "title": "AgentDef runtime declarations and Task required inputs have L2 evidence",
+      "target": {
+        "metric": "declared_minus_covered",
+        "setpoint": 0,
+        "goal": "Every governed declaration has an exact, runnable L2 evidence binding."
+      },
+      "sensor": {
+        "adapter": "declaration_l2",
+        "schema_version": 1,
+        "evidence_registry": "control-plane/declaration-l2-evidence.json"
+      },
+      "decision": {
+        "engine": "lean",
+        "kernel": "MetaCodesControl.ClosedLoop.signal",
+        "theorems": [
+          "admitted_implies_closed_loop",
+          "admitted_implies_zero_deviation",
+          "admitted_implies_feedback_passed",
+          "missing_evidence_blocks",
+          "orphan_cannot_be_compliant",
+          "failed_feedback_blocks",
+          "sensor_failure_blocks",
+          "unobserved_actuator_blocks"
+        ]
+      },
+      "actuator": {
+        "kind": "release_gate",
+        "on_violation": "block",
+        "remediation": "Add or repair a real L2 test and its evidence binding; do not silence the declaration.",
+        "observation": {
+          "schema_version": 1,
+          "build_file": "control-plane/build.zig",
+          "build_step": "rule-check",
+          "workflow_file": ".github/workflows/cross-platform.yml",
+          "workflow_job": "rule-control",
+          "workflow_workdir": "metacodes",
+          "telemetry_path": "metacodes/zig-out/reports/rule-control.json"
+        }
+      },
+      "feedback": {
+        "kind": "zig_l2_then_reobserve",
+        "reobserve": true,
+        "timeout_seconds": 300,
+        "commands": [
+          [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.tests.test_rule_control",
+            "-v"
+          ],
+          [
+            "zig",
+            "build",
+            "test:agentdef-fields",
+            "-Dtinykg=false",
+            "-j2",
+            "--summary",
+            "all"
+          ],
+          [
+            "zig",
+            "build",
+            "test:new",
+            "-Dtinykg=false",
+            "-Dtfilter=L2 schema: Task",
+            "-j2",
+            "--summary",
+            "all"
+          ]
+        ]
+      },
+      "counterexample": {
+        "fixture": "control-plane/counterexamples.json",
+        "required": true
+      }
+    },
+    {
+      "id": "memory.evidence-freshness-governance.l2",
+      "title": "TinyKG candidates expose identity, evidence, supersession, and current-state checks",
+      "target": {
+        "metric": "governance_obligations_minus_observed",
+        "setpoint": 0,
+        "goal": "Every automatic or explicit memory path remains candidate-only until executable evidence, supersession, contradiction, and freshness checks are visible."
+      },
+      "sensor": {
+        "adapter": "memory_evidence_governance",
+        "schema_version": 1
+      },
+      "decision": {
+        "engine": "lean",
+        "kernel": "MetaCodesControl.ClosedLoop.signal",
+        "theorems": [
+          "admitted_implies_closed_loop",
+          "admitted_implies_zero_deviation",
+          "admitted_implies_feedback_passed",
+          "missing_evidence_blocks",
+          "orphan_cannot_be_compliant",
+          "failed_feedback_blocks",
+          "sensor_failure_blocks",
+          "unobserved_actuator_blocks"
+        ]
+      },
+      "actuator": {
+        "kind": "release_gate",
+        "on_violation": "block",
+        "remediation": "Restore runtime node identity and structured governance signals plus their exact L2 assertions; prompt prose or manifest claims alone are insufficient.",
+        "observation": {
+          "schema_version": 1,
+          "build_file": "control-plane/build.zig",
+          "build_step": "rule-check",
+          "workflow_file": ".github/workflows/cross-platform.yml",
+          "workflow_job": "rule-control",
+          "workflow_workdir": "metacodes",
+          "telemetry_path": "metacodes/zig-out/reports/rule-control.json"
+        }
+      },
+      "feedback": {
+        "kind": "zig_l2_then_reobserve",
+        "reobserve": true,
+        "timeout_seconds": 300,
+        "commands": [
+          [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.tests.test_rule_control.MemoryGovernanceSensorTests",
+            "-v"
+          ],
+          [
+            "zig",
+            "build",
+            "test:kg-governance",
+            "-Dtfilter=L2 KG governance:",
+            "-j2",
+            "--summary",
+            "all"
+          ]
+        ]
+      },
+      "counterexample": {
+        "fixture": "control-plane/counterexamples.json",
+        "required": true
+      }
+    },
+    {
+      "id": "ontology.execution-grounded-projection.l2",
+      "title": "Successful host execution feeds tentative TinyKG ontology projection",
+      "target": {
+        "metric": "execution_projection_obligations_minus_observed",
+        "setpoint": 0,
+        "goal": "The successful-execution sensor, task-close projection actuator, and focused real-TinyKG feedback remain connected without trusting model self-report."
+      },
+      "sensor": {
+        "adapter": "execution_ontology_feedback",
+        "schema_version": 1
+      },
+      "decision": {
+        "engine": "lean",
+        "kernel": "MetaCodesControl.ClosedLoop.executionProjectionSignal",
+        "theorems": [
+          "admitted_implies_closed_loop",
+          "admitted_implies_zero_deviation",
+          "admitted_implies_feedback_passed",
+          "execution_projection_admitted_implies_three_obligations",
+          "execution_projection_missing_obligation_blocks",
+          "execution_projection_wrong_cardinality_blocks",
+          "orphan_cannot_be_compliant",
+          "failed_feedback_blocks",
+          "sensor_failure_blocks",
+          "unobserved_actuator_blocks"
+        ]
+      },
+      "actuator": {
+        "kind": "release_gate",
+        "on_violation": "block",
+        "remediation": "Restore the production success sensor, terminal projection/retention report, and focused real-TinyKG L2. Comments, prompt claims, skipped tests, and model-supplied acts_on/uses/produces are not execution evidence.",
+        "observation": {
+          "schema_version": 1,
+          "build_file": "control-plane/build.zig",
+          "build_step": "rule-check",
+          "workflow_file": ".github/workflows/cross-platform.yml",
+          "workflow_job": "rule-control",
+          "workflow_workdir": "metacodes",
+          "telemetry_path": "metacodes/zig-out/reports/rule-control.json"
+        }
+      },
+      "feedback": {
+        "kind": "zig_l2_then_reobserve",
+        "reobserve": true,
+        "timeout_seconds": 300,
+        "commands": [
+          [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.tests.test_rule_control.ExecutionOntologySensorTests",
+            "scripts.tests.test_rule_control.FeedbackExecutionTests",
+            "-v"
+          ],
+          [
+            "zig",
+            "build",
+            "test:kg-ontology-feedback",
+            "-Dtfilter=L2 KG ontology feedback:",
+            "-j2",
+            "--summary",
+            "all"
+          ]
+        ]
+      },
+      "counterexample": {
+        "fixture": "control-plane/counterexamples.json",
+        "required": true
+      }
+    },
+    {
+      "id": "ontology.experience-feedback.l2",
+      "title": "Verified prior execution knowledge reaches the next task decision before work",
+      "target": {
+        "metric": "experience_feedback_obligations_minus_observed",
+        "setpoint": 0,
+        "goal": "Task-only exact retrieval, lifecycle/evidence governance, pre-work result actuation, bounded model-side semantic expansion for the non-vector store, and focused real-TinyKG/provider feedback remain connected as one release-gated loop."
+      },
+      "sensor": {
+        "adapter": "experience_feedback",
+        "schema_version": 1
+      },
+      "decision": {
+        "engine": "lean",
+        "kernel": "MetaCodesControl.ClosedLoop.experienceFeedbackSignal",
+        "theorems": [
+          "admitted_implies_closed_loop",
+          "admitted_implies_zero_deviation",
+          "admitted_implies_feedback_passed",
+          "experience_feedback_admitted_implies_five_obligations",
+          "experience_feedback_missing_obligation_blocks",
+          "experience_feedback_wrong_cardinality_blocks",
+          "orphan_cannot_be_compliant",
+          "failed_feedback_blocks",
+          "sensor_failure_blocks",
+          "unobserved_actuator_blocks"
+        ]
+      },
+      "actuator": {
+        "kind": "release_gate",
+        "on_violation": "block",
+        "remediation": "Restore task-kind-pushed bounded retrieval, lifecycle/evidence/state gates, the unified pre-work tool-result actuator, the bounded no-vector semantic-expansion prompt contract, and the focused real-TinyKG-to-next-provider-request L2. Prompt prose, comments, or ontology writes without decision feedback are insufficient.",
+        "observation": {
+          "schema_version": 1,
+          "build_file": "control-plane/build.zig",
+          "build_step": "rule-check",
+          "workflow_file": ".github/workflows/cross-platform.yml",
+          "workflow_job": "rule-control",
+          "workflow_workdir": "metacodes",
+          "telemetry_path": "metacodes/zig-out/reports/rule-control.json"
+        }
+      },
+      "feedback": {
+        "kind": "zig_l2_then_reobserve",
+        "reobserve": true,
+        "timeout_seconds": 300,
+        "commands": [
+          [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.tests.test_rule_control.ExperienceFeedbackSensorTests",
+            "scripts.tests.test_rule_control.FeedbackExecutionTests",
+            "-v"
+          ],
+          [
+            "zig",
+            "build",
+            "test:kg-experience-feedback",
+            "-Dtfilter=L2 KG experience feedback:",
+            "-j2",
+            "--summary",
+            "all"
+          ]
+        ]
+      },
+      "counterexample": {
+        "fixture": "control-plane/counterexamples.json",
+        "required": true
+      }
+    },
+    {
+      "id": "build.test-throughput-integrity.l2",
+      "title": "Build and test throughput improves without losing coverage, failure semantics, or reproducible identities",
+      "target": {
+        "metric": "build_test_integrity_obligations_minus_observed",
+        "setpoint": 0,
+        "goal": "Per-test diagnostics, deterministic sharding, fail-closed aggregation, exact aggregate inventory, explicit fast/full build paths, a location-independent TinyKG binary, and a time-independent formal artifact identity with a separately verified build receipt remain connected while wall, CPU, RSS, and critical-path measurements are collected as host observations."
+      },
+      "sensor": {
+        "adapter": "build_test_throughput",
+        "schema_version": 1
+      },
+      "decision": {
+        "engine": "lean",
+        "kernel": "MetaCodesControl.ClosedLoop.buildTestSignal",
+        "theorems": [
+          "admitted_implies_closed_loop",
+          "admitted_implies_zero_deviation",
+          "admitted_implies_feedback_passed",
+          "build_test_admitted_implies_seven_obligations",
+          "build_test_missing_obligation_blocks",
+          "build_test_wrong_cardinality_blocks",
+          "orphan_cannot_be_compliant",
+          "failed_feedback_blocks",
+          "sensor_failure_blocks",
+          "unobserved_actuator_blocks"
+        ]
+      },
+      "actuator": {
+        "kind": "release_gate",
+        "on_violation": "block",
+        "remediation": "Restore exact test inventory, deterministic partition fingerprints, checked aggregate accounting, leak/failure propagation, per-test timing diagnostics, separate dev/full build paths, the isolated TinyKG double build, and the complete formal double-build identity/receipt check. A lower wall time, a location-dependent binary, or an identity polluted by build time is not admissible.",
+        "observation": {
+          "schema_version": 1,
+          "build_file": "control-plane/build.zig",
+          "build_step": "rule-check",
+          "workflow_file": ".github/workflows/cross-platform.yml",
+          "workflow_job": "rule-control",
+          "workflow_workdir": "metacodes",
+          "telemetry_path": "metacodes/zig-out/reports/rule-control.json"
+        }
+      },
+      "feedback": {
+        "kind": "zig_l2_then_reobserve",
+        "reobserve": true,
+        "timeout_seconds": 600,
+        "commands": [
+          [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.tests.test_rule_control.BuildTestThroughputSensorTests",
+            "scripts.tests.test_rule_control.FeedbackExecutionTests",
+            "-v"
+          ],
+          [
+            "zig",
+            "build",
+            "test:lib-shard-harness",
+            "-j4"
+          ],
+          [
+            "zig",
+            "build",
+            "test:lib",
+            "-Dlib-test-shards=4",
+            "-j4"
+          ],
+          [
+            "zig",
+            "build",
+            "test:spike",
+            "-Dintegration-test-shards=8",
+            "-j8"
+          ],
+          [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.tests.test_artifact_reproducibility.TinyKgArtifactReproducibilityTest.test_two_isolated_vendor_builds_are_byte_identical_and_runnable",
+            "scripts.tests.test_artifact_reproducibility.FormalKernelArtifactIdentityReproducibilityTest.test_two_isolated_complete_builds_share_identity_and_bind_time_receipts",
+            "-v"
+          ]
+        ]
+      },
+      "counterexample": {
+        "fixture": "control-plane/counterexamples.json",
+        "required": true
+      }
+    },
+    {
+      "id": "eval.budget-checkpoint-durability.l2",
+      "title": "Budget violations are durably checkpointed before evaluation abort",
+      "target": {
+        "metric": "budget_checkpoint_obligations_minus_observed",
+        "setpoint": 0,
+        "goal": "Every arm and order position receives the same fixed cap, the complete remaining schedule is feasible before network, measured usage is bound to that cap, and any violation is marked invalid and durably checkpointed before abort; promotion rechecks the same contract."
+      },
+      "sensor": {
+        "adapter": "eval_budget_checkpoint",
+        "schema_version": 1
+      },
+      "decision": {
+        "engine": "lean",
+        "kernel": "MetaCodesControl.BudgetCheckpoint.evalBudgetSignal",
+        "theorems": [
+          "admitted_implies_closed_loop",
+          "admitted_implies_zero_deviation",
+          "admitted_implies_feedback_passed",
+          "checkpoint_transition_requires_invalid_mark",
+          "abort_transition_requires_committed_checkpoint",
+          "canonical_budget_violation_trace_aborts",
+          "abort_before_checkpoint_is_rejected",
+          "eval_budget_admitted_implies_six_obligations",
+          "eval_budget_missing_obligation_blocks",
+          "eval_budget_wrong_cardinality_blocks",
+          "orphan_cannot_be_compliant",
+          "failed_feedback_blocks",
+          "sensor_failure_blocks",
+          "unobserved_actuator_blocks"
+        ]
+      },
+      "actuator": {
+        "kind": "release_gate",
+        "on_violation": "block",
+        "remediation": "Restore identical per-rollout caps, whole-schedule preflight before network, sealed usage validation, invalid marking before checkpoint publication, durable checkpoint publication before the raised abort, promotion-time revalidation, and their disk-backed counterexample tests. Source order or a pure marker test alone is insufficient.",
+        "observation": {
+          "schema_version": 1,
+          "build_file": "control-plane/build.zig",
+          "build_step": "rule-check",
+          "workflow_file": ".github/workflows/cross-platform.yml",
+          "workflow_job": "rule-control",
+          "workflow_workdir": "metacodes",
+          "telemetry_path": "metacodes/zig-out/reports/rule-control.json"
+        }
+      },
+      "feedback": {
+        "kind": "python_l2_then_reobserve",
+        "reobserve": true,
+        "timeout_seconds": 300,
+        "commands": [
+          [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.tests.test_rule_control.EvalBudgetCheckpointSensorTests",
+            "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_multi_arm_rejects_infeasible_remaining_schedule_before_rollout",
+            "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_multi_arm_checkpoints_runtime_budget_overrun_before_abort",
+            "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_promotion_rechecks_fixed_runtime_budget_and_usage",
+            "-v"
+          ]
+        ]
+      },
+      "counterexample": {
+        "fixture": "control-plane/counterexamples.json",
+        "required": true
+      }
+    },
+    {
+      "id": "eval.treatment-activation.l2",
+      "title": "TinyKG treatment activation is execution-grounded and reverified",
+      "target": {
+        "metric": "treatment_activation_obligations_minus_observed",
+        "setpoint": 0,
+        "goal": "Only the TinyKG arm activates one persistent create-claim-complete lifecycle; native events, transcript and frozen-store readback agree; failures are checkpointed before abort; resume and promotion recompute the attestation from raw artifacts before any further paid work or outcome claim."
+      },
+      "sensor": {
+        "adapter": "treatment_activation",
+        "schema_version": 1
+      },
+      "decision": {
+        "engine": "lean",
+        "kernel": "MetaCodesControl.TreatmentActivation.treatmentActivationSignal",
+        "theorems": [
+          "admitted_implies_closed_loop",
+          "admitted_implies_zero_deviation",
+          "admitted_implies_feedback_passed",
+          "treatment_admitted_implies_store_verified",
+          "store_verification_requires_completed",
+          "canonical_treatment_trace_is_admitted",
+          "claim_before_create_is_rejected",
+          "complete_before_claim_is_rejected",
+          "completion_without_store_readback_is_not_admitted",
+          "baseline_admitted_implies_persistent_lifecycle_absent",
+          "treatment_failure_checkpoint_requires_invalid_mark",
+          "treatment_failure_abort_requires_committed_checkpoint",
+          "treatment_failure_abort_before_checkpoint_is_rejected",
+          "abort_without_invalid_mark_is_rejected",
+          "treatment_activation_admitted_implies_eight_obligations",
+          "treatment_activation_missing_obligation_blocks",
+          "treatment_activation_wrong_cardinality_blocks",
+          "orphan_cannot_be_compliant",
+          "failed_feedback_blocks",
+          "sensor_failure_blocks",
+          "unobserved_actuator_blocks"
+        ]
+      },
+      "actuator": {
+        "kind": "release_gate",
+        "on_violation": "block",
+        "remediation": "Restore prompt/arm isolation, exact native-transcript hashes, the one-task create-claim-complete lifecycle, frozen TinyKG task-packet readback with verified_by evidence, mark-checkpoint-abort ordering, resume-before-network reattestation, promotion-time raw-artifact reattestation, and all real TinyKG/tamper/failure counterexamples. Source order, cached receipts, a pure marker test, or an uncommitted checkpoint attempt cannot satisfy the gate.",
+        "observation": {
+          "schema_version": 1,
+          "build_file": "control-plane/build.zig",
+          "build_step": "rule-check",
+          "workflow_file": ".github/workflows/cross-platform.yml",
+          "workflow_job": "rule-control",
+          "workflow_workdir": "metacodes",
+          "telemetry_path": "metacodes/zig-out/reports/rule-control.json"
+        }
+      },
+      "feedback": {
+        "kind": "python_l2_then_reobserve",
+        "reobserve": true,
+        "timeout_seconds": 300,
+        "commands": [
+          [
+            "zig",
+            "build",
+            "vendor:tinykg"
+          ],
+          [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.tests.test_rule_control.TreatmentActivationSensorTests",
+            "scripts.eval.tests.test_treatment_activation.TreatmentActivationTest",
+            "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_multi_arm_checkpoints_treatment_failure_before_abort",
+            "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_multi_arm_does_not_abort_past_failed_treatment_checkpoint",
+            "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_multi_arm_checkpoints_real_multi_invocation_baseline_receipt",
+            "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_multi_arm_resume_reverifies_treatment_before_network",
+            "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_promotion_reverifies_all_raw_treatment_artifacts",
+            "-v"
+          ]
+        ]
+      },
+      "counterexample": {
+        "fixture": "control-plane/counterexamples.json",
+        "required": true
+      }
+    },
+    {
+      "id": "eval.memory-local-store-isolation.l2",
+      "title": "Memory benchmarks use isolated local TinyKG stores without the remote skill harness",
+      "target": {
+        "metric": "memory_local_store_isolation_obligations_minus_observed",
+        "setpoint": 0,
+        "goal": "Every memory benchmark invokes a hash-pinned local TinyKG binary with an explicit fresh run-local store, sealed child environment, raw read-phase digest guard, native remote-sentinel and fault feedback, and provenance-complete zero-remote trace pins for all three adapters."
+      },
+      "sensor": {
+        "adapter": "memory_local_store_isolation",
+        "schema_version": 1
+      },
+      "decision": {
+        "engine": "lean",
+        "kernel": "MetaCodesControl.ClosedLoop.memoryIsolationSignal",
+        "theorems": [
+          "admitted_implies_closed_loop",
+          "admitted_implies_zero_deviation",
+          "admitted_implies_feedback_passed",
+          "memory_isolation_admitted_implies_six_obligations",
+          "memory_isolation_missing_obligation_blocks",
+          "memory_isolation_wrong_cardinality_blocks",
+          "orphan_cannot_be_compliant",
+          "failed_feedback_blocks",
+          "sensor_failure_blocks",
+          "unobserved_actuator_blocks"
+        ]
+      },
+      "actuator": {
+        "kind": "release_gate",
+        "on_violation": "block",
+        "remediation": "Restore direct hash-pinned TinyKG execution, sealed HOME/TMP and removal of every TINYKG_* child variable, fresh run-local store/output containment, the unnormalized whole-store digest around read operations, all three adapter tests plus real native remote sentinels and write-fault rejection, and the three-trace zero-remote pin. Never substitute the TinyKG skill harness or a remote canonical store for benchmark storage.",
+        "observation": {
+          "schema_version": 1,
+          "build_file": "control-plane/build.zig",
+          "build_step": "rule-check",
+          "workflow_file": ".github/workflows/cross-platform.yml",
+          "workflow_job": "rule-control",
+          "workflow_workdir": "metacodes",
+          "telemetry_path": "metacodes/zig-out/reports/rule-control.json"
+        }
+      },
+      "feedback": {
+        "kind": "python_l2_then_reobserve",
+        "reobserve": true,
+        "timeout_seconds": 300,
+        "commands": [
+          [
+            "zig",
+            "build",
+            "vendor:tinykg"
+          ],
+          [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.tests.test_rule_control.MemoryLocalStoreIsolationSensorTests",
+            "scripts.eval.tests.test_memory_tinykg_local",
+            "-v"
+          ]
+        ]
+      },
+      "counterexample": {
+        "fixture": "control-plane/counterexamples.json",
+        "required": true
+      }
+    },
+    {
+      "id": "eval.paid-budget-journal-authorization.l2",
+      "title": "Paid single-machine evaluations require durable local authorization before provider access",
+      "target": {
+        "metric": "paid_budget_journal_obligations_minus_observed",
+        "setpoint": 0,
+        "goal": "Every single-machine production-memory or WorkBuddy request is covered by the exclusive local journal, a complete transaction identity, two-dimensional budget authority, a durably persisted request_authorized transition before provider execution, conservative crash recovery, exact commit idempotency, and checkpoint-bound receipts; a paid schedule resumes only from a fully validated contiguous rollout prefix whose journal revision/head still match exactly, while dry runs, rejected resumes, and preauthorization failures remain zero-network."
+      },
+      "sensor": {
+        "adapter": "paid_budget_journal",
+        "schema_version": 1
+      },
+      "decision": {
+        "engine": "lean",
+        "kernel": "MetaCodesControl.PaidBudgetJournal.paidBudgetSignal",
+        "theorems": [
+          "admitted_implies_closed_loop",
+          "admitted_implies_zero_deviation",
+          "admitted_implies_feedback_passed",
+          "admitted_identity_is_complete_and_authority_bound",
+          "authorized_recovery_exposes_maximum",
+          "authorized_cannot_return_to_unrequested",
+          "repeated_authorization_is_rejected",
+          "admitted_authorization_has_new_revision_and_head",
+          "committed_usage_is_idempotent",
+          "committed_usage_drift_is_rejected",
+          "provider_request_requires_persisted_authorization",
+          "provider_request_without_persisted_authorization_is_rejected",
+          "provider_request_without_permit_is_rejected",
+          "successful_transition_preserves_total_authority",
+          "paid_budget_admitted_implies_nine_obligations",
+          "paid_budget_missing_obligation_blocks",
+          "paid_budget_wrong_cardinality_blocks",
+          "orphan_cannot_be_compliant",
+          "failed_feedback_blocks",
+          "sensor_failure_blocks",
+          "unobserved_actuator_blocks"
+        ]
+      },
+      "actuator": {
+        "kind": "release_gate",
+        "on_violation": "block",
+        "remediation": "Restore the fixed local journal lifecycle and identity binding, exclusive runner lock, temp-fsync/atomic-rename/parent-fsync publication, real runner authorization-before-provider order, both request crash-window counterexamples, maximum authorized exposure, exact committed replay, fail-closed path/CAS checks, per-rollout atomic checkpoints, exact journal-bound resume-before-credential validation, ambiguous commit-to-checkpoint rejection, dry-run zero side effects, and the one-physical-provider-attempt gate. Lean proves only the abstract lifecycle and budget predicates; flock, fsync, rename, subprocess order, artifact re-observation, and filesystem crash behavior require the native L2 feedback named by this rule.",
+        "observation": {
+          "schema_version": 1,
+          "build_file": "control-plane/build.zig",
+          "build_step": "rule-check",
+          "workflow_file": ".github/workflows/cross-platform.yml",
+          "workflow_job": "rule-control",
+          "workflow_workdir": "metacodes",
+          "telemetry_path": "metacodes/zig-out/reports/rule-control.json"
+        }
+      },
+      "feedback": {
+        "kind": "python_l2_then_reobserve",
+        "reobserve": true,
+        "timeout_seconds": 600,
+        "commands": [
+          [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.tests.test_rule_control.PaidBudgetJournalSensorTests",
+            "scripts.eval.tests.test_memory_budget_journal",
+            "scripts.eval.tests.test_memory_budget_runtime",
+            "scripts.eval.tests.test_memory_agent_runtime",
+            "scripts.eval.tests.test_experiment",
+            "scripts.eval.tests.test_paid_multi_arm_fd",
+            "scripts.eval.tests.test_workbuddy_launch_gate",
+            "scripts.eval.tests.test_workbuddy_adapter",
+            "-v"
+          ],
+          [
+            "zig",
+            "build",
+            "test:new",
+            "-Dtinykg=false",
+            "-Dtfilter=L2 evaluation gate makes one physical provider attempt",
+            "-j2",
+            "--summary",
+            "all"
+          ]
+        ]
+      },
+      "counterexample": {
+        "fixture": "control-plane/counterexamples.json",
+        "required": true
+      }
+    }
+  ]
+}

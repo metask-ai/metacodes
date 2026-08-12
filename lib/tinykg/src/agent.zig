@@ -4,6 +4,8 @@ const graph_mod = @import("graph.zig");
 const index = @import("index.zig");
 const query = @import("query.zig");
 const storage = @import("storage.zig");
+const context_packet_mod = @import("agent/context_packet.zig");
+const context_packet = context_packet_mod.ContextPacketAssembly(core, index, query.EdgeCursor, query.NodeLookup);
 
 pub const ObservationInput = struct {
     task: ?core.NodeId = null,
@@ -19,6 +21,7 @@ pub const IdleMaintenancePolicy = struct {
     node_text_delta_max_records: u64 = 0,
     node_text_run_every_ops: usize = 0,
     node_text_run_max_records: u64 = 0,
+    primary_text_finalize_every_ops: usize = 0,
 
     pub const disabled = IdleMaintenancePolicy{};
     pub const edge_l0_maint10s16e64 = IdleMaintenancePolicy{
@@ -50,6 +53,12 @@ pub const IdleMaintenancePolicy = struct {
             completed_append_ops != 0 and
             completed_append_ops % self.node_text_run_every_ops == 0;
     }
+
+    pub fn shouldFinalizePrimaryText(self: IdleMaintenancePolicy, completed_append_ops: usize) bool {
+        return self.primary_text_finalize_every_ops != 0 and
+            completed_append_ops != 0 and
+            completed_append_ops % self.primary_text_finalize_every_ops == 0;
+    }
 };
 
 pub const IdleMaintenanceResult = struct {
@@ -61,6 +70,8 @@ pub const IdleMaintenanceResult = struct {
     node_text_delta: storage.NodeTextDeltaMaintenanceResult = .{ .compacted = false },
     node_text_runs_ran: bool = false,
     node_text_runs: storage.NodeTextRunMaintenanceResult = .{ .compacted = false },
+    primary_text_finalize_ran: bool = false,
+    primary_text_finalize: storage.NodeTextsCompressionResult = .{},
 };
 
 pub const IdleMaintenanceStats = struct {
@@ -84,13 +95,16 @@ pub const IdleMaintenanceStats = struct {
     node_text_run_records_before_last: u64 = 0,
     node_text_run_records_after_last: u64 = 0,
     node_text_run_gc_deleted_runs: u64 = 0,
+    primary_text_finalizations: usize = 0,
+    primary_text_bytes_before_last: u64 = 0,
+    primary_text_bytes_after_last: u64 = 0,
 
     fn recordAppend(self: *IdleMaintenanceStats) !void {
         self.append_ops = std.math.add(usize, self.append_ops, 1) catch return error.RecordTooLarge;
     }
 
     fn recordMaintenance(self: *IdleMaintenanceStats, result: IdleMaintenanceResult) !void {
-        if (!result.edge_l0_ran and !result.edge_gc_ran and !result.node_text_delta_ran and !result.node_text_runs_ran) return;
+        if (!result.edge_l0_ran and !result.edge_gc_ran and !result.node_text_delta_ran and !result.node_text_runs_ran and !result.primary_text_finalize_ran) return;
         self.maintenance_ops = std.math.add(usize, self.maintenance_ops, 1) catch return error.RecordTooLarge;
         if (result.edge_l0_ran) {
             self.maintenance_entries_before_last = result.edge_l0.manifest_entries_before;
@@ -124,6 +138,13 @@ pub const IdleMaintenanceStats = struct {
                 self.node_text_run_compactions = std.math.add(usize, self.node_text_run_compactions, 1) catch return error.RecordTooLarge;
                 self.node_text_run_records_compacted = std.math.add(u64, self.node_text_run_records_compacted, result.node_text_runs.compacted_run_records) catch return error.RecordTooLarge;
                 self.node_text_run_gc_deleted_runs = std.math.add(u64, self.node_text_run_gc_deleted_runs, result.node_text_runs.gc_deleted_runs) catch return error.RecordTooLarge;
+            }
+        }
+        if (result.primary_text_finalize_ran) {
+            self.primary_text_bytes_before_last = result.primary_text_finalize.before_bytes;
+            self.primary_text_bytes_after_last = result.primary_text_finalize.after_bytes;
+            if (result.primary_text_finalize.compressed) {
+                self.primary_text_finalizations = std.math.add(usize, self.primary_text_finalizations, 1) catch return error.RecordTooLarge;
             }
         }
     }
@@ -209,6 +230,10 @@ pub fn runIdleMaintenanceWithPinnedManifests(
         result.node_text_runs_ran = true;
         result.node_text_runs = try store.compactNodeTextRunsBudgetedExceptAndProcessLeases(policy.node_text_run_max_records, pinned_node_text_run_manifest_paths);
     }
+    if (policy.shouldFinalizePrimaryText(completed_append_ops)) {
+        result.primary_text_finalize_ran = true;
+        result.primary_text_finalize = try store.finalizePrimaryTextStorageWithResult();
+    }
     return result;
 }
 
@@ -284,28 +309,8 @@ fn rollbackLastObservation(graph: *graph_mod.Graph, id: core.NodeId) void {
     _ = graph.removeLastNodeIfId(id);
 }
 
-pub const ContextPacket = struct {
-    focus: core.NodeId,
-    max_facts: usize,
-    facts: std.ArrayList(ContextFact),
-
-    pub fn deinit(self: *ContextPacket, allocator: std.mem.Allocator) void {
-        self.facts.deinit(allocator);
-    }
-};
-
-pub const ContextFact = struct {
-    node_id: core.NodeId,
-    edge_id: core.EdgeId,
-    rel: core.RelKind,
-    direction: Direction,
-    score: u16,
-
-    pub const Direction = enum {
-        outgoing,
-        incoming,
-    };
-};
+pub const ContextPacket = context_packet.ContextPacket;
+pub const ContextFact = context_packet.ContextFact;
 
 pub fn contextPacket(allocator: std.mem.Allocator, graph: *const graph_mod.Graph, focus: core.NodeId, max_facts: usize) !ContextPacket {
     var mem_index = try index.MemoryIndex.init(allocator, graph);
@@ -327,30 +332,14 @@ pub fn contextPacketWithCursor(
 ) !ContextPacket {
     if (isReservedNodeId(focus)) return core.Error.InvalidId;
     if (mem_index.getNode(graph, focus) == null) return core.Error.NotFound;
-    var facts = std.ArrayList(ContextFact).empty;
-    errdefer facts.deinit(allocator);
-    if (max_facts == 0) return .{ .focus = focus, .max_facts = max_facts, .facts = facts };
-
-    var outgoing_context = ContextCollectContext{
-        .allocator = allocator,
-        .facts = &facts,
-        .max_facts = max_facts,
-        .direction = .outgoing,
-        .node_lookup = .{ .memory = .{ .graph = graph, .mem_index = mem_index } },
-    };
-    _ = try edge_cursor.forEachOutgoing(focus, &outgoing_context, collectContextFact);
-
-    var incoming_context = ContextCollectContext{
-        .allocator = allocator,
-        .facts = &facts,
-        .max_facts = max_facts,
-        .direction = .incoming,
-        .node_lookup = .{ .memory = .{ .graph = graph, .mem_index = mem_index } },
-    };
-    _ = try edge_cursor.forEachIncoming(focus, &incoming_context, collectContextFact);
-
-    std.mem.sort(ContextFact, facts.items, {}, contextFactLessThan);
-    return .{ .focus = focus, .max_facts = max_facts, .facts = facts };
+    return context_packet.assemble(
+        allocator,
+        edge_cursor,
+        .{ .memory = .{ .graph = graph, .mem_index = mem_index } },
+        focus,
+        max_facts,
+        null,
+    );
 }
 
 pub fn contextPacketWithPersistentStore(
@@ -453,143 +442,26 @@ fn contextPacketWithPersistentStoreOnce(
     defer node_view.deinit();
     if (!try node_view.nodeExists(focus)) return core.Error.NotFound;
 
-    var facts = std.ArrayList(ContextFact).empty;
-    errdefer facts.deinit(allocator);
-    if (max_facts == 0) return .{ .focus = focus, .max_facts = max_facts, .facts = facts };
-
     const cursor = query.EdgeCursor{ .persistent_store = .{
         .allocator = allocator,
         .store = store,
         .edge_retention_registry = edge_retention_registry,
     } };
     const node_lookup = query.NodeLookup{ .persistent_store = .{ .store = store, .node_view = &node_view, .missing_is_invalid = true } };
-    var outgoing_context = ContextCollectContext{
-        .allocator = allocator,
-        .facts = &facts,
-        .max_facts = max_facts,
-        .direction = .outgoing,
-        .node_lookup = node_lookup,
-        .budget = budget,
-        .stats = stats,
-        .budget_start_nodes = budget_start_nodes,
-        .budget_start_edges = budget_start_edges,
-        .deadline = deadline,
-    };
-    _ = try cursor.forEachOutgoing(focus, &outgoing_context, collectContextFact);
-
-    var incoming_context = ContextCollectContext{
-        .allocator = allocator,
-        .facts = &facts,
-        .max_facts = max_facts,
-        .direction = .incoming,
-        .node_lookup = node_lookup,
-        .budget = budget,
-        .stats = stats,
-        .budget_start_nodes = budget_start_nodes,
-        .budget_start_edges = budget_start_edges,
-        .deadline = deadline,
-    };
-    _ = try cursor.forEachIncoming(focus, &incoming_context, collectContextFact);
-
-    std.mem.sort(ContextFact, facts.items, {}, contextFactLessThan);
-    return .{ .focus = focus, .max_facts = max_facts, .facts = facts };
-}
-
-fn relationScore(rel: core.RelKind) u16 {
-    return switch (rel) {
-        .defines, .depends_on, .blocks, .evidences, .verified_by => 80,
-        .contains, .calls, .imports, .derived_from, .summarizes => 60,
-        .mentions, .references, .explains, .based_on => 40,
-        else => 20,
-    };
-}
-
-const ContextCollectContext = struct {
-    allocator: std.mem.Allocator,
-    facts: *std.ArrayList(ContextFact),
-    max_facts: usize,
-    direction: ContextFact.Direction,
-    node_lookup: query.NodeLookup,
-    budget: ?core.QueryBudget = null,
-    stats: ?*index.QueryStats = null,
-    budget_start_nodes: usize = 0,
-    budget_start_edges: usize = 0,
-    deadline: core.QueryDeadline = .none,
-};
-
-fn collectContextFact(ctx: *ContextCollectContext, edge: index.EdgeRef) !bool {
-    if (ctx.deadline.expired()) return core.Error.BudgetExceeded;
-    if (ctx.stats) |stats| {
-        const budget = ctx.budget orelse return core.Error.Unsupported;
-        if (stats.edges_visited - ctx.budget_start_edges >= budget.max_visited_edges) return core.Error.BudgetExceeded;
-        try index.addVisitedEdges(stats, 1);
-    }
-    switch (ctx.direction) {
-        .outgoing => {
-            try chargeContextNode(ctx);
-            const exists = try ctx.node_lookup.exists(edge.dst);
-            if (!exists) return false;
-            try countContextNode(ctx);
-            try appendContextFactBounded(ctx.allocator, ctx.facts, ctx.max_facts, .{
-                .node_id = edge.dst,
-                .edge_id = edge.edge_id,
-                .rel = edge.rel,
-                .direction = .outgoing,
-                .score = relationScore(edge.rel) + 20,
-            });
+    return context_packet.assemble(
+        allocator,
+        cursor,
+        node_lookup,
+        focus,
+        max_facts,
+        .{
+            .budget = budget,
+            .stats = stats,
+            .budget_start_nodes = budget_start_nodes,
+            .budget_start_edges = budget_start_edges,
+            .deadline = deadline,
         },
-        .incoming => {
-            if (edge.src.toInt() == edge.dst.toInt()) return false;
-            try chargeContextNode(ctx);
-            const exists = try ctx.node_lookup.exists(edge.src);
-            if (!exists) return false;
-            try countContextNode(ctx);
-            try appendContextFactBounded(ctx.allocator, ctx.facts, ctx.max_facts, .{
-                .node_id = edge.src,
-                .edge_id = edge.edge_id,
-                .rel = edge.rel,
-                .direction = .incoming,
-                .score = relationScore(edge.rel),
-            });
-        },
-    }
-    return false;
-}
-
-fn chargeContextNode(ctx: *ContextCollectContext) !void {
-    const stats = ctx.stats orelse return;
-    const budget = ctx.budget orelse return core.Error.Unsupported;
-    if (stats.nodes_visited - ctx.budget_start_nodes >= budget.max_visited_nodes) return core.Error.BudgetExceeded;
-}
-
-fn countContextNode(ctx: *ContextCollectContext) !void {
-    const stats = ctx.stats orelse return;
-    try index.addVisitedNodes(stats, 1);
-}
-
-fn contextFactLessThan(_: void, lhs: ContextFact, rhs: ContextFact) bool {
-    if (lhs.score != rhs.score) return lhs.score > rhs.score;
-    if (@intFromEnum(lhs.rel) != @intFromEnum(rhs.rel)) return @intFromEnum(lhs.rel) < @intFromEnum(rhs.rel);
-    if (lhs.node_id.toInt() != rhs.node_id.toInt()) return lhs.node_id.toInt() < rhs.node_id.toInt();
-    return lhs.edge_id.toInt() < rhs.edge_id.toInt();
-}
-
-fn appendContextFactBounded(allocator: std.mem.Allocator, facts: *std.ArrayList(ContextFact), max_facts: usize, fact: ContextFact) !void {
-    if (max_facts == 0) return;
-    if (facts.items.len < max_facts) {
-        try facts.append(allocator, fact);
-        return;
-    }
-
-    var worst_index: usize = 0;
-    for (facts.items[1..], 1..) |candidate, i| {
-        if (contextFactLessThan({}, facts.items[worst_index], candidate)) {
-            worst_index = i;
-        }
-    }
-    if (contextFactLessThan({}, fact, facts.items[worst_index])) {
-        facts.items[worst_index] = fact;
-    }
+    );
 }
 
 fn isReservedNodeId(id: core.NodeId) bool {
@@ -650,6 +522,7 @@ test "idle maintenance policy gates budgeted edge L0 compaction" {
 
     try std.testing.expect(!IdleMaintenancePolicy.disabled.shouldMaintainEdgeL0(2));
     try std.testing.expect(!IdleMaintenancePolicy.disabled.shouldMaintainEdgeGc(2));
+    try std.testing.expect(!IdleMaintenancePolicy.disabled.shouldFinalizePrimaryText(2));
     try std.testing.expect(!IdleMaintenancePolicy.edge_l0_maint10s16e64.shouldMaintainEdgeL0(9));
     try std.testing.expect(IdleMaintenancePolicy.edge_l0_maint10s16e64.shouldMaintainEdgeL0(10));
     try std.testing.expectEqual(@as(usize, 16), IdleMaintenancePolicy.edge_l0_maint10s16e64.edge_l0_max_segments);
@@ -688,6 +561,38 @@ test "idle maintenance policy gates budgeted edge L0 compaction" {
     try std.testing.expectEqual(@as(u64, 0), session.stats.maintenance_gc_deleted_manifests);
     try std.testing.expectEqual(@as(usize, 3), session.stats.maintenance_entries_before_last);
     try std.testing.expectEqual(@as(usize, 2), session.stats.maintenance_entries_after_last);
+}
+
+test "idle maintenance explicitly finalizes legacy raw primary text" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .durability = .fast,
+        .primary_text_write_mode = .bulk_ingest,
+    });
+    defer store.deinit();
+    try store.createEmpty();
+    const text = [_]u8{'a'} ** 4096;
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .document, .text = &text });
+
+    const skipped = try runIdleMaintenance(store, .{ .primary_text_finalize_every_ops = 2 }, 1);
+    try std.testing.expect(!skipped.primary_text_finalize_ran);
+    const finalized = try runIdleMaintenance(store, .{ .primary_text_finalize_every_ops = 2 }, 2);
+    try std.testing.expect(finalized.primary_text_finalize_ran);
+    try std.testing.expect(finalized.primary_text_finalize.compressed);
+
+    var session = AgentWriteSession.init(store, .{ .primary_text_finalize_every_ops = 1 });
+    const no_op = try session.recordAppendAndMaintain();
+    try std.testing.expect(no_op.primary_text_finalize_ran);
+    try std.testing.expect(!no_op.primary_text_finalize.compressed);
+    try std.testing.expectEqual(@as(usize, 1), session.stats.maintenance_ops);
+    try std.testing.expectEqual(@as(usize, 0), session.stats.primary_text_finalizations);
 }
 
 test "idle maintenance edge gc preserves pinned epoch manifests" {

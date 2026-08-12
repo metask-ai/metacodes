@@ -39,6 +39,7 @@ const api_stream = @import("stream.zig");
 const provider_mod = @import("provider.zig");
 const capability = @import("capability.zig");
 const cache = @import("cache.zig");
+const request_overrides = @import("request_overrides.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
 const StreamEvent = api_stream.StreamEvent;
@@ -58,6 +59,8 @@ pub const OpenAIClient = struct {
     max_tokens: u32 = 4096,
     context_window: u32 = 128_000,
     reasoning_effort: ?types.ReasoningEffort = null,
+    /// 方言字段覆盖(null = profile 默认)。来源:计划 jolly-glacier。
+    overrides: request_overrides.RequestOverrides = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8, base_url: ?[]const u8) OpenAIClient {
         return .{
@@ -86,6 +89,8 @@ pub const OpenAIClient = struct {
             .maxInputTokensFn = &pMaxInputTokens,
             .reasoningEffortFn = &pReasoningEffort,
             .setReasoningEffortFn = &pSetReasoningEffort,
+            .requestOverridesFn = &pRequestOverrides,
+            .setRequestOverridesFn = &pSetRequestOverrides,
             .supportsFn = &pSupports,
         };
     }
@@ -94,6 +99,20 @@ pub const OpenAIClient = struct {
     }
     fn pModel(ctx: *anyopaque) []const u8 {
         return cast(ctx).model;
+    }
+    /// Provider.requestOverrides() 返回 Client.overrides;同步也镜像 reasoning_effort
+    /// 进 overrides.reasoning_effort(若 overrides 未显式设,从 legacy 字段兜底),
+    /// 让 serialize 经统一入口拿到 effort。
+    fn pRequestOverrides(ctx: *anyopaque) request_overrides.RequestOverrides {
+        const self = cast(ctx);
+        var o = self.overrides;
+        if (o.reasoning_effort == null) o.reasoning_effort = self.reasoning_effort;
+        return o;
+    }
+    fn pSetRequestOverrides(ctx: *anyopaque, o: request_overrides.RequestOverrides) void {
+        cast(ctx).overrides = o;
+        // 同步 reasoning_effort(若 o 显式设了),保持 legacy 字段一致
+        if (o.reasoning_effort) |e| cast(ctx).reasoning_effort = e;
     }
     fn pMaxTokens(ctx: *anyopaque) u32 {
         return cast(ctx).max_tokens;
@@ -130,11 +149,15 @@ pub const OpenAIClient = struct {
         return pSendStream(ctx, messages, system, tools, abort, model_override, tool_choice, user_query);
     }
     fn pSendStream(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, user_query: []const u8) anyerror!StreamHandle {
-        _ = tool_choice;
         _ = user_query; // OpenAI 无 server-tool web_search → 无需 query 透传
         const self = cast(ctx);
         const model = model_override orelse self.model;
-        const body = try serializeOpenAIRequest(self.allocator, model, messages, system, tools, self.reasoning_effort);
+        // overrides 从 provider 状态读(reasoning_effort 走 legacy 兜底,tool_choice 走 per-call 参数)。
+        // 这样 agent_loop 无需感知 overrides——provider 自己管方言字段。
+        var o = self.overrides;
+        if (o.reasoning_effort == null) o.reasoning_effort = self.reasoning_effort;
+        o.tool_choice = tool_choice;
+        const body = try serializeOpenAIRequestWithOverrides(self.allocator, model, messages, system, tools, o);
         defer self.allocator.free(body);
         return self.doStream(body, abort);
     }
@@ -200,6 +223,7 @@ pub const OpenAIClient = struct {
         const heap = try self.allocator.create(OpenAIStream);
         heap.* = .{
             .allocator = self.allocator,
+            .model = self.model,
             .request = req_ptr,
             .response = response,
             .abort = abort,
@@ -218,6 +242,7 @@ fn secureFree(allocator: std.mem.Allocator, buf: []u8) void {
 /// OpenAI 流式响应:持 Response + transfer buffer + 逐行 SSE 解析状态。包成中立 StreamHandle。
 const OpenAIStream = struct {
     allocator: std.mem.Allocator,
+    model: []const u8,
     request: *http.Client.Request,
     response: http.Client.Response,
     transfer_buf: [8192]u8 = undefined,
@@ -337,6 +362,17 @@ const OpenAIStream = struct {
                 const owned = try self.allocator.dupe(u8, content);
                 return StreamEvent{ .text = owned };
             }
+        }
+        // delta.reasoning_content → thinking(DeepSeek/Kimi/Qwen/GLM-5)。
+        // OpenAI 原生不返回此字段(仅 reasoning_tokens 计数);兼容端点把它作为平级字符串返回。
+        // 委托给 dialect(按 model 选解析逻辑;OpenAI 原生 dialect 返 null)。
+        const dialect_mod = @import("dialect.zig");
+        const dialect = dialect_mod.dialectFor(.openai, self.model);
+        if (try dialect.extractThinkingDelta(data, self.allocator)) |reasoning| {
+            if (reasoning.len > 0) {
+                return StreamEvent{ .thinking = reasoning };
+            }
+            self.allocator.free(reasoning);
         }
         // delta.tool_calls 增量(P0.1 并行):按 `index` 分槽累积。OpenAI 流式对每个并行 tool_call
         // 用独立 index;同一 chunk 的 tool_calls array 可含多个元素,元素跨 chunk 续拼 arguments。
@@ -589,26 +625,59 @@ fn extractDeltaContent(data: []const u8) ?[]const u8 {
     return util_json.extractStringField(data, "content");
 }
 
+/// 从 OpenAI chat/completions delta 提取 reasoning_content(DeepSeek/Kimi/Qwen/GLM-5)。
+/// 与 content 平级的字符串字段。OpenAI 原生无此字段。
+fn extractDeltaReasoning(data: []const u8) ?[]const u8 {
+    return util_json.extractStringField(data, "reasoning_content");
+}
+
 /// 中立 Conversation/tools → OpenAI chat/completions 请求 body。caller free。
-pub fn serializeOpenAIRequest(allocator: std.mem.Allocator, model: []const u8, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, reasoning_effort: ?types.ReasoningEffort) ![]u8 {
+/// 按 model 查 ModelProfile 决定 thinking wire 格式(GLM prompt 标签 / K3 extra_body / DeepSeek 顶层 / OpenAI effort)。
+/// tool_choice 由 dialect.serializeToolChoice 翻译成 OpenAI wire(Anthropic 语义→OpenAI 语义)。
+pub fn serializeOpenAIRequest(allocator: std.mem.Allocator, model: []const u8, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, reasoning_effort: ?types.ReasoningEffort, tool_choice: ?json_mod.ToolChoice) ![]u8 {
+    // Legacy 签名 wrapper:把散落的 reasoning_effort + tool_choice 包成 RequestOverrides
+    // 转给 serializeOpenAIRequestWithOverrides。保留向后兼容(既有测试/调用方不动)。
+    return serializeOpenAIRequestWithOverrides(allocator, model, messages, system, tools, .{
+        .reasoning_effort = reasoning_effort,
+        .tool_choice = tool_choice,
+    });
+}
+
+/// 完整方言字段入口的序列化(阶段 3:接线 dead code)。
+/// overrides 非 null 字段 = 显式覆盖;null 字段 = dialect 按 profile 静态推断(现状)。
+/// 来源:计划 jolly-glacier(2026-08-11)。
+pub fn serializeOpenAIRequestWithOverrides(allocator: std.mem.Allocator, model: []const u8, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, overrides: request_overrides.RequestOverrides) ![]u8 {
+    const adapter = @import("model_adapter.zig");
+    const dialect_mod = @import("dialect.zig");
+    const profile = adapter.profileFor(.openai, model);
+    const dialect = dialect_mod.dialectFor(.openai, model);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "{\"model\":");
     try util_json.serializeString(model, &out, allocator);
-    if (reasoning_effort) |effort| {
-        if (effort.active()) {
-            try out.appendSlice(allocator, ",\"reasoning_effort\":");
-            try util_json.serializeString(effort.name(), &out, allocator);
-        }
+    // thinking 控制:委托给 dialect(按 model 选 wire 格式)。
+    try dialect.serializeThinking(profile, overrides.reasoning_effort, &out, allocator);
+    // 通用采样参数(不经 dialect,所有 OpenAI 协议都认)。
+    if (overrides.temperature) |t| {
+        try out.appendSlice(allocator, ",\"temperature\":");
+        try util_json.serializeNumber(t, &out, allocator);
+    }
+    if (overrides.top_p) |p| {
+        try out.appendSlice(allocator, ",\"top_p\":");
+        try util_json.serializeNumber(p, &out, allocator);
     }
     // stream_options.include_usage=true:OpenAI 默认流式不发 usage,显式要求才在末尾发一个
     // {choices:[],usage:{...}} chunk。缓存命中(cached_tokens)就在这个 usage 里。
     try out.appendSlice(allocator, ",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
     var first = true;
-    // system → 首条 {role:"system"}
+    // system → 首条 {role:"system"}。dialect 可注入厂商特定标签(如旧 GLM-4.6 <reasoning_effort>;新 dialect 不调)。
     if (system) |sys| {
         try out.appendSlice(allocator, "{\"role\":\"system\",\"content\":");
-        try util_json.serializeString(sys, &out, allocator);
+        var sys_buf: std.ArrayList(u8) = .empty;
+        defer sys_buf.deinit(allocator);
+        try sys_buf.appendSlice(allocator, sys);
+        try dialect.injectSystemMods(profile, overrides.reasoning_effort, &sys_buf, allocator);
+        try util_json.serializeString(sys_buf.items, &out, allocator);
         try out.append(allocator, '}');
         first = false;
     }
@@ -628,6 +697,22 @@ pub fn serializeOpenAIRequest(allocator: std.mem.Allocator, model: []const u8, m
             }
             try out.append(allocator, ']');
         }
+    }
+    // tool_choice:委托给 dialect(按 model 翻译 + 能力降级 GLM-5)。
+    if (overrides.tool_choice) |tc| {
+        _ = try dialect.serializeToolChoice(profile, tc, &out, allocator);
+    }
+    // response_format:阶段 3 接线(此前 dead code)。能力守门在 dialect 内(GLM-5 json_schema→json_object)。
+    if (overrides.response_format) |rf| {
+        _ = try dialect.serializeResponseFormat(profile, rf, &out, allocator);
+    }
+    // prompt_cache_key:阶段 3 接线。能力守门(supports_prompt_cache_key=false 的 dialect 返 false 不发)。
+    if (overrides.prompt_cache_key) |key| {
+        _ = try dialect.serializePromptCacheKey(profile, key, &out, allocator);
+    }
+    // parallel_tool_calls:阶段 3 接线。能力守门(supports_parallel_tool_calls=false 的 dialect 返 false 不发)。
+    if (overrides.parallel_tool_calls) |b| {
+        _ = try dialect.serializeParallelToolCalls(profile, b, &out, allocator);
     }
     try out.append(allocator, '}');
     return out.toOwnedSlice(allocator);
@@ -717,7 +802,7 @@ test "OpenAI 请求翻译:中立 Conversation → chat/completions body" {
     const msgs = [_]types.ApiMessage{
         .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hello" }} },
     };
-    const body = try serializeOpenAIRequest(a, "gpt-4o", &msgs, "you are helpful", null, .high);
+    const body = try serializeOpenAIRequest(a, "gpt-4o", &msgs, "you are helpful", null, .high, null);
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"gpt-4o\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null);
@@ -725,4 +810,188 @@ test "OpenAI 请求翻译:中立 Conversation → chat/completions body" {
     try std.testing.expect(std.mem.indexOf(u8, body, "hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
+}
+
+test "extractDeltaReasoning: 从 chunk 解析 reasoning_content 字段" {
+    const chunk = "{\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking...\"}}]}";
+    const got = extractDeltaReasoning(chunk);
+    try std.testing.expect(got != null);
+    try std.testing.expectEqualStrings("thinking...", got.?);
+}
+
+test "extractDeltaReasoning: 缺失字段返回 null" {
+    const chunk = "{\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}";
+    try std.testing.expect(extractDeltaReasoning(chunk) == null);
+}
+
+test "serializeOpenAIRequest: GLM-5.2 effort=high 走顶层 reasoning_effort body(非 system 标签)" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const body = try serializeOpenAIRequest(a, "glm-5.2", &msgs, "sys", null, .high, null);
+    defer a.free(body);
+    // GLM-5.2:顶层 reasoning_effort body + thinking:{type:enabled};不再注入 system 标签。
+    // 来源:docs.z.ai/guides/capabilities/thinking(2026-08 KnowForge 调研)。
+    try std.testing.expect(std.mem.indexOf(u8, body, "<reasoning_effort>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "clear_thinking") != null);
+}
+
+test "serializeOpenAIRequest: Kimi K3 effort=high 走顶层 reasoning_effort(不发 thinking body)" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const body = try serializeOpenAIRequest(a, "kimi-k3", &msgs, "sys", null, .high, null);
+    defer a.free(body);
+    // K3:顶层 reasoning_effort,不发 thinking:{} body(那是 K2.6)。
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"keep\":\"all\"") == null);
+}
+
+test "serializeOpenAIRequest: Kimi K3 effort=null 默认 max" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const body = try serializeOpenAIRequest(a, "kimi-k3", &msgs, "sys", null, null, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"max\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":") == null);
+}
+
+test "serializeOpenAIRequest: Kimi K2.6 effort=high 走 extra_body thinking" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const body = try serializeOpenAIRequest(a, "kimi-k2", &msgs, "sys", null, .high, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"keep\":\"all\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"high\"") != null);
+    // K2.6 不发顶层 reasoning_effort(那是 K3 的)
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":") == null);
+}
+
+test "serializeOpenAIRequest: DeepSeek effort=high 走顶层 reasoning_effort" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const body = try serializeOpenAIRequest(a, "deepseek-chat", &msgs, "sys", null, .high, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"}") != null);
+}
+
+test "serializeOpenAIRequest: DeepSeek effort=xhigh → reasoning_effort=max(V4 修正)" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const body = try serializeOpenAIRequest(a, "deepseek-chat", &msgs, "sys", null, .xhigh, null);
+    defer a.free(body);
+    // V4 文档明确 xhigh → max(此前误为 high,2026-08 KnowForge 调研修正)
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"max\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") == null);
+}
+
+// ── M3:tool_choice 端到端字节断言(声明=接线=测试 DoD)───────────────────────────
+
+test "M3 serializeOpenAIRequest: tool_choice=auto 发 \"auto\"" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const tc = json_mod.ToolChoice{ .type = "auto" };
+    const body = try serializeOpenAIRequest(a, "gpt-4o", &msgs, "sys", null, null, tc);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") != null);
+}
+
+test "M3 serializeOpenAIRequest: tool_choice=any → \"required\"(OpenAI 语义)" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const tc = json_mod.ToolChoice{ .type = "any" };
+    const body = try serializeOpenAIRequest(a, "gpt-4o", &msgs, "sys", null, null, tc);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"required\"") != null);
+}
+
+test "M3 serializeOpenAIRequest: tool_choice=tool+name → function 指定" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const tc = json_mod.ToolChoice{ .type = "tool", .name = "web_search" };
+    const body = try serializeOpenAIRequest(a, "gpt-4o", &msgs, "sys", null, null, tc);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"web_search\"}}") != null);
+}
+
+test "M3 serializeOpenAIRequest: tool_choice=none → \"none\"" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const tc = json_mod.ToolChoice{ .type = "none" };
+    const body = try serializeOpenAIRequest(a, "gpt-4o", &msgs, "sys", null, null, tc);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"none\"") != null);
+}
+
+test "M3 serializeOpenAIRequest: tool_choice=tool 缺 name → 退到 required" {
+    // tool 类型但 name=null,无法指定具体工具,退到 required(强制选一个)。
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const tc = json_mod.ToolChoice{ .type = "tool", .name = null };
+    const body = try serializeOpenAIRequest(a, "gpt-4o", &msgs, "sys", null, null, tc);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"required\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"function\"") == null);
+}
+
+test "M3 serializeOpenAIRequest: GLM-5 tool_choice=required 降级为 auto(能力守门)" {
+    // 声明=接线=测试:GLM-5 profile.tool_choice_support==.auto_only,任何非 auto/none 都必须降级。
+    // 不降级 → 服务端 400;dialect 必须守门。
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const tc = json_mod.ToolChoice{ .type = "required" };
+    const body = try serializeOpenAIRequest(a, "glm-5.2", &msgs, "sys", null, null, tc);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"required\"") == null);
+}
+
+test "M3 serializeOpenAIRequest: GLM-5 tool_choice=none 不降级(通用语义)" {
+    // none=不调用工具,所有 OpenAI-compatible 服务端都认,不该降级成 auto(会变允许工具)。
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const tc = json_mod.ToolChoice{ .type = "none" };
+    const body = try serializeOpenAIRequest(a, "glm-5.2", &msgs, "sys", null, null, tc);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"none\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") == null);
+}
+
+test "M3 serializeOpenAIRequest: tool_choice=null 不发 tool_choice 字段" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const body = try serializeOpenAIRequest(a, "gpt-4o", &msgs, "sys", null, null, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tool_choice") == null);
 }

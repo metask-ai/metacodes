@@ -4,28 +4,28 @@ const graph_mod = @import("graph.zig");
 const index = @import("index.zig");
 const segment_mod = @import("segment.zig");
 const storage = @import("storage.zig");
+const metaknow_deferred_based_on_mod = @import("query/metaknow_deferred_based_on.zig");
+const metaknow_deferred_based_on = metaknow_deferred_based_on_mod.MetaknowDeferredBasedOn(core, index, storage);
+const neighbor_traversal_mod = @import("query/neighbor_traversal.zig");
+const neighbor_traversal = neighbor_traversal_mod.NeighborTraversal(core, index, EdgeCursor, NodeLookup);
+const path_traversal_mod = @import("query/path_traversal.zig");
+const path_traversal = path_traversal_mod.PathTraversal(core, index);
 
-pub const metaknow_deferred_based_on_file = "metaknow_deferred_based_on.bin";
-pub const metaknow_deferred_based_on_magic = [_]u8{ 'T', 'K', 'D', 'B', 'O', 'N', '3', '\n' };
-pub const metaknow_deferred_based_on_header_len: usize = 80;
-pub const metaknow_deferred_based_on_index_record_len: usize = 12;
-pub const metaknow_deferred_based_on_target_record_len: usize = 4;
-pub const metaknow_deferred_based_on_edge_id_base: u64 = 1_000_000_000_000;
-
-pub const Neighbor = struct {
-    edge_id: core.EdgeId,
-    node_id: core.NodeId,
-    rel: core.RelKind,
-};
-
-pub const NeighborResult = struct {
-    neighbors: std.ArrayList(Neighbor),
-    stats: index.QueryStats,
-
-    pub fn deinit(self: *NeighborResult, allocator: std.mem.Allocator) void {
-        self.neighbors.deinit(allocator);
-    }
-};
+pub const metaknow_deferred_based_on_file = metaknow_deferred_based_on.metaknow_deferred_based_on_file;
+pub const metaknow_deferred_based_on_magic = metaknow_deferred_based_on.metaknow_deferred_based_on_magic;
+pub const metaknow_deferred_based_on_header_len = metaknow_deferred_based_on.metaknow_deferred_based_on_header_len;
+pub const metaknow_deferred_based_on_index_record_len = metaknow_deferred_based_on.metaknow_deferred_based_on_index_record_len;
+pub const metaknow_deferred_based_on_target_record_len = metaknow_deferred_based_on.metaknow_deferred_based_on_target_record_len;
+pub const metaknow_deferred_based_on_edge_id_base = metaknow_deferred_based_on.metaknow_deferred_based_on_edge_id_base;
+pub const MetaknowDeferredBasedOnDirection = metaknow_deferred_based_on.MetaknowDeferredBasedOnDirection;
+pub const MetaknowDeferredBasedOnQueryResult = metaknow_deferred_based_on.MetaknowDeferredBasedOnQueryResult;
+pub const metaknowDeferredBasedOnPath = metaknow_deferred_based_on.metaknowDeferredBasedOnPath;
+pub const readMetaknowDeferredBasedOnTargets = metaknow_deferred_based_on.readMetaknowDeferredBasedOnTargets;
+pub const Neighbor = neighbor_traversal.Neighbor;
+pub const NeighborResult = neighbor_traversal.NeighborResult;
+pub const neighborsWithCursor = neighbor_traversal.neighborsWithCursor;
+pub const PathResult = path_traversal.PathResult;
+pub const pathWithCursor = path_traversal.pathWithCursor;
 
 pub const EdgeCursor = union(enum) {
     memory: struct {
@@ -112,26 +112,6 @@ pub const EdgeCursor = union(enum) {
     }
 };
 
-pub const MetaknowDeferredBasedOnDirection = enum {
-    forward,
-    reverse,
-};
-
-pub const MetaknowDeferredBasedOnQueryResult = struct {
-    targets: []u64 = &.{},
-    edge_id_base: u64 = 0,
-    target_start: u64 = 0,
-    total_count: usize = 0,
-
-    pub fn deinit(self: *MetaknowDeferredBasedOnQueryResult, allocator: std.mem.Allocator) void {
-        if (self.targets.len != 0) allocator.free(self.targets);
-    }
-};
-
-pub fn metaknowDeferredBasedOnPath(allocator: std.mem.Allocator, store: storage.Store) ![]u8 {
-    return std.fs.path.join(allocator, &.{ store.dir_path, metaknow_deferred_based_on_file });
-}
-
 fn memoryCursorEdges(mem_index: *index.MemoryIndex, order: storage.EdgeIndexOrder, node_id: core.NodeId, rel_filter: ?core.RelKind) ![]const index.EdgeRef {
     return switch (order) {
         .src => if (rel_filter) |rel| mem_index.outgoingRelation(node_id, rel) else mem_index.outgoing(node_id),
@@ -192,220 +172,9 @@ fn forEachStoreEdgeRefFiltered(allocator: std.mem.Allocator, store: storage.Stor
     }
     if (stopped) return true;
     if (rel_filter == null or rel_filter.? == .based_on) {
-        if (try forEachMetaknowDeferredBasedOnEdgeRef(allocator, store, order, node_id, context, callback)) return true;
+        if (try metaknow_deferred_based_on.forEachEdgeRef(allocator, store, order, node_id, context, callback)) return true;
     }
     return false;
-}
-
-fn forEachMetaknowDeferredBasedOnEdgeRef(
-    allocator: std.mem.Allocator,
-    store: storage.Store,
-    order: storage.EdgeIndexOrder,
-    node_id: core.NodeId,
-    context: anytype,
-    comptime callback: fn (@TypeOf(context), index.EdgeRef) anyerror!bool,
-) !bool {
-    const direction: MetaknowDeferredBasedOnDirection = switch (order) {
-        .src => .forward,
-        .dst => .reverse,
-        .id => return core.Error.Unsupported,
-    };
-    const sidecar_path = try metaknowDeferredBasedOnPath(allocator, store);
-    defer allocator.free(sidecar_path);
-    var deferred = try readMetaknowDeferredBasedOnTargets(allocator, store.io, sidecar_path, node_id, (core.QueryBudget{}).max_visited_edges, direction);
-    defer deferred.deinit(allocator);
-    if (deferred.total_count > deferred.targets.len) return core.Error.BudgetExceeded;
-    for (deferred.targets, 0..) |target, index_pos| {
-        const target_id = core.NodeId.fromInt(target);
-        const edge_id = core.EdgeId.fromInt(deferred.edge_id_base + deferred.target_start + index_pos + 1);
-        const edge: index.EdgeRef = switch (direction) {
-            .forward => .{ .src = node_id, .dst = target_id, .edge_id = edge_id, .rel = .based_on },
-            .reverse => .{ .src = target_id, .dst = node_id, .edge_id = edge_id, .rel = .based_on },
-        };
-        if (try callback(context, edge)) return true;
-    }
-    return false;
-}
-
-pub fn readMetaknowDeferredBasedOnTargets(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    sidecar_path: []const u8,
-    node_id: core.NodeId,
-    max_results: usize,
-    direction: MetaknowDeferredBasedOnDirection,
-) !MetaknowDeferredBasedOnQueryResult {
-    const stat = std.Io.Dir.cwd().statFile(io, sidecar_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return .{},
-        else => |e| return e,
-    };
-    if (stat.kind != .file or stat.size < metaknow_deferred_based_on_header_len) return error.InvalidRecord;
-    var file = try std.Io.Dir.cwd().openFile(io, sidecar_path, .{});
-    defer file.close(io);
-
-    var header: [metaknow_deferred_based_on_header_len]u8 = undefined;
-    if (try file.readPositionalAll(io, &header, 0) != header.len) return error.InvalidRecord;
-    if (!std.mem.eql(u8, header[0..8], &metaknow_deferred_based_on_magic)) return error.InvalidRecord;
-    const forward_source_count = std.mem.readInt(u64, header[8..16], .little);
-    const forward_link_count = std.mem.readInt(u64, header[16..24], .little);
-    const forward_target_offset = std.mem.readInt(u64, header[24..32], .little);
-    const edge_id_base = std.mem.readInt(u64, header[32..40], .little);
-    const reverse_source_count = std.mem.readInt(u64, header[48..56], .little);
-    const reverse_link_count = std.mem.readInt(u64, header[56..64], .little);
-    const reverse_target_offset = std.mem.readInt(u64, header[64..72], .little);
-
-    const forward_index_bytes = try std.math.mul(u64, forward_source_count, metaknow_deferred_based_on_index_record_len);
-    const forward_target_bytes = try std.math.mul(u64, forward_link_count, metaknow_deferred_based_on_target_record_len);
-    const reverse_index_bytes = try std.math.mul(u64, reverse_source_count, metaknow_deferred_based_on_index_record_len);
-    const reverse_target_bytes = try std.math.mul(u64, reverse_link_count, metaknow_deferred_based_on_target_record_len);
-    const expected_forward_target_offset = try std.math.add(u64, metaknow_deferred_based_on_header_len, forward_index_bytes);
-    if (forward_target_offset != expected_forward_target_offset) return error.InvalidRecord;
-    const reverse_index_offset = try std.math.add(u64, forward_target_offset, forward_target_bytes);
-    const expected_reverse_target_offset = try std.math.add(u64, reverse_index_offset, reverse_index_bytes);
-    if (reverse_target_offset != expected_reverse_target_offset) return error.InvalidRecord;
-    const expected_size = try std.math.add(u64, reverse_target_offset, reverse_target_bytes);
-    if (stat.size != expected_size) return error.InvalidRecord;
-
-    const source_count = switch (direction) {
-        .forward => forward_source_count,
-        .reverse => reverse_source_count,
-    };
-    const link_count = switch (direction) {
-        .forward => forward_link_count,
-        .reverse => reverse_link_count,
-    };
-    const index_offset = switch (direction) {
-        .forward => @as(u64, metaknow_deferred_based_on_header_len),
-        .reverse => reverse_index_offset,
-    };
-    const target_offset = switch (direction) {
-        .forward => forward_target_offset,
-        .reverse => reverse_target_offset,
-    };
-    const result_edge_id_base = switch (direction) {
-        .forward => edge_id_base,
-        .reverse => try std.math.add(u64, edge_id_base, forward_link_count),
-    };
-    if (source_count > std.math.maxInt(usize)) return error.RecordTooLarge;
-
-    const source_count_usize: usize = @intCast(source_count);
-    const wanted = node_id.toInt();
-    var low: usize = 0;
-    var high: usize = source_count_usize;
-    while (low < high) {
-        const mid = low + (high - low) / 2;
-        const record = try readMetaknowDeferredBasedOnIndexRecord(&file, io, index_offset, mid);
-        if (record.source < wanted) {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    if (low >= source_count_usize) return .{};
-    const found = try readMetaknowDeferredBasedOnIndexRecord(&file, io, index_offset, low);
-    if (found.source != wanted) return .{};
-    const target_start = found.target_start;
-    const total_count_u64 = found.count;
-    if (target_start > link_count or total_count_u64 > link_count - target_start) return error.InvalidRecord;
-    const total_count: usize = @intCast(total_count_u64);
-    const take = @min(max_results, total_count);
-    const targets = try allocator.alloc(u64, take);
-    errdefer allocator.free(targets);
-    const targets_bytes_len = try std.math.mul(usize, take, metaknow_deferred_based_on_target_record_len);
-    const targets_bytes = try allocator.alloc(u8, targets_bytes_len);
-    defer allocator.free(targets_bytes);
-    const target_read_offset = try std.math.add(u64, target_offset, try std.math.mul(u64, target_start, metaknow_deferred_based_on_target_record_len));
-    if (targets_bytes_len != 0 and try file.readPositionalAll(io, targets_bytes, target_read_offset) != targets_bytes_len) return error.InvalidRecord;
-    for (targets, 0..) |*target, index_pos| {
-        target.* = std.mem.readInt(u32, targets_bytes[index_pos * metaknow_deferred_based_on_target_record_len ..][0..4], .little);
-    }
-    return .{
-        .targets = targets,
-        .edge_id_base = result_edge_id_base,
-        .target_start = target_start,
-        .total_count = total_count,
-    };
-}
-
-const MetaknowDeferredBasedOnIndexRecord = struct {
-    source: u64,
-    target_start: u64,
-    count: u64,
-};
-
-fn readMetaknowDeferredBasedOnIndexRecord(file: *std.Io.File, io: std.Io, index_offset: u64, index_pos: usize) !MetaknowDeferredBasedOnIndexRecord {
-    const record_byte_offset = try std.math.add(
-        u64,
-        index_offset,
-        try std.math.mul(u64, @intCast(index_pos), metaknow_deferred_based_on_index_record_len),
-    );
-    var bytes: [metaknow_deferred_based_on_index_record_len]u8 = undefined;
-    if (try file.readPositionalAll(io, &bytes, record_byte_offset) != bytes.len) return error.InvalidRecord;
-    return .{
-        .source = std.mem.readInt(u32, bytes[0..4], .little),
-        .target_start = std.mem.readInt(u32, bytes[4..8], .little),
-        .count = std.mem.readInt(u32, bytes[8..12], .little),
-    };
-}
-
-test "deferred based_on query does not allocate whole index" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
-    const sidecar_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], metaknow_deferred_based_on_file });
-    defer std.testing.allocator.free(sidecar_path);
-
-    const source_count: usize = 200;
-    const link_count: usize = source_count;
-    const forward_index_bytes = source_count * metaknow_deferred_based_on_index_record_len;
-    const forward_target_bytes = link_count * metaknow_deferred_based_on_target_record_len;
-    const forward_target_offset = metaknow_deferred_based_on_header_len + forward_index_bytes;
-    const reverse_index_offset = forward_target_offset + forward_target_bytes;
-    const reverse_target_offset = reverse_index_offset;
-    const total_bytes = reverse_target_offset;
-    var bytes = try std.testing.allocator.alloc(u8, total_bytes);
-    defer std.testing.allocator.free(bytes);
-    @memset(bytes, 0);
-    @memcpy(bytes[0..8], &metaknow_deferred_based_on_magic);
-    std.mem.writeInt(u64, bytes[8..16], source_count, .little);
-    std.mem.writeInt(u64, bytes[16..24], link_count, .little);
-    std.mem.writeInt(u64, bytes[24..32], forward_target_offset, .little);
-    std.mem.writeInt(u64, bytes[32..40], metaknow_deferred_based_on_edge_id_base, .little);
-    std.mem.writeInt(u64, bytes[40..48], source_count, .little);
-    std.mem.writeInt(u64, bytes[48..56], 0, .little);
-    std.mem.writeInt(u64, bytes[56..64], 0, .little);
-    std.mem.writeInt(u64, bytes[64..72], reverse_target_offset, .little);
-    for (0..source_count) |index_pos| {
-        const index_offset = metaknow_deferred_based_on_header_len + index_pos * metaknow_deferred_based_on_index_record_len;
-        std.mem.writeInt(u32, bytes[index_offset..][0..4], @intCast(index_pos + 1), .little);
-        std.mem.writeInt(u32, bytes[index_offset + 4 ..][0..4], @intCast(index_pos), .little);
-        std.mem.writeInt(u32, bytes[index_offset + 8 ..][0..4], 1, .little);
-        const target_offset = forward_target_offset + index_pos * metaknow_deferred_based_on_target_record_len;
-        std.mem.writeInt(u32, bytes[target_offset..][0..4], @intCast(10_000 + index_pos), .little);
-    }
-    {
-        var file = try std.Io.Dir.cwd().createFile(std.testing.io, sidecar_path, .{ .truncate = true });
-        defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, bytes, 0);
-    }
-
-    var fixed_bytes: [128]u8 = undefined;
-    var fixed = std.heap.FixedBufferAllocator.init(&fixed_bytes);
-    var result = try readMetaknowDeferredBasedOnTargets(
-        fixed.allocator(),
-        std.testing.io,
-        sidecar_path,
-        .fromInt(199),
-        8,
-        .forward,
-    );
-    defer result.deinit(fixed.allocator());
-    try std.testing.expectEqual(@as(usize, 1), result.targets.len);
-    try std.testing.expectEqual(@as(usize, 1), result.total_count);
-    try std.testing.expectEqual(@as(u64, 198), result.target_start);
-    try std.testing.expectEqual(@as(u64, 10_198), result.targets[0]);
 }
 
 fn forEachOpenedFullSegmentEdgeRef(store: storage.Store, segments: *storage.PublishedEdgeSegments, coverage: storage.PublishedEdgeSegmentsCoverage, direction: segment_mod.Direction, node_id: core.NodeId, rel_filter: ?core.RelKind, context: anytype, comptime callback: fn (@TypeOf(context), index.EdgeRef) anyerror!bool) !bool {
@@ -514,7 +283,11 @@ fn collectDeltaSegmentEdgeRefs(
         .out = &out,
         .max_records = max_records,
     };
-    _ = try store.forEachOpenedPublishedEdgeSegmentNeighbor(edge_segments, direction, node_id, rel_filter, max_records, &collect_context, struct {
+    // Tombstones are filtered inside the storage callback adapter. Keep the
+    // visible-result cap in this collector, but allow the bounded default scan
+    // budget to skip deleted physical records before a live delta edge.
+    const scan_limit = @max(max_records, (core.QueryBudget{}).max_visited_edges);
+    _ = try store.forEachOpenedPublishedEdgeSegmentNeighbor(edge_segments, direction, node_id, rel_filter, scan_limit, &collect_context, struct {
         fn visit(collect_ctx: *SegmentCollectContext, edge: segment_mod.EdgeRecord) !bool {
             if (collect_ctx.out.items.len >= collect_ctx.max_records) return core.Error.BudgetExceeded;
             try collect_ctx.out.append(collect_ctx.allocator, segmentEdgeToRef(edge));
@@ -823,7 +596,7 @@ pub fn neighborsWithIndex(
 ) !NeighborResult {
     if (isReservedNodeId(node_id)) return core.Error.InvalidId;
     if (mem_index.getNode(graph, node_id) == null) return core.Error.NotFound;
-    return neighborsWithCursorAndLookup(
+    return neighbor_traversal.neighborsWithCursorAndLookup(
         allocator,
         .{ .memory = .{ .mem_index = mem_index } },
         .{ .memory = .{ .graph = graph, .mem_index = mem_index } },
@@ -831,107 +604,6 @@ pub fn neighborsWithIndex(
         rel_filter,
         budget,
     );
-}
-
-pub fn neighborsWithCursor(
-    allocator: std.mem.Allocator,
-    cursor: EdgeCursor,
-    node_id: core.NodeId,
-    rel_filter: ?core.RelKind,
-    budget: core.QueryBudget,
-) !NeighborResult {
-    if (isReservedNodeId(node_id)) return core.Error.InvalidId;
-    return neighborsWithCursorAndLookup(allocator, cursor, null, node_id, rel_filter, budget);
-}
-
-fn neighborsWithCursorAndLookup(
-    allocator: std.mem.Allocator,
-    cursor: EdgeCursor,
-    node_lookup: ?NodeLookup,
-    node_id: core.NodeId,
-    rel_filter: ?core.RelKind,
-    budget: core.QueryBudget,
-) !NeighborResult {
-    return neighborsWithCursorAndLookupDeadline(allocator, cursor, node_lookup, node_id, rel_filter, budget, core.QueryDeadline.immediateOrNone(budget.timeout_ms));
-}
-
-fn neighborsWithCursorAndLookupDeadline(
-    allocator: std.mem.Allocator,
-    cursor: EdgeCursor,
-    node_lookup: ?NodeLookup,
-    node_id: core.NodeId,
-    rel_filter: ?core.RelKind,
-    budget: core.QueryBudget,
-    deadline: core.QueryDeadline,
-) !NeighborResult {
-    var result = NeighborResult{
-        .neighbors = .empty,
-        .stats = .{},
-    };
-    errdefer result.deinit(allocator);
-    if (deadline.expired()) {
-        result.stats.budget_exceeded = true;
-        return result;
-    }
-
-    var context = NeighborCollectContext{
-        .allocator = allocator,
-        .result = &result,
-        .rel_filter = rel_filter,
-        .budget = budget,
-        .node_lookup = node_lookup,
-        .deadline = deadline,
-    };
-    _ = try cursor.forEachOutgoingRelation(node_id, rel_filter, &context, collectNeighbor);
-    result.stats.results = result.neighbors.items.len;
-    return result;
-}
-
-const NeighborCollectContext = struct {
-    allocator: std.mem.Allocator,
-    result: *NeighborResult,
-    rel_filter: ?core.RelKind,
-    budget: core.QueryBudget,
-    node_lookup: ?NodeLookup,
-    deadline: core.QueryDeadline,
-    preallocated: bool = false,
-};
-
-fn collectNeighbor(ctx: *NeighborCollectContext, edge: index.EdgeRef) !bool {
-    if (ctx.deadline.expired()) {
-        ctx.result.stats.budget_exceeded = true;
-        return true;
-    }
-    if (ctx.result.stats.edges_visited >= ctx.budget.max_visited_edges) {
-        ctx.result.stats.budget_exceeded = true;
-        return true;
-    }
-    try index.addVisitedEdges(&ctx.result.stats, 1);
-    if (ctx.rel_filter) |rel| {
-        if (edge.rel != rel) return false;
-    }
-    if (ctx.node_lookup) |lookup| {
-        if (!try lookup.exists(edge.dst)) return false;
-    }
-    if (ctx.result.neighbors.items.len >= ctx.budget.max_results) {
-        ctx.result.stats.budget_exceeded = true;
-        return true;
-    }
-    if (!ctx.preallocated) {
-        try ctx.result.neighbors.ensureTotalCapacity(ctx.allocator, neighborPreallocCapacity(ctx.budget));
-        ctx.preallocated = true;
-    }
-    try ctx.result.neighbors.append(ctx.allocator, .{
-        .edge_id = edge.edge_id,
-        .node_id = edge.dst,
-        .rel = edge.rel,
-    });
-    return false;
-}
-
-fn neighborPreallocCapacity(budget: core.QueryBudget) usize {
-    const max_neighbor_prealloc: usize = 256;
-    return @min(max_neighbor_prealloc, @min(budget.max_results, budget.max_visited_edges));
 }
 
 pub fn neighborsWithStore(
@@ -944,7 +616,7 @@ pub fn neighborsWithStore(
 ) !NeighborResult {
     if (isReservedNodeId(node_id)) return core.Error.InvalidId;
     if (graph.getNode(node_id) == null) return core.Error.NotFound;
-    return neighborsWithCursorAndLookup(
+    return neighbor_traversal.neighborsWithCursorAndLookup(
         allocator,
         .{ .store = .{
             .allocator = allocator,
@@ -1036,7 +708,7 @@ fn neighborsWithPersistentStoreOnce(
         edge_segments_coverage = segments_for_query.coverage;
     }
 
-    return neighborsWithCursorAndLookupDeadline(
+    return neighbor_traversal.neighborsWithCursorAndLookupDeadline(
         allocator,
         .{ .persistent_store = .{ .allocator = allocator, .store = store, .edge_segments = edge_segments_ref, .edge_segments_coverage = edge_segments_coverage, .edge_retention_registry = edge_retention_registry } },
         .{ .persistent_store = .{ .store = store, .node_view = &node_view, .missing_is_invalid = true } },
@@ -1046,15 +718,6 @@ fn neighborsWithPersistentStoreOnce(
         deadline,
     );
 }
-
-pub const PathResult = struct {
-    nodes: std.ArrayList(core.NodeId),
-    stats: index.QueryStats,
-
-    pub fn deinit(self: *PathResult, allocator: std.mem.Allocator) void {
-        self.nodes.deinit(allocator);
-    }
-};
 
 pub fn path(
     allocator: std.mem.Allocator,
@@ -1078,194 +741,7 @@ pub fn pathWithIndex(
     rel_filter: ?core.RelKind,
     budget: core.QueryBudget,
 ) !PathResult {
-    return pathWithCursor(allocator, .{ .memory = .{ .mem_index = mem_index } }, .{ .memory = .{ .graph = graph, .mem_index = mem_index } }, from, to, rel_filter, budget);
-}
-
-pub fn pathWithCursor(
-    allocator: std.mem.Allocator,
-    cursor: EdgeCursor,
-    node_lookup: NodeLookup,
-    from: core.NodeId,
-    to: core.NodeId,
-    rel_filter: ?core.RelKind,
-    budget: core.QueryBudget,
-) !PathResult {
-    return pathWithCursorDeadline(allocator, cursor, node_lookup, from, to, rel_filter, budget, core.QueryDeadline.immediateOrNone(budget.timeout_ms), false);
-}
-
-fn pathWithCursorDeadline(
-    allocator: std.mem.Allocator,
-    cursor: EdgeCursor,
-    node_lookup: NodeLookup,
-    from: core.NodeId,
-    to: core.NodeId,
-    rel_filter: ?core.RelKind,
-    budget: core.QueryBudget,
-    deadline: core.QueryDeadline,
-    missing_edge_target_is_invalid: bool,
-) !PathResult {
-    var result = PathResult{ .nodes = .empty, .stats = .{} };
-    errdefer result.deinit(allocator);
-
-    if (isReservedNodeId(from) or isReservedNodeId(to)) return core.Error.InvalidId;
-    if (deadline.expired()) {
-        result.stats.budget_exceeded = true;
-        return result;
-    }
-    if (from.toInt() == to.toInt()) {
-        if (!try node_lookup.exists(from)) return core.Error.NotFound;
-        try result.nodes.append(allocator, from);
-        result.stats.results = 1;
-        return result;
-    }
-    if (pathNodeBudgetExhausted(&result, budget)) return result;
-    if (!try node_lookup.exists(from) or !try node_lookup.exists(to)) return core.Error.NotFound;
-
-    var frontier = std.ArrayList(core.NodeId).empty;
-    defer frontier.deinit(allocator);
-    var parents = std.AutoHashMap(u64, u64).init(allocator);
-    defer parents.deinit();
-    var depths = std.AutoHashMap(u64, u8).init(allocator);
-    defer depths.deinit();
-
-    const prealloc_nodes = traversalPreallocNodeCapacity(budget);
-    try frontier.ensureTotalCapacity(allocator, prealloc_nodes);
-    try parents.ensureTotalCapacity(@intCast(prealloc_nodes));
-    try depths.ensureTotalCapacity(@intCast(prealloc_nodes));
-    try frontier.append(allocator, from);
-    try parents.put(from.toInt(), 0);
-    try depths.put(from.toInt(), 0);
-
-    var pos: usize = 0;
-    while (pos < frontier.items.len) : (pos += 1) {
-        if (deadline.expired()) {
-            result.stats.budget_exceeded = true;
-            return result;
-        }
-        if (result.stats.nodes_visited >= budget.max_visited_nodes) {
-            result.stats.budget_exceeded = true;
-            return result;
-        }
-        const current = frontier.items[pos];
-        const current_depth = depths.get(current.toInt()).?;
-        try index.addVisitedNodes(&result.stats, 1);
-        if (current_depth >= budget.max_depth) {
-            if (try depthLimitWouldTruncate(cursor, node_lookup, current, rel_filter, &parents, &result, budget, deadline, missing_edge_target_is_invalid)) {
-                result.stats.budget_exceeded = true;
-            }
-            continue;
-        }
-
-        var context = PathExploreContext{
-            .allocator = allocator,
-            .result = &result,
-            .frontier = &frontier,
-            .parents = &parents,
-            .depths = &depths,
-            .node_lookup = node_lookup,
-            .current = current,
-            .current_depth = current_depth,
-            .from = from,
-            .to = to,
-            .budget = budget,
-            .deadline = deadline,
-            .missing_edge_target_is_invalid = missing_edge_target_is_invalid,
-        };
-        _ = try cursor.forEachOutgoingRelation(current, rel_filter, &context, explorePathEdge);
-        if (result.stats.budget_exceeded or result.nodes.items.len != 0) return result;
-    }
-    return result;
-}
-
-const PathExploreContext = struct {
-    allocator: std.mem.Allocator,
-    result: *PathResult,
-    frontier: *std.ArrayList(core.NodeId),
-    parents: *std.AutoHashMap(u64, u64),
-    depths: *std.AutoHashMap(u64, u8),
-    node_lookup: NodeLookup,
-    current: core.NodeId,
-    current_depth: u8,
-    from: core.NodeId,
-    to: core.NodeId,
-    budget: core.QueryBudget,
-    deadline: core.QueryDeadline,
-    missing_edge_target_is_invalid: bool,
-};
-
-fn explorePathEdge(ctx: *PathExploreContext, edge: index.EdgeRef) !bool {
-    if (ctx.deadline.expired()) {
-        ctx.result.stats.budget_exceeded = true;
-        return true;
-    }
-    if (ctx.result.stats.edges_visited >= ctx.budget.max_visited_edges) {
-        ctx.result.stats.budget_exceeded = true;
-        return true;
-    }
-    try index.addVisitedEdges(&ctx.result.stats, 1);
-    if (ctx.parents.contains(edge.dst.toInt())) return false;
-    if (!try ctx.node_lookup.exists(edge.dst)) {
-        if (ctx.missing_edge_target_is_invalid) return error.InvalidRecord;
-        return false;
-    }
-    try ctx.parents.put(edge.dst.toInt(), ctx.current.toInt());
-    try ctx.depths.put(edge.dst.toInt(), ctx.current_depth + 1);
-    if (edge.dst.toInt() == ctx.to.toInt()) {
-        try reconstructPath(ctx.allocator, &ctx.result.nodes, ctx.parents, ctx.from, ctx.to);
-        ctx.result.stats.results = 1;
-        return true;
-    }
-    try ctx.frontier.append(ctx.allocator, edge.dst);
-    return false;
-}
-
-const DepthLimitContext = struct {
-    node_lookup: NodeLookup,
-    parents: *std.AutoHashMap(u64, u64),
-    result: *PathResult,
-    budget: core.QueryBudget,
-    deadline: core.QueryDeadline,
-    missing_edge_target_is_invalid: bool,
-};
-
-fn depthLimitWouldTruncate(
-    cursor: EdgeCursor,
-    node_lookup: NodeLookup,
-    current: core.NodeId,
-    rel_filter: ?core.RelKind,
-    parents: *std.AutoHashMap(u64, u64),
-    result: *PathResult,
-    budget: core.QueryBudget,
-    deadline: core.QueryDeadline,
-    missing_edge_target_is_invalid: bool,
-) !bool {
-    var context = DepthLimitContext{
-        .node_lookup = node_lookup,
-        .parents = parents,
-        .result = result,
-        .budget = budget,
-        .deadline = deadline,
-        .missing_edge_target_is_invalid = missing_edge_target_is_invalid,
-    };
-    return cursor.forEachOutgoingRelation(current, rel_filter, &context, depthLimitEdgeCallback);
-}
-
-fn depthLimitEdgeCallback(ctx: *DepthLimitContext, edge: index.EdgeRef) !bool {
-    if (ctx.deadline.expired()) {
-        ctx.result.stats.budget_exceeded = true;
-        return true;
-    }
-    if (ctx.result.stats.edges_visited >= ctx.budget.max_visited_edges) {
-        ctx.result.stats.budget_exceeded = true;
-        return true;
-    }
-    try index.addVisitedEdges(&ctx.result.stats, 1);
-    if (ctx.parents.contains(edge.dst.toInt())) return false;
-    if (!try ctx.node_lookup.exists(edge.dst)) {
-        if (ctx.missing_edge_target_is_invalid) return error.InvalidRecord;
-        return false;
-    }
-    return true;
+    return path_traversal.pathWithCursor(allocator, @as(EdgeCursor, .{ .memory = .{ .mem_index = mem_index } }), @as(NodeLookup, .{ .memory = .{ .graph = graph, .mem_index = mem_index } }), from, to, rel_filter, budget);
 }
 
 pub fn pathWithStore(
@@ -1277,11 +753,11 @@ pub fn pathWithStore(
     rel_filter: ?core.RelKind,
     budget: core.QueryBudget,
 ) !PathResult {
-    return pathWithCursor(allocator, .{ .store = .{
+    return path_traversal.pathWithCursor(allocator, @as(EdgeCursor, .{ .store = .{
         .allocator = allocator,
         .store = store,
         .graph = graph,
-    } }, .{ .graph = graph }, from, to, rel_filter, budget);
+    } }), @as(NodeLookup, .{ .graph = graph }), from, to, rel_filter, budget);
 }
 
 pub fn pathWithPersistentStore(
@@ -1342,10 +818,10 @@ fn pathWithPersistentStoreOnce(
     if (isReservedNodeId(from) or isReservedNodeId(to)) return core.Error.InvalidId;
     const deadline = core.QueryDeadline.fromIo(store.io, budget.timeout_ms);
     if (deadline.expired() or (from.toInt() != to.toInt() and budget.max_visited_nodes == 0)) {
-        return pathWithCursorDeadline(
+        return path_traversal.pathWithCursorDeadline(
             allocator,
-            .{ .persistent_store = .{ .allocator = allocator, .store = store, .edge_retention_registry = edge_retention_registry } },
-            .{ .persistent_store = .{ .store = store } },
+            @as(EdgeCursor, .{ .persistent_store = .{ .allocator = allocator, .store = store, .edge_retention_registry = edge_retention_registry } }),
+            @as(NodeLookup, .{ .persistent_store = .{ .store = store } }),
             from,
             to,
             rel_filter,
@@ -1367,10 +843,10 @@ fn pathWithPersistentStoreOnce(
         edge_segments_ref = &segments_for_query.segments;
         edge_segments_coverage = segments_for_query.coverage;
     }
-    return pathWithCursorDeadline(
+    return path_traversal.pathWithCursorDeadline(
         allocator,
-        .{ .persistent_store = .{ .allocator = allocator, .store = store, .edge_segments = edge_segments_ref, .edge_segments_coverage = edge_segments_coverage, .edge_retention_registry = edge_retention_registry } },
-        .{ .persistent_store = .{ .store = store, .node_view = &node_view } },
+        @as(EdgeCursor, .{ .persistent_store = .{ .allocator = allocator, .store = store, .edge_segments = edge_segments_ref, .edge_segments_coverage = edge_segments_coverage, .edge_retention_registry = edge_retention_registry } }),
+        @as(NodeLookup, .{ .persistent_store = .{ .store = store, .node_view = &node_view } }),
         from,
         to,
         rel_filter,
@@ -1386,40 +862,6 @@ fn isReservedNodeId(id: core.NodeId) bool {
 
 fn budgetTimedOutImmediately(budget: core.QueryBudget) bool {
     return budget.timeout_ms == 0;
-}
-
-fn pathNodeBudgetExhausted(result: *PathResult, budget: core.QueryBudget) bool {
-    if (result.stats.nodes_visited < budget.max_visited_nodes) return false;
-    result.stats.budget_exceeded = true;
-    return true;
-}
-
-fn traversalPreallocNodeCapacity(budget: core.QueryBudget) usize {
-    const max_prealloc_nodes: usize = 16 * 1024;
-    const wanted = std.math.add(usize, budget.max_visited_nodes, 1) catch max_prealloc_nodes;
-    return @min(wanted, max_prealloc_nodes);
-}
-
-fn reconstructPath(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayList(core.NodeId),
-    parents: *std.AutoHashMap(u64, u64),
-    from: core.NodeId,
-    to: core.NodeId,
-) !void {
-    var reversed = std.ArrayList(core.NodeId).empty;
-    defer reversed.deinit(allocator);
-    var current = to.toInt();
-    while (current != 0) {
-        try reversed.append(allocator, core.NodeId.fromInt(current));
-        if (current == from.toInt()) break;
-        current = parents.get(current) orelse 0;
-    }
-    var i = reversed.items.len;
-    while (i > 0) {
-        i -= 1;
-        try out.append(allocator, reversed.items[i]);
-    }
 }
 
 test "neighbors filters by relation" {
@@ -1994,6 +1436,49 @@ test "persistent neighbors hide tombstoned edges from opened published segment" 
     try std.testing.expectEqual(@as(usize, 1), result.neighbors.items.len);
     try std.testing.expectEqual(live_func.toInt(), result.neighbors.items[0].node_id.toInt());
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(std.testing.io, store.edge_by_src_path, .{}));
+}
+
+test "persistent delta lookup counts visible edges after tombstone filtering" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+    const segment_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "edge-base" });
+    defer std.testing.allocator.free(segment_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    const base_src = core.NodeId.fromInt(1);
+    const base_dst = core.NodeId.fromInt(2);
+    const delta_src = core.NodeId.fromInt(3);
+    const deleted_dst = core.NodeId.fromInt(4);
+    const live_dst = core.NodeId.fromInt(5);
+    try store.appendNodesBatch(&.{
+        .{ .id = base_src, .kind = .file, .text = "base source" },
+        .{ .id = base_dst, .kind = .function, .text = "base target" },
+        .{ .id = delta_src, .kind = .file, .text = "delta source" },
+        .{ .id = deleted_dst, .kind = .function, .text = "deleted target" },
+        .{ .id = live_dst, .kind = .function, .text = "live target" },
+    });
+    try store.appendEdge(.{ .id = .fromInt(1), .src = base_src, .dst = base_dst, .rel = .defines });
+    try std.testing.expectEqual(@as(u64, 1), try store.publishEdgeAdjacencySegment(segment_path));
+    try store.appendEdgesBatch(&.{
+        .{ .id = .fromInt(2), .src = delta_src, .dst = deleted_dst, .rel = .defines },
+        .{ .id = .fromInt(3), .src = delta_src, .dst = live_dst, .rel = .defines },
+    });
+    try store.deleteEdge(.fromInt(2));
+
+    var refs = try readPersistentStoreEdgeRefsLimited(std.testing.allocator, std.testing.allocator, store, .src, delta_src, 1);
+    defer refs.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), refs.items.len);
+    try std.testing.expectEqual(@as(u64, 3), refs.items[0].edge_id.toInt());
+    try std.testing.expectEqual(live_dst, refs.items[0].dst);
 }
 
 test "persistent neighbors use visible full compacted segment after tombstone" {
@@ -2580,23 +2065,6 @@ test "path can use persistent store without graph argument" {
     try std.testing.expectEqual(@as(usize, 0), timed_out.nodes.items.len);
     try std.testing.expect(timed_out.stats.budget_exceeded);
 
-    var parents = std.AutoHashMap(u64, u64).init(std.testing.allocator);
-    defer parents.deinit();
-    try parents.put(a.toInt(), 0);
-    var helper_result = PathResult{ .nodes = .empty, .stats = .{} };
-    defer helper_result.deinit(std.testing.allocator);
-    try std.testing.expect(try depthLimitWouldTruncate(
-        .{ .persistent_store = .{ .allocator = std.testing.allocator, .store = store } },
-        .{ .persistent_store = .{ .store = store } },
-        a,
-        .depends_on,
-        &parents,
-        &helper_result,
-        .{},
-        .immediate,
-        true,
-    ));
-
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var exhausted = try pathWithPersistentStore(failing.allocator(), store, a, c, .depends_on, .{ .max_visited_nodes = 0 });
     defer exhausted.deinit(failing.allocator());
@@ -2765,8 +2233,10 @@ test "path persistent store repairs corrupt node catalog" {
     const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
     defer std.testing.allocator.free(store_path);
 
-    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
-    store.options.validate_indexes_on_read = true;
+    var store = try storage.Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .primary_text_write_mode = .bulk_ingest,
+        .validate_indexes_on_read = true,
+    });
     defer store.deinit();
     try store.createEmpty();
 

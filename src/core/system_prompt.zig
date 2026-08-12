@@ -10,6 +10,8 @@
 
 const std = @import("std");
 const util_fs = @import("../util/fs.zig");
+const kg_retrieval = @import("../kg/retrieval_protocol.zig");
+const kg_tasks = @import("../kg/task_protocol.zig");
 
 // ============================================================================
 // 静态 section（直译 TS prompts.ts 同名函数，仅把 "Claude Code" 改成 "MetaCode"）
@@ -181,19 +183,15 @@ const PLATFORM: []const u8 = switch (@import("builtin").os.tag) {
 };
 
 /// 拼 # Environment 段，返回 allocator-owned string。
-fn buildEnvSection(allocator: std.mem.Allocator, model: []const u8) ![]u8 {
+/// cwd 由调用方提供(CLI 传进程 cwd,Session 传 workspace.root)——库不预设 cwd 来源。
+fn buildEnvSection(allocator: std.mem.Allocator, model: []const u8, cwd: []const u8) ![]u8 {
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
 
     try buf.appendSlice(allocator, "# Environment\n");
     try buf.appendSlice(allocator, "You have been invoked in the following environment: \n");
 
-    // CWD
-    const cwd = util_fs.getCwd(allocator) catch |err| blk: {
-        @import("../util/log.zig").debug("sysprompt", "getCwd failed: {s}", .{@errorName(err)});
-        break :blk try allocator.dupe(u8, "(unknown)");
-    };
-    defer allocator.free(cwd);
+    // CWD(由调用方传入;不读进程 cwd——Session 隔离要求 workspace.root)
     {
         const s = try std.fmt.allocPrint(allocator, " - Primary working directory: {s}\n", .{cwd});
         defer allocator.free(s);
@@ -252,8 +250,22 @@ fn buildEnvSection(allocator: std.mem.Allocator, model: []const u8) ![]u8 {
 // ============================================================================
 
 /// 构造完整 system prompt。caller 拥有返回 slice。
-pub fn build(allocator: std.mem.Allocator, model: []const u8) ![]u8 {
-    return buildWithSkills(allocator, model, null);
+/// cwd 为环境段的 Primary working directory(CLI 传进程 cwd)。
+pub fn build(allocator: std.mem.Allocator, model: []const u8, cwd: []const u8) ![]u8 {
+    return buildWithSkills(allocator, model, null, cwd);
+}
+
+/// 子 Agent 系统提示静态段(缺陷 A)。两处 fallback 共用(Linus R11 常量化)。
+pub const SUBAGENT_LITERAL = "You are a subagent. Complete the task and return a concise final answer.\n";
+
+/// 子 Agent 系统提示:静态字面量 + 环境段(缺陷 A 修复)。
+/// 两处启动点(abi_v1 / model_skill_tool)共用此函数,确保环境段一致。
+/// cwd 用 workspace.root(非进程 cwd——子 Agent 继承父 Session 的 workspace 隔离)。
+/// 不含工具段——子 Agent 工具描述经 tool_defs 透传,无需在 system_prompt 重复。
+pub fn buildSubagentSystemPrompt(allocator: std.mem.Allocator, model: []const u8, cwd: []const u8) ![]u8 {
+    const env = try buildEnvSection(allocator, model, cwd);
+    defer allocator.free(env);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ SUBAGENT_LITERAL, env });
 }
 
 /// 同 build，外加 skills section（让模型知道有哪些 Skill 可激活、何时激活）。
@@ -262,8 +274,9 @@ pub fn buildWithSkills(
     allocator: std.mem.Allocator,
     model: []const u8,
     skills: ?*const @import("../skills/skill.zig").SkillSet,
+    cwd: []const u8,
 ) ![]u8 {
-    return buildWithSkillsAndAgents(allocator, model, skills, null);
+    return buildWithSkillsAndAgents(allocator, model, skills, null, cwd);
 }
 
 /// 完整版:skills section + subagents section。
@@ -274,19 +287,25 @@ pub fn buildWithSkillsAndAgents(
     model: []const u8,
     skills: ?*const @import("../skills/skill.zig").SkillSet,
     agents: ?*const @import("../agents/set.zig").AgentSet,
+    cwd: []const u8,
 ) ![]u8 {
-    return buildFull(allocator, model, skills, agents, null, "", false);
+    return buildFull(allocator, model, skills, agents, null, "", false, cwd);
 }
 
 /// 最完整版:额外接收 enabled_tool_names,让 # Using your tools 段按工具集动态裁剪
 /// (对应 cc getUsingYourToolsSection(enabledTools))。
 /// enabled_tool_names 为 null → 用全量静态 USING_TOOLS_SECTION(向后兼容)。
-/// KG 段(设计 KG_DESIGN v3-final §5):仅 kg ready 时拼。≤15 行——决策边界 + 写入纪律。
+/// KG 段(设计 KG_DESIGN v3-final §5):仅 kg ready 时拼——决策边界、lexical bridge、写入纪律。
 pub const KG_SECTION =
     \\# Knowledge Graph
     \\A persistent knowledge graph stores durable memory and the cross-session task graph. It outlives this session: decisions, user corrections, and plan progress recorded there will be visible to future sessions.
     \\
     \\When to KgRecall: the user refers to prior decisions or past work; you are continuing cross-session work; an ambiguous request likely depends on earlier project choices. Skip it for self-contained tasks.
+    \\
+++ kg_retrieval.SYSTEM_RULES ++
+    \\
+++ kg_tasks.SYSTEM_RULES ++
+    \\
     \\When to KgRemember: a decision was made and confirmed; the user corrected you (record the rule + why); you learned a non-obvious project fact. Write short, structured facts — never transient task chatter or raw logs.
     \\Division of labor: KgRemember is for short atomic facts. For long-form narrative (investigation writeups, multi-step lessons) write a memory markdown file instead (see # Memory) — those files are auto-imported into this same graph and recalled through the same path, so never store the same content both ways.
 ;
@@ -299,8 +318,9 @@ pub fn buildFull(
     enabled_tool_names: ?[]const []const u8,
     memdir_abs: []const u8,
     kg_ready: bool,
+    cwd: []const u8,
 ) ![]u8 {
-    const env_section = try buildEnvSection(allocator, model);
+    const env_section = try buildEnvSection(allocator, model, cwd);
     defer allocator.free(env_section);
 
     const skills_section = if (skills) |s| try buildSkillsSection(allocator, s) else try allocator.dupe(u8, "");
@@ -311,7 +331,11 @@ pub fn buildFull(
 
     // # Memory 段(通道 B):仅 memdir 启用(memdir_abs 非空)时拼。教模型管理自动记忆。
     const memory_section = if (memdir_abs.len > 0)
-        try @import("memory/memory_section.zig").build(allocator, memdir_abs)
+        try @import("memory/memory_section.zig").build(
+            allocator,
+            memdir_abs,
+            if (kg_ready) .tinykg_linked else .markdown_only,
+        )
     else
         try allocator.dupe(u8, "");
     defer allocator.free(memory_section);
@@ -324,7 +348,7 @@ pub fn buildFull(
     };
     defer allocator.free(using_tools_section);
 
-    const deferred_section = try buildDeferredToolsSection(allocator);
+    const deferred_section = try buildDeferredToolsSection(allocator, enabled_tool_names, kg_ready);
     defer allocator.free(deferred_section);
 
     const kg_section: []const u8 = if (kg_ready) KG_SECTION else "";
@@ -348,16 +372,31 @@ pub fn buildFull(
 }
 
 /// 列出 deferred 工具(name + 短描述),说明调 ToolSearch 取 schema 才能用(对齐 cc
-/// <available-deferred-tools>)。registry 里 deferred=true 的进名单。
-/// 注:内置工具现已全常驻(deferred=false),对齐 cc"只 defer MCP"。MCP 动态工具在
-/// DynRegistry(此函数看不到),其 prompt 列名待 MCP 启动接线后补;当前无 MCP → 返空串。
-fn buildDeferredToolsSection(allocator: std.mem.Allocator) ![]u8 {
+/// <available-deferred-tools>)。只列当前 runtime treatment 实际启用的 deferred 工具；
+/// 否则 TinyKG-only schema 名会泄漏到 codex/claude 对照臂并破坏实验隔离。
+/// MCP 动态工具在 DynRegistry(此函数看不到),其 prompt 列名待 MCP 启动接线后补。
+fn buildDeferredToolsSection(
+    allocator: std.mem.Allocator,
+    enabled_tool_names: ?[]const []const u8,
+    kg_ready: bool,
+) ![]u8 {
     const tools = @import("../tools.zig");
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     var any = false;
     for (tools.registry) |*t| {
         if (!t.deferred) continue;
+        if (t.tinykg_gated and !kg_ready) continue;
+        if (enabled_tool_names) |names| {
+            var enabled = false;
+            for (names) |name| {
+                if (std.mem.eql(u8, name, t.name)) {
+                    enabled = true;
+                    break;
+                }
+            }
+            if (!enabled) continue;
+        }
         if (!any) {
             try buf.appendSlice(allocator,
                 \\# Deferred tools
@@ -456,7 +495,7 @@ fn buildSkillsSection(allocator: std.mem.Allocator, set: *const @import("../skil
 const testing = std.testing;
 
 test "build produces non-empty prompt with MetaCode identity" {
-    const s = try build(testing.allocator, "claude-opus-4-7");
+    const s = try build(testing.allocator, "claude-opus-4-7", "/tmp");
     defer testing.allocator.free(s);
     try testing.expect(s.len > 1000);
     try testing.expect(std.mem.indexOf(u8, s, "MetaCode") != null);
@@ -470,6 +509,35 @@ test "build produces non-empty prompt with MetaCode identity" {
     try testing.expect(std.mem.indexOf(u8, s, "# Environment") != null);
 }
 
+test "KG prompt enforces staged semantic neighborhood only when KG is ready" {
+    const with_kg = try buildFull(testing.allocator, "claude-opus-4-7", null, null, null, "", true, "/tmp");
+    defer testing.allocator.free(with_kg);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "computes no embeddings or vector distance") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "2-4 separate compact semantic variants") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "make at most four semantic-variant calls") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "ALIAS BRANCH HAS PRIORITY") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "EXACT/HIGH-PRECISION SEED") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "mechanism, symptom, desired outcome, or nearby implementation term") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "one plausible broader or narrower concept") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "Deduplicate candidates by node_id across every call") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "KgContext") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "Stop as soon as authoritative evidence and any required current-state check are sufficient") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "Persistent task control-plane algorithm") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "A title or compact summary alone is insufficient") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "never leave finished work claimed/open") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "# Deferred tools") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "FormalAuditTask") != null);
+
+    const without_kg = try buildFull(testing.allocator, "claude-opus-4-7", null, null, null, "", false, "/tmp");
+    defer testing.allocator.free(without_kg);
+    try testing.expect(std.mem.indexOf(u8, without_kg, "computes no embeddings or vector distance") == null);
+    try testing.expect(std.mem.indexOf(u8, without_kg, "ALIAS BRANCH HAS PRIORITY") == null);
+    try testing.expect(std.mem.indexOf(u8, without_kg, "KgContext") == null);
+    try testing.expect(std.mem.indexOf(u8, without_kg, "Persistent task control-plane algorithm") == null);
+    try testing.expect(std.mem.indexOf(u8, without_kg, "# Deferred tools") == null);
+    try testing.expect(std.mem.indexOf(u8, without_kg, "FormalAuditTask") == null);
+}
+
 test "knowledge cutoff maps opus-4-7" {
     try testing.expectEqualStrings("January 2026", getKnowledgeCutoff("claude-opus-4-7").?);
     try testing.expectEqualStrings("August 2025", getKnowledgeCutoff("claude-sonnet-4-6").?);
@@ -477,7 +545,7 @@ test "knowledge cutoff maps opus-4-7" {
 }
 
 test "env section includes model id" {
-    const s = try buildEnvSection(testing.allocator, "claude-opus-4-7");
+    const s = try buildEnvSection(testing.allocator, "claude-opus-4-7", "/tmp");
     defer testing.allocator.free(s);
     try testing.expect(std.mem.indexOf(u8, s, "claude-opus-4-7") != null);
     try testing.expect(std.mem.indexOf(u8, s, "# Environment") != null);
@@ -486,7 +554,7 @@ test "env section includes model id" {
 test "buildWithSkills empty set behaves like build (no skills section)" {
     var set = @import("../skills/skill.zig").SkillSet.init(testing.allocator);
     defer set.deinit();
-    const s = try buildWithSkills(testing.allocator, "claude-opus-4-7", &set);
+    const s = try buildWithSkills(testing.allocator, "claude-opus-4-7", &set, "/tmp");
     defer testing.allocator.free(s);
     try testing.expect(std.mem.indexOf(u8, s, "# Available skills") == null);
 }
@@ -498,7 +566,7 @@ test "buildWithSkills includes skill name + description" {
     const md = "---\nname: code-review\ndescription: Review pending changes for bugs\n---\nbody\n";
     try set.skills.append(testing.allocator, try skill_mod.parseSkillMd(testing.allocator, md, "/fake"));
 
-    const s = try buildWithSkills(testing.allocator, "claude-opus-4-7", &set);
+    const s = try buildWithSkills(testing.allocator, "claude-opus-4-7", &set, "/tmp");
     defer testing.allocator.free(s);
     try testing.expect(std.mem.indexOf(u8, s, "# Available skills") != null);
     try testing.expect(std.mem.indexOf(u8, s, "**code-review**") != null);

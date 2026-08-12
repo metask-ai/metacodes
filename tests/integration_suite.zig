@@ -1,0 +1,84 @@
+//! Single compilation root for the complete component/integration gate.
+//!
+//! Keep the inventory here as the source of truth. `build.zig` compiles this
+//! graph once and the deterministic runner partitions individual test names
+//! across processes. This replaces dozens of near-identical binaries without
+//! changing any test body or assertion.
+
+test {
+    _ = @import("integration/http_stream_e2e_test.zig");
+    _ = @import("integration/tool_abort_test.zig");
+    _ = @import("integration/mcp_e2e_test.zig");
+    _ = @import("integration/skills_e2e_test.zig");
+    _ = @import("integration/agents_e2e_test.zig");
+    _ = @import("component/subagent_model_test.zig");
+    _ = @import("component/subagent_agentdef_fields_test.zig");
+    _ = @import("component/web_search_test.zig");
+    _ = @import("component/allowed_tools_test.zig");
+    _ = @import("component/agent_session_tools_test.zig");
+    _ = @import("component/agent_session_host_tools_test.zig");
+    _ = @import("component/agent_session_ui_test.zig");
+    _ = @import("component/skill_fork_test.zig");
+    _ = @import("component/prompt_tool_coupling_test.zig");
+    _ = @import("component/http_error_test.zig");
+    _ = @import("component/answer_queue_test.zig");
+    _ = @import("component/base_url_flag_test.zig");
+    _ = @import("component/task_error_test.zig");
+    _ = @import("component/tool_loop_breaker_test.zig");
+    _ = @import("component/plan_mode_inject_test.zig");
+    _ = @import("component/user_context_inject_test.zig");
+    _ = @import("component/memdir_inject_test.zig");
+    _ = @import("component/agent_background_test.zig");
+    _ = @import("component/skill_fileref_test.zig");
+    _ = @import("component/transcript_roundtrip_test.zig");
+    _ = @import("component/headless_json_test.zig");
+    _ = @import("component/compound_perm_test.zig");
+    _ = @import("component/protected_skill_inject_test.zig");
+    _ = @import("component/read_state_test.zig");
+    _ = @import("component/tool_concurrency_test.zig");
+    _ = @import("component/tool_observation_test.zig");
+    _ = @import("component/project_rule_gate_test.zig");
+    _ = @import("component/rule_author_test.zig");
+    _ = @import("component/rule_impact_governance_test.zig");
+    _ = @import("component/tool_result_storage_test.zig");
+    _ = @import("component/cache_break_test.zig");
+    _ = @import("component/microcompact_test.zig");
+    _ = @import("component/kg_integration_test.zig");
+    _ = @import("component/kg_task_projection_test.zig");
+    _ = @import("component/formal_kernel_test.zig");
+    _ = @import("component/goal_state_test.zig");
+    _ = @import("component/auth_test.zig");
+    _ = @import("component/schema_validation_test.zig");
+    _ = @import("component/tool_schema_coverage_test.zig");
+    _ = @import("component/tool_smoke_test.zig");
+    _ = @import("component/compact_summary_test.zig");
+    _ = @import("component/auto_compact_request_test.zig");
+    _ = @import("component/render_region_test.zig");
+    _ = @import("component/stream_retry_test.zig");
+    _ = @import("component/ui_state_test.zig");
+    _ = @import("component/ui_render_test.zig");
+    _ = @import("component/ui_backend_test.zig");
+    _ = @import("component/ui_multifrontend_test.zig");
+    _ = @import("component/diagnostics_test.zig");
+    _ = @import("component/provider_vtable_test.zig");
+    _ = @import("component/capability_gate_test.zig");
+    _ = @import("component/openai_provider_test.zig");
+    _ = @import("component/gemini_provider_test.zig");
+    _ = @import("component/background_main_test.zig");
+    _ = @import("component/suspend_resume_test.zig");
+    _ = @import("component/diff_highlight_test.zig");
+    _ = @import("component/prompt_override_test.zig");
+    _ = @import("component/web_ui_test.zig");
+    _ = @import("component/weak_model_test.zig");
+    _ = @import("component/task_batch_test.zig");
+    _ = @import("component/teammate_runtime_test.zig");
+    _ = @import("component/swarm_tools_test.zig");
+    _ = @import("component/swarm_dag_test.zig");
+    _ = @import("component/swarm_security_test.zig");
+    _ = @import("component/swarm_process_test.zig");
+    _ = @import("component/swarm_kg_degraded_test.zig");
+    _ = @import("component/add_dir_test.zig");
+    _ = @import("component/dialect_matrix_test.zig");
+    _ = @import("component/overrides_test.zig");
+    _ = @import("component/ontology_rule_projection_test.zig");
+}

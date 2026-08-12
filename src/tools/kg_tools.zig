@@ -1,9 +1,10 @@
-//! KG 记忆工具:KgRemember / KgRecall(设计 v3-final §5)。
+//! KG 记忆工具:KgRemember / KgRecall / KgContext(设计 v3-final §5)。
 //!
 //! - KgRemember:写记忆节点(kind 白名单 + scope project/global + 近重复搭车提示
 //!   + provenance session_id)。免审但**必出可见工具卡**(注册处 resultRenderMode
 //!   禁 hidden——hidden 吞卡血泪)。
 //! - KgRecall:BM25 检索 + 客户端过滤(domain 当前项目+global;默认排除任务面)。
+//! - KgContext:候选节点权威正文分页 + 有界、版本化的本地图邻域，用于证据验证。
 //! - degraded:结构化说明返回(不 spawn、不硬错、不撞熔断器)。
 
 const std = @import("std");
@@ -12,6 +13,8 @@ const kg_mod = @import("../kg/client.zig");
 const util_json = @import("../util/json.zig");
 const common = @import("common.zig");
 const log = @import("../util/log.zig");
+const retrieval_protocol = @import("../kg/retrieval_protocol.zig");
+const lexical_query_plan = @import("../kg/lexical_query_plan.zig");
 
 fn requireKg(ctx: *const ToolContext) ?*kg_mod.KgClient {
     return ctx.kg;
@@ -123,26 +126,73 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     if (!kg.ready) return degradedResult(ctx.allocator, kg);
     kg.setAbort(ctx.abort); // M1:ESC 可中断 spawn
 
-    const query = util_json.extractStringField(args, "query") orelse {
+    var parsed_args = std.json.parseFromSlice(std.json.Value, ctx.allocator, args, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall 参数必须是合法 JSON object", .{});
+            return error.InvalidArguments;
+        },
+    };
+    defer parsed_args.deinit();
+    if (parsed_args.value != .object) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall 参数必须是合法 JSON object", .{});
+        return error.InvalidArguments;
+    }
+    const object = parsed_args.value.object;
+    const query_value = object.get("query") orelse {
         common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall 缺少必填字段 query", .{});
         return error.MissingQuery;
     };
-    const query_owned = try util_json.unescapeString(query, ctx.allocator);
-    defer ctx.allocator.free(query_owned);
+    if (query_value != .string) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall query 必须是字符串", .{});
+        return error.InvalidQuery;
+    }
+    const query = std.mem.trim(u8, query_value.string, " \t\r\n");
+    if (!validRecallQuery(query)) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall query 必须是 1..400 字节的 UTF-8 紧凑查询", .{});
+        return error.InvalidQuery;
+    }
 
     // 可选 type 过滤:归一化 + 集合校验,菜单外报错**不静默空返**(Linus MEDIUM-1)。
     var type_canon: ?[]const u8 = null;
-    if (util_json.extractStringField(args, "type")) |raw| {
-        const resolved = kg_mod.resolveMemoryType(raw) orelse {
+    if (object.get("type")) |raw| {
+        if (raw != .string) {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall type 必须是字符串", .{});
+            return error.InvalidType;
+        }
+        const resolved = kg_mod.resolveMemoryType(raw.string) orelse {
             common.setErrorDetail(ctx.error_detail, ctx.allocator, "type 必须是 decision|user_preference|module|bug|observation 之一", .{});
             return error.InvalidType;
         };
         type_canon = resolved.schema_type;
     }
-    // 采用率埋点(PM:kill-criterion 的 load-bearing 仪器,measure 模型是否用 --type)。
-    log.info("kg", "kg_recall type_filter={s}", .{type_canon orelse "none"});
 
-    const hits = kg.recallTyped(query_owned, 8, false, type_canon) catch |e| {
+    var plan = lexical_query_plan.parse(ctx.allocator, object, query, type_canon) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall lexical_plan 非法: {s}", .{lexical_query_plan.diagnostic(err)});
+        return error.InvalidLexicalPlan;
+    };
+    defer if (plan) |*value| value.deinit(ctx.allocator);
+
+    // Do not trust model-declared seen ids. A governed plan must bind to the
+    // run-scoped host ledger before TinyKG is touched; legacy query-only calls
+    // intentionally preserve their old behavior.
+    var ledger_guard: ?lexical_query_plan.Ledger.Guard = null;
+    defer if (ledger_guard) |*guard| guard.deinit();
+    if (plan) |value| {
+        const ledger = ctx.kg_lexical_ledger orelse {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall lexical_plan requires the session host ledger; governed information-gain metrics fail closed when it is unavailable", .{});
+            return error.LexicalPlanLedgerUnavailable;
+        };
+        ledger_guard = ledger.lockPlan(value) catch |err| {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall lexical_plan host ledger rejected the call: {s}", .{lexical_query_plan.ledgerDiagnostic(err)});
+            return error.InvalidLexicalPlanState;
+        };
+    }
+    // 采用率埋点(PM:kill-criterion 的 load-bearing 仪器,measure 模型是否用 --type)。
+    log.info("kg", "kg_recall type_filter={s} lexical_plan={s}", .{ type_canon orelse "none", if (plan == null) "legacy" else "v1" });
+
+    const hits = kg.recallTyped(query, 8, false, type_canon) catch |e| {
         return kgErrorResult(ctx, kg, e, "KgRecall");
     };
     defer {
@@ -153,8 +203,16 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(ctx.allocator);
+    var new_hit_count: usize = 0;
+    var repeated_hit_count: usize = 0;
+    var hit_ids: [lexical_query_plan.MAX_SEEN_NODE_IDS]u64 = [_]u64{0} ** lexical_query_plan.MAX_SEEN_NODE_IDS;
+    if (hits.len > hit_ids.len) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall returned more hits than the governed 32-node ledger can represent", .{});
+        return error.InvalidLexicalPlanState;
+    }
     try out.appendSlice(ctx.allocator, "{\"hits\":[");
     for (hits, 0..) |h, i| {
+        hit_ids[i] = h.node_id;
         if (i > 0) try out.appendSlice(ctx.allocator, ",");
         const type_str = if (h.schema_type.len > 0) h.schema_type else h.kind;
         const row = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d},\"type\":\"{s}\",\"scope\":\"{s}\",\"score\":{d:.2},\"text\":", .{
@@ -168,6 +226,18 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (h.source_label.len > 0) {
             try out.appendSlice(ctx.allocator, ",\"source\":");
             try appendJsonString(&out, ctx.allocator, h.source_label);
+        }
+        if (ledger_guard) |*guard| {
+            const seen_before = guard.wasSeen(h.node_id);
+            const duplicate_in_batch = containsNodeId(hit_ids[0..i], h.node_id);
+            if (!duplicate_in_batch) {
+                if (seen_before) {
+                    repeated_hit_count += 1;
+                } else {
+                    new_hit_count += 1;
+                }
+            }
+            try out.appendSlice(ctx.allocator, if (seen_before) ",\"seen_before\":true" else ",\"seen_before\":false");
         }
         try out.appendSlice(ctx.allocator, "}");
     }
@@ -188,10 +258,372 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         defer ctx.allocator.free(kv);
         try facet.appendSlice(ctx.allocator, kv);
     }
-    const tail = try std.fmt.allocPrint(ctx.allocator, "],\"count\":{d},\"types_in_results\":{{{s}}}}}", .{ hits.len, facet.items });
-    defer ctx.allocator.free(tail);
+    try out.appendSlice(ctx.allocator, "],\"count\":");
+    const count = try std.fmt.allocPrint(ctx.allocator, "{d}", .{hits.len});
+    defer ctx.allocator.free(count);
+    try out.appendSlice(ctx.allocator, count);
+    try out.appendSlice(ctx.allocator, ",\"types_in_results\":{");
+    try out.appendSlice(ctx.allocator, facet.items);
+    try out.append(ctx.allocator, '}');
+    if (plan) |value| try appendLexicalPlanReceipt(&out, ctx.allocator, value, new_hit_count, repeated_hit_count);
+    try out.appendSlice(ctx.allocator, ",\"retrieval_mode\":\"lexical_bm25_no_embeddings\",\"knowledge_status\":\"unverified_candidates\",\"lexical_guidance\":");
+    try appendJsonString(&out, ctx.allocator, retrieval_protocol.RESULT_GUIDANCE);
+    const tail = "}";
     try out.appendSlice(ctx.allocator, tail);
+    const owned = try out.toOwnedSlice(ctx.allocator);
+    errdefer ctx.allocator.free(owned);
+    if (ledger_guard) |*guard| {
+        guard.commit(hit_ids[0..hits.len]) catch |err| {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall lexical_plan host ledger could not commit the observed hits: {s}", .{lexical_query_plan.ledgerDiagnostic(err)});
+            return error.InvalidLexicalPlanState;
+        };
+    }
+    return owned;
+}
+
+fn validRecallQuery(query: []const u8) bool {
+    if (query.len == 0 or query.len > lexical_query_plan.MAX_QUERY_BYTES or !std.unicode.utf8ValidateSlice(query)) return false;
+    for (query) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    return true;
+}
+
+fn containsNodeId(values: []const u64, expected: u64) bool {
+    for (values) |value| if (value == expected) return true;
+    return false;
+}
+
+fn appendLexicalPlanReceipt(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    plan: lexical_query_plan.Plan,
+    new_hit_count: usize,
+    repeated_hit_count: usize,
+) !void {
+    const selected = plan.selected();
+    const receipt = try std.fmt.allocPrint(
+        allocator,
+        ",\"lexical_query_plan\":{{\"schema_version\":\"{s}\",\"plan_sha256\":\"{s}\",\"intent\":\"{s}\",\"stage\":\"{s}\",\"variant_index\":{d},\"variant_count\":{d},\"variant_kind\":\"{s}\",\"seen_node_count\":{d},\"seen_state_verified\":true,\"ledger_scope\":\"agent_run_plan\",\"new_hit_count\":{d},\"repeated_hit_count\":{d}}}",
+        .{
+            lexical_query_plan.SCHEMA_VERSION,
+            plan.fingerprint,
+            @tagName(plan.intent),
+            @tagName(plan.stage),
+            plan.variant_index,
+            plan.variants.len,
+            @tagName(selected.kind),
+            plan.seen_node_ids.len,
+            new_hit_count,
+            repeated_hit_count,
+        },
+    );
+    defer allocator.free(receipt);
+    try out.appendSlice(allocator, receipt);
+}
+
+const DEFAULT_CONTEXT_EDGES: usize = 12;
+const MAX_CONTEXT_EDGES: usize = 20;
+const DEFAULT_TEXT_BYTES: usize = 6000;
+const MAX_TEXT_BYTES: usize = 12000;
+const MAX_GRAPH_BYTES: usize = 64 * 1024;
+
+/// 读取一个候选节点的权威正文页 + 有界本地图邻域。检索与遍历分开：KgRecall 找种子，
+/// KgContext 验证种子和 evidence；不能让模型仅凭 BM25 摘要或边名下结论。
+pub fn executeContext(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
+    const kg = requireKg(ctx) orelse return degradedResult(ctx.allocator, null);
+    if (!kg.ready) return degradedResult(ctx.allocator, kg);
+    kg.setAbort(ctx.abort);
+
+    var parsed_args = std.json.parseFromSlice(std.json.Value, ctx.allocator, args, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext 参数必须是合法 JSON object", .{});
+            return error.InvalidArguments;
+        },
+    };
+    defer parsed_args.deinit();
+    if (parsed_args.value != .object) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext 参数必须是 JSON object", .{});
+        return error.InvalidArguments;
+    }
+    const obj = parsed_args.value.object;
+
+    const node_id = (try readU64Arg(ctx, obj, "node_id")) orelse {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext 缺少合法 node_id (>0)", .{});
+        return error.InvalidNodeId;
+    };
+    if (node_id == 0) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext node_id 必须大于 0", .{});
+        return error.InvalidNodeId;
+    }
+    const limit_u64 = (try readU64Arg(ctx, obj, "limit")) orelse DEFAULT_CONTEXT_EDGES;
+    if (limit_u64 < 1 or limit_u64 > MAX_CONTEXT_EDGES) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext limit 必须在 1..20", .{});
+        return error.InvalidLimit;
+    }
+    const limit = std.math.cast(usize, limit_u64) orelse return error.InvalidLimit;
+
+    const offset_raw = (try readU64Arg(ctx, obj, "text_offset")) orelse 0;
+    const requested_offset = std.math.cast(usize, offset_raw) orelse {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext text_offset 超出平台范围", .{});
+        return error.InvalidOffset;
+    };
+    const text_limit_u64 = (try readU64Arg(ctx, obj, "text_limit")) orelse DEFAULT_TEXT_BYTES;
+    if (text_limit_u64 < 4 or text_limit_u64 > MAX_TEXT_BYTES) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext text_limit 必须在 4..12000，确保 UTF-8 分页前进", .{});
+        return error.InvalidLimit;
+    }
+    const text_limit = std.math.cast(usize, text_limit_u64) orelse return error.InvalidLimit;
+
+    const metadata_raw = kg.nodeMetadataJson(node_id, true) catch |e| return kgErrorResult(ctx, kg, e, "KgContext");
+    defer kg.allocator.free(metadata_raw);
+    var parsed_metadata = std.json.parseFromSlice(std.json.Value, ctx.allocator, metadata_raw, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext 收到无效 node metadata JSON", .{});
+            return error.InvalidGraphProtocol;
+        },
+    };
+    defer parsed_metadata.deinit();
+    const metadata = parseNodeContextMetadata(parsed_metadata.value, node_id) orelse {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext 不支持当前 node metadata 协议", .{});
+        return error.InvalidGraphProtocol;
+    };
+    const text = metadata.text;
+    const graph_raw = kg.neighborsJson(node_id, limit) catch |e| return kgErrorResult(ctx, kg, e, "KgContext");
+    defer kg.allocator.free(graph_raw);
+    const graph = std.mem.trim(u8, graph_raw, " \t\r\n");
+    if (graph.len > MAX_GRAPH_BYTES) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext 图邻域超过 64KiB；请降低 limit 或选择更精确的节点", .{});
+        return error.ContextTooLarge;
+    }
+
+    // TinyKG 是外部版本化协议。不能把任意 stdout 嵌进工具 JSON；版本或 mode 漂移时
+    // fail closed，让 vendor pin 升级显式更新适配器与 L2。
+    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, graph, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext 收到无效 neighbors JSON", .{});
+            return error.InvalidGraphProtocol;
+        },
+    };
+    defer parsed.deinit();
+    const graph_node_count = validateNeighborGraph(parsed.value, node_id, limit, metadata.generation) orelse {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext 不支持当前 neighbors 协议版本", .{});
+        return error.InvalidGraphProtocol;
+    };
+    const governance = buildKnowledgeGovernance(parsed.value, node_id, metadata.generation) orelse {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext 图协议缺少知识治理状态", .{});
+        return error.InvalidGraphProtocol;
+    };
+
+    const page = textPage(text, requested_offset, text_limit);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(ctx.allocator);
+    const head = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d},\"text\":", .{node_id});
+    defer ctx.allocator.free(head);
+    try out.appendSlice(ctx.allocator, head);
+    try appendJsonString(&out, ctx.allocator, text[page.start..page.end]);
+    const meta = try std.fmt.allocPrint(
+        ctx.allocator,
+        ",\"text_offset\":{d},\"text_returned_bytes\":{d},\"text_total_bytes\":{d},\"text_truncated\":{s},\"next_text_offset\":{d},\"graph_node_count\":{d},\"graph\":",
+        .{ page.start, page.end - page.start, text.len, if (page.end < text.len) "true" else "false", page.end, graph_node_count },
+    );
+    defer ctx.allocator.free(meta);
+    try out.appendSlice(ctx.allocator, meta);
+    try out.appendSlice(ctx.allocator, graph);
+    try appendKnowledgeGovernance(&out, ctx.allocator, governance);
+    try out.appendSlice(ctx.allocator, ",\"verification_guidance\":");
+    try appendJsonString(&out, ctx.allocator, retrieval_protocol.CONTEXT_RESULT_GUIDANCE);
+    try out.appendSlice(ctx.allocator, "}");
     return out.toOwnedSlice(ctx.allocator);
+}
+
+const KnowledgeGovernance = struct {
+    current_generation: bool,
+    deprecated_by: ?u64,
+    verification_edge_count: usize,
+    evidence_edge_count: usize,
+    provenance_edge_count: usize,
+    resolution_edge_count: usize,
+    contradiction_edge_count: usize,
+    graph_truncated: bool,
+
+    fn trustState(self: KnowledgeGovernance) []const u8 {
+        if (!self.current_generation or self.deprecated_by != null) return "superseded";
+        if (self.contradiction_edge_count > 0) return "contradicted";
+        if (self.graph_truncated) return "incomplete_graph";
+        if (self.verification_edge_count + self.evidence_edge_count > 0) return "evidence_connected_candidate";
+        return "unverified_candidate";
+    }
+};
+
+const NodeGeneration = struct {
+    current_generation: bool,
+    deprecated_by: ?u64,
+};
+
+const NodeContextMetadata = struct {
+    text: []const u8,
+    generation: NodeGeneration,
+};
+
+fn parseNodeContextMetadata(value: std.json.Value, requested_node_id: u64) ?NodeContextMetadata {
+    if (value != .object or
+        !jsonStringEquals(value.object.get("schema_version"), "tinykg-agent-retrieval-v1")) return null;
+    const found = value.object.get("found") orelse return null;
+    if (found != .bool or !found.bool) return null;
+    const node = value.object.get("node") orelse return null;
+    if (node != .object) return null;
+    const node_id = node.object.get("id") orelse return null;
+    if (node_id != .integer or node_id.integer < 1 or @as(u64, @intCast(node_id.integer)) != requested_node_id) return null;
+    const text = node.object.get("text") orelse return null;
+    if (text != .string) return null;
+    const status = node.object.get("status") orelse return null;
+    if (status != .object) return null;
+    const current = status.object.get("current_generation") orelse return null;
+    if (current != .bool) return null;
+    const deprecated_value = status.object.get("deprecated_by") orelse return null;
+    const deprecated_by: ?u64 = switch (deprecated_value) {
+        .null => null,
+        .integer => |raw| if (raw > 0) @intCast(raw) else return null,
+        else => return null,
+    };
+    if (current.bool == (deprecated_by != null)) return null;
+    return .{
+        .text = text.string,
+        .generation = .{ .current_generation = current.bool, .deprecated_by = deprecated_by },
+    };
+}
+
+fn buildKnowledgeGovernance(value: std.json.Value, requested_node_id: u64, generation: NodeGeneration) ?KnowledgeGovernance {
+    if (value != .object) return null;
+    const summary = value.object.get("summary") orelse return null;
+    if (summary != .object) return null;
+    const truncated = summary.object.get("truncated") orelse return null;
+    if (truncated != .bool) return null;
+
+    var result = KnowledgeGovernance{
+        .current_generation = generation.current_generation,
+        .deprecated_by = generation.deprecated_by,
+        .verification_edge_count = 0,
+        .evidence_edge_count = 0,
+        .provenance_edge_count = 0,
+        .resolution_edge_count = 0,
+        .contradiction_edge_count = 0,
+        .graph_truncated = truncated.bool,
+    };
+    countGovernanceEdges(value.object.get("edges") orelse return null, requested_node_id, &result) orelse return null;
+    countGovernanceEdges(value.object.get("backrefs") orelse return null, requested_node_id, &result) orelse return null;
+    return result;
+}
+
+fn countGovernanceEdges(value: std.json.Value, requested_node_id: u64, result: *KnowledgeGovernance) ?void {
+    if (value != .array) return null;
+    for (value.array.items) |edge| {
+        if (edge != .object) return null;
+        const src_value = edge.object.get("src") orelse return null;
+        const dst_value = edge.object.get("dst") orelse return null;
+        if (src_value != .integer or src_value.integer < 1 or dst_value != .integer or dst_value.integer < 1) return null;
+        const src: u64 = @intCast(src_value.integer);
+        const dst: u64 = @intCast(dst_value.integer);
+        if (src != requested_node_id and dst != requested_node_id) continue;
+        const rel_value = edge.object.get("rel") orelse return null;
+        if (rel_value != .string) return null;
+        const rel = rel_value.string;
+        if (std.mem.eql(u8, rel, "verified_by")) result.verification_edge_count += 1;
+        if (std.mem.eql(u8, rel, "evidences")) result.evidence_edge_count += 1;
+        if (std.mem.eql(u8, rel, "derived_from") or std.mem.eql(u8, rel, "based_on")) result.provenance_edge_count += 1;
+        if (std.mem.eql(u8, rel, "resolved_by")) result.resolution_edge_count += 1;
+        if (std.mem.eql(u8, rel, "contradicts") or std.mem.eql(u8, rel, "conflicts_with")) result.contradiction_edge_count += 1;
+    }
+    return {};
+}
+
+fn appendKnowledgeGovernance(out: *std.ArrayList(u8), allocator: std.mem.Allocator, governance: KnowledgeGovernance) !void {
+    try out.appendSlice(allocator, ",\"knowledge_governance\":{\"schema_version\":\"metacodes-knowledge-governance-v1\",\"trust_state\":");
+    try appendJsonString(out, allocator, governance.trustState());
+    const head = try std.fmt.allocPrint(
+        allocator,
+        ",\"current_generation\":{s},\"deprecated_by\":",
+        .{if (governance.current_generation) "true" else "false"},
+    );
+    defer allocator.free(head);
+    try out.appendSlice(allocator, head);
+    if (governance.deprecated_by) |node_id| {
+        const rendered = try std.fmt.allocPrint(allocator, "{d}", .{node_id});
+        defer allocator.free(rendered);
+        try out.appendSlice(allocator, rendered);
+    } else {
+        try out.appendSlice(allocator, "null");
+    }
+    const counts = try std.fmt.allocPrint(
+        allocator,
+        ",\"verification_edge_count\":{d},\"evidence_edge_count\":{d},\"provenance_edge_count\":{d},\"resolution_edge_count\":{d},\"contradiction_edge_count\":{d},\"graph_truncated\":{s},\"freshness_state\":\"unknown_requires_current_state_check\",\"usage\":\"candidate_only\",\"required_action\":\"inspect evidence, supersession and conflict signals; do not use memory as a current fact until any required current-state check passes\"}}",
+        .{ governance.verification_edge_count, governance.evidence_edge_count, governance.provenance_edge_count, governance.resolution_edge_count, governance.contradiction_edge_count, if (governance.graph_truncated) "true" else "false" },
+    );
+    defer allocator.free(counts);
+    try out.appendSlice(allocator, counts);
+}
+
+fn readU64Arg(ctx: *const ToolContext, obj: std.json.ObjectMap, name: []const u8) anyerror!?u64 {
+    const value = obj.get(name) orelse return null;
+    if (value != .integer or value.integer < 0) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext {s} 必须是非负整数", .{name});
+        return error.InvalidArguments;
+    }
+    return @intCast(value.integer);
+}
+
+const TextPage = struct { start: usize, end: usize };
+
+fn textPage(text: []const u8, requested_offset: usize, max_bytes: usize) TextPage {
+    var start = @min(requested_offset, text.len);
+    while (start > 0 and start < text.len and isUtf8Continuation(text[start])) start -= 1;
+    var end = @min(text.len, start +| max_bytes);
+    while (end > start and end < text.len and isUtf8Continuation(text[end])) end -= 1;
+    return .{ .start = start, .end = end };
+}
+
+fn isUtf8Continuation(byte: u8) bool {
+    return (byte & 0xC0) == 0x80;
+}
+
+fn jsonStringEquals(value: ?std.json.Value, expected: []const u8) bool {
+    const v = value orelse return false;
+    return v == .string and std.mem.eql(u8, v.string, expected);
+}
+
+fn validateNeighborGraph(value: std.json.Value, requested_node_id: u64, limit: usize, generation: NodeGeneration) ?u64 {
+    if (value != .object or
+        !jsonStringEquals(value.object.get("schema_version"), "tinykg-agent-retrieval-v1") or
+        !jsonStringEquals(value.object.get("mode"), "neighbors")) return null;
+    const query = value.object.get("query") orelse return null;
+    if (query != .object) return null;
+    const root_id = query.object.get("root_id") orelse return null;
+    if (root_id != .integer or root_id.integer < 1 or @as(u64, @intCast(root_id.integer)) != requested_node_id) return null;
+    const summary = value.object.get("summary") orelse return null;
+    if (summary != .object) return null;
+    const count = summary.object.get("node_count") orelse return null;
+    if (count != .integer or count.integer < 0) return null;
+    const node_count: u64 = @intCast(count.integer);
+    // TinyKG `--limit N` bounds neighbor edges; the JSON node set may contain
+    // the root plus N adjacent nodes.
+    if (node_count > limit + 1) return null;
+    const root = value.object.get("root") orelse return null;
+    if (generation.current_generation) {
+        if (node_count < 1 or root != .object) return null;
+        const graph_root_id = root.object.get("id") orelse return null;
+        if (graph_root_id != .integer or graph_root_id.integer < 1 or @as(u64, @intCast(graph_root_id.integer)) != requested_node_id) return null;
+    } else {
+        // Historical generations are intentionally omitted from TinyKG's
+        // neighbor graph. Metadata remains authoritative for deprecated_by;
+        // the empty history continuation is the only accepted sentinel.
+        if (node_count != 0 or root != .null) return null;
+        const truncated = summary.object.get("truncated") orelse return null;
+        if (truncated != .bool or !truncated.bool or
+            !jsonStringEquals(summary.object.get("truncate_reason"), "history")) return null;
+    }
+    return node_count;
 }
 
 /// KgError → 工具层结果。data 错带 detail 引导模型改参;transient 报可重试。
@@ -248,4 +680,48 @@ test "isNearDuplicate: 尺度无关文本重合判定(替代不可靠的 BM25 �
     // 空串 → 非 dup(不阻扰)。
     try testing.expect(!isNearDuplicate("", "x"));
     try testing.expect(!isNearDuplicate("x", ""));
+}
+
+test "textPage preserves UTF-8 boundaries and supports deterministic paging" {
+    const text = "ab中文cd";
+    const first = textPage(text, 0, 4); // would split 文 without boundary repair
+    try testing.expectEqualStrings("ab", text[first.start..first.end]);
+    const second = textPage(text, first.end, 6);
+    try testing.expectEqualStrings("中文", text[second.start..second.end]);
+    const inside_codepoint = textPage(text, 3, 6);
+    try testing.expectEqualStrings("中文", text[inside_codepoint.start..inside_codepoint.end]);
+}
+
+test "validateNeighborGraph binds version, root, and requested limit" {
+    const raw =
+        \\{"schema_version":"tinykg-agent-retrieval-v1","mode":"neighbors","query":{"root_id":42},"summary":{"node_count":6},"root":{"id":42}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, raw, .{});
+    defer parsed.deinit();
+    const current = NodeGeneration{ .current_generation = true, .deprecated_by = null };
+    try testing.expectEqual(@as(?u64, 6), validateNeighborGraph(parsed.value, 42, 5, current));
+    try testing.expect(validateNeighborGraph(parsed.value, 41, 5, current) == null);
+    try testing.expect(validateNeighborGraph(parsed.value, 42, 4, current) == null);
+}
+
+test "node metadata and historical neighbor sentinel fail closed around supersession" {
+    const metadata_raw =
+        \\{"schema_version":"tinykg-agent-retrieval-v1","found":true,"node":{"id":7,"status":{"current_generation":false,"deprecated_by":9},"text":"old fact"}}
+    ;
+    var metadata = try std.json.parseFromSlice(std.json.Value, testing.allocator, metadata_raw, .{});
+    defer metadata.deinit();
+    const parsed_metadata = parseNodeContextMetadata(metadata.value, 7) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("old fact", parsed_metadata.text);
+    try testing.expect(!parsed_metadata.generation.current_generation);
+    try testing.expectEqual(@as(?u64, 9), parsed_metadata.generation.deprecated_by);
+    try testing.expect(parseNodeContextMetadata(metadata.value, 8) == null);
+
+    const history_raw =
+        \\{"schema_version":"tinykg-agent-retrieval-v1","mode":"neighbors","query":{"root_id":7},"summary":{"node_count":0,"truncated":true,"truncate_reason":"history"},"root":null}
+    ;
+    var history = try std.json.parseFromSlice(std.json.Value, testing.allocator, history_raw, .{});
+    defer history.deinit();
+    try testing.expectEqual(@as(?u64, 0), validateNeighborGraph(history.value, 7, 12, parsed_metadata.generation));
+    const current = NodeGeneration{ .current_generation = true, .deprecated_by = null };
+    try testing.expect(validateNeighborGraph(history.value, 7, 12, current) == null);
 }

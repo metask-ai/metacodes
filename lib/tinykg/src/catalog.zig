@@ -3,7 +3,8 @@ const schema = @import("schema.zig");
 const core = @import("core.zig");
 
 pub const catalog_magic = [_]u8{ 'T', 'K', 'G', 'C' };
-pub const catalog_version: u16 = 2;
+pub const catalog_version: u16 = 3;
+pub const catalog_legacy_version: u16 = 2;
 pub const catalog_format_version_legacy: u16 = 1;
 pub const catalog_format_version_embedded: u16 = 2;
 
@@ -127,6 +128,12 @@ pub const Catalog = struct {
 };
 
 pub fn encodeCatalog(allocator: std.mem.Allocator, cat: Catalog) ![]u8 {
+    return encodeCatalogVersion(allocator, cat, catalog_version);
+}
+
+fn encodeCatalogVersion(allocator: std.mem.Allocator, cat: Catalog, version: u16) ![]u8 {
+    if (version != catalog_version and version != catalog_legacy_version) return Error.InvalidVersion;
+    if (cat.format_version != catalog_format_version_legacy and cat.format_version != catalog_format_version_embedded) return Error.InvalidVersion;
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
 
@@ -138,7 +145,7 @@ pub fn encodeCatalog(allocator: std.mem.Allocator, cat: Catalog) ![]u8 {
         record_count += 1;
         var prop_index: usize = 0;
         while (cat.registry.nodePropertyInfo(info.id, prop_index)) |prop| : (prop_index += 1) {
-            try encodePropertyRecord(allocator, &out, .node_property, info.id, prop);
+            try encodePropertyRecord(allocator, &out, .node_property, info.id, prop, version);
             record_count += 1;
         }
     }
@@ -150,7 +157,7 @@ pub fn encodeCatalog(allocator: std.mem.Allocator, cat: Catalog) ![]u8 {
         record_count += 1;
         var prop_index: usize = 0;
         while (cat.registry.relationPropertyInfo(info.id, prop_index)) |prop| : (prop_index += 1) {
-            try encodePropertyRecord(allocator, &out, .relation_property, info.id, prop);
+            try encodePropertyRecord(allocator, &out, .relation_property, info.id, prop, version);
             record_count += 1;
         }
         if (cat.registry.relationCompositionById(info.id)) |comp| {
@@ -174,7 +181,7 @@ pub fn encodeCatalog(allocator: std.mem.Allocator, cat: Catalog) ![]u8 {
     const result = try allocator.alloc(u8, total_len);
 
     @memcpy(result[0..4], &catalog_magic);
-    std.mem.writeInt(u16, result[4..6], catalog_version, .little);
+    std.mem.writeInt(u16, result[4..6], version, .little);
     std.mem.writeInt(u16, result[6..8], cat.format_version, .little);
     std.mem.writeInt(u32, result[8..12], cat.revision, .little);
     std.mem.writeInt(u32, result[12..16], record_count, .little);
@@ -190,8 +197,9 @@ pub fn decodeCatalog(allocator: std.mem.Allocator, bytes: []const u8) !Catalog {
     if (bytes.len < header_len) return Error.InvalidRecord;
     if (!std.mem.eql(u8, bytes[0..4], &catalog_magic)) return Error.InvalidMagic;
     const version = std.mem.readInt(u16, bytes[4..6], .little);
-    if (version != catalog_version) return Error.InvalidVersion;
+    if (version != catalog_version and version != catalog_legacy_version) return Error.InvalidVersion;
     const format_version = std.mem.readInt(u16, bytes[6..8], .little);
+    if (format_version != catalog_format_version_legacy and format_version != catalog_format_version_embedded) return Error.InvalidVersion;
     const revision = std.mem.readInt(u32, bytes[8..12], .little);
     const record_count = std.mem.readInt(u32, bytes[12..16], .little);
     const stored_checksum = std.mem.readInt(u64, bytes[16..24], .little);
@@ -213,16 +221,55 @@ pub fn decodeCatalog(allocator: std.mem.Allocator, bytes: []const u8) !Catalog {
         switch (tag) {
             .node_type => offset = try decodeNodeTypeRecord(&cat, body, offset),
             .relation_type => offset = try decodeRelationTypeRecord(&cat, body, offset),
-            .node_property => offset = try decodePropertyRecord(&cat, .node_property, body, offset),
-            .relation_property => offset = try decodePropertyRecord(&cat, .relation_property, body, offset),
+            .node_property => offset = try decodePropertyRecord(&cat, .node_property, body, offset, version),
+            .relation_property => offset = try decodePropertyRecord(&cat, .relation_property, body, offset, version),
             .composition => offset = try decodeCompositionRecord(&cat, body, offset),
             .profile => offset = try decodeProfileRecord(&cat, body, offset),
             .retired_type => offset = try decodeRetiredTypeRecord(&cat, body, offset),
         }
         count += 1;
     }
-    if (count != record_count) return Error.InvalidRecord;
+    if (count != record_count or offset != body.len) return Error.InvalidRecord;
+    try validateDecodedCatalog(&cat);
+
+    // The catalog is a control-plane schema, not an append log.  Accepting
+    // multiple encodings for the same in-memory state makes duplicate
+    // property/composition records silently become "last writer wins" and
+    // lets record order affect governance.  Re-encoding is cheap at catalog
+    // scale and gives the decoder one fail-closed canonicality rule.
+    const canonical = try encodeCatalogVersion(allocator, cat, version);
+    defer allocator.free(canonical);
+    if (!std.mem.eql(u8, bytes, canonical)) return Error.InvalidRecord;
     return cat;
+}
+
+fn validateDecodedCatalog(cat: *const Catalog) !void {
+    var profiles = std.StringHashMap(void).init(cat.allocator);
+    defer profiles.deinit();
+    for (cat.profiles.items) |profile| {
+        if (profile.len == 0) return Error.InvalidRecord;
+        const entry = try profiles.getOrPut(profile);
+        if (entry.found_existing) return Error.InvalidRecord;
+    }
+
+    const RetiredKey = struct {
+        domain: TypeDomain,
+        id: u16,
+    };
+    var retired_ids = std.AutoHashMap(RetiredKey, void).init(cat.allocator);
+    defer retired_ids.deinit();
+    for (cat.retired.items) |retired| {
+        if (retired.name.len == 0 or retired.retired_at_revision == 0 or retired.retired_at_revision > cat.revision) {
+            return Error.InvalidRecord;
+        }
+        const entry = try retired_ids.getOrPut(.{ .domain = retired.domain, .id = retired.id });
+        if (entry.found_existing) return Error.InvalidRecord;
+        const active = switch (retired.domain) {
+            .node => cat.registry.hasNodeTypeId(retired.id),
+            .relation => cat.registry.hasRelationTypeId(retired.id),
+        };
+        if (active) return Error.InvalidRecord;
+    }
 }
 
 fn encodeNodeTypeRecord(
@@ -249,22 +296,22 @@ fn decodeNodeTypeRecord(
     start: usize,
 ) !usize {
     var offset = start;
-    offset += 1; // reserved/domain byte
+    if ((try readU8(body, &offset)) != 0) return Error.InvalidRecord;
     const id = try readU16(body, &offset);
     const name_len = try readU8(body, &offset);
-    if (offset + name_len > body.len) return Error.InvalidRecord;
+    if (offset > body.len or name_len > body.len - offset) return Error.InvalidRecord;
     const name = body[offset .. offset + name_len];
     offset += name_len;
     const parent_count = try readU8(body, &offset);
-    if (offset + @as(usize, parent_count) * 2 > body.len) return Error.InvalidRecord;
+    if (parent_count > max_parents) return Error.InvalidRecord;
+    if (@as(usize, parent_count) * 2 > body.len - offset) return Error.InvalidRecord;
     var parents_buf: [max_parents]u16 = [_]u16{0} ** max_parents;
     var i: u8 = 0;
     while (i < parent_count) : (i += 1) {
         parents_buf[i] = try readU16(body, &offset);
     }
-    if (!cat.registry.hasNodeTypeId(id)) {
-        try cat.registry.addNodeType(name, id, parents_buf[0..parent_count]);
-    }
+    if (cat.registry.hasNodeTypeId(id)) return Error.InvalidRecord;
+    try cat.registry.addNodeType(name, id, parents_buf[0..parent_count]);
     return offset;
 }
 
@@ -303,11 +350,12 @@ fn decodeRelationTypeRecord(
     offset += 1;
     const id = try readU16(body, &offset);
     const name_len = try readU8(body, &offset);
-    if (offset + name_len > body.len) return Error.InvalidRecord;
+    if (offset > body.len or name_len > body.len - offset) return Error.InvalidRecord;
     const name = body[offset .. offset + name_len];
     offset += name_len;
     const parent_count = try readU8(body, &offset);
-    if (offset + @as(usize, parent_count) * 2 > body.len) return Error.InvalidRecord;
+    if (parent_count > max_parents) return Error.InvalidRecord;
+    if (@as(usize, parent_count) * 2 > body.len - offset) return Error.InvalidRecord;
     var parents_buf: [max_parents]u16 = [_]u16{0} ** max_parents;
     var i: u8 = 0;
     while (i < parent_count) : (i += 1) {
@@ -315,16 +363,17 @@ fn decodeRelationTypeRecord(
     }
     var endpoint: schema.RelationEndpointRule = .{};
     const has_src = try readU8(body, &offset);
-    if (has_src != 0) {
+    if (has_src > 1) return Error.InvalidRecord;
+    if (has_src == 1) {
         endpoint.src = try decodeTypeSet(body, &offset);
     }
     const has_dst = try readU8(body, &offset);
-    if (has_dst != 0) {
+    if (has_dst > 1) return Error.InvalidRecord;
+    if (has_dst == 1) {
         endpoint.dst = try decodeTypeSet(body, &offset);
     }
-    if (!cat.registry.hasRelationTypeId(id)) {
-        try cat.registry.addRelationTypeWithMetadata(name, id, parents_buf[0..parent_count], endpoint, class);
-    }
+    if (cat.registry.hasRelationTypeId(id)) return Error.InvalidRecord;
+    try cat.registry.addRelationTypeWithMetadata(name, id, parents_buf[0..parent_count], endpoint, class);
     return offset;
 }
 
@@ -334,6 +383,7 @@ fn encodePropertyRecord(
     tag: RecordTag,
     type_id: u16,
     prop: schema.PropertyMeta,
+    version: u16,
 ) !void {
     if (prop.name.len > max_name_len) return Error.NameTooLong;
     try out.append(allocator, @intFromEnum(tag));
@@ -343,6 +393,16 @@ fn encodePropertyRecord(
     try out.append(allocator, @intFromEnum(prop.value_type));
     const flags = PropertyFlags.fromPropertyMeta(prop);
     try out.append(allocator, @bitCast(flags));
+    if (version < 3) return;
+    if (prop.value_type == .@"enum" and prop.enum_values.len == 0) return Error.InvalidRecord;
+    if (prop.value_type != .@"enum" and prop.enum_values.len != 0) return Error.InvalidRecord;
+    if (prop.enum_values.len > schema.max_enum_values) return Error.RecordTooLarge;
+    try out.append(allocator, @intCast(prop.enum_values.len));
+    for (prop.enum_values) |value| {
+        if (value.len == 0 or value.len > schema.max_enum_value_bytes) return Error.RecordTooLarge;
+        try out.append(allocator, @intCast(value.len));
+        try out.appendSlice(allocator, value);
+    }
 }
 
 fn decodePropertyRecord(
@@ -350,11 +410,12 @@ fn decodePropertyRecord(
     tag: RecordTag,
     body: []const u8,
     start: usize,
+    version: u16,
 ) !usize {
     var offset = start;
     const type_id = try readU16(body, &offset);
     const name_len = try readU8(body, &offset);
-    if (offset + name_len > body.len) return Error.InvalidRecord;
+    if (offset > body.len or name_len > body.len - offset) return Error.InvalidRecord;
     const name = body[offset .. offset + name_len];
     offset += name_len;
     if (offset >= body.len) return Error.InvalidRecord;
@@ -362,11 +423,33 @@ fn decodePropertyRecord(
     offset += 1;
     if (offset >= body.len) return Error.InvalidRecord;
     const flags: PropertyFlags = @bitCast(body[offset]);
+    if (flags._reserved != 0) return Error.InvalidRecord;
     offset += 1;
+
+    var enum_values_buf: [schema.max_enum_values][]const u8 = undefined;
+    var enum_value_count: u8 = 0;
+    if (version >= 3) {
+        enum_value_count = try readU8(body, &offset);
+        if (enum_value_count > schema.max_enum_values) return Error.InvalidRecord;
+        if (value_type == .@"enum" and enum_value_count == 0) return Error.InvalidRecord;
+        if (value_type != .@"enum" and enum_value_count != 0) return Error.InvalidRecord;
+        var enum_index: u8 = 0;
+        while (enum_index < enum_value_count) : (enum_index += 1) {
+            const value_len = try readU8(body, &offset);
+            if (value_len == 0 or value_len > schema.max_enum_value_bytes) return Error.InvalidRecord;
+            if (offset > body.len or value_len > body.len - offset) return Error.InvalidRecord;
+            enum_values_buf[enum_index] = body[offset .. offset + value_len];
+            offset += value_len;
+        }
+    } else if (value_type == .@"enum" and tag == .node_property and type_id == @intFromEnum(core.NodeKind.task) and std.mem.eql(u8, name, "status")) {
+        enum_value_count = schema.task_status_enum_values.len;
+        for (&schema.task_status_enum_values, 0..) |value, index| enum_values_buf[index] = value;
+    }
 
     const meta = schema.PropertyMeta{
         .name = name,
         .value_type = value_type,
+        .enum_values = enum_values_buf[0..enum_value_count],
         .required = flags.required,
         .nullable = flags.nullable,
         .agent_fillable = flags.agent_fillable,
@@ -409,15 +492,18 @@ fn decodeCompositionRecord(
 ) !usize {
     var offset = start;
     const type_id = try readU16(body, &offset);
-    const enabled = (try readU8(body, &offset)) != 0;
-    const owner = (try readU8(body, &offset)) != 0;
+    const enabled_raw = try readU8(body, &offset);
+    const owner_raw = try readU8(body, &offset);
+    if (enabled_raw > 1 or owner_raw > 1) return Error.InvalidRecord;
+    const enabled = enabled_raw == 1;
+    const owner = owner_raw == 1;
     if (offset >= body.len) return Error.InvalidRecord;
     const cardinality = std.enums.fromInt(schema.CompositionCardinality, body[offset]) orelse return Error.InvalidRecord;
     offset += 1;
     const ordered_by_len = try readU8(body, &offset);
     var ordered_by: ?[]const u8 = null;
     if (ordered_by_len > 0) {
-        if (offset + ordered_by_len > body.len) return Error.InvalidRecord;
+        if (offset > body.len or ordered_by_len > body.len - offset) return Error.InvalidRecord;
         ordered_by = body[offset .. offset + ordered_by_len];
         offset += ordered_by_len;
     }
@@ -448,8 +534,9 @@ fn decodeProfileRecord(
 ) !usize {
     var offset = start;
     const label_len = try readU8(body, &offset);
-    if (offset + label_len > body.len) return Error.InvalidRecord;
+    if (offset > body.len or label_len > body.len - offset) return Error.InvalidRecord;
     const label = try cat.allocator.dupe(u8, body[offset .. offset + label_len]);
+    errdefer cat.allocator.free(label);
     offset += label_len;
     try cat.profiles.append(cat.allocator, label);
     return offset;
@@ -480,8 +567,9 @@ fn decodeRetiredTypeRecord(
     offset += 1;
     const id = try readU16(body, &offset);
     const name_len = try readU8(body, &offset);
-    if (offset + name_len > body.len) return Error.InvalidRecord;
+    if (offset > body.len or name_len > body.len - offset) return Error.InvalidRecord;
     const name = try cat.allocator.dupe(u8, body[offset .. offset + name_len]);
+    errdefer cat.allocator.free(name);
     offset += name_len;
     const retired_at = try readU32(body, &offset);
     try cat.retired.append(cat.allocator, .{
@@ -504,7 +592,7 @@ fn decodeTypeSet(body: []const u8, offset: *usize) !schema.NodeTypeSet {
     const word_count = body[offset.*];
     offset.* += 1;
     if (word_count > node_type_set_word_count) return Error.RecordTooLarge;
-    if (offset.* + @as(usize, word_count) * 8 > body.len) return Error.InvalidRecord;
+    if (@as(usize, word_count) * 8 > body.len - offset.*) return Error.InvalidRecord;
     var set = schema.NodeTypeSet.empty();
     var i: usize = 0;
     while (i < word_count) : (i += 1) {
@@ -527,7 +615,7 @@ fn readU8(body: []const u8, offset: *usize) !u8 {
 }
 
 fn readU16(body: []const u8, offset: *usize) !u16 {
-    if (offset.* + 2 > body.len) return Error.InvalidRecord;
+    if (offset.* > body.len or 2 > body.len - offset.*) return Error.InvalidRecord;
     const v = std.mem.readInt(u16, body[offset.*..][0..2], .little);
     offset.* += 2;
     return v;
@@ -540,7 +628,7 @@ fn appendU32(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: u32) 
 }
 
 fn readU32(body: []const u8, offset: *usize) !u32 {
-    if (offset.* + 4 > body.len) return Error.InvalidRecord;
+    if (offset.* > body.len or 4 > body.len - offset.*) return Error.InvalidRecord;
     const v = std.mem.readInt(u32, body[offset.*..][0..4], .little);
     offset.* += 4;
     return v;
@@ -553,7 +641,7 @@ fn appendU64(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: u64) 
 }
 
 fn readU64(body: []const u8, offset: *usize) !u64 {
-    if (offset.* + 8 > body.len) return Error.InvalidRecord;
+    if (offset.* > body.len or 8 > body.len - offset.*) return Error.InvalidRecord;
     const v = std.mem.readInt(u64, body[offset.*..][0..8], .little);
     offset.* += 8;
     return v;
@@ -566,6 +654,27 @@ fn fnv1a64(data: []const u8) u64 {
         hash *%= 0x100000001b3;
     }
     return hash;
+}
+
+fn wrapRawCatalogBodyForTest(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    record_count: u32,
+) ![]u8 {
+    const encoded = try allocator.alloc(u8, header_len + body.len);
+    @memcpy(encoded[0..4], &catalog_magic);
+    std.mem.writeInt(u16, encoded[4..6], catalog_version, .little);
+    std.mem.writeInt(u16, encoded[6..8], catalog_format_version_embedded, .little);
+    std.mem.writeInt(u32, encoded[8..12], 0, .little);
+    std.mem.writeInt(u32, encoded[12..16], record_count, .little);
+    std.mem.writeInt(u64, encoded[16..24], fnv1a64(body), .little);
+    @memcpy(encoded[header_len..], body);
+    return encoded;
+}
+
+fn decodeCatalogAllocationFailure(allocator: std.mem.Allocator, encoded: []const u8) !void {
+    var decoded = try decodeCatalog(allocator, encoded);
+    defer decoded.deinit();
 }
 
 test "catalog round-trip kernel-only" {
@@ -600,6 +709,61 @@ test "catalog round-trip with agent-dag profile" {
     try std.testing.expectEqualStrings("task", decoded.registry.nodeTypeNameById(@intFromEnum(core.NodeKind.task)).?);
     try std.testing.expect(decoded.registry.hasRelationTypeId(@intFromEnum(core.RelKind.depends_on)));
     try std.testing.expectEqualStrings("depends_on", decoded.registry.relationTypeNameById(@intFromEnum(core.RelKind.depends_on)).?);
+    const status = decoded.registry.nodePropertyByTypeId(@intFromEnum(core.NodeKind.task), "status").?;
+    try std.testing.expect(status.enumAllows("completed"));
+    try std.testing.expect(!status.enumAllows("done-ish"));
+}
+
+test "catalog v2 status enum gains the canonical compatibility domain" {
+    var cat = try Catalog.kernelOnly(std.testing.allocator);
+    defer cat.deinit();
+    try cat.registry.addBuiltinProfile(.agent_dag);
+
+    const encoded = try encodeCatalogVersion(std.testing.allocator, cat, catalog_legacy_version);
+    defer std.testing.allocator.free(encoded);
+    var decoded = try decodeCatalog(std.testing.allocator, encoded);
+    defer decoded.deinit();
+
+    const status = decoded.registry.nodePropertyByTypeId(@intFromEnum(core.NodeKind.task), "status").?;
+    try std.testing.expectEqual(schema.task_status_enum_values.len, status.enum_values.len);
+    try std.testing.expect(status.enumAllows("claimed"));
+    try std.testing.expect(!status.enumAllows("done-ish"));
+}
+
+test "catalog v2 task status string property remains readable" {
+    var cat = try Catalog.kernelOnly(std.testing.allocator);
+    defer cat.deinit();
+    try cat.registry.addNodeType("task", @intFromEnum(core.NodeKind.task), &.{schema.kernel_node_type_id});
+    try cat.registry.setNodeProperty(@intFromEnum(core.NodeKind.task), .{
+        .name = "status",
+        .value_type = .string,
+    });
+
+    const encoded = try encodeCatalogVersion(std.testing.allocator, cat, catalog_legacy_version);
+    defer std.testing.allocator.free(encoded);
+    var decoded = try decodeCatalog(std.testing.allocator, encoded);
+    defer decoded.deinit();
+
+    const status = decoded.registry.nodePropertyByTypeId(@intFromEnum(core.NodeKind.task), "status").?;
+    try std.testing.expectEqual(schema.PropertyType.string, status.value_type);
+    try std.testing.expectEqual(@as(usize, 0), status.enum_values.len);
+}
+
+test "catalog v3 rejects open ended enum domains while v2 stays readable" {
+    var cat = try Catalog.kernelOnly(std.testing.allocator);
+    defer cat.deinit();
+    try cat.registry.addNodeType("LegacyEnumOwner", 100, &.{});
+    try cat.registry.setNodeProperty(100, .{
+        .name = "legacy_state",
+        .value_type = .@"enum",
+    });
+
+    try std.testing.expectError(Error.InvalidRecord, encodeCatalog(std.testing.allocator, cat));
+    const encoded_v2 = try encodeCatalogVersion(std.testing.allocator, cat, catalog_legacy_version);
+    defer std.testing.allocator.free(encoded_v2);
+    var decoded_v2 = try decodeCatalog(std.testing.allocator, encoded_v2);
+    defer decoded_v2.deinit();
+    try std.testing.expect(decoded_v2.registry.nodePropertyByTypeId(100, "legacy_state").?.enumAllows("legacy-value"));
 }
 
 test "catalog round-trip with properties and composition" {
@@ -651,9 +815,10 @@ test "catalog round-trip with retired type" {
     defer cat.deinit();
     try cat.registry.addBuiltinProfile(.agent_dag);
 
-    const task_id = @intFromEnum(core.NodeKind.task);
+    cat.revision = 5;
+    const retired_id: u16 = 101;
     try cat.retired.append(cat.allocator, .{
-        .id = task_id,
+        .id = retired_id,
         .domain = .node,
         .name = try cat.allocator.dupe(u8, "old_task"),
         .retired_at_revision = 5,
@@ -666,9 +831,84 @@ test "catalog round-trip with retired type" {
     defer decoded.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), decoded.retired.items.len);
-    try std.testing.expectEqual(task_id, decoded.retired.items[0].id);
+    try std.testing.expectEqual(retired_id, decoded.retired.items[0].id);
     try std.testing.expectEqualStrings("old_task", decoded.retired.items[0].name);
     try std.testing.expectEqual(@as(u32, 5), decoded.retired.items[0].retired_at_revision);
+}
+
+test "catalog decode releases partial profile and retired allocations" {
+    var cat = try Catalog.kernelOnly(std.testing.allocator);
+    defer cat.deinit();
+    cat.revision = 7;
+    try cat.profiles.append(cat.allocator, try cat.allocator.dupe(u8, "agent-memory"));
+    try cat.retired.append(cat.allocator, .{
+        .id = 101,
+        .domain = .node,
+        .name = try cat.allocator.dupe(u8, "old-task"),
+        .retired_at_revision = 7,
+    });
+    const encoded = try encodeCatalog(std.testing.allocator, cat);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, decodeCatalogAllocationFailure, .{encoded});
+}
+
+test "catalog rejects duplicate profiles and inconsistent retired ids" {
+    {
+        var cat = try Catalog.kernelOnly(std.testing.allocator);
+        defer cat.deinit();
+        try cat.profiles.append(cat.allocator, try cat.allocator.dupe(u8, "agent-memory"));
+        try cat.profiles.append(cat.allocator, try cat.allocator.dupe(u8, "agent-memory"));
+        const encoded = try encodeCatalog(std.testing.allocator, cat);
+        defer std.testing.allocator.free(encoded);
+        try std.testing.expectError(Error.InvalidRecord, decodeCatalog(std.testing.allocator, encoded));
+    }
+
+    {
+        var cat = try Catalog.kernelOnly(std.testing.allocator);
+        defer cat.deinit();
+        cat.revision = 3;
+        try cat.retired.append(cat.allocator, .{
+            .id = schema.kernel_node_type_id,
+            .domain = .node,
+            .name = try cat.allocator.dupe(u8, "old-node"),
+            .retired_at_revision = 2,
+        });
+        const encoded = try encodeCatalog(std.testing.allocator, cat);
+        defer std.testing.allocator.free(encoded);
+        try std.testing.expectError(Error.InvalidRecord, decodeCatalog(std.testing.allocator, encoded));
+    }
+
+    {
+        var cat = try Catalog.kernelOnly(std.testing.allocator);
+        defer cat.deinit();
+        cat.revision = 3;
+        inline for (.{ "old-a", "old-b" }) |name| {
+            try cat.retired.append(cat.allocator, .{
+                .id = 101,
+                .domain = .node,
+                .name = try cat.allocator.dupe(u8, name),
+                .retired_at_revision = 3,
+            });
+        }
+        const encoded = try encodeCatalog(std.testing.allocator, cat);
+        defer std.testing.allocator.free(encoded);
+        try std.testing.expectError(Error.InvalidRecord, decodeCatalog(std.testing.allocator, encoded));
+    }
+
+    {
+        var cat = try Catalog.kernelOnly(std.testing.allocator);
+        defer cat.deinit();
+        cat.revision = 3;
+        try cat.retired.append(cat.allocator, .{
+            .id = 101,
+            .domain = .node,
+            .name = try cat.allocator.dupe(u8, "future-retirement"),
+            .retired_at_revision = 4,
+        });
+        const encoded = try encodeCatalog(std.testing.allocator, cat);
+        defer std.testing.allocator.free(encoded);
+        try std.testing.expectError(Error.InvalidRecord, decodeCatalog(std.testing.allocator, encoded));
+    }
 }
 
 test "catalog rejects bad magic" {
@@ -688,6 +928,65 @@ test "catalog rejects unknown record tag" {
     const new_checksum = fnv1a64(corrupted[header_len..]);
     std.mem.writeInt(u64, corrupted[16..24], new_checksum, .little);
     try std.testing.expectError(Error.InvalidRecord, decodeCatalog(std.testing.allocator, corrupted));
+}
+
+test "catalog rejects noncanonical format and reserved node byte" {
+    var cat = try Catalog.kernelOnly(std.testing.allocator);
+    defer cat.deinit();
+    const encoded = try encodeCatalog(std.testing.allocator, cat);
+    defer std.testing.allocator.free(encoded);
+    var bad_format = try std.testing.allocator.dupe(u8, encoded);
+    defer std.testing.allocator.free(bad_format);
+    std.mem.writeInt(u16, bad_format[6..8], 99, .little);
+    try std.testing.expectError(Error.InvalidVersion, decodeCatalog(std.testing.allocator, bad_format));
+
+    var bad_reserved = try std.testing.allocator.dupe(u8, encoded);
+    defer std.testing.allocator.free(bad_reserved);
+    bad_reserved[header_len + 1] = 1;
+    std.mem.writeInt(u64, bad_reserved[16..24], fnv1a64(bad_reserved[header_len..]), .little);
+    try std.testing.expectError(Error.InvalidRecord, decodeCatalog(std.testing.allocator, bad_reserved));
+}
+
+test "catalog rejects node type parent count beyond fixed decoder capacity" {
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(std.testing.allocator);
+    try body.append(std.testing.allocator, @intFromEnum(RecordTag.node_type));
+    try body.append(std.testing.allocator, 0);
+    try appendU16(std.testing.allocator, &body, 100);
+    try body.append(std.testing.allocator, 1);
+    try body.append(std.testing.allocator, 'n');
+    const invalid_parent_count = max_parents + 1;
+    try body.append(std.testing.allocator, invalid_parent_count);
+    var i: u8 = 0;
+    while (i < invalid_parent_count) : (i += 1) {
+        try appendU16(std.testing.allocator, &body, 0);
+    }
+
+    const encoded = try wrapRawCatalogBodyForTest(std.testing.allocator, body.items, 1);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectError(Error.InvalidRecord, decodeCatalog(std.testing.allocator, encoded));
+}
+
+test "catalog rejects relation type parent count beyond fixed decoder capacity" {
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(std.testing.allocator);
+    try body.append(std.testing.allocator, @intFromEnum(RecordTag.relation_type));
+    try body.append(std.testing.allocator, @intFromEnum(schema.RelationClass.domain));
+    try appendU16(std.testing.allocator, &body, 100);
+    try body.append(std.testing.allocator, 1);
+    try body.append(std.testing.allocator, 'r');
+    const invalid_parent_count = max_parents + 1;
+    try body.append(std.testing.allocator, invalid_parent_count);
+    var i: u8 = 0;
+    while (i < invalid_parent_count) : (i += 1) {
+        try appendU16(std.testing.allocator, &body, 0);
+    }
+    try body.append(std.testing.allocator, 0);
+    try body.append(std.testing.allocator, 0);
+
+    const encoded = try wrapRawCatalogBodyForTest(std.testing.allocator, body.items, 1);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectError(Error.InvalidRecord, decodeCatalog(std.testing.allocator, encoded));
 }
 
 test "catalog rejects truncated record" {

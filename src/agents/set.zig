@@ -187,7 +187,7 @@ const PLAN_DESC = "Research agent used during plan mode to gather context. Read-
 const PLAN_PROMPT =
     \\You are a Plan subagent. Your job is to gather codebase context for the parent agent's planning step.
     \\
-    \\You are read-only. Use Glob, Grep, and Read. You CANNOT use Write, Edit, or Bash for state-changing commands.
+    \\You are read-only. Use Glob, Grep, and Read for current code. When KgRecall and KgContext are listed under Allowed tools, use them if prior decisions, constraints, failures, or project terminology may materially affect the plan. You CANNOT use Write, Edit, or Bash for state-changing commands.
     \\
     \\Return findings that directly inform the plan: which files need changes, dependencies, risks. Be specific.
     \\
@@ -205,7 +205,7 @@ const GENERAL_PROMPT =
 
 fn injectBuiltins(set: *AgentSet) !void {
     try addBuiltin(set, "Explore", EXPLORE_DESC, EXPLORE_PROMPT, &.{ "Read", "Grep", "Glob", "Bash" }, &.{ "Write", "Edit" }, "haiku", .plan, 30, .blue);
-    try addBuiltin(set, "Plan", PLAN_DESC, PLAN_PROMPT, &.{ "Read", "Grep", "Glob" }, &.{ "Write", "Edit", "Bash" }, "inherit", .plan, 30, .purple);
+    try addBuiltin(set, "Plan", PLAN_DESC, PLAN_PROMPT, &.{ "Read", "Grep", "Glob", "KgRecall", "KgContext" }, &.{ "Write", "Edit", "Bash" }, "inherit", .plan, 30, .purple);
     try addBuiltin(set, "general-purpose", GENERAL_DESC, GENERAL_PROMPT, &.{}, &.{}, "inherit", null, 50, .green);
 }
 
@@ -272,6 +272,7 @@ fn makeBuiltin(
         .memory_scope = .none,
         .background = false,
         .effort = null,
+        .overrides = null,
         .isolation = .none,
         .color = color,
         .initial_prompt = initial_prompt_owned,
@@ -316,7 +317,17 @@ test "AgentSet: injectBuiltins gives Explore/Plan/general-purpose" {
     try testing.expect(set.find("Explore").?.color == .blue);
     try testing.expectEqualStrings("haiku", set.find("Explore").?.model);
     // Plan: 紫色
-    try testing.expect(set.find("Plan").?.color == .purple);
+    const plan = set.find("Plan").?;
+    try testing.expect(plan.color == .purple);
+    var saw_recall = false;
+    var saw_context = false;
+    for (plan.tools) |tool_name| {
+        if (std.mem.eql(u8, tool_name, "KgRecall")) saw_recall = true;
+        if (std.mem.eql(u8, tool_name, "KgContext")) saw_context = true;
+        try testing.expect(!std.mem.eql(u8, tool_name, "KgRemember"));
+    }
+    try testing.expect(saw_recall);
+    try testing.expect(saw_context);
     // general-purpose: 绿色,继承父全部工具(tools 空 + disallowed 空)
     try testing.expect(set.find("general-purpose").?.tools.len == 0);
 }

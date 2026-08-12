@@ -6,17 +6,57 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.eval.cli import main
 from scripts.eval.e2e_adapter import EVALUATION_CONTRACT_VERSION, grounding_fingerprints
+from scripts.eval.experiment import arm_config_ids, fixed_rollout_budget
 from scripts.eval.model import load_json, stable_json, write_rollouts
+from scripts.eval.promotion import build_promotion_receipt
 from scripts.eval.tests.test_analysis import rollout
+from scripts.eval.tests.multi_arm_fixture import write_multi_arm_checkpoints
 
 
 ROOT = Path(__file__).resolve().parents[3]
 
 
 class CliTest(unittest.TestCase):
+    def setUp(self):
+        # CLI contract tests use synthetic normalized rows. Raw-artifact
+        # attestation has its own real TinyKG test suite.
+        promotion_patcher = mock.patch(
+            "scripts.eval.promotion.reverify_treatment_activation"
+        )
+        self.promotion_activation = promotion_patcher.start()
+        self.addCleanup(promotion_patcher.stop)
+
+    def test_experiment_rejects_escaped_suite_before_reading_it(self):
+        experiment = load_json(
+            ROOT / "evals/experiments/long-horizon-three-arm-calibration-v2.json"
+        )
+        experiment["suite"] = "../outside-repository-suite.json"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "experiment.json"
+            path.write_text(json.dumps(experiment) + "\n", encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = main(
+                    [
+                        "validate-experiment",
+                        str(path),
+                        "--binary",
+                        "/not-read/metacodes",
+                        "--tinykg-binary",
+                        "/not-read/tinykg",
+                        "--formal-kernel",
+                        "/not-read/formal-kernel",
+                        "--revision",
+                        "not-read",
+                    ]
+                )
+        self.assertEqual(code, 2)
+        self.assertIn("suite escapes repository root", stderr.getvalue())
+
     def _production_gate_config(self, directory: Path, *, all_suites: bool = False) -> Path:
         config = load_json(ROOT / "evals/gates/default.json")
         if not all_suites:
@@ -108,6 +148,209 @@ class CliTest(unittest.TestCase):
             self.assertEqual(code, 0, output.getvalue())
 
             self.assertIn("[PASS] policy_violations", output.getvalue())
+
+    def test_report_multi_validates_frozen_three_arm_identity_and_writes_one_report(self):
+        experiment_path = (
+            ROOT / "evals/experiments/long-horizon-three-arm-confirmatory-v2.json"
+        )
+        suite_path = ROOT / "evals/suites/long-horizon-repository-pk.json"
+        experiment = load_json(experiment_path)
+        suite = load_json(suite_path)
+        fixed = fixed_rollout_budget(experiment["budget"], required=True)
+        assert fixed is not None
+        rollout_cost, rollout_tokens = fixed
+        config_ids = arm_config_ids(
+            experiment, suite, "a" * 64, "b" * 64, "c" * 64
+        )
+        model = experiment["model"]
+        model_fingerprint = hashlib.sha256(stable_json(model).encode("utf-8")).hexdigest()[:16]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            arm_paths = {}
+            for arm_id in config_ids:
+                rows = []
+                for trial in range(experiment["trials"]):
+                    for task in suite["tasks"]:
+                        identity = grounding_fingerprints(task, ROOT)
+                        item = copy.deepcopy(rollout(task["id"], True, config_ids[arm_id]))
+                        item["run_id"] = f"{arm_id}:{task['id']}:{trial}"
+                        item["suite_id"] = suite["suite_id"]
+                        item["task_fingerprint"] = identity["task_fingerprint"]
+                        item["trial"] = trial
+                        item["layers"] = task["layers"]
+                        item["model"] = {**model, "fingerprint": model_fingerprint}
+                        item["harness"].update(
+                            {
+                                "config_id": config_ids[arm_id],
+                                "revision": "same-revision",
+                                "fingerprint": f"{arm_id}:{task['id']}",
+                                "environment_fingerprint": identity["environment_fingerprint"],
+                                "permission_mode": identity["permission_mode"],
+                                "runtime_budget": {
+                                    "max_metered_tokens": rollout_tokens,
+                                    "max_cost_usd": rollout_cost,
+                                },
+                            }
+                        )
+                        item["evaluator"]["fingerprint"] = identity["grader_fingerprint"]
+                        rows.append(item)
+                path = root / f"{arm_id}.jsonl"
+                write_rollouts(path, rows)
+                arm_paths[arm_id] = path
+            markdown = root / "report.md"
+            result_json = root / "report.json"
+            receipt = root / "promotion.json"
+            calibration_experiment = load_json(
+                ROOT
+                / "evals/experiments/long-horizon-three-arm-calibration-v2.json"
+            )
+            calibration_suite = load_json(
+                ROOT / "evals/suites/long-horizon-calibration.json"
+            )
+            calibration_dir = root / "calibration"
+            tinykg_binary = root / "tinykg-verifier"
+            tinykg_binary.write_bytes(b"test-only-tinykg")
+            tinykg_binary.chmod(0o755)
+            calibration_paths = write_multi_arm_checkpoints(
+                calibration_dir,
+                calibration_experiment,
+                calibration_suite,
+                ROOT,
+                metacodes_sha256="a" * 64,
+                tinykg_sha256="b" * 64,
+                formal_kernel_fingerprint="c" * 64,
+                revision="same-revision",
+            )
+            receipt.write_text(
+                json.dumps(
+                    build_promotion_receipt(
+                        calibration_experiment,
+                        calibration_suite,
+                        ROOT,
+                        calibration_paths,
+                        tinykg_binary=tinykg_binary,
+                    ),
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            code = main(
+                [
+                    "report-multi",
+                    "--experiment",
+                    str(experiment_path),
+                    "--codex-style",
+                    str(arm_paths["codex_style"]),
+                    "--claude-style",
+                    str(arm_paths["claude_style"]),
+                    "--tinykg",
+                    str(arm_paths["tinykg"]),
+                    "--promotion-receipt",
+                    str(receipt),
+                    "--calibration-dir",
+                    str(calibration_dir),
+                    "--tinykg-binary",
+                    str(tinykg_binary),
+                    "--markdown",
+                    str(markdown),
+                    "--json",
+                    str(result_json),
+                ]
+            )
+            self.assertEqual(code, 0)
+            self.assertIn("三臂长程评估", markdown.read_text(encoding="utf-8"))
+            self.assertIn(
+                "Lean artifact fingerprint: `" + "c" * 64 + "`",
+                markdown.read_text(encoding="utf-8"),
+            )
+            result = load_json(result_json)
+            self.assertEqual(result["metacodes_sha256"], "a" * 64)
+            self.assertEqual(result["tinykg_sha256"], "b" * 64)
+            self.assertEqual(result["formal_kernel_fingerprint"], "c" * 64)
+            self.assertEqual(len(result["pairwise"]), 3)
+
+    def test_promote_multi_issues_identity_and_budget_bound_receipt(self):
+        experiment_path = (
+            ROOT / "evals/experiments/long-horizon-three-arm-calibration-v2.json"
+        )
+        suite_path = ROOT / "evals/suites/long-horizon-calibration.json"
+        experiment = load_json(experiment_path)
+        suite = load_json(suite_path)
+        fixed = fixed_rollout_budget(experiment["budget"], required=True)
+        assert fixed is not None
+        rollout_cost, rollout_tokens = fixed
+        config_ids = arm_config_ids(
+            experiment, suite, "e" * 64, "f" * 64, "d" * 64
+        )
+        model = experiment["model"]
+        model_fingerprint = hashlib.sha256(
+            stable_json(model).encode("utf-8")
+        ).hexdigest()[:16]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tinykg_binary = root / "tinykg-verifier"
+            tinykg_binary.write_bytes(b"test-only-tinykg")
+            tinykg_binary.chmod(0o755)
+            paths = {}
+            task = suite["tasks"][0]
+            identity = grounding_fingerprints(task, ROOT)
+            for arm_id, config_id in config_ids.items():
+                rows = []
+                for trial in range(6):
+                    item = copy.deepcopy(rollout(task["id"], True, config_id))
+                    item["run_id"] = f"{arm_id}:{task['id']}:{trial}"
+                    item["suite_id"] = suite["suite_id"]
+                    item["task_fingerprint"] = identity["task_fingerprint"]
+                    item["trial"] = trial
+                    item["layers"] = task["layers"]
+                    item["model"] = {**model, "fingerprint": model_fingerprint}
+                    item["harness"].update(
+                        {
+                            "config_id": config_id,
+                            "revision": "calibration-revision",
+                            "fingerprint": arm_id,
+                            "environment_fingerprint": identity["environment_fingerprint"],
+                            "permission_mode": identity["permission_mode"],
+                            "runtime_budget": {
+                                "max_metered_tokens": rollout_tokens,
+                                "max_cost_usd": rollout_cost,
+                            },
+                        }
+                    )
+                    item["evaluator"]["fingerprint"] = identity["grader_fingerprint"]
+                    rows.append(item)
+                path = root / f"{arm_id}.jsonl"
+                write_rollouts(path, rows)
+                paths[arm_id] = path
+            receipt_path = root / "promotion.json"
+            code = main(
+                [
+                    "promote-multi",
+                    "--experiment",
+                    str(experiment_path),
+                    "--codex-style",
+                    str(paths["codex_style"]),
+                    "--claude-style",
+                    str(paths["claude_style"]),
+                    "--tinykg",
+                    str(paths["tinykg"]),
+                    "--tinykg-binary",
+                    str(tinykg_binary),
+                    "--output",
+                    str(receipt_path),
+                ]
+            )
+            self.assertEqual(code, 0)
+            receipt = load_json(receipt_path)
+            self.assertTrue(receipt["eligible"])
+            self.assertEqual(receipt["gate"]["valid_rollouts"], 18)
+            self.assertEqual(receipt["identity"]["metacodes_sha256"], "e" * 64)
+            self.assertEqual(receipt["identity"]["tinykg_sha256"], "f" * 64)
+            self.assertEqual(
+                receipt["identity"]["formal_kernel_fingerprint"], "d" * 64
+            )
+            self.assertEqual(set(receipt["checkpoint_sha256"]), set(config_ids))
 
     def test_release_gate_rejects_incomplete_cherry_picked_rollouts(self):
         with tempfile.TemporaryDirectory() as directory:

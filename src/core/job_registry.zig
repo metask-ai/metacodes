@@ -121,7 +121,8 @@ pub const JobRegistry = struct {
 
     /// spawn 一个子进程跑 `/bin/sh -c command`，stdout/stderr 重定向到落盘文件。
     /// 立刻返回 job_id，不等待进程结束。
-    pub fn spawnBackground(self: *JobRegistry, command: []const u8) !JobEntry {
+    /// cwd 非 null → 子进程 chdir(borrow:spawn 时消费,不存 JobEntry——生命周期不匹配)。
+    pub fn spawnBackground(self: *JobRegistry, command: []const u8, cwd: ?[]const u8) !JobEntry {
         const id = try genId();
 
         const stdout_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.out", .{ self.base_dir, id[0..] });
@@ -131,10 +132,9 @@ pub const JobRegistry = struct {
 
         // 预创建空文件（0600）让 reader 能立刻打开
         const out_fd = createFile(stdout_path) orelse return error.OpenFailed;
-        const err_fd = createFile(stderr_path) orelse {
-            _ = pfs.close(out_fd);
-            return error.OpenFailed;
-        };
+        defer _ = pfs.close(out_fd);
+        const err_fd = createFile(stderr_path) orelse return error.OpenFailed;
+        defer _ = pfs.close(err_fd);
 
         // 走可移植 platform/process.spawnToFiles(POSIX fork+dup2 / Windows CreateProcessW NO_WINDOW
         // + _get_osfhandle 把落盘 fd 转 HANDLE)。可移植 shell(复刻 codex):POSIX /bin/sh -c;
@@ -144,14 +144,14 @@ pub const JobRegistry = struct {
         defer self.allocator.free(cmd_z);
         var argv: [6]?[*:0]const u8 = undefined;
         shell_mod.deriveExecArgs(shell, cmd_z.ptr, &argv);
-        const proc = process.spawnToFiles(argv[0..], out_fd, err_fd) catch {
-            _ = pfs.close(out_fd);
-            _ = pfs.close(err_fd);
-            return error.SpawnFailed;
-        };
-
-        _ = pfs.close(out_fd);
-        _ = pfs.close(err_fd);
+        const proc = process.spawnToFiles(argv[0..], out_fd, err_fd, cwd) catch return error.SpawnFailed;
+        // From this point until registerEntry succeeds, the child has no owner
+        // in jobs[]. OOM while allocating the preview/index must not leak a
+        // live background process.
+        errdefer {
+            process.killJob(proc);
+            process.reapBlocking(proc);
+        }
 
         const started_ms: util_time.Millis = util_time.nowMs();
 
@@ -167,21 +167,25 @@ pub const JobRegistry = struct {
             .command_preview = preview,
             .status = .running,
         };
-        // 结构变更持锁(并发 spawnBackground/get/reapExited 安全)。
-        self.lock();
-        self.jobs.append(self.allocator, entry) catch |e| {
-            self.unlock();
-            return e;
-        };
-        const new_idx = self.jobs.items.len - 1;
-        // key 是 [12]u8 值拷贝，不依赖 jobs buffer 生命周期
-        self.index.put(id, new_idx) catch |e| {
-            self.unlock();
-            return e;
-        };
-        self.unlock();
+        try self.registerEntry(entry);
         log.info("job", "bg spawn id={s} cmd={s}", .{ id[0..], preview });
         return entry; // 值拷贝(非指针),caller 用快照安全
+    }
+
+    /// Register an already-owned entry through the same append/index mutation
+    /// used by real background jobs. Keeping this as one operation makes the
+    /// ArrayList-reallocation invariant directly testable without spawning a
+    /// hundred OS processes merely to exercise a value-keyed map.
+    fn registerEntry(self: *JobRegistry, entry: JobEntry) !void {
+        self.lock();
+        defer self.unlock();
+        self.jobs.append(self.allocator, entry) catch |e| {
+            return e;
+        };
+        errdefer _ = self.jobs.pop();
+        const new_idx = self.jobs.items.len - 1;
+        // key 是 [12]u8 值拷贝，不依赖 jobs buffer 生命周期
+        try self.index.put(entry.id, new_idx);
     }
 
     /// 当前 running 状态的 job 数(statusline 显示用)。
@@ -272,7 +276,9 @@ pub const JobRegistry = struct {
         self.lock();
         defer self.unlock();
         var n: usize = 0;
-        for (self.jobs.items) |j| if (j.status == .running) { n += 1; };
+        for (self.jobs.items) |j| if (j.status == .running) {
+            n += 1;
+        };
         return n;
     }
 };
@@ -301,7 +307,7 @@ test "spawn and reap echo" {
     var r = try JobRegistry.init(a);
     defer r.deinit();
 
-    const j = try r.spawnBackground("echo hello; sleep 0.05");
+    const j = try r.spawnBackground("echo hello; sleep 0.05", null);
     try std.testing.expect(j.status == .running);
 
     // Windows PowerShell cold start is not bounded by the old fixed 200 ms
@@ -334,7 +340,7 @@ test "kill running job" {
     var r = try JobRegistry.init(a);
     defer r.deinit();
 
-    const j = try r.spawnBackground("sleep 30");
+    const j = try r.spawnBackground("sleep 30", null);
     try std.testing.expect(j.status == .running);
     try r.kill(j.idSlice());
     const j2 = r.get(j.idSlice()).?;
@@ -346,8 +352,8 @@ test "activeCount" {
     var r = try JobRegistry.init(a);
     defer r.deinit();
 
-    const j1 = try r.spawnBackground("sleep 2");
-    const j2 = try r.spawnBackground("sleep 2");
+    const j1 = try r.spawnBackground("sleep 2", null);
+    const j2 = try r.spawnBackground("sleep 2", null);
     _ = j1;
     _ = j2;
     try std.testing.expect(r.activeCount() == 2);
@@ -356,7 +362,7 @@ test "activeCount" {
     try std.testing.expect(r.activeCount() == 0);
 }
 
-test "get returns correct entry across many spawns" {
+test "get returns correct entry across many registrations" {
     // 不变量：无论 registry append 了多少次（触发 ArrayList grow），
     // 用保存的 id 查回来的 entry 必须和保存时的 id 一致。
     //
@@ -364,7 +370,9 @@ test "get returns correct entry across many spawns" {
     // ArrayList grow 后老 slice key 悬挂，get 读到错的 index，&jobs.items[idx] 越界。
     // （已亲手把 fix 回退验证过，crash。）
     //
-    // 100 次 trivial job 足以触发 6-7 轮 ArrayList grow（empty → 1 → 2 → 4 → 8 → 16 → 32 → 64 → 128）。
+    // 100 次 registration 足以触发 6-7 轮 ArrayList grow（empty → 1 → 2 → 4 → 8 → 16 → 32 → 64 → 128）。
+    // spawnBackground 的真实进程/重定向路径由前面的 spawn-and-reap 测试覆盖；本测试只验证
+    // registerEntry 的容器不变量，避免 100 个 shell 启动把一个内存安全回归测成 20 秒。
     const a = std.testing.allocator;
     var r = try JobRegistry.init(a);
     defer r.deinit();
@@ -373,8 +381,23 @@ test "get returns correct entry across many spawns" {
     var saved_ids: [N][12]u8 = undefined;
     var i: usize = 0;
     while (i < N) : (i += 1) {
-        const j = try r.spawnBackground("true");
-        saved_ids[i] = j.id;
+        _ = try std.fmt.bufPrint(&saved_ids[i], "{x:0>12}", .{i});
+        const stdout_path = try a.dupe(u8, "synthetic.out");
+        errdefer a.free(stdout_path);
+        const stderr_path = try a.dupe(u8, "synthetic.err");
+        errdefer a.free(stderr_path);
+        const preview = try a.dupe(u8, "synthetic registration");
+        errdefer a.free(preview);
+        try r.registerEntry(.{
+            .id = saved_ids[i],
+            .proc = undefined, // status=.exited: lifecycle code never observes this handle
+            .started_ms = util_time.nowMs(),
+            .stdout_path = stdout_path,
+            .stderr_path = stderr_path,
+            .command_preview = preview,
+            .status = .exited,
+            .exit_code = 0,
+        });
     }
 
     // 反向查所有保存的 id，断言内容一致

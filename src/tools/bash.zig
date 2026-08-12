@@ -50,6 +50,42 @@ fn truncateHead(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     return try out.toOwnedSlice();
 }
 
+fn sha256Hex(bytes: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+/// Format the model-visible bounded preview while retaining a commitment to
+/// the captured bytes before the 30KB display truncation. The zero-gain
+/// breaker hashes this whole JSON result, so two commands whose warnings share
+/// the same 30KB head but whose diagnostics differ later no longer collide.
+fn formatCompletedOutput(
+    allocator: std.mem.Allocator,
+    stdout: []const u8,
+    stderr: []const u8,
+    exit_code: i32,
+) ![]u8 {
+    const stdout_hash = sha256Hex(stdout);
+    const stderr_hash = sha256Hex(stderr);
+    const out_trunc = try truncateHead(allocator, stdout);
+    defer allocator.free(out_trunc);
+    const err_trunc = try truncateHead(allocator, stderr);
+    defer allocator.free(err_trunc);
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try aw.writer.writeAll("{\"stdout\":");
+    try std.json.Stringify.encodeJsonString(out_trunc, .{}, &aw.writer);
+    try aw.writer.writeAll(",\"stderr\":");
+    try std.json.Stringify.encodeJsonString(err_trunc, .{}, &aw.writer);
+    try aw.writer.print(
+        ",\"exit_code\":{d},\"stdout_original_bytes\":{d},\"stderr_original_bytes\":{d},\"stdout_sha256\":\"{s}\",\"stderr_sha256\":\"{s}\"}}",
+        .{ exit_code, stdout.len, stderr.len, stdout_hash[0..], stderr_hash[0..] },
+    );
+    return try aw.toOwnedSlice();
+}
+
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
     const command_escaped = common.extractJsonArg(args, "command") orelse return error.MissingCommand;
@@ -61,6 +97,16 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer allocator.free(raw_command);
     if (raw_command.len == 0) return error.EmptyCommand;
     try security.validateBashCommand(raw_command);
+
+    // A governed Run owns one synchronous observation/formal-decision
+    // lifetime.  A background command would return a successful tool result
+    // while its real effects continue after the post gate and Run terminal
+    // receipt, so reject the explicit detached path before any process is
+    // created.  The foreground path below also bypasses JobRegistry while a
+    // project gate is active, preventing the 15-second auto-background path.
+    if (ctx.project_rule_gate != null and
+        (util_json.extractBoolField(args, "run_in_background") orelse false))
+        return error.ProjectRulesRequireSynchronousExecution;
 
     // description 仅作日志用途，本期透传但不输出
     _ = common.extractJsonArg(args, "description");
@@ -106,10 +152,9 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             if (ctx.jobs) |registry| {
                 // 后台:profile 文件不能删(进程还在跑),detach
                 if (sandbox_wrap) |*sw| sw.detached = true;
-                const j = try registry.spawnBackground(command);
-                return try std.fmt.allocPrint(allocator,
-                    "{{\"job_id\":\"{s}\",\"status\":\"started\",\"stdout_path\":\"{s}\",\"stderr_path\":\"{s}\"}}",
-                    .{ j.id[0..], j.stdout_path, j.stderr_path });
+                const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
+                const j = try registry.spawnBackground(command, cwd_opt);
+                return try std.fmt.allocPrint(allocator, "{{\"job_id\":\"{s}\",\"status\":\"started\",\"stdout_path\":\"{s}\",\"stderr_path\":\"{s}\"}}", .{ j.id[0..], j.stdout_path, j.stderr_path });
             }
         }
     }
@@ -130,11 +175,14 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     //   - 进程已退出 → 读 stdout/stderr 文件返回
     //   - 未退出 + 达到 AUTO_BACKGROUND_MS & ctx.jobs 可用 → 返回 {auto_backgrounded, job_id}
     //   - 未退出 + 达到用户 timeout → kill + error.Timeout
-    if (ctx.jobs) |registry| {
-        // 走 job_registry:命令可能自动转后台,届时 profile 文件不能删 → detach。
-        // 代价:即便命令同步完成,profile 也泄漏到 TMPDIR(系统/重启清理),换取正确性。
-        if (sandbox_wrap) |*sw| sw.detached = true;
-        return try runAutoBackgroundable(allocator, registry, command, timeout_ms, ctx.abort);
+    if (ctx.project_rule_gate == null) {
+        if (ctx.jobs) |registry| {
+            // 走 job_registry:命令可能自动转后台,届时 profile 文件不能删 → detach。
+            // 代价:即便命令同步完成,profile 也泄漏到 TMPDIR(系统/重启清理),换取正确性。
+            if (sandbox_wrap) |*sw| sw.detached = true;
+            const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
+            return try runAutoBackgroundable(allocator, registry, command, timeout_ms, ctx.abort, cwd_opt);
+        }
     }
 
     // 可移植 shell(复刻 codex):POSIX /bin/sh -c;Windows 原生 PowerShell/cmd,零 git-bash。
@@ -144,24 +192,13 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer allocator.free(cmd_z);
     var argv: [6]?[*:0]const u8 = undefined;
     shell_mod.deriveExecArgs(shell, cmd_z.ptr, &argv);
-    const out = try common.spawnCaptureWithStderrTimed(argv[0..], allocator, ctx.abort, timeout_ms, ctx.spawn_tick_fn, common.MAX_SPAWN_CAPTURE_BYTES);
+    const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
+    const out = try common.spawnCaptureWithStderrTimed(argv[0..], allocator, ctx.abort, timeout_ms, ctx.spawn_tick_fn, common.MAX_SPAWN_CAPTURE_BYTES, cwd_opt);
     defer allocator.free(out.stdout);
     defer allocator.free(out.stderr);
 
     // 截断到 MAX_OUTPUT_BYTES(保留头部),防大输出撑爆上下文。
-    const out_trunc = try truncateHead(allocator, out.stdout);
-    defer allocator.free(out_trunc);
-    const err_trunc = try truncateHead(allocator, out.stderr);
-    defer allocator.free(err_trunc);
-
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    try aw.writer.writeAll("{\"stdout\":");
-    try std.json.Stringify.encodeJsonString(out_trunc, .{}, &aw.writer);
-    try aw.writer.writeAll(",\"stderr\":");
-    try std.json.Stringify.encodeJsonString(err_trunc, .{}, &aw.writer);
-    try aw.writer.print(",\"exit_code\":{d}}}", .{out.exit_code});
-    return try aw.toOwnedSlice();
+    return try formatCompletedOutput(allocator, out.stdout, out.stderr, out.exit_code);
 }
 
 /// 新路径：总是 spawn 到 job_registry（stdout/stderr 落盘），父端轮询等待。
@@ -174,8 +211,9 @@ fn runAutoBackgroundable(
     command: []const u8,
     timeout_ms: u64,
     abort: ?*const @import("../util/abort.zig").AbortSignal,
+    cwd: ?[]const u8,
 ) ![]u8 {
-    const j_entry = try registry.spawnBackground(command);
+    const j_entry = try registry.spawnBackground(command, cwd);
     const job_id = j_entry.id; // 值拷贝，不持指针（registry 可能扩容移动）
 
     const effective_budget = @min(timeout_ms, AUTO_BACKGROUND_MS);
@@ -214,19 +252,7 @@ fn readJobAsSync(allocator: std.mem.Allocator, j: *const @import("../core/job_re
     const err_bytes = readWholeFile(j.stderr_path, allocator, common.MAX_SPAWN_CAPTURE_BYTES) catch try allocator.dupe(u8, "");
     defer allocator.free(err_bytes);
 
-    const out_trunc = try truncateHead(allocator, out_bytes);
-    defer allocator.free(out_trunc);
-    const err_trunc = try truncateHead(allocator, err_bytes);
-    defer allocator.free(err_trunc);
-
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    try aw.writer.writeAll("{\"stdout\":");
-    try std.json.Stringify.encodeJsonString(out_trunc, .{}, &aw.writer);
-    try aw.writer.writeAll(",\"stderr\":");
-    try std.json.Stringify.encodeJsonString(err_trunc, .{}, &aw.writer);
-    try aw.writer.print(",\"exit_code\":{d}}}", .{j.exit_code orelse 0});
-    return try aw.toOwnedSlice();
+    return try formatCompletedOutput(allocator, out_bytes, err_bytes, j.exit_code orelse 0);
 }
 
 fn formatAutoBackgrounded(allocator: std.mem.Allocator, j: *const @import("../core/job_registry.zig").JobEntry) ![]u8 {
@@ -244,11 +270,15 @@ fn formatAutoBackgrounded(allocator: std.mem.Allocator, j: *const @import("../co
     defer aw.deinit();
     try aw.writer.writeAll("{\"auto_backgrounded\":true,\"job_id\":");
     try std.json.Stringify.encodeJsonString(j.id[0..], .{}, &aw.writer);
+    try aw.writer.writeAll(",\"stdout_path\":");
+    try std.json.Stringify.encodeJsonString(j.stdout_path, .{}, &aw.writer);
+    try aw.writer.writeAll(",\"stderr_path\":");
+    try std.json.Stringify.encodeJsonString(j.stderr_path, .{}, &aw.writer);
     try aw.writer.writeAll(",\"partial_stdout\":");
     try std.json.Stringify.encodeJsonString(out_trunc, .{}, &aw.writer);
     try aw.writer.writeAll(",\"partial_stderr\":");
     try std.json.Stringify.encodeJsonString(err_trunc, .{}, &aw.writer);
-    try aw.writer.writeAll(",\"note\":\"Command exceeded 15s; moved to background. Use BashOutput to poll or KillShell to terminate.\"}");
+    try aw.writer.writeAll(",\"note\":\"Command exceeded 15s; moved to background. Use BashOutput to poll, or Read on stdout_path/stderr_path to read captured output directly.\"}");
     return try aw.toOwnedSlice();
 }
 
@@ -357,6 +387,25 @@ test "BashTool auto-backgrounds after 15s" {
     }
 }
 
+test "formatAutoBackgrounded 返回 stdout_path/stderr_path 供 Read 直接读" {
+    // 对齐 cc: auto-backgrounded 响应必须含 stdout_path/stderr_path,
+    // 否则模型被迫 BashOutput 轮询,长任务时陷入"轮询无果"死循环。
+    const a = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer registry.deinit();
+    const j = try registry.spawnBackground("echo hi; sleep 30", null);
+    defer registry.kill(j.idSlice()) catch {};
+    const result = try formatAutoBackgrounded(a, &j);
+    defer a.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"auto_backgrounded\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"job_id\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"stdout_path\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"stderr_path\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "partial_stdout") != null);
+    // note 应引导模型用 Read 读 path
+    try std.testing.expect(std.mem.indexOf(u8, result, "Read on stdout_path") != null);
+}
+
 test "truncateHead: 小输出原样,大输出截断 + 标记" {
     const a = std.testing.allocator;
     // 小输出不截。
@@ -390,5 +439,3 @@ test "BashTool 大输出被截断(防撑爆上下文)" {
     // 整个返回 JSON 不该是完整 100000 行(粗略:远小于 ~600KB)。
     try std.testing.expect(r.len < 60_000);
 }
-
-

@@ -21,6 +21,7 @@ const agent_tool = @import("../tools/agent.zig");
 const subagent = @import("../core/subagent.zig");
 const preload = @import("../agents/preload.zig");
 const agent_loop = @import("../core/agent_loop.zig");
+const project_activation = @import("../core/project_rule_activation.zig");
 const writer_backend = @import("../core/writer_backend.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -634,6 +635,25 @@ pub fn handleSlash(
     };
     const ui_backend = backend.backend();
     const jobs = if (app.jobs) |*registry| registry else null;
+    const run_control: ?*project_activation.RunControl = if (app.sessionDir()) |dir|
+        try project_activation.RunControl.init(
+            allocator,
+            dir,
+            app.session_id,
+            if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
+            &app.abort,
+        )
+    else
+        null;
+    defer if (run_control) |control| control.deinit();
+    if (run_control) |control| control.requireDetachedIdle(
+        (if (app.jobs) |*registry| registry.runningCount() else 0) +|
+            (if (app.agent_jobs) |*registry| registry.runningCount() else 0),
+        app.swarm.hasTeam(),
+    ) catch |err| {
+        try control.finishRun(@errorName(err));
+        return err;
+    };
     const result = agent_loop.run(
         &app.conversation,
         app.provider(),
@@ -660,6 +680,8 @@ pub fn handleSlash(
             .model_switch_compact = app.pendingModelSwitchCompact(),
             .dyn_registry = &app.dyn_registry,
             .host_services = app.hostServices(),
+            .tool_observer = if (run_control) |control| control.observer() else null,
+            .project_rule_gate = if (run_control) |control| control.formalGate() else null,
             .project_dir = app.project_dir_or_empty(),
             .sandbox = app.sandboxPtr(),
             .cwd_abs = app.cwdAbs(),
@@ -671,10 +693,12 @@ pub fn handleSlash(
         &ui_backend,
         allocator,
     ) catch |err| {
+        if (run_control) |control| try control.finishRun(@errorName(err));
         std.debug.print("\x1b[31mError after /{s}: {s}\x1b[0m\n", .{ head, @errorName(err) });
         app.clearPendingModelSwitchCompact();
         return .handled;
     };
+    if (run_control) |control| try control.finishRun(@tagName(result.stop_reason));
     app.clearPendingModelSwitchCompact();
     app.persistTranscript();
     if (result.stop_reason == .aborted) app.abort.resetForTesting();

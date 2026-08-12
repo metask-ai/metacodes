@@ -31,7 +31,7 @@ pub const StdioTransport = struct {
     /// spawn 子进程。argv 以 null 结尾，argv[0] 是绝对路径或在 PATH 内。
     /// 走可移植 platform/process.spawnPipes（POSIX fork+pipe / Windows CreateProcessW+CreatePipe）。
     pub fn spawn(allocator: std.mem.Allocator, argv: []const ?[*:0]const u8) !StdioTransport {
-        const child = process.spawnPipes(argv, false) catch return error.SpawnFailed;
+        const child = process.spawnPipes(argv, false, null) catch return error.SpawnFailed;
         return .{
             .child = child,
             .read_buf = .empty,

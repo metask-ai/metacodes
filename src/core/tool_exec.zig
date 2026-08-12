@@ -15,8 +15,12 @@ const std = @import("std");
 const platform = @import("platform");
 const tools_mod = @import("../tools.zig");
 const ToolContext = tools_mod.ToolContext;
+const tool_observation = @import("../tools/observation.zig");
 const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
+const pfs = platform.fs;
+const project_gate_protocol = @import("../tools/project_rule_gate.zig");
+const project_rule_signal = @import("../tools/project_rule_signal.zig");
 
 /// 给任意 allocator 加互斥视图。ArenaAllocator 只隔离自己的链表元数据，它增长时仍会
 /// 调后备 allocator；多个 worker 直接以同一个 session arena 为后备会破坏 arena 状态。
@@ -133,6 +137,268 @@ pub const OneResult = union(enum) {
     host_fatal,
 };
 
+fn emitDispatchStarted(
+    ctx: *const ToolContext,
+    id: []const u8,
+    requested_name: []const u8,
+    dispatched_name: []const u8,
+    input: []const u8,
+    file_target_state: tool_observation.FileTargetState,
+) bool {
+    const sink = ctx.tool_observer orelse return true;
+    return sink.emit(.{ .dispatch_started = .{
+        .id = id,
+        .requested_name = requested_name,
+        .dispatched_name = dispatched_name,
+        .origin = ctx.tool_observation_origin,
+        .agent_depth = ctx.agent_depth,
+        .input_bytes = input.len,
+        .input_sha256 = tool_observation.sha256Hex(input),
+        .file_target_state = file_target_state,
+    } });
+}
+
+fn emitDispatchFinished(
+    ctx: *const ToolContext,
+    id: []const u8,
+    requested_name: []const u8,
+    dispatched_name: []const u8,
+    outcome: tool_observation.Outcome,
+    error_code: ?[]const u8,
+    elapsed_ms: u64,
+    result: ?[]const u8,
+    effect_slot: tool_observation.EffectSlot,
+) bool {
+    const sink = ctx.tool_observer orelse return true;
+    return sink.emit(.{ .dispatch_finished = .{
+        .id = id,
+        .requested_name = requested_name,
+        .dispatched_name = dispatched_name,
+        .origin = ctx.tool_observation_origin,
+        .agent_depth = ctx.agent_depth,
+        .outcome = outcome,
+        .error_code = error_code,
+        .elapsed_ms = elapsed_ms,
+        .result_present = result != null,
+        .result_bytes = if (result) |bytes| bytes.len else 0,
+        .result_sha256 = if (result) |bytes|
+            tool_observation.sha256Hex(bytes)
+        else
+            [_]u8{'0'} ** 64,
+        .effect = effect_slot.effect,
+        .effect_valid = effect_slot.valid,
+    } });
+}
+
+/// Keeps the actual-dispatch observation pair structurally closed. Explicit
+/// terminal outcomes still carry the useful code/result; the defer is a final
+/// defense against a future early-return branch silently losing its finish.
+const DispatchObservation = struct {
+    ctx: *const ToolContext,
+    id: []const u8,
+    requested_name: []const u8,
+    dispatched_name: []const u8,
+    started_at_ms: i64,
+    effect_slot: *tool_observation.EffectSlot,
+    started: bool = false,
+    terminal_attempted: bool = false,
+    input_bytes: usize = 0,
+    file_target_state: @import("project_rule_spec.zig").FileTargetState = .unobserved,
+    project_pre_signal: ?project_gate_protocol.PreSignal = null,
+
+    fn start(self: *DispatchObservation, input: []const u8) bool {
+        if (!emitDispatchStarted(
+            self.ctx,
+            self.id,
+            self.requested_name,
+            self.dispatched_name,
+            input,
+            self.file_target_state,
+        )) return false;
+        self.input_bytes = input.len;
+        self.started = true;
+        return true;
+    }
+
+    fn finish(
+        self: *DispatchObservation,
+        outcome: tool_observation.Outcome,
+        error_code: ?[]const u8,
+        result: ?[]const u8,
+    ) bool {
+        // This protocol protects production evidence, so duplicate/unstarted
+        // terminal attempts must fail closed in Release builds too; a Debug
+        // assertion alone would compile the guard away.
+        if (!self.started or self.terminal_attempted) return false;
+        self.terminal_attempted = true;
+        reobserveFileEffect(self.effect_slot);
+        const elapsed: u64 = @intCast(@max(util_time.nowMs() - self.started_at_ms, 0));
+        const formal = if (self.ctx.project_rule_gate) |gate| gate.post(.{
+            .pre = self.project_pre_signal orelse return false,
+            .outcome = outcome,
+            .effect = self.effect_slot.effect,
+            .effect_valid = self.effect_slot.valid,
+        }) else project_gate_protocol.Result.admit;
+        // Formal admission precedes terminal acceptance, but the already-real
+        // outcome must still be durably recorded even when the gate blocks or
+        // faults.  This ordering prevents an observation sink from treating a
+        // side effect as accepted before the fixed kernel has judged it while
+        // preserving the evidence needed for recovery and a future candidate.
+        const observed = emitDispatchFinished(
+            self.ctx,
+            self.id,
+            self.requested_name,
+            self.dispatched_name,
+            outcome,
+            error_code,
+            elapsed,
+            result,
+            self.effect_slot.*,
+        );
+        return observed and formal == .admit;
+    }
+
+    fn ensureTerminal(self: *DispatchObservation) void {
+        if (!self.started or self.terminal_attempted) return;
+        _ = self.finish(.host_fatal, "DispatchObservationUnwound", null);
+    }
+};
+
+fn reobserveFileEffect(slot: *tool_observation.EffectSlot) void {
+    const effect = slot.effect orelse return;
+    const mutation = switch (effect) {
+        .file_mutation_v1 => |value| value,
+        .file_mutation_v2 => return,
+    };
+    const unavailable = tool_observation.FileReobservationV1{
+        .state = .unavailable,
+        .observed_sha256 = [_]u8{'0'} ** 64,
+        .observed_bytes = 0,
+    };
+    const path = slot.filePath() orelse {
+        slot.effect = .{ .file_mutation_v2 = .{
+            .mutation = mutation,
+            .reobservation = unavailable,
+        } };
+        return;
+    };
+    var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= path_buf.len) {
+        slot.effect = .{ .file_mutation_v2 = .{ .mutation = mutation, .reobservation = unavailable } };
+        return;
+    }
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    const fd = pfs.open(@ptrCast(&path_buf), .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (fd < 0) {
+        slot.effect = .{ .file_mutation_v2 = .{ .mutation = mutation, .reobservation = unavailable } };
+        return;
+    }
+    defer _ = pfs.close(fd);
+    const before = pfs.fileInfo(fd) catch {
+        slot.effect = .{ .file_mutation_v2 = .{ .mutation = mutation, .reobservation = unavailable } };
+        return;
+    };
+    if (!before.is_regular or before.size > std.math.maxInt(usize)) {
+        slot.effect = .{ .file_mutation_v2 = .{ .mutation = mutation, .reobservation = unavailable } };
+        return;
+    }
+    const observed_bytes: usize = @intCast(before.size);
+    if (observed_bytes != mutation.after_bytes) {
+        slot.effect = .{ .file_mutation_v2 = .{
+            .mutation = mutation,
+            .reobservation = .{
+                .state = .mismatched,
+                .observed_sha256 = [_]u8{'0'} ** 64,
+                .observed_bytes = observed_bytes,
+            },
+        } };
+        return;
+    }
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var total: usize = 0;
+    while (true) {
+        const count = pfs.read(fd, &buffer);
+        if (count < 0) {
+            slot.effect = .{ .file_mutation_v2 = .{ .mutation = mutation, .reobservation = unavailable } };
+            return;
+        }
+        if (count == 0) break;
+        const n: usize = @intCast(count);
+        total += n;
+        if (total > observed_bytes) {
+            slot.effect = .{ .file_mutation_v2 = .{ .mutation = mutation, .reobservation = unavailable } };
+            return;
+        }
+        hasher.update(buffer[0..n]);
+    }
+    const after = pfs.fileInfo(fd) catch {
+        slot.effect = .{ .file_mutation_v2 = .{ .mutation = mutation, .reobservation = unavailable } };
+        return;
+    };
+    if (!after.is_regular or after.size != before.size or total != observed_bytes) {
+        slot.effect = .{ .file_mutation_v2 = .{ .mutation = mutation, .reobservation = unavailable } };
+        return;
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    const observed_sha256 = std.fmt.bytesToHex(digest, .lower);
+    slot.effect = .{ .file_mutation_v2 = .{
+        .mutation = mutation,
+        .reobservation = .{
+            .state = if (std.mem.eql(u8, &observed_sha256, &mutation.after_sha256)) .matched else .mismatched,
+            .observed_sha256 = observed_sha256,
+            .observed_bytes = observed_bytes,
+        },
+    } };
+}
+
+const ObservationCapture = struct {
+    mutex: platform.sync.Mutex = .{},
+    starts: usize = 0,
+    finishes: usize = 0,
+    depth: u8 = 0,
+    origin: tool_observation.Origin = .authoritative,
+    outcome: tool_observation.Outcome = .tool_error,
+    effect: ?tool_observation.Effect = null,
+    effect_valid: bool = false,
+    accept_start: bool = true,
+    accept_finish: bool = true,
+    saw_name_repair: bool = false,
+    dispatched_as_write: bool = false,
+
+    fn sink(self: *ObservationCapture) tools_mod.ToolObservationSink {
+        return .{ .ctx = @ptrCast(self), .emitFn = emit };
+    }
+
+    fn emit(raw: *anyopaque, event: tool_observation.Event) bool {
+        const self: *ObservationCapture = @ptrCast(@alignCast(raw));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        switch (event) {
+            .formal_decision, .formal_decision_batch => return true,
+            .dispatch_started => |started| {
+                self.starts += 1;
+                self.depth = started.agent_depth;
+                self.origin = started.origin;
+                self.saw_name_repair = !std.mem.eql(u8, started.requested_name, started.dispatched_name);
+                self.dispatched_as_write = std.mem.eql(u8, started.dispatched_name, "Write");
+                return self.accept_start;
+            },
+            .dispatch_finished => |finished| {
+                self.finishes += 1;
+                self.depth = finished.agent_depth;
+                self.origin = finished.origin;
+                self.outcome = finished.outcome;
+                self.effect = finished.effect;
+                self.effect_valid = finished.effect_valid;
+                return self.accept_finish;
+            },
+        }
+    }
+};
+
 /// **单一工具执行入口**——executeSlots(串行/并发批)与 stream_prefetch(边流边执行)共用,
 /// 保证两条路径的执行语义/错误处理**完全一致**(消除历史"行为分叉":富错误 detail、UnknownTool
 /// 引导、大结果落盘、UiPending 控制信号、计时)。每次自建 arena 规避 GPA 并发;结果 dupe 逃逸。
@@ -158,6 +424,24 @@ pub fn executeOne(
     // L3 挂起槽:工具发起 custom UI 拿到 .pending → 写 {kind,payload} 进这里 + 返 error.UiPending。
     var pending_req: ?tools_mod.PendingRequest = null;
     job_ctx.pending_request = &pending_req;
+    var effect_slot = tool_observation.EffectSlot{};
+    job_ctx.effect_slot = &effect_slot;
+    // Built-in/dynamic dispatch performs deterministic name normalization;
+    // host Session dispatch deliberately receives the exact advertised name.
+    // Preserve both so evidence never attributes a repaired call to the model.
+    var dispatched_name = if (job_ctx.tool_dispatcher != null)
+        name
+    else
+        tools_mod.resolveToolNameExact(&job_ctx, name) orelse name;
+    var dispatch_input = input;
+    var dispatch_observation = DispatchObservation{
+        .ctx = &job_ctx,
+        .id = id,
+        .requested_name = name,
+        .dispatched_name = dispatched_name,
+        .started_at_ms = t_start,
+        .effect_slot = &effect_slot,
+    };
 
     log.infoId("agent", rid, "tool.exec start(par) name={s} id={s}", .{ name, id });
     if (job_ctx.execution_policy) |policy| {
@@ -182,11 +466,184 @@ pub fn executeOne(
             } };
         }
     }
-    const r = tools_mod.dispatch(&job_ctx, name, input) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
+    // Auto source-CAS lowering must not turn a malformed model-authored Write
+    // into a well-typed host-authored Edit.  The ordinary dispatcher performs
+    // these same checks, but lowering happens before it.  Validate every
+    // native built-in Write at this boundary so signal-only and governed Runs
+    // retain identical schema-first semantics. An embedding Session owns its
+    // advertised schema. No formal obligation or dispatch-start evidence is
+    // emitted for an input that never reached a valid dispatcher invocation.
+    if (job_ctx.tool_dispatcher == null and
+        std.mem.eql(u8, dispatched_name, "Write"))
+    {
+        tools_mod.validateRequired("Write", input) catch |err|
+            return invalidNativeWriteArgsResult(
+                name,
+                err,
+                parent_allocator,
+                t_start,
+                rid,
+            );
+        tools_mod.validateTypes("Write", input) catch |err|
+            return invalidNativeWriteArgsResult(
+                name,
+                err,
+                parent_allocator,
+                t_start,
+                rid,
+            );
+    }
+    // Observe once for both signal-only and formally governed Runs.  If this
+    // were conditional on an active rule, the treatment arm would receive a
+    // different sensor and the causal experiment could not separate sensing
+    // from actuation.
+    var project_pre_signal: ?project_gate_protocol.PreSignal = null;
+    if (job_ctx.project_rule_gate != null or job_ctx.tool_observer != null) {
+        project_pre_signal = project_rule_signal.observePre(
+            &job_ctx,
+            id,
+            dispatched_name,
+            input,
+        );
+        dispatch_observation.file_target_state = project_pre_signal.?.file_target_state;
+        dispatch_observation.project_pre_signal = project_pre_signal.?;
+    }
+    if (job_ctx.project_rule_gate) |gate| {
+        switch (gate.pre(project_pre_signal.?)) {
+            .admit => {
+                if (std.mem.eql(u8, dispatched_name, "Write") and
+                    project_pre_signal.?.file_target_state == .missing)
+                    job_ctx.project_write_exclusive_create = true;
+            },
+            .admit_exact_edit => {
+                // This tag is an authority-bearing native execution mode,
+                // not a generic "yes".  A buggy/malicious gate must not use
+                // it to reroute another tool through Edit.
+                if (!std.mem.eql(u8, dispatched_name, "Edit")) {
+                    _ = gate.cancelPre(project_pre_signal.?);
+                    log.warnId("agent", rid, "project formal gate returned exact-edit admission for non-Edit name={s} id={s}", .{ name, id });
+                    return .host_fatal;
+                }
+                job_ctx.project_edit_mode = .whole_file_exact;
+            },
+            .synthesize_exact_edit => {
+                // The first Lean decision selected a bounded repair for this
+                // exact Write.  Construct the corresponding Edit from real
+                // source bytes plus the original proposal, then require a
+                // second Lean admission before exposing any dispatch event.
+                if (!std.mem.eql(u8, dispatched_name, "Write")) {
+                    log.warnId("agent", rid, "project formal gate requested exact-Edit synthesis for non-Write name={s} id={s}", .{ name, id });
+                    return .host_fatal;
+                }
+                const exact_input = project_rule_signal.synthesizeExactEditInput(
+                    &job_ctx,
+                    input,
+                ) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
+                    log.warnId("agent", rid, "project exact-Edit synthesis failed closed name={s} id={s} err={s}", .{ name, id, @errorName(err) });
+                    const denied = @import("tool_error.zig").projectRuleExactEditBlockedJson(
+                        dispatched_name,
+                        parent_allocator,
+                    ) catch return error.OutOfMemory;
+                    return .{ .done = .{
+                        .content = denied,
+                        .is_error = true,
+                        .elapsed_ms = elapsed,
+                    } };
+                };
+                dispatch_input = exact_input;
+                dispatched_name = "Edit";
+                const exact_signal = project_rule_signal.observePre(
+                    &job_ctx,
+                    id,
+                    dispatched_name,
+                    dispatch_input,
+                );
+                switch (gate.pre(exact_signal)) {
+                    .admit_exact_edit => job_ctx.project_edit_mode = .whole_file_exact,
+                    .block => |recovery_action| {
+                        const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
+                        const tool_error = @import("tool_error.zig");
+                        const denied = switch (recovery_action) {
+                            .none => tool_error.errorToJson(
+                                "ProjectRuleBlocked",
+                                "Project formal rule blocked synthesized tool '{s}' before dispatch",
+                                .{dispatched_name},
+                                parent_allocator,
+                            ),
+                            .edit_existing_file_exact => tool_error.projectRuleExactEditBlockedJson(
+                                dispatched_name,
+                                parent_allocator,
+                            ),
+                        } catch return error.OutOfMemory;
+                        return .{ .done = .{
+                            .content = denied,
+                            .is_error = true,
+                            .elapsed_ms = elapsed,
+                        } };
+                    },
+                    .admit, .synthesize_exact_edit, .fault => {
+                        log.warnId("agent", rid, "project synthesized exact Edit lacked recovery admission name={s} id={s}", .{ name, id });
+                        return .host_fatal;
+                    },
+                }
+                project_pre_signal = exact_signal;
+                dispatch_observation.dispatched_name = dispatched_name;
+                dispatch_observation.file_target_state = exact_signal.file_target_state;
+                dispatch_observation.project_pre_signal = exact_signal;
+            },
+            .block => |recovery_action| {
+                const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
+                const tool_error = @import("tool_error.zig");
+                const denied = switch (recovery_action) {
+                    .none => tool_error.errorToJson(
+                        "ProjectRuleBlocked",
+                        "Project formal rule blocked tool '{s}' before dispatch",
+                        .{dispatched_name},
+                        parent_allocator,
+                    ),
+                    .edit_existing_file_exact => tool_error.projectRuleExactEditBlockedJson(
+                        dispatched_name,
+                        parent_allocator,
+                    ),
+                } catch return error.OutOfMemory;
+                return .{ .done = .{
+                    .content = denied,
+                    .is_error = true,
+                    .elapsed_ms = elapsed,
+                } };
+            },
+            .fault => {
+                log.warnId("agent", rid, "project formal gate failed closed before dispatch name={s} id={s}", .{ name, id });
+                return .host_fatal;
+            },
+        }
+    }
+    if (!dispatch_observation.start(dispatch_input)) {
+        if (job_ctx.project_edit_mode == .whole_file_exact) {
+            const gate = job_ctx.project_rule_gate orelse return .host_fatal;
+            if (!gate.cancelPre(project_pre_signal.?))
+                log.warnId("agent", rid, "project exact-edit pre-state cancellation failed after observation start rejection name={s} id={s}", .{ name, id });
+        }
+        log.warnId("agent", rid, "tool observation rejected dispatch start name={s} id={s}", .{ name, id });
+        return .host_fatal;
+    }
+    defer dispatch_observation.ensureTerminal();
+    const r = (if (job_ctx.project_edit_mode == .whole_file_exact)
+        tools_mod.dispatchProjectExactEdit(&job_ctx, dispatch_input)
+    else
+        tools_mod.dispatch(&job_ctx, name, input)) catch |err| {
         const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
+        if (err == error.OutOfMemory) {
+            if (!dispatch_observation.finish(.host_fatal, @errorName(err), null))
+                return .host_fatal;
+            return error.OutOfMemory;
+        }
         // L3:UiPending 是控制信号(非工具错误)——kind/payload dupe 到父 allocator 逃逸 arena。
         if (err == error.UiPending) {
+            if (!dispatch_observation.finish(.pending, @errorName(err), null))
+                return .host_fatal;
             log.infoId("agent", rid, "tool.exec PENDING(par) name={s} id={s} kind={s}", .{ name, id, if (pending_req) |pr| pr.kind else "" });
             const kind = if (pending_req) |pr| try parent_allocator.dupe(u8, pr.kind) else null;
             errdefer if (kind) |bytes| parent_allocator.free(bytes);
@@ -198,6 +655,8 @@ pub fn executeOne(
             } };
         }
         const code = if (err == error.UnknownTool) "UnknownTool" else @errorName(err);
+        if (!dispatch_observation.finish(.tool_error, code, null))
+            return .host_fatal;
         const tool_error = @import("tool_error.zig");
         // 错误 json 用父 allocator(逃逸 arena)。工具填了 detail 用之,否则通用文案。
         // P0.6:UnknownTool 附可用工具清单(hermes 式引导),弱模型据此自纠而非空转烧 turn。
@@ -213,18 +672,25 @@ pub fn executeOne(
             else
                 tool_error.errorToJson(code, "Tool '{s}' does not exist. Available tools: {s}", .{ name, if (names) |nm| nm else "(unavailable)" }, parent_allocator) catch return error.OutOfMemory;
         } else tool_error.errorToJson(code, "{s} failed with {s}", .{ name, @errorName(err) }, parent_allocator) catch return error.OutOfMemory;
+        // `dispatch_input` may be a host-synthesized exact Edit containing
+        // source bytes that were never model-visible. Preserve the historical
+        // model-input diagnostic without leaking that host-only snapshot.
         log.warnId("agent", rid, "tool.exec FAILED(par) name={s} err={s} duration_ms={d} input={s}", .{ name, @errorName(err), elapsed, input[0..@min(input.len, 200)] });
         return .{ .done = .{ .content = ej, .is_error = true, .elapsed_ms = elapsed } };
     };
     // outcome slice 挂 job_ctx.allocator(= 本函数 arena) → 随 arena 回收,无单独释放点。
     switch (r) {
         .host_fatal => {
+            _ = dispatch_observation.finish(.host_fatal, "HostToolFatal", null);
             log.warnId("agent", rid, "tool.exec HOST-FATAL name={s} id={s}", .{ name, id });
             return .host_fatal;
         },
         .host_failed, .host_rejected => |maybe_detail| {
             const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
             const code: []const u8 = if (r == .host_failed) "HostToolFailed" else "HostToolRejected";
+            const outcome: tool_observation.Outcome = if (r == .host_failed) .host_failed else .host_rejected;
+            if (!dispatch_observation.finish(outcome, code, maybe_detail))
+                return .host_fatal;
             const ej = try hostToolErrorJson(code, name, maybe_detail, parent_allocator);
             log.warnId("agent", rid, "tool.exec HOST-{s}(par) name={s} duration_ms={d}", .{ code, name, elapsed });
             return .{ .done = .{ .content = ej, .is_error = true, .elapsed_ms = elapsed } };
@@ -232,12 +698,67 @@ pub fn executeOne(
         .ok => {},
     }
     const ok_bytes = r.ok;
+    if (!dispatch_observation.finish(.succeeded, null, ok_bytes)) {
+        log.warnId("agent", rid, "tool observation rejected dispatch finish name={s} id={s}", .{ name, id });
+        return .host_fatal;
+    }
+    // A successful persistent-task claim is the first decision point for that
+    // task. Feed verified, execution-grounded history back through the same
+    // tool result before the next model request. The adapter is deliberately
+    // best-effort at this outer boundary: protocol/retrieval failures are
+    // encoded as an explicit unavailable packet, while an unexpected adapter
+    // bug must not hide a lease the model already acquired.
+    const experience_packet = @import("../kg/experience_packet.zig");
+    const experience_bytes = experience_packet.enrichClaimResult(
+        job_ctx.allocator,
+        job_ctx.kg,
+        name,
+        input,
+        ok_bytes,
+    ) catch |err| blk: {
+        log.warnId("kg", rid, "experience packet enrichment failed: {s}", .{@errorName(err)});
+        break :blk experience_packet.unavailableClaimResult(
+            job_ctx.allocator,
+            name,
+            input,
+            ok_bytes,
+        ) catch null;
+    };
+    const result_bytes = experience_bytes orelse ok_bytes;
     // dispatch 结果在 arena 里 → dupe 到父 allocator 逃逸。落盘必须延迟到
     // executeSlots 确认整批无 fatal 之后，否则 fatal 会留下无人引用的 transient 文件。
-    const content = try parent_allocator.dupe(u8, ok_bytes);
+    const content = try parent_allocator.dupe(u8, result_bytes);
     const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
-    log.infoId("agent", rid, "tool.exec done(par) name={s} output_bytes={d} duration_ms={d}", .{ name, ok_bytes.len, elapsed });
+    log.infoId("agent", rid, "tool.exec done(par) name={s} output_bytes={d} duration_ms={d}", .{ name, result_bytes.len, elapsed });
     return .{ .done = .{ .content = content, .is_error = false, .elapsed_ms = elapsed } };
+}
+
+fn invalidNativeWriteArgsResult(
+    name: []const u8,
+    err: anyerror,
+    allocator: std.mem.Allocator,
+    started_at_ms: i64,
+    rid: log.RequestId,
+) error{OutOfMemory}!OneResult {
+    const elapsed: u64 = @intCast(@max(util_time.nowMs() - started_at_ms, 0));
+    const code = @errorName(err);
+    const encoded = @import("tool_error.zig").errorToJson(
+        code,
+        "{s} failed with {s}",
+        .{ name, code },
+        allocator,
+    ) catch return error.OutOfMemory;
+    log.warnId(
+        "agent",
+        rid,
+        "tool.exec INVALID-ARGS name={s} code={s} duration_ms={d}",
+        .{ name, code, elapsed },
+    );
+    return .{ .done = .{
+        .content = encoded,
+        .is_error = true,
+        .elapsed_ms = elapsed,
+    } };
 }
 
 fn hostToolErrorJson(
@@ -320,6 +841,11 @@ pub fn executeSlots(
     while (i < slots.len) {
         // denied(已填错误)或 prefetched(结果已由流式预取填好)→ 跳过,不执行。
         if (slots[i].decision == .denied or slots[i].prefetched) {
+            // Prefetch execution is only knowledge-bearing after the main
+            // permission path accepts the slot. Denied prefetched work is
+            // deliberately invisible to the ledger.
+            if (slots[i].decision == .run and slots[i].prefetched)
+                observeSuccessfulExecutions(slots[i .. i + 1], base_ctx);
             i += 1;
             continue;
         }
@@ -341,6 +867,10 @@ pub fn executeSlots(
                 if (job.out_of_memory) return error.OutOfMemory;
             }
         }
+        // Commit host-observed facts after this execution batch succeeds, not
+        // at turn end. A later fatal batch must not erase already established
+        // successful work, while errors in this batch remain excluded.
+        observeSuccessfulExecutions(slots[i..j], base_ctx);
         i = j;
     }
 
@@ -351,6 +881,20 @@ pub fn executeSlots(
     // 结果合计超 200k → 按大小降序把最大的落盘(替成 preview)直到达标。批1A 并发后
     // 多工具同时产大结果更易触发;单结果落盘由上方确认整批成功后统一做,这里管"合计"。
     enforceMessageBudget(slots, base_ctx, parent_allocator);
+}
+
+fn observeSuccessfulExecutions(slots: []const Slot, base_ctx: *const ToolContext) void {
+    const kg = base_ctx.kg orelse return;
+    if (!kg.ready) return;
+    const tasks = base_ctx.tasks orelse return;
+    const task_id = tasks.uniqueActiveKgTaskId() orelse return;
+    const project_dir = if (base_ctx.project_dir.len != 0) base_ctx.project_dir else base_ctx.cwd_abs;
+    if (project_dir.len == 0) return;
+
+    for (slots) |slot| {
+        if (slot.decision != .run or slot.pending or slot.is_error or slot.content == null) continue;
+        kg.observeSuccessfulExecution(task_id, slot.name, slot.input, project_dir);
+    }
 }
 
 fn persistCompletedResults(slots: []Slot, base_ctx: *const ToolContext, parent_allocator: std.mem.Allocator) void {
@@ -981,4 +1525,256 @@ test "Slot.takeContent 转移即置空,与 deinit 无双释放" {
     try std.testing.expect(s.content == null);
     a.free(taken.?); // 调用方持有
     s.deinit(a); // 已置空 → no-op,无双释放(testing.allocator 会抓)
+}
+
+test "tool observation: actual Write dispatch emits UI-independent typed effect at nested depth" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/observed.txt",
+        .{root_buffer[0..root_len]},
+        0,
+    );
+    defer allocator.free(path);
+    const args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"grounded\"}}",
+        .{path},
+    );
+    defer allocator.free(args);
+
+    var capture = ObservationCapture{};
+    var ctx = tools_mod.ToolContext.simple(allocator);
+    ctx.agent_depth = 7;
+    ctx.tool_observer = capture.sink();
+    const result = try executeOne(
+        &ctx,
+        "write_tool",
+        args,
+        "nested-write",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(!done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), capture.starts);
+    try std.testing.expectEqual(@as(usize, 1), capture.finishes);
+    try std.testing.expectEqual(@as(u8, 7), capture.depth);
+    try std.testing.expect(capture.origin == .authoritative);
+    try std.testing.expect(capture.outcome == .succeeded);
+    try std.testing.expect(capture.saw_name_repair);
+    try std.testing.expect(capture.dispatched_as_write);
+    try std.testing.expect(capture.effect_valid);
+    const effect = capture.effect orelse return error.MissingToolEffect;
+    const observed = switch (effect) {
+        .file_mutation_v1 => return error.MissingPostReobservation,
+        .file_mutation_v2 => |value| value,
+    };
+    const mutation = observed.mutation;
+    try std.testing.expect(mutation.before_state == .missing);
+    try std.testing.expect(mutation.change == .changed);
+    try std.testing.expectEqual(@as(usize, "grounded".len), mutation.after_bytes);
+    try std.testing.expectEqualSlices(
+        u8,
+        &tool_observation.sha256Hex(path),
+        &mutation.path_sha256,
+    );
+    try std.testing.expect(observed.reobservation.state == .matched);
+    try std.testing.expectEqualSlices(
+        u8,
+        &mutation.after_sha256,
+        &observed.reobservation.observed_sha256,
+    );
+    try std.testing.expect(platform.fs.exists(path.ptr));
+}
+
+test "tool observation: finish rejection poisons dispatch after preserving actual file effect" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/finish-rejected.txt",
+        .{root_buffer[0..root_len]},
+        0,
+    );
+    defer allocator.free(path);
+    const args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"effect-happened\"}}",
+        .{path},
+    );
+    defer allocator.free(args);
+
+    var capture = ObservationCapture{ .accept_finish = false };
+    var ctx = tools_mod.ToolContext.simple(allocator);
+    ctx.tool_observer = capture.sink();
+    const result = try executeOne(
+        &ctx,
+        "Write",
+        args,
+        "finish-rejected",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+
+    try std.testing.expect(result == .host_fatal);
+    try std.testing.expectEqual(@as(usize, 1), capture.starts);
+    try std.testing.expectEqual(@as(usize, 1), capture.finishes);
+    try std.testing.expect(capture.outcome == .succeeded);
+    try std.testing.expect(capture.effect_valid);
+    try std.testing.expect(capture.effect != null);
+    try std.testing.expect(platform.fs.exists(path.ptr));
+}
+
+test "project post gate runs before terminal observation and block preserves actual effect" {
+    const GateProbe = struct {
+        post_called: bool = false,
+        saw_matched_reobservation: bool = false,
+
+        fn pre(_: *anyopaque, _: project_gate_protocol.PreSignal) project_gate_protocol.PreResult {
+            return .admit;
+        }
+
+        fn post(raw: *anyopaque, signal: project_gate_protocol.PostSignal) project_gate_protocol.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.post_called = true;
+            self.saw_matched_reobservation = switch (signal.effect orelse return .block) {
+                .file_mutation_v1 => false,
+                .file_mutation_v2 => |value| value.reobservation.state == .matched,
+            };
+            return .block;
+        }
+
+        fn gate(self: *@This()) project_gate_protocol.Gate {
+            return .{ .ctx = @ptrCast(self), .preFn = pre, .postFn = post };
+        }
+    };
+    const TerminalCapture = struct {
+        gate_probe: *const GateProbe,
+        starts: usize = 0,
+        finishes: usize = 0,
+        finish_saw_post: bool = false,
+        effect: ?tool_observation.Effect = null,
+
+        fn emit(raw: *anyopaque, event: tool_observation.Event) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            switch (event) {
+                .formal_decision, .formal_decision_batch => {},
+                .dispatch_started => self.starts += 1,
+                .dispatch_finished => |finished| {
+                    self.finishes += 1;
+                    self.finish_saw_post = self.gate_probe.post_called;
+                    self.effect = finished.effect;
+                },
+            }
+            return true;
+        }
+
+        fn sink(self: *@This()) tools_mod.ToolObservationSink {
+            return .{ .ctx = @ptrCast(self), .emitFn = emit };
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/post-blocked.txt",
+        .{root_buffer[0..root_len]},
+        0,
+    );
+    defer allocator.free(path);
+    const args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"effect-happened\"}}",
+        .{path},
+    );
+    defer allocator.free(args);
+
+    var gate_probe = GateProbe{};
+    var capture = TerminalCapture{ .gate_probe = &gate_probe };
+    var ctx = tools_mod.ToolContext.simple(allocator);
+    ctx.project_rule_gate = gate_probe.gate();
+    ctx.tool_observer = capture.sink();
+    const result = try executeOne(
+        &ctx,
+        "Write",
+        args,
+        "post-blocked",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+
+    try std.testing.expect(result == .host_fatal);
+    try std.testing.expect(gate_probe.post_called);
+    try std.testing.expect(gate_probe.saw_matched_reobservation);
+    try std.testing.expectEqual(@as(usize, 1), capture.starts);
+    try std.testing.expectEqual(@as(usize, 1), capture.finishes);
+    try std.testing.expect(capture.finish_saw_post);
+    try std.testing.expect(capture.effect != null);
+    try std.testing.expect(platform.fs.exists(path.ptr));
+}
+
+test "tool observation: sink rejection blocks before actual dispatcher invocation" {
+    const Probe = struct {
+        calls: usize = 0,
+
+        fn dispatch(raw: *const anyopaque, tool_ctx: *const tools_mod.ToolContext, _: []const u8, _: []const u8) anyerror!tools_mod.ToolDispatchOutcome {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            return .{ .ok = try tool_ctx.allocator.dupe(u8, "unexpected") };
+        }
+        fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+        fn nameAt(_: *const anyopaque, _: usize) ?[]const u8 {
+            return null;
+        }
+        fn hostSync(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+        fn dispatcher(self: *@This()) tools_mod.ToolDispatcher {
+            return .{
+                .ctx = @ptrCast(self),
+                .dispatchFn = dispatch,
+                .prefetchSafeFn = prefetchSafe,
+                .nameAtFn = nameAt,
+                .hostSyncFn = hostSync,
+            };
+        }
+    };
+
+    var probe = Probe{};
+    var capture = ObservationCapture{ .accept_start = false };
+    var ctx = tools_mod.ToolContext.simple(std.testing.allocator);
+    ctx.tool_dispatcher = probe.dispatcher();
+    ctx.tool_observer = capture.sink();
+    const result = try executeOne(
+        &ctx,
+        "Probe",
+        "{}",
+        "blocked",
+        std.testing.allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    try std.testing.expect(result == .host_fatal);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    try std.testing.expectEqual(@as(usize, 1), capture.starts);
+    try std.testing.expectEqual(@as(usize, 0), capture.finishes);
 }

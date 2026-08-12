@@ -1,0 +1,134 @@
+{
+  "artifacts": {
+    "execution.json": {
+      "bytes": 706,
+      "sha256": "48baa29a22dffb3705b0b693d08b45e9a112d3cd48600554ff3da59700997d1d"
+    },
+    "manifest.json": {
+      "bytes": 3672,
+      "sha256": "f3e879ab31c399af9aa0dfd406624eda471c4dbb3e9e8a5ae26e3c9d33e82e20"
+    },
+    "source.json": {
+      "bytes": 4393,
+      "sha256": "7b0ee0cf8565a3d6af994e6ecb1f67bb6ac22b82b69dc8336eb8f8f42966aab7"
+    },
+    "validators.json": {
+      "bytes": 2837,
+      "sha256": "23c01341579a7d7677f203e25d27b85b1e9f9e7fb0875be3b388bea7b5f42e0b"
+    }
+  },
+  "budget_authority": {
+    "max_output_tokens": 4096,
+    "max_rollout_cost_usd": 0.85,
+    "max_rollout_metered_tokens": 280000,
+    "max_total_cost_usd": 9.0,
+    "max_total_metered_tokens": 2800000,
+    "prior_conservative_cost_usd": 2.1763888,
+    "prior_conservative_metered_tokens": 1159955,
+    "user_authorization_max_cost_usd": 1000.0
+  },
+  "current_phase": {
+    "paid_rollouts_authorized": true,
+    "quality_evidence": false,
+    "scope": "authorized-host-observable-production-memory-pilot"
+  },
+  "generation": {
+    "adapter": "adapt-procedural-memory",
+    "expected_upstream_sha256": "a035232b2cc68e711c17be40d8a1aaee4aaa6a723759baf91db1c6a9ebb7db38",
+    "family_id": "error-contract-propagation",
+    "limit_families": 1,
+    "source_path": "evals/memory/fixtures/procedural-coding-source.json",
+    "split_seed": 2026080803
+  },
+  "harness": {
+    "binary_sha256": "1ee32fce4e1f1abbcfefa83bf4addff9c72ce736fb89540adf169a9a8e608d65",
+    "git_commit": "1e6ba8f",
+    "revision": "metacodes-memory-production-pilot-v10-1e6ba8f"
+  },
+  "model": {
+    "fingerprint": "e5cc883082b2a25721ee8b861c5e0cca37b6bdd93648d6883d6c8c54a34bf650",
+    "id": "glm-5.2"
+  },
+  "pilot_id": "procedural-glm52-v5",
+  "predecessor_uncertain_request": {
+    "automatic_retry_forbidden": true,
+    "classification": "request-authorized-child-crash-conservative-exposure",
+    "manifest_id": "coding-intent-families-2026080802-1",
+    "maximum_cost_usd": 0.85,
+    "maximum_metered_tokens": 280000,
+    "state": "request_authorized",
+    "transaction_id": "27da31d17143929fba09e07328a178c5cfc09e35708c7d1c781a1f15dc438a0d"
+  },
+  "protocol": {
+    "arms": [
+      {
+        "fingerprint": "1d70eb700887237a6b751c4d80d777d04d2d59710b7cac76d882920583033c96",
+        "id": "no_memory",
+        "treatment": "external memory, host recall, consolidation, and TinyKG retrieval disabled"
+      },
+      {
+        "fingerprint": "5879e7949fd4690eda7ba2aa9445c1b8f4895bc832ce21da370496b4acedf585",
+        "fingerprint_basis": "sha256:markdown-memory-host-episode-consolidation-v1",
+        "id": "markdown_memory",
+        "treatment": "host-observed online execution episode consolidated to durable Markdown, then exposed read-only offline"
+      },
+      {
+        "fingerprint": "1b7c69db0fa9a1ca6dc0a4061428d6d11816c3d9e2145fda6aa5a950ffa80d5b",
+        "fingerprint_basis": "sha256:tinykg-lexical-host-recall-episode-consolidation-v1",
+        "id": "tinykg_lexical",
+        "treatment": "host-observed episode imported into isolated TinyKG with projection provenance, automatic scoped lexical recall, at most four LLM-selected semantic probes, and bounded graph verification"
+      }
+    ],
+    "deterministic_workspace_validator": true,
+    "family_id": "error-contract-propagation",
+    "offline_cases": 2,
+    "online_cases": 1,
+    "rollouts": 9,
+    "trials": 1
+  },
+  "paid_execution_requirements": {
+    "budget_journal": "single-machine locked crash-conservative journal outside the fresh run directory",
+    "credential_transport": "private 0600 auth file to anonymous one-shot inherited file descriptor",
+    "filesystem_isolation": "re-observe the macOS Seatbelt production profile and bound negative probes before provider access",
+    "local_tinykg": "the TinyKG treatment uses a fresh isolated local store; no benchmark arm uses the remote harness",
+    "remote_tinykg": "forbidden for benchmark corpus, trace, and store; refined verification only",
+    "single_provider_attempt": true
+  },
+  "schedule": {
+    "ordered_rows": [
+      [0, "coding:error-contract-propagation:quota-exceeded", 0, "no_memory"],
+      [1, "coding:error-contract-propagation:quota-exceeded", 0, "markdown_memory"],
+      [2, "coding:error-contract-propagation:quota-exceeded", 0, "tinykg_lexical"],
+      [3, "coding:error-contract-propagation:invalid-lease", 0, "markdown_memory"],
+      [4, "coding:error-contract-propagation:invalid-lease", 0, "tinykg_lexical"],
+      [5, "coding:error-contract-propagation:invalid-lease", 0, "no_memory"],
+      [6, "coding:error-contract-propagation:stale-revision", 0, "tinykg_lexical"],
+      [7, "coding:error-contract-propagation:stale-revision", 0, "no_memory"],
+      [8, "coding:error-contract-propagation:stale-revision", 0, "markdown_memory"]
+    ],
+    "ordered_tsv_sha256": "128b43eac8bf699524db6fd295469195af75c55943facf608e1657cd44451eba"
+  },
+  "schema_version": 1,
+  "tinykg_runtime": {
+    "binary_sha256": "66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee",
+    "build_profile": "metacodes-vendored-ReleaseSafe-stripped",
+    "online_consolidation_commands": [
+      "import-md-doc",
+      "add-edge",
+      "neighbors",
+      "store-info"
+    ],
+    "preflight_commands": [
+      "init",
+      "apply",
+      "store-info"
+    ],
+    "schema_version": 3,
+    "source_commit": "93d89bcd4d0208c994da3632fb6166efffcc86e7",
+    "storage_format_version": 2
+  },
+  "toolchain": {
+    "ripgrep_sha256": "2fb61b6e5b3e2d89b115fe6c18fd8805670fdf4bdfde85954d40855a76830e5f",
+    "ripgrep_version": "15.1.0"
+  }
+}

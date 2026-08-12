@@ -1,0 +1,22 @@
+model: metacodes-glm52
+harness: metacodes/0.1.0
+dataset: datasets/wb-bench-code-v1.0/tasks
+harness_backend: local
+model_connection: local_proxy
+jobs_dir: results/metacodes-glm52-code-3-canary
+n_attempts: 1
+record_full_io: true
+agent_user: dev
+verifier_user: dev
+extra_allowed_hosts:
+  - host.docker.internal
+task_selection:
+  mode: name
+  names:
+    - bug_fix-easy-invalid_filterwarnings_regex_error
+    - data_quality-hard-label_conflicts
+    - data_quality-hard-schema_drift
+orchestrator_override:
+  n_concurrent_trials: 1
+context_window: 200000
+context_compact_pct: 92

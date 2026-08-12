@@ -20,8 +20,17 @@ pub const DEFAULT_RATES: Rates = .{
     .cache_write_per_mtok = 3.75,
 };
 
+/// GLM-5.2 production pilot guardrail. This deliberately keeps the higher
+/// Sonnet-4 USD rates instead of pretending the provider's RMB bill is known.
+/// Zhipu's 2026-08-07 public price (8/28 RMB per MTok, 2 RMB cache hit) and
+/// Metask's official-price policy make this conservative for authorization;
+/// it remains an estimate, never a provider-billed cost.
+pub const GLM_52_GUARDRAIL_RATES = DEFAULT_RATES;
+pub const GLM_52_GUARDRAIL_PROVENANCE = "metacodes_glm-5.2_conservative_sonnet4_usd_guardrail_2026-08-07_not_provider_bill";
+
 /// 按 model 名称（子串匹配）返回单价。未匹配到 → DEFAULT_RATES。
 pub fn rateFor(model: []const u8) Rates {
+    if (std.mem.eql(u8, model, "glm-5.2")) return GLM_52_GUARDRAIL_RATES;
     // opus 系列
     if (std.mem.indexOf(u8, model, "opus") != null) {
         return .{
@@ -44,6 +53,11 @@ pub fn rateFor(model: []const u8) Rates {
     return DEFAULT_RATES;
 }
 
+pub fn provenanceFor(model: []const u8) []const u8 {
+    if (std.mem.eql(u8, model, "glm-5.2")) return GLM_52_GUARDRAIL_PROVENANCE;
+    return "metacodes_builtin_2026-04_with_fallback";
+}
+
 /// 计算给定 usage 的总 cost（USD）。
 pub fn computeCost(rates: Rates, input_tokens: u64, output_tokens: u64, cache_read: u64, cache_write: u64) f64 {
     const i = @as(f64, @floatFromInt(input_tokens)) / 1_000_000.0 * rates.input_per_mtok;
@@ -56,6 +70,12 @@ pub fn computeCost(rates: Rates, input_tokens: u64, output_tokens: u64, cache_re
 test "rateFor sonnet default" {
     const r = rateFor("claude-sonnet-4-20250514");
     try std.testing.expect(r.input_per_mtok == 3.0);
+}
+
+test "glm-5.2 uses explicit conservative guardrail provenance" {
+    const rates = rateFor("glm-5.2");
+    try std.testing.expectEqual(GLM_52_GUARDRAIL_RATES, rates);
+    try std.testing.expectEqualStrings(GLM_52_GUARDRAIL_PROVENANCE, provenanceFor("glm-5.2"));
 }
 
 test "rateFor opus" {

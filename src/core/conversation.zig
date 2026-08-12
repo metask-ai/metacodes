@@ -11,6 +11,7 @@ const sync = @import("platform").sync;
 const msg = @import("message.zig");
 
 pub const TOOL_RESULT_CLEARED_STUB = "[tool result cleared to save context]";
+pub const TOOL_RESULT_COMMITMENT_PREFIX = "[tool-result-commitment ";
 pub const TOOL_RESULT_CONTEXT_MIN_BYTES: usize = 8 * 1024;
 pub const TOOL_RESULT_CONTEXT_MAX_BYTES: usize = 64 * 1024;
 /// window(token 数)/8 → 单条 tool_result 内联字节上限(≈ window/32 token,4 bytes/token)。
@@ -499,8 +500,8 @@ pub const Conversation = struct {
                 switch (b) {
                     .tool_result => |tr| {
                         // 已是 stub 的不重复清(幂等)。
-                        if (std.mem.eql(u8, tr.content, TOOL_RESULT_CLEARED_STUB)) continue;
-                        if (!self.clearToolResultAt(m, bi)) continue;
+                        if (isClearedToolResultProjection(tr.content)) continue;
+                        if (self.clearToolResultAt(m, bi) == null) continue;
                         self.noteShrinkAtLocked(mi);
                         cleared += 1;
                     },
@@ -533,13 +534,13 @@ pub const Conversation = struct {
                 seen_recent += 1;
                 if (seen_recent <= keep_recent_results) continue;
                 const tr = b.tool_result;
-                if (std.mem.eql(u8, tr.content, TOOL_RESULT_CLEARED_STUB)) continue;
+                if (isClearedToolResultProjection(tr.content)) continue;
                 const before = tr.content.len;
-                if (!self.clearToolResultAt(m, bi)) continue;
+                const after = self.clearToolResultAt(m, bi) orelse continue;
                 self.noteShrinkAtLocked(mi);
                 out.cleared += 1;
                 out.bytes_before += before;
-                out.bytes_after += TOOL_RESULT_CLEARED_STUB.len;
+                out.bytes_after += after;
             }
         }
         if (out.changed()) self.mutation_version +%= 1;
@@ -560,7 +561,7 @@ pub const Conversation = struct {
                 if (b != .tool_result) continue;
                 const tr = b.tool_result;
                 if (tr.content.len <= max_bytes) continue;
-                if (std.mem.eql(u8, tr.content, TOOL_RESULT_CLEARED_STUB)) continue;
+                if (isCommittedToolResultProjection(tr.content)) continue;
                 const before = tr.content.len;
                 const new_content = truncateToolResultContent(self.allocator, tr.content, max_bytes) catch continue;
                 self.allocator.free(@constCast(tr.content));
@@ -579,18 +580,34 @@ pub const Conversation = struct {
         return out;
     }
 
-    fn clearToolResultAt(self: *Conversation, m: msg.Message, bi: usize) bool {
+    fn clearToolResultAt(self: *Conversation, m: msg.Message, bi: usize) ?usize {
         const tr = m.blocks[bi].tool_result;
-        const new_content = self.allocator.dupe(u8, TOOL_RESULT_CLEARED_STUB) catch return false;
+        const new_content = if (toolResultCommitmentLine(tr.content)) |commitment|
+            std.fmt.allocPrint(
+                self.allocator,
+                "{s}\n{s}",
+                .{ TOOL_RESULT_CLEARED_STUB, commitment },
+            ) catch return null
+        else blk: {
+            const digest = sha256Hex(tr.content);
+            break :blk std.fmt.allocPrint(
+                self.allocator,
+                "{s}\n{s}original_bytes={d} sha256={s}]",
+                .{ TOOL_RESULT_CLEARED_STUB, TOOL_RESULT_COMMITMENT_PREFIX, tr.content.len, digest[0..] },
+            ) catch return null;
+        };
+        if (new_content.len >= tr.content.len) {
+            self.allocator.free(new_content);
+            return null;
+        }
         self.allocator.free(@constCast(tr.content));
         m.blocks[bi] = .{ .tool_result = .{
             .tool_use_id = tr.tool_use_id,
             .content = new_content,
             .is_error = tr.is_error,
         } };
-        return true;
+        return new_content.len;
     }
-
 };
 
 fn isLeadingOrphanToolResult(m: msg.Message) bool {
@@ -645,11 +662,12 @@ fn sameAllocator(a: std.mem.Allocator, b: std.mem.Allocator) bool {
 
 fn truncateToolResultContent(allocator: std.mem.Allocator, content: []const u8, max_bytes: usize) ![]u8 {
     if (content.len <= max_bytes) return try allocator.dupe(u8, content);
+    const digest = sha256Hex(content);
     if (max_bytes < 1024) {
         return try std.fmt.allocPrint(
             allocator,
-            "[tool output truncated to fit context: original_bytes={d}]",
-            .{content.len},
+            "{s}original_bytes={d} sha256={s}]\n[tool output truncated to fit context]",
+            .{ TOOL_RESULT_COMMITMENT_PREFIX, content.len, digest[0..] },
         );
     }
 
@@ -669,9 +687,65 @@ fn truncateToolResultContent(allocator: std.mem.Allocator, content: []const u8, 
     const omitted = tail_start - head_end;
     return try std.fmt.allocPrint(
         allocator,
-        "[tool output truncated to fit context: original_bytes={d}, shown_head_bytes={d}, shown_tail_bytes={d}]\n\n{s}\n\n...[truncated {d} bytes]...\n\n{s}",
-        .{ content.len, head_end, content.len - tail_start, content[0..head_end], omitted, content[tail_start..] },
+        "{s}original_bytes={d} sha256={s}]\n[tool output truncated to fit context: shown_head_bytes={d}, shown_tail_bytes={d}]\n\n{s}\n\n...[truncated {d} bytes]...\n\n{s}",
+        .{ TOOL_RESULT_COMMITMENT_PREFIX, content.len, digest[0..], head_end, content.len - tail_start, content[0..head_end], omitted, content[tail_start..] },
     );
+}
+
+pub fn isCommittedToolResultProjection(content: []const u8) bool {
+    return isClearedToolResultProjection(content) or isTruncatedToolResultProjection(content);
+}
+
+fn isClearedToolResultProjection(content: []const u8) bool {
+    if (std.mem.eql(u8, content, TOOL_RESULT_CLEARED_STUB)) return true;
+    const prefix = TOOL_RESULT_CLEARED_STUB ++ "\n";
+    if (!std.mem.startsWith(u8, content, prefix)) return false;
+    const commitment = commitmentLineAt(content, prefix.len) orelse return false;
+    return prefix.len + commitment.len == content.len;
+}
+
+fn isTruncatedToolResultProjection(content: []const u8) bool {
+    const commitment = commitmentLineAt(content, 0) orelse return false;
+    const rest = content[commitment.len..];
+    return std.mem.startsWith(u8, rest, "\n[tool output truncated to fit context");
+}
+
+fn toolResultCommitmentLine(content: []const u8) ?[]const u8 {
+    const start = if (isTruncatedToolResultProjection(content))
+        @as(usize, 0)
+    else if (isClearedToolResultProjection(content) and !std.mem.eql(u8, content, TOOL_RESULT_CLEARED_STUB))
+        TOOL_RESULT_CLEARED_STUB.len + 1
+    else
+        return null;
+    return commitmentLineAt(content, start);
+}
+
+fn commitmentLineAt(content: []const u8, start: usize) ?[]const u8 {
+    if (start > content.len) return null;
+    const tail = content[start..];
+    const end = std.mem.indexOfScalar(u8, tail, '\n') orelse tail.len;
+    const line = tail[0..end];
+    const bytes_prefix = TOOL_RESULT_COMMITMENT_PREFIX ++ "original_bytes=";
+    if (!std.mem.startsWith(u8, line, bytes_prefix)) return null;
+    var cursor = bytes_prefix.len;
+    const digits_start = cursor;
+    while (cursor < line.len and std.ascii.isDigit(line[cursor])) : (cursor += 1) {}
+    if (cursor == digits_start) return null;
+    _ = std.fmt.parseInt(usize, line[digits_start..cursor], 10) catch return null;
+    const hash_prefix = " sha256=";
+    if (!std.mem.startsWith(u8, line[cursor..], hash_prefix)) return null;
+    cursor += hash_prefix.len;
+    if (line.len - cursor != 65 or line[line.len - 1] != ']') return null;
+    for (line[cursor .. cursor + 64]) |char| {
+        if (!std.ascii.isDigit(char) and !(char >= 'a' and char <= 'f')) return null;
+    }
+    return line;
+}
+
+fn sha256Hex(bytes: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 fn floorUtf8Boundary(s: []const u8, desired: usize) usize {
@@ -789,9 +863,11 @@ test "usage anchor: microcompact clear invalidates it" {
     var c = Conversation.init(a);
     defer c.deinit();
     const blocks = try a.alloc(msg.Block, 1);
+    const content = try a.alloc(u8, 512);
+    @memset(content, 'x');
     blocks[0] = .{ .tool_result = .{
         .tool_use_id = try a.dupe(u8, "t1"),
-        .content = try a.dupe(u8, "big tool output that will be cleared"),
+        .content = content,
         .is_error = false,
     } };
     try c.append(.{ .role = .user, .blocks = blocks });
@@ -802,6 +878,26 @@ test "usage anchor: microcompact clear invalidates it" {
     const reduced = c.microcompactToolResultsByRecentResults(0);
     try std.testing.expectEqual(@as(usize, 1), reduced.cleared);
     try std.testing.expect(c.usageAnchor() == null); // 前缀被改写,实计数不再可信
+}
+
+test "usage anchor: microcompact never expands a short result" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const blocks = try a.alloc(msg.Block, 1);
+    blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "t1"),
+        .content = try a.dupe(u8, "short result"),
+        .is_error = false,
+    } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+    try c.appendText(.assistant, "done");
+    c.setUsageAnchor(50_000);
+
+    const reduced = c.microcompactToolResultsByRecentResults(0);
+    try std.testing.expectEqual(@as(usize, 0), reduced.cleared);
+    try std.testing.expectEqualStrings("short result", c.messages.items[0].blocks[0].tool_result.content);
+    try std.testing.expect(c.usageAnchor() != null);
 }
 
 test "usage anchor: truncating a post-anchor tool_result keeps the anchor (glm 逐轮截断回归)" {

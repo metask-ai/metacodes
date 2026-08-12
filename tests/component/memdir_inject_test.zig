@@ -36,7 +36,7 @@ test "L2: memdir 启用 → system prompt 含 # Memory 段 + memdir 路径(进�
 
     // 用 buildFull 直接造含 memory 段的 system prompt(模拟 App.init 的产物)。
     const memdir_abs = "/home/u/.metacodes/projects/deadbeef/memory";
-    const sp = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, null, memdir_abs, false);
+    const sp = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, null, memdir_abs, false, "/tmp");
     defer a.free(sp);
     // sanity:section 在 system prompt 里
     try std.testing.expect(std.mem.indexOf(u8, sp, "# Memory") != null);
@@ -60,6 +60,26 @@ test "L2: memdir 启用 → system prompt 含 # Memory 段 + memdir 路径(进�
     try std.testing.expect(std.mem.indexOf(u8, sys, "# Memory") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, memdir_abs) != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "user | feedback | project | reference") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "knowledge graph") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sys, "KgRemember") == null);
+}
+
+test "L2: TinyKG-ready memory prompt advertises Markdown graph projection" {
+    const a = std.testing.allocator;
+    const sp = try cc.system_prompt.buildFull(
+        a,
+        "claude-sonnet-4-20250514",
+        null,
+        null,
+        null,
+        "/home/u/.metacodes/projects/deadbeef/memory",
+        true,
+        "/tmp",
+    );
+    defer a.free(sp);
+    try std.testing.expect(std.mem.indexOf(u8, sp, "automatically imported into the knowledge graph") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sp, "KgRemember") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sp, "/kg sync") != null);
 }
 
 test "L2: AutoMem 索引 → 首条 user message(经 user_context.build)" {

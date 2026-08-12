@@ -239,6 +239,39 @@ pub fn describeTask(allocator: std.mem.Allocator, ctx: *const PromptContext) any
     return allocator.dupe(u8, TASK_DESC);
 }
 
+const TASK_GET_SESSION_DESC =
+    "Fetch a task from the in-session task list by id. Use it when the list summary is not enough; tasks do not persist after this session.";
+const TASK_GET_TINYKG_DESC =
+    "Fetch a task by id. For persistent kg-* tasks this also returns a bounded TinyKG task_packet with parent objective, dependencies, evidence, truncation diagnostics and continuations. Call it after restart/compaction or whenever claim could not return a packet; do not work from the title alone.";
+const TASK_CREATE_SESSION_DESC =
+    "Create a task in the in-session task list. Returns the new task id. Use for multi-step work you want to track across turns.";
+const TASK_CREATE_TINYKG_DESC =
+    "Create a persistent task in TinyKG's project DAG. Returns a stable kg-* id that survives compaction and restart; use TaskUpdate to claim, close with evidence, or record terminal failure.";
+const TASK_LIST_SESSION_DESC =
+    "List the in-session task list. Pick an unblocked pending task, mark it in_progress before work, and complete it promptly; this list does not persist after the session.";
+const TASK_LIST_TINYKG_DESC =
+    "List the live task frontier. For kg-* tasks select only an open, ready, unclaimed leaf; then claim it with TaskUpdate status=in_progress before work. This is a summary/projection, so use TaskGet/task_packet for full recovery context.";
+const TASK_UPDATE_SESSION_DESC =
+    "Update an in-session task's status, fields, owner, or dependency links. Use pending/in_progress/completed/deleted and keep the list current as work proceeds.";
+const TASK_UPDATE_TINYKG_DESC =
+    "Update a task's status (pending/in_progress/completed/failed/deleted) and/or fields. For persistent kg-* tasks: claim with in_progress before work (the successful response contains the bounded task_packet); completed/failed are terminal while preserving the stable id; deleted is only a compatibility alias for failed. Close every claimed task with a verified conclusion and actual acts_on/uses/produces when known, then inspect the returned frontier.";
+
+pub fn describeTaskGet(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
+    return allocator.dupe(u8, if (ctx.tinykg_enabled) TASK_GET_TINYKG_DESC else TASK_GET_SESSION_DESC);
+}
+
+pub fn describeTaskCreate(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
+    return allocator.dupe(u8, if (ctx.tinykg_enabled) TASK_CREATE_TINYKG_DESC else TASK_CREATE_SESSION_DESC);
+}
+
+pub fn describeTaskList(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
+    return allocator.dupe(u8, if (ctx.tinykg_enabled) TASK_LIST_TINYKG_DESC else TASK_LIST_SESSION_DESC);
+}
+
+pub fn describeTaskUpdate(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
+    return allocator.dupe(u8, if (ctx.tinykg_enabled) TASK_UPDATE_TINYKG_DESC else TASK_UPDATE_SESSION_DESC);
+}
+
 // ----------------------------------------------------------------------------
 // tests
 // ----------------------------------------------------------------------------
@@ -290,7 +323,8 @@ test "describeCodeMap guides toward definitions and prefers over whole-file Read
     try std.testing.expect(std.mem.indexOf(u8, d, "src/**/*`") != null);
 }
 
-test "describeBash includes Git section only when include_git and not readonly agent" {    const a = std.testing.allocator;
+test "describeBash includes Git section only when include_git and not readonly agent" {
+    const a = std.testing.allocator;
     const main_ctx = PromptContext{ .include_git = true };
     const d1 = try describeBash(a, &main_ctx);
     defer a.free(d1);

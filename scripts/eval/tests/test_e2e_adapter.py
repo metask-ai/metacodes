@@ -6,8 +6,10 @@ from pathlib import Path
 
 from scripts.eval.e2e_adapter import (
     MAX_NATIVE_EVENT_BYTES,
+    MAX_VALIDATOR_OUTPUT_BYTES,
     NATIVE_EVENT_SCHEMA_VERSION,
     _count_policy_violations,
+    _debug_tool_inputs,
     _evaluate_check,
     comparison_fingerprints,
     _is_model_tool_failure,
@@ -18,6 +20,7 @@ from scripts.eval.e2e_adapter import (
     prepare_runtime_metadata,
     _trajectory_judgement,
 )
+from scripts.eval.model import ValidationError
 
 
 def suite():
@@ -49,6 +52,107 @@ def suite():
 
 
 class E2EAdapterTest(unittest.TestCase):
+    def test_runtime_metadata_seals_rollout_budget_before_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scenario.txt").write_text("write answer", encoding="utf-8")
+            binary = root / "metacodes"
+            binary.write_bytes(b"candidate-binary")
+            metadata = prepare_runtime_metadata(
+                suite(),
+                root,
+                "smoke",
+                output=root / "eval-metadata.json",
+                events_path=str(root / "events.jsonl"),
+                run_id="native:budget:0",
+                trial=0,
+                model_provider="test",
+                model_id="model-a",
+                harness_config_id="candidate",
+                harness_revision="abc",
+                permission_mode="default",
+                binary_path=binary,
+                max_metered_tokens=1234,
+                max_cost_usd=5.5,
+            )
+            with self.assertRaisesRegex(ValidationError, "requires both"):
+                prepare_runtime_metadata(
+                    suite(),
+                    root,
+                    "smoke",
+                    output=root / "invalid-budget.json",
+                    events_path=str(root / "events.jsonl"),
+                    run_id="native:budget:invalid",
+                    trial=0,
+                    model_provider="test",
+                    model_id="model-a",
+                    harness_config_id="candidate",
+                    harness_revision="abc",
+                    permission_mode="default",
+                    binary_path=binary,
+                    max_metered_tokens=1234,
+                )
+        assert metadata is not None
+        self.assertEqual(metadata["max_metered_tokens"], 1234)
+        self.assertEqual(metadata["max_cost_usd"], 5.5)
+
+    def test_validator_output_is_killed_and_rejected_above_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            validator = root / "evals/validators/noisy.py"
+            validator.parent.mkdir(parents=True)
+            validator.write_text(
+                f"print('x' * {MAX_VALIDATOR_OUTPUT_BYTES + 1})\n",
+                encoding="utf-8",
+            )
+            result = _evaluate_check(
+                {
+                    "type": "validator",
+                    "validator": "evals/validators/noisy.py",
+                    "timeout_seconds": 10,
+                },
+                workspace,
+                "",
+                repo_root=root,
+            )
+        self.assertFalse(result["passed"])
+        self.assertIn("output exceeds", result["evaluator_error"])
+
+    def test_debug_tool_input_checks_ignore_thinking_and_target_actual_tool_json(self):
+        debug = "\n".join(
+            [
+                '[DEBUG stream] event: {"thinking_delta":"consider TTL then reject it"}',
+                "[INFO stream] tool_use complete id=call_1 name=KgRecall input_bytes=31",
+                '[DEBUG stream] tool_use input_json={"query":"orion-k9 mode"}',
+                "[INFO agent] tool.exec start(par) name=KgRecall id=call_1",
+                "[INFO stream] tool_use complete id=call_2 name=Write input_bytes=40",
+                '[DEBUG stream] tool_use input_json={"file_path":"answer.txt",',
+                '"content":"done"}',
+                "[INFO agent] tool.exec start(par) name=Write id=call_2",
+            ]
+        )
+        self.assertEqual(_debug_tool_inputs(debug, "KgRecall"), ['{"query":"orion-k9 mode"}'])
+        self.assertEqual(
+            _debug_tool_inputs(debug, "Write"),
+            ['{"file_path":"answer.txt",\n"content":"done"}'],
+        )
+        passed = _evaluate_check(
+            {"type": "debug_tool_input_not_contains", "tool": "KgRecall", "text": "TTL"},
+            Path("."),
+            "",
+            debug,
+        )
+        failed = _evaluate_check(
+            {"type": "debug_tool_input_not_contains", "tool": "KgRecall", "text": "orion-k9"},
+            Path("."),
+            "",
+            debug,
+        )
+        self.assertTrue(passed["passed"])
+        self.assertFalse(failed["passed"])
+
     def test_min_tool_counts_requires_the_requested_multiplicity(self):
         constraints = {"required_tools": ["WebSearch"], "min_tool_counts": {"WebSearch": 3}}
         passed = _trajectory_judgement(
@@ -372,6 +476,34 @@ class E2EAdapterTest(unittest.TestCase):
                 self.assertFalse(result["passed"])
                 self.assertIsNone(result["evaluator_error"])
 
+    def test_casefold_workspace_checks_accept_natural_markdown_casing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / "OPERATIONS.md").write_text(
+                "Retry ceiling: 7\n", encoding="utf-8"
+            )
+            contains = _evaluate_check(
+                {
+                    "type": "contains_casefold",
+                    "path": "OPERATIONS.md",
+                    "text": "retry",
+                },
+                workspace,
+                "",
+            )
+            excludes = _evaluate_check(
+                {
+                    "type": "not_contains_casefold",
+                    "path": "OPERATIONS.md",
+                    "text": "unbounded",
+                },
+                workspace,
+                "",
+            )
+            self.assertTrue(contains["passed"])
+            self.assertTrue(excludes["passed"])
+            self.assertIn("casefold", contains["detail"])
+
     def test_native_trace_reader_rejects_links_special_files_and_oversize(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -488,6 +620,118 @@ class E2EAdapterTest(unittest.TestCase):
             native, error = _native_trace_metrics(path)
             self.assertIsNone(native)
             self.assertIn("tool finished before start", error)
+
+    def test_native_trace_preserves_complete_events_from_killed_final_invocation(self):
+        metadata = {
+            "run_id": "partial-run",
+            "invocation": 0,
+            "trial": 0,
+            "suite_id": "suite",
+            "task_id": "task",
+            "task_fingerprint": "task-fp",
+            "model_provider": "test",
+            "model_id": "model",
+            "model_fingerprint": "model-fp",
+            "runtime_model_provider": "test",
+            "runtime_model_id": "model",
+            "harness_config_id": "candidate",
+            "harness_revision": "abc",
+            "harness_fingerprint": "harness-fp",
+            "permission_mode": "default",
+            "runtime_permission_mode": "default",
+            "environment_fingerprint": "environment-fp",
+            "grader_fingerprint": "grader-fp",
+        }
+        events = [
+            {"run_started": {"trace_id": "partial", "metadata": metadata}},
+            {"turn_started": {"trace_id": "partial", "depth": 0, "turn": 1}},
+            {
+                "model_request_finished": {
+                    "trace_id": "partial",
+                    "depth": 0,
+                    "turn": 1,
+                    "attempt": 0,
+                    "elapsed_ms": 250,
+                    "outcome": "success",
+                }
+            },
+            {
+                "compact_request_finished": {
+                    "trace_id": "partial",
+                    "depth": 0,
+                    "turn": 1,
+                    "elapsed_ms": 50,
+                    "outcome": "success",
+                    "cause": "threshold",
+                }
+            },
+            {
+                "context_projection": {
+                    "trace_id": "partial",
+                    "kind": "large_tool_result_truncation",
+                    "changed_items": 1,
+                    "bytes_before": 1000,
+                    "bytes_after": 400,
+                    "active_messages": 3,
+                    "cause": "post_tool_follow_up_threshold",
+                }
+            },
+            {
+                "usage": {
+                    "trace_id": "partial",
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "estimated_cost_usd": 0.01,
+                    "pricing_provenance": "test",
+                }
+            },
+            {
+                "tool_started": {
+                    "trace_id": "partial",
+                    "id": "tool-in-flight",
+                    "name": "Read",
+                    "input_bytes": 1,
+                    "input_sha256": "a",
+                }
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            path.write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            "schema_version": NATIVE_EVENT_SCHEMA_VERSION,
+                            "sequence": index,
+                            "monotonic_elapsed_ns": index * 1_000_000_000,
+                            "session_id": "single",
+                            "event": event,
+                        }
+                    )
+                    + "\n"
+                    for index, event in enumerate(events)
+                ),
+                encoding="utf-8",
+            )
+            native, error = _native_trace_metrics(path)
+            self.assertIsNone(error)
+            self.assertIsNotNone(native)
+            assert native is not None
+            self.assertFalse(native["complete"])
+            self.assertEqual(native["stop_reasons"], ["incomplete"])
+            self.assertEqual(native["metrics"]["model_request_count"], 2)
+            self.assertEqual(native["metrics"]["compact_request_count"], 1)
+            self.assertEqual(native["metrics"]["context_projection_count"], 1)
+            self.assertEqual(native["metrics"]["context_projected_bytes"], 600)
+            self.assertEqual(native["metrics"]["wall_time_ms"], 6000)
+            self.assertEqual(native["metrics"]["cost_usd"], 0.01)
+
+            path.write_text('{"schema_version":3}', encoding="utf-8")
+            native, error = _native_trace_metrics(path)
+            self.assertIsNone(native)
+            self.assertIn("partial line", error)
 
     def test_native_trace_rejects_orphan_policy_and_impossible_latency(self):
         metadata = {
@@ -798,6 +1042,8 @@ class E2EAdapterTest(unittest.TestCase):
                 harness_revision="abc",
                 permission_mode="default",
                 binary_path=binary,
+                max_metered_tokens=1234,
+                max_cost_usd=5.5,
             )
             self.assertIsNotNone(metadata)
             assert metadata is not None
@@ -820,6 +1066,16 @@ class E2EAdapterTest(unittest.TestCase):
                         "attempt": 0,
                         "elapsed_ms": 30,
                         "outcome": "success",
+                    }
+                },
+                {
+                    "compact_request_finished": {
+                        "trace_id": "trace",
+                        "depth": 0,
+                        "turn": 1,
+                        "elapsed_ms": 11,
+                        "outcome": "success",
+                        "cause": "post_tool_follow_up_threshold",
                     }
                 },
                 {
@@ -883,7 +1139,7 @@ class E2EAdapterTest(unittest.TestCase):
                         "turns": 1,
                         "tool_calls": 1,
                         "stop_reason": "end_turn",
-                        "wall_time_ms": 42,
+                        "wall_time_ms": 50,
                         "dropped_events": 0,
                     }
                 },
@@ -918,12 +1174,19 @@ class E2EAdapterTest(unittest.TestCase):
             )
             self.assertEqual(rollout["run_id"], "native:smoke:0")
             self.assertEqual(rollout["model"]["fingerprint"], metadata["model_fingerprint"])
+            self.assertEqual(
+                rollout["harness"]["runtime_budget"],
+                {"max_metered_tokens": 1234, "max_cost_usd": 5.5},
+            )
             self.assertEqual(rollout["metrics"]["cost_usd"], 0.001)
-            self.assertEqual(rollout["metrics"]["wall_time_ms"], 42)
-            self.assertEqual(rollout["metrics"]["model_request_time_ms"], 30)
+            self.assertEqual(rollout["metrics"]["wall_time_ms"], 50)
+            self.assertEqual(rollout["metrics"]["model_request_time_ms"], 41)
+            self.assertEqual(rollout["metrics"]["model_request_count"], 2)
+            self.assertEqual(rollout["metrics"]["compact_request_count"], 1)
+            self.assertEqual(rollout["metrics"]["compact_request_time_ms"], 11)
             self.assertEqual(rollout["metrics"]["tool_stage_time_ms"], 5)
-            self.assertEqual(rollout["metrics"]["harness_time_ms"], 7)
-            self.assertEqual(rollout["metrics"]["model_request_outcomes"], {"success": 1})
+            self.assertEqual(rollout["metrics"]["harness_time_ms"], 4)
+            self.assertEqual(rollout["metrics"]["model_request_outcomes"], {"success": 2})
             self.assertEqual(rollout["metrics"]["policy_violations"], 0)
             self.assertTrue(rollout["judgement"]["trustworthy_success"])
 

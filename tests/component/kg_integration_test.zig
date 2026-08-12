@@ -5,6 +5,7 @@
 //! 找不到二进制(CI 无 tinykg)→ SkipZigTest(不是失败:KG 是增强非依赖)。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const cc = @import("cc");
 
 const KgClient = cc.kg_client.KgClient;
@@ -37,6 +38,41 @@ fn isX(path: []const u8) bool {
     return std.c.access(buf[0..path.len :0].ptr, std.c.X_OK) == 0;
 }
 
+fn overwriteFile(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const file = std.c.fopen(path_z.ptr, "w") orelse return error.WriteFailed;
+    defer _ = std.c.fclose(file);
+    if (bytes.len > 0 and std.c.fwrite(bytes.ptr, 1, bytes.len, file) != bytes.len) return error.WriteFailed;
+}
+
+fn pathExists(path: []const u8) bool {
+    var path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (path.len >= path_buf.len) return false;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    return @import("platform").fs.exists(@ptrCast(&path_buf));
+}
+
+fn unlinkPath(path: []const u8) !void {
+    var path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (path.len >= path_buf.len) return error.PathTooLong;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    if (std.c.unlink(@ptrCast(&path_buf)) != 0) return error.UnlinkFailed;
+}
+
+fn renamePathForTest(from: []const u8, to: []const u8) !void {
+    var from_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    var to_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (from.len >= from_buf.len or to.len >= to_buf.len) return error.PathTooLong;
+    @memcpy(from_buf[0..from.len], from);
+    from_buf[from.len] = 0;
+    @memcpy(to_buf[0..to.len], to);
+    to_buf[to.len] = 0;
+    if (@import("platform").fs.renameReplace(@ptrCast(&from_buf), @ptrCast(&to_buf)) != 0) return error.RenameFailed;
+}
+
 /// 建一个用临时 store + 指定 bin 的 KgClient(绕过 env,直接注入路径)。
 fn makeClient(a: std.mem.Allocator, bin: []const u8, store: []const u8, domain: []const u8) !KgClient {
     return KgClient.init(a, .{
@@ -47,6 +83,21 @@ fn makeClient(a: std.mem.Allocator, bin: []const u8, store: []const u8, domain: 
         .env_bin = "", // 屏蔽真实 env
         .env_store = "",
     });
+}
+
+fn neighborTargetContains(a: std.mem.Allocator, kg: *KgClient, node_id: u64, needle: []const u8) !bool {
+    const payload = try kg.neighborsJson(node_id, 100);
+    defer a.free(payload);
+    const Edge = struct { dst: u64 };
+    const Envelope = struct { edges: []const Edge };
+    const parsed = try std.json.parseFromSlice(Envelope, a, payload, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    for (parsed.value.edges) |edge| {
+        const text = kg.fetchNodeText(edge.dst) catch continue;
+        defer kg.allocator.free(text);
+        if (std.mem.indexOf(u8, text, needle) != null) return true;
+    }
+    return false;
 }
 
 test "L2 KG: ensureReady 建店 + 版本门通过 + remember/recall 往返" {
@@ -70,7 +121,7 @@ test "L2 KG: ensureReady 建店 + 版本门通过 + remember/recall 往返" {
     }
 
     // remember → 返回 node id。
-    const id = try kg.remember(.decision, "用 depends_on 链编码串行步骤,revise 成 verification 闭合", "decision", false);
+    const id = try kg.remember(.decision, "用 depends_on 链编码串行步骤,完成时保留任务原文并连接独立 verification", "decision", false);
     try std.testing.expect(id > 0);
 
     // recall 命中(BM25;domain 过滤=proj-alpha)。
@@ -122,7 +173,7 @@ test "L2 KG: listRecentMemories 按 id 降序枚举最近(替虚词 hack)" {
     try std.testing.expect(std.mem.indexOf(u8, hits[0].text, "gamma") != null);
 }
 
-test "L2 KG: scoped 自动召回 — 相关请求注入、无关请求不注入(相关性门,L0 双侧)" {
+test "L2 KG governance: scoped recall exposes stable node ids and candidate-only guidance" {
     const a = std.testing.allocator;
     const bin = findBin(a) orelse return error.SkipZigTest;
     defer a.free(bin);
@@ -139,7 +190,7 @@ test "L2 KG: scoped 自动召回 — 相关请求注入、无关请求不注入(
     kg.ensureReady();
     if (!kg.ready) return error.SkipZigTest;
 
-    _ = try kg.remember(.observation, "src/kg/client.zig 用子进程驱动 tinykg 集成,进程隔离崩溃", "module", false);
+    const memory_id = try kg.remember(.observation, "src/kg/client.zig 用子进程驱动 tinykg 集成,进程隔离崩溃", "module", false);
 
     var ab = cc.abort.AbortSignal.init();
 
@@ -151,7 +202,19 @@ test "L2 KG: scoped 自动召回 — 相关请求注入、无关请求不注入(
         const inj = try cc.kg_scoped_recall.build(a, &kg, &conv, &ab);
         defer if (inj) |s| a.free(s);
         try std.testing.expect(inj != null);
+        const expected_id = try std.fmt.allocPrint(a, "node_id={d}", .{memory_id});
+        defer a.free(expected_id);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, expected_id) != null);
         try std.testing.expect(std.mem.indexOf(u8, inj.?, "子进程") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "candidate, not a current fact") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "KgContext(node_id)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "one untyped raw-message lexical BM25 probe") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "exact canonical alias/symbol") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "exact/high-precision") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "强制下一步 / MANDATORY NEXT ACTION") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "只能包含该精确词和用户已要求的字段名") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "2-4 个彼此分开的紧凑语义变体") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "机制、症状、期望结果、邻近实现") != null);
     }
     // 负向:零重合无关请求 → 不注入(相关性门挡答案缺席噪声;PM P0 逼可证伪的两侧测试)。
     {
@@ -394,6 +457,318 @@ test "L2 KG: 注入段经 inject_user_context 进请求体(字节断言,DoD)" {
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "KgRecall") != null);
 }
 
+test "L2 KG governance: freshness and contradiction contract enters the actual API request" {
+    const a = std.testing.allocator;
+
+    var srv = try harness.MockServer.start(KG_END_TURN_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    const io = io_runtime.io();
+
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io, "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    const names = [_][]const u8{ "KgRemember", "KgRecall", "KgContext", "TaskList", "TaskGet", "TaskUpdate" };
+    const system_prompt = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &names, "", true, "/tmp");
+    defer a.free(system_prompt);
+    // 生产 App 用 session arena 承载 defs + describe_fn 动态描述；测试保持同一生命周期，
+    // 避免只 free defs slice 却漏掉各工具 owned description。
+    var defs_arena = std.heap.ArenaAllocator.init(a);
+    defer defs_arena.deinit();
+    var pc = cc.tools.PromptContext{ .enabled_tool_names = &names };
+    const defs = try cc.tools.toToolDefinitionsFull(defs_arena.allocator(), null, &pc);
+    // Production always supplies the session activation set. Keep it empty here so the request
+    // proves the real deferred-tool boundary: ToolSearch is visible, FormalAuditTask is not yet.
+    var activated_tools = std.StringHashMap(void).init(a);
+    defer activated_tools.deinit();
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "continue the earlier recovery work");
+
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var wb = cc.writer_backend.WriterBackend.initNull();
+    const be = wb.backend();
+    const result = cc.agent_loop.run(&conv, client.provider(), defs, &perm, .{
+        .max_turns = 1,
+        .system_prompt = system_prompt,
+        .activated_tools = &activated_tools,
+    }, &be, a) catch |e| {
+        std.debug.print("agent_loop.run failed: {s}\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+
+    const cap = srv.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "computes no embeddings or vector distance") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "ALIAS BRANCH HAS PRIORITY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "MUST contain only that exact term plus field names") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "EXACT/HIGH-PRECISION SEED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "RECORD THE PLAN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "lexical-query-plan-v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "stable plan_sha256 plus host-measured new/repeated hit counts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "rejects invented, omitted, cross-plan, or stale ids before search") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "2-4 separate compact semantic variants") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "make at most four semantic-variant calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "mechanism, symptom, desired outcome, or nearby implementation term") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Deduplicate candidates by node_id across every call") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "KgContext") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Stop as soon as authoritative evidence and any required current-state check are sufficient") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Memory is a candidate, not a current fact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "verified_by or evidences") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "deprecated_by, resolved_by, and contradiction") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "current code, git, tests, or external state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "FIRST inspect automatic recall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Omit on the exact/high-precision seed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Persistent task control-plane algorithm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "A successful claim returns a bounded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "A title or compact summary alone is insufficient") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "experience_packet") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "preserve tentative/confirmed state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "never leave finished work claimed/open") != null);
+
+    // KgRecall/Write remain directly callable. FormalAuditTask is genuinely deferred, so
+    // ToolSearch is advertised as its activation gate while the full formal schema stays absent.
+    const tools_field = cap.jsonField("tools") orelse return error.ToolsFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"KgRecall\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"lexical_plan\":{\"type\":\"object\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"schema_version\":{\"type\":\"string\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"enum\":[\"lexical-query-plan-v1\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"variants\":{\"type\":\"array\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"seen_node_ids\":{\"type\":\"array\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"KgContext\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "authoritative node text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "bounded TinyKG task_packet") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "select only an open, ready, unclaimed leaf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "successful response contains the bounded task_packet") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"Write\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"ToolSearch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"FormalAuditTask\"") == null);
+}
+
+test "L2 KG governance: lexical query plan binds variants and measures information gain" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kg-guidance.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-guidance");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+    const memory_id = try kg.remember(.decision, "panic 时通过 checkpoint 恢复任务", "decision", false);
+
+    var ledger = @import("cc").kg_lexical_query_plan.Ledger{};
+    const ctx = @import("cc").tool_context.ToolContext{ .allocator = a, .kg = &kg, .kg_lexical_ledger = &ledger };
+    const first_args =
+        \\{"query":"panic crash checkpoint","lexical_plan":{"schema_version":"lexical-query-plan-v1","intent":"task_recovery","stage":"semantic_expansion","variants":[{"kind":"paraphrase","text":"panic crash checkpoint"},{"kind":"mechanism","text":"checkpoint recovery"}],"variant_index":0,"seen_node_ids":[]}}
+    ;
+    const first_out = try @import("cc").kg_tools.executeRecall(&ctx, first_args);
+    defer a.free(first_out);
+    var first_parsed = try std.json.parseFromSlice(std.json.Value, a, first_out, .{});
+    defer first_parsed.deinit();
+    const first_receipt = first_parsed.value.object.get("lexical_query_plan").?.object;
+    try std.testing.expectEqualStrings("lexical-query-plan-v1", first_receipt.get("schema_version").?.string);
+    try std.testing.expectEqualStrings("task_recovery", first_receipt.get("intent").?.string);
+    try std.testing.expectEqualStrings("semantic_expansion", first_receipt.get("stage").?.string);
+    try std.testing.expectEqualStrings("paraphrase", first_receipt.get("variant_kind").?.string);
+    try std.testing.expectEqual(@as(i64, 0), first_receipt.get("variant_index").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), first_receipt.get("variant_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), first_receipt.get("repeated_hit_count").?.integer);
+    try std.testing.expect(first_receipt.get("new_hit_count").?.integer >= 1);
+    try std.testing.expectEqual(@as(usize, 64), first_receipt.get("plan_sha256").?.string.len);
+    var first_found = false;
+    for (first_parsed.value.object.get("hits").?.array.items) |hit| {
+        if (hit.object.get("node_id").?.integer != @as(i64, @intCast(memory_id))) continue;
+        first_found = true;
+        try std.testing.expect(!hit.object.get("seen_before").?.bool);
+    }
+    try std.testing.expect(first_found);
+
+    var seen_ids_json: std.ArrayList(u8) = .empty;
+    defer seen_ids_json.deinit(a);
+    for (first_parsed.value.object.get("hits").?.array.items, 0..) |hit, index| {
+        if (index > 0) try seen_ids_json.append(a, ',');
+        const id_text = try std.fmt.allocPrint(a, "{d}", .{hit.object.get("node_id").?.integer});
+        defer a.free(id_text);
+        try seen_ids_json.appendSlice(a, id_text);
+    }
+
+    // The model cannot omit ids that the host actually returned. This check
+    // happens before the TinyKG search and is the trust boundary for the
+    // information-gain receipt.
+    var state_detail: ?[]const u8 = null;
+    defer if (state_detail) |value| a.free(value);
+    const state_ctx = @import("cc").tool_context.ToolContext{
+        .allocator = a,
+        .kg = &kg,
+        .kg_lexical_ledger = &ledger,
+        .error_detail = &state_detail,
+    };
+    const omitted_args =
+        \\{"query":"checkpoint recovery","lexical_plan":{"schema_version":"lexical-query-plan-v1","intent":"task_recovery","stage":"semantic_expansion","variants":[{"kind":"paraphrase","text":"panic crash checkpoint"},{"kind":"mechanism","text":"checkpoint recovery"}],"variant_index":1,"seen_node_ids":[]}}
+    ;
+    // Poison the executable only for this call. Invalid seen state must still
+    // return the ledger error, proving the real executeRecall path rejected it
+    // before attempting a TinyKG subprocess.
+    {
+        const saved_bin = kg.bin_path;
+        const poisoned_bin = try a.dupe(u8, "/definitely/missing/tinykg-ledger-must-reject-first");
+        kg.bin_path = poisoned_bin;
+        defer {
+            kg.bin_path = saved_bin;
+            a.free(poisoned_bin);
+        }
+        try std.testing.expectError(error.InvalidLexicalPlanState, @import("cc").kg_tools.executeRecall(&state_ctx, omitted_args));
+    }
+    try std.testing.expect(state_detail != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_detail.?, "does not exactly match the host ledger") != null);
+
+    const second_template =
+        \\{"query":"checkpoint recovery","lexical_plan":{"schema_version":"lexical-query-plan-v1","intent":"task_recovery","stage":"semantic_expansion","variants":[{"kind":"paraphrase","text":"panic crash checkpoint"},{"kind":"mechanism","text":"checkpoint recovery"}],"variant_index":1,"seen_node_ids":[__SEEN_IDS__]}}
+    ;
+    const second_args = try std.mem.replaceOwned(u8, a, second_template, "__SEEN_IDS__", seen_ids_json.items);
+    defer a.free(second_args);
+    const second_out = try @import("cc").kg_tools.executeRecall(&ctx, second_args);
+    defer a.free(second_out);
+    var second_parsed = try std.json.parseFromSlice(std.json.Value, a, second_out, .{});
+    defer second_parsed.deinit();
+    const second_receipt = second_parsed.value.object.get("lexical_query_plan").?.object;
+    try std.testing.expectEqualStrings(first_receipt.get("plan_sha256").?.string, second_receipt.get("plan_sha256").?.string);
+    try std.testing.expectEqualStrings("mechanism", second_receipt.get("variant_kind").?.string);
+    try std.testing.expectEqual(@as(i64, 1), second_receipt.get("variant_index").?.integer);
+    try std.testing.expect(second_receipt.get("seen_state_verified").?.bool);
+    try std.testing.expectEqualStrings("agent_run_plan", second_receipt.get("ledger_scope").?.string);
+    try std.testing.expect(second_receipt.get("repeated_hit_count").?.integer >= 1);
+    var repeated_found = false;
+    for (second_parsed.value.object.get("hits").?.array.items) |hit| {
+        if (hit.object.get("node_id").?.integer != @as(i64, @intCast(memory_id))) continue;
+        repeated_found = true;
+        try std.testing.expect(hit.object.get("seen_before").?.bool);
+    }
+    try std.testing.expect(repeated_found);
+
+    try std.testing.expect(std.mem.indexOf(u8, first_out, "\"retrieval_mode\":\"lexical_bm25_no_embeddings\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_out, "Semantically judge these lexical candidates") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_out, "deduplicate node_id values across calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_out, "KgContext") != null);
+
+    var detail: ?[]const u8 = null;
+    defer if (detail) |value| a.free(value);
+    const bad_ctx = @import("cc").tool_context.ToolContext{ .allocator = a, .kg = &kg, .error_detail = &detail };
+    try std.testing.expectError(error.InvalidLexicalPlan, @import("cc").kg_tools.executeRecall(
+        &bad_ctx,
+        "{\"query\":\"mismatch\",\"lexical_plan\":{\"schema_version\":\"lexical-query-plan-v1\",\"intent\":\"fact_lookup\",\"stage\":\"seed\",\"variants\":[{\"kind\":\"exact\",\"text\":\"needle\"}],\"variant_index\":0,\"seen_node_ids\":[]}}",
+    ));
+    try std.testing.expect(detail != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.?, "must exactly match") != null);
+
+    var no_ledger_detail: ?[]const u8 = null;
+    defer if (no_ledger_detail) |value| a.free(value);
+    const no_ledger_ctx = @import("cc").tool_context.ToolContext{ .allocator = a, .kg = &kg, .error_detail = &no_ledger_detail };
+    try std.testing.expectError(error.LexicalPlanLedgerUnavailable, @import("cc").kg_tools.executeRecall(&no_ledger_ctx, first_args));
+    try std.testing.expect(std.mem.indexOf(u8, no_ledger_detail.?, "fail closed") != null);
+
+    try std.testing.expectError(error.InvalidQuery, @import("cc").kg_tools.executeRecall(&ctx, "{\"query\":\"\"}"));
+    try std.testing.expectError(error.InvalidQuery, @import("cc").kg_tools.executeRecall(&ctx, "{\"query\":7}"));
+    const long_query = [_]u8{'x'} ** 401;
+    const long_args = try std.fmt.allocPrint(a, "{{\"query\":\"{s}\"}}", .{&long_query});
+    defer a.free(long_args);
+    try std.testing.expectError(error.InvalidQuery, @import("cc").kg_tools.executeRecall(&ctx, long_args));
+}
+
+test "L2 KG governance: KgContext emits evidence, freshness, and supersession signals" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kg-context.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-context");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const old_id = try kg.remember(.decision, "authoritative-policy=quartz-16; superseded generation", "decision", false);
+    const root_id = try kg.remember(.decision, "authoritative-policy=quartz-17; verify connected evidence", "decision", false);
+    const evidence_id = try kg.remember(.observation, "evidence: approved after concurrency replay", "observation", false);
+    try kg.addEdge(root_id, "derived_from", evidence_id);
+    try kg.addEdge(root_id, "verified_by", evidence_id);
+    try kg.addEdge(old_id, "deprecated_by", root_id);
+
+    const ctx = @import("cc").tool_context.ToolContext{ .allocator = a, .kg = &kg };
+    const args = try std.fmt.allocPrint(a, "{{\"node_id\":{d},\"limit\":5,\"text_offset\":0,\"text_limit\":16}}", .{root_id});
+    defer a.free(args);
+    const out = try @import("cc").kg_tools.executeContext(&ctx, args);
+    defer a.free(out);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, @intCast(root_id)), obj.get("node_id").?.integer);
+    try std.testing.expectEqualStrings("authoritative-po", obj.get("text").?.string);
+    try std.testing.expectEqual(@as(i64, 0), obj.get("text_offset").?.integer);
+    try std.testing.expectEqual(@as(i64, 16), obj.get("next_text_offset").?.integer);
+    try std.testing.expect(obj.get("text_truncated").?.bool);
+    const graph = obj.get("graph").?.object;
+    try std.testing.expectEqualStrings("tinykg-agent-retrieval-v1", graph.get("schema_version").?.string);
+    try std.testing.expectEqualStrings("neighbors", graph.get("mode").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"rel\":\"derived_from\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Inspect connected evidence nodes with KgContext") != null);
+    const governance = obj.get("knowledge_governance").?.object;
+    try std.testing.expectEqualStrings("metacodes-knowledge-governance-v1", governance.get("schema_version").?.string);
+    try std.testing.expect(governance.get("current_generation").?.bool);
+    try std.testing.expect(governance.get("deprecated_by").? == .null);
+    try std.testing.expectEqual(@as(i64, 1), governance.get("verification_edge_count").?.integer);
+    try std.testing.expectEqualStrings("evidence_connected_candidate", governance.get("trust_state").?.string);
+    try std.testing.expectEqualStrings("unknown_requires_current_state_check", governance.get("freshness_state").?.string);
+    try std.testing.expectEqualStrings("candidate_only", governance.get("usage").?.string);
+
+    const old_args = try std.fmt.allocPrint(a, "{{\"node_id\":{d},\"limit\":20}}", .{old_id});
+    defer a.free(old_args);
+    const old_out = try @import("cc").kg_tools.executeContext(&ctx, old_args);
+    defer a.free(old_out);
+    var old_parsed = try std.json.parseFromSlice(std.json.Value, a, old_out, .{});
+    defer old_parsed.deinit();
+    const old_governance = old_parsed.value.object.get("knowledge_governance").?.object;
+    try std.testing.expect(!old_governance.get("current_generation").?.bool);
+    try std.testing.expectEqual(@as(i64, @intCast(root_id)), old_governance.get("deprecated_by").?.integer);
+    try std.testing.expectEqualStrings("superseded", old_governance.get("trust_state").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, old_out, "do not use memory as a current fact") != null);
+
+    var detail: ?[]const u8 = null;
+    defer if (detail) |d| a.free(d);
+    const bad_ctx = @import("cc").tool_context.ToolContext{ .allocator = a, .kg = &kg, .error_detail = &detail };
+    try std.testing.expectError(error.InvalidLimit, @import("cc").kg_tools.executeContext(&bad_ctx, "{\"node_id\":1,\"limit\":21}"));
+    try std.testing.expect(detail != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.?, "1..20") != null);
+    a.free(detail.?);
+    detail = null;
+    try std.testing.expectError(error.InvalidLimit, @import("cc").kg_tools.executeContext(&bad_ctx, "{\"node_id\":1,\"limit\":0}"));
+    try std.testing.expect(detail != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.?, "1..20") != null);
+    a.free(detail.?);
+    detail = null;
+    try std.testing.expectError(error.InvalidLimit, @import("cc").kg_tools.executeContext(&bad_ctx, "{\"node_id\":1,\"text_limit\":1}"));
+    try std.testing.expect(detail != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.?, "4..12000") != null);
+}
+
 test "L2 KG: 版本门 — degraded 明示且不 spawn" {
     const a = std.testing.allocator;
     // 故意给不存在的二进制 → degraded,ensureReady 不崩,recall 返回 Degraded。
@@ -411,6 +786,150 @@ test "L2 KG: 版本门 — degraded 明示且不 spawn" {
     try std.testing.expect(kg.degradedMessage().len > 0);
     // degraded 后调用直接返回 Degraded(不 spawn)。
     try std.testing.expectError(cc.kg_client.KgError.Degraded, kg.recall("x", 5, false));
+}
+
+test "L2 KG: schema v2 明确 degraded 并给 copy-on-write task-status-v1 迁移指令" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/legacy-schema.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    // 先用当前 binary 建合法 store，再只把 manifest schema 降为 2，模拟迁移前 canonical store。
+    {
+        var current = try makeClient(a, bin, store, "proj-schema-gate");
+        defer current.deinit();
+        current.ensureReady();
+        if (!current.ready) return error.SkipZigTest;
+    }
+    const manifest_path = try std.fmt.allocPrint(a, "{s}/.tinykg/store-manifest.json", .{store});
+    defer a.free(manifest_path);
+    try overwriteFile(a, manifest_path,
+        \\{
+        \\  "store_manifest_version": 1,
+        \\  "storage_format_version": 2,
+        \\  "created_by": "tinykg",
+        \\  "schema": {"schema_version": 2, "kernel_version": 1, "enabled_profiles": []},
+        \\  "migration": {"name": "legacy-test", "source": "", "recorded_ns": 1}
+        \\}
+    );
+
+    var legacy = try makeClient(a, bin, store, "proj-schema-gate");
+    defer legacy.deinit();
+    legacy.ensureReady();
+    try std.testing.expect(!legacy.ready);
+    const reason = legacy.degradedMessage();
+    try std.testing.expect(std.mem.indexOf(u8, reason, "期望 3 实际 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reason, "migrate-store-v2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reason, "--task-status-v1 --verify") != null);
+}
+
+test "L2 KG migrate: legacy canonical 自动迁移并保留 rollback backup" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/auto-legacy.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    // 用当前 binary 创建结构正确的店，再移除 manifest，机械模拟 legacy store。
+    {
+        var current = try makeClient(a, bin, store, "proj-auto-migrate");
+        defer current.deinit();
+        current.ensureReady();
+        if (!current.ready) return error.SkipZigTest;
+    }
+    const manifest = try std.fmt.allocPrint(a, "{s}/.tinykg/store-manifest.json", .{store});
+    defer a.free(manifest);
+    try unlinkPath(manifest);
+
+    var migrated = try makeClient(a, bin, store, "proj-auto-migrate");
+    defer migrated.deinit();
+    migrated.ensureReady();
+    try std.testing.expect(migrated.ready);
+    const backup = try std.fmt.allocPrint(a, "{s}.legacy.bak", .{store});
+    defer a.free(backup);
+    try std.testing.expect(pathExists(store));
+    try std.testing.expect(pathExists(backup));
+}
+
+test "L2 KG migrate: canonical rename 后崩溃窗口由 backup 恢复且不会 init 空店" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/recover-legacy.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+    {
+        var current = try makeClient(a, bin, store, "proj-auto-recover");
+        defer current.deinit();
+        current.ensureReady();
+        if (!current.ready) return error.SkipZigTest;
+    }
+    const manifest = try std.fmt.allocPrint(a, "{s}/.tinykg/store-manifest.json", .{store});
+    defer a.free(manifest);
+    try unlinkPath(manifest);
+    const backup = try std.fmt.allocPrint(a, "{s}.legacy.bak", .{store});
+    defer a.free(backup);
+    // 精确模拟 host 已把 canonical 改名为 backup、尚未调用 provider/tinykg 的崩溃窗。
+    try renamePathForTest(store, backup);
+    try std.testing.expect(!pathExists(store));
+
+    var recovered = try makeClient(a, bin, store, "proj-auto-recover");
+    defer recovered.deinit();
+    recovered.ensureReady();
+    try std.testing.expect(recovered.ready);
+    try std.testing.expect(pathExists(store));
+    try std.testing.expect(pathExists(backup));
+}
+
+test "L2 KG migrate: TinyKG 发布失败时恢复 legacy 且 session fail closed" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/failed-legacy.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+    {
+        var current = try makeClient(a, bin, store, "proj-auto-fail");
+        defer current.deinit();
+        current.ensureReady();
+        if (!current.ready) return error.SkipZigTest;
+    }
+    const manifest = try std.fmt.allocPrint(a, "{s}/.tinykg/store-manifest.json", .{store});
+    defer a.free(manifest);
+    try unlinkPath(manifest);
+
+    // TinyKG 只会回收带 request-matched marker 的 staging；外来目录必须拒绝。
+    const foreign_staging = try std.fmt.allocPrint(a, "{s}.tinykg-migrate-store-v2.tmp", .{store});
+    defer a.free(foreign_staging);
+    const staging_z = try a.dupeZ(u8, foreign_staging);
+    defer a.free(staging_z);
+    if (std.c.mkdir(staging_z.ptr, 0o700) != 0) return error.MkdirFailed;
+
+    var failed = try makeClient(a, bin, store, "proj-auto-fail");
+    defer failed.deinit();
+    failed.ensureReady();
+    try std.testing.expect(!failed.ready);
+    try std.testing.expect(pathExists(store)); // rollback 恢复原店，不留下 canonical 缺口
+    const backup = try std.fmt.allocPrint(a, "{s}.legacy.bak", .{store});
+    defer a.free(backup);
+    try std.testing.expect(!pathExists(backup));
+    try std.testing.expect(std.mem.indexOf(u8, failed.degradedMessage(), "自动 migrate 失败") != null);
 }
 
 test "L2 KG: plan 落图 → frontier → 闭合解锁(DAG 驱动全链)" {
@@ -460,6 +979,67 @@ test "L2 KG: plan 落图 → frontier → 闭合解锁(DAG 驱动全链)" {
 
     // 闭合步骤1 → 步骤2 应自动变 ready。
     try kg.closeTask(step1_id, "步骤1完成:代码已读");
+
+    // 长程控制面不允许闭合证据覆盖任务身份:原步骤文本仍在同一 id，证据通过
+    // verified_by 独立挂接；task-packet/get/neighbors 因此能同时恢复“做什么”、
+    // “完成状态”和“凭什么完成”。
+    try std.testing.expectEqual(cc.kg_client.TaskStatus.completed, try kg.taskStatus(step1_id));
+    const packet = try kg.taskPacket(step1_id, 20);
+    defer kg.allocator.free(packet);
+    try std.testing.expect(std.mem.startsWith(u8, packet, "task_packet\t"));
+    try std.testing.expect(std.mem.indexOf(u8, packet, "\tstatus=completed\t") != null);
+    try std.testing.expect(std.mem.indexOf(u8, packet, "\ttask\t读现有代码") != null);
+    try std.testing.expect(std.mem.indexOf(u8, packet, "verified_by_out") != null);
+    try std.testing.expect(std.mem.indexOf(u8, packet, "completion evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, packet, "代码已读") != null);
+    const closed_text = try kg.fetchNodeText(step1_id);
+    defer kg.allocator.free(closed_text);
+    try std.testing.expectEqualStrings("读现有代码", std.mem.trim(u8, closed_text, " \t\r\n"));
+    const closed_graph = try kg.neighborsJson(step1_id, 20);
+    defer kg.allocator.free(closed_graph);
+    var closed_json = try std.json.parseFromSlice(std.json.Value, a, closed_graph, .{});
+    defer closed_json.deinit();
+    const closed_root = closed_json.value.object.get("root") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("task", closed_root.object.get("kind").?.string);
+    var evidence_id: u64 = 0;
+    for (closed_json.value.object.get("edges").?.array.items) |edge| {
+        const obj = edge.object;
+        if (std.mem.eql(u8, obj.get("rel").?.string, "verified_by")) {
+            evidence_id = @intCast(obj.get("dst").?.integer);
+        }
+    }
+    try std.testing.expect(evidence_id != 0);
+    const evidence_text = try kg.fetchNodeText(evidence_id);
+    defer kg.allocator.free(evidence_text);
+    try std.testing.expect(std.mem.indexOf(u8, evidence_text, "步骤1完成:代码已读") != null);
+
+    // 幂等完成:重复 close 不新建 verification/边，也不生成 deprecated_by 版本链。
+    try kg.closeTask(step1_id, "重复调用应 no-op");
+    const closed_graph_again = try kg.neighborsJson(step1_id, 20);
+    defer kg.allocator.free(closed_graph_again);
+    var verified_by_count: usize = 0;
+    var scan: usize = 0;
+    while (std.mem.indexOfPos(u8, closed_graph_again, scan, "\"rel\":\"verified_by\"")) |pos| {
+        verified_by_count += 1;
+        scan = pos + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), verified_by_count);
+
+    // fresh restart 不依赖进程内缓存：同一稳定 task id 仍能恢复 completed packet/原文/证据。
+    {
+        var fresh = try makeClient(a, bin, store, "proj-plan");
+        defer fresh.deinit();
+        fresh.ensureReady();
+        try std.testing.expect(fresh.ready);
+        try std.testing.expectEqual(cc.kg_client.TaskStatus.completed, try fresh.taskStatus(step1_id));
+        const fresh_packet = try fresh.taskPacket(step1_id, 20);
+        defer fresh.allocator.free(fresh_packet);
+        try std.testing.expect(std.mem.indexOf(u8, fresh_packet, "读现有代码") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fresh_packet, "verified_by_out") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fresh_packet, "completion evidence") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fresh_packet, "代码已读") != null);
+    }
+
     const rows2 = try kg.frontier(r.root_id, 10);
     defer {
         for (rows2) |*row| row.deinit(a);
@@ -559,11 +1139,386 @@ test "L2 KG: DAG 驱动闭环经工具 — TaskList 呈现 frontier + TaskUpdate
     try std.testing.expect(std.mem.indexOf(u8, upd, "\"closed\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, upd, "\"subject\":\"B\"") != null); // B 解锁进 next
 
-    // A 已闭合退出 frontier;再 TaskList 不应再含 subject "A"(它现在是 verification)。
+    // A 已闭合退出 frontier；稳定 task 本身仍可由 TaskGet/task-packet 按原 id 恢复。
     const list2 = try task_tools.executeList(&ctx, "{}");
     defer a.free(list2);
     try std.testing.expect(std.mem.indexOf(u8, list2, "\"subject\":\"A\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, list2, "\"subject\":\"B\"") != null);
+    const get_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\"}}", .{a_id});
+    defer a.free(get_args);
+    const closed_task = try task_tools.executeGet(&ctx, get_args);
+    defer a.free(closed_task);
+    try std.testing.expect(std.mem.indexOf(u8, closed_task, "\"subject\":\"A\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, closed_task, "\"kg_status\":\"completed\"") != null);
+}
+
+test "L2 KG: failed 是显式终态 — frontier/TaskList 保留失败上下文且不解锁父任务" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const proj_dir = pbuf[0..dir_len];
+    const store = try std.fmt.allocPrint(a, "{s}/kgfailed.kg", .{proj_dir});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-failed");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const root = try kg.createTask("失败传播计划", "plan_root");
+    const child = try kg.createChildTask(root, "不可恢复的步骤", "plan_step");
+    const cancelled = try kg.createChildTask(root, "主动取消的步骤", "plan_step");
+    try cc.kg_inject.writeIdPointer(a, proj_dir, "kg_root", root);
+
+    const TaskStore = cc.core_task_store.TaskStore;
+    var tasks = TaskStore.init(a);
+    defer tasks.deinit();
+    const ctx = cc.tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &tasks,
+        .kg = &kg,
+        .kg_projects_dir = proj_dir,
+    };
+    const fail_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"failed\",\"conclusion\":\"验证发现产物不可用\"}}", .{child});
+    defer a.free(fail_args);
+    const fail_response = try cc.task_tools.executeUpdate(&ctx, fail_args);
+    defer a.free(fail_response);
+    try std.testing.expect(std.mem.indexOf(u8, fail_response, "\"kg_status\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fail_response, "\"preserved\":true") != null);
+
+    // 旧 deleted 调用在 KG 路由上只作 failed 兼容别名，不能物理删除稳定 id。
+    const deleted_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"deleted\",\"conclusion\":\"用户取消\"}}", .{cancelled});
+    defer a.free(deleted_args);
+    const deleted_response = try cc.task_tools.executeUpdate(&ctx, deleted_args);
+    defer a.free(deleted_response);
+    try std.testing.expect(std.mem.indexOf(u8, deleted_response, "\"kg_status\":\"failed\"") != null);
+    try std.testing.expectEqual(cc.kg_client.TaskStatus.failed, try kg.taskStatus(cancelled));
+    const cancelled_packet = try kg.taskPacket(cancelled, 20);
+    defer kg.allocator.free(cancelled_packet);
+    try std.testing.expect(std.mem.indexOf(u8, cancelled_packet, "主动取消的步骤") != null);
+
+    try std.testing.expectEqual(cc.kg_client.TaskStatus.failed, try kg.taskStatus(child));
+    const packet = try kg.taskPacket(child, 20);
+    defer kg.allocator.free(packet);
+    try std.testing.expect(std.mem.indexOf(u8, packet, "status=failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, packet, "不可恢复的步骤") != null);
+    try std.testing.expect(std.mem.indexOf(u8, packet, "failure evidence") != null);
+
+    const rows = try kg.frontier(root, 20);
+    defer {
+        for (rows) |*row| row.deinit(kg.allocator);
+        kg.allocator.free(rows);
+    }
+    var found_failed = false;
+    for (rows) |row| {
+        if (row.task_id == child and row.role == .failed and row.status == .failed and row.readiness == .blocked) {
+            found_failed = true;
+        }
+    }
+    try std.testing.expect(found_failed);
+
+    // failed child 不算 completed：父 branch 仍不可 claim，且错误必须归 data 而非瞬时重试。
+    try std.testing.expectError(cc.kg_client.KgError.Data, kg.claimTask(root, "agent-failed-test"));
+    try std.testing.expect(std.mem.indexOf(u8, kg.detail(), "TaskHasOpenChildren") != null);
+
+    const list = try cc.task_tools.executeList(&ctx, "{}");
+    defer a.free(list);
+    try std.testing.expect(std.mem.indexOf(u8, list, "\"subject\":\"不可恢复的步骤\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list, "\"status\":\"blocked\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list, "\"kg_status\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list, "parallel_hint") == null);
+}
+
+test "L2 KG: claim returns bounded packet and fresh process resumes with one lease identity" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const proj_dir = pbuf[0..dir_len];
+    const store = try std.fmt.allocPrint(a, "{s}/kg-resume-packet.kg", .{proj_dir});
+    defer a.free(store);
+
+    var first = try makeClient(a, bin, store, "proj-resume-packet");
+    defer first.deinit();
+    first.ensureReady();
+    if (!first.ready) return error.SkipZigTest;
+
+    const root = try first.createTask("跨进程目标", "plan_root");
+    const child = try first.createChildTask(root, "实现 packet 恢复\n必须读取父目标、依赖和证据", "plan_step");
+    try cc.kg_inject.writeIdPointer(a, proj_dir, "kg_root", root);
+
+    var first_tasks = cc.core_task_store.TaskStore.init(a);
+    defer first_tasks.deinit();
+    const holder = "worker@packet-team";
+    const first_ctx = cc.tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &first_tasks,
+        .kg = &first,
+        .kg_projects_dir = proj_dir,
+        .kg_agent_ident = holder,
+    };
+    const claim_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"in_progress\"}}", .{child});
+    defer a.free(claim_args);
+    const claimed = try cc.task_tools.executeUpdate(&first_ctx, claim_args);
+    defer a.free(claimed);
+    var claimed_json = try std.json.parseFromSlice(std.json.Value, a, claimed, .{});
+    defer claimed_json.deinit();
+    const claimed_obj = claimed_json.value.object;
+    try std.testing.expect(claimed_obj.get("claimed").?.bool);
+    try std.testing.expectEqualStrings(holder, claimed_obj.get("claimed_by").?.string);
+    const claim_packet = claimed_obj.get("task_packet") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("task-packet", claim_packet.object.get("mode").?.string);
+    try std.testing.expectEqual(@as(i64, @intCast(child)), claim_packet.object.get("query").?.object.get("task_id").?.integer);
+    try std.testing.expectEqualStrings("claimed", claim_packet.object.get("query").?.object.get("status").?.string);
+    try std.testing.expect(!claim_packet.object.get("summary").?.object.get("truncated").?.bool);
+    // claim 已把 kg-* 任务镜像进本地 TaskStore；TaskGet 仍必须回图真源，不能被镜像旁路。
+    const same_get_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\"}}", .{child});
+    defer a.free(same_get_args);
+    const same_fetched = try cc.task_tools.executeGet(&first_ctx, same_get_args);
+    defer a.free(same_fetched);
+    try std.testing.expect(std.mem.indexOf(u8, same_fetched, "\"task_packet\":{") != null);
+    const live_list = try cc.task_tools.executeList(&first_ctx, "{}");
+    defer a.free(live_list);
+    try std.testing.expect(std.mem.indexOf(u8, live_list, "\"kg_status\":\"claimed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, live_list, holder) != null);
+
+    // Simulate a fresh process/client with no Conversation. The same resumed
+    // host identity can recover the exact claimed task from TaskGet and the
+    // startup packet; a different session must not receive that private lease packet.
+    var fresh = try makeClient(a, bin, store, "proj-resume-packet");
+    defer fresh.deinit();
+    fresh.ensureReady();
+    try std.testing.expect(fresh.ready);
+    var fresh_tasks = cc.core_task_store.TaskStore.init(a);
+    defer fresh_tasks.deinit();
+    const fresh_ctx = cc.tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &fresh_tasks,
+        .kg = &fresh,
+        .kg_projects_dir = proj_dir,
+        .kg_agent_ident = holder,
+    };
+    const get_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\"}}", .{child});
+    defer a.free(get_args);
+    const fetched = try cc.task_tools.executeGet(&fresh_ctx, get_args);
+    defer a.free(fetched);
+    var fetched_json = try std.json.parseFromSlice(std.json.Value, a, fetched, .{});
+    defer fetched_json.deinit();
+    const fetched_packet = fetched_json.value.object.get("task_packet") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("claimed", fetched_packet.object.get("query").?.object.get("status").?.string);
+    var saw_parent = false;
+    for (fetched_packet.object.get("edges").?.array.items) |edge| {
+        if (std.mem.eql(u8, edge.object.get("view_role").?.string, "parent_in")) saw_parent = true;
+    }
+    try std.testing.expect(saw_parent);
+
+    const resumed_summary = cc.kg_inject.buildSummaryForAgent(a, &fresh, proj_dir, holder) orelse return error.TestUnexpectedResult;
+    defer a.free(resumed_summary);
+    try std.testing.expect(std.mem.indexOf(u8, resumed_summary, "Active task recovery packet") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resumed_summary, "\"task_id\":") != null);
+    const other_summary = cc.kg_inject.buildSummaryForAgent(a, &fresh, proj_dir, "other-session") orelse return error.TestUnexpectedResult;
+    defer a.free(other_summary);
+    try std.testing.expect(std.mem.indexOf(u8, other_summary, "Active task recovery packet") == null);
+
+    const wrong_ctx = cc.tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &fresh_tasks,
+        .kg = &fresh,
+        .kg_projects_dir = proj_dir,
+        .kg_agent_ident = "other-session",
+    };
+    const release_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"pending\"}}", .{child});
+    defer a.free(release_args);
+    try std.testing.expectError(error.KgReleaseFailed, cc.task_tools.executeUpdate(&wrong_ctx, release_args));
+    try std.testing.expectEqual(cc.kg_client.TaskStatus.claimed, try fresh.taskStatus(child));
+
+    const wrong_close_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"completed\",\"conclusion\":\"wrong holder evidence must not commit\",\"acts_on\":[\"UNAUTHORIZED_PROJECTION_SENTINEL\"]}}", .{child});
+    defer a.free(wrong_close_args);
+    try std.testing.expectError(error.KgCloseFailed, cc.task_tools.executeUpdate(&wrong_ctx, wrong_close_args));
+    try std.testing.expectEqual(cc.kg_client.TaskStatus.claimed, try fresh.taskStatus(child));
+    const wrong_neighbors = try fresh.neighborsText(child, 20);
+    defer fresh.allocator.free(wrong_neighbors);
+    try std.testing.expect(std.mem.indexOf(u8, wrong_neighbors, "UNAUTHORIZED_PROJECTION_SENTINEL") == null);
+
+    const close_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"completed\",\"conclusion\":\"fresh process verified packet recovery\"}}", .{child});
+    defer a.free(close_args);
+    const closed = try cc.task_tools.executeUpdate(&fresh_ctx, close_args);
+    defer a.free(closed);
+    try std.testing.expect(std.mem.indexOf(u8, closed, "\"closed\":true") != null);
+    try std.testing.expectEqual(cc.kg_client.TaskStatus.completed, try fresh.taskStatus(child));
+    const terminal_packet = try fresh.taskPacket(child, 20);
+    defer fresh.allocator.free(terminal_packet);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_packet, "fresh process verified packet recovery") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_packet, "wrong holder evidence must not commit") == null);
+}
+
+test "L2 KG: claim packet 失败会释放刚取得的租约" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    if (std.mem.indexOfScalar(u8, bin, '"') != null) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const proj_dir = pbuf[0..dir_len];
+    const store = try std.fmt.allocPrint(a, "{s}/kg-claim-packet-fail.kg", .{proj_dir});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-claim-packet-fail");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+    const root = try kg.createTask("packet rollback root", "plan_root");
+    const child = try kg.createChildTask(root, "packet rollback child", "plan_step");
+
+    // Delegate every command to real tinykg except task-packet, which fails
+    // after task-claim has already succeeded inside the same tool call.
+    const wrapper = try std.fmt.allocPrint(a, "{s}/tinykg-packet-fail", .{proj_dir});
+    defer a.free(wrapper);
+    const script = try std.fmt.allocPrint(a, "#!/bin/sh\nif [ \"$1\" = \"task-packet\" ]; then exit 23; fi\nexec \"{s}\" \"$@\"\n", .{bin});
+    defer a.free(script);
+    try overwriteFile(a, wrapper, script);
+    const wrapper_z = try a.dupeZ(u8, wrapper);
+    defer a.free(wrapper_z);
+    if (std.c.chmod(wrapper_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    a.free(kg.bin_path.?);
+    kg.bin_path = try a.dupe(u8, wrapper);
+
+    var tasks = cc.core_task_store.TaskStore.init(a);
+    defer tasks.deinit();
+    var detail: ?[]const u8 = null;
+    defer if (detail) |d| a.free(d);
+    const holder = "packet-fail-worker";
+    const ctx = cc.tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &tasks,
+        .kg = &kg,
+        .kg_projects_dir = proj_dir,
+        .kg_agent_ident = holder,
+        .error_detail = &detail,
+    };
+    const claim_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"in_progress\"}}", .{child});
+    defer a.free(claim_args);
+    try std.testing.expectError(error.KgTaskPacketUnavailable, cc.task_tools.executeUpdate(&ctx, claim_args));
+    a.free(kg.bin_path.?);
+    kg.bin_path = try a.dupe(u8, bin);
+    try std.testing.expectEqual(cc.kg_client.TaskStatus.open, try kg.taskStatus(child));
+    try std.testing.expect(detail != null and std.mem.indexOf(u8, detail.?, "已自动释放") != null);
+}
+
+test "L2 KG: legacy kg_inbox lease survives fresh-process startup recovery" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const proj_dir = pbuf[0..dir_len];
+    const store = try std.fmt.allocPrint(a, "{s}/kg-legacy-inbox-resume.kg", .{proj_dir});
+    defer a.free(store);
+
+    var first = try makeClient(a, bin, store, "proj-legacy-inbox-resume");
+    defer first.deinit();
+    first.ensureReady();
+    if (!first.ready) return error.SkipZigTest;
+
+    const inbox = try first.createTask("legacy inbox", "todo_root");
+    const child = try first.createChildTask(inbox, "恢复旧待办租约", "todo");
+    try cc.kg_inject.writeIdPointer(a, proj_dir, "kg_inbox", inbox);
+    const holder = "legacy-worker@resume";
+    try first.claimTask(child, holder);
+
+    // 新 client 模拟重启；无 kg_task_anchor，仍须从 legacy inbox 找回租约
+    // packet。同时模拟历史上 kg_root/kg_inbox 重叠的店，输出必须按稳定 task id 去重。
+    try cc.kg_inject.writeIdPointer(a, proj_dir, "kg_root", inbox);
+    var fresh = try makeClient(a, bin, store, "proj-legacy-inbox-resume");
+    defer fresh.deinit();
+    fresh.ensureReady();
+    try std.testing.expect(fresh.ready);
+    const summary = cc.kg_inject.buildSummaryForAgent(a, &fresh, proj_dir, holder) orelse return error.TestUnexpectedResult;
+    defer a.free(summary);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "Active task recovery packet") != null);
+    var task_id_buf: [48]u8 = undefined;
+    const task_id_needle = try std.fmt.bufPrint(&task_id_buf, "\"task_id\":{d}", .{child});
+    try std.testing.expect(std.mem.indexOf(u8, summary, task_id_needle) != null);
+    var claimed_buf: [96]u8 = undefined;
+    const claimed_needle = try std.fmt.bufPrint(&claimed_buf, "CLAIMED [{d}]", .{child});
+    const claimed_pos = std.mem.indexOf(u8, summary, claimed_needle) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOfPos(u8, summary, claimed_pos + claimed_needle.len, claimed_needle) == null);
+
+    var tasks = cc.core_task_store.TaskStore.init(a);
+    defer tasks.deinit();
+    const ctx = cc.tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &tasks,
+        .kg = &fresh,
+        .kg_projects_dir = proj_dir,
+        .kg_agent_ident = holder,
+    };
+    const list = try cc.task_tools.executeList(&ctx, "{}");
+    defer a.free(list);
+    var id_buf: [64]u8 = undefined;
+    const id_needle = try std.fmt.bufPrint(&id_buf, "\"id\":\"kg-{d}\"", .{child});
+    const id_pos = std.mem.indexOf(u8, list, id_needle) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOfPos(u8, list, id_pos + id_needle.len, id_needle) == null);
+}
+
+test "L2 KG: stale task anchor falls back to legacy root in the same startup" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const proj_dir = pbuf[0..dir_len];
+    const store = try std.fmt.allocPrint(a, "{s}/kg-stale-anchor.kg", .{proj_dir});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-stale-anchor");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const legacy_root = try kg.createTask("legacy root", "plan_root");
+    const child = try kg.createChildTask(legacy_root, "same-startup fallback child", "plan_step");
+    _ = child;
+    try cc.kg_inject.writeIdPointer(a, proj_dir, "kg_root", legacy_root);
+    try cc.kg_inject.writeIdPointer(a, proj_dir, "kg_task_anchor", 999_999_999);
+
+    const summary = cc.kg_inject.buildSummaryForAgent(a, &kg, proj_dir, "worker") orelse return error.TestUnexpectedResult;
+    defer a.free(summary);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "same-startup fallback child") != null);
+    try std.testing.expect(cc.kg_inject.readIdPointer(a, proj_dir, "kg_task_anchor") == null);
+
+    // Recreate the stale pointer to exercise TaskList's independent live path.
+    try cc.kg_inject.writeIdPointer(a, proj_dir, "kg_task_anchor", 999_999_999);
+    var tasks = cc.core_task_store.TaskStore.init(a);
+    defer tasks.deinit();
+    const ctx = cc.tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &tasks,
+        .kg = &kg,
+        .kg_projects_dir = proj_dir,
+    };
+    const list = try cc.task_tools.executeList(&ctx, "{}");
+    defer a.free(list);
+    try std.testing.expect(std.mem.indexOf(u8, list, "same-startup fallback child") != null);
 }
 
 test "L2 KG: 深树全链 — 嵌套子任务/branch 聚合/path/claim 租约/并行提示/闭合波前前进" {
@@ -650,6 +1605,7 @@ test "L2 KG: 深树全链 — 嵌套子任务/branch 聚合/path/claim 租约/�
         const resp = try task_tools.executeUpdate(&ctx, claim_args);
         defer a.free(resp);
         try std.testing.expect(std.mem.indexOf(u8, resp, "\"claimed\":true") != null);
+        try std.testing.expectEqual(cc.kg_client.TaskStatus.claimed, try kg.taskStatus(sub_a));
 
         try std.testing.expectError(error.Data, kg.claimTask(sub_a, "other-session"));
 
@@ -663,7 +1619,7 @@ test "L2 KG: 深树全链 — 嵌套子任务/branch 聚合/path/claim 租约/�
     }
 
     // 闭合两个子任务 → 步骤一子树全闭 → 步骤一变 ready 叶子(波前上移);闭步骤一 → 步骤二解锁。
-    try kg.closeTask(sub_a, "甲完成");
+    try kg.closeTaskAs(sub_a, "甲完成", ctx.agent_ident.asSlice());
     try kg.closeTask(sub_b, "乙完成");
     {
         const rows = try kg.frontier(r.root_id, 10);
@@ -742,8 +1698,51 @@ test "L2 KG: 12b 锚单入口 — TaskList 经 task 锚看全多计划,镜像 to
     // 镜像 todo 只出现一次(store 遍历),frontier 行被镜像去重滤掉。
     const first_hit = std.mem.indexOf(u8, list, "\"subject\":\"顺手待办\"").?;
     try std.testing.expect(std.mem.indexOfPos(u8, list, first_hit + 1, "\"subject\":\"顺手待办\"") == null);
-    // inbox root 是容器不是任务,不上看板。
-    try std.testing.expect(std.mem.indexOf(u8, list, "会话待办") == null);
+    // inbox root 是容器不是任务,不上看板；它可作为 todo 的 path 面包屑出现。
+    try std.testing.expect(std.mem.indexOf(u8, list, "\"subject\":\"会话待办") == null);
+}
+
+test "L2 KG: TaskList live frontier 瞬时失败时回退本地 kg 镜像" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const proj_dir = pbuf[0..dir_len];
+    const store_path = try std.fmt.allocPrint(a, "{s}/kg-list-fallback.kg", .{proj_dir});
+    defer a.free(store_path);
+
+    var kg = try makeClient(a, bin, store_path, "proj-list-fallback");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const task_tools = @import("cc").task_tools;
+    const TaskStore = @import("cc").core_task_store.TaskStore;
+    var tstore = TaskStore.init(a);
+    defer tstore.deinit();
+    const ctx = @import("cc").tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &tstore,
+        .kg = &kg,
+        .kg_projects_dir = proj_dir,
+    };
+
+    // write-through 同时建立 live pointer 和本地 UI 镜像。
+    const created = try task_tools.executeCreate(&ctx, "{\"subject\":\"离线仍可见\",\"description\":\"cached projection\"}");
+    a.free(created);
+    try std.testing.expect(tstore.tasks.items.len == 1);
+
+    // 保持 ready/pointer 不变，只让后续 frontier spawn 失败，模拟瞬时执行故障。
+    a.free(kg.bin_path.?);
+    kg.bin_path = try a.dupe(u8, "/definitely/missing/tinykg");
+
+    const list = try task_tools.executeList(&ctx, "{}");
+    defer a.free(list);
+    try std.testing.expect(std.mem.indexOf(u8, list, "离线仍可见") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list, "\"id\":\"kg-") != null);
 }
 
 test "L2 KG: derived_from 溯源 — 认领计划步骤后 KgRemember 的记忆回链任务" {
@@ -1235,6 +2234,396 @@ test "L2 KG: 目标导向投影 — 任务闭合经工具写 acts_on/uses/produc
     try std.testing.expect(std.mem.indexOf(u8, nb_b, "\"state\":\"tentative\"") != null);
 }
 
+test "L2 KG ontology feedback: successful host execution projects without model self-report" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const project_dir = pbuf[0..dir_len];
+    const store_path = try std.fmt.allocPrint(a, "{s}/kg-execution-feedback.kg", .{project_dir});
+    defer a.free(store_path);
+
+    var kg = try makeClient(a, bin, store_path, "proj-execution-feedback");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const root = try kg.createTask("execution-grounded ontology root", "plan_root");
+    const first = try kg.createChildTask(root, "first observed task", "plan_step");
+    const second = try kg.createChildTask(root, "second isolated task", "plan_step");
+
+    const first_path = try std.fmt.allocPrint(a, "{s}/first.zig", .{project_dir});
+    defer a.free(first_path);
+    const second_path = try std.fmt.allocPrint(a, "{s}/second.zig", .{project_dir});
+    defer a.free(second_path);
+    try overwriteFile(a, first_path, "const value = 1;\n");
+    try overwriteFile(a, second_path, "const sibling = 2;\n");
+
+    var tasks = cc.core_task_store.TaskStore.init(a);
+    defer tasks.deinit();
+    const ctx = cc.tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &tasks,
+        .kg = &kg,
+        .project_dir = project_dir,
+        .cwd_abs = project_dir,
+    };
+    const rid = cc.util_log.RequestId{ .bytes = [_]u8{'k'} ** 12 };
+
+    // Claim is the provenance anchor. The host sensor refuses to guess if the
+    // TaskStore has zero or multiple in-progress kg-* mirrors.
+    const first_claim_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"in_progress\"}}", .{first});
+    defer a.free(first_claim_args);
+    const first_claim = try cc.task_tools.executeUpdate(&ctx, first_claim_args);
+    defer a.free(first_claim);
+
+    const read_first = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}\"}}", .{first_path});
+    defer a.free(read_first);
+    const edit_first = try std.fmt.allocPrint(
+        a,
+        "{{\"file_path\":\"{s}\",\"old_string\":\"const value = 1;\",\"new_string\":\"const value = 3; // PRIVATE_BODY_SENTINEL\"}}",
+        .{first_path},
+    );
+    defer a.free(edit_first);
+    var first_slots = [_]cc.tool_exec.Slot{
+        .{ .decision = .run, .name = "Read", .id = "read-first", .input = read_first },
+        .{ .decision = .run, .name = "Edit", .id = "edit-first", .input = edit_first },
+    };
+    defer for (&first_slots) |*slot| slot.deinit(a);
+    try cc.tool_exec.executeSlots(&first_slots, &ctx, a, rid);
+    try std.testing.expect(!first_slots[0].is_error);
+    try std.testing.expect(!first_slots[1].is_error);
+
+    // No acts_on/uses/produces fields: projection must be supplied entirely by
+    // the execution ledger, while raw Edit body never enters the graph.
+    const first_close_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"completed\",\"conclusion\":\"host execution verified\"}}", .{first});
+    defer a.free(first_close_args);
+    const first_close = try cc.task_tools.executeUpdate(&ctx, first_close_args);
+    defer a.free(first_close);
+    try std.testing.expect(std.mem.indexOf(u8, first_close, "\"explicit\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_close, "\"observed\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_close, "\"retained\":0") != null);
+    const first_neighbors = try kg.neighborsJson(first, 30);
+    defer a.free(first_neighbors);
+    try std.testing.expect(try neighborTargetContains(a, &kg, first, "first.zig"));
+    try std.testing.expect(std.mem.indexOf(u8, first_neighbors, "\"rel\":\"acts_on\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_neighbors, "\"rel\":\"produces\"") != null);
+    try std.testing.expect(!(try neighborTargetContains(a, &kg, first, "PRIVATE_BODY_SENTINEL")));
+
+    const second_claim_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"in_progress\"}}", .{second});
+    defer a.free(second_claim_args);
+    const second_claim = try cc.task_tools.executeUpdate(&ctx, second_claim_args);
+    defer a.free(second_claim);
+
+    const denied_input = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/DENIED_SENTINEL.zig\",\"content\":\"must not execute\"}}", .{project_dir});
+    defer a.free(denied_input);
+    const missing_input = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/MISSING_SENTINEL.zig\"}}", .{project_dir});
+    defer a.free(missing_input);
+    const read_second = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}\"}}", .{second_path});
+    defer a.free(read_second);
+    var second_slots = [_]cc.tool_exec.Slot{
+        .{ .decision = .denied, .name = "Write", .id = "denied-write", .input = denied_input },
+        .{ .decision = .run, .name = "Read", .id = "failed-read", .input = missing_input },
+        .{ .decision = .run, .name = "Read", .id = "read-second", .input = read_second },
+    };
+    defer for (&second_slots) |*slot| slot.deinit(a);
+    try cc.tool_exec.executeSlots(&second_slots, &ctx, a, rid);
+    try std.testing.expect(second_slots[1].is_error);
+    try std.testing.expect(!second_slots[2].is_error);
+
+    // Explicit + observed copies of the same fact must collapse to one edge;
+    // task one above still proves the zero-self-report path independently.
+    const second_close_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"completed\",\"conclusion\":\"isolation verified\",\"acts_on\":[\"second.zig\"]}}", .{second});
+    defer a.free(second_close_args);
+    const second_close = try cc.task_tools.executeUpdate(&ctx, second_close_args);
+    defer a.free(second_close);
+    try std.testing.expect(std.mem.indexOf(u8, second_close, "\"observed\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_close, "\"explicit\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_close, "\"projected\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_close, "\"retained\":0") != null);
+    const second_neighbors = try kg.neighborsJson(second, 30);
+    defer a.free(second_neighbors);
+    try std.testing.expect(try neighborTargetContains(a, &kg, second, "second.zig"));
+    try std.testing.expect(!(try neighborTargetContains(a, &kg, second, "first.zig")));
+    try std.testing.expect(!(try neighborTargetContains(a, &kg, second, "DENIED_SENTINEL")));
+    try std.testing.expect(!(try neighborTargetContains(a, &kg, second, "MISSING_SENTINEL")));
+    try std.testing.expect(!(try neighborTargetContains(a, &kg, first, "second.zig")));
+}
+
+test "L2 KG experience feedback: claim exposes verified prior execution before work" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const project_dir = pbuf[0..dir_len];
+    const store_path = try std.fmt.allocPrint(a, "{s}/kg-experience-feedback.kg", .{project_dir});
+    defer a.free(store_path);
+
+    var kg = try makeClient(a, bin, store_path, "proj-experience-feedback");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const root = try kg.createTask("parser recovery roadmap", "plan_root");
+    const prior = try kg.createChildTask(root, "repair parser checkpoint recovery corruption", "plan_step");
+    const unfinished = try kg.createChildTask(root, "parser checkpoint recovery unfinished decoy", "plan_step");
+    const current = try kg.createChildTask(root, "diagnose parser checkpoint recovery regression", "plan_step");
+
+    var tasks = cc.core_task_store.TaskStore.init(a);
+    defer tasks.deinit();
+    const ctx = cc.tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &tasks,
+        .kg = &kg,
+        .project_dir = project_dir,
+        .cwd_abs = project_dir,
+    };
+
+    // Materialize the same lifecycle/provenance shape produced in normal use:
+    // claim -> completed + verified_by -> tentative execution association.
+    const prior_claim_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"in_progress\"}}", .{prior});
+    defer a.free(prior_claim_args);
+    const prior_claim = try cc.task_tools.executeUpdate(&ctx, prior_claim_args);
+    defer a.free(prior_claim);
+    const prior_close_args = try std.fmt.allocPrint(
+        a,
+        "{{\"taskId\":\"kg-{d}\",\"status\":\"completed\",\"conclusion\":\"parser checkpoint replay verified\",\"acts_on\":[\"src/parser_checkpoint.zig\"],\"uses\":[\"checkpoint-replay\"]}}",
+        .{prior},
+    );
+    defer a.free(prior_close_args);
+    const prior_close = try cc.task_tools.executeUpdate(&ctx, prior_close_args);
+    defer a.free(prior_close);
+    const confirmed_playbook = try kg.ensureConcept("verified-parser-recovery-playbook");
+    try kg.addRefEdge(prior, "produces", confirmed_playbook, true);
+
+    // A lexically closer but unfinished task must never enter the experience
+    // packet. Its graph association is deliberately present to catch adapters
+    // that inspect neighbors but forget lifecycle/evidence governance.
+    const decoy = try kg.ensureConcept("UNFINISHED_EXPERIENCE_SENTINEL");
+    try kg.addRefEdge(unfinished, "acts_on", decoy, false);
+
+    // Prove the fixture actually distinguishes mixed-kind retrieval from the
+    // task-only contract. This exact decision would consume a normal recall
+    // slot, but must never appear in the experience packet's search window.
+    _ = try kg.remember(.decision, "diagnose parser checkpoint recovery regression", "decision", false);
+    const mixed_hits = try kg.recall("diagnose parser checkpoint recovery regression", 8, true);
+    defer {
+        for (mixed_hits) |*hit| hit.deinit(kg.allocator);
+        kg.allocator.free(mixed_hits);
+    }
+    var saw_non_task_hit = false;
+    for (mixed_hits) |hit| {
+        if (!std.mem.eql(u8, hit.kind, "task")) saw_non_task_hit = true;
+    }
+    try std.testing.expect(saw_non_task_hit);
+
+    const current_claim_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"in_progress\"}}", .{current});
+    defer a.free(current_claim_args);
+    const rid = cc.util_log.RequestId{ .bytes = [_]u8{'x'} ** 12 };
+    const claim_result = try cc.tool_exec.executeOne(&ctx, "TaskUpdate", current_claim_args, "claim-current", a, rid);
+    switch (claim_result) {
+        .done => |done| {
+            defer if (done.content) |content| a.free(content);
+            try std.testing.expect(!done.is_error);
+            const content = done.content orelse return error.TestUnexpectedResult;
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, content, .{});
+            defer parsed.deinit();
+            const packet = parsed.value.object.get("experience_packet") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("metacodes-experience-packet-v1", packet.object.get("schema_version").?.string);
+            try std.testing.expect(packet.object.get("candidate_only").?.bool);
+            try std.testing.expectEqualStrings("exact_task_text_task_kind_only", packet.object.get("automatic_probe_scope").?.string);
+            try std.testing.expectEqualStrings("llm_before_work_if_insufficient", packet.object.get("semantic_expansion_owner").?.string);
+            try std.testing.expectEqualStrings("multi_read_reverify_required", packet.object.get("snapshot_consistency").?.string);
+            try std.testing.expectEqual(@as(i64, @intCast(current)), packet.object.get("query_task_id").?.integer);
+            try std.testing.expect(std.mem.indexOf(u8, content, "repair parser checkpoint recovery corruption") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "src/parser_checkpoint.zig") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "checkpoint-replay") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "verified-parser-recovery-playbook") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "\"state\":\"tentative\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "\"state\":\"confirmed\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "\"evidence_node_ids\":[") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "parser checkpoint replay verified") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "UNFINISHED_EXPERIENCE_SENTINEL") == null);
+            const history = packet.object.get("history").?.array.items;
+            var prior_history: ?std.json.ObjectMap = null;
+            for (history) |entry| {
+                if (entry != .object) continue;
+                const entry_id = entry.object.get("task_id") orelse continue;
+                if (entry_id == .integer and entry_id.integer == @as(i64, @intCast(prior))) {
+                    prior_history = entry.object;
+                    break;
+                }
+            }
+            const prior_entry = prior_history orelse return error.TestUnexpectedResult;
+            const evidence_ids = prior_entry.get("evidence_node_ids").?.array.items;
+            const verified_evidence = prior_entry.get("verified_evidence").?.array.items;
+            try std.testing.expect(evidence_ids.len >= 1);
+            try std.testing.expect(verified_evidence.len >= 1);
+            const evidence_entry = verified_evidence[0].object;
+            try std.testing.expectEqual(evidence_ids[0].integer, evidence_entry.get("node_id").?.integer);
+            try std.testing.expect(std.mem.indexOf(u8, evidence_entry.get("text").?.string, "parser checkpoint replay verified") != null);
+            const metrics = packet.object.get("metrics").?.object;
+            try std.testing.expect(metrics.get("accepted_tasks").?.integer >= 1);
+            try std.testing.expect(metrics.get("accepted_evidence_excerpts").?.integer >= 1);
+            try std.testing.expectEqual(@as(i64, 0), metrics.get("evidence_excerpt_failures").?.integer);
+            try std.testing.expect(metrics.get("rejected_not_completed").?.integer >= 1);
+            try std.testing.expectEqual(@as(i64, 2), metrics.get("accepted_tentative").?.integer);
+            try std.testing.expectEqual(@as(i64, 1), metrics.get("accepted_confirmed").?.integer);
+            // The text-search window itself is task-only. Execution concepts
+            // such as src/parser_checkpoint.zig cannot crowd out prior tasks.
+            try std.testing.expectEqual(metrics.get("search_hits").?.integer, metrics.get("task_candidates").?.integer);
+            const subprocess_lower = metrics.get("subprocess_calls_lower_bound").?.integer;
+            const subprocess_upper = metrics.get("subprocess_calls_upper_bound").?.integer;
+            try std.testing.expect(subprocess_lower >= 1);
+            try std.testing.expect(subprocess_upper >= subprocess_lower);
+            try std.testing.expect(!metrics.get("subprocess_count_exact").?.bool);
+            try std.testing.expectEqual(@as(usize, 10), metrics.get("packet_bytes").?.string.len);
+            if (std.c.getenv("METACODES_PRINT_EXPERIENCE_METRICS") != null) {
+                std.debug.print(
+                    "experience_feedback_metrics schema=v1 search_hits={d} task_candidates={d} accepted_tasks={d} accepted_associations={d} accepted_tentative={d} accepted_confirmed={d} rejected_not_completed={d} subprocess_lower={d} subprocess_upper={d} elapsed_ms={d} packet_bytes={s}\n",
+                    .{
+                        metrics.get("search_hits").?.integer,
+                        metrics.get("task_candidates").?.integer,
+                        metrics.get("accepted_tasks").?.integer,
+                        metrics.get("accepted_associations").?.integer,
+                        metrics.get("accepted_tentative").?.integer,
+                        metrics.get("accepted_confirmed").?.integer,
+                        metrics.get("rejected_not_completed").?.integer,
+                        subprocess_lower,
+                        subprocess_upper,
+                        metrics.get("elapsed_ms").?.integer,
+                        metrics.get("packet_bytes").?.string,
+                    },
+                );
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // A fresh decision round after compaction/restart follows TaskGet rather
+    // than re-claiming the live lease. The same governed experience must cross
+    // the unified result boundary on that recovery path too.
+    const current_get_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\"}}", .{current});
+    defer a.free(current_get_args);
+    const get_result = try cc.tool_exec.executeOne(&ctx, "TaskGet", current_get_args, "recover-current", a, rid);
+    switch (get_result) {
+        .done => |done| {
+            defer if (done.content) |content| a.free(content);
+            try std.testing.expect(!done.is_error);
+            const content = done.content orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, content, "\"kg_status\":\"claimed\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "\"experience_packet\":{") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "repair parser checkpoint recovery corruption") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "parser checkpoint replay verified") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "UNFINISHED_EXPERIENCE_SENTINEL") == null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "\"query_reused_from_tool_result\":true") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Scope-matched L2: prove the enriched tool result is not merely computed
+    // and discarded. A real two-turn agent loop must serialize the historical
+    // task into the second provider request before the model can choose work.
+    const api_current = try kg.createChildTask(root, "investigate parser checkpoint recovery failure", "plan_step");
+    var api_id_buf: [24]u8 = undefined;
+    const api_id = try std.fmt.bufPrint(&api_id_buf, "{d}", .{api_current});
+    const claim_sse_template =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"claim1\",\"name\":\"TaskUpdate\",\"input\":{}}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"taskId\\\":\\\"kg-__TASK_ID__\\\",\\\"status\\\":\\\"in_progress\\\"}\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+    const claim_sse = try std.mem.replaceOwned(u8, a, claim_sse_template, "__TASK_ID__", api_id);
+    defer a.free(claim_sse);
+    const responses = [_][]const u8{ claim_sse, KG_END_TURN_SSE };
+    var srv = try harness.MockServer.startCassette(&responses, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var api_client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer api_client.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "Claim the persistent task, inspect prior evidence, then continue.");
+    var api_tasks = cc.core_task_store.TaskStore.init(a);
+    defer api_tasks.deinit();
+    const enabled = [_][]const u8{ "TaskUpdate", "KgRecall", "KgContext" };
+    var defs_arena = std.heap.ArenaAllocator.init(a);
+    defer defs_arena.deinit();
+    var prompt_context = cc.tools.PromptContext{ .enabled_tool_names = &enabled };
+    const defs = try cc.tools.toToolDefinitionsFull(defs_arena.allocator(), null, &prompt_context);
+    const system_prompt = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &enabled, "", true, "/tmp");
+    defer a.free(system_prompt);
+    const permission = cc.permission.createContext(.bypass_permissions, a);
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    const run_result = try cc.agent_loop.run(&conv, api_client.provider(), defs, &permission, .{
+        .max_turns = 2,
+        .system_prompt = system_prompt,
+        .tasks = &api_tasks,
+        .kg = &kg,
+        .project_dir = project_dir,
+        .cwd_abs = project_dir,
+    }, &backend, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, run_result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    const first_request = srv.requestAt(0) orelse return error.NoRequestCaptured;
+    const second_request = srv.requestAt(1) orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "LEXICAL EXPANSION") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "2-4 separate compact semantic variants") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "Deduplicate candidates by node_id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "repair parser checkpoint recovery corruption") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "parser checkpoint replay verified") == null);
+    try std.testing.expect(std.mem.indexOf(u8, second_request.body(), "metacodes-experience-packet-v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_request.body(), "repair parser checkpoint recovery corruption") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_request.body(), "parser checkpoint replay verified") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_request.body(), "llm_before_work_if_insufficient") != null);
+    if (std.c.getenv("METACODES_PRINT_EXPERIENCE_METRICS") != null)
+        std.debug.print("experience_feedback_delivery schema=v1 provider_requests={d} delivered_to_next_request=1\n", .{srv.requestCount()});
+}
+
+test "L2 KG: ref-edge 重试修复缺失 state 且不降级 confirmed" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kg-ref-retry.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-ref-retry");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const task = try kg.ensureConcept("partial-projection-task");
+    const target = try kg.ensureConcept("partial-projection-target");
+    try kg.addEdge(task, "uses", target); // simulate add-edge success before state write failed
+    try kg.addRefEdge(task, "uses", target, false);
+    const repaired = try kg.neighborsJson(task, 20);
+    defer a.free(repaired);
+    try std.testing.expect(std.mem.indexOf(u8, repaired, "\"state\":\"tentative\"") != null);
+
+    try kg.confirmClassification(task, "uses", target);
+    try kg.addRefEdge(task, "uses", target, false); // agent retry must not downgrade human confirmation
+    const monotonic = try kg.neighborsJson(task, 20);
+    defer a.free(monotonic);
+    try std.testing.expect(std.mem.indexOf(u8, monotonic, "\"state\":\"confirmed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, monotonic, "\"state\":\"tentative\"") == null);
+}
+
 test "L2 KG: 分类纠正入图 — 覆盖不并存 + error_event/fix 留痕(改动四)" {
     const a = std.testing.allocator;
     const bin = findBin(a) orelse return error.SkipZigTest;
@@ -1305,4 +2694,91 @@ test "L2 KG: 分类纠正入图 — 覆盖不并存 + error_event/fix 留痕(改
         s = p + 1;
     }
     try std.testing.expectEqual(@as(usize, 1), confirmed_count);
+}
+
+const CHILD_KG_RECALL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"kg1\",\"name\":\"KgRecall\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"quasar-needle-731 isolated child memory\\\",\\\"lexical_plan\\\":{\\\"schema_version\\\":\\\"lexical-query-plan-v1\\\",\\\"intent\\\":\\\"task_recovery\\\",\\\"stage\\\":\\\"seed\\\",\\\"variants\\\":[{\\\"kind\\\":\\\"exact\\\",\\\"text\\\":\\\"quasar-needle-731 isolated child memory\\\"}],\\\"variant_index\\\":0,\\\"seen_node_ids\\\":[]}}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+test "L2 KG: general-purpose child gets read tools and an isolated KgClient" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kg-child-read.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-child-read");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+    _ = try kg.remember(.decision, "quasar-needle-731: child agents must recover this durable decision", "decision", false);
+
+    const responses = [_][]const u8{ CHILD_KG_RECALL_SSE, KG_END_TURN_SSE };
+    var srv = try harness.MockServer.startCassette(&responses, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    var agents = cc.agents_set.AgentSet.init(a);
+    defer agents.deinit();
+    try agents.loadFromStandardPaths("");
+    const general = agents.find("general-purpose").?;
+
+    const enabled = [_][]const u8{ "KgRemember", "KgRecall", "KgContext" };
+    var defs_arena = std.heap.ArenaAllocator.init(a);
+    defer defs_arena.deinit();
+    var prompt_ctx = cc.tools.PromptContext{ .enabled_tool_names = &enabled };
+    const parent_defs = try cc.tools.toToolDefinitionsFull(defs_arena.allocator(), null, &prompt_ctx);
+    const filtered = try cc.agents_filter.filterToolDefs(a, parent_defs, general);
+    defer a.free(filtered);
+    var child_policy = cc.tool_context.ToolSetExecutionPolicy{ .definitions = filtered };
+
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var child_abort = cc.util_abort.AbortSignal.init();
+    var result = try cc.core_subagent.spawnAgent(
+        a,
+        client.provider(),
+        &client,
+        parent_defs,
+        &perm,
+        &child_abort,
+        "Recover the durable decision before answering.",
+        .{
+            .max_turns = 3,
+            .tool_defs_override = filtered,
+            .execution_policy = child_policy.executionPolicy(),
+            .kg = &kg,
+            .home_dir = "/tmp",
+        },
+    );
+    defer result.deinit();
+
+    const cap = srv.lastRequest() orelse return error.NoRequestCaptured;
+    const tools_field = cap.jsonField("tools") orelse return error.ToolsFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"KgRecall\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"KgContext\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"KgRemember\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "quasar-needle-731") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "child agents must recover this durable decision") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "seen_state_verified") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "agent_run_plan") != null);
+    try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
+
+    // KgRecall sets abort on the client it executes against. The parent must stay untouched,
+    // otherwise a child cancellation pointer leaks into the parent session after return.
+    try std.testing.expect(kg.abort == null);
 }

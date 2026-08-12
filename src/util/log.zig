@@ -119,14 +119,61 @@ pub fn setLevel(level: Level) void {
     g_default_level = level;
 }
 
-/// 测试钩子:直接注入日志文件 fd(绕过 METACODES_LOG_FILE 的一次性 init)。
-/// 用于 L2 测试断言 errId/warnId 落盘内容(如 Stage 6 HTTP 错误 body)。
-/// 同时把 g_initialized 置 1,避免后续 logImpl 触发 initFromEnv 覆盖。
-pub fn setLogFileFdForTest(fd: pfs.Fd) void {
+pub const TestState = struct {
+    default_level: Level,
+    module_filters: []const ModuleFilter,
+    log_file_fd: ?pfs.Fd,
+    initialized: bool,
+    stderr_enabled: bool,
+    request_id_seed: u32,
+    request_id_sequence: u32,
+};
+
+fn testStateLocked() TestState {
+    return .{
+        .default_level = g_default_level,
+        .module_filters = g_module_filters,
+        .log_file_fd = g_log_file_fd,
+        .initialized = g_initialized,
+        .stderr_enabled = g_stderr_enabled,
+        .request_id_seed = g_reqid_seed,
+        .request_id_sequence = g_reqid_seq.load(.monotonic),
+    };
+}
+
+/// Snapshot every logger global that tests are allowed to mutate. Aggregated
+/// suites deliberately keep multiple test files in one process, so a test
+/// must restore this state instead of relying on process teardown for cleanup.
+pub fn snapshotForTest() TestState {
     lock();
     defer unlock();
+    return testStateLocked();
+}
+
+/// 测试钩子:直接注入借用的日志文件 fd(绕过 METACODES_LOG_FILE 的一次性 init)。
+/// 返回完整 process-global 状态，调用方必须在关闭 fd 之前 `restoreForTest`。如果
+/// 只关 fd 不清全局槽，该数字被后续文件复用时，logger 会静默污染无关文件。
+pub fn setLogFileFdForTest(fd: pfs.Fd) TestState {
+    lock();
+    defer unlock();
+    const previous = testStateLocked();
     g_initialized = true;
     g_log_file_fd = fd;
+    return previous;
+}
+
+/// 恢复 `setLogFileFdForTest` 之前的日志状态。这里不 close 任何 fd：旧/新 fd
+/// 的所有权都属于各自调用方，logger 只借用。
+pub fn restoreForTest(previous: TestState) void {
+    lock();
+    defer unlock();
+    g_default_level = previous.default_level;
+    g_module_filters = previous.module_filters;
+    g_log_file_fd = previous.log_file_fd;
+    g_initialized = previous.initialized;
+    g_stderr_enabled = previous.stderr_enabled;
+    g_reqid_seed = previous.request_id_seed;
+    g_reqid_seq.store(previous.request_id_sequence, .monotonic);
 }
 
 /// 解析 "stream:debug,agent:info,*:warn" 这种字符串
@@ -233,7 +280,7 @@ pub fn setStderrEnabled(enabled: bool) void {
 fn writeAll(fd: pfs.Fd, bytes: []const u8) void {
     var total: usize = 0;
     while (total < bytes.len) {
-        const n = pfs.write(fd, bytes[total..][0..bytes.len - total]);
+        const n = pfs.write(fd, bytes[total..][0 .. bytes.len - total]);
         if (n <= 0) return;
         total += @as(usize, @intCast(n));
     }
@@ -311,6 +358,8 @@ test "Level ordering" {
 }
 
 test "effectiveLevel: default + filter" {
+    const previous = snapshotForTest();
+    defer restoreForTest(previous);
     // 重置状态
     g_default_level = .warn;
     g_module_filters = &.{};
@@ -323,6 +372,8 @@ test "effectiveLevel: default + filter" {
 }
 
 test "enableVerbose does not downgrade above info" {
+    const previous = snapshotForTest();
+    defer restoreForTest(previous);
     g_default_level = .debug;
     enableVerbose();
     try testing.expect(g_default_level == .debug); // debug 比 info 更详细，不下调
@@ -332,15 +383,21 @@ test "enableVerbose does not downgrade above info" {
 }
 
 test "logImpl is no-op when level too low" {
+    const previous = snapshotForTest();
+    defer restoreForTest(previous);
     // 静默测试：只要不 panic 就行
     g_default_level = .err;
     g_module_filters = &.{};
+    g_initialized = true;
     debug("test", "should be filtered out: {d}", .{42});
     info("test", "also filtered: {s}", .{"x"});
     // error 会真写 stderr（但 bufPrint 失败不 panic）——测试不验证输出
 }
 
 test "RequestId unique and stable format" {
+    const previous = snapshotForTest();
+    defer restoreForTest(previous);
+    g_initialized = true;
     g_reqid_seed = 0xABCD_1234;
     g_reqid_seq.store(0, .monotonic);
 
@@ -352,8 +409,11 @@ test "RequestId unique and stable format" {
 }
 
 test "debugId smoke (does not panic)" {
+    const previous = snapshotForTest();
+    defer restoreForTest(previous);
     g_default_level = .err;
     g_module_filters = &.{};
+    g_initialized = true;
     const id = genRequestId();
     debugId("test", id, "filtered debug {d}", .{7});
     infoId("test", id, "filtered info {s}", .{"ok"});

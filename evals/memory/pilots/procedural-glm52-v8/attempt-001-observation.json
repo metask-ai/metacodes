@@ -1,0 +1,129 @@
+{
+  "artifact_provenance": {
+    "local_only_artifact_tree": "~/.local/state/metacodes/memory-pilots/procedural-glm52-v8/artifacts/run-001",
+    "local_only_artifact_tree_bytes": 47705375,
+    "local_only_artifact_tree_files": 336,
+    "local_only_artifact_tree_sha256": "93d3b7745b18a5b68b3e267d2ba49425315062bbc64a4e4f87ae8d6cbce303eb",
+    "metacodes_binary_sha256": "32c0d1d103ad84c396e966dbb93c88b32c8a6464c6ebfc029d9739488e646c22",
+    "pilot_freeze_commit": "a5035c3",
+    "tinykg_binary_sha256": "66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee"
+  },
+  "budget_journal": {
+    "committed_cost_usd": 0.364948,
+    "committed_metered_tokens": 499871,
+    "conservative_exposure_cost_usd": 1.864948,
+    "conservative_exposure_metered_tokens": 1099871,
+    "head_sha256": "96abfde3dd9562f5874454cb923940e02fe08f923c09962bbc67c043bd9ea960",
+    "journal_id": "c0da979ed2ed31b9876e8b24bfcf42f02a630a6ffde2273e4ea49bf34937b453",
+    "revision": 20,
+    "sha256": "f513787ec030dac237b6c4bbe79818b4298bfff41f2c5da3538db4a5f246ace7",
+    "uncertain_authorized_transactions": 1
+  },
+  "failure": {
+    "classification": "post-provider-toolchain-identity-drift",
+    "detail": "production ripgrep binary was no longer executable after sequence 6 returned from the provider, so the runner failed closed before parsing or committing the result",
+    "root_cause": "the schedule repeatedly depended on the continued executability of an external pinned ripgrep source instead of first materializing one host-owned immutable run snapshot",
+    "sequence": 6
+  },
+  "manifest_id": "coding-intent-families-2026080810-1",
+  "outcome": {
+    "automatic_retry_forbidden": true,
+    "canonical_runtime_receipt_published": false,
+    "committed_rollout_transactions": 6,
+    "provider_http_requests_in_committed_transactions": 50,
+    "provider_http_requests_in_uncertain_transaction": 15,
+    "quality_evidence": false,
+    "remaining_rollouts_not_started": 2,
+    "status": "halted",
+    "uncertain_transaction_id": "ee403d91d4be42294b54ba7f45ba2dde1ced3a6b622c691e6f84b21b75fd22bd"
+  },
+  "program_authority": {
+    "conservative_cost_usd_after_attempt": 5.5977768,
+    "conservative_metered_tokens_after_attempt": 3449320,
+    "user_authorization_max_cost_usd": 1000.0
+  },
+  "rollouts": [
+    {
+      "actual_cost_usd": 0.045356,
+      "actual_metered_tokens": 68188,
+      "arm": "no_memory",
+      "provider_http_requests": 9,
+      "sequence": 0,
+      "transaction_id": "785b9d5621e1b1f47d411294b81a5a829b69ad7264c9a5201ed210a420cf4c34",
+      "workspace_deterministic_success": true
+    },
+    {
+      "actual_cost_usd": 0.033729,
+      "actual_metered_tokens": 39715,
+      "arm": "markdown_memory",
+      "provider_http_requests": 5,
+      "sequence": 1,
+      "transaction_id": "e300aa850b7badeaacd99b6161bea7182f20ddd9ddc5bca103985f15ce882f3f",
+      "workspace_deterministic_success": true
+    },
+    {
+      "actual_cost_usd": 0.059767,
+      "actual_metered_tokens": 101371,
+      "arm": "tinykg_lexical",
+      "provider_http_requests": 9,
+      "query_plan_status": "invalid",
+      "scoped_recall_status": "no_hits",
+      "sequence": 2,
+      "transaction_id": "bc8ddc17d5dd2fb033dcb2aba15612f23c7256d1171607d985d61426adf0980a",
+      "workspace_deterministic_success": false
+    },
+    {
+      "actual_cost_usd": 0.074444,
+      "actual_metered_tokens": 82433,
+      "arm": "markdown_memory",
+      "provider_http_requests": 9,
+      "sequence": 3,
+      "transaction_id": "dbf680a76b6ceabb5a3572dca1181815737f6a791484db62526d62d46d6bc9e0",
+      "workspace_deterministic_success": false
+    },
+    {
+      "actual_cost_usd": 0.115075,
+      "actual_metered_tokens": 164463,
+      "arm": "tinykg_lexical",
+      "provider_http_requests": 12,
+      "query_plan_status": "host_recall_covered",
+      "scoped_recall_injected_bytes": 1584,
+      "scoped_recall_status": "injected",
+      "sequence": 4,
+      "transaction_id": "880298f4a702627638c599f7b9caf9e85125361b3c003949e015acfcb28d790c",
+      "workspace_deterministic_success": true
+    },
+    {
+      "actual_cost_usd": 0.036577,
+      "actual_metered_tokens": 43701,
+      "arm": "no_memory",
+      "provider_http_requests": 6,
+      "sequence": 5,
+      "transaction_id": "e681ca0ab895ee0b1edf4251d18510892df90c59e6db919ee52e68e78d8e297a",
+      "workspace_deterministic_success": false
+    }
+  ],
+  "schema_version": 1,
+  "treatment_activation": {
+    "offline_markdown_observed_successes": 0,
+    "offline_no_memory_observed_successes": 0,
+    "offline_tinykg_committed_successes": 1,
+    "offline_tinykg_uncertain_observed_successes": 1,
+    "tinykg_offline_scoped_recall_injected_bytes": 1584,
+    "tinykg_online_query_plan_status": "invalid",
+    "tinykg_online_scoped_recall_status": "no_hits",
+    "tinykg_store_text_current_after_online": true,
+    "tinykg_store_text_stale_after_online": false
+  },
+  "uncertain_rollout_diagnostic": {
+    "arm": "tinykg_lexical",
+    "maximum_cost_usd": 1.5,
+    "maximum_metered_tokens": 600000,
+    "observed_uncommitted_cost_usd": 0.119286,
+    "observed_uncommitted_metered_tokens": 199998,
+    "provider_result_present": true,
+    "scoped_recall_injected_bytes": 1584,
+    "sequence": 6,
+    "workspace_deterministic_success_recomputed_offline": true
+  }
+}

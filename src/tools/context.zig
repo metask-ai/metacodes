@@ -115,6 +115,17 @@ pub const ToolProgressReporter = struct {
     }
 };
 
+pub const ToolObservationSink = @import("observation.zig").Sink;
+pub const ProjectRuleGate = @import("project_rule_gate.zig").Gate;
+pub const ToolObservationOrigin = @import("observation.zig").Origin;
+
+/// Host-only execution constraint installed after the formal recovery gate.
+/// It is not model input and cannot be selected through a tool argument.
+pub const ProjectEditMode = enum {
+    ordinary,
+    whole_file_exact,
+};
+
 /// Admission-fixed Run identity, passed by value down the execution chain.
 /// Immutable for the duration of one Run; never looked up from mutable state.
 pub const RunIdentity = struct {
@@ -281,6 +292,10 @@ pub const ToolContext = struct {
     /// TinyKG 客户端(记忆/计划/DAG 真相源;设计 KG_DESIGN v3-final)。
     /// null = 未配置(缺二进制)——KG 工具此时不会注册;non-null 但 !ready = degraded。
     kg: ?*@import("../kg/client.zig").KgClient = null,
+    /// 本次 agent run 的无向量检索事实账本。lexical_plan 存在时必须非 null：
+    /// 宿主据此校验模型声明的 seen_node_ids，并在同一锁内计算/提交真实命中增益。
+    /// legacy query-only 路径不读取它。由 agent_loop.run 创建，绝不进 TinyKG store。
+    kg_lexical_ledger: ?*@import("../kg/lexical_query_plan.zig").Ledger = null,
     /// KG per-project 指针目录(`{home}/.metacodes/projects/<git根hash>`)。plan 落图写 kg_root
     /// 到此。空串 = 未配置。设计 KG_DESIGN v3-final §3。
     kg_projects_dir: []const u8 = "",
@@ -360,6 +375,12 @@ pub const ToolContext = struct {
     /// gen(路由仍归父视图,身份必须独立,否则并发 subagent 共享 sentinel 互相无防撞)。
     /// **身份由程序赋予,绝不指望模型手填。**
     agent_ident: @import("../core/session_id.zig").SessionId = @import("../core/session_id.zig").SessionId.single,
+    /// TinyKG lease holder identity override. Null means `agent_ident`.
+    /// Swarm uses the stable human-readable `name@team` here for both claim and
+    /// close; keeping it separate from the fixed-width session id prevents the
+    /// old split-brain state where one identity claimed and another tried to
+    /// close the same task. Host-injected only; never exposed as a model field.
+    kg_agent_ident: ?[]const u8 = null,
     /// 当前 project root(${CLAUDE_PROJECT_DIR} 替换)。
     project_dir: []const u8 = "",
     /// 全局 disable-shell-execution 开关(settings.json `disableSkillShellExecution`)。
@@ -398,6 +419,27 @@ pub const ToolContext = struct {
     /// id = 该工具的 tool_use id(per-toolUse 多卡按它路由;tool_exec runJob 盖入)。flat 保留(per-job 数据非闭包)。
     progress_tool_id: []const u8 = "",
 
+    /// UI-independent evidence emitted at the actual dispatch boundary. The
+    /// sink is host supplied and may fail closed; it is not a permission or
+    /// rule-promotion capability. `effect_slot` is installed by executeOne for
+    /// one synchronous dispatch and must never escape that call.
+    tool_observer: ?ToolObservationSink = null,
+    /// Hash-pinned project-specific formal gate. Unlike permission policy it
+    /// is evaluated inside executeOne at the actual dispatch seam, so TUI,
+    /// headless, Web, subagents, TaskBatch, and prefetch cannot bypass it.
+    project_rule_gate: ?ProjectRuleGate = null,
+    tool_observation_origin: ToolObservationOrigin = .authoritative,
+    effect_slot: ?*@import("observation.zig").EffectSlot = null,
+    /// executeOne sets this only after a formal gate admits a Write whose
+    /// target was observed missing.  Write then uses O_EXCL so a file created
+    /// in the observation-to-open window is not silently truncated.
+    project_write_exclusive_create: bool = false,
+    /// executeOne sets this only for a Lean-admitted recovery Edit.  The
+    /// native Edit implementation then requires old_string to equal the full
+    /// bytes read from one O_NOFOLLOW RDWR descriptor and disables every
+    /// fuzzy/substring fallback.
+    project_edit_mode: ProjectEditMode = .ordinary,
+
     /// **U6 A2:工具→父 backend 通知通路**。Task 生 subagent → emit agent_lifecycle;
     /// TaskUpdate 改 DAG → emit tasks_changed。agent_loop(depth==0)注入,转发到 backend.emitEvent
     /// (mirror progress_reporter/ProgressTramp)。null = 无(headless/子 agent/纯单测)→ 工具跳过 emit。
@@ -434,6 +476,22 @@ pub const ToolContext = struct {
     /// id 自动用 self.progress_tool_id(per-toolUse 多卡路由)。
     pub fn reportProgress(self: *const ToolContext, phase: ProgressPhase, text: []const u8, count: u32) void {
         if (self.progress_reporter) |r| r.report(self.progress_tool_id, phase, text, count);
+    }
+
+    /// Attach target-file evidence observed by this dispatch. `after` is the
+    /// byte sequence the tool finished writing, not a race-free post-dispatch
+    /// re-observation. With no executeOne-installed slot (direct unit calls /
+    /// legacy embedders), this is deliberately a no-op rather than a second
+    /// observation path.
+    pub fn reportFileMutation(
+        self: *const ToolContext,
+        path: []const u8,
+        before: @import("observation.zig").BeforeContent,
+        after: []const u8,
+    ) void {
+        const slot = self.effect_slot orelse return;
+        const effect = @import("observation.zig").fileMutation(path, before, after).file_mutation_v1;
+        slot.recordFileMutation(path, effect);
     }
 
     pub fn isPrefetchSafe(self: *const ToolContext, name: []const u8) bool {

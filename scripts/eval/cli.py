@@ -7,7 +7,9 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
@@ -15,8 +17,10 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.eval.analysis import (  # type: ignore
         compare,
+        compare_multi_arm,
         gate,
         render_comparison_markdown,
+        render_multi_arm_markdown,
         render_summary_markdown,
         summarize,
         validate_release_contract,
@@ -28,6 +32,10 @@ if __package__ in {None, ""}:
         import_run,
         prepare_runtime_metadata,
     )
+    from scripts.eval.experiment import (  # type: ignore
+        build_dry_run_plan,
+        validate_experiment,
+    )
     from scripts.eval.model import (  # type: ignore
         ValidationError,
         load_json,
@@ -36,12 +44,57 @@ if __package__ in {None, ""}:
         validate_suite,
         write_rollouts,
     )
-    from scripts.eval.paired_runner import run_paired  # type: ignore
+    from scripts.eval.memory_benchmark import (  # type: ignore
+        load_memory_rows,
+        render_memory_markdown,
+        summarize_memory,
+        write_memory_rows,
+    )
+    from scripts.eval.memory_hotpot_adapter import (  # type: ignore
+        OFFICIAL_SOURCE_REVISION,
+        OFFICIAL_SOURCE_URL,
+        adapt_hotpot,
+        artifact_bytes as memory_adapter_artifact_bytes,
+        load_execution as load_memory_execution,
+        load_source_policy as load_hotpot_source_policy,
+    )
+    from scripts.eval.memory_longmem_adapter import (  # type: ignore
+        OFFICIAL_SOURCE_REVISION as LONGMEM_OFFICIAL_SOURCE_REVISION,
+        OFFICIAL_SOURCE_URL as LONGMEM_OFFICIAL_SOURCE_URL,
+        adapt_longmem,
+        artifact_bytes as longmem_adapter_artifact_bytes,
+        load_execution as load_longmem_execution,
+    )
+    from scripts.eval.memory_procedural_adapter import (  # type: ignore
+        adapt_procedural,
+        artifact_bytes as procedural_adapter_artifact_bytes,
+        load_execution as load_procedural_execution,
+    )
+    from scripts.eval.memory_query_plan import render_query_plan_markdown  # type: ignore
+    from scripts.eval.memory_replay import (  # type: ignore
+        load_manifest as load_memory_manifest,
+        load_observations as load_memory_observations,
+        load_runtime_receipt as load_memory_runtime_receipt,
+        replay_observations,
+        render_warm_context_cache_markdown,
+        summarize_warm_context_cache,
+        summarize_runtime_query_plans,
+    )
+    from scripts.eval.memory_tinykg_local import run_local_tinykg_smoke  # type: ignore
+    from scripts.eval.paired_runner import run_multi_arm, run_paired  # type: ignore
+    from scripts.eval.promotion import (  # type: ignore
+        build_promotion_receipt,
+        calibration_checkpoint_paths,
+        validate_calibration_bundle,
+        validate_multi_arm_evidence,
+    )
 else:
     from .analysis import (
         compare,
+        compare_multi_arm,
         gate,
         render_comparison_markdown,
+        render_multi_arm_markdown,
         render_summary_markdown,
         summarize,
         validate_release_contract,
@@ -53,6 +106,10 @@ else:
         import_run,
         prepare_runtime_metadata,
     )
+    from .experiment import (
+        build_dry_run_plan,
+        validate_experiment,
+    )
     from .model import (
         ValidationError,
         load_json,
@@ -61,7 +118,50 @@ else:
         validate_suite,
         write_rollouts,
     )
-    from .paired_runner import run_paired
+    from .memory_benchmark import (
+        load_memory_rows,
+        render_memory_markdown,
+        summarize_memory,
+        write_memory_rows,
+    )
+    from .memory_hotpot_adapter import (
+        OFFICIAL_SOURCE_REVISION,
+        OFFICIAL_SOURCE_URL,
+        adapt_hotpot,
+        artifact_bytes as memory_adapter_artifact_bytes,
+        load_execution as load_memory_execution,
+        load_source_policy as load_hotpot_source_policy,
+    )
+    from .memory_longmem_adapter import (
+        OFFICIAL_SOURCE_REVISION as LONGMEM_OFFICIAL_SOURCE_REVISION,
+        OFFICIAL_SOURCE_URL as LONGMEM_OFFICIAL_SOURCE_URL,
+        adapt_longmem,
+        artifact_bytes as longmem_adapter_artifact_bytes,
+        load_execution as load_longmem_execution,
+    )
+    from .memory_procedural_adapter import (
+        adapt_procedural,
+        artifact_bytes as procedural_adapter_artifact_bytes,
+        load_execution as load_procedural_execution,
+    )
+    from .memory_query_plan import render_query_plan_markdown
+    from .memory_replay import (
+        load_manifest as load_memory_manifest,
+        load_observations as load_memory_observations,
+        load_runtime_receipt as load_memory_runtime_receipt,
+        render_warm_context_cache_markdown,
+        replay_observations,
+        summarize_warm_context_cache,
+        summarize_runtime_query_plans,
+    )
+    from .memory_tinykg_local import run_local_tinykg_smoke
+    from .paired_runner import run_multi_arm, run_paired
+    from .promotion import (
+        build_promotion_receipt,
+        calibration_checkpoint_paths,
+        validate_calibration_bundle,
+        validate_multi_arm_evidence,
+    )
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -71,7 +171,28 @@ def _write(path: Optional[str], text: str) -> None:
     if path:
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding="utf-8")
+        temp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=target.parent,
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, target)
+            temp_path = None
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
     else:
         print(text, end="" if text.endswith("\n") else "\n")
 
@@ -93,6 +214,364 @@ def cmd_validate_suite(args: argparse.Namespace) -> int:
 def cmd_validate_rollouts(args: argparse.Namespace) -> int:
     rollouts = load_rollouts(Path(args.rollouts))
     print(f"rollouts: valid ({len(rollouts)} records)")
+    return 0
+
+
+def cmd_validate_memory(args: argparse.Namespace) -> int:
+    rows = load_memory_rows(Path(args.results))
+    print(f"memory results: valid ({len(rows)} records)")
+    return 0
+
+
+def cmd_report_memory(args: argparse.Namespace) -> int:
+    rows = load_memory_rows(Path(args.results))
+    summary = summarize_memory(rows, base_arm=args.base_arm)
+    _write(args.markdown, render_memory_markdown(summary, args.title))
+    if args.json:
+        _write_json(args.json, summary)
+    return 0
+
+
+def cmd_report_memory_query_plans(args: argparse.Namespace) -> int:
+    receipt_path = Path(args.runtime_receipt).resolve()
+    receipt = load_memory_runtime_receipt(receipt_path)
+    artifact_root = (
+        Path(args.artifact_root).resolve()
+        if args.artifact_root
+        else receipt_path.parent
+    )
+    summary = summarize_runtime_query_plans(receipt, artifact_root)
+    _write(args.markdown, render_query_plan_markdown(summary, args.title))
+    if args.json:
+        _write_json(args.json, summary)
+    print(
+        "memory query plans: "
+        f"explicit_verified={summary['status_counts']['explicit_plan_verified']} "
+        f"host_recall_satisfied={summary['status_counts']['host_recall_satisfied']} "
+        f"invalid={summary['status_counts']['invalid']} "
+        f"legacy_unavailable={summary['status_counts']['legacy_unavailable']}"
+    )
+    return 0
+
+
+def cmd_report_memory_cache(args: argparse.Namespace) -> int:
+    receipt_path = Path(args.runtime_receipt).resolve()
+    receipt = load_memory_runtime_receipt(receipt_path)
+    artifact_root = (
+        Path(args.artifact_root).resolve()
+        if args.artifact_root
+        else receipt_path.parent
+    )
+    receipt_sha256 = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+    summary = summarize_warm_context_cache(
+        receipt,
+        artifact_root,
+        runtime_receipt_sha256=receipt_sha256,
+    )
+    _write(args.markdown, render_warm_context_cache_markdown(summary, args.title))
+    if args.json:
+        _write_json(args.json, summary)
+    print(
+        "memory warm-cache: "
+        f"diagnostic_gate={'PASS' if summary['warm_cache_diagnostic_gate_passed'] else 'FAIL'} "
+        f"arms={len(summary['by_arm'])} rollouts={len(summary['rollouts'])}"
+    )
+    return 0
+
+
+def cmd_replay_memory(args: argparse.Namespace) -> int:
+    input_paths = {
+        Path(args.manifest).resolve(),
+        Path(args.observations).resolve(),
+        Path(args.dataset_source).resolve(),
+        Path(args.runtime_receipt).resolve(),
+    }
+    output_paths = [
+        Path(value).resolve()
+        for value in (args.output, args.markdown, args.json)
+        if value
+    ]
+    if len(set(output_paths)) != len(output_paths):
+        raise ValidationError("memory replay output paths must be distinct")
+    overlap = input_paths.intersection(output_paths)
+    if overlap:
+        raise ValidationError(
+            f"memory replay output would overwrite an input artifact: {sorted(map(str, overlap))}"
+        )
+    manifest = load_memory_manifest(Path(args.manifest))
+    observations = load_memory_observations(Path(args.observations))
+    runtime_receipt_path = Path(args.runtime_receipt).resolve()
+    runtime_receipt = load_memory_runtime_receipt(runtime_receipt_path)
+    rows = replay_observations(
+        manifest,
+        observations,
+        dataset_source=Path(args.dataset_source),
+        runtime_receipt=runtime_receipt,
+        runtime_artifact_root=runtime_receipt_path.parent,
+    )
+    write_memory_rows(Path(args.output), rows)
+    if args.markdown or args.json:
+        summary = summarize_memory(rows, base_arm=args.base_arm)
+        if args.markdown:
+            _write(args.markdown, render_memory_markdown(summary, args.title))
+        if args.json:
+            _write_json(args.json, summary)
+    print(
+        f"memory replay complete: rows={len(rows)} "
+        f"manifest={hashlib.sha256(stable_json(manifest).encode('utf-8')).hexdigest()[:16]}"
+    )
+    return 0
+
+
+def cmd_adapt_hotpot_memory(args: argparse.Namespace) -> int:
+    input_paths = {
+        Path(args.source).resolve(),
+        Path(args.execution).resolve(),
+    }
+    if args.source_policy:
+        input_paths.add(Path(args.source_policy).resolve())
+    output_paths = {
+        Path(args.output_source).resolve(),
+        Path(args.output_manifest).resolve(),
+    }
+    if len(output_paths) != 2:
+        raise ValidationError("HotpotQA adapter output paths must be distinct")
+    overlap = input_paths.intersection(output_paths)
+    if overlap:
+        raise ValidationError(
+            "HotpotQA adapter output would overwrite an input artifact: "
+            f"{sorted(map(str, overlap))}"
+        )
+    execution = load_memory_execution(Path(args.execution))
+    source_policy = (
+        load_hotpot_source_policy(Path(args.source_policy))
+        if args.source_policy
+        else None
+    )
+    source_slice, manifest = adapt_hotpot(
+        Path(args.source),
+        execution,
+        expected_source_sha256=args.expected_source_sha256,
+        limit=args.limit,
+        split_seed=args.split_seed,
+        source_url=args.source_url,
+        source_revision=args.source_revision,
+        source_policy=source_policy,
+    )
+    _write(
+        args.output_source,
+        memory_adapter_artifact_bytes(source_slice).decode("utf-8"),
+    )
+    _write(
+        args.output_manifest,
+        memory_adapter_artifact_bytes(manifest).decode("utf-8"),
+    )
+    print(
+        "HotpotQA memory adapter complete: "
+        f"cases={len(manifest['cases'])} "
+        f"source={manifest['dataset']['source_sha256'][:16]} "
+        f"upstream={source_slice['upstream']['source_sha256'][:16]}"
+    )
+    return 0
+
+
+def cmd_adapt_longmem_memory(args: argparse.Namespace) -> int:
+    input_paths = {
+        Path(args.source).resolve(),
+        Path(args.execution).resolve(),
+    }
+    output_paths = {
+        Path(args.output_source).resolve(),
+        Path(args.output_manifest).resolve(),
+    }
+    if len(output_paths) != 2:
+        raise ValidationError("LongMemEval-S adapter output paths must be distinct")
+    overlap = input_paths.intersection(output_paths)
+    if overlap:
+        raise ValidationError(
+            "LongMemEval-S adapter output would overwrite an input artifact: "
+            f"{sorted(map(str, overlap))}"
+        )
+    execution = load_longmem_execution(Path(args.execution))
+    source_slice, manifest = adapt_longmem(
+        Path(args.source),
+        execution,
+        expected_source_sha256=args.expected_source_sha256,
+        limit=args.limit,
+        split_seed=args.split_seed,
+        source_url=args.source_url,
+        source_revision=args.source_revision,
+    )
+    _write(
+        args.output_source,
+        longmem_adapter_artifact_bytes(source_slice).decode("utf-8"),
+    )
+    _write(
+        args.output_manifest,
+        longmem_adapter_artifact_bytes(manifest).decode("utf-8"),
+    )
+    print(
+        "LongMemEval-S memory adapter complete: "
+        f"cases={len(manifest['cases'])} "
+        f"source={manifest['dataset']['source_sha256'][:16]} "
+        f"upstream={source_slice['upstream']['source_sha256'][:16]}"
+    )
+    return 0
+
+
+def cmd_adapt_procedural_memory(args: argparse.Namespace) -> int:
+    input_paths = {
+        Path(args.source).resolve(),
+        Path(args.execution).resolve(),
+    }
+    output_paths = {
+        Path(args.output_source).resolve(),
+        Path(args.output_validators).resolve(),
+        Path(args.output_manifest).resolve(),
+    }
+    if len(output_paths) != 3:
+        raise ValidationError("procedural adapter output paths must be distinct")
+    overlap = input_paths.intersection(output_paths)
+    if overlap:
+        raise ValidationError(
+            "procedural adapter output would overwrite an input artifact: "
+            f"{sorted(map(str, overlap))}"
+        )
+    execution = load_procedural_execution(Path(args.execution))
+    source_slice, validators, manifest = adapt_procedural(
+        Path(args.source),
+        execution,
+        expected_source_sha256=args.expected_source_sha256,
+        limit_families=args.limit_families,
+        split_seed=args.split_seed,
+    )
+    _write(
+        args.output_source,
+        procedural_adapter_artifact_bytes(source_slice).decode("utf-8"),
+    )
+    _write(
+        args.output_validators,
+        procedural_adapter_artifact_bytes(validators).decode("utf-8"),
+    )
+    _write(
+        args.output_manifest,
+        procedural_adapter_artifact_bytes(manifest).decode("utf-8"),
+    )
+    print(
+        "procedural coding memory adapter complete: "
+        f"families={len(source_slice['families'])} "
+        f"cases={len(manifest['cases'])} "
+        f"source={manifest['dataset']['source_sha256'][:16]}"
+    )
+    return 0
+
+
+def cmd_smoke_local_tinykg_memory(args: argparse.Namespace) -> int:
+    trace = run_local_tinykg_smoke(
+        binary=Path(args.binary),
+        expected_binary_sha256=args.expected_binary_sha256,
+        source_path=Path(args.source),
+        manifest_path=Path(args.manifest),
+        run_dir=Path(args.run_dir),
+        output_path=Path(args.output),
+        case_limit=args.case_limit,
+    )
+    print(
+        "local TinyKG memory smoke complete: "
+        f"adapter={trace['identity']['adapter_id']} "
+        f"cases={len(trace['cases'])} "
+        "remote_calls=0 remote_writes=0"
+    )
+    return 0
+
+
+def _load_experiment_and_suite(path: Path) -> tuple[Dict[str, Any], Dict[str, Any], Path]:
+    experiment = load_json(path)
+    suite_value = experiment.get("suite")
+    if not isinstance(suite_value, str) or not suite_value.strip():
+        raise ValidationError("experiment.suite: expected non-empty string")
+    suite_path = (REPO_ROOT / suite_value).resolve()
+    try:
+        suite_path.relative_to(REPO_ROOT.resolve())
+    except ValueError as exc:
+        raise ValidationError("experiment.suite escapes repository root") from exc
+    if not suite_path.is_file():
+        raise ValidationError(f"experiment.suite does not exist: {suite_value}")
+    suite = load_json(suite_path)
+    validate_experiment(experiment, REPO_ROOT, suite)
+    return experiment, suite, suite_path
+
+
+def cmd_validate_experiment(args: argparse.Namespace) -> int:
+    experiment, suite, _suite_path = _load_experiment_and_suite(Path(args.experiment))
+    plan = build_dry_run_plan(
+        experiment,
+        suite,
+        binary=Path(args.binary),
+        tinykg_binary=Path(args.tinykg_binary),
+        formal_kernel=Path(args.formal_kernel),
+        revision=args.revision,
+    )
+    print(
+        f"experiment {experiment['experiment_id']}: valid "
+        f"({len(suite['tasks'])} tasks, {plan['rollout_count']} planned rollouts, "
+        f"plan={plan['plan_fingerprint']})"
+    )
+    return 0
+
+
+def cmd_run_multi(args: argparse.Namespace) -> int:
+    experiment, suite, suite_path = _load_experiment_and_suite(Path(args.experiment))
+    if args.dry_run:
+        plan = build_dry_run_plan(
+            experiment,
+            suite,
+            binary=Path(args.binary),
+            tinykg_binary=Path(args.tinykg_binary),
+            formal_kernel=Path(args.formal_kernel),
+            revision=args.revision,
+            budget_used_cost_usd=args.budget_used_cost_usd,
+            budget_used_tokens=args.budget_used_tokens,
+        )
+        _write_json(args.plan_output, plan)
+        print(
+            f"multi-arm dry-run complete: rollouts={plan['rollout_count']} "
+            f"plan={plan['plan_fingerprint']} paid=0",
+            file=sys.stderr if args.plan_output is None else sys.stdout,
+        )
+        return 0
+    collected = run_multi_arm(
+        experiment,
+        suite,
+        REPO_ROOT,
+        Path(args.binary),
+        tinykg_binary=Path(args.tinykg_binary),
+        formal_kernel=Path(args.formal_kernel),
+        revision=args.revision,
+        output_dir=Path(args.output_dir),
+        suite_path=suite_path,
+        allow_paid_rollouts=args.allow_paid_rollouts,
+        promotion_receipt=(
+            load_json(Path(args.promotion_receipt))
+            if args.promotion_receipt
+            else None
+        ),
+        calibration_checkpoints=(
+            calibration_checkpoint_paths(Path(args.calibration_dir))
+            if args.calibration_dir
+            else None
+        ),
+        budget_used_cost_usd=args.budget_used_cost_usd,
+        budget_used_tokens=args.budget_used_tokens,
+        budget_journal_path=(
+            Path(args.budget_journal) if args.budget_journal else None
+        ),
+        auth_file=args.auth_file,
+    )
+    print(
+        "multi-arm E2E complete: "
+        + " ".join(f"{arm}={len(rows)}" for arm, rows in collected.items())
+    )
     return 0
 
 
@@ -125,6 +604,8 @@ def cmd_prepare_e2e(args: argparse.Namespace) -> int:
         harness_revision=args.harness_revision,
         permission_mode=args.permission_mode,
         binary_path=Path(args.binary),
+        max_metered_tokens=args.max_metered_tokens,
+        max_cost_usd=args.max_cost_usd,
     )
     if metadata is None:
         print(f"task {args.task}: not in scored suite; native evaluation disabled")
@@ -186,6 +667,87 @@ def cmd_compare(args: argparse.Namespace) -> int:
     _write(args.markdown, markdown)
     if args.json:
         _write_json(args.json, result)
+    return 0
+
+
+def _validated_multi_arm_outputs(
+    experiment: Dict[str, Any],
+    suite: Dict[str, Any],
+    paths: Dict[str, Path],
+    *,
+    tinykg_binary: Path,
+) -> tuple[Dict[str, Any], Dict[str, list[Dict[str, Any]]]]:
+    metadata, rollouts_by_arm, _checkpoint_sha256 = validate_multi_arm_evidence(
+        experiment,
+        suite,
+        REPO_ROOT,
+        paths,
+        tinykg_binary=tinykg_binary,
+    )
+    result = compare_multi_arm(rollouts_by_arm)
+    result.update(metadata)
+    return result, rollouts_by_arm
+
+
+def cmd_report_multi(args: argparse.Namespace) -> int:
+    experiment, suite, _suite_path = _load_experiment_and_suite(Path(args.experiment))
+    if experiment["stage"]["scoring"] != "confirmatory":
+        raise ValidationError(
+            "report-multi only accepts the held-out confirmatory stage; "
+            "use promote-multi for calibration"
+        )
+    paths = {
+        "codex_style": Path(args.codex_style),
+        "claude_style": Path(args.claude_style),
+        "tinykg": Path(args.tinykg),
+    }
+    result, _rollouts_by_arm = _validated_multi_arm_outputs(
+        experiment,
+        suite,
+        paths,
+        tinykg_binary=Path(args.tinykg_binary),
+    )
+    receipt = load_json(Path(args.promotion_receipt))
+    calibration_cost, calibration_tokens = validate_calibration_bundle(
+        receipt,
+        experiment,
+        REPO_ROOT,
+        calibration_checkpoint_paths(Path(args.calibration_dir)),
+        tinykg_binary=Path(args.tinykg_binary),
+        metacodes_sha256=result["metacodes_sha256"],
+        tinykg_sha256=result["tinykg_sha256"],
+        formal_kernel_fingerprint=result["formal_kernel_fingerprint"],
+        revision=result["harness_revision"],
+    )
+    result["promotion"] = {
+        "source_experiment_id": receipt["source_experiment_id"],
+        "source_experiment_fingerprint": receipt["source_experiment_fingerprint"],
+        "calibration_cost_usd": calibration_cost,
+        "calibration_tokens": calibration_tokens,
+    }
+    _write(args.markdown, render_multi_arm_markdown(result))
+    if args.json:
+        _write_json(args.json, result)
+    return 0
+
+
+def cmd_promote_multi(args: argparse.Namespace) -> int:
+    experiment, suite, _suite_path = _load_experiment_and_suite(Path(args.experiment))
+    if experiment["stage"]["id"] != "calibration":
+        raise ValidationError("promote-multi only accepts the calibration stage")
+    paths = {
+        "codex_style": Path(args.codex_style),
+        "claude_style": Path(args.claude_style),
+        "tinykg": Path(args.tinykg),
+    }
+    receipt = build_promotion_receipt(
+        experiment,
+        suite,
+        REPO_ROOT,
+        paths,
+        tinykg_binary=Path(args.tinykg_binary),
+    )
+    _write_json(args.output, receipt)
     return 0
 
 
@@ -504,6 +1066,17 @@ def parser() -> argparse.ArgumentParser:
     validate_rollouts_parser.add_argument("rollouts")
     validate_rollouts_parser.set_defaults(func=cmd_validate_rollouts)
 
+    validate_experiment_parser = commands.add_parser(
+        "validate-experiment",
+        help="validate the frozen three-arm long-horizon contract and dry-run identity",
+    )
+    validate_experiment_parser.add_argument("experiment")
+    validate_experiment_parser.add_argument("--binary", required=True)
+    validate_experiment_parser.add_argument("--tinykg-binary", required=True)
+    validate_experiment_parser.add_argument("--formal-kernel", required=True)
+    validate_experiment_parser.add_argument("--revision", required=True)
+    validate_experiment_parser.set_defaults(func=cmd_validate_experiment)
+
     import_parser = commands.add_parser(
         "import-e2e", help="normalize an existing tests/e2e run directory"
     )
@@ -528,6 +1101,8 @@ def parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--harness-revision", required=True)
     prepare_parser.add_argument("--permission-mode", required=True)
     prepare_parser.add_argument("--binary", required=True)
+    prepare_parser.add_argument("--max-metered-tokens", type=int)
+    prepare_parser.add_argument("--max-cost-usd", type=float)
     prepare_parser.set_defaults(func=cmd_prepare_e2e)
 
     finalize_parser = commands.add_parser(
@@ -543,6 +1118,143 @@ def parser() -> argparse.ArgumentParser:
     report_parser.add_argument("--markdown")
     report_parser.add_argument("--json")
     report_parser.set_defaults(func=cmd_report)
+
+    validate_memory_parser = commands.add_parser(
+        "validate-memory",
+        help="validate memory-maturation-v1 result JSONL without scoring",
+    )
+    validate_memory_parser.add_argument("results")
+    validate_memory_parser.set_defaults(func=cmd_validate_memory)
+
+    memory_report_parser = commands.add_parser(
+        "report-memory",
+        help="score episodic, multi-hop, and procedural memory result JSONL",
+    )
+    memory_report_parser.add_argument("results")
+    memory_report_parser.add_argument("--base-arm", default="no_memory")
+    memory_report_parser.add_argument("--title", default="metacodes memory maturation")
+    memory_report_parser.add_argument("--markdown")
+    memory_report_parser.add_argument("--json")
+    memory_report_parser.set_defaults(func=cmd_report_memory)
+
+    query_plan_report_parser = commands.add_parser(
+        "report-memory-query-plans",
+        help="recompute governed TinyKG query-plan gain from native cassettes",
+    )
+    query_plan_report_parser.add_argument("--runtime-receipt", required=True)
+    query_plan_report_parser.add_argument(
+        "--artifact-root",
+        help="runtime artifact root (defaults to the receipt parent directory)",
+    )
+    query_plan_report_parser.add_argument(
+        "--title",
+        default="metacodes governed lexical query plans",
+    )
+    query_plan_report_parser.add_argument("--markdown")
+    query_plan_report_parser.add_argument("--json")
+    query_plan_report_parser.set_defaults(func=cmd_report_memory_query_plans)
+
+    cache_report_parser = commands.add_parser(
+        "report-memory-cache",
+        help="measure warm provider-cache reuse from receipt-bound native events",
+    )
+    cache_report_parser.add_argument("--runtime-receipt", required=True)
+    cache_report_parser.add_argument(
+        "--artifact-root",
+        help="runtime artifact root (defaults to the receipt parent directory)",
+    )
+    cache_report_parser.add_argument(
+        "--title",
+        default="metacodes warm-cache diagnostic",
+    )
+    cache_report_parser.add_argument("--markdown")
+    cache_report_parser.add_argument("--json")
+    cache_report_parser.set_defaults(func=cmd_report_memory_cache)
+
+    hotpot_adapter_parser = commands.add_parser(
+        "adapt-hotpot-memory",
+        help="freeze a pinned HotpotQA distractor subset and replay manifest",
+    )
+    hotpot_adapter_parser.add_argument("--source", required=True)
+    hotpot_adapter_parser.add_argument("--expected-source-sha256", required=True)
+    hotpot_adapter_parser.add_argument("--execution", required=True)
+    hotpot_adapter_parser.add_argument(
+        "--source-policy",
+        help="source-SHA-bound quarantine policy for known upstream annotation defects",
+    )
+    hotpot_adapter_parser.add_argument("--output-source", required=True)
+    hotpot_adapter_parser.add_argument("--output-manifest", required=True)
+    hotpot_adapter_parser.add_argument("--limit", type=int, default=1000)
+    hotpot_adapter_parser.add_argument("--split-seed", type=int, default=20260806)
+    hotpot_adapter_parser.add_argument("--source-url", default=OFFICIAL_SOURCE_URL)
+    hotpot_adapter_parser.add_argument(
+        "--source-revision",
+        default=OFFICIAL_SOURCE_REVISION,
+    )
+    hotpot_adapter_parser.set_defaults(func=cmd_adapt_hotpot_memory)
+
+    longmem_adapter_parser = commands.add_parser(
+        "adapt-longmem-memory",
+        help="freeze a pinned cleaned LongMemEval-S subset and replay manifest",
+    )
+    longmem_adapter_parser.add_argument("--source", required=True)
+    longmem_adapter_parser.add_argument("--expected-source-sha256", required=True)
+    longmem_adapter_parser.add_argument("--execution", required=True)
+    longmem_adapter_parser.add_argument("--output-source", required=True)
+    longmem_adapter_parser.add_argument("--output-manifest", required=True)
+    longmem_adapter_parser.add_argument("--limit", type=int, default=500)
+    longmem_adapter_parser.add_argument("--split-seed", type=int, default=20260806)
+    longmem_adapter_parser.add_argument(
+        "--source-url",
+        default=LONGMEM_OFFICIAL_SOURCE_URL,
+    )
+    longmem_adapter_parser.add_argument(
+        "--source-revision",
+        default=LONGMEM_OFFICIAL_SOURCE_REVISION,
+    )
+    longmem_adapter_parser.set_defaults(func=cmd_adapt_longmem_memory)
+
+    procedural_adapter_parser = commands.add_parser(
+        "adapt-procedural-memory",
+        help="freeze coding intent families, workspaces, validators, and causal schedule",
+    )
+    procedural_adapter_parser.add_argument("--source", required=True)
+    procedural_adapter_parser.add_argument("--expected-source-sha256", required=True)
+    procedural_adapter_parser.add_argument("--execution", required=True)
+    procedural_adapter_parser.add_argument("--output-source", required=True)
+    procedural_adapter_parser.add_argument("--output-validators", required=True)
+    procedural_adapter_parser.add_argument("--output-manifest", required=True)
+    procedural_adapter_parser.add_argument("--limit-families", type=int, default=2)
+    procedural_adapter_parser.add_argument("--split-seed", type=int, default=20260806)
+    procedural_adapter_parser.set_defaults(func=cmd_adapt_procedural_memory)
+
+    local_tinykg_parser = commands.add_parser(
+        "smoke-local-tinykg-memory",
+        help="materialize a memory source slice in fresh explicit local TinyKG stores",
+    )
+    local_tinykg_parser.add_argument("--binary", required=True)
+    local_tinykg_parser.add_argument("--expected-binary-sha256", required=True)
+    local_tinykg_parser.add_argument("--source", required=True)
+    local_tinykg_parser.add_argument("--manifest", required=True)
+    local_tinykg_parser.add_argument("--run-dir", required=True)
+    local_tinykg_parser.add_argument("--output", required=True)
+    local_tinykg_parser.add_argument("--case-limit", type=int, default=1)
+    local_tinykg_parser.set_defaults(func=cmd_smoke_local_tinykg_memory)
+
+    memory_replay_parser = commands.add_parser(
+        "replay-memory",
+        help="join a frozen memory case manifest with host-owned observations",
+    )
+    memory_replay_parser.add_argument("--manifest", required=True)
+    memory_replay_parser.add_argument("--observations", required=True)
+    memory_replay_parser.add_argument("--dataset-source", required=True)
+    memory_replay_parser.add_argument("--runtime-receipt", required=True)
+    memory_replay_parser.add_argument("--output", required=True)
+    memory_replay_parser.add_argument("--base-arm", default="no_memory")
+    memory_replay_parser.add_argument("--title", default="metacodes memory maturation")
+    memory_replay_parser.add_argument("--markdown")
+    memory_replay_parser.add_argument("--json")
+    memory_replay_parser.set_defaults(func=cmd_replay_memory)
 
     paired_parser = commands.add_parser(
         "run-paired", help="run repeated order-balanced baseline/candidate native E2E"
@@ -564,6 +1276,57 @@ def parser() -> argparse.ArgumentParser:
     paired_parser.add_argument("--max-cumulative-tokens", type=int)
     paired_parser.set_defaults(func=cmd_run_paired)
 
+    multi_parser = commands.add_parser(
+        "run-multi",
+        help="dry-run or execute the resumable three-arm long-horizon experiment",
+    )
+    multi_parser.add_argument("--experiment", required=True)
+    multi_parser.add_argument("--binary", required=True)
+    multi_parser.add_argument("--tinykg-binary", required=True)
+    multi_parser.add_argument("--formal-kernel", required=True)
+    multi_parser.add_argument("--revision", required=True)
+    multi_parser.add_argument("--output-dir", required=True)
+    multi_parser.add_argument("--dry-run", action="store_true")
+    multi_parser.add_argument("--plan-output")
+    multi_parser.add_argument("--allow-paid-rollouts", action="store_true")
+    multi_parser.add_argument(
+        "--budget-journal",
+        help=(
+            "private local budget journal outside --output-dir; required for "
+            "paid execution and ignored by --dry-run"
+        ),
+    )
+    multi_parser.add_argument(
+        "--auth-file",
+        type=Path,
+        default=Path.home() / ".metacodes" / "auth.json",
+        help=(
+            "private 0600 credential file loaded only after journal/checkpoint "
+            "validation; ignored by --dry-run"
+        ),
+    )
+    multi_parser.add_argument(
+        "--promotion-receipt",
+        help="calibration receipt required by the confirmatory stage",
+    )
+    multi_parser.add_argument(
+        "--calibration-dir",
+        help="authoritative calibration directory containing the three JSONL checkpoints",
+    )
+    multi_parser.add_argument(
+        "--budget-used-cost-usd",
+        type=float,
+        default=0.0,
+        help="paid cost from earlier attempts of this same stage; counts against stage and aggregate caps",
+    )
+    multi_parser.add_argument(
+        "--budget-used-tokens",
+        type=int,
+        default=0,
+        help="metered tokens from earlier attempts of this same stage; counts against stage and aggregate caps",
+    )
+    multi_parser.set_defaults(func=cmd_run_multi)
+
     compare_parser = commands.add_parser(
         "compare", help="paired comparison with exact McNemar significance"
     )
@@ -575,6 +1338,33 @@ def parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--markdown")
     compare_parser.add_argument("--json")
     compare_parser.set_defaults(func=cmd_compare)
+
+    multi_report_parser = commands.add_parser(
+        "report-multi",
+        help="validate and render one unified report for the three long-horizon arms",
+    )
+    multi_report_parser.add_argument("--experiment", required=True)
+    multi_report_parser.add_argument("--codex-style", required=True)
+    multi_report_parser.add_argument("--claude-style", required=True)
+    multi_report_parser.add_argument("--tinykg", required=True)
+    multi_report_parser.add_argument("--promotion-receipt", required=True)
+    multi_report_parser.add_argument("--calibration-dir", required=True)
+    multi_report_parser.add_argument("--tinykg-binary", required=True)
+    multi_report_parser.add_argument("--markdown")
+    multi_report_parser.add_argument("--json")
+    multi_report_parser.set_defaults(func=cmd_report_multi)
+
+    promote_parser = commands.add_parser(
+        "promote-multi",
+        help="validate a complete non-scoring calibration stage and issue its receipt",
+    )
+    promote_parser.add_argument("--experiment", required=True)
+    promote_parser.add_argument("--codex-style", required=True)
+    promote_parser.add_argument("--claude-style", required=True)
+    promote_parser.add_argument("--tinykg", required=True)
+    promote_parser.add_argument("--tinykg-binary", required=True)
+    promote_parser.add_argument("--output", required=True)
+    promote_parser.set_defaults(func=cmd_promote_multi)
 
     gate_parser = commands.add_parser("gate", help="enforce deployment/regression thresholds")
     gate_parser.add_argument("candidate")

@@ -1,0 +1,19 @@
+model: metacodes-w0-fake
+harness: metacodes/0.1.0
+dataset: datasets/metacodes-w0-synthetic/tasks
+harness_backend: local
+model_connection: local_proxy
+jobs_dir: results/metacodes-w0-synthetic
+n_attempts: 1
+# There are deliberately no provider calls in W0. Keeping this false also
+# avoids assigning an instance-specific proxy route to a zero-request fixture.
+record_full_io: false
+agent_user: dev
+verifier_user: dev
+task_selection:
+  mode: name
+  names: [metacodes-w0-artifact]
+orchestrator_override:
+  n_concurrent_trials: 1
+context_window: 200000
+context_compact_pct: 92

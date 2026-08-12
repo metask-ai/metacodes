@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "protocol_id": "metacodes-memory-maturation-v1",
+  "manifest_sha256": "a2e4e94a616e91bc14d49c7307f2785f517ff7d20ec3b01dd6c20875e3aa1abe",
+  "observations_sha256": "6c4c21505cc24230c4b4d9b1b34e2990b0823b7e75e0721fe7098e466c4ab957",
+  "dataset_sha256": "f06680d8589f572c2f1bfaa9734d45de3fdb2d2daf0f107ab4041272f2c53820",
+  "adapter_id": "synthetic-replay",
+  "adapter_revision": "memory-replay-v1",
+  "model_id": "fixture-model",
+  "model_fingerprint": "9372c470eeadd5ecd9c3c74c2b3cb633f8e2f2fad799250a0f70d652b6b825e4",
+  "harness_revision": "fixture-replay-v1",
+  "arms": [
+    {
+      "id": "no_memory",
+      "fingerprint": "f1cdfee9c65d357f1d94ae9eb9a84eb41802329c5acfb401d34d13b6958a2e43"
+    },
+    {
+      "id": "tinykg_lexical",
+      "fingerprint": "c9c35f091308fabff2b2fbb7638de61a01b11e070d639452b4f23771a9466f5c"
+    }
+  ],
+  "graders": [
+    {
+      "case_id": "episodic-preference-1",
+      "fingerprint": "eb075832bfc23fb7064e5affea2503c5b1751cbdd49368745003794f0e5e6789"
+    },
+    {
+      "case_id": "multihop-config-1",
+      "fingerprint": "eb075832bfc23fb7064e5affea2503c5b1751cbdd49368745003794f0e5e6789"
+    },
+    {
+      "case_id": "procedural-config-online-1",
+      "fingerprint": "7a73e7fd4fe4bbeebe819c7b525b339a8ccbe3e91bcf5fe10a11a2984f9c6ef4"
+    },
+    {
+      "case_id": "procedural-config-offline-1",
+      "fingerprint": "7a73e7fd4fe4bbeebe819c7b525b339a8ccbe3e91bcf5fe10a11a2984f9c6ef4"
+    }
+  ]
+}

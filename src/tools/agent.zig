@@ -30,6 +30,10 @@ pub const MAX_AGENT_DEPTH = @import("context.zig").MAX_AGENT_DEPTH;
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // Precondition: depth guard
     if (ctx.agent_depth >= MAX_AGENT_DEPTH) return error.AgentDepthExceeded;
+    if (ctx.project_rule_gate != null and
+        ((util_json.extractBoolField(args, "run_in_background") orelse false) or
+            util_json.extractStringField(args, "name") != null))
+        return error.ProjectRulesRequireSynchronousAgent;
 
     const api_client = ctx.api_client;
     if (ctx.provider == null and api_client == null) return error.AgentUnavailable;
@@ -62,6 +66,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const bg = requested_background or (if (def_opt) |d| d.background else false);
     const teammate_request = util_json.extractStringField(args, "name") != null;
     const out_of_process_teammate = teammate_request and ctx.swarm != null and ctx.swarm.?.out_of_process;
+    if (ctx.project_rule_gate != null and (bg or teammate_request))
+        return error.ProjectRulesRequireSynchronousAgent;
 
     // AgentDef.memory:解析唯一受限目录，并把它同时接到 system prompt、permission memdir
     // 豁免和 sandbox additional_dirs。三层必须同源，避免“提示说能写但权限/沙箱拒绝”。
@@ -155,6 +161,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         }
         ctx.allocator.free(originals);
     };
+    var effective_tool_names: ?[][]const u8 = null;
+    defer if (effective_tool_names) |names| ctx.allocator.free(names);
     if (def_opt) |d| {
         const filtered = try filter_mod.filterToolDefs(ctx.allocator, tool_defs, d);
         filtered_owned = filtered;
@@ -164,14 +172,18 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         // 只读 agent(Explore/Plan)的 Bash 会去掉 Git 段 + 加只读提醒(对齐 cc Explore)。
         // 描述里引用其它工具的判断基于过滤后的工具集。
         const tools_mod = @import("../tools.zig");
-        var names = try ctx.allocator.alloc([]const u8, filtered.len);
-        defer ctx.allocator.free(names);
+        const names = try ctx.allocator.alloc([]const u8, filtered.len);
+        effective_tool_names = names;
         for (filtered, 0..) |fd, i| names[i] = fd.name;
         const sub_prompt_ctx = tools_mod.PromptContext{
             .permission_mode = if (d.permission_mode) |m| mapPermissionMode(m) else .default,
             .enabled_tool_names = names,
             .agent_type = d.name,
             .include_git = true,
+            // AgentDef may intentionally hide KgRecall while retaining the
+            // persistent Task tools. Runtime capability, not a filtered tool
+            // name, decides which Task contract the child sees.
+            .tinykg_enabled = ctx.kg != null,
         };
         const originals = try ctx.allocator.alloc([]const u8, filtered.len);
         for (filtered, 0..) |fd, i| originals[i] = fd.description;
@@ -232,6 +244,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .home_dir = ctx.home_dir,
             .additional_dirs = effective_additional_dirs,
             .memory_dir = memory_dir,
+            // def.tools 是意图白名单；真正可用集合还受父 arm/capability 与永久禁用集约束。
+            .allowed_tool_names = if (d.tools.len > 0) effective_tool_names.? else null,
         });
         sys_prompt_owned = sp;
         sys_prompt = sp;
@@ -329,6 +343,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .max_turns = max_turns,
             .model_override = model_override,
             .reasoning_effort_override = if (def_opt) |d| d.effort else null,
+            .overrides_override = if (def_opt) |d| d.overrides else null,
             .perm_override = perm_override,
             .project_dir = effective_project_dir,
             .parent_model = ctx.parent_model,
@@ -450,9 +465,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .dyn_registry = ctx.dyn_registry,
             .tool_defs_override = if (filtered_owned != null) effective_tool_defs else null,
             .execution_policy = child_execution_policy,
+            .tool_observer = ctx.tool_observer,
+            .project_rule_gate = ctx.project_rule_gate,
             .permission_mode_override = perm_override,
             .model_override = model_override,
             .reasoning_effort_override = if (def_opt) |d| d.effort else null,
+            .overrides_override = if (def_opt) |d| d.overrides else null,
             .host_services = if (ctx.host_services) |hs| hs.skillOnly() else null,
             .project_dir = effective_project_dir,
             .kg = ctx.kg,
@@ -589,6 +607,34 @@ test "Task depth guard rejects at MAX" {
         .agent_depth = MAX_AGENT_DEPTH,
     };
     try testing.expectError(error.AgentDepthExceeded, execute(&ctx, "{\"prompt\":\"hi\"}"));
+}
+
+test "active project rules reject detached Agent before provider or worker side effects" {
+    const GateProbe = struct {
+        fn pre(_: *anyopaque, _: @import("project_rule_gate.zig").PreSignal) @import("project_rule_gate.zig").PreResult {
+            return .admit;
+        }
+        fn post(_: *anyopaque, _: @import("project_rule_gate.zig").PostSignal) @import("project_rule_gate.zig").Result {
+            return .admit;
+        }
+    };
+    var marker: u8 = 0;
+    const ctx = ToolContext{
+        .allocator = testing.allocator,
+        .project_rule_gate = .{
+            .ctx = @ptrCast(&marker),
+            .preFn = GateProbe.pre,
+            .postFn = GateProbe.post,
+        },
+    };
+    try testing.expectError(
+        error.ProjectRulesRequireSynchronousAgent,
+        execute(&ctx, "{\"prompt\":\"hi\",\"run_in_background\":true}"),
+    );
+    try testing.expectError(
+        error.ProjectRulesRequireSynchronousAgent,
+        execute(&ctx, "{\"prompt\":\"hi\",\"name\":\"worker\"}"),
+    );
 }
 
 test "parseUintField extracts max_turns" {

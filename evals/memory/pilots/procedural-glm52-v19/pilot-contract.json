@@ -1,0 +1,189 @@
+{
+  "schema_version": 1,
+  "pilot_id": "procedural-glm52-v19",
+  "artifacts": {
+    "execution.json": {
+      "bytes": 706,
+      "sha256": "f975bc3ac94081019686fa7d721c672103c324f367f37f5b4f26d2307bb51184"
+    },
+    "manifest.json": {
+      "bytes": 24504,
+      "sha256": "3c2d55c4436bbaeb998def7862162ba1bac85cfd150089ef92184cf99648ee92"
+    },
+    "source.json": {
+      "bytes": 15083,
+      "sha256": "bbbb7973a6cef303c22a7df7f49adc72c88f16e5673863d0680ee6fdf6708630"
+    },
+    "validators.json": {
+      "bytes": 14682,
+      "sha256": "24e6b012df58f7439007cbd06165a9bf83e907708d924b8c5f5ef6b93724ffdc"
+    }
+  },
+  "generation": {
+    "adapter": "adapt-procedural-memory",
+    "expected_upstream_sha256": "ca5f49131f610a800b7ab3dc3fcd2649de2c37ff74411cf31d5dc54e24e8e437",
+    "family_ids": [
+      "evidence-route-transfer-v4",
+      "rollback-ticket-transfer-v4",
+      "lease-release-transfer-v4",
+      "checkpoint-capsule-transfer-v4"
+    ],
+    "limit_families": 4,
+    "source_path": "evals/memory/fixtures/procedural-latent-protocol-families-v4.json",
+    "split_seed": 2026080820
+  },
+  "current_phase": {
+    "paid_rollouts_authorized": true,
+    "quality_evidence": false,
+    "scope": "multi-family-order-balanced-replication-with-explicit-durable-rollout-resume-after-credential-replacement"
+  },
+  "analysis_plan": {
+    "primary_estimand": "paired offline deterministic-success risk difference: tinykg_lexical minus no_memory",
+    "primary_population": "all frozen offline case-trial matches for which both compared arm rows are evaluator-ready; unmatched invalid rows are reported separately and never imputed",
+    "primary_test": "two-sided exact McNemar test over matched case-trial pairs at alpha=0.05",
+    "uncertainty": "cluster bootstrap risk-difference interval with 10000 resamples, seed 2026080820, clustered by family and trial",
+    "secondary_comparisons": [
+      "markdown_memory minus no_memory paired offline success",
+      "tinykg_lexical minus markdown_memory paired offline success"
+    ],
+    "secondary_diagnostics": [
+      "evidence precision and recall at k",
+      "verified evidence recall at k",
+      "explicit governed-plan, host-recall, and safely-contained denied-tool status",
+      "turns, metered tokens, exposed memory tokens, and cost",
+      "online acquisition success and offline write leakage"
+    ],
+    "multiplicity": "one primary comparison; secondary comparisons and diagnostics are descriptive",
+    "stopping_rule": "execute the complete frozen schedule unless a fail-closed budget, credential, binary, sandbox, journal, uncontained-tool, or runtime invariant stops before the next provider request; no efficacy stopping",
+    "invalid_rows": "retain for audit and exclude from outcome denominators; any differential invalidity blocks promotion to confirmatory evidence",
+    "interpretation": "quality_evidence remains false regardless of outcome; this replication selects and debugs a later confirmatory design"
+  },
+  "budget_authority": {
+    "max_output_tokens": 4096,
+    "max_rollout_cost_usd": 1.5,
+    "max_rollout_metered_tokens": 600000,
+    "max_total_cost_usd": 220.0,
+    "max_total_metered_tokens": 87000000,
+    "prior_conservative_cost_usd": 20.1836198,
+    "prior_conservative_metered_tokens": 18635513,
+    "user_authorization_max_cost_usd": 1000.0
+  },
+  "harness": {
+    "binary_sha256": "80d10a08698a3f820dc260d98e1394056bd87c9fd7fb48fedabb4b3b125952aa",
+    "binary_source_commit": "fe9c6ddaf442b5a01c701fe95ce8941e594b5db9",
+    "runner_source_commit": "cc0ca47",
+    "revision": "metacodes-memory-production-pilot-v23-cc0ca47"
+  },
+  "model": {
+    "fingerprint": "e5cc883082b2a25721ee8b861c5e0cca37b6bdd93648d6883d6c8c54a34bf650",
+    "id": "glm-5.2"
+  },
+  "incident_guard": {
+    "provider_schema_exposes_disallowed_tools": false,
+    "safely_contained_attempt": "continue only when a hash-bound tool result is error=true with permission_denied, safety, recoverable=false",
+    "tool_less_breaker_finalization": "accept only as the final request with an omitted tools field, exact fixed breaker text, and at least one triggering tool result",
+    "uncontained_attempt": "fail closed before the next provider request",
+    "mid_schedule_failure": "persist budget checkpoint before attempting artifact-tree digest, then rethrow",
+    "v16_transaction_reuse": false,
+    "v17_transaction_reuse": false,
+    "v18_transaction_reuse": false
+  },
+  "paid_execution_requirements": {
+    "budget_journal": "single-machine locked crash-conservative journal outside the fresh run directory",
+    "credential_transport": "private 0600 auth file to anonymous one-shot inherited file descriptor; neither credential nor its fingerprint enters artifacts",
+    "filesystem_isolation": "re-observe the macOS Seatbelt production profile and bound negative probes before provider access",
+    "governed_recall": "the model-visible KgRecall schema requires lexical_plan; explicit plans and host-scoped recall are separately audited",
+    "local_tinykg": "each family, trial, and treatment uses its own fresh isolated local store; no benchmark arm uses the remote harness",
+    "offline_memory_immutability": "before credential exposure, prove every offline Markdown and TinyKG root immutable while allowing only the transient TinyKG CLI lock subtree",
+    "remote_tinykg": "forbidden for benchmark corpus, trace, receipt, artifact, and store; refined verification only",
+    "semantic_grader": "Python registries are checked with AST literal assignment equality without executing candidate code",
+    "single_provider_attempt": true,
+    "tinykg_read_preflight": "before budget reservation, the exact pinned TinyKG binary must run store-info and one bounded lexical search inside the production Seatbelt profile and preserve store digests",
+    "tool_result_semantics": "only successful memory writes count as mutations; safely denied disallowed-tool attempts remain visible as model tool errors",
+    "toolchain_snapshot": "ripgrep is copied to the canonical run-owned 0500 snapshot before provider access"
+  },
+  "resume_contract": {
+    "activation": "resume is allowed only with the explicit --resume-paid-run flag and is never automatic",
+    "contiguous_prefix": "the checkpoint must bind the fully verified contiguous schedule prefix and every referenced rollout artifact and receipt",
+    "credential_gate": "checkpoint, runner, binary, artifact, and journal validation must complete before credential loading",
+    "journal_binding": "journal identity, revision, head hash, and file hash must exactly match the checkpoint and all referenced transactions must be committed",
+    "uncheckpointed_rollout": "any rollout directory outside the checkpointed prefix blocks resume",
+    "commit_to_checkpoint_ambiguity": "a journal advance without a matching verified rollout checkpoint blocks replay; the narrow window is detected, not claimed recoverable"
+  },
+  "predecessor_attempts": [
+    {
+      "committed_cost_usd": 0.896485,
+      "committed_metered_tokens": 1323282,
+      "completed_rollout_transactions": 12,
+      "pilot_id": "procedural-glm52-v16",
+      "quality_evidence": false,
+      "status": "halted-runner-misclassification",
+      "uncertain_authorized_transactions": 0
+    },
+    {
+      "committed_cost_usd": 6.680704,
+      "committed_metered_tokens": 9164004,
+      "completed_rollout_transactions": 111,
+      "pilot_id": "procedural-glm52-v17",
+      "quality_evidence": false,
+      "status": "halted-evidence-validator-protocol-drift",
+      "uncertain_authorized_transactions": 0
+    },
+    {
+      "committed_cost_usd": 0.0,
+      "committed_metered_tokens": 0,
+      "completed_rollout_transactions": 0,
+      "conservative_exposure_cost_usd": 1.5,
+      "conservative_exposure_metered_tokens": 600000,
+      "pilot_id": "procedural-glm52-v18",
+      "quality_evidence": false,
+      "status": "halted-provider-authentication-rejected",
+      "uncertain_authorized_transactions": 1
+    }
+  ],
+  "protocol": {
+    "arms": [
+      {
+        "fingerprint": "1d70eb700887237a6b751c4d80d777d04d2d59710b7cac76d882920583033c96",
+        "id": "no_memory",
+        "treatment": "external memory, host recall, consolidation, and TinyKG retrieval disabled"
+      },
+      {
+        "fingerprint": "5879e7949fd4690eda7ba2aa9445c1b8f4895bc832ce21da370496b4acedf585",
+        "id": "markdown_memory",
+        "treatment": "host-observed online execution episode consolidated to durable Markdown, then exposed read-only offline"
+      },
+      {
+        "fingerprint": "f80d2a7e533cd8baf44db8613700d0891042fb131213c18e7c13081076556f71",
+        "id": "tinykg_lexical",
+        "treatment": "host-observed episode imported into isolated TinyKG, derived lexical catalog published, scoped recall performed, and model retrieval forced through a replayable lexical query plan"
+      }
+    ],
+    "families": 4,
+    "online_cases": 4,
+    "offline_cases": 8,
+    "trials": 4,
+    "rollouts": 144,
+    "deterministic_workspace_validator": true,
+    "observation_schema_version": 2,
+    "production_receipt_schema_version": 8,
+    "sandbox_probe_schema_version": 3
+  },
+  "schedule": {
+    "rows": 144,
+    "offline_rows_per_arm": 32,
+    "arm_position_counts": 16,
+    "ordered_tsv_sha256": "bcf441355b667c0eba626a815b3d54dc88ae4de0f57459defbf2898e3fa46302"
+  },
+  "tinykg_runtime": {
+    "binary_sha256": "66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee",
+    "build_profile": "metacodes-vendored-ReleaseSafe-stripped",
+    "storage_format_version": 2,
+    "schema_version": 3,
+    "source_commit": "93d89bcd4d0208c994da3632fb6166efffcc86e7"
+  },
+  "toolchain": {
+    "ripgrep_sha256": "882ee4837235e252ce5ffecc3c1707f6d5b7db0054b7922301b5dc0f466a0fed",
+    "ripgrep_version": "15.2.0"
+  }
+}

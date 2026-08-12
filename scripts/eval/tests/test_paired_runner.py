@@ -1,3 +1,5 @@
+import math
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,7 +8,13 @@ from unittest import mock
 from scripts.eval.e2e_adapter import comparison_fingerprints
 from scripts.eval.model import ValidationError
 from scripts.eval.paired_runner import (
+    InfrastructureRunError,
+    _mark_runtime_budget_invalid,
     _require_budget,
+    _require_multi_budget,
+    _require_remaining_schedule_capacity,
+    _require_runtime_budget_provenance,
+    _remaining_multi_budget,
     _run_once,
     alternating_schedule,
     run_paired,
@@ -15,6 +23,147 @@ from scripts.eval.paired_runner import (
 
 
 class PairedRunnerTest(unittest.TestCase):
+    def test_runtime_budget_violation_is_checkpointable_invalid_evidence(self):
+        rollout = {
+            "execution": {"status": "completed", "invalid_reasons": []},
+            "judgement": {
+                "valid_for_scoring": True,
+                "trustworthy_success": True,
+            },
+            "attribution": [],
+        }
+        _mark_runtime_budget_invalid(rollout, "tokens=1001/1000")
+        self.assertEqual(rollout["execution"]["status"], "invalid")
+        self.assertEqual(
+            rollout["execution"]["invalid_reasons"],
+            ["runtime_budget_contract_violation"],
+        )
+        self.assertFalse(rollout["judgement"]["valid_for_scoring"])
+        self.assertFalse(rollout["judgement"]["trustworthy_success"])
+        self.assertEqual(
+            rollout["attribution"][0]["code"],
+            "runtime_budget_contract_violation",
+        )
+
+    def test_normalized_runtime_budget_must_match_sealed_allowance(self):
+        rollout = {
+            "harness": {
+                "runtime_budget": {
+                    "max_metered_tokens": 1000,
+                    "max_cost_usd": 5.0,
+                }
+            },
+            "metrics": {
+                "cost_usd": 4.0,
+                "input_tokens": 400,
+                "output_tokens": 100,
+                "cache_read_tokens": 400,
+                "cache_write_tokens": 100,
+            },
+        }
+        _require_runtime_budget_provenance(
+            rollout, max_metered_tokens=1000, max_cost_usd=5.0
+        )
+        with self.assertRaisesRegex(ValidationError, "does not match"):
+            _require_runtime_budget_provenance(
+                rollout, max_metered_tokens=999, max_cost_usd=5.0
+            )
+        rollout["metrics"]["cache_read_tokens"] = 401
+        with self.assertRaisesRegex(ValidationError, "exceeded"):
+            _require_runtime_budget_provenance(
+                rollout, max_metered_tokens=1000, max_cost_usd=5.0
+            )
+
+    def test_remaining_schedule_capacity_blocks_before_a_doomed_paid_run(self):
+        budget = {
+            "max_rollout_cost_usd": 5.0,
+            "max_rollout_tokens": 1000,
+            "max_stage_cost_usd": 100.0,
+            "max_stage_tokens": 10_000,
+            "max_aggregate_cost_usd": 1000.0,
+            "max_aggregate_tokens": 100_000,
+            "paid_rollouts_enabled": True,
+        }
+        self.assertEqual(
+            _require_remaining_schedule_capacity(
+                {},
+                budget,
+                remaining_rollouts=9,
+                stage_prior_cost_usd=0.0,
+                stage_prior_tokens=0,
+                aggregate_prior_cost_usd=0.0,
+                aggregate_prior_tokens=0,
+            ),
+            (5.0, 1000),
+        )
+        with self.assertRaisesRegex(ValidationError, "not budget-feasible before network"):
+            _require_remaining_schedule_capacity(
+                {},
+                budget,
+                remaining_rollouts=10,
+                stage_prior_cost_usd=0.0,
+                stage_prior_tokens=0,
+                aggregate_prior_cost_usd=0.0,
+                aggregate_prior_tokens=0,
+            )
+
+    def test_runtime_budget_is_the_smaller_remaining_stage_or_aggregate_allowance(self):
+        budget = {
+            "max_stage_cost_usd": 10.0,
+            "max_stage_tokens": 1000,
+            "max_aggregate_cost_usd": 11.0,
+            "max_aggregate_tokens": 1000,
+        }
+        collected = {
+            "arm": [
+                {
+                    "metrics": {
+                        "cost_usd": 1.25,
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "cache_read_tokens": 20,
+                        "cache_write_tokens": 2,
+                    }
+                }
+            ]
+        }
+        cost, tokens = _remaining_multi_budget(
+            collected,
+            budget,
+            stage_prior_cost_usd=2.0,
+            stage_prior_tokens=100,
+            aggregate_prior_cost_usd=4.0,
+            aggregate_prior_tokens=200,
+        )
+        self.assertAlmostEqual(cost, 5.75)
+        self.assertEqual(tokens, 763)
+
+    def test_multi_arm_budget_offsets_count_against_stage_and_aggregate_caps(self):
+        budget = {
+            "max_stage_cost_usd": 1.0,
+            "max_stage_tokens": 100,
+            "max_aggregate_cost_usd": 10.0,
+            "max_aggregate_tokens": 1000,
+        }
+        with self.assertRaisesRegex(ValidationError, "cost budget reached"):
+            _require_multi_budget(
+                {"arm": []},
+                budget,
+                stage_prior_cost_usd=1.0,
+                stage_prior_tokens=0,
+                aggregate_prior_cost_usd=1.0,
+                aggregate_prior_tokens=0,
+            )
+        with self.assertRaisesRegex(ValidationError, "token budget reached"):
+            _require_multi_budget(
+                {"arm": []},
+                budget,
+                stage_prior_cost_usd=0.0,
+                stage_prior_tokens=100,
+                aggregate_prior_cost_usd=0.0,
+                aggregate_prior_tokens=100,
+            )
+
     def test_cumulative_budget_counts_offsets_and_all_token_classes(self):
         collected = {
             "baseline": [
@@ -45,6 +194,51 @@ class PairedRunnerTest(unittest.TestCase):
                 used_tokens=63,
                 max_cumulative_cost_usd=None,
                 max_cumulative_tokens=100,
+            )
+
+    def test_budget_fails_closed_when_cost_or_token_telemetry_is_missing(self):
+        collected = {"arm": [{"run_id": "r1", "metrics": {}}]}
+        with self.assertRaisesRegex(ValidationError, "cost budget telemetry missing"):
+            _require_budget(
+                collected,
+                used_cost_usd=0,
+                used_tokens=0,
+                max_cumulative_cost_usd=1.0,
+                max_cumulative_tokens=None,
+            )
+        with self.assertRaisesRegex(ValidationError, "token budget telemetry missing"):
+            _require_budget(
+                collected,
+                used_cost_usd=0,
+                used_tokens=0,
+                max_cumulative_cost_usd=None,
+                max_cumulative_tokens=100,
+            )
+
+    def test_paired_runner_rejects_nonfinite_budget_inputs(self):
+        kwargs = dict(
+            suite={},
+            repo_root=Path("."),
+            baseline_binary=Path("missing-a"),
+            candidate_binary=Path("missing-b"),
+            trials=1,
+            scenario_glob="*",
+            model_provider="test",
+            model_id="test",
+            baseline_output=Path("a.jsonl"),
+            candidate_output=Path("b.jsonl"),
+            baseline_revision="a",
+            candidate_revision="b",
+        )
+        with self.assertRaisesRegex(ValidationError, "budget usage offsets"):
+            run_paired(
+                **kwargs,
+                budget_used_cost_usd=math.nan,
+            )
+        with self.assertRaisesRegex(ValidationError, "max cumulative cost"):
+            run_paired(
+                **kwargs,
+                max_cumulative_cost_usd=math.inf,
             )
 
     def test_checkpoint_with_unscorable_rollout_fails_closed(self):
@@ -79,7 +273,21 @@ class PairedRunnerTest(unittest.TestCase):
                 created.mkdir()
                 return mock.Mock(returncode=2)
 
-            with mock.patch(
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "METACODES_LONG_HORIZON_ARM": "host-leak",
+                    "METACODES_NO_AUTO_RECALL": "1",
+                    "TINYKG_STORE": "/host/store",
+                    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+                    "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
+                    "CLAUDE_CODE_MAX_RETRIES": "99",
+                    "RG_BIN": "/host/rg",
+                    "E2E_BASE_URL": "http://host-leak.invalid",
+                    "E2E_RECORD": "1",
+                    "E2E_TIMEOUT": "9999",
+                },
+            ), mock.patch(
                 "scripts.eval.paired_runner.subprocess.run", side_effect=fake_run
             ) as patched_run:
                 observed = _run_once(
@@ -92,9 +300,21 @@ class PairedRunnerTest(unittest.TestCase):
                     "glm-5.2",
                     suite_path,
                     "baseline-rev",
+                    timeout_seconds=123,
                 )
             observed_env = patched_run.call_args.kwargs["env"]
             self.assertEqual(observed_env["E2E_HARNESS_REVISION"], "baseline-rev")
+            self.assertEqual(observed_env["E2E_RUN_LABEL"], "evaluation")
+            self.assertNotIn("METACODES_LONG_HORIZON_ARM", observed_env)
+            self.assertNotIn("METACODES_NO_AUTO_RECALL", observed_env)
+            self.assertNotIn("TINYKG_STORE", observed_env)
+            self.assertNotIn("CLAUDE_CODE_DISABLE_AUTO_MEMORY", observed_env)
+            self.assertNotIn("CLAUDE_CODE_DISABLE_CLAUDE_MDS", observed_env)
+            self.assertNotIn("CLAUDE_CODE_MAX_RETRIES", observed_env)
+            self.assertNotIn("RG_BIN", observed_env)
+            self.assertNotIn("E2E_BASE_URL", observed_env)
+            self.assertNotIn("E2E_RECORD", observed_env)
+            self.assertEqual(observed_env["E2E_TIMEOUT"], "123")
             self.assertEqual(observed, (runs / "scored-failure").resolve())
 
     def test_run_once_rejects_infrastructure_exit(self):
@@ -127,6 +347,43 @@ class PairedRunnerTest(unittest.TestCase):
                         suite_path,
                         "candidate-rev",
                     )
+
+    def test_run_once_returns_auditable_infrastructure_failure_when_requested(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "tests" / "e2e" / "runs"
+            runs.mkdir(parents=True)
+            runner = root / "tests" / "e2e" / "run_e2e.sh"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(0o755)
+            binary = root / "metacodes"
+            binary.write_bytes(b"binary")
+            binary.chmod(0o755)
+            suite_path = root / "suite.json"
+            suite_path.write_text("{}\n", encoding="utf-8")
+
+            def fake_run(*_args, **_kwargs):
+                (runs / "invalid-evidence").mkdir()
+                return mock.Mock(returncode=1)
+
+            with mock.patch(
+                "scripts.eval.paired_runner.subprocess.run", side_effect=fake_run
+            ):
+                with self.assertRaises(InfrastructureRunError) as raised:
+                    _run_once(
+                        root,
+                        binary,
+                        "tinykg",
+                        2,
+                        "task-a",
+                        "anthropic",
+                        "glm-5.2",
+                        suite_path,
+                        "candidate-rev",
+                        allow_invalid_run=True,
+                    )
+            self.assertEqual(raised.exception.returncode, 1)
+            self.assertEqual(raised.exception.run_dir, (runs / "invalid-evidence").resolve())
 
     def test_schedule_balances_order_across_trials(self):
         self.assertEqual(
@@ -203,8 +460,11 @@ class PairedRunnerTest(unittest.TestCase):
                 model_id,
                 observed_suite_path,
                 harness_revision,
+                *,
+                timeout_seconds=None,
             ):
                 self.assertEqual(observed_suite_path, suite_path)
+                self.assertEqual(timeout_seconds, 10)
                 if fail_after[0] is not None and len(invocations) >= fail_after[0]:
                     raise RuntimeError("simulated interruption")
                 task_id = selector

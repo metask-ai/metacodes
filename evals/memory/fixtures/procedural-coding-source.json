@@ -1,0 +1,1899 @@
+{
+  "schema_version": 1,
+  "dataset_id": "coding-intent-transfer-v1",
+  "dataset_revision": "checked-in-fixture-v1",
+  "families": [
+    {
+      "id": "config-field-migration",
+      "intent_template": "Migrate legacy configuration field `{old}` to canonical `{new}`. Update parser, serializer, docs, and round-trip contract while retaining input compatibility.",
+      "procedure_evidence_id": "procedure:config-field-migration:v1",
+      "cases": [
+        {
+          "id": "trace-header",
+          "split": "online",
+          "bindings": {
+            "new": "requestHeader",
+            "old": "traceHeader"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/config.md",
+                "content": "# Request tracing\n\n`traceHeader` is the canonical header configuration key.\n"
+              },
+              {
+                "path": "src/config.py",
+                "content": "def parse(raw):\n    return {\"traceHeader\": raw.get(\"traceHeader\")}\n\ndef serialize(config):\n    return {\"traceHeader\": config[\"traceHeader\"]}\n"
+              },
+              {
+                "path": "tests/contract.txt",
+                "content": "canonical=traceHeader\nlegacy=\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/config.md",
+              "src/config.py",
+              "tests/contract.txt"
+            ],
+            "required_changed_paths": [
+              "docs/config.md",
+              "src/config.py",
+              "tests/contract.txt"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/config.py",
+                "value": "raw.get(\"requestHeader\", raw.get(\"traceHeader\"))"
+              },
+              {
+                "kind": "contains",
+                "path": "src/config.py",
+                "value": "return {\"requestHeader\": config[\"requestHeader\"]}"
+              },
+              {
+                "kind": "not_contains",
+                "path": "src/config.py",
+                "value": "return {\"traceHeader\": config[\"traceHeader\"]}"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/config.md",
+                "value": "`traceHeader` remains accepted as a legacy input alias."
+              },
+              {
+                "kind": "equals",
+                "path": "tests/contract.txt",
+                "value": "canonical=requestHeader\nlegacy=traceHeader\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/config.md",
+              "content": "# Request tracing\n\n`requestHeader` is the canonical header configuration key.\n`traceHeader` remains accepted as a legacy input alias.\n"
+            },
+            {
+              "path": "src/config.py",
+              "content": "def parse(raw):\n    return {\"requestHeader\": raw.get(\"requestHeader\", raw.get(\"traceHeader\"))}\n\ndef serialize(config):\n    return {\"requestHeader\": config[\"requestHeader\"]}\n"
+            },
+            {
+              "path": "tests/contract.txt",
+              "content": "canonical=requestHeader\nlegacy=traceHeader\n"
+            }
+          ]
+        },
+        {
+          "id": "retry-cap",
+          "split": "offline",
+          "bindings": {
+            "new": "maxRetries",
+            "old": "retryCap"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/config.md",
+                "content": "# Retry policy\n\n`retryCap` is the canonical retry limit key.\n"
+              },
+              {
+                "path": "src/config.py",
+                "content": "def parse(raw):\n    return {\"retryCap\": raw.get(\"retryCap\")}\n\ndef serialize(config):\n    return {\"retryCap\": config[\"retryCap\"]}\n"
+              },
+              {
+                "path": "tests/contract.txt",
+                "content": "canonical=retryCap\nlegacy=\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/config.md",
+              "src/config.py",
+              "tests/contract.txt"
+            ],
+            "required_changed_paths": [
+              "docs/config.md",
+              "src/config.py",
+              "tests/contract.txt"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/config.py",
+                "value": "raw.get(\"maxRetries\", raw.get(\"retryCap\"))"
+              },
+              {
+                "kind": "contains",
+                "path": "src/config.py",
+                "value": "return {\"maxRetries\": config[\"maxRetries\"]}"
+              },
+              {
+                "kind": "not_contains",
+                "path": "src/config.py",
+                "value": "return {\"retryCap\": config[\"retryCap\"]}"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/config.md",
+                "value": "`retryCap` remains accepted as a legacy input alias."
+              },
+              {
+                "kind": "equals",
+                "path": "tests/contract.txt",
+                "value": "canonical=maxRetries\nlegacy=retryCap\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/config.md",
+              "content": "# Retry policy\n\n`maxRetries` is the canonical retry limit key.\n`retryCap` remains accepted as a legacy input alias.\n"
+            },
+            {
+              "path": "src/config.py",
+              "content": "def parse(raw):\n    return {\"maxRetries\": raw.get(\"maxRetries\", raw.get(\"retryCap\"))}\n\ndef serialize(config):\n    return {\"maxRetries\": config[\"maxRetries\"]}\n"
+            },
+            {
+              "path": "tests/contract.txt",
+              "content": "canonical=maxRetries\nlegacy=retryCap\n"
+            }
+          ]
+        },
+        {
+          "id": "cache-ttl",
+          "split": "offline",
+          "bindings": {
+            "new": "cacheTtlSeconds",
+            "old": "cacheTTL"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/config.md",
+                "content": "# Cache lifetime\n\n`cacheTTL` is the canonical cache lifetime key.\n"
+              },
+              {
+                "path": "src/config.py",
+                "content": "def parse(raw):\n    return {\"cacheTTL\": raw.get(\"cacheTTL\")}\n\ndef serialize(config):\n    return {\"cacheTTL\": config[\"cacheTTL\"]}\n"
+              },
+              {
+                "path": "tests/contract.txt",
+                "content": "canonical=cacheTTL\nlegacy=\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/config.md",
+              "src/config.py",
+              "tests/contract.txt"
+            ],
+            "required_changed_paths": [
+              "docs/config.md",
+              "src/config.py",
+              "tests/contract.txt"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/config.py",
+                "value": "raw.get(\"cacheTtlSeconds\", raw.get(\"cacheTTL\"))"
+              },
+              {
+                "kind": "contains",
+                "path": "src/config.py",
+                "value": "return {\"cacheTtlSeconds\": config[\"cacheTtlSeconds\"]}"
+              },
+              {
+                "kind": "not_contains",
+                "path": "src/config.py",
+                "value": "return {\"cacheTTL\": config[\"cacheTTL\"]}"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/config.md",
+                "value": "`cacheTTL` remains accepted as a legacy input alias."
+              },
+              {
+                "kind": "equals",
+                "path": "tests/contract.txt",
+                "value": "canonical=cacheTtlSeconds\nlegacy=cacheTTL\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/config.md",
+              "content": "# Cache lifetime\n\n`cacheTtlSeconds` is the canonical cache lifetime key.\n`cacheTTL` remains accepted as a legacy input alias.\n"
+            },
+            {
+              "path": "src/config.py",
+              "content": "def parse(raw):\n    return {\"cacheTtlSeconds\": raw.get(\"cacheTtlSeconds\", raw.get(\"cacheTTL\"))}\n\ndef serialize(config):\n    return {\"cacheTtlSeconds\": config[\"cacheTtlSeconds\"]}\n"
+            },
+            {
+              "path": "tests/contract.txt",
+              "content": "canonical=cacheTtlSeconds\nlegacy=cacheTTL\n"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "error-contract-propagation",
+      "intent_template": "Add internal error code `{code}` for `{condition}` and propagate it through the registry, protocol manifest, docs, and contract using stable wire spelling `{wire}`.",
+      "procedure_evidence_id": "procedure:error-contract-propagation:v1",
+      "cases": [
+        {
+          "id": "quota-exceeded",
+          "split": "online",
+          "bindings": {
+            "code": "quota_exceeded",
+            "condition": "a request exceeding its metered quota",
+            "wire": "QUOTA_EXCEEDED"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/errors.md",
+                "content": "# Errors\n\n- `INVALID_REQUEST`: malformed input.\n"
+              },
+              {
+                "path": "src/errors.py",
+                "content": "ERROR_CODES = {\n    \"invalid_request\": \"INVALID_REQUEST\",\n}\n"
+              },
+              {
+                "path": "tests/protocol.json",
+                "content": "{\"errors\":[\"INVALID_REQUEST\"]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/errors.md",
+              "src/errors.py",
+              "tests/protocol.json"
+            ],
+            "required_changed_paths": [
+              "docs/errors.md",
+              "src/errors.py",
+              "tests/protocol.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/errors.py",
+                "value": "\"quota_exceeded\": \"QUOTA_EXCEEDED\""
+              },
+              {
+                "kind": "contains",
+                "path": "tests/protocol.json",
+                "value": "\"QUOTA_EXCEEDED\""
+              },
+              {
+                "kind": "contains",
+                "path": "docs/errors.md",
+                "value": "a request exceeding its metered quota"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/errors.md",
+              "content": "# Errors\n\n- `INVALID_REQUEST`: malformed input.\n- `QUOTA_EXCEEDED`: a request exceeding its metered quota.\n"
+            },
+            {
+              "path": "src/errors.py",
+              "content": "ERROR_CODES = {\n    \"invalid_request\": \"INVALID_REQUEST\",\n    \"quota_exceeded\": \"QUOTA_EXCEEDED\",\n}\n"
+            },
+            {
+              "path": "tests/protocol.json",
+              "content": "{\"errors\":[\"INVALID_REQUEST\",\"QUOTA_EXCEEDED\"]}\n"
+            }
+          ]
+        },
+        {
+          "id": "stale-revision",
+          "split": "offline",
+          "bindings": {
+            "code": "stale_revision",
+            "condition": "a compare-and-swap against an outdated graph revision",
+            "wire": "STALE_REVISION"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/errors.md",
+                "content": "# Errors\n\n- `INVALID_REQUEST`: malformed input.\n"
+              },
+              {
+                "path": "src/errors.py",
+                "content": "ERROR_CODES = {\n    \"invalid_request\": \"INVALID_REQUEST\",\n}\n"
+              },
+              {
+                "path": "tests/protocol.json",
+                "content": "{\"errors\":[\"INVALID_REQUEST\"]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/errors.md",
+              "src/errors.py",
+              "tests/protocol.json"
+            ],
+            "required_changed_paths": [
+              "docs/errors.md",
+              "src/errors.py",
+              "tests/protocol.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/errors.py",
+                "value": "\"stale_revision\": \"STALE_REVISION\""
+              },
+              {
+                "kind": "contains",
+                "path": "tests/protocol.json",
+                "value": "\"STALE_REVISION\""
+              },
+              {
+                "kind": "contains",
+                "path": "docs/errors.md",
+                "value": "a compare-and-swap against an outdated graph revision"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/errors.md",
+              "content": "# Errors\n\n- `INVALID_REQUEST`: malformed input.\n- `STALE_REVISION`: a compare-and-swap against an outdated graph revision.\n"
+            },
+            {
+              "path": "src/errors.py",
+              "content": "ERROR_CODES = {\n    \"invalid_request\": \"INVALID_REQUEST\",\n    \"stale_revision\": \"STALE_REVISION\",\n}\n"
+            },
+            {
+              "path": "tests/protocol.json",
+              "content": "{\"errors\":[\"INVALID_REQUEST\",\"STALE_REVISION\"]}\n"
+            }
+          ]
+        },
+        {
+          "id": "invalid-lease",
+          "split": "offline",
+          "bindings": {
+            "code": "invalid_lease",
+            "condition": "a task mutation attempted with an expired ownership lease",
+            "wire": "INVALID_LEASE"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/errors.md",
+                "content": "# Errors\n\n- `INVALID_REQUEST`: malformed input.\n"
+              },
+              {
+                "path": "src/errors.py",
+                "content": "ERROR_CODES = {\n    \"invalid_request\": \"INVALID_REQUEST\",\n}\n"
+              },
+              {
+                "path": "tests/protocol.json",
+                "content": "{\"errors\":[\"INVALID_REQUEST\"]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/errors.md",
+              "src/errors.py",
+              "tests/protocol.json"
+            ],
+            "required_changed_paths": [
+              "docs/errors.md",
+              "src/errors.py",
+              "tests/protocol.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/errors.py",
+                "value": "\"invalid_lease\": \"INVALID_LEASE\""
+              },
+              {
+                "kind": "contains",
+                "path": "tests/protocol.json",
+                "value": "\"INVALID_LEASE\""
+              },
+              {
+                "kind": "contains",
+                "path": "docs/errors.md",
+                "value": "a task mutation attempted with an expired ownership lease"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/errors.md",
+              "content": "# Errors\n\n- `INVALID_REQUEST`: malformed input.\n- `INVALID_LEASE`: a task mutation attempted with an expired ownership lease.\n"
+            },
+            {
+              "path": "src/errors.py",
+              "content": "ERROR_CODES = {\n    \"invalid_request\": \"INVALID_REQUEST\",\n    \"invalid_lease\": \"INVALID_LEASE\",\n}\n"
+            },
+            {
+              "path": "tests/protocol.json",
+              "content": "{\"errors\":[\"INVALID_REQUEST\",\"INVALID_LEASE\"]}\n"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capability-contract-propagation",
+      "intent_template": "Register capability `{name}` for {purpose}. Update the implementation registry, protocol manifest, and docs using stable wire spelling `{wire}`.",
+      "procedure_evidence_id": "procedure:capability-contract-propagation:v1",
+      "cases": [
+        {
+          "id": "audit-stream",
+          "split": "online",
+          "bindings": {
+            "name": "audit_stream",
+            "purpose": "streaming immutable audit records to compliance sinks",
+            "wire": "AUDIT_STREAM"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/capabilities.md",
+                "content": "# Capabilities\n\n- `HEALTH_CHECK`: reporting service health.\n"
+              },
+              {
+                "path": "src/capabilities.py",
+                "content": "CAPABILITIES = {\n    \"health_check\": \"HEALTH_CHECK\",\n}\n"
+              },
+              {
+                "path": "tests/capabilities.json",
+                "content": "{\"capabilities\":[\"HEALTH_CHECK\"]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/capabilities.md",
+              "src/capabilities.py",
+              "tests/capabilities.json"
+            ],
+            "required_changed_paths": [
+              "docs/capabilities.md",
+              "src/capabilities.py",
+              "tests/capabilities.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/capabilities.py",
+                "value": "\"audit_stream\": \"AUDIT_STREAM\""
+              },
+              {
+                "kind": "contains",
+                "path": "tests/capabilities.json",
+                "value": "\"AUDIT_STREAM\""
+              },
+              {
+                "kind": "contains",
+                "path": "docs/capabilities.md",
+                "value": "streaming immutable audit records to compliance sinks"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/capabilities.md",
+              "content": "# Capabilities\n\n- `HEALTH_CHECK`: reporting service health.\n- `AUDIT_STREAM`: streaming immutable audit records to compliance sinks.\n"
+            },
+            {
+              "path": "src/capabilities.py",
+              "content": "CAPABILITIES = {\n    \"health_check\": \"HEALTH_CHECK\",\n    \"audit_stream\": \"AUDIT_STREAM\",\n}\n"
+            },
+            {
+              "path": "tests/capabilities.json",
+              "content": "{\"capabilities\":[\"HEALTH_CHECK\",\"AUDIT_STREAM\"]}\n"
+            }
+          ]
+        },
+        {
+          "id": "snapshot-restore",
+          "split": "offline",
+          "bindings": {
+            "name": "snapshot_restore",
+            "purpose": "restoring a workspace from a versioned snapshot",
+            "wire": "SNAPSHOT_RESTORE"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/capabilities.md",
+                "content": "# Capabilities\n\n- `HEALTH_CHECK`: reporting service health.\n"
+              },
+              {
+                "path": "src/capabilities.py",
+                "content": "CAPABILITIES = {\n    \"health_check\": \"HEALTH_CHECK\",\n}\n"
+              },
+              {
+                "path": "tests/capabilities.json",
+                "content": "{\"capabilities\":[\"HEALTH_CHECK\"]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/capabilities.md",
+              "src/capabilities.py",
+              "tests/capabilities.json"
+            ],
+            "required_changed_paths": [
+              "docs/capabilities.md",
+              "src/capabilities.py",
+              "tests/capabilities.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/capabilities.py",
+                "value": "\"snapshot_restore\": \"SNAPSHOT_RESTORE\""
+              },
+              {
+                "kind": "contains",
+                "path": "tests/capabilities.json",
+                "value": "\"SNAPSHOT_RESTORE\""
+              },
+              {
+                "kind": "contains",
+                "path": "docs/capabilities.md",
+                "value": "restoring a workspace from a versioned snapshot"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/capabilities.md",
+              "content": "# Capabilities\n\n- `HEALTH_CHECK`: reporting service health.\n- `SNAPSHOT_RESTORE`: restoring a workspace from a versioned snapshot.\n"
+            },
+            {
+              "path": "src/capabilities.py",
+              "content": "CAPABILITIES = {\n    \"health_check\": \"HEALTH_CHECK\",\n    \"snapshot_restore\": \"SNAPSHOT_RESTORE\",\n}\n"
+            },
+            {
+              "path": "tests/capabilities.json",
+              "content": "{\"capabilities\":[\"HEALTH_CHECK\",\"SNAPSHOT_RESTORE\"]}\n"
+            }
+          ]
+        },
+        {
+          "id": "schema-inspect",
+          "split": "offline",
+          "bindings": {
+            "name": "schema_inspect",
+            "purpose": "reporting the active schema and storage-format contract",
+            "wire": "SCHEMA_INSPECT"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/capabilities.md",
+                "content": "# Capabilities\n\n- `HEALTH_CHECK`: reporting service health.\n"
+              },
+              {
+                "path": "src/capabilities.py",
+                "content": "CAPABILITIES = {\n    \"health_check\": \"HEALTH_CHECK\",\n}\n"
+              },
+              {
+                "path": "tests/capabilities.json",
+                "content": "{\"capabilities\":[\"HEALTH_CHECK\"]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/capabilities.md",
+              "src/capabilities.py",
+              "tests/capabilities.json"
+            ],
+            "required_changed_paths": [
+              "docs/capabilities.md",
+              "src/capabilities.py",
+              "tests/capabilities.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/capabilities.py",
+                "value": "\"schema_inspect\": \"SCHEMA_INSPECT\""
+              },
+              {
+                "kind": "contains",
+                "path": "tests/capabilities.json",
+                "value": "\"SCHEMA_INSPECT\""
+              },
+              {
+                "kind": "contains",
+                "path": "docs/capabilities.md",
+                "value": "reporting the active schema and storage-format contract"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/capabilities.md",
+              "content": "# Capabilities\n\n- `HEALTH_CHECK`: reporting service health.\n- `SCHEMA_INSPECT`: reporting the active schema and storage-format contract.\n"
+            },
+            {
+              "path": "src/capabilities.py",
+              "content": "CAPABILITIES = {\n    \"health_check\": \"HEALTH_CHECK\",\n    \"schema_inspect\": \"SCHEMA_INSPECT\",\n}\n"
+            },
+            {
+              "path": "tests/capabilities.json",
+              "content": "{\"capabilities\":[\"HEALTH_CHECK\",\"SCHEMA_INSPECT\"]}\n"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lifecycle-state-propagation",
+      "intent_template": "Add lifecycle state `{name}` for {purpose}. Propagate it through the state registry, stable wire map, terminal classification, docs, and contract using wire spelling `{wire}` and terminal flag `{terminal}`.",
+      "procedure_evidence_id": "procedure:lifecycle-state-propagation:v1",
+      "cases": [
+        {
+          "id": "paused",
+          "split": "online",
+          "bindings": {
+            "name": "paused",
+            "purpose": "temporarily suspending work while preserving resumability",
+            "terminal": "false",
+            "wire": "PAUSED"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/lifecycle.md",
+                "content": "# Lifecycle states\n\n- `OPEN`: accepted but not started.\n- `RUNNING`: actively executing.\n"
+              },
+              {
+                "path": "src/lifecycle.py",
+                "content": "STATES = [\"open\", \"running\"]\nWIRE = {\"open\": \"OPEN\", \"running\": \"RUNNING\"}\nTERMINAL = {\"open\": False, \"running\": False}\n"
+              },
+              {
+                "path": "tests/lifecycle.json",
+                "content": "{\"states\":[{\"name\":\"open\",\"wire\":\"OPEN\",\"terminal\":false},{\"name\":\"running\",\"wire\":\"RUNNING\",\"terminal\":false}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/lifecycle.md",
+              "src/lifecycle.py",
+              "tests/lifecycle.json"
+            ],
+            "required_changed_paths": [
+              "docs/lifecycle.md",
+              "src/lifecycle.py",
+              "tests/lifecycle.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/lifecycle.py",
+                "value": "STATES = [\"open\", \"running\", \"paused\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/lifecycle.py",
+                "value": "\"paused\": \"PAUSED\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/lifecycle.py",
+                "value": "\"paused\": False"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/lifecycle.md",
+                "value": "`PAUSED`: temporarily suspending work while preserving resumability."
+              },
+              {
+                "kind": "equals",
+                "path": "tests/lifecycle.json",
+                "value": "{\"states\":[{\"name\":\"open\",\"wire\":\"OPEN\",\"terminal\":false},{\"name\":\"running\",\"wire\":\"RUNNING\",\"terminal\":false},{\"name\":\"paused\",\"wire\":\"PAUSED\",\"terminal\":false}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/lifecycle.md",
+              "content": "# Lifecycle states\n\n- `OPEN`: accepted but not started.\n- `RUNNING`: actively executing.\n- `PAUSED`: temporarily suspending work while preserving resumability.\n"
+            },
+            {
+              "path": "src/lifecycle.py",
+              "content": "STATES = [\"open\", \"running\", \"paused\"]\nWIRE = {\"open\": \"OPEN\", \"running\": \"RUNNING\", \"paused\": \"PAUSED\"}\nTERMINAL = {\"open\": False, \"running\": False, \"paused\": False}\n"
+            },
+            {
+              "path": "tests/lifecycle.json",
+              "content": "{\"states\":[{\"name\":\"open\",\"wire\":\"OPEN\",\"terminal\":false},{\"name\":\"running\",\"wire\":\"RUNNING\",\"terminal\":false},{\"name\":\"paused\",\"wire\":\"PAUSED\",\"terminal\":false}]}\n"
+            }
+          ]
+        },
+        {
+          "id": "cancelled",
+          "split": "offline",
+          "bindings": {
+            "name": "cancelled",
+            "purpose": "ending work after an explicit cancellation request",
+            "terminal": "true",
+            "wire": "CANCELLED"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/lifecycle.md",
+                "content": "# Lifecycle states\n\n- `OPEN`: accepted but not started.\n- `RUNNING`: actively executing.\n"
+              },
+              {
+                "path": "src/lifecycle.py",
+                "content": "STATES = [\"open\", \"running\"]\nWIRE = {\"open\": \"OPEN\", \"running\": \"RUNNING\"}\nTERMINAL = {\"open\": False, \"running\": False}\n"
+              },
+              {
+                "path": "tests/lifecycle.json",
+                "content": "{\"states\":[{\"name\":\"open\",\"wire\":\"OPEN\",\"terminal\":false},{\"name\":\"running\",\"wire\":\"RUNNING\",\"terminal\":false}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/lifecycle.md",
+              "src/lifecycle.py",
+              "tests/lifecycle.json"
+            ],
+            "required_changed_paths": [
+              "docs/lifecycle.md",
+              "src/lifecycle.py",
+              "tests/lifecycle.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/lifecycle.py",
+                "value": "STATES = [\"open\", \"running\", \"cancelled\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/lifecycle.py",
+                "value": "\"cancelled\": \"CANCELLED\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/lifecycle.py",
+                "value": "\"cancelled\": True"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/lifecycle.md",
+                "value": "`CANCELLED`: ending work after an explicit cancellation request."
+              },
+              {
+                "kind": "equals",
+                "path": "tests/lifecycle.json",
+                "value": "{\"states\":[{\"name\":\"open\",\"wire\":\"OPEN\",\"terminal\":false},{\"name\":\"running\",\"wire\":\"RUNNING\",\"terminal\":false},{\"name\":\"cancelled\",\"wire\":\"CANCELLED\",\"terminal\":true}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/lifecycle.md",
+              "content": "# Lifecycle states\n\n- `OPEN`: accepted but not started.\n- `RUNNING`: actively executing.\n- `CANCELLED`: ending work after an explicit cancellation request.\n"
+            },
+            {
+              "path": "src/lifecycle.py",
+              "content": "STATES = [\"open\", \"running\", \"cancelled\"]\nWIRE = {\"open\": \"OPEN\", \"running\": \"RUNNING\", \"cancelled\": \"CANCELLED\"}\nTERMINAL = {\"open\": False, \"running\": False, \"cancelled\": True}\n"
+            },
+            {
+              "path": "tests/lifecycle.json",
+              "content": "{\"states\":[{\"name\":\"open\",\"wire\":\"OPEN\",\"terminal\":false},{\"name\":\"running\",\"wire\":\"RUNNING\",\"terminal\":false},{\"name\":\"cancelled\",\"wire\":\"CANCELLED\",\"terminal\":true}]}\n"
+            }
+          ]
+        },
+        {
+          "id": "draining",
+          "split": "offline",
+          "bindings": {
+            "name": "draining",
+            "purpose": "finishing accepted work while refusing new work",
+            "terminal": "false",
+            "wire": "DRAINING"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/lifecycle.md",
+                "content": "# Lifecycle states\n\n- `OPEN`: accepted but not started.\n- `RUNNING`: actively executing.\n"
+              },
+              {
+                "path": "src/lifecycle.py",
+                "content": "STATES = [\"open\", \"running\"]\nWIRE = {\"open\": \"OPEN\", \"running\": \"RUNNING\"}\nTERMINAL = {\"open\": False, \"running\": False}\n"
+              },
+              {
+                "path": "tests/lifecycle.json",
+                "content": "{\"states\":[{\"name\":\"open\",\"wire\":\"OPEN\",\"terminal\":false},{\"name\":\"running\",\"wire\":\"RUNNING\",\"terminal\":false}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/lifecycle.md",
+              "src/lifecycle.py",
+              "tests/lifecycle.json"
+            ],
+            "required_changed_paths": [
+              "docs/lifecycle.md",
+              "src/lifecycle.py",
+              "tests/lifecycle.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/lifecycle.py",
+                "value": "STATES = [\"open\", \"running\", \"draining\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/lifecycle.py",
+                "value": "\"draining\": \"DRAINING\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/lifecycle.py",
+                "value": "\"draining\": False"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/lifecycle.md",
+                "value": "`DRAINING`: finishing accepted work while refusing new work."
+              },
+              {
+                "kind": "equals",
+                "path": "tests/lifecycle.json",
+                "value": "{\"states\":[{\"name\":\"open\",\"wire\":\"OPEN\",\"terminal\":false},{\"name\":\"running\",\"wire\":\"RUNNING\",\"terminal\":false},{\"name\":\"draining\",\"wire\":\"DRAINING\",\"terminal\":false}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/lifecycle.md",
+              "content": "# Lifecycle states\n\n- `OPEN`: accepted but not started.\n- `RUNNING`: actively executing.\n- `DRAINING`: finishing accepted work while refusing new work.\n"
+            },
+            {
+              "path": "src/lifecycle.py",
+              "content": "STATES = [\"open\", \"running\", \"draining\"]\nWIRE = {\"open\": \"OPEN\", \"running\": \"RUNNING\", \"draining\": \"DRAINING\"}\nTERMINAL = {\"open\": False, \"running\": False, \"draining\": False}\n"
+            },
+            {
+              "path": "tests/lifecycle.json",
+              "content": "{\"states\":[{\"name\":\"open\",\"wire\":\"OPEN\",\"terminal\":false},{\"name\":\"running\",\"wire\":\"RUNNING\",\"terminal\":false},{\"name\":\"draining\",\"wire\":\"DRAINING\",\"terminal\":false}]}\n"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "hook-contract-propagation",
+      "procedure_evidence_id": "procedure:hook-contract-propagation:v1",
+      "intent_template": "Register hook `{name}` for {purpose}. Propagate it through the hook registry, stable wire map, replayability classification, docs, and contract using wire spelling `{wire}` and replayable flag `{replayable}`.",
+      "cases": [
+        {
+          "id": "memory-consolidated",
+          "split": "online",
+          "bindings": {
+            "name": "memory_consolidated",
+            "purpose": "emitting after a durable memory migration commits",
+            "replayable": "true",
+            "wire": "MEMORY_CONSOLIDATED"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/hooks.md",
+                "content": "# Runtime hooks\n\n- `SESSION_STARTED`: emitted when a session begins.\n"
+              },
+              {
+                "path": "src/hooks.py",
+                "content": "HOOKS = [\"session_started\"]\nWIRE = {\"session_started\": \"SESSION_STARTED\"}\nREPLAYABLE = {\"session_started\": False}\n"
+              },
+              {
+                "path": "tests/hooks.json",
+                "content": "{\"hooks\":[{\"name\":\"session_started\",\"wire\":\"SESSION_STARTED\",\"replayable\":false}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/hooks.md",
+              "src/hooks.py",
+              "tests/hooks.json"
+            ],
+            "required_changed_paths": [
+              "docs/hooks.md",
+              "src/hooks.py",
+              "tests/hooks.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/hooks.py",
+                "value": "HOOKS = [\"session_started\", \"memory_consolidated\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/hooks.py",
+                "value": "\"memory_consolidated\": \"MEMORY_CONSOLIDATED\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/hooks.py",
+                "value": "\"memory_consolidated\": True"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/hooks.md",
+                "value": "`MEMORY_CONSOLIDATED`: emitting after a durable memory migration commits."
+              },
+              {
+                "kind": "equals",
+                "path": "tests/hooks.json",
+                "value": "{\"hooks\":[{\"name\":\"session_started\",\"wire\":\"SESSION_STARTED\",\"replayable\":false},{\"name\":\"memory_consolidated\",\"wire\":\"MEMORY_CONSOLIDATED\",\"replayable\":true}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/hooks.md",
+              "content": "# Runtime hooks\n\n- `SESSION_STARTED`: emitted when a session begins.\n- `MEMORY_CONSOLIDATED`: emitting after a durable memory migration commits.\n"
+            },
+            {
+              "path": "src/hooks.py",
+              "content": "HOOKS = [\"session_started\", \"memory_consolidated\"]\nWIRE = {\"session_started\": \"SESSION_STARTED\", \"memory_consolidated\": \"MEMORY_CONSOLIDATED\"}\nREPLAYABLE = {\"session_started\": False, \"memory_consolidated\": True}\n"
+            },
+            {
+              "path": "tests/hooks.json",
+              "content": "{\"hooks\":[{\"name\":\"session_started\",\"wire\":\"SESSION_STARTED\",\"replayable\":false},{\"name\":\"memory_consolidated\",\"wire\":\"MEMORY_CONSOLIDATED\",\"replayable\":true}]}\n"
+            }
+          ]
+        },
+        {
+          "id": "budget-authorized",
+          "split": "offline",
+          "bindings": {
+            "name": "budget_authorized",
+            "purpose": "emitting after a paid request authorization is durably recorded",
+            "replayable": "true",
+            "wire": "BUDGET_AUTHORIZED"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/hooks.md",
+                "content": "# Runtime hooks\n\n- `SESSION_STARTED`: emitted when a session begins.\n"
+              },
+              {
+                "path": "src/hooks.py",
+                "content": "HOOKS = [\"session_started\"]\nWIRE = {\"session_started\": \"SESSION_STARTED\"}\nREPLAYABLE = {\"session_started\": False}\n"
+              },
+              {
+                "path": "tests/hooks.json",
+                "content": "{\"hooks\":[{\"name\":\"session_started\",\"wire\":\"SESSION_STARTED\",\"replayable\":false}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/hooks.md",
+              "src/hooks.py",
+              "tests/hooks.json"
+            ],
+            "required_changed_paths": [
+              "docs/hooks.md",
+              "src/hooks.py",
+              "tests/hooks.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/hooks.py",
+                "value": "HOOKS = [\"session_started\", \"budget_authorized\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/hooks.py",
+                "value": "\"budget_authorized\": \"BUDGET_AUTHORIZED\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/hooks.py",
+                "value": "\"budget_authorized\": True"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/hooks.md",
+                "value": "`BUDGET_AUTHORIZED`: emitting after a paid request authorization is durably recorded."
+              },
+              {
+                "kind": "equals",
+                "path": "tests/hooks.json",
+                "value": "{\"hooks\":[{\"name\":\"session_started\",\"wire\":\"SESSION_STARTED\",\"replayable\":false},{\"name\":\"budget_authorized\",\"wire\":\"BUDGET_AUTHORIZED\",\"replayable\":true}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/hooks.md",
+              "content": "# Runtime hooks\n\n- `SESSION_STARTED`: emitted when a session begins.\n- `BUDGET_AUTHORIZED`: emitting after a paid request authorization is durably recorded.\n"
+            },
+            {
+              "path": "src/hooks.py",
+              "content": "HOOKS = [\"session_started\", \"budget_authorized\"]\nWIRE = {\"session_started\": \"SESSION_STARTED\", \"budget_authorized\": \"BUDGET_AUTHORIZED\"}\nREPLAYABLE = {\"session_started\": False, \"budget_authorized\": True}\n"
+            },
+            {
+              "path": "tests/hooks.json",
+              "content": "{\"hooks\":[{\"name\":\"session_started\",\"wire\":\"SESSION_STARTED\",\"replayable\":false},{\"name\":\"budget_authorized\",\"wire\":\"BUDGET_AUTHORIZED\",\"replayable\":true}]}\n"
+            }
+          ]
+        },
+        {
+          "id": "task-claim-lost",
+          "split": "offline",
+          "bindings": {
+            "name": "task_claim_lost",
+            "purpose": "emitting when a task ownership lease expires",
+            "replayable": "false",
+            "wire": "TASK_CLAIM_LOST"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/hooks.md",
+                "content": "# Runtime hooks\n\n- `SESSION_STARTED`: emitted when a session begins.\n"
+              },
+              {
+                "path": "src/hooks.py",
+                "content": "HOOKS = [\"session_started\"]\nWIRE = {\"session_started\": \"SESSION_STARTED\"}\nREPLAYABLE = {\"session_started\": False}\n"
+              },
+              {
+                "path": "tests/hooks.json",
+                "content": "{\"hooks\":[{\"name\":\"session_started\",\"wire\":\"SESSION_STARTED\",\"replayable\":false}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/hooks.md",
+              "src/hooks.py",
+              "tests/hooks.json"
+            ],
+            "required_changed_paths": [
+              "docs/hooks.md",
+              "src/hooks.py",
+              "tests/hooks.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/hooks.py",
+                "value": "HOOKS = [\"session_started\", \"task_claim_lost\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/hooks.py",
+                "value": "\"task_claim_lost\": \"TASK_CLAIM_LOST\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/hooks.py",
+                "value": "\"task_claim_lost\": False"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/hooks.md",
+                "value": "`TASK_CLAIM_LOST`: emitting when a task ownership lease expires."
+              },
+              {
+                "kind": "equals",
+                "path": "tests/hooks.json",
+                "value": "{\"hooks\":[{\"name\":\"session_started\",\"wire\":\"SESSION_STARTED\",\"replayable\":false},{\"name\":\"task_claim_lost\",\"wire\":\"TASK_CLAIM_LOST\",\"replayable\":false}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/hooks.md",
+              "content": "# Runtime hooks\n\n- `SESSION_STARTED`: emitted when a session begins.\n- `TASK_CLAIM_LOST`: emitting when a task ownership lease expires.\n"
+            },
+            {
+              "path": "src/hooks.py",
+              "content": "HOOKS = [\"session_started\", \"task_claim_lost\"]\nWIRE = {\"session_started\": \"SESSION_STARTED\", \"task_claim_lost\": \"TASK_CLAIM_LOST\"}\nREPLAYABLE = {\"session_started\": False, \"task_claim_lost\": False}\n"
+            },
+            {
+              "path": "tests/hooks.json",
+              "content": "{\"hooks\":[{\"name\":\"session_started\",\"wire\":\"SESSION_STARTED\",\"replayable\":false},{\"name\":\"task_claim_lost\",\"wire\":\"TASK_CLAIM_LOST\",\"replayable\":false}]}\n"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "policy-action-propagation",
+      "procedure_evidence_id": "procedure:policy-action-propagation:v1",
+      "intent_template": "Register policy action `{name}`. Propagate it through the action registry, stable wire map, risk classification, docs, and contract using this exact documentation line: - {wire} (risk={risk}): {purpose}.",
+      "cases": [
+        {
+          "id": "memory-export",
+          "split": "online",
+          "bindings": {
+            "name": "memory_export",
+            "purpose": "exporting a governed memory snapshot",
+            "risk": "high",
+            "wire": "MEMORY_EXPORT"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/policy-actions.md",
+                "content": "# Policy actions\n\n- READ (risk=low): reading public metadata.\n"
+              },
+              {
+                "path": "src/policy_actions.py",
+                "content": "ACTIONS = [\"read\"]\nWIRE = {\"read\": \"READ\"}\nRISK = {\"read\": \"low\"}\n"
+              },
+              {
+                "path": "tests/policy-actions.json",
+                "content": "{\"actions\":[{\"name\":\"read\",\"wire\":\"READ\",\"risk\":\"low\"}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/policy-actions.md",
+              "src/policy_actions.py",
+              "tests/policy-actions.json"
+            ],
+            "required_changed_paths": [
+              "docs/policy-actions.md",
+              "src/policy_actions.py",
+              "tests/policy-actions.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/policy_actions.py",
+                "value": "ACTIONS = [\"read\", \"memory_export\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/policy_actions.py",
+                "value": "\"memory_export\": \"MEMORY_EXPORT\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/policy_actions.py",
+                "value": "\"memory_export\": \"high\""
+              },
+              {
+                "kind": "contains",
+                "path": "docs/policy-actions.md",
+                "value": "- MEMORY_EXPORT (risk=high): exporting a governed memory snapshot."
+              },
+              {
+                "kind": "equals",
+                "path": "tests/policy-actions.json",
+                "value": "{\"actions\":[{\"name\":\"read\",\"wire\":\"READ\",\"risk\":\"low\"},{\"name\":\"memory_export\",\"wire\":\"MEMORY_EXPORT\",\"risk\":\"high\"}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/policy-actions.md",
+              "content": "# Policy actions\n\n- READ (risk=low): reading public metadata.\n- MEMORY_EXPORT (risk=high): exporting a governed memory snapshot.\n"
+            },
+            {
+              "path": "src/policy_actions.py",
+              "content": "ACTIONS = [\"read\", \"memory_export\"]\nWIRE = {\"read\": \"READ\", \"memory_export\": \"MEMORY_EXPORT\"}\nRISK = {\"read\": \"low\", \"memory_export\": \"high\"}\n"
+            },
+            {
+              "path": "tests/policy-actions.json",
+              "content": "{\"actions\":[{\"name\":\"read\",\"wire\":\"READ\",\"risk\":\"low\"},{\"name\":\"memory_export\",\"wire\":\"MEMORY_EXPORT\",\"risk\":\"high\"}]}\n"
+            }
+          ]
+        },
+        {
+          "id": "task-delegate",
+          "split": "offline",
+          "bindings": {
+            "name": "task_delegate",
+            "purpose": "delegating a task to an isolated worker",
+            "risk": "medium",
+            "wire": "TASK_DELEGATE"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/policy-actions.md",
+                "content": "# Policy actions\n\n- READ (risk=low): reading public metadata.\n"
+              },
+              {
+                "path": "src/policy_actions.py",
+                "content": "ACTIONS = [\"read\"]\nWIRE = {\"read\": \"READ\"}\nRISK = {\"read\": \"low\"}\n"
+              },
+              {
+                "path": "tests/policy-actions.json",
+                "content": "{\"actions\":[{\"name\":\"read\",\"wire\":\"READ\",\"risk\":\"low\"}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/policy-actions.md",
+              "src/policy_actions.py",
+              "tests/policy-actions.json"
+            ],
+            "required_changed_paths": [
+              "docs/policy-actions.md",
+              "src/policy_actions.py",
+              "tests/policy-actions.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/policy_actions.py",
+                "value": "ACTIONS = [\"read\", \"task_delegate\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/policy_actions.py",
+                "value": "\"task_delegate\": \"TASK_DELEGATE\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/policy_actions.py",
+                "value": "\"task_delegate\": \"medium\""
+              },
+              {
+                "kind": "contains",
+                "path": "docs/policy-actions.md",
+                "value": "- TASK_DELEGATE (risk=medium): delegating a task to an isolated worker."
+              },
+              {
+                "kind": "equals",
+                "path": "tests/policy-actions.json",
+                "value": "{\"actions\":[{\"name\":\"read\",\"wire\":\"READ\",\"risk\":\"low\"},{\"name\":\"task_delegate\",\"wire\":\"TASK_DELEGATE\",\"risk\":\"medium\"}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/policy-actions.md",
+              "content": "# Policy actions\n\n- READ (risk=low): reading public metadata.\n- TASK_DELEGATE (risk=medium): delegating a task to an isolated worker.\n"
+            },
+            {
+              "path": "src/policy_actions.py",
+              "content": "ACTIONS = [\"read\", \"task_delegate\"]\nWIRE = {\"read\": \"READ\", \"task_delegate\": \"TASK_DELEGATE\"}\nRISK = {\"read\": \"low\", \"task_delegate\": \"medium\"}\n"
+            },
+            {
+              "path": "tests/policy-actions.json",
+              "content": "{\"actions\":[{\"name\":\"read\",\"wire\":\"READ\",\"risk\":\"low\"},{\"name\":\"task_delegate\",\"wire\":\"TASK_DELEGATE\",\"risk\":\"medium\"}]}\n"
+            }
+          ]
+        },
+        {
+          "id": "ontology-migrate",
+          "split": "offline",
+          "bindings": {
+            "name": "ontology_migrate",
+            "purpose": "migrating a versioned ontology snapshot",
+            "risk": "high",
+            "wire": "ONTOLOGY_MIGRATE"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/policy-actions.md",
+                "content": "# Policy actions\n\n- READ (risk=low): reading public metadata.\n"
+              },
+              {
+                "path": "src/policy_actions.py",
+                "content": "ACTIONS = [\"read\"]\nWIRE = {\"read\": \"READ\"}\nRISK = {\"read\": \"low\"}\n"
+              },
+              {
+                "path": "tests/policy-actions.json",
+                "content": "{\"actions\":[{\"name\":\"read\",\"wire\":\"READ\",\"risk\":\"low\"}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/policy-actions.md",
+              "src/policy_actions.py",
+              "tests/policy-actions.json"
+            ],
+            "required_changed_paths": [
+              "docs/policy-actions.md",
+              "src/policy_actions.py",
+              "tests/policy-actions.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/policy_actions.py",
+                "value": "ACTIONS = [\"read\", \"ontology_migrate\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/policy_actions.py",
+                "value": "\"ontology_migrate\": \"ONTOLOGY_MIGRATE\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/policy_actions.py",
+                "value": "\"ontology_migrate\": \"high\""
+              },
+              {
+                "kind": "contains",
+                "path": "docs/policy-actions.md",
+                "value": "- ONTOLOGY_MIGRATE (risk=high): migrating a versioned ontology snapshot."
+              },
+              {
+                "kind": "equals",
+                "path": "tests/policy-actions.json",
+                "value": "{\"actions\":[{\"name\":\"read\",\"wire\":\"READ\",\"risk\":\"low\"},{\"name\":\"ontology_migrate\",\"wire\":\"ONTOLOGY_MIGRATE\",\"risk\":\"high\"}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/policy-actions.md",
+              "content": "# Policy actions\n\n- READ (risk=low): reading public metadata.\n- ONTOLOGY_MIGRATE (risk=high): migrating a versioned ontology snapshot.\n"
+            },
+            {
+              "path": "src/policy_actions.py",
+              "content": "ACTIONS = [\"read\", \"ontology_migrate\"]\nWIRE = {\"read\": \"READ\", \"ontology_migrate\": \"ONTOLOGY_MIGRATE\"}\nRISK = {\"read\": \"low\", \"ontology_migrate\": \"high\"}\n"
+            },
+            {
+              "path": "tests/policy-actions.json",
+              "content": "{\"actions\":[{\"name\":\"read\",\"wire\":\"READ\",\"risk\":\"low\"},{\"name\":\"ontology_migrate\",\"wire\":\"ONTOLOGY_MIGRATE\",\"risk\":\"high\"}]}\n"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "compatibility-convention-transfer",
+      "procedure_evidence_id": "procedure:compatibility-convention-transfer:v1",
+      "intent_template": "Register sibling command `{name}`. {instruction}",
+      "cases": [
+        {
+          "id": "snapshot-export",
+          "split": "online",
+          "bindings": {
+            "instruction": "Establish this family's compatibility convention: use legacy alias COMPAT_<UPPER_SNAKE_NAME>, sentinel order authorize > execute > audit, and documentation line - <name> => <alias> [authorize > execute > audit]. Update the command registry, legacy alias map, sentinel map, docs, and JSON contract.",
+            "name": "snapshot_export"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/command-contracts.md",
+                "content": "# Command contracts\n\n- read => READ_V1 [validate > commit]\n"
+              },
+              {
+                "path": "src/command_contract.py",
+                "content": "COMMANDS = [\"read\"]\nLEGACY_ALIAS = {\"read\": \"READ_V1\"}\nSENTINELS = {\"read\": [\"validate\", \"commit\"]}\n"
+              },
+              {
+                "path": "tests/command-contract.json",
+                "content": "{\"commands\":[{\"name\":\"read\",\"legacy_alias\":\"READ_V1\",\"sentinels\":[\"validate\",\"commit\"]}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/command-contracts.md",
+              "src/command_contract.py",
+              "tests/command-contract.json"
+            ],
+            "required_changed_paths": [
+              "docs/command-contracts.md",
+              "src/command_contract.py",
+              "tests/command-contract.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/command_contract.py",
+                "value": "COMMANDS = [\"read\", \"snapshot_export\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/command_contract.py",
+                "value": "\"snapshot_export\": \"COMPAT_SNAPSHOT_EXPORT\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/command_contract.py",
+                "value": "\"snapshot_export\": [\"authorize\", \"execute\", \"audit\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/command-contracts.md",
+                "value": "- snapshot_export => COMPAT_SNAPSHOT_EXPORT [authorize > execute > audit]"
+              },
+              {
+                "kind": "equals",
+                "path": "tests/command-contract.json",
+                "value": "{\"commands\":[{\"name\":\"read\",\"legacy_alias\":\"READ_V1\",\"sentinels\":[\"validate\",\"commit\"]},{\"name\":\"snapshot_export\",\"legacy_alias\":\"COMPAT_SNAPSHOT_EXPORT\",\"sentinels\":[\"authorize\",\"execute\",\"audit\"]}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/command-contracts.md",
+              "content": "# Command contracts\n\n- read => READ_V1 [validate > commit]\n- snapshot_export => COMPAT_SNAPSHOT_EXPORT [authorize > execute > audit]\n"
+            },
+            {
+              "path": "src/command_contract.py",
+              "content": "COMMANDS = [\"read\", \"snapshot_export\"]\nLEGACY_ALIAS = {\"read\": \"READ_V1\", \"snapshot_export\": \"COMPAT_SNAPSHOT_EXPORT\"}\nSENTINELS = {\"read\": [\"validate\", \"commit\"], \"snapshot_export\": [\"authorize\", \"execute\", \"audit\"]}\n"
+            },
+            {
+              "path": "tests/command-contract.json",
+              "content": "{\"commands\":[{\"name\":\"read\",\"legacy_alias\":\"READ_V1\",\"sentinels\":[\"validate\",\"commit\"]},{\"name\":\"snapshot_export\",\"legacy_alias\":\"COMPAT_SNAPSHOT_EXPORT\",\"sentinels\":[\"authorize\",\"execute\",\"audit\"]}]}\n"
+            }
+          ]
+        },
+        {
+          "id": "task-handoff",
+          "split": "offline",
+          "bindings": {
+            "instruction": "Reuse the previously established family compatibility convention for this sibling. Update the command registry, legacy alias map, sentinel map, docs, and JSON contract.",
+            "name": "task_handoff"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/command-contracts.md",
+                "content": "# Command contracts\n\n- read => READ_V1 [validate > commit]\n"
+              },
+              {
+                "path": "src/command_contract.py",
+                "content": "COMMANDS = [\"read\"]\nLEGACY_ALIAS = {\"read\": \"READ_V1\"}\nSENTINELS = {\"read\": [\"validate\", \"commit\"]}\n"
+              },
+              {
+                "path": "tests/command-contract.json",
+                "content": "{\"commands\":[{\"name\":\"read\",\"legacy_alias\":\"READ_V1\",\"sentinels\":[\"validate\",\"commit\"]}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/command-contracts.md",
+              "src/command_contract.py",
+              "tests/command-contract.json"
+            ],
+            "required_changed_paths": [
+              "docs/command-contracts.md",
+              "src/command_contract.py",
+              "tests/command-contract.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/command_contract.py",
+                "value": "COMMANDS = [\"read\", \"task_handoff\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/command_contract.py",
+                "value": "\"task_handoff\": \"COMPAT_TASK_HANDOFF\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/command_contract.py",
+                "value": "\"task_handoff\": [\"authorize\", \"execute\", \"audit\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/command-contracts.md",
+                "value": "- task_handoff => COMPAT_TASK_HANDOFF [authorize > execute > audit]"
+              },
+              {
+                "kind": "equals",
+                "path": "tests/command-contract.json",
+                "value": "{\"commands\":[{\"name\":\"read\",\"legacy_alias\":\"READ_V1\",\"sentinels\":[\"validate\",\"commit\"]},{\"name\":\"task_handoff\",\"legacy_alias\":\"COMPAT_TASK_HANDOFF\",\"sentinels\":[\"authorize\",\"execute\",\"audit\"]}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/command-contracts.md",
+              "content": "# Command contracts\n\n- read => READ_V1 [validate > commit]\n- task_handoff => COMPAT_TASK_HANDOFF [authorize > execute > audit]\n"
+            },
+            {
+              "path": "src/command_contract.py",
+              "content": "COMMANDS = [\"read\", \"task_handoff\"]\nLEGACY_ALIAS = {\"read\": \"READ_V1\", \"task_handoff\": \"COMPAT_TASK_HANDOFF\"}\nSENTINELS = {\"read\": [\"validate\", \"commit\"], \"task_handoff\": [\"authorize\", \"execute\", \"audit\"]}\n"
+            },
+            {
+              "path": "tests/command-contract.json",
+              "content": "{\"commands\":[{\"name\":\"read\",\"legacy_alias\":\"READ_V1\",\"sentinels\":[\"validate\",\"commit\"]},{\"name\":\"task_handoff\",\"legacy_alias\":\"COMPAT_TASK_HANDOFF\",\"sentinels\":[\"authorize\",\"execute\",\"audit\"]}]}\n"
+            }
+          ]
+        },
+        {
+          "id": "ontology-promote",
+          "split": "offline",
+          "bindings": {
+            "instruction": "Reuse the previously established family compatibility convention for this sibling. Update the command registry, legacy alias map, sentinel map, docs, and JSON contract.",
+            "name": "ontology_promote"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/command-contracts.md",
+                "content": "# Command contracts\n\n- read => READ_V1 [validate > commit]\n"
+              },
+              {
+                "path": "src/command_contract.py",
+                "content": "COMMANDS = [\"read\"]\nLEGACY_ALIAS = {\"read\": \"READ_V1\"}\nSENTINELS = {\"read\": [\"validate\", \"commit\"]}\n"
+              },
+              {
+                "path": "tests/command-contract.json",
+                "content": "{\"commands\":[{\"name\":\"read\",\"legacy_alias\":\"READ_V1\",\"sentinels\":[\"validate\",\"commit\"]}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/command-contracts.md",
+              "src/command_contract.py",
+              "tests/command-contract.json"
+            ],
+            "required_changed_paths": [
+              "docs/command-contracts.md",
+              "src/command_contract.py",
+              "tests/command-contract.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/command_contract.py",
+                "value": "COMMANDS = [\"read\", \"ontology_promote\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/command_contract.py",
+                "value": "\"ontology_promote\": \"COMPAT_ONTOLOGY_PROMOTE\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/command_contract.py",
+                "value": "\"ontology_promote\": [\"authorize\", \"execute\", \"audit\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/command-contracts.md",
+                "value": "- ontology_promote => COMPAT_ONTOLOGY_PROMOTE [authorize > execute > audit]"
+              },
+              {
+                "kind": "equals",
+                "path": "tests/command-contract.json",
+                "value": "{\"commands\":[{\"name\":\"read\",\"legacy_alias\":\"READ_V1\",\"sentinels\":[\"validate\",\"commit\"]},{\"name\":\"ontology_promote\",\"legacy_alias\":\"COMPAT_ONTOLOGY_PROMOTE\",\"sentinels\":[\"authorize\",\"execute\",\"audit\"]}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/command-contracts.md",
+              "content": "# Command contracts\n\n- read => READ_V1 [validate > commit]\n- ontology_promote => COMPAT_ONTOLOGY_PROMOTE [authorize > execute > audit]\n"
+            },
+            {
+              "path": "src/command_contract.py",
+              "content": "COMMANDS = [\"read\", \"ontology_promote\"]\nLEGACY_ALIAS = {\"read\": \"READ_V1\", \"ontology_promote\": \"COMPAT_ONTOLOGY_PROMOTE\"}\nSENTINELS = {\"read\": [\"validate\", \"commit\"], \"ontology_promote\": [\"authorize\", \"execute\", \"audit\"]}\n"
+            },
+            {
+              "path": "tests/command-contract.json",
+              "content": "{\"commands\":[{\"name\":\"read\",\"legacy_alias\":\"READ_V1\",\"sentinels\":[\"validate\",\"commit\"]},{\"name\":\"ontology_promote\",\"legacy_alias\":\"COMPAT_ONTOLOGY_PROMOTE\",\"sentinels\":[\"authorize\",\"execute\",\"audit\"]}]}\n"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "recovery-protocol-transfer",
+      "procedure_evidence_id": "procedure:recovery-protocol-transfer:v1",
+      "intent_template": "Register sibling recovery operation `{name}`. {instruction}",
+      "cases": [
+        {
+          "id": "incident-export",
+          "split": "online",
+          "bindings": {
+            "instruction": "Establish this family's recovery protocol: use compatibility alias RECOVERY_<UPPER_SNAKE_NAME>, phase order snapshot > diagnose > attest, and documentation line - <name> => <alias> [snapshot > diagnose > attest]. Update the operation registry, compatibility alias map, phase map, docs, and JSON contract.",
+            "name": "incident_export"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/recovery-operations.md",
+                "content": "# Recovery operations\n\n- inspect => INSPECT_V1 [observe > report]\n"
+              },
+              {
+                "path": "src/recovery_operations.py",
+                "content": "OPERATIONS = [\"inspect\"]\nCOMPAT_ALIAS = {\"inspect\": \"INSPECT_V1\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"]}\n"
+              },
+              {
+                "path": "tests/recovery-operations.json",
+                "content": "{\"operations\":[{\"name\":\"inspect\",\"compat_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/recovery-operations.md",
+              "src/recovery_operations.py",
+              "tests/recovery-operations.json"
+            ],
+            "required_changed_paths": [
+              "docs/recovery-operations.md",
+              "src/recovery_operations.py",
+              "tests/recovery-operations.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/recovery_operations.py",
+                "value": "OPERATIONS = [\"inspect\", \"incident_export\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/recovery_operations.py",
+                "value": "\"incident_export\": \"RECOVERY_INCIDENT_EXPORT\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/recovery_operations.py",
+                "value": "\"incident_export\": [\"snapshot\", \"diagnose\", \"attest\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/recovery-operations.md",
+                "value": "- incident_export => RECOVERY_INCIDENT_EXPORT [snapshot > diagnose > attest]"
+              },
+              {
+                "kind": "equals",
+                "path": "tests/recovery-operations.json",
+                "value": "{\"operations\":[{\"name\":\"inspect\",\"compat_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]},{\"name\":\"incident_export\",\"compat_alias\":\"RECOVERY_INCIDENT_EXPORT\",\"phases\":[\"snapshot\",\"diagnose\",\"attest\"]}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/recovery-operations.md",
+              "content": "# Recovery operations\n\n- inspect => INSPECT_V1 [observe > report]\n- incident_export => RECOVERY_INCIDENT_EXPORT [snapshot > diagnose > attest]\n"
+            },
+            {
+              "path": "src/recovery_operations.py",
+              "content": "OPERATIONS = [\"inspect\", \"incident_export\"]\nCOMPAT_ALIAS = {\"inspect\": \"INSPECT_V1\", \"incident_export\": \"RECOVERY_INCIDENT_EXPORT\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"], \"incident_export\": [\"snapshot\", \"diagnose\", \"attest\"]}\n"
+            },
+            {
+              "path": "tests/recovery-operations.json",
+              "content": "{\"operations\":[{\"name\":\"inspect\",\"compat_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]},{\"name\":\"incident_export\",\"compat_alias\":\"RECOVERY_INCIDENT_EXPORT\",\"phases\":[\"snapshot\",\"diagnose\",\"attest\"]}]}\n"
+            }
+          ]
+        },
+        {
+          "id": "journal-repair",
+          "split": "offline",
+          "bindings": {
+            "instruction": "Reuse the previously established family recovery protocol for this sibling. Update the operation registry, compatibility alias map, phase map, docs, and JSON contract.",
+            "name": "journal_repair"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/recovery-operations.md",
+                "content": "# Recovery operations\n\n- inspect => INSPECT_V1 [observe > report]\n"
+              },
+              {
+                "path": "src/recovery_operations.py",
+                "content": "OPERATIONS = [\"inspect\"]\nCOMPAT_ALIAS = {\"inspect\": \"INSPECT_V1\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"]}\n"
+              },
+              {
+                "path": "tests/recovery-operations.json",
+                "content": "{\"operations\":[{\"name\":\"inspect\",\"compat_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/recovery-operations.md",
+              "src/recovery_operations.py",
+              "tests/recovery-operations.json"
+            ],
+            "required_changed_paths": [
+              "docs/recovery-operations.md",
+              "src/recovery_operations.py",
+              "tests/recovery-operations.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/recovery_operations.py",
+                "value": "OPERATIONS = [\"inspect\", \"journal_repair\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/recovery_operations.py",
+                "value": "\"journal_repair\": \"RECOVERY_JOURNAL_REPAIR\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/recovery_operations.py",
+                "value": "\"journal_repair\": [\"snapshot\", \"diagnose\", \"attest\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/recovery-operations.md",
+                "value": "- journal_repair => RECOVERY_JOURNAL_REPAIR [snapshot > diagnose > attest]"
+              },
+              {
+                "kind": "equals",
+                "path": "tests/recovery-operations.json",
+                "value": "{\"operations\":[{\"name\":\"inspect\",\"compat_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]},{\"name\":\"journal_repair\",\"compat_alias\":\"RECOVERY_JOURNAL_REPAIR\",\"phases\":[\"snapshot\",\"diagnose\",\"attest\"]}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/recovery-operations.md",
+              "content": "# Recovery operations\n\n- inspect => INSPECT_V1 [observe > report]\n- journal_repair => RECOVERY_JOURNAL_REPAIR [snapshot > diagnose > attest]\n"
+            },
+            {
+              "path": "src/recovery_operations.py",
+              "content": "OPERATIONS = [\"inspect\", \"journal_repair\"]\nCOMPAT_ALIAS = {\"inspect\": \"INSPECT_V1\", \"journal_repair\": \"RECOVERY_JOURNAL_REPAIR\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"], \"journal_repair\": [\"snapshot\", \"diagnose\", \"attest\"]}\n"
+            },
+            {
+              "path": "tests/recovery-operations.json",
+              "content": "{\"operations\":[{\"name\":\"inspect\",\"compat_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]},{\"name\":\"journal_repair\",\"compat_alias\":\"RECOVERY_JOURNAL_REPAIR\",\"phases\":[\"snapshot\",\"diagnose\",\"attest\"]}]}\n"
+            }
+          ]
+        },
+        {
+          "id": "lease-recover",
+          "split": "offline",
+          "bindings": {
+            "instruction": "Reuse the previously established family recovery protocol for this sibling. Update the operation registry, compatibility alias map, phase map, docs, and JSON contract.",
+            "name": "lease_recover"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/recovery-operations.md",
+                "content": "# Recovery operations\n\n- inspect => INSPECT_V1 [observe > report]\n"
+              },
+              {
+                "path": "src/recovery_operations.py",
+                "content": "OPERATIONS = [\"inspect\"]\nCOMPAT_ALIAS = {\"inspect\": \"INSPECT_V1\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"]}\n"
+              },
+              {
+                "path": "tests/recovery-operations.json",
+                "content": "{\"operations\":[{\"name\":\"inspect\",\"compat_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/recovery-operations.md",
+              "src/recovery_operations.py",
+              "tests/recovery-operations.json"
+            ],
+            "required_changed_paths": [
+              "docs/recovery-operations.md",
+              "src/recovery_operations.py",
+              "tests/recovery-operations.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/recovery_operations.py",
+                "value": "OPERATIONS = [\"inspect\", \"lease_recover\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/recovery_operations.py",
+                "value": "\"lease_recover\": \"RECOVERY_LEASE_RECOVER\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/recovery_operations.py",
+                "value": "\"lease_recover\": [\"snapshot\", \"diagnose\", \"attest\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/recovery-operations.md",
+                "value": "- lease_recover => RECOVERY_LEASE_RECOVER [snapshot > diagnose > attest]"
+              },
+              {
+                "kind": "equals",
+                "path": "tests/recovery-operations.json",
+                "value": "{\"operations\":[{\"name\":\"inspect\",\"compat_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]},{\"name\":\"lease_recover\",\"compat_alias\":\"RECOVERY_LEASE_RECOVER\",\"phases\":[\"snapshot\",\"diagnose\",\"attest\"]}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/recovery-operations.md",
+              "content": "# Recovery operations\n\n- inspect => INSPECT_V1 [observe > report]\n- lease_recover => RECOVERY_LEASE_RECOVER [snapshot > diagnose > attest]\n"
+            },
+            {
+              "path": "src/recovery_operations.py",
+              "content": "OPERATIONS = [\"inspect\", \"lease_recover\"]\nCOMPAT_ALIAS = {\"inspect\": \"INSPECT_V1\", \"lease_recover\": \"RECOVERY_LEASE_RECOVER\"}\nPHASES = {\"inspect\": [\"observe\", \"report\"], \"lease_recover\": [\"snapshot\", \"diagnose\", \"attest\"]}\n"
+            },
+            {
+              "path": "tests/recovery-operations.json",
+              "content": "{\"operations\":[{\"name\":\"inspect\",\"compat_alias\":\"INSPECT_V1\",\"phases\":[\"observe\",\"report\"]},{\"name\":\"lease_recover\",\"compat_alias\":\"RECOVERY_LEASE_RECOVER\",\"phases\":[\"snapshot\",\"diagnose\",\"attest\"]}]}\n"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

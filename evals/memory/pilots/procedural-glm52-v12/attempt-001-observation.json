@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "manifest_id": "coding-intent-families-2026080814-1",
+  "artifact_provenance": {
+    "local_only_artifact_tree": "~/.local/state/metacodes/memory-pilots/procedural-glm52-v12/artifacts/run-001",
+    "local_only_artifact_tree_bytes": 8795495,
+    "local_only_artifact_tree_files": 30,
+    "local_only_artifact_tree_sha256": "3b2009e433f0a113577ce0262297af10cfce3b9d568d09450fa7d3cb5248f0d8",
+    "metacodes_binary_sha256": "32c0d1d103ad84c396e966dbb93c88b32c8a6464c6ebfc029d9739488e646c22",
+    "pilot_freeze_commit": "177e9c9",
+    "ripgrep_snapshot_mode": "0500",
+    "ripgrep_snapshot_sha256": "882ee4837235e252ce5ffecc3c1707f6d5b7db0054b7922301b5dc0f466a0fed",
+    "tinykg_binary_sha256": "66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee"
+  },
+  "budget_journal": {
+    "committed_cost_usd": 0.0,
+    "committed_metered_tokens": 0,
+    "conservative_exposure_cost_usd": 1.5,
+    "conservative_exposure_metered_tokens": 600000,
+    "head_sha256": "b6a5f7c0c8759d7bbe5ad705575181fc4f02b19b6a40fb28bb10f76f529bde54",
+    "journal_id": "1fb64fb3b2e20c1571717fcc3504911423da6a280a65e5e6a6af3953863affe0",
+    "revision": 2,
+    "sha256": "54a16e63f2fced533be7067a45ea45879209c281a6987296f7f764d63353f051",
+    "uncertain_authorized_transactions": 1
+  },
+  "failure": {
+    "classification": "request-authorized-invalid-api-key",
+    "detail": "The provider received the first request and returned HTTP 401 with code INVALID_API_KEY before any model turn or tool call.",
+    "root_cause": "The private 0600 pilot credential was rejected by the provider. The failure does not establish whether the key was expired, revoked, or otherwise invalid, so the authorized transaction remains conservatively unsettled.",
+    "sequence": 0
+  },
+  "provider_evidence": {
+    "child_process_failure_path": "rollouts/00000-run-28698c3c403d599cdcca/child-process-failure.json",
+    "credential_present_in_artifacts": false,
+    "http_requests": 1,
+    "provider_error_code": "INVALID_API_KEY",
+    "provider_http_status": 401,
+    "stderr_bytes": 272,
+    "stderr_sha256": "2d64540b2a2fe19afe9dc44d1dd637c80ca123aaf4091e7cbbd3dc7779b9dcb8",
+    "stdout_bytes": 134,
+    "stdout_sha256": "fa8450bff0ee3c957a8dee852f56ca3ae367f09399f558d7c23db79e338b7bb0",
+    "tool_calls": 0,
+    "turns": 0
+  },
+  "outcome": {
+    "automatic_retry_forbidden": true,
+    "canonical_runtime_receipt_published": false,
+    "committed_rollout_transactions": 0,
+    "provider_http_requests_in_uncertain_transaction": 1,
+    "quality_evidence": false,
+    "remaining_rollouts_not_started": 8,
+    "status": "halted",
+    "uncertain_authorized_transactions": 1
+  },
+  "program_authority": {
+    "conservative_cost_usd_after_attempt": 9.1764158,
+    "conservative_metered_tokens_after_attempt": 5329364,
+    "user_authorization_max_cost_usd": 1000.0
+  },
+  "rollouts": [],
+  "unsettled_transaction": {
+    "authorization_revision": 2,
+    "max_cost_usd": 1.5,
+    "max_metered_tokens": 600000,
+    "provider_http_requests": 1,
+    "sequence": 0,
+    "state": "request_authorized",
+    "transaction_id": "2a53fc44a007fab397e642486802368e951730f7ecc4ff75aae85b7c817369e0"
+  }
+}
