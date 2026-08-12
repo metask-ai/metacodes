@@ -74,14 +74,18 @@ pub const Projector = struct {
         return true;
     }
 
+    pub fn inFlightCount(self: *const Projector) usize {
+        return self.tools.items.len;
+    }
+
     pub fn closeForTerminal(self: *Projector, phase: protocol.RunStatePhase) void {
         self.clearTools();
         self.phase = phase;
     }
 
-    pub fn nextSnapshot(self: *Projector) protocol.RunState {
+    pub fn nextSnapshot(self: *Projector) Error!protocol.RunState {
         self.transition_seq += 1;
-        const view = self.allocator.alloc(protocol.RunStateTool, self.tools.items.len) catch unreachable;
+        const view = try self.allocator.alloc(protocol.RunStateTool, self.tools.items.len);
         for (self.tools.items, view) |tool, *dest| {
             dest.* = .{ .tool_call_id = tool.tool_call_id, .name = tool.name };
         }
@@ -118,13 +122,13 @@ test "projector tracks concurrent tools and closes terminal snapshots" {
     try std.testing.expect(try projector.addTool("read", "Read"));
     try std.testing.expect(try projector.addTool("bash", "Bash"));
     try std.testing.expect(projector.setPhase(.executing_tools));
-    const snapshot = projector.nextSnapshot();
+    const snapshot = try projector.nextSnapshot();
     try std.testing.expectEqual(@as(usize, 2), snapshot.in_flight_tools.len);
     std.testing.allocator.free(snapshot.in_flight_tools);
     try std.testing.expect(projector.removeTool("read"));
     try std.testing.expect(!projector.removeTool("read"));
     projector.closeForTerminal(.failed);
-    const terminal_snapshot = projector.nextSnapshot();
+    const terminal_snapshot = try projector.nextSnapshot();
     defer std.testing.allocator.free(terminal_snapshot.in_flight_tools);
     try std.testing.expectEqual(@as(usize, 0), terminal_snapshot.in_flight_tools.len);
     try std.testing.expectEqual(protocol.RunStatePhase.failed, terminal_snapshot.phase);
@@ -139,7 +143,7 @@ test "projector owns tool references independently of input buffers" {
     _ = try projector.addTool(&id, &name);
     @memset(&id, 'x');
     @memset(&name, 'y');
-    const snapshot = projector.nextSnapshot();
+    const snapshot = try projector.nextSnapshot();
     defer std.testing.allocator.free(snapshot.in_flight_tools);
     try std.testing.expectEqualStrings("ab", snapshot.in_flight_tools[0].tool_call_id);
     try std.testing.expectEqualStrings("Read", snapshot.in_flight_tools[0].name);

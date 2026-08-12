@@ -490,6 +490,7 @@ const AbiSession = struct {
     permission_audit: ?session_permission.AuditTrail = null,
     permission_request_sequence: u64 = 0,
     pending_permission: ?PendingPermission = null,
+    run_state_projector: run_state.Projector = undefined,
     staged_permission_provenance: ?StagedPermissionProvenance = null,
     staged_permission_failure: u32 = wire.STATUS_OK,
     budget_state: session_budget.SessionState = .{
@@ -979,9 +980,92 @@ const AbiSession = struct {
         return makeRunContext(self.handle(), identity);
     }
 
+    fn emitRunStateSnapshot(self: *AbiSession, session_id: core.session_id.SessionId, run_id: u64) bool {
+        const callback = self.callbacks.on_event orelse return true;
+        const snapshot = self.run_state_projector.nextSnapshot() catch {
+            self.recordCallbackStatus(wire.STATUS_OUT_OF_MEMORY);
+            return false;
+        };
+        defer allocator.free(snapshot.in_flight_tools);
+        const json = std.json.Stringify.valueAlloc(
+            allocator,
+            public_protocol.CoreEvent{ .run_state = snapshot },
+            .{},
+        ) catch {
+            self.recordCallbackStatus(wire.STATUS_OUT_OF_MEMORY);
+            return false;
+        };
+        defer allocator.free(json);
+        const identity = core.agent_session.RunIdentity{ .session_id = session_id, .run_id = run_id };
+        const run = self.runContext(&identity);
+        if (callback(self.callbacks.ctx, &run, view(json)) != wire.EVENT_CONTINUE) {
+            self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
+            self.core_session.noteCallbackFailure();
+            return false;
+        }
+        return true;
+    }
+
+    fn observeRunState(self: *AbiSession, session_id: core.session_id.SessionId, run_id: u64, event: core.protocol.ui_event.CoreEvent) bool {
+        if (self.run_state_projector.run_id != run_id) {
+            self.run_state_projector.begin(run_id);
+            if (!self.emitRunStateSnapshot(session_id, run_id)) return false;
+        }
+        var changed = false;
+        switch (event) {
+            .progress => |value| {
+                changed = self.run_state_projector.observeProgress(value.turn, value.tool_calls);
+                changed = self.run_state_projector.setPhase(.generating) or changed;
+            },
+            .tool_start => |value| {
+                const added = self.run_state_projector.addTool(value.id, value.name) catch {
+                    self.recordCallbackStatus(wire.STATUS_RESOURCE_LIMIT);
+                    return false;
+                };
+                changed = self.run_state_projector.setPhase(.executing_tools) or added;
+            },
+            .tool_result => |value| {
+                const removed = self.run_state_projector.removeTool(value.id);
+                changed = removed;
+                if (self.run_state_projector.inFlightCount() == 0)
+                    changed = self.run_state_projector.setPhase(.generating) or changed;
+            },
+            .retry_notice => {
+                changed = self.run_state_projector.setPhase(.retrying);
+            },
+            .ui_request_pending => {
+                changed = self.run_state_projector.setPhase(.waiting_ui);
+            },
+            .diag_run_end => |value| {
+                if (self.run_state_projector.setPhase(.finalizing)) {
+                    if (!self.emitRunStateSnapshot(session_id, run_id)) return false;
+                }
+                const terminal: public_protocol.RunStatePhase = if (std.mem.eql(u8, value.stop_reason_name, "aborted"))
+                    .aborted
+                else if (std.mem.eql(u8, value.stop_reason_name, "end_turn") or
+                    std.mem.eql(u8, value.stop_reason_name, "max_turns"))
+                    .completed
+                else
+                    .failed;
+                self.run_state_projector.closeForTerminal(terminal);
+                return self.emitRunStateSnapshot(session_id, run_id);
+            },
+            else => {},
+        }
+        if (!changed) return true;
+        return self.emitRunStateSnapshot(session_id, run_id);
+    }
+
+    fn startRunState(self: *AbiSession, session_id: core.session_id.SessionId, run_id: u64) bool {
+        self.run_state_projector.begin(run_id);
+        return self.emitRunStateSnapshot(session_id, run_id);
+    }
+
     fn emit(raw: *anyopaque, session_id: core.session_id.SessionId, run_id: u64, event: core.protocol.ui_event.CoreEvent) bool {
         const self: *AbiSession = @ptrCast(@alignCast(raw));
         if (!self.publishStagedPermission(session_id, run_id, event))
+            return false;
+        if (!self.observeRunState(session_id, run_id, event))
             return false;
         const callback = self.callbacks.on_event orelse return true;
         const public_event = protocol_v1.event(event) orelse return true;
@@ -2515,6 +2599,10 @@ const AbiSession = struct {
             run_id,
             .{ .ctx = self, .emit = AbiSession.emit },
         );
+        if (!self.startRunState(identity.session_id, run_id)) {
+            _ = admitted.finishWithoutConversation() catch {};
+            return error.CallbackFailed;
+        }
         self.active_mcp_environment = if (mcp_environment) |*environment| environment else null;
         defer self.active_mcp_environment = null;
         const inner_surface = if (skill_environment) |*environment|
@@ -2629,6 +2717,10 @@ const AbiSession = struct {
             run_id,
             .{ .ctx = self, .emit = AbiSession.emit },
         );
+        if (!self.startRunState(self.core_session.session_id, run_id)) {
+            _ = admitted.finishWithoutConversation() catch {};
+            return error.CallbackFailed;
+        }
         var activation = skill_activation.activate(allocator, plan, .{
             .materializations = materializations,
             .parent_frame = parent_frame,
@@ -4582,6 +4674,7 @@ fn buildAbiSession(
         .authority_issues = authority_issues,
         .permission_state = permission_state,
         .permission_audit = permission_audit,
+        .run_state_projector = run_state.Projector.init(allocator),
         .budget_state = budget_state,
         .last_terminal_kind = if (config.restored) |decoded|
             decoded.descriptor.terminal_kind
@@ -5481,6 +5574,7 @@ fn sessionDestroy(handle: ?*wire.SessionHandle, out_error: ?*wire.OwnedBytesV1) 
 
 fn deinitAbiSession(self: *AbiSession, runtime: *AbiRuntime) void {
     self.clearStagedPermission();
+    self.run_state_projector.deinit();
     if (self.policy_root) |root_frame| {
         root_frame.release();
         self.policy_root = null;
