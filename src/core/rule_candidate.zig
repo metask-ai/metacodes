@@ -103,7 +103,7 @@ pub const Loaded = struct {
                 const receipt_id = self.source_receipt_id orelse break :blk false;
                 const subject = self.source_subject_sha256 orelse break :blk false;
                 const issuer = self.source_issuer_sha256 orelse break :blk false;
-                var receipt = try source_receipt.load(allocator, session_dir, receipt_id);
+                var receipt = try source_receipt.loadBound(allocator, session_dir, receipt_id);
                 defer receipt.deinit();
                 break :blk receipt.kind == .user_correction and
                     std.mem.eql(u8, &receipt.project_sha256, &self.project_sha256) and
@@ -122,7 +122,7 @@ pub const Loaded = struct {
                 const subject = self.source_subject_sha256 orelse break :blk false;
                 const binding = self.source_observation orelse break :blk false;
                 const expected = self.source_interval_sha256 orelse break :blk false;
-                var receipt = try source_receipt.load(allocator, session_dir, receipt_id);
+                var receipt = try source_receipt.loadBound(allocator, session_dir, receipt_id);
                 defer receipt.deinit();
                 if (receipt.kind != .runtime_counterexample or
                     !std.mem.eql(u8, &receipt.project_sha256, &self.project_sha256) or
@@ -450,7 +450,7 @@ fn bindSource(
 ) !BoundSource {
     return switch (source) {
         .user_correction => |value| blk: {
-            var receipt = try source_receipt.load(
+            var receipt = try source_receipt.loadBound(
                 std.heap.c_allocator,
                 session_dir,
                 value.receipt_id,
@@ -475,7 +475,7 @@ fn bindSource(
             } };
         },
         .runtime_counterexample => |value| blk: {
-            var receipt = try source_receipt.load(
+            var receipt = try source_receipt.loadBound(
                 std.heap.c_allocator,
                 session_dir,
                 value.receipt_id,

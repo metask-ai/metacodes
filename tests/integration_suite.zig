@@ -80,4 +80,5 @@ test {
     _ = @import("component/add_dir_test.zig");
     _ = @import("component/dialect_matrix_test.zig");
     _ = @import("component/overrides_test.zig");
+    _ = @import("component/ontology_rule_projection_test.zig");
 }

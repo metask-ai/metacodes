@@ -235,7 +235,7 @@ fn validateEvidence(
         return error.InvalidEvidence;
     if (item.kind != .user_correction and item.kind != .runtime_counterexample)
         return;
-    var receipt = try source_receipt.load(
+    var receipt = try source_receipt.loadBound(
         std.heap.c_allocator,
         session_dir,
         item.artifact_sha256,

@@ -58,6 +58,13 @@ pub const Loaded = struct {
     kind: Kind,
     subject_sha256: [64]u8,
     observation_interval_sha256: ?[64]u8,
+    source_session_id: ?session_id_mod.SessionId,
+    transcript_line_index: ?u64,
+    transcript_line_sha256: ?[64]u8,
+    transcript_prefix_sha256: ?[64]u8,
+    observation: ?observation_journal.RunBinding,
+    checker_sha256: ?[64]u8,
+    subject_text: ?[]const u8,
 
     pub fn deinit(self: *Loaded) void {
         self.arena.deinit();
@@ -206,8 +213,8 @@ pub fn persistRuntimeCounterexample(
     });
 }
 
-/// Re-open and fully validate a receipt.  Candidate admission calls this; an
-/// unverified caller-supplied hash never becomes source authority.
+/// Parse and authenticate the immutable receipt itself.  Authority consumers
+/// must call `loadBound`, which also reopens the transcript or observation Run.
 pub fn load(
     allocator: std.mem.Allocator,
     session_dir: []const u8,
@@ -250,23 +257,43 @@ pub fn load(
 
     var subject: [64]u8 = undefined;
     var interval: ?[64]u8 = null;
+    var source_session_id: ?session_id_mod.SessionId = null;
+    var transcript_line_index: ?u64 = null;
+    var transcript_line_sha256: ?[64]u8 = null;
+    var transcript_prefix_sha256: ?[64]u8 = null;
+    var source_observation: ?observation_journal.RunBinding = null;
+    var checker_sha256: ?[64]u8 = null;
     const kind: Kind = switch (record.body.evidence) {
         .user_correction => |evidence| blk: {
-            if (session_id_mod.SessionId.fromSlice(evidence.session_id) == null or
-                parseLowerHex64(evidence.transcript_line_sha256) == null or
-                parseLowerHex64(evidence.transcript_prefix_sha256) == null)
+            source_session_id = session_id_mod.SessionId.fromSlice(evidence.session_id) orelse
+                return error.InvalidReceipt;
+            transcript_line_index = evidence.transcript_line_index;
+            transcript_line_sha256 = parseLowerHex64(evidence.transcript_line_sha256) orelse
+                return error.InvalidReceipt;
+            transcript_prefix_sha256 = parseLowerHex64(evidence.transcript_prefix_sha256) orelse
                 return error.InvalidReceipt;
             subject = parseLowerHex64(evidence.correction_sha256) orelse return error.InvalidReceipt;
             break :blk .user_correction;
         },
         .runtime_counterexample => |evidence| blk: {
-            if (session_id_mod.SessionId.fromSlice(evidence.observation.session_id) == null or
-                session_id_mod.SessionId.fromSlice(evidence.observation.run_id) == null or
-                parseLowerHex64(evidence.observation.interval_sha256) == null or
-                parseLowerHex64(evidence.checker_sha256) == null)
+            const session_id = session_id_mod.SessionId.fromSlice(evidence.observation.session_id) orelse
+                return error.InvalidReceipt;
+            const run_id = session_id_mod.SessionId.fromSlice(evidence.observation.run_id) orelse
+                return error.InvalidReceipt;
+            if (evidence.observation.first_sequence > evidence.observation.last_sequence)
                 return error.InvalidReceipt;
             subject = parseLowerHex64(evidence.verdict_sha256) orelse return error.InvalidReceipt;
-            interval = parseLowerHex64(evidence.observation.interval_sha256).?;
+            interval = parseLowerHex64(evidence.observation.interval_sha256) orelse
+                return error.InvalidReceipt;
+            checker_sha256 = parseLowerHex64(evidence.checker_sha256) orelse
+                return error.InvalidReceipt;
+            source_session_id = session_id;
+            source_observation = .{
+                .session_id = session_id,
+                .run_id = run_id,
+                .first_sequence = evidence.observation.first_sequence,
+                .last_sequence = evidence.observation.last_sequence,
+            };
             break :blk .runtime_counterexample;
         },
     };
@@ -278,7 +305,73 @@ pub fn load(
         .kind = kind,
         .subject_sha256 = subject,
         .observation_interval_sha256 = interval,
+        .source_session_id = source_session_id,
+        .transcript_line_index = transcript_line_index,
+        .transcript_line_sha256 = transcript_line_sha256,
+        .transcript_prefix_sha256 = transcript_prefix_sha256,
+        .observation = source_observation,
+        .checker_sha256 = checker_sha256,
+        .subject_text = null,
     };
+}
+
+/// Reopen every host artifact committed by the receipt.  A content-addressed
+/// receipt whose transcript or journal was replaced is not source authority.
+pub fn loadBound(
+    allocator: std.mem.Allocator,
+    session_dir: []const u8,
+    receipt_id: [64]u8,
+) !Loaded {
+    var loaded = try load(allocator, session_dir, receipt_id);
+    errdefer loaded.deinit();
+    switch (loaded.kind) {
+        .user_correction => {
+            const session_id = loaded.source_session_id orelse return error.InvalidReceipt;
+            if (!std.mem.eql(u8, std.fs.path.basename(session_dir), session_id.asSlice()))
+                return error.SessionIdentityMismatch;
+            const transcript = try readTranscript(session_dir);
+            defer std.heap.c_allocator.free(transcript);
+            const line = try transcriptLine(
+                transcript,
+                loaded.transcript_line_index orelse return error.InvalidReceipt,
+            );
+            const subject_text = try userLineSubject(
+                loaded.arena.allocator(),
+                line.bytes,
+                loaded.subject_sha256,
+            ) orelse
+                return error.SourceArtifactChanged;
+            if (!std.mem.eql(
+                u8,
+                &observation.sha256Hex(line.bytes),
+                &(loaded.transcript_line_sha256 orelse return error.InvalidReceipt),
+            ) or !std.mem.eql(
+                u8,
+                &observation.sha256Hex(transcript[0..line.prefix_end]),
+                &(loaded.transcript_prefix_sha256 orelse return error.InvalidReceipt),
+            ))
+                return error.SourceArtifactChanged;
+            loaded.subject_text = subject_text;
+        },
+        .runtime_counterexample => {
+            const binding = loaded.observation orelse return error.InvalidReceipt;
+            const interval = loaded.observation_interval_sha256 orelse return error.InvalidReceipt;
+            const checker = loaded.checker_sha256 orelse return error.InvalidReceipt;
+            const validated = try observation_journal.validateRunBinding(session_dir, binding);
+            if (!validated.summary.complete or
+                !std.mem.eql(u8, &validated.interval_sha256, &interval) or
+                !try observation_journal.runContainsBlockedVerdict(
+                    std.heap.c_allocator,
+                    session_dir,
+                    binding,
+                    checker,
+                    loaded.subject_sha256,
+                    loaded.project_sha256,
+                    null,
+                )) return error.SourceArtifactChanged;
+        },
+    }
+    return loaded;
 }
 
 fn persistBody(session_dir: []const u8, body: WireBody) !PersistResult {
@@ -363,6 +456,32 @@ fn validateUserLine(line: []const u8, correction: []const u8) !void {
             std.mem.eql(u8, text.string, correction)) return;
     }
     return error.CorrectionNotInTranscript;
+}
+
+fn userLineSubject(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    subject_sha256: [64]u8,
+) !?[]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.c_allocator, line, .{
+        .duplicate_field_behavior = .@"error",
+    }) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const role = parsed.value.object.get("role") orelse return null;
+    const blocks = parsed.value.object.get("blocks") orelse return null;
+    if (role != .string or !std.mem.eql(u8, role.string, "user") or blocks != .array)
+        return null;
+    for (blocks.array.items) |block| {
+        if (block != .object) continue;
+        const kind = block.object.get("type") orelse continue;
+        const text = block.object.get("text") orelse continue;
+        if (kind == .string and text == .string and
+            std.mem.eql(u8, kind.string, "text") and
+            std.mem.eql(u8, &observation.sha256Hex(text.string), &subject_sha256))
+            return try allocator.dupe(u8, text.string);
+    }
+    return null;
 }
 
 const VerdictProbe = struct {
