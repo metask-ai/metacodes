@@ -1444,6 +1444,25 @@ class PaidBudgetJournalSensorTests(unittest.TestCase):
             observation.missing_declarations,
         )
 
+    def test_workbuddy_authorized_failure_without_receipt_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        launcher = root / "scripts/eval/workbuddy/launch_gate.py"
+        launcher.write_text(
+            launcher.read_text(encoding="utf-8").replace(
+                "failure_receipt = _authorized_failure_receipt(",
+                "failure_receipt = trust_unbound_failure(",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_paid_budget_journal(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "authorized_crash_recovery_consumes_maximum_without_retry",
+            observation.missing_declarations,
+        )
+
     def test_workbuddy_cannot_authorize_without_environment_reobservation(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)

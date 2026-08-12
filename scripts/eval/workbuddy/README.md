@@ -125,6 +125,16 @@ results and memory text remain in isolated local trial artifacts and are not
 copied into the derived metrics. A failed or interrupted authorized run is not
 automatically retried.
 
+If the runner returns nonzero after authorization, the gate writes a separate
+`metacodes-workbuddy-authorized-failure-v1` receipt before reporting the
+failure. It keeps the journal transaction in `request_authorized`, reports
+actual cost/tokens as unknown, marks `quality_evidence=false` and
+`retry_allowed=false`, and binds only bounded status/count/timing summaries
+plus hashes of local artifacts. It never copies credentials, request/response
+bodies, error text or memory text into the receipt. A hard crash can still
+occur before this diagnostic is published; the durable journal remains the
+authority and continues charging the transaction maximum in that case.
+
 Committed token usage includes uncached prompt, completion, cache-read and
 cache-creation tokens. Cache accounting is not allowed to disappear merely
 because the provider reports those fields separately.

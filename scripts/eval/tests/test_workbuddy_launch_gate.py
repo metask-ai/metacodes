@@ -6,12 +6,14 @@ import sys
 import tempfile
 import threading
 import unittest
+import time
 from pathlib import Path
 from unittest import mock
 
 from scripts.eval.memory_budget_journal import validate_checkpoint_payload
 from scripts.eval.model import ValidationError, stable_json
 from scripts.eval.workbuddy.launch_gate import (
+    AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION,
     LaunchError,
     PROVIDER_KEY_ENV,
     SCHEMA_VERSION,
@@ -26,6 +28,7 @@ from scripts.eval.workbuddy.launch_gate import (
     _reobserve_host_control_plane,
     _reobserve_launch_inputs,
     execute_launch,
+    validate_authorized_failure_receipt,
     validate_launch_manifest,
 )
 from scripts.eval.workbuddy.trace import (
@@ -43,8 +46,9 @@ def digest(label: str) -> str:
 
 
 class _Server:
-    def __init__(self, journal_path: Path):
+    def __init__(self, journal_path: Path, *, response_status: int = 200):
         self.journal_path = journal_path
+        self.response_status = response_status
         self.requests = 0
         self.errors = []
         owner = self
@@ -71,10 +75,10 @@ class _Server:
                     self.send_response(500)
                     self.end_headers()
                     return
-                self.send_response(200)
+                self.send_response(owner.response_status)
                 self.send_header("content-type", "application/json")
                 self.end_headers()
-                self.wfile.write(b'{"ok":true}')
+                self.wfile.write(b'{"provider_body":"must-not-enter-receipt"}')
 
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -300,6 +304,46 @@ record = {"request": {"body": {"model": "volatile-route", "system": "stable", "m
 '''
 
     @staticmethod
+    def _failure_runner_code() -> str:
+        return r'''
+import json, os, sys, urllib.error, urllib.request
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from scripts.eval.workbuddy.key_fd import resolve_secret_env
+secret = resolve_secret_env("", "METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF")
+assert secret == "private-workbuddy-test-key"
+assert "METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF" not in os.environ
+request = urllib.request.Request(
+    sys.argv[2], data=b'{"secret_prompt":"must-not-enter-receipt"}', method="POST"
+)
+status = 0
+try:
+    urllib.request.urlopen(request, timeout=5)
+except urllib.error.HTTPError as error:
+    status = error.code
+assert status == 503
+agent = Path(sys.argv[3]) / "results/metacodes-code-l2/run/code-task-a__1/agent"
+agent.mkdir(parents=True)
+record = {
+    "duration_ms": 12.5,
+    "error": "Backend returned 503 with secret_prompt and private-workbuddy-test-key",
+    "request": {"body": {"prompt": "must-not-enter-receipt"}},
+    "response": {
+        "status": 503,
+        "raw_bytes": 51,
+        "content_len": 51,
+        "tool_calls_count": 0,
+        "upstream_error_body": "must-not-enter-receipt",
+    },
+}
+(agent / "requests.jsonl").write_text(json.dumps(record) + "\n")
+(agent.parent / "exception.txt").write_text(
+    "private-workbuddy-test-key must-not-enter-receipt\n"
+)
+raise SystemExit(23)
+'''
+
+    @staticmethod
     def _credential_fd():
         read_fd, write_fd = os.pipe()
         os.write(write_fd, b"private-workbuddy-test-key")
@@ -353,6 +397,89 @@ record = {"request": {"body": {"model": "volatile-route", "system": "stable", "m
             self.assertTrue(receipt.is_file())
             self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
             self.assertNotIn("private-workbuddy-test-key", receipt.read_text())
+
+    def test_real_child_provider_503_writes_private_authorized_failure_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest = self._manifest(root)
+            journal = root / "budget.json"
+            receipt = root / "authorized-failure.json"
+            repo = Path(__file__).resolve().parents[3]
+            with _Server(journal, response_status=503) as provider:
+                with self.assertRaisesRegex(
+                    LaunchError, "runner exited 23.*retry is forbidden"
+                ):
+                    execute_launch(
+                        manifest_path=manifest,
+                        journal_path=journal,
+                        receipt_path=receipt,
+                        credential_fd=self._credential_fd(),
+                        runner_argv=[
+                            sys.executable,
+                            "-c",
+                            self._failure_runner_code(),
+                            str(repo),
+                            provider.url,
+                            str(root / "workbuddy"),
+                        ],
+                    )
+            self.assertEqual(1, provider.requests)
+            self.assertFalse(provider.errors)
+            self.assertEqual(0o600, receipt.stat().st_mode & 0o777)
+            failure = validate_authorized_failure_receipt(
+                receipt, journal_path=journal
+            )
+            self.assertEqual(
+                AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION,
+                failure["schema_version"],
+            )
+            self.assertEqual("authorized_failure", failure["state"])
+            self.assertFalse(failure["quality_evidence"])
+            self.assertFalse(failure["retry_allowed"])
+            self.assertFalse(failure["actual_usage_known"])
+            self.assertEqual(
+                "request_authorized", failure["budget_transaction"]["state"]
+            )
+            self.assertIsNone(
+                failure["budget_transaction"]["actual_cost_microusd"]
+            )
+            self.assertIsNone(
+                failure["budget_transaction"]["actual_metered_tokens"]
+            )
+            self.assertEqual(500_000, failure["journal"]["exposure_cost_microusd"])
+            self.assertEqual(50_000, failure["journal"]["exposure_metered_tokens"])
+            self.assertEqual(23, failure["runner"]["returncode"])
+            self.assertEqual(
+                {"503": 1},
+                failure["failure_evidence"]["request_audit"][
+                    "response_status_counts"
+                ],
+            )
+            self.assertGreaterEqual(
+                failure["failure_evidence"]["artifact_count"], 2
+            )
+            receipt_text = receipt.read_text(encoding="utf-8")
+            for forbidden in (
+                "private-workbuddy-test-key",
+                "secret_prompt",
+                "must-not-enter-receipt",
+                "upstream_error_body",
+            ):
+                self.assertNotIn(forbidden, receipt_text)
+
+            # A fresh receipt path does not mask the durable journal rule: the
+            # same run is rejected before another provider request.
+            with _Server(journal, response_status=503) as retry_provider:
+                with self.assertRaisesRegex(ValidationError, "retry is forbidden"):
+                    execute_launch(
+                        manifest_path=manifest,
+                        journal_path=journal,
+                        receipt_path=root / "forbidden-retry.json",
+                        credential_fd=self._credential_fd(),
+                        runner_argv=[sys.executable, "-c", "raise SystemExit(99)"],
+                    )
+            self.assertEqual(0, retry_provider.requests)
 
     def test_injected_runner_cannot_create_quality_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -589,6 +716,219 @@ record = {"request": {"body": {"model": "volatile-route", "system": "stable", "m
                     credential_fd=self._credential_fd(),
                     runner_argv=[sys.executable, "-c", "raise SystemExit(98)"],
                 )
+
+    def test_provider_received_then_crash_has_no_forged_failure_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest = self._manifest(root)
+            journal = root / "budget.json"
+            receipt = root / "receipt.json"
+            repo = Path(__file__).resolve().parents[3]
+
+            def crash(stage, _authorization):
+                if stage == "after_provider_return_before_commit":
+                    raise RuntimeError("injected post-provider crash")
+
+            with _Server(journal) as provider:
+                with self.assertRaisesRegex(
+                    RuntimeError, "injected post-provider crash"
+                ):
+                    execute_launch(
+                        manifest_path=manifest,
+                        journal_path=journal,
+                        receipt_path=receipt,
+                        credential_fd=self._credential_fd(),
+                        runner_argv=[
+                            sys.executable,
+                            "-c",
+                            self._runner_code(),
+                            str(repo),
+                            provider.url,
+                            str(root / "workbuddy"),
+                        ],
+                        fault_hook=crash,
+                    )
+            self.assertEqual(1, provider.requests)
+            self.assertFalse(receipt.exists())
+            state = validate_checkpoint_payload(journal.read_bytes())
+            transaction = next(iter(state["transactions"].values()))
+            self.assertEqual("request_authorized", transaction["state"])
+
+    def test_existing_or_linked_receipt_target_fails_before_provider(self):
+        for kind in ("regular", "symlink", "hardlink", "temporary"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                os.chmod(root, 0o700)
+                manifest = self._manifest(root)
+                journal = root / "budget.json"
+                receipt = root / "receipt.json"
+                source = root / "source"
+                source.write_text("occupied\n", encoding="utf-8")
+                if kind == "regular":
+                    receipt.write_text("occupied\n", encoding="utf-8")
+                elif kind == "symlink":
+                    receipt.symlink_to(source)
+                elif kind == "hardlink":
+                    os.link(source, receipt)
+                else:
+                    receipt.with_name(receipt.name + ".tmp").write_text(
+                        "incomplete\n", encoding="utf-8"
+                    )
+                with _Server(journal) as provider:
+                    with self.assertRaisesRegex(
+                        LaunchError, "occupied or incomplete"
+                    ):
+                        execute_launch(
+                            manifest_path=manifest,
+                            journal_path=journal,
+                            receipt_path=receipt,
+                            credential_fd=self._credential_fd(),
+                            runner_argv=[sys.executable, "-c", "raise SystemExit(0)"],
+                        )
+                self.assertEqual(0, provider.requests)
+                self.assertFalse(journal.exists())
+
+    def test_receipt_cannot_collide_with_journal_internal_paths(self):
+        for suffix in ("", ".lock", ".tmp"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                os.chmod(root, 0o700)
+                manifest = self._manifest(root)
+                journal = root / "budget.json"
+                with _Server(journal) as provider:
+                    with self.assertRaisesRegex(LaunchError, "journal internals"):
+                        execute_launch(
+                            manifest_path=manifest,
+                            journal_path=journal,
+                            receipt_path=journal.with_name(journal.name + suffix),
+                            credential_fd=self._credential_fd(),
+                            runner_argv=[sys.executable, "-c", "raise SystemExit(0)"],
+                        )
+                self.assertEqual(0, provider.requests)
+                self.assertFalse(journal.exists())
+
+    def test_untrusted_receipt_parent_fails_before_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest = self._manifest(root)
+            journal = root / "budget.json"
+            untrusted = root / "untrusted"
+            untrusted.mkdir(mode=0o777)
+            os.chmod(untrusted, 0o777)
+            with _Server(journal) as provider:
+                with self.assertRaisesRegex(LaunchError, "private directory"):
+                    execute_launch(
+                        manifest_path=manifest,
+                        journal_path=journal,
+                        receipt_path=untrusted / "receipt.json",
+                        credential_fd=self._credential_fd(),
+                        runner_argv=[sys.executable, "-c", "raise SystemExit(0)"],
+                    )
+            self.assertEqual(0, provider.requests)
+            self.assertFalse(journal.exists())
+
+    def test_receipt_parent_rejects_direct_symlink_but_allows_system_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest = self._manifest(root)
+            journal = root / "budget.json"
+            real_parent = root / "private"
+            real_parent.mkdir(mode=0o700)
+            linked_parent = root / "linked"
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+            with _Server(journal) as provider:
+                with self.assertRaisesRegex(LaunchError, "must not be a symlink"):
+                    execute_launch(
+                        manifest_path=manifest,
+                        journal_path=journal,
+                        receipt_path=linked_parent / "receipt.json",
+                        credential_fd=self._credential_fd(),
+                        runner_argv=[sys.executable, "-c", "raise SystemExit(0)"],
+                    )
+            self.assertEqual(0, provider.requests)
+            self.assertFalse(journal.exists())
+
+            # macOS commonly exposes /var as a system symlink to /private/var.
+            # A symlink in an ancestor is acceptable because publication uses
+            # the resolved, ownership-checked directory fd rather than the path.
+            alias_root = Path("/var")
+            resolved_root = root.resolve()
+            if alias_root.is_symlink() and str(resolved_root).startswith(
+                "/private/var/"
+            ):
+                alias = Path("/var") / resolved_root.relative_to("/private/var")
+                with _Server(journal) as provider:
+                    with self.assertRaisesRegex(LaunchError, "runner exited 17"):
+                        execute_launch(
+                            manifest_path=manifest,
+                            journal_path=journal,
+                            receipt_path=alias / "alias-receipt.json",
+                            credential_fd=self._credential_fd(),
+                            runner_argv=[
+                                sys.executable,
+                                "-c",
+                                "raise SystemExit(17)",
+                            ],
+                        )
+                self.assertEqual(0, provider.requests)
+                self.assertTrue((root / "alias-receipt.json").is_file())
+
+    def test_failure_receipt_ignores_unrelated_new_result_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest = self._manifest(root)
+            journal = root / "budget.json"
+            receipt = root / "receipt.json"
+            unrelated = (
+                root
+                / "workbuddy/results/metacodes-code-l2/unrelated/other/requests.jsonl"
+            )
+            unrelated.parent.mkdir(parents=True)
+            unrelated.write_text(
+                json.dumps(
+                    {
+                        "response": {"status": 418},
+                        "error": "unrelated-secret-marker",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            # The injected path uses isolated-test-time attribution. Make the
+            # unrelated root provably older than the child start boundary.
+            old_ns = time.time_ns() - 10_000_000_000
+            os.utime(unrelated.parent.parent, ns=(old_ns, old_ns))
+            repo = Path(__file__).resolve().parents[3]
+            with _Server(journal, response_status=503) as provider:
+                with self.assertRaises(LaunchError):
+                    execute_launch(
+                        manifest_path=manifest,
+                        journal_path=journal,
+                        receipt_path=receipt,
+                        credential_fd=self._credential_fd(),
+                        runner_argv=[
+                            sys.executable,
+                            "-c",
+                            self._failure_runner_code(),
+                            str(repo),
+                            provider.url,
+                            str(root / "workbuddy"),
+                        ],
+                    )
+            failure = validate_authorized_failure_receipt(
+                receipt, journal_path=journal
+            )
+            self.assertEqual(
+                {"503": 1},
+                failure["failure_evidence"]["request_audit"][
+                    "response_status_counts"
+                ],
+            )
+            self.assertNotIn("unrelated-secret-marker", receipt.read_text())
 
     def test_manifest_drift_fails_before_journal_or_credential(self):
         with tempfile.TemporaryDirectory() as directory:

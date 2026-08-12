@@ -29,6 +29,7 @@ from ..memory_budget_journal import (
     BudgetAuthority,
     BudgetJournal,
     BudgetTransaction,
+    validate_checkpoint_payload,
     usd_to_microusd_ceiling,
 )
 from ..model import ValidationError, stable_json
@@ -56,9 +57,17 @@ from .trace import (
 
 SCHEMA_VERSION = "metacodes-workbuddy-paid-launch-v1"
 RECEIPT_SCHEMA_VERSION = "metacodes-workbuddy-paid-receipt-v1"
+AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION = (
+    "metacodes-workbuddy-authorized-failure-v1"
+)
 PROVIDER_KEY_ENV = "METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF"
 MAX_USER_AUTHORITY_MICROUSD = 1000 * 1_000_000
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$")
+MAX_FAILURE_ARTIFACTS = 256
+MAX_FAILURE_ARTIFACT_BYTES = 64 * 1024 * 1024
+MAX_FAILURE_ARTIFACT_TOTAL_BYTES = 256 * 1024 * 1024
+MAX_FAILURE_REQUEST_RECORDS = 4096
+MAX_FAILURE_WALK_ENTRIES = 8192
 FaultHook = Callable[[str, Mapping[str, Any]], None]
 HOST_CONTROL_PLANE_MODULES = {
     "environment_preflight": Path(__file__).with_name("environment_preflight.py"),
@@ -807,35 +816,134 @@ def _reobserve_launch_inputs(manifest: Mapping[str, Any]) -> None:
         raise LaunchError("WorkBuddy provider base URL changed after launch manifest creation")
 
 
-def _write_private_new(path: Path, payload: bytes) -> None:
-    if path.exists() or path.is_symlink():
-        raise LaunchError(f"refusing to overwrite paid launch artifact: {path}")
-    parent = path.parent.resolve(strict=True)
-    info = parent.stat()
-    if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o022:
-        raise LaunchError("paid launch artifact parent must be a trusted private directory")
-    if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
-        raise LaunchError("paid launch artifact parent must be owned by the current user")
-    path = parent / path.name
-    temporary = path.with_name(path.name + ".tmp")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(temporary, flags, 0o600)
+def _open_private_artifact_parent(path: Path) -> tuple[Path, int]:
+    if not path.name or path.name in {".", ".."}:
+        raise LaunchError("paid launch artifact has an invalid file name")
+    absolute_parent = Path(os.path.abspath(os.fspath(path.parent)))
     try:
-        offset = 0
-        while offset < len(payload):
-            written = os.write(descriptor, payload[offset:])
-            if written <= 0:
-                raise LaunchError("short paid launch artifact write")
-            offset += written
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    os.replace(temporary, path)
-    parent_fd = os.open(parent, os.O_RDONLY)
+        parent_link_info = absolute_parent.lstat()
+    except FileNotFoundError:
+        raise LaunchError("paid launch artifact parent does not exist")
+    except OSError as exc:
+        raise LaunchError(
+            f"paid launch artifact parent cannot be inspected: {exc}"
+        ) from exc
+    if stat.S_ISLNK(parent_link_info.st_mode):
+        raise LaunchError("paid launch artifact parent must not be a symlink")
     try:
-        os.fsync(parent_fd)
-    finally:
+        parent = absolute_parent.resolve(strict=True)
+    except OSError as exc:
+        raise LaunchError(f"paid launch artifact parent cannot be resolved: {exc}") from exc
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        parent_fd = os.open(parent, flags)
+    except OSError as exc:
+        raise LaunchError(f"paid launch artifact parent cannot be opened: {exc}") from exc
+    try:
+        info = os.fstat(parent_fd)
+        observed = parent.stat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or (info.st_dev, info.st_ino)
+            != (parent_link_info.st_dev, parent_link_info.st_ino)
+            or (info.st_dev, info.st_ino) != (observed.st_dev, observed.st_ino)
+            or stat.S_IMODE(info.st_mode) & 0o022
+        ):
+            raise LaunchError(
+                "paid launch artifact parent must be a stable private directory"
+            )
+        if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+            raise LaunchError(
+                "paid launch artifact parent must be owned by the current user"
+            )
+        return parent, parent_fd
+    except BaseException:
         os.close(parent_fd)
+        raise
+
+
+def _entry_exists(parent_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise LaunchError(f"cannot inspect paid launch artifact {name!r}: {exc}") from exc
+
+
+def _write_private_new(
+    path: Path, payload: bytes, *, preopened_parent_fd: int | None = None
+) -> None:
+    owns_parent_fd = preopened_parent_fd is None
+    if preopened_parent_fd is not None:
+        parent_fd = preopened_parent_fd
+        if _entry_exists(parent_fd, path.name):
+            raise LaunchError(f"refusing to overwrite paid launch artifact: {path}")
+        if _entry_exists(parent_fd, path.name + ".tmp"):
+            raise LaunchError(
+                "incomplete paid launch artifact requires manual inspection"
+            )
+    else:
+        _parent, parent_fd = _open_private_artifact_parent(path)
+    temporary_name = path.name + ".tmp"
+    try:
+        if _entry_exists(parent_fd, path.name):
+            raise LaunchError(f"refusing to overwrite paid launch artifact: {path}")
+        if _entry_exists(parent_fd, temporary_name):
+            raise LaunchError(
+                "incomplete paid launch artifact requires manual inspection"
+            )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_fd)
+    except BaseException:
+        if owns_parent_fd:
+            os.close(parent_fd)
+        raise
+    try:
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise LaunchError("short paid launch artifact write")
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        # link(2) publishes without overwriting a concurrently-created final
+        # path.  A crash before the temporary name is removed leaves an
+        # explicit fail-closed artifact for manual inspection.
+        os.link(
+            temporary_name,
+            path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        os.fsync(parent_fd)
+        os.unlink(temporary_name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        final_fd = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            final = os.fstat(final_fd)
+            if (
+                not stat.S_ISREG(final.st_mode)
+                or final.st_nlink != 1
+                or stat.S_IMODE(final.st_mode) & 0o077
+            ):
+                raise LaunchError("published paid launch artifact is not private")
+        finally:
+            os.close(final_fd)
+    finally:
+        if owns_parent_fd:
+            os.close(parent_fd)
 
 
 def _read_credential(descriptor: int) -> bytes:
@@ -1322,6 +1430,599 @@ def _receipt_quality_evidence(
     return official_runner and manifest["quality_evidence_on_commit"] is True
 
 
+def _request_audit_summary(path: Path) -> Dict[str, object]:
+    """Reduce a raw proxy request log without retaining any body or text."""
+
+    payload = _read_regular(path, maximum=MAX_FAILURE_ARTIFACT_BYTES)
+    lines = [line for line in payload.splitlines() if line.strip()]
+    statuses: Dict[str, int] = {}
+    duration_ms_total = 0.0
+    duration_ms_max = 0.0
+    response_raw_bytes = 0
+    response_content_bytes = 0
+    tool_calls = 0
+    records_with_error = 0
+    malformed_records = 0
+    observed = min(len(lines), MAX_FAILURE_REQUEST_RECORDS)
+    for line in lines[:observed]:
+        try:
+            row = json.loads(line.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            malformed_records += 1
+            continue
+        if not isinstance(row, dict):
+            malformed_records += 1
+            continue
+        response = row.get("response")
+        if not isinstance(response, dict):
+            response = {}
+            malformed_records += 1
+        status = response.get("status")
+        status_key = (
+            str(status)
+            if isinstance(status, int)
+            and not isinstance(status, bool)
+            and 100 <= status <= 599
+            else "unknown"
+        )
+        statuses[status_key] = statuses.get(status_key, 0) + 1
+        duration = row.get("duration_ms")
+        if (
+            isinstance(duration, (int, float))
+            and not isinstance(duration, bool)
+            and math.isfinite(duration)
+            and duration >= 0
+        ):
+            duration_ms_total += float(duration)
+            duration_ms_max = max(duration_ms_max, float(duration))
+        for key, target in (
+            ("raw_bytes", "raw"),
+            ("content_len", "content"),
+            ("tool_calls_count", "tools"),
+        ):
+            value = response.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                continue
+            if target == "raw":
+                response_raw_bytes += value
+            elif target == "content":
+                response_content_bytes += value
+            else:
+                tool_calls += value
+        if row.get("error") is not None:
+            records_with_error += 1
+    return {
+        "source_bytes": len(payload),
+        "source_sha256": _sha256_bytes(payload),
+        "records": len(lines),
+        "records_observed": observed,
+        "records_truncated": len(lines) > observed,
+        "malformed_records": malformed_records,
+        "response_status_counts": dict(sorted(statuses.items())),
+        "records_with_error": records_with_error,
+        "duration_ms_total": duration_ms_total,
+        "duration_ms_max": duration_ms_max,
+        "response_raw_bytes": response_raw_bytes,
+        "response_content_bytes": response_content_bytes,
+        "tool_calls": tool_calls,
+        "request_body_retained": False,
+        "response_body_retained": False,
+        "error_text_retained": False,
+    }
+
+
+def _official_failure_roots(
+    manifest: Mapping[str, Any], result_root: Path, *, started_ns: int
+) -> tuple[list[Path], int]:
+    """Return only trial roots cryptographically attributable to this run."""
+
+    workbuddy = Path(manifest["workbuddy"]["checkout"]).resolve(strict=True)
+    run_id = str(manifest["run_id"])
+    instance = workbuddy / "scripts/logs/instances" / run_id
+    roots: list[Path] = []
+    rejected = 0
+    try:
+        resolved = _json(instance / "manifest.json")
+        expected_route = resolved.get("model_route")
+    except (LaunchError, OSError):
+        expected_route = None
+    if (
+        isinstance(expected_route, str)
+        and expected_route.startswith(run_id + "--")
+        and "__" not in expected_route
+        and _is_safe_directory_beneath(workbuddy, instance)
+    ):
+        roots.append(instance)
+    else:
+        expected_route = None
+
+    launch = result_root / ".launches" / run_id
+    if _is_safe_directory_beneath(workbuddy, launch):
+        roots.append(launch)
+
+    selected = set(manifest["cohort"]["selected_tasks"])
+    dataset_root = Path(str(manifest["cohort"]["dataset"])).parent.name
+    if not result_root.is_dir() or result_root.is_symlink() or expected_route is None:
+        return roots, rejected
+    for result_path in result_root.glob("*/*/result.json"):
+        trial = result_path.parent
+        try:
+            if not _is_safe_directory_beneath(result_root, trial):
+                rejected += 1
+                continue
+            if result_path.stat().st_mtime_ns < started_ns:
+                continue
+            result = _json(result_path)
+            task_name = result.get("task_name")
+            task_id = result.get("task_id")
+            agent = result.get("agent_info")
+            model = agent.get("model_info") if isinstance(agent, dict) else None
+            task = (
+                task_name.removeprefix("workbuddy/")
+                if isinstance(task_name, str)
+                else None
+            )
+            task_path = task_id.get("path") if isinstance(task_id, dict) else None
+            expected_task_path = str(
+                Path(".workspace/tmp/staged")
+                / run_id
+                / dataset_root
+                / "tasks"
+                / str(task)
+            )
+            checksum = result.get("task_checksum")
+            if (
+                task not in selected
+                or result.get("source") != "tasks"
+                or task_path != expected_task_path
+                or not isinstance(agent, dict)
+                or agent.get("name") != "metacodes"
+                or not isinstance(model, dict)
+                or model.get("name") != expected_route
+                or result.get("trial_uri") != trial.as_uri()
+                or not isinstance(checksum, str)
+                or re.fullmatch(r"[0-9a-f]{64}", checksum) is None
+            ):
+                rejected += 1
+                continue
+            roots.append(trial)
+        except (LaunchError, OSError, AttributeError):
+            rejected += 1
+    return roots, rejected
+
+
+def _is_safe_directory_beneath(base: Path, candidate: Path) -> bool:
+    try:
+        relative = candidate.relative_to(base)
+    except ValueError:
+        return False
+    current = base
+    try:
+        base_info = current.lstat()
+        if not stat.S_ISDIR(base_info.st_mode):
+            return False
+        for part in relative.parts:
+            current = current / part
+            info = current.lstat()
+            if not stat.S_ISDIR(info.st_mode):
+                return False
+    except OSError:
+        return False
+    return True
+
+
+def _authorized_failure_artifacts(
+    manifest: Mapping[str, Any], *, started_ns: int, official_runner: bool
+) -> Dict[str, object]:
+    workbuddy = Path(manifest["workbuddy"]["checkout"]).resolve(strict=True)
+    result_root = workbuddy / "results" / str(manifest["job"]["slug"])
+    roots: list[Path] = []
+    unsafe_entries = 0
+    identity_rejected_roots = 0
+    if official_runner:
+        roots, identity_rejected_roots = _official_failure_roots(
+            manifest, result_root, started_ns=started_ns
+        )
+    elif result_root.is_dir() and not result_root.is_symlink():
+        for entry in os.scandir(result_root):
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                unsafe_entries += 1
+                continue
+            if not stat.S_ISDIR(info.st_mode):
+                if entry.is_symlink():
+                    unsafe_entries += 1
+                continue
+            if entry.name != ".launches" and info.st_mtime_ns >= started_ns:
+                roots.append(Path(entry.path))
+
+    accepted_names = {
+        "exception.txt",
+        "job.log",
+        "metacodes-transcript.jsonl",
+        OBSERVATION_FILENAME,
+        "proxy.yaml",
+        "requests.jsonl",
+        "result.json",
+        "trial.log",
+        "trajectory.json",
+    }
+    artifacts: list[Dict[str, object]] = []
+    request_summaries: list[Dict[str, object]] = []
+    total_bytes = 0
+    walked_entries = 0
+    truncated = False
+    seen: set[Path] = set()
+    for root in sorted(set(roots)):
+        for directory, directories, files in os.walk(root, followlinks=False):
+            walked_entries += len(directories) + len(files)
+            if walked_entries > MAX_FAILURE_WALK_ENTRIES:
+                truncated = True
+                break
+            safe_directories: list[str] = []
+            for name in directories:
+                candidate = Path(directory) / name
+                try:
+                    info = candidate.lstat()
+                except OSError:
+                    unsafe_entries += 1
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    safe_directories.append(name)
+                else:
+                    unsafe_entries += 1
+            directories[:] = safe_directories
+            for name in sorted(files):
+                if name not in accepted_names and not (
+                    name.startswith("shard-") and name.endswith(".log")
+                ):
+                    continue
+                candidate = Path(directory) / name
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                if len(artifacts) >= MAX_FAILURE_ARTIFACTS:
+                    truncated = True
+                    break
+                try:
+                    info = candidate.lstat()
+                except OSError:
+                    unsafe_entries += 1
+                    continue
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_nlink != 1
+                    or info.st_size <= 0
+                    or info.st_size > MAX_FAILURE_ARTIFACT_BYTES
+                    or total_bytes + info.st_size > MAX_FAILURE_ARTIFACT_TOTAL_BYTES
+                ):
+                    unsafe_entries += 1
+                    continue
+                try:
+                    identity = _identity(
+                        candidate, maximum=MAX_FAILURE_ARTIFACT_BYTES
+                    )
+                except (LaunchError, OSError):
+                    unsafe_entries += 1
+                    continue
+                relative = candidate.relative_to(workbuddy).as_posix()
+                artifact: Dict[str, object] = {
+                    "relative_path": relative,
+                    "bytes": identity["bytes"],
+                    "sha256": identity["sha256"],
+                }
+                if name == "requests.jsonl":
+                    summary = _request_audit_summary(candidate)
+                    current_identity = _identity(
+                        candidate, maximum=MAX_FAILURE_ARTIFACT_BYTES
+                    )
+                    if (
+                        summary["source_bytes"] != identity["bytes"]
+                        or summary["source_sha256"] != identity["sha256"]
+                        or current_identity != identity
+                    ):
+                        unsafe_entries += 1
+                        continue
+                    artifact["kind"] = "request_audit"
+                    artifact["request_audit"] = summary
+                    request_summaries.append(summary)
+                else:
+                    if _identity(
+                        candidate, maximum=MAX_FAILURE_ARTIFACT_BYTES
+                    ) != identity:
+                        unsafe_entries += 1
+                        continue
+                    artifact["kind"] = "local_artifact"
+                artifacts.append(artifact)
+                total_bytes += int(identity["bytes"])
+            if truncated:
+                break
+        if truncated:
+            break
+
+    status_counts: Dict[str, int] = {}
+    request_records = 0
+    malformed_records = 0
+    for summary in request_summaries:
+        request_records += int(summary["records"])
+        malformed_records += int(summary["malformed_records"])
+        for status, count in summary["response_status_counts"].items():
+            status_counts[status] = status_counts.get(status, 0) + int(count)
+    return {
+        "artifacts": artifacts,
+        "artifact_count": len(artifacts),
+        "artifact_bytes": total_bytes,
+        "truncated": truncated,
+        "unsafe_entries": unsafe_entries,
+        "identity_scope": (
+            "official-run-id-and-task" if official_runner else "isolated-test-time"
+        ),
+        "identity_rejected_roots": identity_rejected_roots,
+        "request_audit": {
+            "files": len(request_summaries),
+            "records": request_records,
+            "malformed_records": malformed_records,
+            "response_status_counts": dict(sorted(status_counts.items())),
+            "request_body_retained": False,
+            "response_body_retained": False,
+            "error_text_retained": False,
+        },
+    }
+
+
+def _validated_failure_transaction(
+    checkpoint: bytes, transaction_id: str
+) -> Mapping[str, Any]:
+    replayed = validate_checkpoint_payload(checkpoint)
+    transaction = replayed["transactions"].get(transaction_id)
+    if transaction is None or transaction["state"] != "request_authorized":
+        raise LaunchError("failure receipt does not reopen an authorized transaction")
+    return transaction
+
+
+def validate_authorized_failure_receipt(
+    path: Path, *, journal_path: Path | None = None
+) -> Dict[str, Any]:
+    receipt = _json(path)
+    expected_fields = {
+        "schema_version",
+        "state",
+        "quality_evidence",
+        "retry_allowed",
+        "actual_usage_known",
+        "remote_request_outcome",
+        "launch_manifest_content_sha256",
+        "run_id",
+        "model",
+        "harness_fingerprint",
+        "cohort",
+        "budget_transaction",
+        "journal",
+        "runner",
+        "failure_evidence",
+        "privacy",
+    }
+    if set(receipt) != expected_fields or receipt.get("schema_version") != (
+        AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION
+    ):
+        raise LaunchError("authorized failure receipt schema drifted")
+    if (
+        receipt.get("state") != "authorized_failure"
+        or receipt.get("quality_evidence") is not False
+        or receipt.get("retry_allowed") is not False
+        or receipt.get("actual_usage_known") is not False
+        or receipt.get("remote_request_outcome") != "unknown"
+        or receipt.get("privacy")
+        != {
+            "credential_retained": False,
+            "request_body_retained": False,
+            "response_body_retained": False,
+            "memory_text_retained": False,
+        }
+    ):
+        raise LaunchError("authorized failure receipt safety classification drifted")
+    transaction = receipt.get("budget_transaction")
+    journal = receipt.get("journal")
+    runner = receipt.get("runner")
+    cohort = receipt.get("cohort")
+    evidence = receipt.get("failure_evidence")
+    if not all(
+        isinstance(value, dict)
+        for value in (transaction, journal, runner, cohort, evidence)
+    ):
+        raise LaunchError("authorized failure receipt budget binding is malformed")
+    if (
+        transaction.get("state") != "request_authorized"
+        or transaction.get("actual_cost_microusd") is not None
+        or transaction.get("actual_metered_tokens") is not None
+        or receipt.get("run_id") != transaction.get("run_id")
+        or receipt.get("launch_manifest_content_sha256")
+        != transaction.get("manifest_sha256")
+        or receipt.get("harness_fingerprint")
+        != transaction.get("harness_fingerprint")
+        or receipt.get("model")
+        != {
+            "fingerprint": transaction.get("model_fingerprint"),
+            "provider_identity": transaction.get("provider_identity"),
+        }
+        or journal.get("journal_id") != transaction.get("journal_id")
+        or journal.get("revision") != transaction.get("journal_revision")
+        or journal.get("head_sha256") != transaction.get("journal_head_sha256")
+        or not isinstance(journal.get("exposure_cost_microusd"), int)
+        or isinstance(journal.get("exposure_cost_microusd"), bool)
+        or journal["exposure_cost_microusd"] < transaction.get("max_cost_microusd", -1)
+        or not isinstance(journal.get("exposure_metered_tokens"), int)
+        or isinstance(journal.get("exposure_metered_tokens"), bool)
+        or journal["exposure_metered_tokens"]
+        < transaction.get("max_metered_tokens", -1)
+    ):
+        raise LaunchError("authorized failure receipt transaction binding drifted")
+    returncode = runner.get("returncode")
+    elapsed = runner.get("elapsed_seconds")
+    if (
+        set(runner) != {"returncode", "elapsed_seconds"}
+        or not isinstance(returncode, int)
+        or isinstance(returncode, bool)
+        or returncode == 0
+        or not isinstance(elapsed, (int, float))
+        or isinstance(elapsed, bool)
+        or not math.isfinite(elapsed)
+        or elapsed < 0
+    ):
+        raise LaunchError("authorized failure receipt runner evidence is invalid")
+    if (
+        set(cohort)
+        != {
+            "subset",
+            "cohort",
+            "selected_tasks_sha256",
+            "selected_task_count",
+        }
+        or not isinstance(cohort.get("subset"), str)
+        or not isinstance(cohort.get("cohort"), str)
+        or not isinstance(cohort.get("selected_task_count"), int)
+        or isinstance(cohort.get("selected_task_count"), bool)
+        or cohort["selected_task_count"] <= 0
+        or not isinstance(cohort.get("selected_tasks_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", cohort["selected_tasks_sha256"])
+        is None
+    ):
+        raise LaunchError("authorized failure receipt cohort binding is invalid")
+    summary = evidence.get("request_audit")
+    artifacts = evidence.get("artifacts")
+    if (
+        set(evidence)
+        != {
+            "artifacts",
+            "artifact_count",
+            "artifact_bytes",
+            "truncated",
+            "unsafe_entries",
+            "identity_scope",
+            "identity_rejected_roots",
+            "request_audit",
+        }
+        or not isinstance(artifacts, list)
+        or evidence.get("artifact_count") != len(artifacts)
+        or not isinstance(summary, dict)
+        or summary.get("request_body_retained") is not False
+        or summary.get("response_body_retained") is not False
+        or summary.get("error_text_retained") is not False
+    ):
+        raise LaunchError("authorized failure receipt evidence schema drifted")
+    for value, label in (
+        (journal.get("journal_id"), "journal id"),
+        (journal.get("head_sha256"), "journal head"),
+        (journal.get("checkpoint_sha256"), "journal checkpoint"),
+        (transaction.get("transaction_id"), "transaction id"),
+    ):
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise LaunchError(f"authorized failure receipt {label} is invalid")
+    if journal_path is not None:
+        checkpoint = _read_regular(journal_path, maximum=8 * 1024 * 1024)
+        if (
+            len(checkpoint) != journal.get("checkpoint_bytes")
+            or _sha256_bytes(checkpoint) != journal.get("checkpoint_sha256")
+        ):
+            raise LaunchError("authorized failure receipt journal checkpoint drifted")
+        reopened = validate_checkpoint_payload(checkpoint)
+        reopened_transaction = _validated_failure_transaction(
+            checkpoint, str(transaction["transaction_id"])
+        )
+        if (
+            reopened["journal_id"] != journal["journal_id"]
+            or reopened["revision"] != journal["revision"]
+            or reopened["head_sha256"] != journal["head_sha256"]
+            or reopened_transaction["identity_sha256"]
+            != transaction.get("identity_sha256")
+        ):
+            raise LaunchError("authorized failure receipt does not reopen from journal")
+    return receipt
+
+
+def _authorized_failure_receipt(
+    *,
+    manifest: Mapping[str, Any],
+    journal: BudgetJournal,
+    transaction_id: str,
+    runner_returncode: int,
+    started_ns: int,
+    official_runner: bool,
+) -> Dict[str, object]:
+    transaction = journal.transaction_receipt(transaction_id)
+    if transaction["state"] != "request_authorized":
+        raise LaunchError("authorized failure receipt requires durable authorization")
+    checkpoint = journal.checkpoint_payload()
+    reopened = validate_checkpoint_payload(checkpoint)
+    reopened_transaction = _validated_failure_transaction(checkpoint, transaction_id)
+    snapshot = journal.snapshot()
+    if (
+        reopened["journal_id"] != snapshot["journal_id"]
+        or reopened["revision"] != snapshot["revision"]
+        or reopened["head_sha256"] != snapshot["head_sha256"]
+        or reopened_transaction["identity"]
+        != {
+            "run_id": transaction["run_id"],
+            "manifest_sha256": transaction["manifest_sha256"],
+            "model_fingerprint": transaction["model_fingerprint"],
+            "harness_fingerprint": transaction["harness_fingerprint"],
+            "provider_identity": transaction["provider_identity"],
+            "max_cost_microusd": transaction["max_cost_microusd"],
+            "max_metered_tokens": transaction["max_metered_tokens"],
+        }
+    ):
+        raise LaunchError("budget journal changed while building failure receipt")
+    evidence = _authorized_failure_artifacts(
+        manifest, started_ns=started_ns, official_runner=official_runner
+    )
+    return {
+        "schema_version": AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION,
+        "state": "authorized_failure",
+        "quality_evidence": False,
+        "retry_allowed": False,
+        "actual_usage_known": False,
+        "remote_request_outcome": "unknown",
+        "launch_manifest_content_sha256": manifest["content_sha256"],
+        "run_id": manifest["run_id"],
+        "model": {
+            "fingerprint": manifest["model"]["fingerprint"],
+            "provider_identity": manifest["model"]["provider_identity"],
+        },
+        "harness_fingerprint": manifest["harness_fingerprint"],
+        "cohort": {
+            "subset": manifest["cohort"]["subset"],
+            "cohort": manifest["cohort"]["cohort"],
+            "selected_tasks_sha256": manifest["cohort"][
+                "selected_tasks_sha256"
+            ],
+            "selected_task_count": len(manifest["cohort"]["selected_tasks"]),
+        },
+        "budget_transaction": transaction,
+        "journal": {
+            "journal_id": snapshot["journal_id"],
+            "revision": snapshot["revision"],
+            "head_sha256": snapshot["head_sha256"],
+            "checkpoint_bytes": len(checkpoint),
+            "checkpoint_sha256": _sha256_bytes(checkpoint),
+            "transaction_states": snapshot["transaction_states"],
+            "exposure_cost_microusd": snapshot["exposure_cost_microusd"],
+            "exposure_metered_tokens": snapshot["exposure_metered_tokens"],
+        },
+        "runner": {
+            "returncode": runner_returncode,
+            "elapsed_seconds": (time.time_ns() - started_ns) / 1_000_000_000,
+        },
+        "failure_evidence": evidence,
+        "privacy": {
+            "credential_retained": False,
+            "request_body_retained": False,
+            "response_body_retained": False,
+            "memory_text_retained": False,
+        },
+    }
+
+
 def execute_launch(
     *,
     manifest_path: Path,
@@ -1332,6 +2033,21 @@ def execute_launch(
     fault_hook: FaultHook | None = None,
 ) -> Dict[str, object]:
     manifest = validate_launch_manifest(manifest_path)
+    receipt_absolute = Path(os.path.abspath(os.fspath(receipt_path)))
+    journal_absolute = Path(os.path.abspath(os.fspath(journal_path)))
+    journal_internal = {
+        journal_absolute,
+        journal_absolute.with_name(journal_absolute.name + ".lock"),
+        journal_absolute.with_name(journal_absolute.name + ".tmp"),
+    }
+    receipt_internal = {
+        receipt_absolute,
+        receipt_absolute.with_name(receipt_absolute.name + ".tmp"),
+    }
+    if journal_internal & receipt_internal:
+        raise LaunchError(
+            "paid launch receipt must not collide with budget journal internals"
+        )
     official_runner = runner_argv is None
     if official_runner:
         _reobserve_launch_inputs(manifest)
@@ -1356,7 +2072,36 @@ def execute_launch(
     workbuddy = Path(manifest["workbuddy"]["checkout"])
     argv = list(runner_argv or manifest["execution"]["runner"])
     credential_open = True
+    receipt_parent_fd = -1
     try:
+        receipt_parent, receipt_parent_fd = _open_private_artifact_parent(
+            receipt_path
+        )
+        receipt_storage_path = receipt_parent / receipt_path.name
+        try:
+            journal_parent = journal_absolute.parent.resolve(strict=True)
+        except OSError as exc:
+            raise LaunchError(
+                f"paid launch journal parent cannot be resolved: {exc}"
+            ) from exc
+        canonical_journal_internal = {
+            journal_parent / journal_absolute.name,
+            journal_parent / (journal_absolute.name + ".lock"),
+            journal_parent / (journal_absolute.name + ".tmp"),
+        }
+        if {
+            receipt_storage_path,
+            receipt_parent / (receipt_path.name + ".tmp"),
+        } & canonical_journal_internal:
+            raise LaunchError(
+                "paid launch receipt must not collide with budget journal internals"
+            )
+        if _entry_exists(receipt_parent_fd, receipt_path.name) or _entry_exists(
+            receipt_parent_fd, receipt_path.name + ".tmp"
+        ):
+            raise LaunchError(
+                "paid launch receipt path is already occupied or incomplete"
+            )
         with BudgetJournal(journal_path, authority) as journal:
             reserved = journal.reserve(transaction)
             transaction_id = reserved["transaction_id"]
@@ -1430,9 +2175,29 @@ def execute_launch(
                 if fault_hook is not None:
                     fault_hook("after_provider_return_before_commit", authorization)
                 if completed.returncode != 0:
+                    failure_receipt = _authorized_failure_receipt(
+                        manifest=manifest,
+                        journal=journal,
+                        transaction_id=transaction_id,
+                        runner_returncode=completed.returncode,
+                        started_ns=started_ns,
+                        official_runner=official_runner,
+                    )
+                    _write_private_new(
+                        receipt_path,
+                        (
+                            json.dumps(failure_receipt, sort_keys=True, indent=2)
+                            + "\n"
+                        ).encode("utf-8"),
+                        preopened_parent_fd=receipt_parent_fd,
+                    )
+                    validate_authorized_failure_receipt(
+                        receipt_storage_path, journal_path=journal_path
+                    )
                     raise LaunchError(
                         f"WorkBuddy runner exited {completed.returncode}; "
-                        "authorized maximum remains exposed"
+                        "authorized maximum remains exposed and retry is forbidden; "
+                        f"failure receipt: {receipt_path}"
                     )
                 usage = _collect_usage(
                     manifest,
@@ -1469,6 +2234,7 @@ def execute_launch(
                     (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode(
                         "utf-8"
                     ),
+                    preopened_parent_fd=receipt_parent_fd,
                 )
                 return receipt
             except BaseException:
@@ -1483,6 +2249,8 @@ def execute_launch(
                         except OSError:
                             pass
     finally:
+        if receipt_parent_fd >= 0:
+            os.close(receipt_parent_fd)
         if credential_open:
             try:
                 os.close(credential_fd)

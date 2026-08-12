@@ -2970,6 +2970,12 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
     workbuddy_reobserve_source = top_source(
         "workbuddy_launch", "_reobserve_launch_inputs"
     )
+    workbuddy_failure_receipt_source = top_source(
+        "workbuddy_launch", "_authorized_failure_receipt"
+    )
+    workbuddy_failure_validate_source = top_source(
+        "workbuddy_launch", "validate_authorized_failure_receipt"
+    )
     workbuddy_preflight_source = top_source("workbuddy_preflight", "validate_receipt")
     workbuddy_reobserve_lines = call_lines(
         workbuddy_launch, "_reobserve_launch_inputs"
@@ -2977,6 +2983,7 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
     workbuddy_authorize_lines = call_lines(
         workbuddy_launch, "journal.authorize_request"
     )
+    workbuddy_calls = call_names(workbuddy_launch)
     alternate_launchers = {
         name
         for name in runner_calls
@@ -3336,6 +3343,39 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                     "rerun.assert_not_called()",
                 )
             ),
+            "WorkBuddy authorized failure is non-retry evidence with maximum exposure": (
+                "_authorized_failure_receipt" in workbuddy_calls
+                and "validate_authorized_failure_receipt" in workbuddy_calls
+                and all(
+                    marker in workbuddy_launch_source
+                    for marker in (
+                        "authorized maximum remains exposed and retry is forbidden",
+                    )
+                )
+                and all(
+                    marker in workbuddy_failure_receipt_source
+                    for marker in (
+                        'transaction["state"] != "request_authorized"',
+                        '"state": "authorized_failure"',
+                        '"quality_evidence": False',
+                        '"retry_allowed": False',
+                        '"actual_usage_known": False',
+                        '"remote_request_outcome": "unknown"',
+                        '"exposure_cost_microusd": snapshot["exposure_cost_microusd"]',
+                        '"exposure_metered_tokens": snapshot["exposure_metered_tokens"]',
+                    )
+                )
+                and all(
+                    marker in sources["workbuddy_launch_tests"]
+                    for marker in (
+                        "test_real_child_provider_503_writes_private_authorized_failure_receipt",
+                        'self.assertFalse(failure["retry_allowed"])',
+                        'self.assertFalse(failure["actual_usage_known"])',
+                        '"request_authorized", failure["budget_transaction"]["state"]',
+                        "self.assertEqual(0, retry_provider.requests)",
+                    )
+                )
+            ),
         },
         declarations[5]: {
             "replay checks aggregate cost and token exposure after every event": all(
@@ -3470,6 +3510,28 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                     'stage == "after_rollout_checkpoint"',
                     "self.assertEqual(len(invocations), 2)",
                     "self.assertEqual(len(invocations), 16)",
+                )
+            ),
+            "WorkBuddy failure receipt reopens exact authorized journal checkpoint": (
+                all(
+                    marker in workbuddy_failure_validate_source
+                    for marker in (
+                        "validate_checkpoint_payload(checkpoint)",
+                        "_validated_failure_transaction(",
+                        'transaction.get("actual_cost_microusd") is not None',
+                        'transaction.get("actual_metered_tokens") is not None',
+                        'journal.get("checkpoint_sha256")',
+                        "does not reopen from journal",
+                    )
+                )
+                and all(
+                    marker in sources["workbuddy_launch_tests"]
+                    for marker in (
+                        "validate_authorized_failure_receipt(",
+                        "journal_path=journal",
+                        "test_provider_received_then_crash_has_no_forged_failure_receipt",
+                        "self.assertFalse(receipt.exists())",
+                    )
                 )
             ),
         },
