@@ -251,16 +251,7 @@ fn spawnPipesPosix(argv: []const ?[*:0]const u8, inherit_env: bool, cwd: ?[]cons
             if (devnull != 2) _ = std.c.close(devnull);
         }
         // 缺陷 B 修复:子进程 chdir。
-        if (cwd) |c| {
-            if (c.len < std.fs.max_path_bytes) {
-                var cwd_z: [std.fs.max_path_bytes:0]u8 = undefined;
-                @memcpy(cwd_z[0..c.len], c);
-                cwd_z[c.len] = 0;
-                if (std.c.chdir(&cwd_z) != 0) std.c._exit(127);
-            } else {
-                std.c._exit(127);
-            }
-        }
+        if (!chdirChild(cwd)) std.c._exit(127);
         const argv0 = argv[0] orelse std.c._exit(127);
         const envp: [*:null]const ?[*:0]const u8 = if (inherit_env) @ptrCast(std.c.environ) else &.{null};
         _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), envp);
@@ -393,16 +384,7 @@ pub fn spawnToFiles(argv: []const ?[*:0]const u8, out_fd: c_int, err_fd: c_int, 
         _ = std.c.close(out_fd);
         _ = std.c.close(err_fd);
         // 缺陷 B 修复:子进程 chdir。
-        if (cwd) |c| {
-            if (c.len < std.fs.max_path_bytes) {
-                var cwd_z: [std.fs.max_path_bytes:0]u8 = undefined;
-                @memcpy(cwd_z[0..c.len], c);
-                cwd_z[c.len] = 0;
-                if (std.c.chdir(&cwd_z) != 0) std.c._exit(127);
-            } else {
-                std.c._exit(127);
-            }
-        }
+        if (!chdirChild(cwd)) std.c._exit(127);
         const argv0 = argv[0] orelse std.c._exit(127);
         _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), @ptrCast(std.c.environ));
         std.c._exit(127);
@@ -496,6 +478,18 @@ fn killGroupPosix(pgid: std.c.pid_t) void {
     _ = std.c.kill(-pgid, std.c.SIG.KILL);
 }
 
+/// fork-child 内 chdir(缺陷 B)。异步信号安全:仅栈 buffer + chdir,无 malloc/lock。
+/// 成功返 true;失败或 cwd 过长返 false(调用方 _exit(127))。
+/// 三处 spawn 原语共用,避免 7 行代码重复(Linus R2)。
+fn chdirChild(cwd: ?[]const u8) bool {
+    const c = cwd orelse return true;
+    if (c.len >= std.fs.max_path_bytes) return false;
+    var cwd_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    @memcpy(cwd_z[0..c.len], c);
+    cwd_z[c.len] = 0;
+    return std.c.chdir(&cwd_z) == 0;
+}
+
 fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts: CaptureOpts) CaptureError!Captured {
     var out_pipe: [2]std.c.fd_t = undefined;
     if (std.c.pipe(&out_pipe) != 0) return error.PipeFailed;
@@ -556,17 +550,7 @@ fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts
         }
         _ = std.c.close(out_pipe[1]);
         // 缺陷 B 修复:子进程 chdir(仅影响本子进程,父进程 cwd 不变)。
-        // fork-child 间不能分配,用栈 buffer 转 sentinel-terminated(异步信号安全)。
-        if (opts.cwd) |c| {
-            if (c.len < std.fs.max_path_bytes) {
-                var cwd_z: [std.fs.max_path_bytes:0]u8 = undefined;
-                @memcpy(cwd_z[0..c.len], c);
-                cwd_z[c.len] = 0;
-                if (std.c.chdir(&cwd_z) != 0) std.c._exit(127);
-            } else {
-                std.c._exit(127);
-            }
-        }
+        if (!chdirChild(opts.cwd)) std.c._exit(127);
         const argv0 = argv[0] orelse std.c._exit(127);
         const envp: [*:null]const ?[*:0]const u8 = if (opts.inherit_env) @ptrCast(std.c.environ) else &.{null};
         _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), envp);

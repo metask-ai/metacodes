@@ -897,12 +897,14 @@ const ForkExecutorContext = struct {
         // 缺陷 A 修复:子 Agent 系统提示 = 静态字面量 + 环境段(cwd=workspace.root)。
         // 与 model_skill_tool.zig 共用 buildSubagentSystemPrompt,确保两路径一致。
         const sp_mod = @import("../core/system_prompt.zig");
+        // fallback 用 SUBAGENT_LITERAL(常量,非 owned);成功时 buildSubagentSystemPrompt
+        // 返回 owned,用指针比较判断所有权(比子串匹配更可靠,Linus R4)。
         const subagent_system_prompt = sp_mod.buildSubagentSystemPrompt(
             output_allocator,
             self.session.model,
             self.session.workspace.root,
-        ) catch "You are a subagent. Complete the task and return a concise final answer.\n";
-        defer if (std.mem.indexOf(u8, subagent_system_prompt, "Environment") != null)
+        ) catch sp_mod.SUBAGENT_LITERAL;
+        defer if (subagent_system_prompt.ptr != sp_mod.SUBAGENT_LITERAL.ptr)
             output_allocator.free(subagent_system_prompt);
 
         const child = core.subagent.spawnAgentSink(

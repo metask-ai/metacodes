@@ -163,14 +163,14 @@ test "L2 AgentSession Bash 子进程 cwd 绑 workspace.root(缺陷 B 回归)" {
     // 缺陷 B:子进程必须 chdir 到 workspace.root,而非继承父进程(测试进程)cwd。
     // 验证:workspace.root 设为 tmp 目录(≠ 测试进程 cwd),Bash 跑 `pwd`,
     // tool_result 在下一请求 body 里出现,且含 workspace.root 路径片段。
+    // Windows 跳过:realPath 返回 `\` 分隔符,pwd 输出也是 `\`,但 root 经 `\`→`/`
+    // 替换后 indexOf 会失配;且 Windows pwd 命令行为差异。POSIX 路径已验证 PASS。
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
-    for (root_buf[0..root_len]) |*c| {
-        if (c.* == '\\') c.* = '/';
-    }
     const root = root_buf[0..root_len];
 
     const tool_sse = try bashToolSse(a, "pwd");
@@ -201,6 +201,9 @@ test "L2 AgentSession Bash 子进程 cwd 绑 workspace.root(缺陷 B 回归)" {
     try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
 
     // 下一请求 body 应含 tool_result,其 stdout 含 workspace.root(子进程在 root 下跑 pwd)。
+    // 用 count >= 2 区分:system_prompt 的 environment 段含 cwd=root 一次(永远存在),
+    // tool_result 的 pwd 输出含 root 一次(仅当子进程真 chdir 到 root)。若 chdir 没接线,
+    // tool_result 的 pwd 是测试进程 cwd(≠ root),count 仅 1 → 测试 FAIL。Linus R21。
     const body = (srv.lastRequest() orelse return error.NoRequestCaptured).body();
-    try std.testing.expect(std.mem.indexOf(u8, body, root) != null);
+    try std.testing.expect(std.mem.count(u8, body, root) >= 2);
 }
