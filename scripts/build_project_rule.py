@@ -25,7 +25,8 @@ import time
 from typing import Any, Sequence
 
 
-CANDIDATE_SCHEMA = "metacodes-rule-candidate-v3"
+CANDIDATE_SCHEMA = "metacodes-rule-candidate-v4"
+LEGACY_CANDIDATE_SCHEMA = "metacodes-rule-candidate-v3"
 SPEC_SCHEMA = "metacodes-project-rule-spec-v2"
 MANIFEST_SCHEMA = "metacodes-project-rule-build-v1"
 MAX_CANDIDATE_BYTES = 128 * 1024
@@ -154,12 +155,90 @@ def strip_lean_noncode(source: str) -> str:
     return re.sub(r'"(?:\\.|[^"\\])*"', '""', source)
 
 
+def valid_hex64(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def valid_text(value: Any, maximum: int) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and len(value.encode("utf-8")) <= maximum
+    )
+
+
+def validate_run_binding(value: Any) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "session_id",
+        "run_id",
+        "first_sequence",
+        "last_sequence",
+        "interval_sha256",
+    }:
+        raise BuildError("candidate source observation shape mismatch")
+    for name in ("session_id", "run_id"):
+        if not isinstance(value[name], str) or re.fullmatch(r"[0-9a-f]{24}", value[name]) is None:
+            raise BuildError(f"candidate source {name} is invalid")
+    first = value["first_sequence"]
+    last = value["last_sequence"]
+    if type(first) is not int or type(last) is not int or first < 0 or last < first or last > 2**64 - 1:
+        raise BuildError("candidate source observation sequence is invalid")
+    if not valid_hex64(value["interval_sha256"]):
+        raise BuildError("candidate source interval digest is invalid")
+
+
+def validate_candidate_source(value: Any, schema: str) -> None:
+    if not isinstance(value, dict) or len(value) != 1:
+        raise BuildError("candidate source union is invalid")
+    kind, evidence = next(iter(value.items()))
+    allowed = {"user_correction", "agent_reflection", "runtime_counterexample"}
+    if schema == CANDIDATE_SCHEMA:
+        allowed.add("rule_author")
+    if kind not in allowed or not isinstance(evidence, dict):
+        raise BuildError("candidate source kind is unsupported by schema")
+
+    if kind == "user_correction":
+        expected = {"receipt_id", "correction_sha256", "authority_sha256"}
+        if set(evidence) != expected or any(not valid_hex64(evidence[name]) for name in expected):
+            raise BuildError("candidate user-correction source is invalid")
+        return
+
+    if kind == "agent_reflection":
+        if set(evidence) != {"observation", "reflector_sha256", "falsifier"}:
+            raise BuildError("candidate agent-reflection source shape mismatch")
+        validate_run_binding(evidence["observation"])
+        if not valid_hex64(evidence["reflector_sha256"]):
+            raise BuildError("candidate reflection actor is invalid")
+        if not valid_text(evidence["falsifier"], 8 * 1024):
+            raise BuildError("candidate source falsifier is invalid")
+        return
+
+    if kind == "runtime_counterexample":
+        if set(evidence) != {"receipt_id", "observation", "verdict_sha256"}:
+            raise BuildError("candidate runtime-counterexample source shape mismatch")
+        validate_run_binding(evidence["observation"])
+        if not valid_hex64(evidence["receipt_id"]) or not valid_hex64(evidence["verdict_sha256"]):
+            raise BuildError("candidate runtime-counterexample source is invalid")
+        return
+
+    if set(evidence) != {"receipt_id", "observation", "falsifier"}:
+        raise BuildError("candidate rule-author source shape mismatch")
+    validate_run_binding(evidence["observation"])
+    if not valid_hex64(evidence["receipt_id"]):
+        raise BuildError("candidate rule-author receipt is invalid")
+    if not valid_text(evidence["falsifier"], 8 * 1024):
+        raise BuildError("candidate source falsifier is invalid")
+
+
 def validate_candidate(raw: bytes, expected_id: str | None) -> tuple[dict[str, Any], str, str, bytes]:
     record = strict_json_loads(raw)
     if not isinstance(record, dict) or set(record) != {"candidate_id", "state", "body"}:
         raise BuildError("candidate record shape mismatch")
     body = record["body"]
-    if not isinstance(body, dict) or body.get("schema_version") != CANDIDATE_SCHEMA or record["state"] != "proposed":
+    if not isinstance(body, dict) or body.get("schema_version") not in {
+        CANDIDATE_SCHEMA,
+        LEGACY_CANDIDATE_SCHEMA,
+    } or record["state"] != "proposed":
         raise BuildError("unsupported candidate schema/state")
     if set(body) != {
         "schema_version",
@@ -179,13 +258,12 @@ def validate_candidate(raw: bytes, expected_id: str | None) -> tuple[dict[str, A
     if sha256_bytes(stable_json(body)) != candidate_id:
         raise BuildError("candidate body hash mismatch")
     for name in ("project_sha256", "proposer_sha256"):
-        if not isinstance(body[name], str) or not re.fullmatch(r"[0-9a-f]{64}", body[name]):
+        if not valid_hex64(body[name]):
             raise BuildError(f"candidate {name} is invalid")
     invariant = body["invariant"]
     if not isinstance(invariant, str) or not invariant.strip() or len(invariant.encode("utf-8")) > 8 * 1024:
         raise BuildError("candidate invariant is missing or oversized")
-    if not isinstance(body["source"], dict) or len(body["source"]) != 1:
-        raise BuildError("candidate source union is invalid")
+    validate_candidate_source(body["source"], body["schema_version"])
     source = body.get("lean_source")
     if not isinstance(source, str) or not source.strip() or len(source.encode("utf-8")) > MAX_SOURCE_BYTES:
         raise BuildError("candidate Lean source is missing or oversized")

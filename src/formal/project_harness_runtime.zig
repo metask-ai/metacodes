@@ -65,7 +65,12 @@ pub const Operation = enum {
     recovery_pre_decision,
     recovery_post_decision,
 };
-pub const SourceKind = enum { user_correction, agent_reflection, runtime_counterexample };
+pub const SourceKind = enum {
+    user_correction,
+    agent_reflection,
+    runtime_counterexample,
+    rule_author,
+};
 
 pub const ImpactOperation = enum { promote, demote, quarantine };
 pub const ImpactRuleState = enum { shadowed, promoted, quarantined };
