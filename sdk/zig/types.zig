@@ -845,7 +845,7 @@ pub const SessionAbortFnV1 = *const fn (
     reason_code: u32,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
-/// Runs the canonical default best-effort compact policy. Revision 7 accepts
+/// Runs the canonical default best-effort compact policy. Revision 8 accepts
 /// no target token budget and does not guarantee fit for a model context.
 pub const SessionCompactFnV1 = *const fn (
     session: ?*SessionHandle,

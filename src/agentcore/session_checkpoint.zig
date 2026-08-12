@@ -1,4 +1,4 @@
-//! AgentCore-owned Revision 7 Session checkpoint envelope and streaming codec.
+//! AgentCore-owned Revision 8 Session checkpoint envelope and streaming codec.
 //!
 //! Persistence media, encryption, authenticity and retention remain Host
 //! responsibilities. This module owns only the bounded canonical envelope.
@@ -10,7 +10,7 @@ const message = core.message;
 const SessionId = core.session_id.SessionId;
 
 pub const STATE_SCHEMA_REVISION: u32 = 1;
-pub const AGENTCORE_ABI_REVISION: u32 = 7;
+pub const AGENTCORE_ABI_REVISION: u32 = 8;
 pub const HEADER_BYTES: usize = 192;
 pub const DIGEST_BYTES: usize = 32;
 pub const MIN_CHECKPOINT_BUDGET: u64 = HEADER_BYTES + DIGEST_BYTES + 1;

@@ -16,7 +16,7 @@ pub enum AbiError {
     LengthOverflow,
 }
 
-/// Validated Revision 7 function table. Discovery rejects every earlier
+/// Validated Revision 8 function table. Discovery rejects every earlier
 /// revision; there is no legacy probe or alternate layout.
 #[derive(Clone, Copy)]
 pub struct Api {

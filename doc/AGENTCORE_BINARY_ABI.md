@@ -10,7 +10,7 @@ stateful AgentSession execution. It does not expose or define a host product
 model.
 
 **Status: experimental.** The premature 2026-07-17 freeze was retracted after
-consumer feedback exposed a dangling callback-identity contract. Revision 7
+consumer feedback exposed a dangling callback-identity contract. Revision 8
 now defines one exact hard-cut wire shape after Permission authority,
 checkpoint/restore, durable budget, and MCP Runtime/Session seams were
 implemented and tested; this is not a general v1 stability promise.
@@ -20,21 +20,21 @@ and treat a different revision as incompatible. Layouts, numeric values,
 function-table order, and semantics may change only through another explicit
 revision cut while v1 remains experimental.
 
-The current experimental bundle is **ABI v1 revision 7**. Revision 7 is a
+The current experimental bundle is **ABI v1 revision 8**. Revision 8 is a
 hard-cut replacement for every earlier revision. In addition to the Revision
 6 Session surface, it completes the Runtime/Session MCP protocol boundary:
 
-- `metask_agentcore_api_v1` is 216 bytes and requires `abi_revision == 7`;
+- `metask_agentcore_api_v1` is 216 bytes and requires `abi_revision == 8`;
 - `RuntimeConfigV1`, `SessionHostConfigV1`, `SessionCreateConfigV1`,
   `SessionRestoreConfigV1`, `RunInputV1`, and `RunResultV1` are respectively
   96, 168, 64, 64, 104, and 72 bytes on the required 64-bit ABI;
 - checkpoint, restore, describe, MCP refresh/describe/apply/selection,
   Permission rule update, compact, and abort entries are mandatory;
-- the exact required capability set is `0x7ffff`;
-- `manifest.json` records revision 7, table size 216, and that exact capability
+- the exact required capability set is `0xfffff`;
+- `manifest.json` records revision 8, table size 216, and that exact capability
   set.
 
-Revision 7 provides no earlier AgentCore revision compatibility, shim, dual dispatch, or old
+Revision 8 provides no earlier AgentCore revision compatibility, shim, dual dispatch, or old
 table layout. Consumers update the header, SDK, manifest, and library
 atomically, validate the stable
 `struct_size`/`abi_version` prefix before reading later fields, then require
@@ -253,13 +253,18 @@ The v1 observation set is:
 | `context_warning` | Context-pressure thresholds and level |
 | `auto_compact` | Conversation compaction summary |
 | `retry_notice` | Provider retry attempt and delay |
+| `run_state` | Root Run phase snapshot, per-Run transition sequence, turn/tool-call sample, and owned in-flight tool identities |
 | `permission_provenance` | Final Permission decision, canonical source, request binding, generation, and typed callback outcome |
 
 Events describe observations, not commands. A Host may render, aggregate,
 persist, or ignore them; consuming an event never drives the core execution
 loop.
 
-`on_event` is mandatory in Revision 7. To reconstruct final visible assistant
+`on_event` is mandatory in Revision 8. `run_state` is emitted for admitted-run
+start, phase/tool-set/turn/tool-call changes, and terminal closure; it is not a
+mirror of text or usage deltas. Its `transition_seq` starts at 1 for each Run
+and advances only for emitted RunState snapshots. Usage remains authoritative
+in the existing usage event stream. To reconstruct final visible assistant
 output, a Host accumulates only closed segments: `text_chunk` appends to the
 current segment and `stream_done` closes it. `tool_start` and `tool_result` are
 semantic boundaries that discard any unclosed segment and all previously

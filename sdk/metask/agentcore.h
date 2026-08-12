@@ -645,7 +645,7 @@ typedef uint32_t (*metask_agentcore_session_export_checkpoint_fn_v1)(
 typedef void (*metask_agentcore_buffer_release_fn_v1)(
     metask_agentcore_owned_bytes_v1 *);
 
-/* Function-table order is fixed within Revision 7. No earlier revision layout
+/* Function-table order is fixed within Revision 8. No earlier revision layout
  * is accepted, probed, aliased, or dispatched. */
 typedef struct {
     uint32_t struct_size;
