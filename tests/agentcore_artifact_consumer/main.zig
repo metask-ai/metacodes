@@ -4,7 +4,7 @@ const wire = sdk.types;
 const Server = @import("mock_server.zig").Server;
 
 comptime {
-    if (wire.ABI_REVISION != 7 or
+    if (wire.ABI_REVISION != 8 or
         wire.MCP_NEGOTIATION_AUTO != 1 or
         wire.MCP_NEGOTIATION_MODERN_ONLY != 2 or
         wire.MCP_NEGOTIATION_LEGACY_ONLY != 3 or
@@ -15,7 +15,7 @@ comptime {
         wire.MCP_APPLY_APPLIED != 1 or
         wire.MCP_APPLY_SUPERSEDED != 2 or
         wire.MCP_APPLY_REJECTED != 3)
-        @compileError("source-free Revision 7 MCP codes must match the public contract");
+        @compileError("source-free Revision 8 MCP codes must match the public contract");
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
         @compileError("revision 7 must not expose the removed catalog refresh entry");
@@ -637,7 +637,7 @@ pub fn main(init: std.process.Init) !void {
     session = null;
     try expectStatus(.ok, api.runtimeDestroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
-    std.debug.print("AgentCore source-free consumer: Revision 7 tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 8 tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 const CatalogIdentities = struct {

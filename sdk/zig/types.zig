@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 7;
+pub const ABI_REVISION: u32 = 8;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 7 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 8 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -287,7 +287,8 @@ pub const CAP_MCP_RUNTIME_CATALOG: u64 = 1 << 15;
 pub const CAP_MCP_SESSION_SELECTION: u64 = 1 << 16;
 pub const CAP_DURABLE_BUDGET: u64 = 1 << 17;
 pub const CAP_SESSION_PERMISSION_AUTHORITY: u64 = 1 << 18;
-pub const REQUIRED_CAPABILITIES_V1: u64 = CAP_RUNTIME | CAP_BUILTIN_TOOLS | CAP_HOST_SYNC_TOOLS | CAP_HOST_UI | CAP_CORE_EVENTS_JSON | CAP_ABORT | CAP_SKILL_CATALOG | CAP_TYPED_RUN_INPUT | CAP_SESSION_MODEL_MUTATION | CAP_MANUAL_COMPACT | CAP_SKILL_SELECTION | CAP_HOST_PERMISSION_RULES | CAP_SESSION_CHECKPOINT | CAP_SESSION_RESTORE | CAP_SESSION_DESCRIBE | CAP_MCP_RUNTIME_CATALOG | CAP_MCP_SESSION_SELECTION | CAP_DURABLE_BUDGET | CAP_SESSION_PERMISSION_AUTHORITY;
+pub const CAP_RUN_STATE_OBSERVATION: u64 = 1 << 19;
+pub const REQUIRED_CAPABILITIES_V1: u64 = CAP_RUNTIME | CAP_BUILTIN_TOOLS | CAP_HOST_SYNC_TOOLS | CAP_HOST_UI | CAP_CORE_EVENTS_JSON | CAP_ABORT | CAP_SKILL_CATALOG | CAP_TYPED_RUN_INPUT | CAP_SESSION_MODEL_MUTATION | CAP_MANUAL_COMPACT | CAP_SKILL_SELECTION | CAP_HOST_PERMISSION_RULES | CAP_SESSION_CHECKPOINT | CAP_SESSION_RESTORE | CAP_SESSION_DESCRIBE | CAP_MCP_RUNTIME_CATALOG | CAP_MCP_SESSION_SELECTION | CAP_DURABLE_BUDGET | CAP_SESSION_PERMISSION_AUTHORITY | CAP_RUN_STATE_OBSERVATION;
 
 /// Each published v1 revision is rigid: every struct_size is exact and every
 /// reserved field is zero. A Host pins version, revision, table size, and
@@ -1004,9 +1005,9 @@ test "typed status and stop reason validate every public code" {
     try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(std.math.maxInt(u32)));
 }
 
-test "Revision 7 MCP codes append without changing Revision 6 meanings" {
+test "Revision 8 RunState capability appends without changing prior meanings" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 7), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 8), ABI_REVISION);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);

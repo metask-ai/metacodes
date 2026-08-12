@@ -113,9 +113,9 @@ pub fn validateManifest(manifest: Manifest, expected: Expected) Error!void {
     if (!std.mem.eql(u8, manifest.build.optimize, expected.optimize)) return error.OptimizeMismatch;
     if (manifest.build.strip != expected.strip) return error.StripMismatch;
     if (manifest.contract.binary_abi_version != 1 or
-        manifest.contract.binary_abi_revision != 7 or
+        manifest.contract.binary_abi_revision != 8 or
         manifest.contract.binary_abi_table_size != 216 or
-        manifest.contract.capabilities != 0x7ffff)
+        manifest.contract.capabilities != 0xfffff)
         return error.AbiMismatch;
     if (!std.mem.eql(u8, manifest.contract.binary_abi_status, "experimental")) return error.AbiStatusMismatch;
     const expected_link_inputs: []const []const u8 = if (std.mem.eql(u8, expected.os, "windows"))
@@ -218,9 +218,9 @@ fn validManifest() Manifest {
         .contract = .{
             .binary_abi_status = "experimental",
             .binary_abi_version = 1,
-            .binary_abi_revision = 7,
+            .binary_abi_revision = 8,
             .binary_abi_table_size = 216,
-            .capabilities = 0x7ffff,
+            .capabilities = 0xfffff,
         },
         .files = &valid_files,
     };

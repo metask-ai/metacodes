@@ -112,6 +112,34 @@ pub const UsageDelta = struct {
     cache_creation_input_tokens: u64 = 0,
 };
 
+pub const RunStatePhase = enum {
+    starting,
+    generating,
+    executing_tools,
+    waiting_ui,
+    retrying,
+    compacting,
+    finalizing,
+    completed,
+    failed,
+    aborted,
+    poisoned,
+};
+
+pub const RunStateTool = struct {
+    tool_call_id: []const u8,
+    name: []const u8,
+};
+
+pub const RunState = struct {
+    run_id: u64,
+    transition_seq: u64,
+    phase: RunStatePhase,
+    turn: u32,
+    tool_calls: u32,
+    in_flight_tools: []const RunStateTool,
+};
+
 pub const CoreEvent = union(enum) {
     text_chunk: []const u8,
     tool_start: struct {
@@ -157,6 +185,7 @@ pub const CoreEvent = union(enum) {
         max: u32,
         delay_ms: u64,
     },
+    run_state: RunState,
     permission_provenance: PermissionProvenance,
     stream_done,
 };
@@ -1104,6 +1133,7 @@ test "CoreEvent decoder covers every ABI v1 tag" {
         "{\"context_warning\":{\"current_tokens\":1,\"warning_threshold\":2,\"auto_compact_threshold\":3,\"blocking_limit\":4,\"level\":\"medium\"}}",
         "{\"auto_compact\":{\"dropped\":1,\"kept\":2,\"before_tokens\":3,\"after_tokens\":4,\"cause\":\"trigger\"}}",
         "{\"retry_notice\":{\"attempt\":1,\"max\":2,\"delay_ms\":3}}",
+        "{\"run_state\":{\"run_id\":9,\"transition_seq\":1,\"phase\":\"starting\",\"turn\":0,\"tool_calls\":0,\"in_flight_tools\":[]}}",
         "{\"permission_provenance\":{\"decision\":\"allow\",\"source\":\"explicit_allow\",\"matched_rule_id\":null,\"session_id\":\"000000000000000000000001\",\"run_id\":1,\"tool_call_id\":\"tool-1\",\"request_id\":null,\"tool\":{\"namespace\":\"builtin\",\"name\":\"Read\",\"binding\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"canonical_arguments_digest\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"policy_generation\":1,\"used_session_rule\":false,\"callback_outcome\":null,\"response\":null}}",
         "{\"stream_done\":{}}",
     };

@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
-#error "AgentCore ABI v1 revision 7 requires a 64-bit pointer ABI"
+#error "AgentCore ABI v1 revision 8 requires a 64-bit pointer ABI"
 #endif
 
 #ifdef __cplusplus
@@ -13,11 +13,11 @@ extern "C" {
 #endif
 
 /* sdk/zig/types.zig is the normative fixed-layout schema. This header is its
- * Revision 7 C projection; sdk/rust/src/raw.rs is generated from this file.
+ * Revision 8 C projection; sdk/rust/src/raw.rs is generated from this file.
  * AgentCore ABI v1 remains experimental. Consumers pin an exact bundle and
  * must validate version, revision, table size, and capabilities together. */
 #define METASK_AGENTCORE_ABI_V1 1u
-#define METASK_AGENTCORE_ABI_REVISION 7u
+#define METASK_AGENTCORE_ABI_REVISION 8u
 
 #define METASK_AGENTCORE_STATUS_OK 0u
 #define METASK_AGENTCORE_STATUS_INVALID_ARGUMENT 1u
@@ -200,7 +200,8 @@ extern "C" {
 #define METASK_AGENTCORE_CAP_MCP_SESSION_SELECTION (1ULL << 16)
 #define METASK_AGENTCORE_CAP_DURABLE_BUDGET (1ULL << 17)
 #define METASK_AGENTCORE_CAP_SESSION_PERMISSION_AUTHORITY (1ULL << 18)
-#define METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 ((1ULL << 19) - 1ULL)
+#define METASK_AGENTCORE_CAP_RUN_STATE_OBSERVATION (1ULL << 19)
+#define METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 ((1ULL << 20) - 1ULL)
 
 typedef struct metask_agentcore_runtime metask_agentcore_runtime;
 typedef struct metask_agentcore_session metask_agentcore_session;
@@ -771,7 +772,7 @@ metask_agentcore_owned_bytes_v1_release(
 #define METASK_AGENTCORE_ASSERT_OFFSET(type, field, offset) \
     METASK_AGENTCORE_STATIC_ASSERT(offsetof(type, field) == (offset), #type "." #field " offset")
 
-METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 7u,
+METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 8u,
                                "AgentCore revision 7");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_AUTO == 1u,
                                "MCP auto code");
