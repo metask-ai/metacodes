@@ -239,6 +239,13 @@ const Probe = struct {
     saw_tool_start: bool = false,
     saw_tool_result: bool = false,
     saw_run_state: bool = false,
+    run_state_sequence_valid: bool = true,
+    run_state_saw_starting: bool = false,
+    run_state_saw_executing_tools: bool = false,
+    run_state_saw_completed: bool = false,
+    run_state_terminal_empty: bool = false,
+    run_state_last_run_id: u64 = 0,
+    run_state_last_seq: u64 = 0,
 
     fn context(self: *Probe, run_ptr: ?*const wire.RunContextV1) ?sdk.RunContext {
         const run = sdk.validateRunContext(run_ptr) catch return null;
@@ -258,7 +265,25 @@ const Probe = struct {
             .known => |known_event| switch (known_event) {
                 .tool_start => self.saw_tool_start = true,
                 .tool_result => self.saw_tool_result = true,
-                .run_state => self.saw_run_state = true,
+                .run_state => |state| {
+                    self.saw_run_state = true;
+                    if (self.run_state_last_run_id != state.run_id) {
+                        self.run_state_last_run_id = state.run_id;
+                        self.run_state_last_seq = 0;
+                    }
+                    if (state.transition_seq != self.run_state_last_seq + 1)
+                        self.run_state_sequence_valid = false;
+                    self.run_state_last_seq = state.transition_seq;
+                    switch (state.phase) {
+                        .starting => self.run_state_saw_starting = true,
+                        .executing_tools => self.run_state_saw_executing_tools = true,
+                        .completed => {
+                            self.run_state_saw_completed = true;
+                            self.run_state_terminal_empty = state.in_flight_tools.len == 0;
+                        },
+                        else => {},
+                    }
+                },
                 else => {},
             },
             .unknown => {},
@@ -4062,6 +4087,11 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
     try std.testing.expect(probe.saw_tool_start and probe.saw_tool_result and probe.saw_run_state);
+    try std.testing.expect(probe.run_state_sequence_valid);
+    try std.testing.expect(probe.run_state_saw_starting and
+        probe.run_state_saw_executing_tools and
+        probe.run_state_saw_completed and
+        probe.run_state_terminal_empty);
 
     const body = (server.lastRequest() orelse
         return error.NoRequestCaptured).body();
