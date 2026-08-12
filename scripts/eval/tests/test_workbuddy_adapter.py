@@ -35,6 +35,7 @@ from scripts.eval.workbuddy.trace import (
     OBSERVATION_JOURNAL_SCHEMA,
     TOOL_OBSERVATION_SCHEMA,
     TraceError,
+    anthropic_messages_endpoint,
     final_result,
     load_control_metrics,
     project_state_hash,
@@ -72,6 +73,28 @@ class WorkBuddyTraceTest(unittest.TestCase):
 
     def test_project_state_hash_matches_zig_xxhash64(self):
         self.assertEqual(project_state_hash("/workspace"), "5807156ecf67bb70")
+
+    def test_proxy_origin_becomes_complete_anthropic_messages_endpoint(self):
+        for source in (
+            "http://host.docker.internal:3456",
+            "http://host.docker.internal:3456/",
+            "http://host.docker.internal:3456/v1/messages",
+            "http://host.docker.internal:3456/v1/messages/",
+        ):
+            self.assertEqual(
+                anthropic_messages_endpoint(source),
+                "http://host.docker.internal:3456/v1/messages",
+            )
+        for invalid in (
+            "",
+            "host.docker.internal:3456",
+            "http://host.docker.internal:3456/other",
+            "http://host.docker.internal:3456/?route=glm",
+            "http://host.docker.internal:3456/#fragment",
+            "http://host.docker.internal:3456\n/v1/messages",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(TraceError):
+                anthropic_messages_endpoint(invalid)
 
     def test_transcript_maps_calls_results_and_cache_metrics_without_dropping_provenance(self):
         result = final_result(
@@ -905,6 +928,21 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         self.assertIn(
             'raise ValueError("metacodes WorkBuddy trial received remote TinyKG authority")',
             source,
+        )
+
+    def test_adapter_uses_complete_messages_endpoint_so_proxy_rewrites_model(self):
+        source = (
+            Path(__file__).parents[1]
+            / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "escaped_proxy = anthropic_messages_endpoint(self._proxy_url)",
+            source,
+        )
+        self.assertIn('"METACODES_BASE_URL": escaped_proxy', source)
+        self.assertLess(
+            source.index("escaped_proxy = anthropic_messages_endpoint(self._proxy_url)"),
+            source.index('"METACODES_BASE_URL": escaped_proxy'),
         )
 
     def test_overlay_patches_resolve_and_prepare_with_one_mount_contract(self):

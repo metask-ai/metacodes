@@ -27,6 +27,7 @@ from workbuddy_bench.agents._agent_user import ensure_agent_user
 from workbuddy_bench.agents._metacodes_trace import (
     OBSERVATION_FILENAME,
     TraceError,
+    anthropic_messages_endpoint,
     load_control_metrics,
     load_trace_ir,
     project_state_hash,
@@ -153,10 +154,16 @@ class MetacodesAgent(BaseInstalledAgent):
         instruction = self.render_instruction(instruction)
         escaped_instruction = shlex.quote(instruction)
         escaped_model = shlex.quote(self.model_name)
-        escaped_proxy = self._proxy_url
-        if "\n" in escaped_proxy or "\r" in escaped_proxy:
-            raise ValueError("proxy_url contains a newline")
-
+        try:
+            escaped_proxy = anthropic_messages_endpoint(self._proxy_url)
+        except TraceError as exc:
+            raise ValueError(str(exc)) from exc
+        # metacodes treats METACODES_BASE_URL as the complete Anthropic
+        # messages endpoint, not as a server root.  WorkBuddy supplies the host
+        # proxy root, so make the protocol endpoint explicit.  Otherwise the
+        # request arrives at `/`, the proxy classifies it as auxiliary traffic,
+        # and the internal route slug leaks upstream instead of being rewritten
+        # to the configured backend model.
         route = self.model_name
         # The WorkBuddy proxy consumes this prefix for per-trial attribution,
         # then resolves the suffix against its registered route table.

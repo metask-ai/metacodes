@@ -15,6 +15,7 @@ import re
 import stat
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 
 MAX_TRACE_BYTES = 64 * 1024 * 1024
@@ -37,6 +38,29 @@ _MASK64 = (1 << 64) - 1
 
 class TraceError(ValueError):
     """The captured headless output cannot support an auditable trajectory."""
+
+
+def anthropic_messages_endpoint(proxy_url: str) -> str:
+    """Turn a WorkBuddy proxy root into metacodes' complete messages URL.
+
+    WorkBuddy models describe the job-private proxy by origin, while metacodes'
+    ``METACODES_BASE_URL`` contract is a complete inference endpoint.  Keeping
+    this conversion explicit makes the proxy classify the call as inference and
+    rewrite the route alias to its pinned backend model.
+    """
+
+    if not isinstance(proxy_url, str) or "\n" in proxy_url or "\r" in proxy_url:
+        raise TraceError("WorkBuddy proxy URL is invalid")
+    parsed = urlsplit(proxy_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/", "/v1/messages", "/v1/messages/"}
+    ):
+        raise TraceError("WorkBuddy proxy URL is not an HTTP origin or messages endpoint")
+    return urlunsplit((parsed.scheme, parsed.netloc, "/v1/messages", "", ""))
 
 
 def _rotl64(value: int, bits: int) -> int:
