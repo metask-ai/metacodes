@@ -24,14 +24,18 @@ const impact_stats = @import("rule_impact_stats.zig");
 const source_receipt = @import("rule_source_receipt.zig");
 const project_rule_spec = @import("project_rule_spec.zig");
 const rule_candidate = @import("rule_candidate.zig");
+const ontology_projection = @import("ontology_rule_projection.zig");
 
 pub const SYSTEM_PROMPT = @embedFile("templates/rule_author/prompt.md");
+pub const SYSTEM_PROMPT_V2 = @embedFile("templates/rule_author/prompt-v2.md");
 pub fn systemPromptSha256() [64]u8 {
     return observation.sha256Hex(SYSTEM_PROMPT);
 }
 pub const PACKET_SCHEMA_VERSION = "metacodes-rule-author-packet-v1";
+pub const PACKET_SCHEMA_VERSION_V2 = "metacodes-rule-author-packet-v2";
 pub const RESPONSE_SCHEMA_VERSION = "metacodes-rule-author-response-v1";
 pub const RECEIPT_SCHEMA_VERSION = "metacodes-rule-author-receipt-v1";
+pub const RECEIPT_SCHEMA_VERSION_V2 = "metacodes-rule-author-receipt-v2";
 pub const RECEIPT_FILE_PREFIX = "rule-author-receipt-";
 
 pub const MAX_PACKET_BYTES: usize = 64 * 1024;
@@ -41,6 +45,7 @@ pub const MAX_MODEL_BYTES: usize = 256;
 pub const MAX_REASON_BYTES: usize = 2048;
 pub const MAX_EVIDENCE_ITEMS: usize = 16;
 pub const MAX_EVIDENCE_SUMMARY_BYTES: usize = 4096;
+pub const MAX_PACKET_V2_BYTES: usize = MAX_PACKET_BYTES + ontology_projection.MAX_PACKET_BYTES + 4096;
 
 pub const Trigger = enum {
     user_correction,
@@ -85,6 +90,33 @@ pub const PricingAuthority = struct {
     cache_write_microusd_per_mtok: u64,
 };
 
+/// Host-supplied expected identity for one already-persisted ontology
+/// projection.  prepare() reopens the receipt and accepts none of the packet
+/// prose from the caller.
+pub const OntologyProjectionAuthority = struct {
+    receipt_id: [64]u8,
+    ontology_revision: [64]u8,
+    ontology_snapshot_sha256: [64]u8,
+    active_bundle_revision: u64,
+    active_bundle_sha256: [64]u8,
+};
+
+pub const ProjectionBinding = struct {
+    receipt_id: [64]u8,
+    packet_sha256: [64]u8,
+    ontology_revision: [64]u8,
+    ontology_snapshot_sha256: [64]u8,
+    active_bundle_revision: u64,
+    active_bundle_sha256: [64]u8,
+    generation_evidence_sha256: [64]u8,
+    held_out_commitments_sha256: [64]u8,
+};
+
+pub const Protocol = union(enum) {
+    v1,
+    v2: ProjectionBinding,
+};
+
 pub const PrepareInput = struct {
     session_dir: []const u8,
     project_sha256: [64]u8,
@@ -98,6 +130,7 @@ pub const PrepareInput = struct {
     evidence: []const EvidenceItem,
     caps: CallCaps,
     pricing: PricingAuthority,
+    ontology_projection: ?OntologyProjectionAuthority = null,
 };
 
 const WireRun = struct {
@@ -124,6 +157,28 @@ const WirePacket = struct {
     impact: impact_stats.Snapshot,
 };
 
+const WireProjectionIdentity = struct {
+    receipt_id: []const u8,
+    packet_sha256: []const u8,
+    ontology_revision: []const u8,
+    ontology_snapshot_sha256: []const u8,
+    active_bundle_revision: u64,
+    active_bundle_sha256: []const u8,
+    generation_evidence_sha256: []const u8,
+    held_out_commitments_sha256: []const u8,
+};
+
+const WirePacketV2 = struct {
+    schema_version: []const u8 = PACKET_SCHEMA_VERSION_V2,
+    project_sha256: []const u8,
+    source: WireRun,
+    trigger: Trigger,
+    evidence: []const WireEvidence,
+    impact: impact_stats.Snapshot,
+    ontology_projection_identity: WireProjectionIdentity,
+    ontology_projection: std.json.Value,
+};
+
 pub const PreparedRequest = struct {
     arena: std.heap.ArenaAllocator,
     project_sha256: [64]u8,
@@ -140,6 +195,7 @@ pub const PreparedRequest = struct {
     packet_sha256: [64]u8,
     caps: CallCaps,
     pricing: PricingAuthority,
+    protocol: Protocol = .v1,
 
     pub fn deinit(self: *PreparedRequest) void {
         self.arena.deinit();
@@ -189,18 +245,53 @@ pub fn prepare(allocator: std.mem.Allocator, input: PrepareInput) !PreparedReque
         .last_sequence = input.observation.last_sequence,
         .interval_sha256 = run.interval_sha256[0..],
     };
-    const packet = try std.json.Stringify.valueAlloc(a, WirePacket{
+    var protocol: Protocol = .v1;
+    const packet = if (input.ontology_projection) |authority| blk: {
+        var loaded = try loadProjectionAuthority(
+            allocator,
+            input.session_dir,
+            input.project_sha256,
+            authority,
+        );
+        defer loaded.deinit();
+        const binding = projectionBinding(&loaded);
+        protocol = .{ .v2 = binding };
+        const ontology_value = std.json.parseFromSliceLeaky(
+            std.json.Value,
+            a,
+            loaded.projection.packet,
+            .{
+                .ignore_unknown_fields = false,
+                .allocate = .alloc_always,
+                .duplicate_field_behavior = .@"error",
+            },
+        ) catch return error.InvalidOntologyProjectionPacket;
+        break :blk try std.json.Stringify.valueAlloc(a, WirePacketV2{
+            .project_sha256 = input.project_sha256[0..],
+            .source = source,
+            .trigger = input.trigger,
+            .evidence = wire_evidence,
+            .impact = snapshot,
+            .ontology_projection_identity = wireProjectionIdentity(&binding),
+            .ontology_projection = ontology_value,
+        }, .{});
+    } else try std.json.Stringify.valueAlloc(a, WirePacket{
         .project_sha256 = input.project_sha256[0..],
         .source = source,
         .trigger = input.trigger,
         .evidence = wire_evidence,
         .impact = snapshot,
     }, .{});
-    if (packet.len == 0 or packet.len > MAX_PACKET_BYTES) return error.PacketTooLarge;
+    const max_packet_bytes = switch (protocol) {
+        .v1 => MAX_PACKET_BYTES,
+        .v2 => MAX_PACKET_V2_BYTES,
+    };
+    if (packet.len == 0 or packet.len > max_packet_bytes) return error.PacketTooLarge;
     // Provider has no per-call input-token setter.  Reserving at least one
     // token per request byte is conservative for UTF-8 and avoids pretending
     // the adapter can enforce a smaller amount than it actually sends.
-    const conservative_input = std.math.add(usize, packet.len, SYSTEM_PROMPT.len) catch
+    const system_prompt = systemPrompt(protocol);
+    const conservative_input = std.math.add(usize, packet.len, system_prompt.len) catch
         return error.PacketTooLarge;
     if (input.caps.max_input_tokens < conservative_input)
         return error.InputCapCannotCoverRequest;
@@ -213,7 +304,7 @@ pub fn prepare(allocator: std.mem.Allocator, input: PrepareInput) !PreparedReque
         .budget_authorization_sha256 = input.budget_authorization_sha256,
         .model = model,
         .model_sha256 = observation.sha256Hex(model),
-        .system_prompt_sha256 = systemPromptSha256(),
+        .system_prompt_sha256 = systemPromptSha256For(protocol),
         .observation = input.observation,
         .interval_sha256 = run.interval_sha256,
         .trigger = input.trigger,
@@ -221,7 +312,77 @@ pub fn prepare(allocator: std.mem.Allocator, input: PrepareInput) !PreparedReque
         .packet_sha256 = observation.sha256Hex(packet),
         .caps = input.caps,
         .pricing = input.pricing,
+        .protocol = protocol,
     };
+}
+
+fn systemPrompt(protocol: Protocol) []const u8 {
+    return switch (protocol) {
+        .v1 => SYSTEM_PROMPT,
+        .v2 => SYSTEM_PROMPT_V2,
+    };
+}
+
+fn systemPromptSha256For(protocol: Protocol) [64]u8 {
+    return observation.sha256Hex(systemPrompt(protocol));
+}
+
+fn projectionBinding(loaded: *const ontology_projection.Loaded) ProjectionBinding {
+    return .{
+        .receipt_id = loaded.receipt_id,
+        .packet_sha256 = loaded.projection.packet_sha256,
+        .ontology_revision = loaded.projection.ontology_revision,
+        .ontology_snapshot_sha256 = loaded.projection.ontology_snapshot_sha256,
+        .active_bundle_revision = loaded.projection.active_bundle_revision,
+        .active_bundle_sha256 = loaded.projection.active_bundle_sha256,
+        .generation_evidence_sha256 = loaded.projection.generation_evidence_sha256,
+        .held_out_commitments_sha256 = loaded.projection.held_out_commitments_sha256,
+    };
+}
+
+fn wireProjectionIdentity(binding: *const ProjectionBinding) WireProjectionIdentity {
+    return .{
+        .receipt_id = binding.receipt_id[0..],
+        .packet_sha256 = binding.packet_sha256[0..],
+        .ontology_revision = binding.ontology_revision[0..],
+        .ontology_snapshot_sha256 = binding.ontology_snapshot_sha256[0..],
+        .active_bundle_revision = binding.active_bundle_revision,
+        .active_bundle_sha256 = binding.active_bundle_sha256[0..],
+        .generation_evidence_sha256 = binding.generation_evidence_sha256[0..],
+        .held_out_commitments_sha256 = binding.held_out_commitments_sha256[0..],
+    };
+}
+
+fn loadProjectionAuthority(
+    allocator: std.mem.Allocator,
+    session_dir: []const u8,
+    project_sha256: [64]u8,
+    authority: OntologyProjectionAuthority,
+) !ontology_projection.Loaded {
+    var loaded = try ontology_projection.loadBound(allocator, session_dir, authority.receipt_id);
+    errdefer loaded.deinit();
+    if (!std.mem.eql(u8, &loaded.projection.project_sha256, &project_sha256) or
+        !std.mem.eql(u8, &loaded.projection.ontology_revision, &authority.ontology_revision) or
+        !std.mem.eql(u8, &loaded.projection.ontology_snapshot_sha256, &authority.ontology_snapshot_sha256) or
+        loaded.projection.active_bundle_revision != authority.active_bundle_revision or
+        !std.mem.eql(u8, &loaded.projection.active_bundle_sha256, &authority.active_bundle_sha256))
+        return error.OntologyProjectionIdentityMismatch;
+    return loaded;
+}
+
+fn reopenProjectionBinding(
+    allocator: std.mem.Allocator,
+    session_dir: []const u8,
+    project_sha256: [64]u8,
+    binding: ProjectionBinding,
+) !ontology_projection.Loaded {
+    var loaded = try ontology_projection.loadBound(allocator, session_dir, binding.receipt_id);
+    errdefer loaded.deinit();
+    const observed = projectionBinding(&loaded);
+    if (!std.mem.eql(u8, &loaded.projection.project_sha256, &project_sha256) or
+        !std.meta.eql(observed, binding))
+        return error.OntologyProjectionBindingMismatch;
+    return loaded;
 }
 
 fn validateEvidence(
@@ -424,6 +585,7 @@ pub const AuthorResult = struct {
     proposal: ?Proposal,
     usage: Usage,
     provider_elapsed_ns: u64,
+    protocol: Protocol = .v1,
 
     pub fn deinit(self: *AuthorResult) void {
         self.arena.deinit();
@@ -453,6 +615,7 @@ pub fn author(
     abort: ?*const AbortSignal,
 ) !AuthorResult {
     try validatePermit(prepared, permit);
+    try validatePreparedProjection(allocator, session_dir, prepared);
     if (!std.mem.eql(u8, &bound_provider.provider_sha256, &prepared.provider_sha256))
         return error.ProviderIdentityMismatch;
     if (!std.mem.eql(u8, bound_provider.provider.model(), prepared.model))
@@ -467,7 +630,7 @@ pub fn author(
     }};
     var stream = try bound_provider.provider.sendStream(
         &api_messages,
-        SYSTEM_PROMPT,
+        systemPrompt(prepared.protocol),
         null,
         abort,
         null,
@@ -516,6 +679,10 @@ pub fn author(
         return error.AuthorResponseIncomplete;
     const provider_elapsed_ns = elapsedNs(provider_started_ns);
     try validatePermit(prepared, permit);
+    // The provider may have run for minutes. Reopen the projection and every
+    // bound generation receipt again before turning its response into durable
+    // evidence; prepare-time validity is not commit-time validity.
+    try validatePreparedProjection(allocator, session_dir, prepared);
     const metered_input = std.math.add(
         u64,
         usage.input_tokens,
@@ -533,6 +700,7 @@ pub fn author(
     result.interval_sha256 = prepared.interval_sha256;
     result.usage = usage;
     result.provider_elapsed_ns = provider_elapsed_ns;
+    result.protocol = prepared.protocol;
     result.receipt_id = try persistReceipt(
         session_dir,
         prepared,
@@ -541,6 +709,10 @@ pub fn author(
         response.items,
         &result,
     );
+    var committed = try loadReceipt(allocator, session_dir, result.receipt_id);
+    defer committed.deinit();
+    if (!try receiptMatchesResult(allocator, &committed, &result))
+        return error.AuthorReceiptResultMismatch;
     return result;
 }
 
@@ -618,7 +790,27 @@ fn parseResponse(allocator: std.mem.Allocator, bytes: []const u8) !AuthorResult 
         .proposal = proposal,
         .usage = .{},
         .provider_elapsed_ns = 0,
+        .protocol = .v1,
     };
+}
+
+fn validatePreparedProjection(
+    allocator: std.mem.Allocator,
+    session_dir: []const u8,
+    prepared: *const PreparedRequest,
+) !void {
+    switch (prepared.protocol) {
+        .v1 => {},
+        .v2 => |binding| {
+            var loaded = try reopenProjectionBinding(
+                allocator,
+                session_dir,
+                prepared.project_sha256,
+                binding,
+            );
+            loaded.deinit();
+        },
+    }
 }
 
 pub fn renderCanonicalLean(
@@ -689,31 +881,74 @@ const PreparedIdentity = struct {
     cache_write_microusd_per_mtok: u64,
 };
 
+const PreparedIdentityV2 = struct {
+    schema_version: []const u8 = "metacodes-rule-author-prepared-identity-v2",
+    project_sha256: []const u8,
+    author_sha256: []const u8,
+    provider_sha256: []const u8,
+    budget_authorization_sha256: []const u8,
+    model_sha256: []const u8,
+    system_prompt_sha256: []const u8,
+    packet_sha256: []const u8,
+    interval_sha256: []const u8,
+    trigger: Trigger,
+    max_cost_microusd: u64,
+    max_input_tokens: u64,
+    max_output_tokens: u64,
+    pricing_provenance_sha256: []const u8,
+    input_microusd_per_mtok: u64,
+    output_microusd_per_mtok: u64,
+    cache_read_microusd_per_mtok: u64,
+    cache_write_microusd_per_mtok: u64,
+    ontology_projection: WireProjectionIdentity,
+};
+
 fn preparedIdentity(prepared: *const PreparedRequest) ![64]u8 {
     if (!std.mem.eql(u8, &prepared.model_sha256, &observation.sha256Hex(prepared.model)) or
-        !std.mem.eql(u8, &prepared.system_prompt_sha256, &systemPromptSha256()) or
+        !std.mem.eql(u8, &prepared.system_prompt_sha256, &systemPromptSha256For(prepared.protocol)) or
         !std.mem.eql(u8, &prepared.packet_sha256, &observation.sha256Hex(prepared.packet)))
         return error.PreparedRequestDrift;
-    const body = PreparedIdentity{
-        .project_sha256 = prepared.project_sha256[0..],
-        .author_sha256 = prepared.author_sha256[0..],
-        .provider_sha256 = prepared.provider_sha256[0..],
-        .budget_authorization_sha256 = prepared.budget_authorization_sha256[0..],
-        .model_sha256 = prepared.model_sha256[0..],
-        .system_prompt_sha256 = prepared.system_prompt_sha256[0..],
-        .packet_sha256 = prepared.packet_sha256[0..],
-        .interval_sha256 = prepared.interval_sha256[0..],
-        .trigger = prepared.trigger,
-        .max_cost_microusd = prepared.caps.max_cost_microusd,
-        .max_input_tokens = prepared.caps.max_input_tokens,
-        .max_output_tokens = prepared.caps.max_output_tokens,
-        .pricing_provenance_sha256 = prepared.pricing.provenance_sha256[0..],
-        .input_microusd_per_mtok = prepared.pricing.input_microusd_per_mtok,
-        .output_microusd_per_mtok = prepared.pricing.output_microusd_per_mtok,
-        .cache_read_microusd_per_mtok = prepared.pricing.cache_read_microusd_per_mtok,
-        .cache_write_microusd_per_mtok = prepared.pricing.cache_write_microusd_per_mtok,
+    const encoded = switch (prepared.protocol) {
+        .v1 => try std.json.Stringify.valueAlloc(std.heap.c_allocator, PreparedIdentity{
+            .project_sha256 = prepared.project_sha256[0..],
+            .author_sha256 = prepared.author_sha256[0..],
+            .provider_sha256 = prepared.provider_sha256[0..],
+            .budget_authorization_sha256 = prepared.budget_authorization_sha256[0..],
+            .model_sha256 = prepared.model_sha256[0..],
+            .system_prompt_sha256 = prepared.system_prompt_sha256[0..],
+            .packet_sha256 = prepared.packet_sha256[0..],
+            .interval_sha256 = prepared.interval_sha256[0..],
+            .trigger = prepared.trigger,
+            .max_cost_microusd = prepared.caps.max_cost_microusd,
+            .max_input_tokens = prepared.caps.max_input_tokens,
+            .max_output_tokens = prepared.caps.max_output_tokens,
+            .pricing_provenance_sha256 = prepared.pricing.provenance_sha256[0..],
+            .input_microusd_per_mtok = prepared.pricing.input_microusd_per_mtok,
+            .output_microusd_per_mtok = prepared.pricing.output_microusd_per_mtok,
+            .cache_read_microusd_per_mtok = prepared.pricing.cache_read_microusd_per_mtok,
+            .cache_write_microusd_per_mtok = prepared.pricing.cache_write_microusd_per_mtok,
+        }, .{}),
+        .v2 => |binding| try std.json.Stringify.valueAlloc(std.heap.c_allocator, PreparedIdentityV2{
+            .project_sha256 = prepared.project_sha256[0..],
+            .author_sha256 = prepared.author_sha256[0..],
+            .provider_sha256 = prepared.provider_sha256[0..],
+            .budget_authorization_sha256 = prepared.budget_authorization_sha256[0..],
+            .model_sha256 = prepared.model_sha256[0..],
+            .system_prompt_sha256 = prepared.system_prompt_sha256[0..],
+            .packet_sha256 = prepared.packet_sha256[0..],
+            .interval_sha256 = prepared.interval_sha256[0..],
+            .trigger = prepared.trigger,
+            .max_cost_microusd = prepared.caps.max_cost_microusd,
+            .max_input_tokens = prepared.caps.max_input_tokens,
+            .max_output_tokens = prepared.caps.max_output_tokens,
+            .pricing_provenance_sha256 = prepared.pricing.provenance_sha256[0..],
+            .input_microusd_per_mtok = prepared.pricing.input_microusd_per_mtok,
+            .output_microusd_per_mtok = prepared.pricing.output_microusd_per_mtok,
+            .cache_read_microusd_per_mtok = prepared.pricing.cache_read_microusd_per_mtok,
+            .cache_write_microusd_per_mtok = prepared.pricing.cache_write_microusd_per_mtok,
+            .ontology_projection = wireProjectionIdentity(&binding),
+        }, .{}),
     };
-    const encoded = try std.json.Stringify.valueAlloc(std.heap.c_allocator, body, .{});
     defer std.heap.c_allocator.free(encoded);
     return observation.sha256Hex(encoded);
 }
@@ -835,6 +1070,43 @@ const ReceiptRecord = struct {
     body: ReceiptBody,
 };
 
+const ReceiptBodyV2 = struct {
+    schema_version: []const u8 = RECEIPT_SCHEMA_VERSION_V2,
+    project_sha256: []const u8,
+    author_sha256: []const u8,
+    provider_sha256: []const u8,
+    budget_authorization_sha256: []const u8,
+    model: []const u8,
+    model_sha256: []const u8,
+    system_prompt_sha256: []const u8,
+    packet_sha256: []const u8,
+    response_sha256: []const u8,
+    source: WireRun,
+    trigger: Trigger,
+    prepared_sha256: []const u8,
+    authorization_sha256: []const u8,
+    authorized_at_ns: i128,
+    cooldown_ns: u64,
+    request_id: []const u8,
+    caps: CallCaps,
+    pricing: PricingAuthority,
+    usage: Usage,
+    provider_elapsed_ns: u64,
+    decision: Decision,
+    reason_sha256: []const u8,
+    proposal: ?ReceiptProposal,
+    ontology_projection: WireProjectionIdentity,
+};
+
+const ReceiptRecordV2 = struct {
+    receipt_id: []const u8,
+    body: ReceiptBodyV2,
+};
+
+const ReceiptSchemaProbe = struct {
+    body: struct { schema_version: []const u8 },
+};
+
 pub const LoadedReceipt = struct {
     arena: std.heap.ArenaAllocator,
     receipt_id: [64]u8,
@@ -863,6 +1135,7 @@ pub const LoadedReceipt = struct {
     falsifier_sha256: ?[64]u8,
     rule_spec_sha256: ?[64]u8,
     lean_source_sha256: ?[64]u8,
+    protocol: Protocol = .v1,
 
     pub fn deinit(self: *LoadedReceipt) void {
         self.arena.deinit();
@@ -878,6 +1151,9 @@ fn persistReceipt(
     response: []const u8,
     result: *const AuthorResult,
 ) ![64]u8 {
+    // Close the post-response TOCTOU window as tightly as possible. This is
+    // the final observation before the author verdict becomes durable.
+    try validatePreparedProjection(std.heap.c_allocator, session_dir, prepared);
     var proposal: ?ReceiptProposal = null;
     var invariant_sha256: [64]u8 = undefined;
     var falsifier_sha256: [64]u8 = undefined;
@@ -903,47 +1179,98 @@ fn persistReceipt(
     }
     const response_sha256 = observation.sha256Hex(response);
     const reason_sha256 = observation.sha256Hex(result.reason);
-    const body = ReceiptBody{
-        .project_sha256 = prepared.project_sha256[0..],
-        .author_sha256 = prepared.author_sha256[0..],
-        .provider_sha256 = prepared.provider_sha256[0..],
-        .budget_authorization_sha256 = prepared.budget_authorization_sha256[0..],
-        .model = prepared.model,
-        .model_sha256 = prepared.model_sha256[0..],
-        .system_prompt_sha256 = prepared.system_prompt_sha256[0..],
-        .packet_sha256 = prepared.packet_sha256[0..],
-        .response_sha256 = response_sha256[0..],
-        .source = .{
-            .session_id = prepared.observation.session_id.asSlice(),
-            .run_id = prepared.observation.run_id.asSlice(),
-            .first_sequence = prepared.observation.first_sequence,
-            .last_sequence = prepared.observation.last_sequence,
-            .interval_sha256 = prepared.interval_sha256[0..],
-        },
-        .trigger = prepared.trigger,
-        .prepared_sha256 = permit.prepared_sha256[0..],
-        .authorization_sha256 = permit.authorization_sha256[0..],
-        .authorized_at_ns = permit.authorized_at_ns,
-        .cooldown_ns = permit.cooldown_ns,
-        .request_id = request_id[0..],
-        .caps = prepared.caps,
-        .pricing = prepared.pricing,
-        .usage = result.usage,
-        .provider_elapsed_ns = result.provider_elapsed_ns,
-        .decision = result.decision,
-        .reason_sha256 = reason_sha256[0..],
-        .proposal = proposal,
+    const source = WireRun{
+        .session_id = prepared.observation.session_id.asSlice(),
+        .run_id = prepared.observation.run_id.asSlice(),
+        .first_sequence = prepared.observation.first_sequence,
+        .last_sequence = prepared.observation.last_sequence,
+        .interval_sha256 = prepared.interval_sha256[0..],
     };
-    const body_json = try std.json.Stringify.valueAlloc(std.heap.c_allocator, body, .{});
-    defer std.heap.c_allocator.free(body_json);
-    const receipt_id = observation.sha256Hex(body_json);
-    const record_json = try std.json.Stringify.valueAlloc(
-        std.heap.c_allocator,
-        ReceiptRecord{ .receipt_id = receipt_id[0..], .body = body },
-        .{},
-    );
+    const record_json = switch (prepared.protocol) {
+        .v1 => blk: {
+            const body = ReceiptBody{
+                .project_sha256 = prepared.project_sha256[0..],
+                .author_sha256 = prepared.author_sha256[0..],
+                .provider_sha256 = prepared.provider_sha256[0..],
+                .budget_authorization_sha256 = prepared.budget_authorization_sha256[0..],
+                .model = prepared.model,
+                .model_sha256 = prepared.model_sha256[0..],
+                .system_prompt_sha256 = prepared.system_prompt_sha256[0..],
+                .packet_sha256 = prepared.packet_sha256[0..],
+                .response_sha256 = response_sha256[0..],
+                .source = source,
+                .trigger = prepared.trigger,
+                .prepared_sha256 = permit.prepared_sha256[0..],
+                .authorization_sha256 = permit.authorization_sha256[0..],
+                .authorized_at_ns = permit.authorized_at_ns,
+                .cooldown_ns = permit.cooldown_ns,
+                .request_id = request_id[0..],
+                .caps = prepared.caps,
+                .pricing = prepared.pricing,
+                .usage = result.usage,
+                .provider_elapsed_ns = result.provider_elapsed_ns,
+                .decision = result.decision,
+                .reason_sha256 = reason_sha256[0..],
+                .proposal = proposal,
+            };
+            const body_json = try std.json.Stringify.valueAlloc(std.heap.c_allocator, body, .{});
+            defer std.heap.c_allocator.free(body_json);
+            const receipt_id = observation.sha256Hex(body_json);
+            break :blk try std.json.Stringify.valueAlloc(
+                std.heap.c_allocator,
+                ReceiptRecord{ .receipt_id = receipt_id[0..], .body = body },
+                .{},
+            );
+        },
+        .v2 => |binding| blk: {
+            const body = ReceiptBodyV2{
+                .project_sha256 = prepared.project_sha256[0..],
+                .author_sha256 = prepared.author_sha256[0..],
+                .provider_sha256 = prepared.provider_sha256[0..],
+                .budget_authorization_sha256 = prepared.budget_authorization_sha256[0..],
+                .model = prepared.model,
+                .model_sha256 = prepared.model_sha256[0..],
+                .system_prompt_sha256 = prepared.system_prompt_sha256[0..],
+                .packet_sha256 = prepared.packet_sha256[0..],
+                .response_sha256 = response_sha256[0..],
+                .source = source,
+                .trigger = prepared.trigger,
+                .prepared_sha256 = permit.prepared_sha256[0..],
+                .authorization_sha256 = permit.authorization_sha256[0..],
+                .authorized_at_ns = permit.authorized_at_ns,
+                .cooldown_ns = permit.cooldown_ns,
+                .request_id = request_id[0..],
+                .caps = prepared.caps,
+                .pricing = prepared.pricing,
+                .usage = result.usage,
+                .provider_elapsed_ns = result.provider_elapsed_ns,
+                .decision = result.decision,
+                .reason_sha256 = reason_sha256[0..],
+                .proposal = proposal,
+                .ontology_projection = wireProjectionIdentity(&binding),
+            };
+            const body_json = try std.json.Stringify.valueAlloc(std.heap.c_allocator, body, .{});
+            defer std.heap.c_allocator.free(body_json);
+            const receipt_id = observation.sha256Hex(body_json);
+            break :blk try std.json.Stringify.valueAlloc(
+                std.heap.c_allocator,
+                ReceiptRecordV2{ .receipt_id = receipt_id[0..], .body = body },
+                .{},
+            );
+        },
+    };
     defer std.heap.c_allocator.free(record_json);
     if (record_json.len + 1 > MAX_RECEIPT_BYTES) return error.ReceiptTooLarge;
+
+    // Extract the content-addressed id from the already canonical record. This
+    // is not a trust decision; loadReceipt() will strictly parse and rehash it.
+    var id_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer id_arena.deinit();
+    const id_probe = std.json.parseFromSliceLeaky(struct { receipt_id: []const u8 }, id_arena.allocator(), record_json, .{
+        .ignore_unknown_fields = true,
+        .duplicate_field_behavior = .@"error",
+    }) catch return error.InvalidAuthorReceipt;
+    const receipt_id = parseHex(id_probe.receipt_id) orelse return error.InvalidAuthorReceipt;
 
     var path_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
     const path = try std.fmt.bufPrint(
@@ -997,14 +1324,64 @@ pub fn loadReceipt(
     const path_z = try a.dupeZ(u8, path);
     const raw = try readReceiptFile(a, path_z.ptr);
     if (raw.len < 2 or raw[raw.len - 1] != '\n') return error.InvalidAuthorReceipt;
-    const record = std.json.parseFromSliceLeaky(ReceiptRecord, a, raw[0 .. raw.len - 1], .{
-        .ignore_unknown_fields = false,
+    const record_bytes = raw[0 .. raw.len - 1];
+    const probe = std.json.parseFromSliceLeaky(ReceiptSchemaProbe, a, record_bytes, .{
+        .ignore_unknown_fields = true,
         .allocate = .alloc_always,
         .duplicate_field_behavior = .@"error",
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidAuthorReceipt,
     };
+    if (std.mem.eql(u8, probe.body.schema_version, RECEIPT_SCHEMA_VERSION)) {
+        const record = std.json.parseFromSliceLeaky(ReceiptRecord, a, record_bytes, .{
+            .ignore_unknown_fields = false,
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidAuthorReceipt,
+        };
+        return validateLoadedReceipt(allocator, session_dir, &arena, receipt_id, record, .v1);
+    }
+    if (std.mem.eql(u8, probe.body.schema_version, RECEIPT_SCHEMA_VERSION_V2)) {
+        const record = std.json.parseFromSliceLeaky(ReceiptRecordV2, a, record_bytes, .{
+            .ignore_unknown_fields = false,
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidAuthorReceipt,
+        };
+        const binding = parseProjectionBinding(record.body.ontology_projection) orelse
+            return error.InvalidAuthorReceipt;
+        return validateLoadedReceipt(allocator, session_dir, &arena, receipt_id, record, .{ .v2 = binding });
+    }
+    return error.InvalidAuthorReceipt;
+}
+
+fn parseProjectionBinding(value: WireProjectionIdentity) ?ProjectionBinding {
+    return .{
+        .receipt_id = parseHex(value.receipt_id) orelse return null,
+        .packet_sha256 = parseHex(value.packet_sha256) orelse return null,
+        .ontology_revision = parseHex(value.ontology_revision) orelse return null,
+        .ontology_snapshot_sha256 = parseHex(value.ontology_snapshot_sha256) orelse return null,
+        .active_bundle_revision = value.active_bundle_revision,
+        .active_bundle_sha256 = parseHex(value.active_bundle_sha256) orelse return null,
+        .generation_evidence_sha256 = parseHex(value.generation_evidence_sha256) orelse return null,
+        .held_out_commitments_sha256 = parseHex(value.held_out_commitments_sha256) orelse return null,
+    };
+}
+
+fn validateLoadedReceipt(
+    allocator: std.mem.Allocator,
+    session_dir: []const u8,
+    arena: *std.heap.ArenaAllocator,
+    receipt_id: [64]u8,
+    record: anytype,
+    protocol: Protocol,
+) !LoadedReceipt {
+    const a = arena.allocator();
     const parsed_id = parseHex(record.receipt_id) orelse return error.InvalidAuthorReceipt;
     const project = parseHex(record.body.project_sha256) orelse return error.InvalidAuthorReceipt;
     const author_sha256 = parseHex(record.body.author_sha256) orelse return error.InvalidAuthorReceipt;
@@ -1026,7 +1403,11 @@ pub fn loadReceipt(
         return error.InvalidAuthorReceipt;
     const run_id = @import("session_id.zig").SessionId.fromSlice(record.body.source.run_id) orelse
         return error.InvalidAuthorReceipt;
-    if (!std.mem.eql(u8, record.body.schema_version, RECEIPT_SCHEMA_VERSION) or
+    const expected_schema = switch (protocol) {
+        .v1 => RECEIPT_SCHEMA_VERSION,
+        .v2 => RECEIPT_SCHEMA_VERSION_V2,
+    };
+    if (!std.mem.eql(u8, record.body.schema_version, expected_schema) or
         !std.mem.eql(u8, &parsed_id, &receipt_id) or
         record.body.source.first_sequence > record.body.source.last_sequence or
         !validText(record.body.model, MAX_MODEL_BYTES) or
@@ -1039,30 +1420,49 @@ pub fn loadReceipt(
         record.body.caps,
         record.body.pricing,
     )) return error.InvalidAuthorReceipt;
-    const reconstructed_prepared = PreparedIdentity{
-        .project_sha256 = record.body.project_sha256,
-        .author_sha256 = record.body.author_sha256,
-        .provider_sha256 = record.body.provider_sha256,
-        .budget_authorization_sha256 = record.body.budget_authorization_sha256,
-        .model_sha256 = record.body.model_sha256,
-        .system_prompt_sha256 = record.body.system_prompt_sha256,
-        .packet_sha256 = record.body.packet_sha256,
-        .interval_sha256 = record.body.source.interval_sha256,
-        .trigger = record.body.trigger,
-        .max_cost_microusd = record.body.caps.max_cost_microusd,
-        .max_input_tokens = record.body.caps.max_input_tokens,
-        .max_output_tokens = record.body.caps.max_output_tokens,
-        .pricing_provenance_sha256 = record.body.pricing.provenance_sha256[0..],
-        .input_microusd_per_mtok = record.body.pricing.input_microusd_per_mtok,
-        .output_microusd_per_mtok = record.body.pricing.output_microusd_per_mtok,
-        .cache_read_microusd_per_mtok = record.body.pricing.cache_read_microusd_per_mtok,
-        .cache_write_microusd_per_mtok = record.body.pricing.cache_write_microusd_per_mtok,
+    if (!std.mem.eql(u8, &prompt_sha256, &systemPromptSha256For(protocol)))
+        return error.InvalidAuthorReceipt;
+    const reconstructed_prepared_json = switch (protocol) {
+        .v1 => try std.json.Stringify.valueAlloc(a, PreparedIdentity{
+            .project_sha256 = record.body.project_sha256,
+            .author_sha256 = record.body.author_sha256,
+            .provider_sha256 = record.body.provider_sha256,
+            .budget_authorization_sha256 = record.body.budget_authorization_sha256,
+            .model_sha256 = record.body.model_sha256,
+            .system_prompt_sha256 = record.body.system_prompt_sha256,
+            .packet_sha256 = record.body.packet_sha256,
+            .interval_sha256 = record.body.source.interval_sha256,
+            .trigger = record.body.trigger,
+            .max_cost_microusd = record.body.caps.max_cost_microusd,
+            .max_input_tokens = record.body.caps.max_input_tokens,
+            .max_output_tokens = record.body.caps.max_output_tokens,
+            .pricing_provenance_sha256 = record.body.pricing.provenance_sha256[0..],
+            .input_microusd_per_mtok = record.body.pricing.input_microusd_per_mtok,
+            .output_microusd_per_mtok = record.body.pricing.output_microusd_per_mtok,
+            .cache_read_microusd_per_mtok = record.body.pricing.cache_read_microusd_per_mtok,
+            .cache_write_microusd_per_mtok = record.body.pricing.cache_write_microusd_per_mtok,
+        }, .{}),
+        .v2 => |binding| try std.json.Stringify.valueAlloc(a, PreparedIdentityV2{
+            .project_sha256 = record.body.project_sha256,
+            .author_sha256 = record.body.author_sha256,
+            .provider_sha256 = record.body.provider_sha256,
+            .budget_authorization_sha256 = record.body.budget_authorization_sha256,
+            .model_sha256 = record.body.model_sha256,
+            .system_prompt_sha256 = record.body.system_prompt_sha256,
+            .packet_sha256 = record.body.packet_sha256,
+            .interval_sha256 = record.body.source.interval_sha256,
+            .trigger = record.body.trigger,
+            .max_cost_microusd = record.body.caps.max_cost_microusd,
+            .max_input_tokens = record.body.caps.max_input_tokens,
+            .max_output_tokens = record.body.caps.max_output_tokens,
+            .pricing_provenance_sha256 = record.body.pricing.provenance_sha256[0..],
+            .input_microusd_per_mtok = record.body.pricing.input_microusd_per_mtok,
+            .output_microusd_per_mtok = record.body.pricing.output_microusd_per_mtok,
+            .cache_read_microusd_per_mtok = record.body.pricing.cache_read_microusd_per_mtok,
+            .cache_write_microusd_per_mtok = record.body.pricing.cache_write_microusd_per_mtok,
+            .ontology_projection = wireProjectionIdentity(&binding),
+        }, .{}),
     };
-    const reconstructed_prepared_json = try std.json.Stringify.valueAlloc(
-        a,
-        reconstructed_prepared,
-        .{},
-    );
     if (!std.mem.eql(
         u8,
         &prepared_sha256,
@@ -1103,8 +1503,20 @@ pub fn loadReceipt(
     }
     if ((record.body.decision == .propose) != (record.body.proposal != null))
         return error.InvalidAuthorReceipt;
+    switch (protocol) {
+        .v1 => {},
+        .v2 => |binding| {
+            var loaded_projection = try reopenProjectionBinding(
+                allocator,
+                session_dir,
+                project,
+                binding,
+            );
+            loaded_projection.deinit();
+        },
+    }
     return .{
-        .arena = arena,
+        .arena = arena.*,
         .receipt_id = receipt_id,
         .project_sha256 = project,
         .author_sha256 = author_sha256,
@@ -1136,6 +1548,7 @@ pub fn loadReceipt(
         .falsifier_sha256 = falsifier_sha256,
         .rule_spec_sha256 = rule_spec_sha256,
         .lean_source_sha256 = lean_source_sha256,
+        .protocol = protocol,
     };
 }
 
@@ -1184,6 +1597,7 @@ fn receiptMatchesResult(
         receipt.decision != result.decision or
         !std.meta.eql(receipt.usage, result.usage) or
         receipt.provider_elapsed_ns != result.provider_elapsed_ns or
+        !std.meta.eql(receipt.protocol, result.protocol) or
         !std.mem.eql(u8, &receipt.reason_sha256, &observation.sha256Hex(result.reason)))
         return false;
     const proposal = result.proposal orelse return receipt.decision == .abstain;
@@ -1327,6 +1741,14 @@ test "rule author gate is fail-closed and binds request identity" {
     try validatePermit(&prepared, permit);
     prepared.packet_sha256 = .{'e'} ** 64;
     try std.testing.expectError(error.PreparedRequestDrift, validatePermit(&prepared, permit));
+}
+
+test "v1 rule author prompt remains byte-compatible for cache and old receipts" {
+    try std.testing.expectEqualStrings(
+        "9e6affe7ae9548a90f9d52fc537956f334e3730828b80d512cc2f8ba8b063514",
+        &systemPromptSha256(),
+    );
+    try std.testing.expectEqualStrings(SYSTEM_PROMPT, systemPrompt(.v1));
 }
 
 test "canonical Lean is deterministic and carries the full RuleSpec v2" {
