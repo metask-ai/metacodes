@@ -21,12 +21,14 @@ import tempfile
 from typing import Any, Dict, List, Mapping, Sequence
 
 
-MANIFEST_SCHEMA = "metacodes-project-harness-evolution-manifest-v1"
-REPORT_SCHEMA = "metacodes-project-harness-evolution-report-v1"
+MANIFEST_SCHEMA = "metacodes-project-harness-evolution-manifest-v2"
+REPORT_SCHEMA = "metacodes-project-harness-evolution-report-v2"
 PREPARE_SCHEMA = "metacodes-project-harness-lifecycle-prepare-v2"
 FINAL_SCHEMA = "metacodes-project-harness-lifecycle-final-v2"
 AUDIT_SCHEMA = "metacodes-project-harness-lifecycle-audit-v2"
 BUILD_SCHEMA = "metacodes-project-rule-build-v1"
+RUNTIME_CONTRACT_SCHEMA = "metacodes-project-harness-runtime-contract-v1"
+RULE_FLAVORS = frozenset({"evolved", "static"})
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_JOURNAL_BYTES = 64 * 1024 * 1024
 RUNTIME_SESSION_ID = "fedcba9876543210fedcba98"
@@ -157,6 +159,12 @@ def _identity(value: Any, where: str) -> str:
     return value
 
 
+def _project_identity(project_root: Path) -> str:
+    return _sha256_bytes(
+        b"metacodes-project-identity-v1\x00" + os.fsencode(str(project_root))
+    )
+
+
 def _inside(root: Path, child: Path) -> bool:
     try:
         child.resolve(strict=True).relative_to(root.resolve(strict=True))
@@ -194,9 +202,27 @@ def freeze_manifest(
     kernel: Path,
     lake: Path,
     builder: Path,
+    *,
+    project_root: Path | None = None,
+    home_root: Path | None = None,
+    rule_flavor: str = "evolved",
 ) -> Dict[str, Any]:
     repo = repo.resolve(strict=True)
     root = root.resolve(strict=True)
+    if rule_flavor not in RULE_FLAVORS:
+        raise EvolutionError(f"unsupported project rule flavor: {rule_flavor}")
+    project_root = (project_root if project_root is not None else root / "project").resolve(
+        strict=False
+    )
+    home_root = (home_root if home_root is not None else root / "home").resolve(
+        strict=False
+    )
+    if not project_root.is_absolute() or not home_root.is_absolute():
+        raise EvolutionError("runtime project/HOME paths must be absolute")
+    if project_root != Path(os.path.normpath(str(project_root))):
+        raise EvolutionError("runtime project path must use canonical lexical spelling")
+    if home_root != root / "home":
+        raise EvolutionError("runtime HOME must be the artifact-local home directory")
     artifacts = {
         "driver": driver.resolve(strict=True),
         "kernel": kernel.resolve(strict=True),
@@ -218,6 +244,14 @@ def freeze_manifest(
         "external_network_calls_authorized": 0,
         "paid_cost_authority_usd": 0,
         "raw_artifact_root": str(root),
+        "runtime_contract": {
+            "schema_version": RUNTIME_CONTRACT_SCHEMA,
+            "rule_flavor": rule_flavor,
+            "project_root": str(project_root),
+            "home_root": str(home_root),
+            "project_root_binding": "exact_absolute",
+            "home_root_binding": "artifact_local_exact",
+        },
         "repository": dict(_git_identity(repo)),
         "artifacts": {
             name: {"path": str(path), "sha256": _sha256_file(path)}
@@ -284,6 +318,30 @@ def analyze_lifecycle(manifest_path: Path) -> Dict[str, Any]:
     root = Path(str(manifest.get("raw_artifact_root", "")))
     if not root.is_absolute() or not _inside(root, manifest_path):
         raise EvolutionError("manifest/root binding drift")
+    runtime_contract = manifest.get("runtime_contract")
+    if not isinstance(runtime_contract, Mapping) or set(runtime_contract) != {
+        "schema_version",
+        "rule_flavor",
+        "project_root",
+        "home_root",
+        "project_root_binding",
+        "home_root_binding",
+    }:
+        raise EvolutionError("manifest runtime contract drift")
+    rule_flavor = runtime_contract.get("rule_flavor")
+    project_root = Path(str(runtime_contract.get("project_root", "")))
+    home_root = Path(str(runtime_contract.get("home_root", "")))
+    if (
+        runtime_contract.get("schema_version") != RUNTIME_CONTRACT_SCHEMA
+        or rule_flavor not in RULE_FLAVORS
+        or runtime_contract.get("project_root_binding") != "exact_absolute"
+        or runtime_contract.get("home_root_binding") != "artifact_local_exact"
+        or not project_root.is_absolute()
+        or not home_root.is_absolute()
+        or project_root != Path(os.path.normpath(str(project_root)))
+        or home_root != root / "home"
+    ):
+        raise EvolutionError("manifest runtime contract is invalid")
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, Mapping):
         raise EvolutionError("manifest has no frozen artifacts")
@@ -314,6 +372,8 @@ def analyze_lifecycle(manifest_path: Path) -> Dict[str, Any]:
         raise EvolutionError("E2 result claimed E3 superiority")
 
     project = _identity(prepare.get("project_sha256"), "prepare.project_sha256")
+    if project != _project_identity(project_root):
+        raise EvolutionError("project identity does not bind the runtime project path")
     candidate = _identity(prepare.get("candidate_id"), "prepare.candidate_id")
     source = _identity(prepare.get("source_receipt_id"), "prepare.source_receipt_id")
     for name, value in (("final", final), ("audit", audit)):
@@ -339,22 +399,36 @@ def analyze_lifecycle(manifest_path: Path) -> Dict[str, Any]:
         final.get("source_kind") != "user_correction"
         or final.get("real_isolated_lean_build") is not True
         or final.get("synthetic_active_identity") is not False
-        or final.get("runtime_blocked_before_dispatch") is not True
+        or prepare.get("rule_flavor") != rule_flavor
+        or final.get("rule_flavor") != rule_flavor
+        or audit.get("rule_flavor") != rule_flavor
+        or final.get("runtime_blocked_before_dispatch") is not (rule_flavor == "evolved")
         or final.get("runtime_task_succeeded") is not True
-        or final.get("runtime_recovery_succeeded") is not True
+        or final.get("runtime_recovery_succeeded") is not (rule_flavor == "evolved")
     ):
         raise EvolutionError("production lifecycle mechanism gate failed")
 
-    project_root = Path(str(prepare.get("project_root", "")))
-    home_root = Path(str(prepare.get("home_root", "")))
     session_dir = Path(str(prepare.get("session_dir", "")))
     rules_dir = Path(str(prepare.get("rules_dir", "")))
     candidate_path = Path(str(prepare.get("candidate_path", "")))
-    for path in (project_root, home_root, session_dir, rules_dir, candidate_path):
+    if (
+        Path(str(prepare.get("project_root", ""))) != project_root
+        or Path(str(prepare.get("home_root", ""))) != home_root
+    ):
+        raise EvolutionError("prepare/runtime path contract drift")
+    if project_root.resolve(strict=True) != project_root:
+        raise EvolutionError("runtime project path is not canonical")
+    for path in (home_root, session_dir, rules_dir, candidate_path):
         if not path.is_absolute() or not _inside(root, path):
             raise EvolutionError(f"lifecycle path escaped experiment root: {path}")
-    if project_root != root / "project" or home_root != root / "home":
-        raise EvolutionError("project/home path binding drift")
+    state_root = session_dir.parent
+    if (
+        session_dir.name != "0123456789abcdef01234567"
+        or rules_dir != state_root / "project-rules"
+        or candidate_path.parent != session_dir
+        or state_root.parent != home_root / ".metacodes/projects"
+    ):
+        raise EvolutionError("lifecycle state path topology drift")
     if candidate_path.name != f"rule-candidate-{candidate}.json":
         raise EvolutionError("candidate path identity drift")
     candidate_record = _read_json(candidate_path)
@@ -486,7 +560,6 @@ def analyze_lifecycle(manifest_path: Path) -> Dict[str, Any]:
     ):
         raise EvolutionError("active bundle identity drift")
 
-    state_root = session_dir.parent
     runtime_dir = state_root / RUNTIME_SESSION_ID
     journal_path = runtime_dir / "tool-observations.jsonl"
     if _sha256_file(journal_path) != final.get("runtime_journal_sha256"):
@@ -531,18 +604,14 @@ def analyze_lifecycle(manifest_path: Path) -> Dict[str, Any]:
         single = observation.get("formal_decision")
         if isinstance(single, Mapping):
             formal.append({**single, "_sequence": record["sequence"]})
-    # The model/provider requested one Write. Lean blocks that operation, then
-    # the host deterministically rewrites it to one exact Edit under a second
-    # Lean generation while retaining the original tool id. A dispatched Write
-    # is always a failure; requested Write + dispatched Edit is the expected
-    # source-bound recovery identity.
     if (
         [item.get("id") for item in dispatch_starts] != ["runtime-write"]
         or [item.get("id") for item in dispatch_finishes] != ["runtime-write"]
     ):
-        raise EvolutionError("host rewrite dispatch identity drift")
-    if len(formal) != 3:
-        raise EvolutionError("runtime did not emit the expected three formal decisions")
+        raise EvolutionError("runtime dispatch identity drift")
+    expected_formal_count = 3 if rule_flavor == "evolved" else 2
+    if len(formal) != expected_formal_count:
+        raise EvolutionError("runtime formal-decision count drift")
     kernel_sha = _identity(artifacts["kernel"].get("sha256"), "kernel.sha256")
     for item in formal:
         if (
@@ -562,51 +631,6 @@ def analyze_lifecycle(manifest_path: Path) -> Dict[str, Any]:
             "verdict_sha256",
         ):
             _identity(item.get(key), f"formal.{key}")
-    write_blocks = sum(
-        item.get("dispatch_id") == "runtime-write"
-        and item.get("operation") == "pre_decision"
-        and item.get("phase") == "pre"
-        and item.get("result") == "block"
-        and item.get("recovery_action") == "edit_existing_file_exact"
-        and item.get("actuation") == "enforced"
-        and item.get("candidate_id") == candidate
-        for item in formal
-    )
-    recovery_pre_admits = sum(
-        item.get("dispatch_id") == "runtime-write"
-        and item.get("operation") == "recovery_pre_decision"
-        and item.get("phase") == "pre"
-        and item.get("result") == "admit"
-        and item.get("actuation") == "enforced"
-        and item.get("candidate_id") == candidate
-        for item in formal
-    )
-    recovery_post_admits = sum(
-        item.get("dispatch_id") == "runtime-write"
-        and item.get("operation") == "recovery_post_decision"
-        and item.get("phase") == "post"
-        and item.get("result") == "admit"
-        and item.get("actuation") == "enforced"
-        and item.get("candidate_id") == candidate
-        for item in formal
-    )
-    if write_blocks != 1 or recovery_pre_admits != 1 or recovery_post_admits != 1:
-        raise EvolutionError("runtime formal-decision order/result drift")
-    write_pre = next(
-        item for item in formal
-        if item.get("dispatch_id") == "runtime-write"
-        and item.get("operation") == "pre_decision"
-    )
-    recovery_pre = next(
-        item for item in formal
-        if item.get("dispatch_id") == "runtime-write"
-        and item.get("operation") == "recovery_pre_decision"
-    )
-    recovery_post = next(
-        item for item in formal
-        if item.get("dispatch_id") == "runtime-write"
-        and item.get("operation") == "recovery_post_decision"
-    )
     rewrite_started = dispatch_starts[0]
     rewrite_finished = dispatch_finishes[0]
     start_sequence = next(
@@ -617,10 +641,40 @@ def analyze_lifecycle(manifest_path: Path) -> Dict[str, Any]:
         record["sequence"] for record in events
         if (_formal_or_dispatch(record) or (None, None))[0] == "dispatch_finished"
     )
-    if not (
-        write_pre["_sequence"] < recovery_pre["_sequence"] < start_sequence
-        < recovery_post["_sequence"] < finish_sequence
-    ):
+    if rule_flavor == "evolved":
+        expected_tool = "Edit"
+        expected_decisions = (
+            ("pre_decision", "pre", "block", "edit_existing_file_exact"),
+            ("recovery_pre_decision", "pre", "admit", "none"),
+            ("recovery_post_decision", "post", "admit", "none"),
+        )
+    else:
+        expected_tool = "Write"
+        expected_decisions = (
+            ("pre_decision", "pre", "admit", "none"),
+            ("post_decision", "post", "admit", "none"),
+        )
+    matched_decisions: List[Mapping[str, Any]] = []
+    for operation, phase, result, recovery_action in expected_decisions:
+        matches = [
+            item for item in formal
+            if item.get("dispatch_id") == "runtime-write"
+            and item.get("operation") == operation
+            and item.get("phase") == phase
+            and item.get("result") == result
+            and item.get("recovery_action") == recovery_action
+            and item.get("candidate_id") == candidate
+        ]
+        if len(matches) != 1:
+            raise EvolutionError("runtime formal-decision result drift")
+        matched_decisions.append(matches[0])
+    decision_sequences = [item["_sequence"] for item in matched_decisions]
+    expected_order = (
+        [decision_sequences[0], decision_sequences[1], start_sequence, decision_sequences[2], finish_sequence]
+        if rule_flavor == "evolved"
+        else [decision_sequences[0], start_sequence, decision_sequences[1], finish_sequence]
+    )
+    if expected_order != sorted(expected_order) or len(set(expected_order)) != len(expected_order):
         raise EvolutionError("formal gate/dispatch causal ordering drift")
     effect = rewrite_finished.get("effect")
     mutation_v2 = effect.get("file_mutation_v2") if isinstance(effect, Mapping) else None
@@ -628,9 +682,9 @@ def analyze_lifecycle(manifest_path: Path) -> Dict[str, Any]:
     reobservation = mutation_v2.get("reobservation") if isinstance(mutation_v2, Mapping) else None
     if (
         rewrite_started.get("requested_name") != "Write"
-        or rewrite_started.get("dispatched_name") != "Edit"
+        or rewrite_started.get("dispatched_name") != expected_tool
         or rewrite_finished.get("requested_name") != "Write"
-        or rewrite_finished.get("dispatched_name") != "Edit"
+        or rewrite_finished.get("dispatched_name") != expected_tool
         or rewrite_finished.get("outcome") != "succeeded"
         or rewrite_finished.get("effect_valid") is not True
         or not isinstance(mutation, Mapping)
@@ -638,7 +692,7 @@ def analyze_lifecycle(manifest_path: Path) -> Dict[str, Any]:
         or not isinstance(reobservation, Mapping)
         or reobservation.get("state") != "matched"
     ):
-        raise EvolutionError("Lean-authorized host rewrite lacks a successful reobserved effect")
+        raise EvolutionError("Lean-authorized dispatch lacks a successful reobserved effect")
     if _read_regular(project_root / "protected.txt", 1024) != b"new":
         raise EvolutionError("admitted host rewrite did not recover the real file")
 
@@ -648,20 +702,31 @@ def analyze_lifecycle(manifest_path: Path) -> Dict[str, Any]:
         "isolated_lean_build_and_empty_axiom_audit": True,
         "replay_shadow_promotion_chain_reopened": True,
         "hash_pinned_active_bundle_reattested": True,
-        "write_blocked_before_dispatch": True,
-        "lean_authorized_host_rewrite_reobserved": True,
+        "runtime_contract_and_rule_flavor_matched": True,
         "independent_process_audit_passed": True,
         "provider_requests_zero": True,
     }
+    if rule_flavor == "evolved":
+        gates.update({
+            "write_blocked_before_dispatch": True,
+            "lean_authorized_host_rewrite_reobserved": True,
+        })
+    else:
+        gates.update({
+            "bounded_write_admitted_by_static_rule": True,
+            "static_write_effect_reobserved": True,
+        })
     return {
         "schema_version": REPORT_SCHEMA,
         "manifest_sha256": _sha256_file(manifest_path),
         "evidence_level": "E2",
         "quality_evidence": False,
         "outcome_superiority_claimed": False,
+        "rule_flavor": rule_flavor,
         "evolution_lifecycle_passed": all(gates.values()),
         "gates": gates,
         "candidate_id": candidate,
+        "project_root": str(project_root),
         "source_receipt_id": source,
         "promotion_receipt_id": final["promotion_receipt_id"],
         "bundle_sha256": final["bundle_sha256"],
@@ -699,6 +764,10 @@ def run_evolution(
     kernel: Path,
     lake: Path,
     builder: Path,
+    *,
+    project_root: Path | None = None,
+    home_root: Path | None = None,
+    rule_flavor: str = "evolved",
 ) -> Dict[str, Any]:
     repo = repo.resolve(strict=True)
     root = root.absolute()
@@ -712,7 +781,23 @@ def run_evolution(
     # Keep the spelling passed to Seatbelt, the native driver, and the
     # analyzer identical (`/var` is a symlink to `/private/var` on macOS).
     root = root.resolve(strict=True)
-    manifest = freeze_manifest(repo, root, driver, kernel, lake, builder)
+    project_root = (project_root if project_root is not None else root / "project").resolve(
+        strict=False
+    )
+    home_root = (home_root if home_root is not None else root / "home").resolve(
+        strict=False
+    )
+    manifest = freeze_manifest(
+        repo,
+        root,
+        driver,
+        kernel,
+        lake,
+        builder,
+        project_root=project_root,
+        home_root=home_root,
+        rule_flavor=rule_flavor,
+    )
     manifest_path = root / "manifest.json"
     _write_new(manifest_path, manifest)
     frozen = manifest["artifacts"]
@@ -728,7 +813,13 @@ def run_evolution(
         "METACODES_PROJECT_KERNEL_SHA256": kernel_sha,
     }
     driver_path = str(frozen["driver"]["path"])
-    _run([driver_path, "--phase", "prepare", "--root", str(root)], repo, base_env)
+    runtime_args = [
+        "--root", str(root),
+        "--project-root", str(project_root),
+        "--home-root", str(home_root),
+        "--rule-flavor", rule_flavor,
+    ]
+    _run([driver_path, "--phase", "prepare", *runtime_args], repo, base_env)
     prepare = _read_json(root / "lifecycle-prepare.json")
     candidate_path = Path(str(prepare.get("candidate_path", "")))
     candidate_id = _identity(prepare.get("candidate_id"), "prepare.candidate_id")
@@ -754,8 +845,7 @@ def run_evolution(
         {"PATH": os.defpath, "TMPDIR": tempfile.gettempdir(), "LANG": "C", "LC_ALL": "C", "TZ": "UTC"},
     )
     common = [
-        "--root",
-        str(root),
+        *runtime_args,
         "--repo",
         str(repo),
         "--build-dir",
@@ -787,6 +877,9 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--kernel", type=Path, required=True)
     run.add_argument("--lake", type=Path, required=True)
     run.add_argument("--builder", type=Path, required=True)
+    run.add_argument("--project-root", type=Path)
+    run.add_argument("--home-root", type=Path)
+    run.add_argument("--rule-flavor", choices=sorted(RULE_FLAVORS), default="evolved")
     analyze = sub.add_parser("analyze")
     analyze.add_argument("--manifest", type=Path, required=True)
     analyze.add_argument("--output", type=Path, required=True)
@@ -804,6 +897,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.kernel,
                 args.lake,
                 args.builder,
+                project_root=args.project_root,
+                home_root=args.home_root,
+                rule_flavor=args.rule_flavor,
             )
         else:
             report = analyze_lifecycle(args.manifest)
