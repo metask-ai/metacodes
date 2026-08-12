@@ -1036,6 +1036,13 @@ const AbiSession = struct {
             .ui_request_pending => {
                 changed = self.run_state_projector.setPhase(.waiting_ui);
             },
+            .diag_compact_request => |value| {
+                if (std.mem.eql(u8, value.outcome, "started")) {
+                    changed = self.run_state_projector.setPhase(.compacting);
+                } else if (self.run_state_projector.phase == .compacting) {
+                    changed = self.run_state_projector.setPhase(.generating);
+                }
+            },
             .diag_run_end => |value| {
                 if (self.run_state_projector.setPhase(.finalizing)) {
                     if (!self.emitRunStateSnapshot(session_id, run_id)) return false;
@@ -1059,6 +1066,12 @@ const AbiSession = struct {
     fn startRunState(self: *AbiSession, session_id: core.session_id.SessionId, run_id: u64) bool {
         self.run_state_projector.begin(run_id);
         return self.emitRunStateSnapshot(session_id, run_id);
+    }
+
+    fn emitPoisonedRunState(self: *AbiSession, run_id: u64) void {
+        if (self.callback_status.load(.acquire) != wire.STATUS_OK) return;
+        self.run_state_projector.closeForTerminal(.poisoned);
+        _ = self.emitRunStateSnapshot(self.core_session.session_id, run_id);
     }
 
     fn emit(raw: *anyopaque, session_id: core.session_id.SessionId, run_id: u64, event: core.protocol.ui_event.CoreEvent) bool {
@@ -5798,8 +5811,10 @@ fn sessionRunInput(
                 if (err == error.CheckpointBudgetRequired)
                     writeRunBudgetFields(self, out);
                 if (err == error.AdmittedCleanupFailed or
-                    self.core_session.isPoisoned())
+                    self.core_session.isPoisoned()) {
+                    if (self.core_session.isPoisoned()) self.emitPoisonedRunState(run_id);
                     self.facade_poisoned.store(true, .release);
+                }
                 return failError(status, err, out_error);
             };
             break :text_run text_execution;
@@ -5833,8 +5848,10 @@ fn sessionRunInput(
                 if (err == error.CheckpointBudgetRequired)
                     writeRunBudgetFields(self, out);
                 if (err == error.AdmittedCleanupFailed or
-                    self.core_session.isPoisoned())
+                    self.core_session.isPoisoned()) {
+                    if (self.core_session.isPoisoned()) self.emitPoisonedRunState(run_id);
                     self.facade_poisoned.store(true, .release);
+                }
                 return failError(status, err, out_error);
             };
         },

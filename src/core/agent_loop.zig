@@ -2013,6 +2013,18 @@ fn runAutoCompactIfNeeded(
         // 任务锚:进行中的任务确定性追加到摘要尾(压缩有损,闭环纪律硬保底)。
         const task_anchor: ?[]u8 = if (tasks) |ts| compact_summary.buildTaskAnchor(allocator, ts) else null;
         defer if (task_anchor) |a| allocator.free(a);
+        // Lifecycle boundary: the compact request is now admitted. The
+        // completion diagnostic below remains useful for elapsed/outcome
+        // telemetry, while the ABI RunState projector observes this start
+        // boundary before provider work begins.
+        backend.emitEvent(sess, .{ .diag_compact_request = .{
+            .trace_id = trace_id,
+            .depth = depth,
+            .turn = turn,
+            .elapsed_ms = 0,
+            .outcome = "started",
+            .cause = trigger_cause,
+        } });
         const EstimateContext = struct {
             allocator: std.mem.Allocator,
             provider: provider_mod.Provider,
