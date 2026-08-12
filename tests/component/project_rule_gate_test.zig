@@ -3328,6 +3328,99 @@ test "L2 project rule batch runtime uses two checker calls for 4 rules" {
     _ = try runBatchRuntimeFixture(4);
 }
 
+test "L2 repeated identical signals retain distinct physical checker calls" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
+    defer allocator.free(evidence_dir);
+    try cc.util_fs.mkdirParents(evidence_dir);
+
+    var active = try syntheticActive(allocator, 1, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+    };
+    const sid = cc.session_id.SessionId.fromSlice("1123456789abcdef01234567").?;
+    var journal = try cc.tool_observation_journal.Journal.init(evidence_dir, sid);
+    const sink = journal.sink();
+    runtime.evidence_dir = evidence_dir;
+    runtime.observation_sink = sink;
+    var probe = Probe{};
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.tool_dispatcher = probe.dispatcher();
+    ctx.project_rule_gate = runtime.protocolGate();
+    ctx.tool_observer = sink;
+
+    for ([_][]const u8{ "same-signal-a", "same-signal-b" }) |dispatch_id| {
+        const result = try cc.tool_exec.executeOne(
+            &ctx,
+            "Read",
+            "{}",
+            dispatch_id,
+            allocator,
+            .{ .bytes = [_]u8{'0'} ** 12 },
+        );
+        switch (result) {
+            .done => |done| {
+                if (done.content) |bytes| allocator.free(bytes);
+                try std.testing.expect(!done.is_error);
+            },
+            else => return error.UnexpectedToolResult,
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    try journal.finishRun("end_turn");
+    const binding = try journal.runBinding();
+    journal.deinit();
+
+    var observed = try cc.tool_observation_journal.loadRunDispatches(
+        allocator,
+        evidence_dir,
+        binding,
+    );
+    defer observed.deinit();
+    try std.testing.expectEqual(@as(usize, 4), observed.formal_decisions.len);
+
+    var calls = std.AutoHashMap([64]u8, void).init(allocator);
+    defer calls.deinit();
+    var pre_request: ?[64]u8 = null;
+    var post_request: ?[64]u8 = null;
+    for (observed.formal_decisions) |formal| {
+        const call = formal.checker_call_sha256 orelse
+            return error.MissingCheckerCallIdentity;
+        const entry = try calls.getOrPut(call);
+        try std.testing.expect(!entry.found_existing);
+        switch (formal.phase) {
+            .pre => {
+                if (pre_request) |expected|
+                    try std.testing.expectEqualSlices(u8, &expected, &formal.request_sha256)
+                else
+                    pre_request = formal.request_sha256;
+            },
+            .post => {
+                if (post_request) |expected|
+                    try std.testing.expectEqualSlices(u8, &expected, &formal.request_sha256)
+                else
+                    post_request = formal.request_sha256;
+            },
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 4), calls.count());
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &(pre_request orelse unreachable),
+        &(post_request orelse unreachable),
+    ));
+}
+
 test "L2 project rule batch runtime uses two checker calls for 16 rules" {
     _ = try runBatchRuntimeFixture(16);
 }

@@ -627,6 +627,11 @@ pub const RuntimeGate = struct {
             };
         }
         const first = &batch.invocations[0];
+        const checker_call_sha256 = physicalCheckerCallIdentity(
+            first.checker_call_sha256 orelse return .{ .result = .fault },
+            dispatch_id,
+            phase,
+        );
         if (!sink.emit(.{ .formal_decision_batch = .{
             .dispatch_id = dispatch_id,
             .phase = phase,
@@ -636,7 +641,7 @@ pub const RuntimeGate = struct {
             .bundle_sha256 = self.active.bundle_sha256,
             .bundle_revision = self.active.revision,
             .kernel_sha256 = self.active.kernel_sha256,
-            .checker_call_sha256 = first.checker_call_sha256 orelse return .{ .result = .fault },
+            .checker_call_sha256 = checker_call_sha256,
             .checker_verdict_sha256 = batch.verdict_sha256,
             .checker_batch_size = first.checker_batch_size,
             .checker_elapsed_ns = first.checker_elapsed_ns,
@@ -720,6 +725,29 @@ pub const RuntimeGate = struct {
                 self.inflight_exact_edits[self.inflight_exact_edits_len];
     }
 };
+
+/// A checker request digest identifies bytes, not a physical execution. Two
+/// legitimate tool calls can carry byte-identical signals (for example two
+/// reads with the same input size), so publishing the request digest as the
+/// call identity collapses distinct subprocess executions in the durable
+/// journal. Bind the content digest to the host-observed dispatch and phase;
+/// `request_sha256` remains available separately for content equality.
+fn physicalCheckerCallIdentity(
+    request_batch_sha256: [64]u8,
+    dispatch_id: []const u8,
+    phase: observation.FormalPhase,
+) [64]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("metacodes-project-checker-call-v1\x00");
+    hasher.update(&request_batch_sha256);
+    hasher.update("\x00");
+    hasher.update(@tagName(phase));
+    hasher.update("\x00");
+    hasher.update(dispatch_id);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
 
 fn isRecoveryOperation(operation: kernel.Operation) bool {
     return switch (operation) {
