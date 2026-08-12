@@ -10,6 +10,7 @@ const pfs = @import("platform").fs;
 const util_fs = @import("../util/fs.zig");
 const observation = @import("../tools/observation.zig");
 const candidate_mod = @import("rule_candidate.zig");
+const candidate_source = @import("rule_candidate_source.zig");
 const lifecycle = @import("rule_lifecycle.zig");
 const evaluation = @import("rule_evaluation.zig");
 const build_bundle = @import("rule_build_bundle.zig");
@@ -134,11 +135,18 @@ const OptionalActive = union(enum) {
 
 pub fn promote(allocator: std.mem.Allocator, input: PromoteInput) !PromoteResult {
     try validatePromoteInput(input);
-    try util_fs.mkdirParents(input.project_rules_dir);
     var candidate = try candidate_mod.load(allocator, input.evidence_dir, input.candidate_id);
     defer candidate.deinit();
     if (!std.mem.eql(u8, &candidate.project_sha256, &input.project_sha256))
         return error.ProjectIdentityMismatch;
+
+    // Reject a stale/tampered source before creating the rules directory,
+    // reopening lifecycle/build artifacts, or invoking an evaluation checker.
+    // A second verification under the active lease below closes the window
+    // between these read-only checks and construction of the new bundle.
+    if (!try candidate_source.verify(allocator, input.evidence_dir, &candidate))
+        return error.SourceReceiptMismatch;
+    try util_fs.mkdirParents(input.project_rules_dir);
 
     var shadow = try lifecycle.load(allocator, input.evidence_dir, input.shadow_receipt_id);
     defer shadow.deinit();
@@ -234,6 +242,17 @@ pub fn promote(allocator: std.mem.Allocator, input: PromoteInput) !PromoteResult
         if (equalHex(entry.candidate_id, input.candidate_id)) return error.CandidateAlreadyActive;
     }
 
+    // Reopen the entire candidate source before constructing or persisting a
+    // new bundle.  An addressed bundle is inert until active-CAS, but leaving
+    // orphan artifacts for a drifted ontology/author receipt obscures audit
+    // causality and turns a source failure into a partial side effect.
+    const source_bound = try candidate_source.verify(
+        allocator,
+        input.evidence_dir,
+        &candidate,
+    );
+    if (!source_bound) return error.SourceReceiptMismatch;
+
     const rules = try allocator.alloc(RuleEntry, previous_rules.len + 1);
     defer allocator.free(rules);
     @memcpy(rules[0..previous_rules.len], previous_rules);
@@ -257,15 +276,12 @@ pub fn promote(allocator: std.mem.Allocator, input: PromoteInput) !PromoteResult
     defer allocator.free(bundle_json);
     try persistAddressed(input.project_rules_dir, BUNDLE_PREFIX, bundle_sha256, bundle_json);
 
-    const source_bound = try candidate.sourceIsBound(
-        allocator,
-        input.evidence_dir,
-    );
     const facts = kernel.PromotionFacts{
         .source_kind = switch (candidate.source_kind) {
             .user_correction => .user_correction,
             .agent_reflection => .agent_reflection,
             .runtime_counterexample => .runtime_counterexample,
+            .rule_author => .rule_author,
         },
         .source_receipt_bound = source_bound,
         .proposer = candidate.proposer_sha256[0..],

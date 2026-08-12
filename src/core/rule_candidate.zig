@@ -14,7 +14,8 @@ const session_id_mod = @import("session_id.zig");
 const util_fs = @import("../util/fs.zig");
 const project_rule_spec = @import("project_rule_spec.zig");
 
-pub const SCHEMA_VERSION = "metacodes-rule-candidate-v3";
+pub const SCHEMA_VERSION = "metacodes-rule-candidate-v4";
+pub const LEGACY_SCHEMA_VERSION = "metacodes-rule-candidate-v3";
 pub const FILE_PREFIX = "rule-candidate-";
 pub const MAX_INVARIANT_BYTES: usize = 8 * 1024;
 pub const MAX_FALSIFIER_BYTES: usize = 8 * 1024;
@@ -40,10 +41,22 @@ pub const RuntimeCounterexample = struct {
     verdict_sha256: [64]u8,
 };
 
+/// A proposal emitted by the isolated rule-author provider.  The author
+/// receipt is an explicit source kind rather than an overloaded
+/// `agent_reflection` identity: downstream governance must reopen that receipt
+/// (and, for v2 receipts, its ontology projection) before admitting any
+/// lifecycle or promotion transition.
+pub const RuleAuthor = struct {
+    receipt_id: [64]u8,
+    observation: observation_journal.RunBinding,
+    falsifier: []const u8,
+};
+
 pub const Source = union(enum) {
     user_correction: UserCorrection,
     agent_reflection: AgentReflection,
     runtime_counterexample: RuntimeCounterexample,
+    rule_author: RuleAuthor,
 };
 
 pub const ProposalInput = struct {
@@ -67,10 +80,12 @@ pub const SourceKind = enum {
     user_correction,
     agent_reflection,
     runtime_counterexample,
+    rule_author,
 };
 
 pub const Loaded = struct {
     arena: std.heap.ArenaAllocator,
+    legacy_schema: bool,
     candidate_id: [64]u8,
     project_sha256: [64]u8,
     proposer_sha256: [64]u8,
@@ -134,7 +149,28 @@ pub const Loaded = struct {
                 break :blk validated.summary.complete and
                     std.mem.eql(u8, &validated.interval_sha256, &expected);
             },
+            // A candidate cannot authenticate an author receipt without
+            // importing rule_author and creating a dependency cycle.  Full
+            // governance callers must use rule_candidate_source.verify().
+            .rule_author => false,
         };
+    }
+
+    /// Reopen the immediate observation evidence committed by a source.  For
+    /// `rule_author` this is deliberately only the inner run binding; it is
+    /// used by rule_author.verifyCandidateBinding() after that function has
+    /// independently reopened the author receipt and ontology projection.
+    pub fn sourceEvidenceIsBound(
+        self: *const Loaded,
+        session_dir: []const u8,
+    ) !bool {
+        if (self.source_kind != .rule_author)
+            return error.SourceKindHasNoSeparateEvidenceLayer;
+        const binding = self.source_observation orelse return false;
+        const expected = self.source_interval_sha256 orelse return false;
+        const validated = try observation_journal.validateRunBinding(session_dir, binding);
+        return validated.summary.complete and
+            std.mem.eql(u8, &validated.interval_sha256, &expected);
     }
 };
 
@@ -162,6 +198,11 @@ const WireSource = union(enum) {
         observation: WireRun,
         verdict_sha256: []const u8,
     },
+    rule_author: struct {
+        receipt_id: []const u8,
+        observation: WireRun,
+        falsifier: []const u8,
+    },
 };
 
 const BoundSource = union(enum) {
@@ -172,6 +213,10 @@ const BoundSource = union(enum) {
     },
     runtime_counterexample: struct {
         source: RuntimeCounterexample,
+        interval_sha256: [64]u8,
+    },
+    rule_author: struct {
+        source: RuleAuthor,
         interval_sha256: [64]u8,
     },
 };
@@ -217,6 +262,11 @@ const RawCandidateRecord = struct {
                 receipt_id: []const u8,
                 observation: WireRun,
                 verdict_sha256: []const u8,
+            },
+            rule_author: struct {
+                receipt_id: []const u8,
+                observation: WireRun,
+                falsifier: []const u8,
             },
         },
     },
@@ -329,8 +379,9 @@ pub fn load(
     const stored_id = parseLowerHex64(record.candidate_id) orelse return error.InvalidCandidate;
     const project = parseLowerHex64(record.body.project_sha256) orelse return error.InvalidCandidate;
     const proposer = parseLowerHex64(record.body.proposer_sha256) orelse return error.InvalidCandidate;
+    const legacy_schema = std.mem.eql(u8, record.body.schema_version, LEGACY_SCHEMA_VERSION);
     if (!std.mem.eql(u8, record.state, "proposed") or
-        !std.mem.eql(u8, record.body.schema_version, SCHEMA_VERSION) or
+        (!legacy_schema and !std.mem.eql(u8, record.body.schema_version, SCHEMA_VERSION)) or
         !std.mem.eql(u8, &stored_id, &candidate_id) or
         !validText(record.body.invariant, MAX_INVARIANT_BYTES) or
         !validText(record.body.lean_source, MAX_LEAN_SOURCE_BYTES))
@@ -376,9 +427,23 @@ pub fn load(
                 return error.InvalidCandidate;
             break :blk .runtime_counterexample;
         },
+        .rule_author => |source| blk: {
+            if (legacy_schema) return error.InvalidCandidate;
+            source_receipt_id = parseLowerHex64(source.receipt_id) orelse
+                return error.InvalidCandidate;
+            const parsed_run = parseWireRun(source.observation) orelse
+                return error.InvalidCandidate;
+            source_observation = parsed_run.binding;
+            source_interval_sha256 = parsed_run.interval_sha256;
+            if (!validText(source.falsifier, MAX_FALSIFIER_BYTES))
+                return error.InvalidCandidate;
+            source_falsifier_sha256 = observation.sha256Hex(source.falsifier);
+            break :blk .rule_author;
+        },
     };
     return .{
         .arena = arena,
+        .legacy_schema = legacy_schema,
         .candidate_id = candidate_id,
         .project_sha256 = project,
         .proposer_sha256 = proposer,
@@ -439,6 +504,12 @@ fn validateInput(input: ProposalInput) !void {
             if (!validLowerHex64(source.receipt_id) or
                 !validLowerHex64(source.verdict_sha256))
                 return error.InvalidSourceEvidence;
+        },
+        .rule_author => |source| {
+            if (!validLowerHex64(source.receipt_id))
+                return error.InvalidSourceEvidence;
+            if (!validText(source.falsifier, MAX_FALSIFIER_BYTES))
+                return error.InvalidFalsifier;
         },
     }
 }
@@ -501,6 +572,17 @@ fn bindSource(
                 .interval_sha256 = validation.interval_sha256,
             } };
         },
+        .rule_author => |value| blk: {
+            const validation = try observation_journal.validateRunBinding(
+                session_dir,
+                value.observation,
+            );
+            if (!validation.summary.complete) return error.ObservationJournalIncomplete;
+            break :blk .{ .rule_author = .{
+                .source = value,
+                .interval_sha256 = validation.interval_sha256,
+            } };
+        },
     };
 }
 
@@ -521,6 +603,11 @@ fn wireSource(source: *const BoundSource) WireSource {
             .observation = wireRun(&value.source.observation, &value.interval_sha256),
             .verdict_sha256 = value.source.verdict_sha256[0..],
         } },
+        .rule_author => |*value| .{ .rule_author = .{
+            .receipt_id = value.source.receipt_id[0..],
+            .observation = wireRun(&value.source.observation, &value.interval_sha256),
+            .falsifier = value.source.falsifier,
+        } },
     };
 }
 
@@ -539,6 +626,7 @@ fn intervalDigest(source: BoundSource) ?[64]u8 {
         .user_correction => null,
         .agent_reflection => |value| value.interval_sha256,
         .runtime_counterexample => |value| value.interval_sha256,
+        .rule_author => |value| value.interval_sha256,
     };
 }
 
@@ -660,7 +748,39 @@ test "agent reflection candidate binds a completed observation interval and is i
     try std.testing.expect(std.mem.indexOf(u8, artifact, input.lean_source) != null);
     var loaded = try load(std.testing.allocator, root, created.candidate_id);
     defer loaded.deinit();
+    try std.testing.expect(!loaded.legacy_schema);
     try std.testing.expect(try loaded.sourceIsBound(std.testing.allocator, root));
+
+    // Historical v3 candidates remain content-addressable and reopenable.
+    // The schema discriminator is part of the hashed body, so exercise the
+    // real on-disk identity instead of merely forcing the load branch.
+    var legacy_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer legacy_arena.deinit();
+    const legacy_a = legacy_arena.allocator();
+    var legacy_record = try std.json.parseFromSliceLeaky(
+        RawCandidateRecord,
+        legacy_a,
+        artifact[0 .. artifact.len - 1],
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+    );
+    legacy_record.body.schema_version = LEGACY_SCHEMA_VERSION;
+    const legacy_body_json = try std.json.Stringify.valueAlloc(legacy_a, legacy_record.body, .{});
+    const legacy_id = observation.sha256Hex(legacy_body_json);
+    legacy_record.candidate_id = legacy_id[0..];
+    const legacy_record_json = try std.json.Stringify.valueAlloc(legacy_a, legacy_record, .{});
+    var legacy_name_buffer: [96]u8 = undefined;
+    const legacy_name = try fileName(legacy_id, &legacy_name_buffer);
+    var legacy_dir = try std.Io.Dir.openDirAbsolute(std.testing.io, root, .{});
+    defer legacy_dir.close(std.testing.io);
+    try legacy_dir.writeFile(std.testing.io, .{
+        .sub_path = legacy_name,
+        .data = try std.mem.concat(legacy_a, u8, &.{ legacy_record_json, "\n" }),
+    });
+    var legacy_loaded = try load(std.testing.allocator, root, legacy_id);
+    defer legacy_loaded.deinit();
+    try std.testing.expect(legacy_loaded.legacy_schema);
+    try std.testing.expectEqual(SourceKind.agent_reflection, legacy_loaded.source_kind);
+    try std.testing.expect(try legacy_loaded.sourceIsBound(std.testing.allocator, root));
 
     var bad_binding = binding;
     bad_binding.last_sequence += 1;

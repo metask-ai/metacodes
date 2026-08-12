@@ -471,11 +471,11 @@ test "L2 ontology projection drives isolated v2 rule author without actor contex
     ));
     var loaded_candidate = try cc.rule_candidate.load(a, session_dir, candidate.candidate_id);
     defer loaded_candidate.deinit();
-    try std.testing.expectEqual(cc.rule_candidate.SourceKind.agent_reflection, loaded_candidate.source_kind);
+    try std.testing.expectEqual(cc.rule_candidate.SourceKind.rule_author, loaded_candidate.source_kind);
 
     // The candidate remains non-authorizing: persistence exposes no build,
     // promotion, bundle mutation, or TinyKG mutation operation.
-    try std.testing.expectEqualSlices(u8, &authored.receipt_id, &loaded_candidate.proposer_sha256);
+    try std.testing.expectEqualSlices(u8, &AUTHOR, &loaded_candidate.proposer_sha256);
 
     // Candidate verification is not a one-time copy check. It reopens the
     // v2 author receipt, which reopens the projection and its source receipt.
@@ -489,6 +489,236 @@ test "L2 ontology projection drives isolated v2 rule author without actor contex
         authored.receipt_id,
         candidate.candidate_id,
     ));
+}
+
+test "L2 governed rule author preserves actor independence and lifecycle reopens ontology source" {
+    const a = std.heap.page_allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const session_dir = try std.fmt.allocPrint(a, "{s}/0123456789abcdef01234567", .{root});
+    defer a.free(session_dir);
+    try std.Io.Dir.createDirAbsolute(std.testing.io, session_dir, .default_dir);
+    const binding = try completedFailureRun(session_dir);
+    var ontology = try persistOntologyProjection(a, session_dir);
+    defer ontology.deinit(a);
+    var prepared = try prepareFailurePacketV2(a, session_dir, binding, ontology.authority);
+    defer prepared.deinit();
+    const permit = try permitFor(&prepared);
+    const response_json = try proposalJson(a);
+    defer a.free(response_json);
+    const sse = try textSse(a, response_json);
+    defer a.free(sse);
+    var server = try harness.MockServer.start(sse, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(
+        a,
+        io_runtime.io(),
+        "author-lifecycle-test-key",
+        TEST_MODEL,
+        url,
+    );
+    defer client.deinit();
+    client.setMaxTokensOverride(256);
+    var authored = try rule_author.author(a, session_dir, .{
+        .provider = client.provider(),
+        .provider_sha256 = PROVIDER,
+    }, &prepared, permit, null);
+    defer authored.deinit();
+    const candidate = try rule_author.persistCandidate(a, session_dir, &authored);
+    var loaded_candidate = try cc.rule_candidate.load(a, session_dir, candidate.candidate_id);
+    defer loaded_candidate.deinit();
+    try std.testing.expectEqual(cc.rule_candidate.SourceKind.rule_author, loaded_candidate.source_kind);
+    try std.testing.expectEqualSlices(u8, &AUTHOR, &loaded_candidate.proposer_sha256);
+    const canonical_spec = try cc.project_rule_spec.renderCanonical(a, loaded_candidate.rule_spec);
+    defer a.free(canonical_spec);
+
+    const build_evidence = cc.rule_lifecycle.BuildEvidence{
+        .manifest_sha256 = .{'1'} ** 64,
+        .lean_source_sha256 = loaded_candidate.lean_source_sha256,
+        .rule_spec_sha256 = observation.sha256Hex(canonical_spec),
+        .compiled_artifact_sha256 = .{'2'} ** 64,
+        .toolchain_sha256 = .{'3'} ** 64,
+        .sdk_sha256 = .{'4'} ** 64,
+        .sdk_olean_sha256 = .{'5'} ** 64,
+        .build_log_sha256 = .{'6'} ** 64,
+        .network_disabled = true,
+        .secrets_absent = true,
+        .source_bounded = true,
+        .output_bounded = true,
+        .completed = true,
+    };
+    // The receipt id is not the actor. A same-author builder must now be
+    // rejected even though its actor hash differs from the author receipt.
+    try std.testing.expectError(error.BuilderNotIndependent, cc.rule_lifecycle.persist(
+        session_dir,
+        .{
+            .candidate_id = candidate.candidate_id,
+            .project_sha256 = PROJECT,
+            .actor_sha256 = AUTHOR,
+            .checker_sha256 = .{'7'} ** 64,
+            .predecessor_receipt_id = null,
+            .evidence = .{ .built = build_evidence },
+        },
+    ));
+    const built = try cc.rule_lifecycle.persist(session_dir, .{
+        .candidate_id = candidate.candidate_id,
+        .project_sha256 = PROJECT,
+        .actor_sha256 = .{'3'} ** 64,
+        .checker_sha256 = .{'7'} ** 64,
+        .predecessor_receipt_id = null,
+        .evidence = .{ .built = build_evidence },
+    });
+    const axiom = try cc.rule_lifecycle.persist(session_dir, .{
+        .candidate_id = candidate.candidate_id,
+        .project_sha256 = PROJECT,
+        .actor_sha256 = .{'4'} ** 64,
+        .checker_sha256 = .{'8'} ** 64,
+        .predecessor_receipt_id = built.receipt_id,
+        .evidence = .{ .axiom_audited = .{
+            .audit_sha256 = .{'a'} ** 64,
+            .policy_sha256 = .{'b'} ** 64,
+            .forbidden_declaration_count = 0,
+            .unexpected_axiom_count = 0,
+            .completed = true,
+        } },
+    });
+    const replay = try cc.rule_lifecycle.persist(session_dir, .{
+        .candidate_id = candidate.candidate_id,
+        .project_sha256 = PROJECT,
+        .actor_sha256 = .{'5'} ** 64,
+        .checker_sha256 = .{'9'} ** 64,
+        .predecessor_receipt_id = axiom.receipt_id,
+        .evidence = .{ .replay_passed = .{
+            .corpus_sha256 = .{'c'} ** 64,
+            .results_sha256 = .{'d'} ** 64,
+            .positive_cases = 1,
+            .negative_cases = 1,
+            .false_positive_count = 0,
+            .false_negative_count = 0,
+            .completed = true,
+        } },
+    });
+    const shadow = try cc.rule_lifecycle.persist(session_dir, .{
+        .candidate_id = candidate.candidate_id,
+        .project_sha256 = PROJECT,
+        .actor_sha256 = .{'6'} ** 64,
+        .checker_sha256 = .{'9'} ** 64,
+        .predecessor_receipt_id = replay.receipt_id,
+        .evidence = .{ .shadow_passed = .{
+            .interval_sha256 = .{'e'} ** 64,
+            .results_sha256 = .{'f'} ** 64,
+            .observed_decisions = 1,
+            .divergence_count = 0,
+            .side_effect_count = 0,
+            .completed = true,
+        } },
+    });
+
+    const promotion_evidence = cc.rule_lifecycle.PromotionEvidence{
+        .lifecycle_request_sha256 = .{'7'} ** 64,
+        .lifecycle_verdict_sha256 = .{'8'} ** 64,
+        .runtime_kernel_sha256 = .{'9'} ** 64,
+        .bundle_sha256 = .{'a'} ** 64,
+        .previous_bundle_sha256 = ZERO_SHA,
+        .bundle_revision = 1,
+        .checker_admitted = true,
+        .checker_elapsed_ns = 1,
+        .checker_bytes = 1,
+    };
+    const invocation = cc.project_harness_runtime.Invocation{
+        .bindings = .{
+            .request_id = .{'1'} ** 64,
+            .operation = .promote,
+            .kernel_sha256 = promotion_evidence.runtime_kernel_sha256,
+            .candidate_id = candidate.candidate_id,
+            .project_sha256 = PROJECT,
+            .bundle_sha256 = promotion_evidence.bundle_sha256,
+            .bundle_revision = 1,
+        },
+        .actual_checker_sha256 = promotion_evidence.runtime_kernel_sha256,
+        .request_sha256 = promotion_evidence.lifecycle_request_sha256,
+        .verdict_sha256 = promotion_evidence.lifecycle_verdict_sha256,
+        .checker_bytes = 1,
+        .checker_elapsed_ns = 1,
+        .verdict = .{ .admitted = true, .checks = .{
+            .request_valid = true,
+            .rule_valid = true,
+            .lifecycle_valid = true,
+            .decision_valid = true,
+        } },
+    };
+    const original_transcript = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        ontology.transcript_path,
+        a,
+        .limited(64 * 1024),
+    );
+    defer a.free(original_transcript);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = ontology.transcript_path,
+        .data = "{\"role\":\"user\",\"blocks\":[{\"type\":\"text\",\"text\":\"drifted\"}]}\n",
+    });
+    const unopened_rules_dir = try std.fmt.allocPrint(a, "{s}/project-rules", .{root});
+    defer a.free(unopened_rules_dir);
+    try std.testing.expectError(error.SourceArtifactChanged, cc.project_rule_bundle.promote(a, .{
+        .evidence_dir = session_dir,
+        .project_rules_dir = unopened_rules_dir,
+        .candidate_id = candidate.candidate_id,
+        .project_sha256 = PROJECT,
+        // These deliberately invalid downstream bindings prove source
+        // reopening precedes lifecycle/build/checker work at the real entry.
+        .shadow_receipt_id = ZERO_SHA,
+        .promoter_sha256 = .{'7'} ** 64,
+        .trusted_build_files = .{
+            .toolchain_path = "/unreachable/toolchain",
+            .sdk_source_path = "/unreachable/sdk",
+            .sdk_olean_path = "/unreachable/sdk.olean",
+        },
+        .config = .{
+            .checker_path = "/unreachable/checker",
+            .expected_sha256 = .{'9'} ** 64,
+        },
+    }));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(
+        std.testing.io,
+        unopened_rules_dir,
+        .{},
+    ));
+    try std.testing.expectError(error.SourceArtifactChanged, cc.rule_lifecycle.persistPromotion(
+        session_dir,
+        .{
+            .candidate_id = candidate.candidate_id,
+            .project_sha256 = PROJECT,
+            .actor_sha256 = .{'7'} ** 64,
+            .checker_sha256 = promotion_evidence.runtime_kernel_sha256,
+            .predecessor_receipt_id = shadow.receipt_id,
+            .evidence = .{ .promoted = promotion_evidence },
+        },
+        &invocation,
+    ));
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = ontology.transcript_path,
+        .data = original_transcript,
+    });
+    const promoted = try cc.rule_lifecycle.persistPromotion(session_dir, .{
+        .candidate_id = candidate.candidate_id,
+        .project_sha256 = PROJECT,
+        .actor_sha256 = .{'7'} ** 64,
+        .checker_sha256 = promotion_evidence.runtime_kernel_sha256,
+        .predecessor_receipt_id = shadow.receipt_id,
+        .evidence = .{ .promoted = promotion_evidence },
+    }, &invocation);
+    var loaded_promotion = try cc.rule_lifecycle.load(a, session_dir, promoted.receipt_id);
+    defer loaded_promotion.deinit();
+    try std.testing.expectEqual(cc.rule_lifecycle.Stage.promoted, loaded_promotion.stage);
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
 }
 
 test "L2 ontology drift after prepare blocks v2 author before provider request" {

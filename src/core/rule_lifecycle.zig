@@ -11,6 +11,7 @@ const std = @import("std");
 const pfs = @import("platform").fs;
 const observation = @import("../tools/observation.zig");
 const rule_candidate = @import("rule_candidate.zig");
+const rule_candidate_source = @import("rule_candidate_source.zig");
 const project_rule_spec = @import("project_rule_spec.zig");
 const project_harness_runtime = @import("../formal/project_harness_runtime.zig");
 
@@ -588,7 +589,7 @@ fn validatePromotionChain(
     shadow: Loaded,
     promoter: [64]u8,
 ) !void {
-    if (!try candidate.sourceIsBound(std.heap.c_allocator, session_dir))
+    if (!try rule_candidate_source.verify(std.heap.c_allocator, session_dir, &candidate))
         return error.SourceReceiptMismatch;
     var replay = try loadPrevious(std.heap.c_allocator, session_dir, shadow, .replay_passed);
     defer replay.deinit();

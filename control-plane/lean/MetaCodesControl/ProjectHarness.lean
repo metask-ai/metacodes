@@ -18,6 +18,7 @@ inductive SourceKind where
   | userCorrection
   | agentReflection
   | runtimeCounterexample
+  | ruleAuthor
   deriving Repr, BEq, DecidableEq
 
 inductive Operation where
@@ -95,7 +96,7 @@ def nonzeroHex (value : String) : Bool :=
 
 def sourceValid (facts : PromotionFacts) : Bool :=
   match facts.sourceKind with
-  | .userCorrection | .runtimeCounterexample => facts.sourceReceiptBound
+  | .userCorrection | .runtimeCounterexample | .ruleAuthor => facts.sourceReceiptBound
   | .agentReflection => true
 
 def actorsIndependent (facts : PromotionFacts) : Bool :=
@@ -183,6 +184,15 @@ theorem correction_promotion_requires_receipt (request : Request)
   have source := obligations.1
   simpa [sourceValid, kind] using source
 
+theorem rule_author_promotion_requires_receipt (request : Request)
+    (facts : PromotionFacts) (kind : facts.sourceKind = .ruleAuthor)
+    (admitted : SafePromotion request facts = true) :
+    facts.sourceReceiptBound = true := by
+  have obligations := safePromotion_sound request facts admitted
+  simp only [promotionObligations, Bool.and_eq_true] at obligations
+  have source := obligations.1
+  simpa [sourceValid, kind] using source
+
 theorem denied_all_predecision_blocks (request : Request) (signal : PreSignal)
     (payload : request.payload = .pre signal)
     (same : signal.tool = request.ruleSpec.targetTool)
@@ -213,6 +223,7 @@ def sourceName : SourceKind → String
   | .userCorrection => "user_correction"
   | .agentReflection => "agent_reflection"
   | .runtimeCounterexample => "runtime_counterexample"
+  | .ruleAuthor => "rule_author"
 
 def operationName : Operation → String
   | .promote => "promote"
@@ -243,6 +254,7 @@ def sourceOfString? : String → Option SourceKind
   | "user_correction" => some .userCorrection
   | "agent_reflection" => some .agentReflection
   | "runtime_counterexample" => some .runtimeCounterexample
+  | "rule_author" => some .ruleAuthor
   | _ => none
 
 def operationOfString? : String → Option Operation

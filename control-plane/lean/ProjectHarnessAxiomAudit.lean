@@ -4,6 +4,7 @@ import MetaCodesControl.RuleImpactAggregateGovernance
 
 #print axioms MetaCodesControl.ProjectHarness.safePromotion_sound
 #print axioms MetaCodesControl.ProjectHarness.correction_promotion_requires_receipt
+#print axioms MetaCodesControl.ProjectHarness.rule_author_promotion_requires_receipt
 #print axioms MetaCodesControl.ProjectHarness.denied_all_predecision_blocks
 #print axioms MetaCodesControl.ProjectHarness.denied_existing_file_predecision_blocks
 #print axioms MetaCodesControl.ProjectRule.denied_observed_overwrite_selects_exact_edit_recovery

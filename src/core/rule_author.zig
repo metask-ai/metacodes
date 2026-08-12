@@ -1566,13 +1566,18 @@ pub fn persistCandidate(
         return error.AuthorReceiptResultMismatch;
     const persisted = try rule_candidate.persist(session_dir, .{
         .project_sha256 = result.project_sha256,
-        .proposer_sha256 = result.receipt_id,
+        // Independence checks must compare actor identities, not artifact
+        // identities.  The immutable author receipt is bound separately by
+        // the `rule_author` source; using its content hash as the proposer
+        // would let the same author appear independent from its own build,
+        // audit, replay, shadow, or promotion actor identity.
+        .proposer_sha256 = receipt.author_sha256,
         .invariant = proposal.invariant,
         .rule_spec = proposal.rule_spec,
         .lean_source = proposal.lean_source,
-        .source = .{ .agent_reflection = .{
+        .source = .{ .rule_author = .{
+            .receipt_id = result.receipt_id,
             .observation = result.observation,
-            .reflector_sha256 = result.receipt_id,
             .falsifier = proposal.falsifier,
         } },
     });
@@ -1632,10 +1637,10 @@ pub fn verifyCandidateBinding(
     const rule_spec_json = try project_rule_spec.renderCanonical(allocator, candidate.rule_spec);
     defer allocator.free(rule_spec_json);
     return std.mem.eql(u8, &candidate.project_sha256, &receipt.project_sha256) and
-        std.mem.eql(u8, &candidate.proposer_sha256, &receipt.receipt_id) and
-        candidate.source_kind == .agent_reflection and
-        candidate.source_issuer_sha256 != null and
-        std.mem.eql(u8, &candidate.source_issuer_sha256.?, &receipt.receipt_id) and
+        std.mem.eql(u8, &candidate.proposer_sha256, &receipt.author_sha256) and
+        candidate.source_kind == .rule_author and
+        candidate.source_receipt_id != null and
+        std.mem.eql(u8, &candidate.source_receipt_id.?, &receipt.receipt_id) and
         candidate.source_observation != null and
         std.meta.eql(candidate.source_observation.?, receipt.observation) and
         candidate.source_interval_sha256 != null and
@@ -1645,7 +1650,7 @@ pub fn verifyCandidateBinding(
         std.mem.eql(u8, &candidate.invariant_sha256, &receipt.invariant_sha256.?) and
         std.mem.eql(u8, &candidate.lean_source_sha256, &receipt.lean_source_sha256.?) and
         std.mem.eql(u8, &observation.sha256Hex(rule_spec_json), &receipt.rule_spec_sha256.?) and
-        try candidate.sourceIsBound(allocator, session_dir);
+        try candidate.sourceEvidenceIsBound(session_dir);
 }
 
 fn readReceiptFile(allocator: std.mem.Allocator, path: [*:0]const u8) ![]u8 {

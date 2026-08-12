@@ -29,6 +29,7 @@ host_os=$(uname -s)
 axiom_audit=$(cd "$lean_dir" && "$lake" env lean ProjectHarnessAxiomAudit.lean 2>&1)
 expected_axioms="'MetaCodesControl.ProjectHarness.safePromotion_sound' depends on axioms: [propext]
 'MetaCodesControl.ProjectHarness.correction_promotion_requires_receipt' depends on axioms: [propext]
+'MetaCodesControl.ProjectHarness.rule_author_promotion_requires_receipt' depends on axioms: [propext]
 'MetaCodesControl.ProjectHarness.denied_all_predecision_blocks' depends on axioms: [propext]
 'MetaCodesControl.ProjectHarness.denied_existing_file_predecision_blocks' depends on axioms: [propext]
 'MetaCodesControl.ProjectRule.denied_observed_overwrite_selects_exact_edit_recovery' depends on axioms: [propext]
@@ -89,6 +90,9 @@ hex_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 hex_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 hex_c=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 hex_d=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+hex_e=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+hex_f=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+zero_hex=0000000000000000000000000000000000000000000000000000000000000000
 request_prefix="{\"schema_version\":\"metacodes-project-harness-request-v3\",\"request_id\":\"$hex_a\","
 request_bindings="\"expected_checker_version\":\"metacodes-project-harness-kernel-v3\",\"kernel_sha256\":\"$hex_a\",\"candidate_id\":\"$hex_b\",\"project_sha256\":\"$hex_c\",\"bundle_sha256\":\"$hex_d\",\"bundle_revision\":1,\"rule_spec\":{\"schema_version\":\"metacodes-project-rule-spec-v2\",\"target_tool\":\"Write\",\"target_scope\":\"existing_file\",\"deny_target\":true,\"max_input_bytes\":8192,\"max_agent_depth\":4,\"authoritative_only\":true,\"effect_requirement\":\"none\"},"
 prefix="${request_prefix}\"operation\":\"pre_decision\",${request_bindings}\"payload\":{\"pre\":{"
@@ -104,6 +108,17 @@ admit_verdict=$(printf '%s' "$admit_request" | "$output")
 }
 [[ "$admit_verdict" == *'"decision":"admit"'* ]] || {
   echo "build-project-harness-kernel: admit smoke failed" >&2
+  exit 1
+}
+promotion_facts="{\"source_kind\":\"rule_author\",\"source_receipt_bound\":true,\"proposer\":\"$hex_a\",\"builder\":\"$hex_b\",\"auditor\":\"$hex_c\",\"replay_evaluator\":\"$hex_d\",\"shadow_evaluator\":\"$hex_e\",\"promoter\":\"$hex_f\",\"replay_checker\":\"$hex_a\",\"shadow_checker\":\"$hex_a\",\"build_receipt\":\"$hex_a\",\"axiom_predecessor\":\"$hex_a\",\"axiom_receipt\":\"$hex_b\",\"replay_predecessor\":\"$hex_b\",\"replay_receipt\":\"$hex_c\",\"shadow_predecessor\":\"$hex_c\",\"build_manifest\":\"$hex_d\",\"rule_spec_sha256\":\"$hex_e\",\"sdk_olean\":\"$hex_f\",\"build_completed\":true,\"axiom_completed\":true,\"forbidden_declaration_count\":0,\"unexpected_axiom_count\":0,\"replay_completed\":true,\"replay_positive_cases\":1,\"replay_negative_cases\":1,\"replay_false_positive_count\":0,\"replay_false_negative_count\":0,\"shadow_completed\":true,\"shadow_observed_decisions\":1,\"shadow_divergence_count\":0,\"shadow_side_effect_count\":0,\"previous_revision\":0,\"previous_bundle_sha256\":\"$zero_hex\",\"previous_rule_count\":0,\"bundle_rule_count\":1,\"candidate_occurrences\":1}"
+promotion_request="${request_prefix}\"operation\":\"promote\",${request_bindings}\"payload\":{\"promotion\":$promotion_facts}}"
+promotion_unbound=${promotion_request/\"source_receipt_bound\":true/\"source_receipt_bound\":false}
+promotion_admit=$(printf '%s' "$promotion_request" | "$output")
+promotion_block=$(printf '%s' "$promotion_unbound" | "$output")
+[[ "$promotion_admit" == *'"decision":"admit"'* &&
+  "$promotion_block" == *'"decision":"block"'* &&
+  "$promotion_block" == *'"source_evidence_missing"'* ]] || {
+  echo "build-project-harness-kernel: governed rule-author promotion smoke failed" >&2
   exit 1
 }
 recovery_pre_prefix="${request_prefix}\"operation\":\"recovery_pre_decision\",${request_bindings}\"payload\":{\"recovery_pre\":{"
@@ -224,7 +239,7 @@ fi
 host_arch=$(uname -m)
 lean_version=$(cd "$lean_dir" && "$lake" env lean --version | tr -d '\n')
 printf '%s\n' \
-  "{\"schema_version\":\"metacodes-project-kernel-artifact-v6\",\"checker_version\":\"metacodes-project-harness-kernel-v3\",\"request_schema\":\"metacodes-project-harness-request-v3\",\"verdict_schema\":\"metacodes-project-harness-verdict-v3\",\"batch_request_schema\":\"metacodes-project-harness-batch-request-v3\",\"batch_verdict_schema\":\"metacodes-project-harness-batch-verdict-v3\",\"impact_request_schema\":\"metacodes-rule-impact-governance-request-v1\",\"impact_verdict_schema\":\"metacodes-rule-impact-governance-verdict-v1\",\"impact_aggregate_request_schema\":\"metacodes-rule-impact-aggregate-governance-request-v1\",\"impact_aggregate_verdict_schema\":\"metacodes-rule-impact-aggregate-governance-verdict-v1\",\"max_batch_requests\":1024,\"max_impact_aggregate_members\":64,\"binary_sha256\":\"$binary_sha256\",\"binary_bytes\":$binary_bytes,\"kernel_source_sha256\":\"$kernel_source_sha256\",\"rule_source_sha256\":\"$rule_source_sha256\",\"impact_source_sha256\":\"$impact_source_sha256\",\"impact_aggregate_source_sha256\":\"$impact_aggregate_source_sha256\",\"formal_kernel_source_sha256\":\"$formal_kernel_source_sha256\",\"main_source_sha256\":\"$main_source_sha256\",\"axiom_audit_source_sha256\":\"$axiom_source_sha256\",\"axiom_policy\":\"propext\",\"axiom_audit\":\"passed\",\"host_os\":\"$host_os\",\"host_arch\":\"$host_arch\",\"linker\":\"$linker\",\"lean_version\":\"$lean_version\",\"native_smoke\":\"passed\",\"native_batch_smoke\":\"passed\",\"native_recovery_smoke\":\"passed\",\"native_impact_smoke\":\"passed\",\"native_impact_aggregate_smoke\":\"passed\"}" >"$manifest"
+  "{\"schema_version\":\"metacodes-project-kernel-artifact-v6\",\"checker_version\":\"metacodes-project-harness-kernel-v3\",\"request_schema\":\"metacodes-project-harness-request-v3\",\"verdict_schema\":\"metacodes-project-harness-verdict-v3\",\"batch_request_schema\":\"metacodes-project-harness-batch-request-v3\",\"batch_verdict_schema\":\"metacodes-project-harness-batch-verdict-v3\",\"impact_request_schema\":\"metacodes-rule-impact-governance-request-v1\",\"impact_verdict_schema\":\"metacodes-rule-impact-governance-verdict-v1\",\"impact_aggregate_request_schema\":\"metacodes-rule-impact-aggregate-governance-request-v1\",\"impact_aggregate_verdict_schema\":\"metacodes-rule-impact-aggregate-governance-verdict-v1\",\"max_batch_requests\":1024,\"max_impact_aggregate_members\":64,\"binary_sha256\":\"$binary_sha256\",\"binary_bytes\":$binary_bytes,\"kernel_source_sha256\":\"$kernel_source_sha256\",\"rule_source_sha256\":\"$rule_source_sha256\",\"impact_source_sha256\":\"$impact_source_sha256\",\"impact_aggregate_source_sha256\":\"$impact_aggregate_source_sha256\",\"formal_kernel_source_sha256\":\"$formal_kernel_source_sha256\",\"main_source_sha256\":\"$main_source_sha256\",\"axiom_audit_source_sha256\":\"$axiom_source_sha256\",\"axiom_policy\":\"propext\",\"axiom_audit\":\"passed\",\"host_os\":\"$host_os\",\"host_arch\":\"$host_arch\",\"linker\":\"$linker\",\"lean_version\":\"$lean_version\",\"native_smoke\":\"passed\",\"native_rule_author_promotion_smoke\":\"passed\",\"native_batch_smoke\":\"passed\",\"native_recovery_smoke\":\"passed\",\"native_impact_smoke\":\"passed\",\"native_impact_aggregate_smoke\":\"passed\"}" >"$manifest"
 
 echo "project harness kernel: $output"
 echo "sha256: $binary_sha256"
