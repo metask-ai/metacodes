@@ -77,6 +77,7 @@ pub const WriterBackend = struct {
                 if (self.colorize) self.emit("\x1b[32m");
             },
             .text_chunk => |t| self.emit(t),
+            .thinking_chunk => {}, // headless/job sink 不显示思考过程(agent_loop 已存 conversation)
             .tool_start => |s| {
                 // verbose 普通工具行(对齐旧 agent_loop:387)。WriterBackend 是 core 层,
                 // 不 import UI widget tool_card 做分类(层泄漏);verbose 下打所有工具名即可

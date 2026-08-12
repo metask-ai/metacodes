@@ -211,7 +211,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "BashOutput",
-        .description = "Read stdout/stderr and status of a backgrounded Bash job by job_id",
+        .description = "Read stdout/stderr and status of a backgrounded Bash job by job_id. Returns stdout/stderr chunks (from stdout_path/stderr_path files) plus status (running|exited|killed). Use stdout_since_byte/stderr_since_byte for incremental reads (pass previous stdout_total_bytes). max_bytes caps a single read (default 64KB). NOTE: if the command used shell redirection (>/>>/2>), the redirected output goes to the user-specified file, NOT stdout_path — Read that file directly. For long-running jobs, prefer Read on stdout_path (returned when the job auto-backgrounded) over polling BashOutput.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "job_id", .type = "string", .description = "The id of the backgrounded Bash job to read" },
         }, .required = &.{"job_id"} },

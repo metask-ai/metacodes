@@ -193,7 +193,7 @@ pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_erro
 **一回合做什么**:流式发当前 conversation → 收集 assistant 文本 + tool_use blocks(经 backend
 emit `text_chunk`/`tool_start`)→ 按权限决策 + 并发安全分批执行工具(`tool_exec.executeSlots`)→
 tool_result 回灌为 user 消息 → 下一轮。直到无 tool_use(`end_turn`)/ 达 max_turns / abort /
-熔断(`tool_loop`)/ 挂起(`suspended`,见 §5)。
+挂起(`suspended`,见 §5)。`tool_loop` 枚举值保留为 ABI 兼容(无生产者,对齐 codex 无主动熔断)。
 
 ### 4.1 Options(全可选,`.{}` 即最简跑)
 

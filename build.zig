@@ -1370,6 +1370,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/swarm_security_test.zig",
         "tests/component/swarm_process_test.zig",
         "tests/component/add_dir_test.zig",
+        "tests/component/dialect_matrix_test.zig",
     };
     for (new_files) |f| {
         const m = b.createModule(.{

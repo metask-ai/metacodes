@@ -106,6 +106,7 @@ fn textSse(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
         "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_author\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":0}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"thinking_delta\",\"thinking\":\"private author reasoning must not enter the proposal\"}}}}\n\n" ++
             "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n" ++
             "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{s}}}}}\n\n" ++
             "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++

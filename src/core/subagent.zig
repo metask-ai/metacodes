@@ -163,9 +163,8 @@ pub fn spawnAgentSink(
 
     // subagent 是隔离上下文:给它**自己的** TaskStore。早先未挂 store(opts 无 tasks 字段)→
     // subagent 调 TaskCreate 时 requireStore 返 TaskStoreUnavailable → 第一轮多个 TaskCreate
-    // 全失败同错 → 熔断器(单轮内累计)turns=1 就 tool_loop 中止,subagent 啥也没干。
-    // 用独立 store 而非共享父 store:① 后台 subagent 跑在独立线程,TaskStore 无 mutex 非线程
-    // 安全,共享会数据竞争;② 隔离语义——subagent 的任务清单不该混进主对话的 todo。
+    // 全失败同错。用独立 store 而非共享父 store:① 后台 subagent 跑在独立线程,TaskStore
+    // 无 mutex 非线程安全,共享会数据竞争;② 隔离语义——subagent 的任务清单不该混进主对话的 todo。
     var sub_tasks = TaskStore.init(allocator);
     defer sub_tasks.deinit();
 

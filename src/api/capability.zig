@@ -34,23 +34,34 @@ pub fn supports(kind: ProviderKind, model: []const u8, cap: Capability) bool {
 
 /// Gemini 能力矩阵(C3 真填:Gemini 用 function calling + responseSchema structured output + 隐式/显式
 /// context caching;无 Anthropic 式 server-tool web_search)。
+/// Gemini 能力矩阵
 fn geminiSupports(_: []const u8, cap: Capability) bool {
     return switch (cap) {
-        .structured_output => true, // responseMimeType:application/json + responseSchema
         .prompt_cache => true, // 隐式 + 显式 context caching(有状态对象)——本 client 实现了句柄表机制
         .web_search, .server_tool => false, // Gemini grounding 与 Anthropic server-tool 语义不同, 保守 false
         .extended_thinking => false, // thinking(thought parts)未接, 保守 false
+        .structured_output => true, // responseSchema JSON
+        .reasoning_content => false, // Gemini 用 thought_summary+signature,非平级字段
     };
 }
 
-/// OpenAI 能力矩阵(P3 真填:OpenAI 用 function calling + json mode,无 Anthropic 式 server-tool
-/// web_search / prompt caching / interleaved thinking)。
-fn openaiSupports(_: []const u8, cap: Capability) bool {
+/// OpenAI 兼容端点能力矩阵。按 model 子串区分:
+/// - OpenAI 原生:无 reasoning_content(只 reasoning_tokens 计数)
+/// - GLM-5/Kimi K3/DeepSeek/Qwen3:有 reasoning_content 平级字段
+/// - Mistral:ThinkChunk(content[] 里的 thinking 类型,语义接近 reasoning_content)
+fn openaiSupports(model: []const u8, cap: Capability) bool {
     return switch (cap) {
-        .structured_output => true, // function calling / response_format json_schema
+        .structured_output => !hasSubstr(model, "glm-5") and !hasSubstr(model, "glm-4"), // GLM-5 仅 json_object
         .web_search, .server_tool => false, // 无 Anthropic 式 server-tool web_search
-        .prompt_cache => false, // OpenAI 自动缓存, 无显式 cache_control(语义不同, 保守 false)
+        .prompt_cache => hasSubstr(model, "kimi") or hasSubstr(model, "k2") or hasSubstr(model, "moonshot"), // K3 prompt_cache_key
         .extended_thinking => false, // o1/o3 的 reasoning 与 Anthropic interleaved thinking 不同
+        .reasoning_content => blk: {
+            // OpenAI 原生(GPT-4o/o1/o3/GPT-5)不返回 reasoning_content;兼容端点返回。
+            const compat = hasSubstr(model, "glm-") or hasSubstr(model, "kimi") or hasSubstr(model, "k2") or
+                hasSubstr(model, "moonshot") or hasSubstr(model, "deepseek") or hasSubstr(model, "qwen3") or
+                hasSubstr(model, "qwen-3") or hasSubstr(model, "mistral") or hasSubstr(model, "magistral");
+            break :blk compat;
+        },
     };
 }
 
@@ -66,6 +77,8 @@ fn anthropicSupports(model: []const u8, cap: Capability) bool {
         .extended_thinking => claude4 or hasSubstr(model, "claude-3-7"),
         // structured outputs:Claude 4.x 子集(对齐 cc modelSupportsStructuredOutputs)。
         .structured_output => claude4,
+        // Claude 用 content[] 里的 thinking block,非平级 reasoning_content 字段。
+        .reasoning_content => false,
     };
 }
 

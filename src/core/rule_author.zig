@@ -488,6 +488,12 @@ pub fn author(
                 return error.AuthorResponseTooLarge;
             try response.appendSlice(allocator, bytes);
         },
+        // Reasoning is provider-private control output, not part of the
+        // versioned RuleAuthor response.  In particular it must not be
+        // concatenated into the strict JSON proposal or persisted as rule
+        // evidence.  The final typed response remains the only admitted
+        // author payload.
+        .thinking => |bytes| allocator.free(bytes),
         .usage => |delta| try addUsage(&usage, delta),
         .done => saw_done = true,
         .tool_use_start => |tool| {

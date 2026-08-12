@@ -106,6 +106,7 @@ pub fn capabilityLabel(cap: Capability) []const u8 {
         .extended_thinking => "thinking",
         .prompt_cache => "prompt_cache",
         .structured_output => "structured_output",
+        .reasoning_content => "reasoning_content",
     };
 }
 

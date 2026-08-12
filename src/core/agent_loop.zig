@@ -130,81 +130,6 @@ const EventTramp = struct {
     }
 };
 
-/// 同一工具连续返回同样错误码达到此次数 → 判定模型陷入死循环,熔断中止本轮 run。
-/// 实战痛点(e2e 实测):MiniMax 端点对 Task/TaskCreate 反复发空参 `{}`,触发同一
-/// MissingField 错误,从 ~46 turn 烧到 max_turns=50 才停。3 次足以区分"偶发重试"
-/// 与"原地空参风暴";到达后注入明确终止现场，再借一个无工具采样轮收尾。
-pub const MAX_SAME_TOOL_ERROR: u32 = 3;
-
-/// **零增益重复熔断(主防线,与轮数正交)**:同一 (tool, input) 产出**同一 result** 累计达此
-/// 次数 → 判定原地打转(错误型 MAX_SAME_TOOL_ERROR 熔断抓不到"成功但零信息增益"的重复:
-/// 反复 Read 同一 offset / 反复 Grep 同 pattern,每次成功→永不熔断→无限循环,50 轮帽曾是唯一
-/// 拦截)。分页(offset 递进)是不同 signature 不触发;结果变化(git status 状态变)→ result_hash
-/// 变 → 重置计数,不误杀合法 re-check。这才度量真实"打转",轮数只配当防呆 backstop。
-pub const MAX_ZERO_GAIN_REPEAT: u32 = 3;
-
-/// 零增益重复追踪器:sig_hash(tool name+input)→ {同结果累计次数}。同 sig **同 result** 累计
-/// 达 MAX_ZERO_GAIN_REPEAT = 原地打转。结果变化(result_hash 变)→ 重置(不误杀合法 re-check);
-/// 不同 sig(如分页 offset 递进)各自独立计数(不触发)。
-pub const ZeroGainTracker = struct {
-    const Entry = struct { result_hash: u64, count: u32 };
-    map: std.AutoHashMap(u64, Entry),
-
-    pub fn init(allocator: std.mem.Allocator) ZeroGainTracker {
-        return .{ .map = std.AutoHashMap(u64, Entry).init(allocator) };
-    }
-    pub fn deinit(self: *ZeroGainTracker) void {
-        self.map.deinit();
-    }
-    pub fn clear(self: *ZeroGainTracker) void {
-        self.map.clearRetainingCapacity();
-    }
-    pub fn hasSameResult(self: *const ZeroGainTracker, sig_hash: u64, result_hash: u64) bool {
-        const entry = self.map.get(sig_hash) orelse return false;
-        return entry.result_hash == result_hash;
-    }
-    /// 记录一次并返回该 sig 的当前同结果累计次数。OOM → best-effort 返 0(不阻塞 run)。
-    pub fn record(self: *ZeroGainTracker, sig_hash: u64, result_hash: u64) u32 {
-        const gop = self.map.getOrPut(sig_hash) catch return 0;
-        if (gop.found_existing and gop.value_ptr.result_hash == result_hash) {
-            gop.value_ptr.count += 1;
-        } else {
-            gop.value_ptr.* = .{ .result_hash = result_hash, .count = 1 };
-        }
-        return gop.value_ptr.count;
-    }
-    pub fn tripped(self: *ZeroGainTracker, sig_hash: u64, result_hash: u64) bool {
-        return self.record(sig_hash, result_hash) >= MAX_ZERO_GAIN_REPEAT;
-    }
-};
-
-const ZeroGainObservation = struct {
-    sig_hash: u64,
-    result_hash: u64,
-    tool_name: []const u8,
-};
-
-const LOOP_BREAKER_FINALIZATION =
-    "[loop-breaker] Repeated ineffective tool actions were stopped. " ++
-    "Do not call any more tools. Using only the evidence already present, provide a concise final answer " ++
-    "covering completed work, verified results, remaining blockers, and the next step.";
-
-/// 工具失败签名:工具名 + 错误码 的哈希。用于检测"同工具同错连续 N 次"。
-/// 用哈希而非存切片:tu.name/code 生命周期随 turn 释放,存哈希避免悬挂。
-const ToolErrSig = struct {
-    name_hash: u64,
-    code_hash: u64,
-    fn of(name: []const u8, code: []const u8) ToolErrSig {
-        return .{
-            .name_hash = std.hash.Wyhash.hash(0, name),
-            .code_hash = std.hash.Wyhash.hash(0, code),
-        };
-    }
-    fn eql(a: ToolErrSig, b: ToolErrSig) bool {
-        return a.name_hash == b.name_hash and a.code_hash == b.code_hash;
-    }
-};
-
 /// Auto-compact 阈值下限:避免 catalog 返回异常小值(测试 mock、未知模型)导致每 turn 都 compact。
 /// 低于这个值不做压缩。设为 32K——正常对话/工具调研远小于此,只有真逼近 context window 才触发。
 pub const MIN_AUTO_COMPACT_THRESHOLD: usize = 32_000;
@@ -286,9 +211,8 @@ pub const RunResult = struct {
 };
 
 pub const Options = struct {
-    /// **防呆 backstop**,非防跑飞主闸(轮数不度量任何真实风险)。长任务靠 pre-sampling
-    /// auto-compact 压缩续接(codex 同构),防跑飞靠 MAX_SAME_TOOL_ERROR(错误型)+
-    /// MAX_ZERO_GAIN_REPEAT(零增益重复,主防线)。故此值只当"真失控兜底",设高。
+    /// **唯一兜底 backstop**(对齐 codex:无主动熔断,只靠 max_turns + 用户中断)。
+    /// 轮数不度量任何真实风险,只防真失控。长任务靠 pre-sampling auto-compact 压缩续接。
     max_turns: u32 = 400,
     /// **成本次闸**(度量真实"烧钱"维度,与轮数正交)。本 run 累计成本(USD)达此值 → 停
     /// (.budget),交互层询问用户是否继续(不自动续)。null = 不设预算(默认)。
@@ -560,12 +484,13 @@ fn buildEffectiveToolSet(
 
 /// L4:run 出口统一收口——发 diag_run_end 诊断事件后返回 result。每个 `return <result>` 改成
 /// `return finishRun(backend, sess, trace_id, depth, <result>)`,保证所有出口(abort/api_error/
-/// end_turn/tool_error/tool_loop/max_turns)都 emit run span 终点,无遗漏(对齐"诊断不沉默")。
+/// end_turn/tool_error/max_turns)都 emit run span 终点,无遗漏(对齐"诊断不沉默")。
 ///
 /// **span 平衡契约**:正常完成的 turn(有工具→循环 / 无工具→end_turn)都发 diag_turn_end,
-/// 每个 turn_begin 配一个 turn_end。异常终止(abort/api_error/tool_error/tool_loop)**不**发
+/// 每个 turn_begin 配一个 turn_end。异常终止(abort/api_error/tool_error)**不**发
 /// turn_end——该 turn 未完成,由 run_end 的 stop_reason 标明死因。消费者:turn span 未闭合 +
 /// run_end 非 end_turn/max_turns = 该 turn 被中断,正确语义,非 bug。
+/// (tool_loop 保留为 ABI dead variant,不再生产;对齐 codex 无主动熔断。)
 fn finishRun(backend: *const UiBackend, sess: @import("session_id.zig").SessionId, trace_id: [12]u8, depth: u8, result: RunResult) RunResult {
     backend.emitEvent(sess, .{ .diag_run_end = .{
         .trace_id = trace_id,
@@ -582,13 +507,6 @@ fn stopReasonForAbort(abort: ?*const AbortSignal) StopReason {
         if (signal.reason() == .evaluation_budget) .budget else .aborted
     else
         .aborted;
-}
-
-fn providerFailureStopReason(breaker_finalization: bool) StopReason {
-    // The breaker itself already established the terminal condition. Failure
-    // of its best-effort prose finalizer must not rewrite that controlled stop
-    // into an unrelated API failure (or discard the preceding assistant text).
-    return if (breaker_finalization) .tool_loop else .api_error;
 }
 
 /// 一次用户请求的完整 agent 运行：发送当前 conversation 到 API，
@@ -620,25 +538,11 @@ pub fn run(
     var continuations: u32 = 0;
     const MAX_CONTINUATIONS: u32 = 3;
 
-    // 工具错误熔断:**按 turn** 跟踪"同错轮"。本轮有错、无成功、且本轮所有 error 同签名
-    // → 算一个"同错轮";连续 MAX_SAME_TOOL_ERROR 个同签名同错轮 → 熔断。任意成功/换签名
-    // /无错 → 重置。判定在 6d 内层循环**之后**(避免单轮多工具同错被误算多次)。
-    var last_err_sig: ?ToolErrSig = null;
-    var same_err_count: u32 = 0;
-    // 零增益重复熔断(主防线),持有整个 run。
-    var zero_gain = ZeroGainTracker.init(allocator);
-    defer zero_gain.deinit();
     // Governed lexical recall is run-scoped: the model proposes aliases and
     // variants, while this bounded host ledger remembers only node ids that
     // were actually returned. It is shared by every turn/tool context in this
     // run and never persisted into the canonical TinyKG store.
     var kg_lexical_ledger = @import("../kg/lexical_query_plan.zig").Ledger{};
-    // A breaker is a controlled soft stop, not permission to throw away the
-    // work already completed. After the triggering tool_result turn, allow one
-    // extra provider request with no advertised tools so the model can turn the
-    // existing evidence into a useful final answer. This one borrowed turn is
-    // intentionally allowed even when the triggering turn reached max_turns.
-    var breaker_finalization = false;
     // 成本次闸:累计本 run 成本(USD),达 opts.cost_budget_usd → 停(.budget)。
     const cost_rates = @import("../util/pricing.zig").rateFor(provider.model());
     var run_cost_usd: f64 = 0;
@@ -652,7 +556,7 @@ pub fn run(
     // the transcript or across process revisions.
     var compact_summary_reserve_tokens: usize = 0;
 
-    while (turns < opts.max_turns or breaker_finalization) : (turns += 1) {
+    while (turns < opts.max_turns) : (turns += 1) {
         // 开头检查 abort
         if (opts.abort) |a| if (a.isAborted()) {
             log.warn("agent", "aborted before turn {d}", .{turns + 1});
@@ -709,10 +613,9 @@ pub fn run(
             provider,
         );
         defer effective_tools.deinit(allocator);
-        const gated_tool_defs: []const json_mod.ToolDefinition = if (breaker_finalization)
-            &.{}
-        else
-            effective_tools.defs;
+        // 对齐 codex:无 breaker_finalization gate,gated_tool_defs 即 effective_tools.defs。
+        // 保留别名减少下游改动,为将来可选 gate 预留。
+        const gated_tool_defs: []const json_mod.ToolDefinition = effective_tools.defs;
 
         // 自动 compact：发请求前检查 token 估算,超阈值则保留最近 N 条。
         // 阈值 null 时 = input context window * 0.8(逼近 context 上限才压缩,留出回复空间)。
@@ -750,7 +653,7 @@ pub fn run(
                     opts.abort,
                 );
                 if (previous_model_compact_outcome == .api_error) {
-                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = providerFailureStopReason(breaker_finalization), .turns = turns, .tool_calls = total_tool_calls });
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
                 }
                 if (previous_model_compact_outcome == .aborted) {
                     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
@@ -784,7 +687,7 @@ pub fn run(
                 opts.abort,
             );
             if (pre_sampling_compact == .api_error) {
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = providerFailureStopReason(breaker_finalization), .turns = turns, .tool_calls = total_tool_calls });
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
             }
             if (pre_sampling_compact == .aborted) {
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
@@ -824,6 +727,11 @@ pub fn run(
         }
         var assistant_text = std.ArrayList(u8).empty;
         defer assistant_text.deinit(allocator);
+
+        // 思考过程累加器:本轮所有 thinking_delta/reasoning_content 拼成一个 thinking block,
+        // 存入 assistant message(preserved thinking)。下轮请求 serializeContent 回传。
+        var thinking_text = std.ArrayList(u8).empty;
+        defer thinking_text.deinit(allocator);
 
         var tool_uses = std.ArrayList(msg.ToolUse).empty;
         defer tool_uses.deinit(allocator);
@@ -919,7 +827,7 @@ pub fn run(
             stream = provider.sendStreamRetry(
                 api_messages.items,
                 effective_system_prompt,
-                if (breaker_finalization) null else gated_tool_defs,
+                gated_tool_defs,
                 opts.abort,
                 opts.model_override,
                 null,
@@ -953,21 +861,16 @@ pub fn run(
                             turns + 1,
                             allocator,
                         )) {
-                            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = providerFailureStopReason(breaker_finalization), .turns = turns, .tool_calls = total_tool_calls });
+                            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
                         }
                         continue :request_recovery;
                     },
                     else => |e| {
                         log.err("agent", "sendMessageStream failed turn={d}: {s}", .{ turns + 1, @errorName(e) });
-                        // An explicit user/evaluation abort still outranks the
-                        // breaker finalizer. Other provider failures preserve
-                        // .tool_loop so already-completed work is not recast as
-                        // a fresh API failure merely because prose cleanup
-                        // could not be sampled.
                         const stop_reason = if (e == error.Aborted)
                             stopReasonForAbort(opts.abort)
                         else
-                            providerFailureStopReason(breaker_finalization);
+                            .api_error;
                         return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns, .tool_calls = total_tool_calls });
                     },
                 }
@@ -1008,6 +911,15 @@ pub fn run(
                         try assistant_text.appendSlice(allocator, text);
                         log.debugId("agent", rid, "text chunk bytes={d}", .{text.len});
                         // text bytes 是 stream 分配的 owned——用完必须 free，否则泄漏
+                        allocator.free(text);
+                    },
+                    .thinking => |text| {
+                        // 思考过程:不混入 assistant_text(最终回答),单独 emit 给 UI 折叠显示。
+                        // preserved thinking:累加进 thinking_text,turn 末存入 thinking block,
+                        // 下轮请求 serializeContent 回传给模型。
+                        backend.emitEvent(sess, .{ .thinking_chunk = text });
+                        try thinking_text.appendSlice(allocator, text);
+                        log.debugId("agent", rid, "thinking chunk bytes={d}", .{text.len});
                         allocator.free(text);
                     },
                     .tool_use_start => |tu_in| {
@@ -1156,6 +1068,7 @@ pub fn run(
                 for (assistant_blocks.items) |b| b.deinit(allocator);
                 assistant_blocks.clearRetainingCapacity();
                 assistant_text.clearRetainingCapacity();
+                thinking_text.clearRetainingCapacity();
                 if (can_recover_context_error) {
                     if (!recoverContextWindowExceeded(
                         conversation,
@@ -1172,18 +1085,25 @@ pub fn run(
                         turns + 1,
                         allocator,
                     )) {
-                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = providerFailureStopReason(breaker_finalization), .turns = turns + 1, .tool_calls = total_tool_calls });
+                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
                     }
                     continue :request_recovery;
                 }
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = providerFailureStopReason(breaker_finalization), .turns = turns + 1, .tool_calls = total_tool_calls });
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
             }
 
             break :request_recovery;
         }
         const rid = rid_for_turn;
 
-        // 4. 把 assistant text + tool_uses 组装成 Message 追加到 conversation
+        // 4. 把 thinking + assistant text + tool_uses 组装成 Message 追加到 conversation。
+        // 顺序:thinking block 先于 text(对齐 Anthropic content[] 规范;OpenAI-compatible
+        // 的 reasoning_content 平级字段由 request.zig 序列化时处理,block 顺序无害)。
+        if (thinking_text.items.len > 0) {
+            const th_owned = try allocator.dupe(u8, thinking_text.items);
+            errdefer allocator.free(th_owned);
+            try assistant_blocks.append(allocator, .{ .thinking = th_owned });
+        }
         if (assistant_text.items.len > 0) {
             const text_owned = try allocator.dupe(u8, assistant_text.items);
             errdefer allocator.free(text_owned);
@@ -1211,11 +1131,6 @@ pub fn run(
             break;
         };
         if (!has_tool_use) {
-            if (breaker_finalization) {
-                backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
-                fireStopHook(permission_ctx.hooks, allocator, conversation, "tool_loop", depth);
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
-            }
             // max_tokens 续写:模型被 token 上限截断(非自然 end_turn),
             // 注入 continue 提示让它接着写,而不是当作完成。最多 MAX_CONTINUATIONS 次。
             if (turn_stop_reason == .max_tokens and continuations < MAX_CONTINUATIONS) {
@@ -1234,15 +1149,6 @@ pub fn run(
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls });
         }
 
-        // A provider should not emit tool_use after receiving no tool schema.
-        // Treat non-compliance as the end of the one-shot finalization instead
-        // of executing an unadvertised action or entering another loop.
-        if (breaker_finalization) {
-            backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
-            fireStopHook(permission_ctx.hooks, allocator, conversation, "tool_loop", depth);
-            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
-        }
-
         // 6. 执行所有 tool_use，把结果作为 user-role 的 tool_result block 追加。
         //    批1:权限检查主线程串行,执行按 isConcurrencySafe 分批并发(tool_exec.zig)。
         const tool_stage_started_ns = util_time.nowNs();
@@ -1251,9 +1157,6 @@ pub fn run(
             for (result_blocks.items) |b| b.deinit(allocator);
             result_blocks.deinit(allocator);
         }
-
-        // 本轮是否触发工具熔断(同工具同错连续 MAX_SAME_TOOL_ERROR 次)。
-        var tool_loop_tripped = false;
 
         // 6a. 收集 tool_use + 主线程串行做权限检查 → slots。
         const tool_exec = @import("tool_exec.zig");
@@ -1507,10 +1410,8 @@ pub fn run(
             .elapsed_ms = elapsedSinceNs(tool_stage_started_ns),
         } });
         if (opts.event_projection.emitToolStart(opts.emit_tool_cards, opts.agent_depth)) {
-            // P2.1:只发 clear_current_tool 清运行态动态卡。**不再**为每个 slot 补发一条空 content
-            // 的 tool_result——那是历史"双发",逼每个 backend 靠 content.len>0 去重(tui gate / web JS dedup /
-            // WebSearch 靠真 emit 也会 clearToolCard)。真结果由下方每 slot 的单条 tool_result(真 content)
-            // 承载,backend 收敛为"每工具一条干净 tool_result"。
+            // P2.1:只发 clear_current_tool 清运行态动态卡。真结果由下方每 slot 的单条
+            // tool_result(真 content)承载,不再双发空+实。
             backend.emitEvent(sess, .clear_current_tool);
         }
 
@@ -1576,18 +1477,7 @@ pub fn run(
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .suspended, .turns = turns + 1, .tool_calls = total_tool_calls, .suspend_info = si });
         }
 
-        // 6d. 按原顺序回填 result_blocks。熔断判定**不在此内层循环累加**——否则单轮内
-        // 多个工具调用返回同一错误(如 subagent 第一轮发 3 个 TaskCreate 全失败)会在一轮内
-        // 把 same_err_count 累到阈值,turns=1 就误熔断。改为:本轮只归纳"本轮错误特征"
-        // (是否所有 error slot 同签名、有无成功 slot),循环后做**跨 turn**累积判定。
-        var turn_err_sig: ?ToolErrSig = null; // 本轮 error slot 的统一签名(若全同)
-        var turn_uniform_err = true; // 本轮 error slot 是否全是同一签名
-        var turn_any_error = false; // 本轮是否有 error slot
-        var turn_any_success = false; // 本轮是否有成功 slot
-        // Per-turn aggregation is essential: three identical calls in one
-        // parallel block are one model decision, not three failed turns.
-        var turn_zero_gain: std.ArrayList(ZeroGainObservation) = .empty;
-        defer turn_zero_gain.deinit(allocator);
+        // 6d. 按原顺序回填 result_blocks。
         // P0.2 PostToolUse:执行后 hook 产出的 additionalContext,拼成一段注入本轮 user 消息(下轮模型可见)。
         var post_ctx: std.ArrayList(u8) = .empty;
         defer post_ctx.deinit(allocator);
@@ -1600,17 +1490,6 @@ pub fn run(
             // 本迭代若再加 try 也不会双释放。
             var content_transferred = false;
             errdefer if (!content_transferred) allocator.free(content);
-            if (s.is_error) {
-                turn_any_error = true;
-                const sig = ToolErrSig.of(s.name, content);
-                if (turn_err_sig) |prev| {
-                    if (!prev.eql(sig)) turn_uniform_err = false;
-                } else {
-                    turn_err_sig = sig;
-                }
-            } else {
-                turn_any_success = true;
-            }
             const tool_use_id = try allocator.dupe(u8, s.id);
             errdefer if (!content_transferred) allocator.free(tool_use_id);
             try result_blocks.append(allocator, .{ .tool_result = .{
@@ -1631,30 +1510,6 @@ pub fn run(
                 };
             }
 
-            // 这里只归纳本轮成功结果；跨轮计数在 slot 循环后统一进行。错误风暴由
-            // same-error breaker 负责，避免两套熔断器对同一错误重复计数。
-            if (!s.is_error) {
-                var sh = std.hash.Wyhash.init(0);
-                sh.update(s.name);
-                sh.update(s.input);
-                const observation = ZeroGainObservation{
-                    .sig_hash = sh.final(),
-                    .result_hash = std.hash.Wyhash.hash(0, content),
-                    .tool_name = s.name,
-                };
-                var found = false;
-                for (turn_zero_gain.items) |*existing| {
-                    if (existing.sig_hash != observation.sig_hash) continue;
-                    // Same signature appearing several times in one parallel
-                    // response counts once. If results differ, retain the last
-                    // result; that difference will be classified as progress.
-                    existing.* = observation;
-                    found = true;
-                    break;
-                }
-                if (!found) turn_zero_gain.append(allocator, observation) catch {};
-            }
-
             // 实时工具卡渲染(REPL):把结果经 backend 渲染到屏幕——Edit/Write diff 着色、
             // Grep/Glob 摘要、Read 摘要。headless/单测 tool_render_theme=null → 跳过(emit 仍发,
             // 但那些场景用 WriterBackend,tool_result no-op)。渲染移入 backend(renderResult)。
@@ -1670,56 +1525,6 @@ pub fn run(
             }
         }
 
-        // "Repeated" only means zero gain when no successful action in this
-        // turn is new or changed. Any such progress clears stale counts from
-        // unrelated work, then seeds the current observations at count one.
-        // This gives the tracker a real cross-turn window while preserving the
-        // three-turn protection for an unchanged Read/Bash loop.
-        var turn_has_progress = false;
-        for (turn_zero_gain.items) |observation| {
-            if (!zero_gain.hasSameResult(observation.sig_hash, observation.result_hash)) {
-                turn_has_progress = true;
-                break;
-            }
-        }
-        if (turn_has_progress) {
-            zero_gain.clear();
-            for (turn_zero_gain.items) |observation| {
-                _ = zero_gain.record(observation.sig_hash, observation.result_hash);
-            }
-        } else {
-            for (turn_zero_gain.items) |observation| {
-                const n = zero_gain.record(observation.sig_hash, observation.result_hash);
-                if (n >= MAX_ZERO_GAIN_REPEAT) {
-                    log.warnId("agent", rid, "zero-gain repeat breaker: tool {s} identical input+result x{d} turns", .{ observation.tool_name, n });
-                    backend.emitEvent(sess, .{ .diag_breaker_tripped = .{ .trace_id = trace_id, .depth = depth, .same_err_count = n } });
-                    tool_loop_tripped = true;
-                }
-            }
-        }
-
-        // 跨 turn 熔断累积:本轮被视为"同错轮"当且仅当——有错、无成功、且本轮所有 error
-        // 同一签名。连续 MAX_SAME_TOOL_ERROR 个"同错轮"且签名一致 → 熔断。任意成功 / 换
-        // 签名 / 无错 → 重置。这样既治"连续多轮原地同错风暴",又不误杀"单轮并发多工具同错"。
-        if (turn_any_error and !turn_any_success and turn_uniform_err) {
-            const sig = turn_err_sig.?;
-            if (last_err_sig != null and last_err_sig.?.eql(sig)) {
-                same_err_count += 1;
-            } else {
-                same_err_count = 1;
-                last_err_sig = sig;
-            }
-            if (same_err_count >= MAX_SAME_TOOL_ERROR) {
-                log.warnId("agent", rid, "tool-loop circuit breaker tripped: same error x{d} turns consecutively", .{same_err_count});
-                // L4 诊断:熔断触发。
-                backend.emitEvent(sess, .{ .diag_breaker_tripped = .{ .trace_id = trace_id, .depth = depth, .same_err_count = same_err_count } });
-                tool_loop_tripped = true;
-            }
-        } else {
-            same_err_count = 0;
-            last_err_sig = null;
-        }
-
         if (result_blocks.items.len == 0) {
             result_blocks.deinit(allocator);
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_error, .turns = turns + 1, .tool_calls = total_tool_calls });
@@ -1730,22 +1535,9 @@ pub fn run(
             const ctx_text = try std.fmt.allocPrint(allocator, "[PostToolUse hook]\n{s}", .{post_ctx.items});
             try result_blocks.append(allocator, .{ .text = ctx_text });
         }
-        if (tool_loop_tripped) {
-            const breaker_text = try allocator.dupe(u8, LOOP_BREAKER_FINALIZATION);
-            errdefer allocator.free(breaker_text);
-            try result_blocks.append(allocator, .{ .text = breaker_text });
-        }
 
         const blocks_owned = try result_blocks.toOwnedSlice(allocator);
         try conversation.append(.{ .role = .user, .blocks = blocks_owned });
-
-        // 工具熔断是受控软停。错误/重复结果和明确 breaker 标记都已进入
-        // conversation；再借一个不带 tools 的采样轮生成可交付的收尾文本。
-        if (tool_loop_tripped) {
-            breaker_finalization = true;
-            backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
-            continue;
-        }
 
         // Mid-turn follow-up compact: after tool_result blocks are appended and
         // before the next sampling request, re-check the actual pending request.
@@ -3778,35 +3570,6 @@ test "stream context-window recovery retries before assistant payload" {
     try std.testing.expectEqualStrings("current request", active[1].blocks[0].text);
     // 被投影掉的 oldest 仍原样保留在头部(供 transcript/resume)。
     try std.testing.expectEqualStrings("oldest context", c.messages.items[0].blocks[0].text);
-}
-
-test "ZeroGainTracker:同 sig 同 result 达 MAX 打转;分页/结果变化不误触发" {
-    const a = std.testing.allocator;
-    // 同 sig 同 result 累计:第 MAX_ZERO_GAIN_REPEAT(3)次才打转。
-    {
-        var z = ZeroGainTracker.init(a);
-        defer z.deinit();
-        try std.testing.expect(!z.tripped(1, 100)); // count=1
-        try std.testing.expect(!z.tripped(1, 100)); // count=2
-        try std.testing.expect(z.tripped(1, 100)); // count=3 → 打转
-    }
-    // 分页:不同 sig(offset 递进 → 不同 hash)各自独立,永不触发。
-    {
-        var z = ZeroGainTracker.init(a);
-        defer z.deinit();
-        try std.testing.expect(!z.tripped(10, 200));
-        try std.testing.expect(!z.tripped(11, 201));
-        try std.testing.expect(!z.tripped(12, 202));
-        try std.testing.expect(!z.tripped(13, 203));
-    }
-    // 结果变化:同 sig 但 result_hash 每次变(如 git status 状态变)→ 每次重置,不误杀 re-check。
-    {
-        var z = ZeroGainTracker.init(a);
-        defer z.deinit();
-        try std.testing.expect(!z.tripped(5, 10));
-        try std.testing.expect(!z.tripped(5, 20)); // result 变 → reset count=1
-        try std.testing.expect(!z.tripped(5, 30)); // 又变 → reset,不触发
-    }
 }
 
 test "context warning emits once only at medium pressure" {

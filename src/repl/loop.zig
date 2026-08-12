@@ -738,10 +738,6 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             if (bd) |b| std.debug.print("\x1b[33m  动作分布:{s}\x1b[0m\n", .{b});
             std.debug.print("\x1b[33m直接输入你的下一步(如\"继续\")续接对话,或调整方向。\x1b[0m\n", .{});
         }
-        // 打转熔断(零增益重复 / 连续同错):明确告知,非静默。
-        if (result.stop_reason == .tool_loop) {
-            std.debug.print("\x1b[33m检测到重复无效动作(同操作反复无信息增益,或连续同错),已中止本轮以防打转。\n调整方向后输入下一步可继续。\x1b[0m\n", .{});
-        }
         // 模型 API 撞墙:带真实错误现场告知(HTTP 状态 + body 摘要),不许塌缩成猜谜文案——
         // 2026-07-12 NUL 字节 bug 排障靠抓包才看到 "Failed to parse request body" 的教训。
         if (result.stop_reason == .api_error) {
