@@ -64,7 +64,7 @@ class Handler(BaseHTTPRequestHandler):
         command = body.get("command", "__markdown__")
         if command == "slow":
             time.sleep(1.0)
-        if command == "stats" and self.server.mode == "backpressure":  # type: ignore[attr-defined]
+        if command in {"stats", "add-node"} and self.server.mode == "backpressure":  # type: ignore[attr-defined]
             response = self.response(body, False, -3, "", "tinykgd: error: DaemonQueueFull\n", "none")
             return self.send_json(response)
         if command == "stats" and self.server.mode == "conflict":  # type: ignore[attr-defined]
@@ -168,9 +168,11 @@ def main() -> int:
         assert "path" not in ACTOR.markdown_uploads[0]
         server.mode = "backpressure"  # type: ignore[attr-defined]
         assert "backpressure=observed" in run_probe(args.probe, url, "backpressure")
+        assert "backpressure_write_no_commit=observed" in run_probe(args.probe, url, "backpressure-write")
         server.mode = "conflict"  # type: ignore[attr-defined]
         assert "conflict=observed" in run_probe(args.probe, url, "conflict")
         server.mode = "normal"  # type: ignore[attr-defined]
+        assert "unauthorized_write_no_commit=observed" in run_probe(args.probe, url, "unauthorized-write")
         started = time.monotonic()
         assert "wall_clock_timeout=observed" in run_probe(args.probe, url, "timeout")
         assert time.monotonic() - started < 1.0

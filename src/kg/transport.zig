@@ -201,15 +201,10 @@ pub const WebTransport = struct {
                 return Error.RequestTimedOut;
             };
             const response = self.postBeforeDeadline(url, body, request_id, remaining_ms) catch |err| {
+                if (!mutates or provesNoCommit(err)) return normalizeReadFailure(err);
                 if (attempt == 0 and remainingTimeoutMs(deadline_ms) != null) continue;
-                if (mutates) {
-                    try self.recordAmbiguousRequestId(request_id);
-                    return Error.AmbiguousCommit;
-                }
-                return switch (err) {
-                    Error.AuthenticationFailed, Error.IncompatibleDaemon, Error.InvalidResponse, Error.RequestIdConflict, Error.Backpressure, Error.RequestTimedOut => err,
-                    else => Error.DaemonUnavailable,
-                };
+                try self.recordAmbiguousRequestId(request_id);
+                return Error.AmbiguousCommit;
             };
             if (response.commit_state == .ambiguous) {
                 response.deinit(self.allocator);
@@ -380,6 +375,26 @@ fn remainingTimeoutMs(deadline_ms: i128) ?u64 {
     return @intCast(deadline_ms - @as(i128, now_ms));
 }
 
+fn provesNoCommit(err: Error) bool {
+    return switch (err) {
+        Error.InvalidConfiguration,
+        Error.InvalidUrl,
+        Error.AuthenticationFailed,
+        Error.RequestIdConflict,
+        Error.Backpressure,
+        Error.DaemonUnavailable,
+        => true,
+        else => false,
+    };
+}
+
+fn normalizeReadFailure(err: Error) Error {
+    return switch (err) {
+        Error.RequestFailed, Error.ResponseTooLarge => Error.DaemonUnavailable,
+        else => err,
+    };
+}
+
 fn stringifyAlloc(allocator: std.mem.Allocator, value: anytype) Error![]u8 {
     var output = std.Io.Writer.Allocating.init(allocator);
     errdefer output.deinit();
@@ -447,4 +462,7 @@ test "transport command policies bind sessions and task capabilities" {
     try std.testing.expect(!requiresTaskHierarchy("stats"));
     try std.testing.expect(identifierValid("metacodes-session-a1"));
     try std.testing.expect(!identifierValid("bad id"));
+    try std.testing.expect(provesNoCommit(Error.AuthenticationFailed));
+    try std.testing.expect(provesNoCommit(Error.Backpressure));
+    try std.testing.expect(!provesNoCommit(Error.RequestTimedOut));
 }

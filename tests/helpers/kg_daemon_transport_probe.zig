@@ -11,10 +11,11 @@ pub fn main(init: std.process.Init) !void {
     const action = args.next() orelse return error.MissingAction;
 
     const timeout_ms: u64 = if (std.mem.eql(u8, action, "timeout")) 100 else 2_000;
+    const effective_api_key = if (std.mem.eql(u8, action, "unauthorized-write")) "wrong-test-key" else api_key;
     var transport = try cc.kg_transport.WebTransport.init(init.gpa, .{
         .io = init.io,
         .url = url,
-        .api_key = api_key,
+        .api_key = effective_api_key,
         .expected_build_id = build_id,
         .expected_schema_digest = schema_digest,
         .timeout_ms = timeout_ms,
@@ -49,6 +50,20 @@ pub fn main(init: std.process.Init) !void {
             transport.run("stats", &.{}, false),
         );
         try out.writeAll("backpressure=observed\n");
+    } else if (std.mem.eql(u8, action, "backpressure-write")) {
+        try std.testing.expectError(
+            cc.kg_transport.Error.Backpressure,
+            transport.run("add-node", &.{ "observation", "queue-full" }, true),
+        );
+        try std.testing.expect(transport.ambiguousRequestId() == null);
+        try out.writeAll("backpressure_write_no_commit=observed\n");
+    } else if (std.mem.eql(u8, action, "unauthorized-write")) {
+        try std.testing.expectError(
+            cc.kg_transport.Error.AuthenticationFailed,
+            transport.run("add-node", &.{ "observation", "unauthorized" }, true),
+        );
+        try std.testing.expect(transport.ambiguousRequestId() == null);
+        try out.writeAll("unauthorized_write_no_commit=observed\n");
     } else if (std.mem.eql(u8, action, "conflict")) {
         try std.testing.expectError(
             cc.kg_transport.Error.RequestIdConflict,
