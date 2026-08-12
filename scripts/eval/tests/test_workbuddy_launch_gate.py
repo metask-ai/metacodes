@@ -2,6 +2,7 @@ import hashlib
 import http.server
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -49,6 +50,7 @@ from scripts.eval.workbuddy.trace import (
 )
 from scripts.eval.workbuddy import WORKBUDDY_PINNED_COMMIT
 from scripts.eval.workbuddy.install_overlay import _digest
+from scripts.eval.workbuddy.environment_preflight import prebuild as prebuild_environment
 from scripts.eval.workbuddy.stage_artifacts import stage
 
 
@@ -900,6 +902,147 @@ with urllib.request.urlopen(
                     credential_fd=self._credential_fd(),
                     runner_argv=[sys.executable, "-c", "raise SystemExit(98)"],
                 )
+
+    def test_dataset_staging_drift_on_real_launch_path_precedes_budget_and_runner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest_path = self._manifest(root)
+            workbuddy = root / "workbuddy"
+            harness = workbuddy / "configs/harnesses/metacodes/docker"
+            harness.mkdir(parents=True)
+            (harness / "Dockerfile").write_text(
+                "FROM scratch\n", encoding="utf-8"
+            )
+            for task in ("code-task-a", "code-task-b"):
+                environment = (
+                    workbuddy
+                    / f"datasets/wb-bench-code-v1.0/tasks/{task}/environment"
+                )
+                environment.mkdir(parents=True)
+                (environment / "Dockerfile").write_text(
+                    "FROM scratch\n", encoding="utf-8"
+                )
+                (environment.parent / "task.toml").write_text(
+                    f"[task]\nname = '{task}'\n", encoding="utf-8"
+                )
+            docker = root / "docker"
+            docker.write_text("fixture\n", encoding="utf-8")
+            docker.chmod(0o755)
+            preflight_path = root / "environment-preflight.json"
+
+            def fake_environment_run(argv, **_kwargs):
+                args = [str(item) for item in argv]
+                if args[0] == "git":
+                    return subprocess.CompletedProcess(
+                        args, 0, WORKBUDDY_PINNED_COMMIT + "\n", ""
+                    )
+                if "buildx" in args and "build" in args:
+                    return subprocess.CompletedProcess(args, 0, "built\n", "")
+                if args[1:3] == ["image", "inspect"]:
+                    row = {
+                        "Id": "sha256:" + "a" * 64,
+                        "Architecture": "amd64",
+                        "Os": "linux",
+                    }
+                    return subprocess.CompletedProcess(
+                        args, 0, json.dumps(row), ""
+                    )
+                if args[1:3] == ["version", "--format"]:
+                    return subprocess.CompletedProcess(
+                        args, 0, '{"Version":"test"}\n', ""
+                    )
+                raise AssertionError(f"unexpected environment command: {args}")
+
+            with mock.patch(
+                "scripts.eval.workbuddy.environment_preflight._run",
+                side_effect=fake_environment_run,
+            ):
+                preflight = prebuild_environment(
+                    workbuddy=workbuddy,
+                    dataset="datasets/wb-bench-code-v1.0/tasks",
+                    selected_tasks=["code-task-a"],
+                    output=preflight_path,
+                    docker=docker,
+                )
+
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["cohort"]["manifest"] = {
+                "path": "/fixture/cohort.json",
+                "bytes": 1,
+                "sha256": digest("cohort"),
+            }
+            manifest["artifacts"]["executables"] = {}
+            manifest["environment_preflight"] = {
+                "receipt": {
+                    "path": str(preflight_path),
+                    "bytes": len(preflight_path.read_bytes()),
+                    "sha256": hashlib.sha256(preflight_path.read_bytes()).hexdigest(),
+                },
+                "content_sha256": preflight["content_sha256"],
+                "target_platform": "linux/amd64",
+            }
+            manifest["model"]["backend_url_env"] = "WORKBUDDY_L2_UNUSED_URL"
+            manifest["model"]["backend_url_sha256"] = hashlib.sha256(b"").hexdigest()
+            manifest.pop("content_sha256")
+            manifest["content_sha256"] = hashlib.sha256(
+                stable_json(manifest).encode("utf-8")
+            ).hexdigest()
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            os.chmod(manifest_path, 0o600)
+
+            # WorkBuddy stages and prepares the complete dataset before task
+            # selection. Drift an unselected task after receipt publication.
+            (workbuddy / "datasets/wb-bench-code-v1.0/tasks/code-task-b/task.toml").write_text(
+                "[task]\nname = 'drifted'\n", encoding="utf-8"
+            )
+            journal = root / "budget.json"
+            receipt = root / "receipt.json"
+            credential_fd = self._credential_fd()
+            try:
+                with mock.patch(
+                    "scripts.eval.workbuddy.launch_gate._reobserve_host_control_plane"
+                ), mock.patch(
+                    "scripts.eval.workbuddy.launch_gate._git",
+                    return_value=WORKBUDDY_PINNED_COMMIT,
+                ), mock.patch(
+                    "scripts.eval.workbuddy.launch_gate._reobserve_identity"
+                ), mock.patch(
+                    "scripts.eval.workbuddy.launch_gate.validate_installed_overlay",
+                    return_value={
+                        "overlay_sha256": manifest["workbuddy"][
+                            "overlay_content_sha256"
+                        ]
+                    },
+                ), mock.patch(
+                    "scripts.eval.workbuddy.launch_gate._paid_host_guard"
+                ), mock.patch(
+                    "scripts.eval.workbuddy.launch_gate._runner_tool",
+                    side_effect=lambda path, *_args, **_kwargs: manifest["execution"][
+                        "runner_tools"
+                    ][Path(path).name],
+                ), mock.patch(
+                    "scripts.eval.workbuddy.environment_preflight._run",
+                    side_effect=fake_environment_run,
+                ), mock.patch(
+                    "scripts.eval.workbuddy.launch_gate.subprocess.run"
+                ) as runner:
+                    with self.assertRaisesRegex(
+                        LaunchError, "dataset staging contract changed"
+                    ):
+                        execute_launch(
+                            manifest_path=manifest_path,
+                            journal_path=journal,
+                            receipt_path=receipt,
+                            credential_fd=credential_fd,
+                        )
+                runner.assert_not_called()
+                self.assertFalse(journal.exists())
+                self.assertFalse(receipt.exists())
+            finally:
+                os.close(credential_fd)
 
     def test_provider_received_then_crash_has_no_forged_failure_receipt(self):
         with tempfile.TemporaryDirectory() as directory:

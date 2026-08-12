@@ -26,9 +26,12 @@ from . import WORKBUDDY_PINNED_COMMIT
 from .stage_artifacts import TARGET_PLATFORM
 
 
-SCHEMA_VERSION = "metacodes-workbuddy-environment-preflight-v1"
+SCHEMA_VERSION = "metacodes-workbuddy-environment-preflight-v2"
 TASK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,191}$")
 DEFAULT_HARNESS_IMAGE = "workbuddy-bench/harness/metacodes:0.1.0"
+MAX_DATASET_TASKS = 4096
+MAX_TASK_TOML_BYTES = 1024 * 1024
+MAX_DATASET_TASK_TOML_BYTES = 128 * 1024 * 1024
 
 
 class EnvironmentPreflightError(ValueError):
@@ -43,7 +46,23 @@ def _canonical_sha256(value: object) -> str:
     return _sha256_bytes(stable_json(value).encode("utf-8"))
 
 
-def _read_regular(path: Path, maximum: int = 2 * 1024 * 1024 * 1024) -> bytes:
+def _stable_file_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_uid,
+        info.st_gid,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _read_regular_observed(
+    path: Path, maximum: int = 2 * 1024 * 1024 * 1024
+) -> tuple[bytes, os.stat_result]:
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
         before = os.fstat(descriptor)
@@ -64,12 +83,15 @@ def _read_regular(path: Path, maximum: int = 2 * 1024 * 1024 * 1024) -> bytes:
             if observed > maximum:
                 raise EnvironmentPreflightError(f"environment input is too large: {path}")
         after = os.fstat(descriptor)
-        identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-        if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        if _stable_file_identity(before) != _stable_file_identity(after):
             raise EnvironmentPreflightError(f"environment input changed while hashing: {path}")
-        return b"".join(chunks)
+        return b"".join(chunks), after
     finally:
         os.close(descriptor)
+
+
+def _read_regular(path: Path, maximum: int = 2 * 1024 * 1024 * 1024) -> bytes:
+    return _read_regular_observed(path, maximum)[0]
 
 
 def _tree_identity(root: Path) -> Dict[str, object]:
@@ -222,6 +244,135 @@ def _resolve_dataset(workbuddy: Path, dataset: str) -> Path:
     return path
 
 
+def _dataset_staging_identity(
+    dataset_path: Path, selected_tasks: Sequence[str]
+) -> Dict[str, object]:
+    """Bind every task.toml that WorkBuddy may rewrite before selection.
+
+    ``prepare_tasks.py`` walks the complete dataset, not only the selected
+    cohort.  Copies preserve file modes, so a read-only unselected task can
+    otherwise fail after paid authorization.  This scan deliberately checks
+    owner-write mode bits rather than ``os.access``: effective privileges do
+    not describe whether the staged copy will satisfy that contract.
+    """
+
+    try:
+        before = dataset_path.lstat()
+    except OSError as exc:
+        raise EnvironmentPreflightError(
+            f"cannot inspect WorkBuddy dataset: {dataset_path}"
+        ) from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+        raise EnvironmentPreflightError(
+            f"WorkBuddy dataset is not a regular directory: {dataset_path}"
+        )
+    rows: list[Dict[str, object]] = []
+    names: set[str] = set()
+    total_bytes = 0
+    try:
+        children = sorted(dataset_path.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        raise EnvironmentPreflightError(
+            f"cannot enumerate WorkBuddy dataset: {dataset_path}"
+        ) from exc
+    for child in children:
+        try:
+            child_info = child.lstat()
+        except OSError as exc:
+            raise EnvironmentPreflightError(
+                f"cannot inspect WorkBuddy dataset entry: {child}"
+            ) from exc
+        if stat.S_ISLNK(child_info.st_mode):
+            if child.is_dir() and (child / "task.toml").exists():
+                raise EnvironmentPreflightError(
+                    f"WorkBuddy task directory is a symlink: {child}"
+                )
+            continue
+        if not stat.S_ISDIR(child_info.st_mode):
+            continue
+        task_toml = child / "task.toml"
+        try:
+            task_info = task_toml.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise EnvironmentPreflightError(
+                f"cannot inspect WorkBuddy task.toml: {task_toml}"
+            ) from exc
+        if len(rows) >= MAX_DATASET_TASKS:
+            raise EnvironmentPreflightError(
+                f"WorkBuddy dataset exceeds {MAX_DATASET_TASKS} tasks"
+            )
+        if stat.S_ISLNK(task_info.st_mode):
+            raise EnvironmentPreflightError(
+                f"WorkBuddy task.toml is a symlink: {task_toml}"
+            )
+        try:
+            payload, observed = _read_regular_observed(
+                task_toml, maximum=MAX_TASK_TOML_BYTES
+            )
+        except OSError as exc:
+            raise EnvironmentPreflightError(
+                f"cannot inspect WorkBuddy task.toml: {task_toml}"
+            ) from exc
+        if _stable_file_identity(task_info) != _stable_file_identity(observed):
+            raise EnvironmentPreflightError(
+                f"WorkBuddy task.toml changed before hashing: {task_toml}"
+            )
+        if not TASK_RE.fullmatch(child.name):
+            raise EnvironmentPreflightError(
+                f"WorkBuddy dataset contains an unsafe task name: {child.name}"
+            )
+        mode = stat.S_IMODE(observed.st_mode)
+        if mode & stat.S_IWUSR == 0:
+            raise EnvironmentPreflightError(
+                f"WorkBuddy task.toml is not owner-writable for staging: {task_toml}"
+            )
+        total_bytes += len(payload)
+        if total_bytes > MAX_DATASET_TASK_TOML_BYTES:
+            raise EnvironmentPreflightError(
+                "WorkBuddy dataset task.toml payload exceeds the staging bound"
+            )
+        names.add(child.name)
+        rows.append(
+            {
+                "task": child.name,
+                "task_toml": {
+                    "bytes": len(payload),
+                    "mode": mode,
+                    "owner_writable": True,
+                    "sha256": _sha256_bytes(payload),
+                },
+            }
+        )
+    try:
+        after = dataset_path.lstat()
+    except OSError as exc:
+        raise EnvironmentPreflightError(
+            f"cannot re-observe WorkBuddy dataset: {dataset_path}"
+        ) from exc
+    if _stable_file_identity(before) != _stable_file_identity(after):
+        raise EnvironmentPreflightError(
+            f"WorkBuddy dataset changed while scanning: {dataset_path}"
+        )
+    missing = sorted(set(selected_tasks) - names)
+    if missing:
+        raise EnvironmentPreflightError(
+            "selected WorkBuddy task is absent from the staging dataset: "
+            + ", ".join(missing)
+        )
+    if not rows:
+        raise EnvironmentPreflightError("WorkBuddy dataset has no task.toml files")
+    return {
+        "path": str(dataset_path),
+        "task_count": len(rows),
+        "task_toml_bytes": total_bytes,
+        "owner_writable": True,
+        "content_sha256": _canonical_sha256(rows),
+        "tasks": rows,
+    }
+
+
 def prebuild(
     *,
     workbuddy: Path,
@@ -243,6 +394,7 @@ def prebuild(
     if not os.access(docker_path, os.X_OK):
         raise EnvironmentPreflightError("docker executable is not executable")
     dataset_path = _resolve_dataset(checkout, dataset)
+    dataset_staging = _dataset_staging_identity(dataset_path, selected_tasks)
     started = time.monotonic()
     harness_context = checkout / "configs/harnesses/metacodes/docker"
     harness_identity = _tree_identity(harness_context)
@@ -302,6 +454,7 @@ def prebuild(
         "workbuddy_commit": WORKBUDDY_PINNED_COMMIT,
         "workbuddy_checkout": str(checkout),
         "dataset": dataset,
+        "dataset_staging": dataset_staging,
         "selected_tasks": list(selected_tasks),
         "target_platform": TARGET_PLATFORM,
         "docker": {
@@ -367,6 +520,13 @@ def validate_receipt(
     ):
         raise EnvironmentPreflightError("environment preflight receipt contract mismatch")
     dataset_path = _resolve_dataset(checkout, dataset)
+    observed_dataset_staging = _dataset_staging_identity(
+        dataset_path, expected_tasks
+    )
+    if value.get("dataset_staging") != observed_dataset_staging:
+        raise EnvironmentPreflightError(
+            "WorkBuddy dataset staging contract changed after preflight"
+        )
     docker_row = value.get("docker") or {}
     if (
         not isinstance(docker_row, dict)

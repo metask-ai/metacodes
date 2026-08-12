@@ -620,6 +620,9 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
             (harness / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
             environment = workbuddy / "datasets/code/tasks/task-a/environment"
             environment.mkdir(parents=True)
+            (environment.parent / "task.toml").write_text(
+                "[task]\nname = 'task-a'\n", encoding="utf-8"
+            )
             (environment / "Dockerfile").write_text(
                 "FROM scratch\n", encoding="utf-8"
             )
@@ -648,6 +651,8 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
             self.assertEqual(built, observed)
             self.assertEqual(built["target_platform"], "linux/amd64")
             self.assertEqual(built["tasks"]["task-a"]["architecture"], "amd64")
+            self.assertEqual(built["dataset_staging"]["task_count"], 1)
+            self.assertTrue(built["dataset_staging"]["owner_writable"])
             self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
 
             (environment / "Dockerfile").write_text(
@@ -678,6 +683,9 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
             (harness / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
             environment = workbuddy / "datasets/code/tasks/task-a/environment"
             environment.mkdir(parents=True)
+            (environment.parent / "task.toml").write_text(
+                "[task]\nname = 'task-a'\n", encoding="utf-8"
+            )
             (environment / "Dockerfile").write_text(
                 "FROM scratch\n", encoding="utf-8"
             )
@@ -698,6 +706,170 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
                         output=root / "preflight.json",
                         docker=docker,
                     )
+
+    def test_preflight_rejects_unselected_readonly_task_before_docker_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            workbuddy = root / "workbuddy"
+            harness = workbuddy / "configs/harnesses/metacodes/docker"
+            harness.mkdir(parents=True)
+            (harness / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            for task in ("task-a", "task-b"):
+                environment = workbuddy / f"datasets/code/tasks/{task}/environment"
+                environment.mkdir(parents=True)
+                (environment / "Dockerfile").write_text(
+                    "FROM scratch\n", encoding="utf-8"
+                )
+                (environment.parent / "task.toml").write_text(
+                    f"[task]\nname = '{task}'\n", encoding="utf-8"
+                )
+            unselected = workbuddy / "datasets/code/tasks/task-b/task.toml"
+            unselected.chmod(0o444)
+            calls: list[list[str]] = []
+
+            def observe_run(argv, **kwargs):
+                calls.append([str(item) for item in argv])
+                return self._fake_run()(argv, **kwargs)
+
+            docker = root / "docker"
+            docker.write_text("fixture\n", encoding="utf-8")
+            docker.chmod(0o755)
+            with mock.patch(
+                "scripts.eval.workbuddy.environment_preflight._run",
+                side_effect=observe_run,
+            ):
+                with self.assertRaisesRegex(
+                    EnvironmentPreflightError,
+                    r"not owner-writable.*task-b/task\.toml",
+                ):
+                    prebuild(
+                        workbuddy=workbuddy,
+                        dataset="datasets/code/tasks",
+                        selected_tasks=["task-a"],
+                        output=root / "preflight.json",
+                        docker=docker,
+                    )
+            self.assertFalse(
+                any("buildx" in call and "build" in call for call in calls)
+            )
+            self.assertFalse((root / "preflight.json").exists())
+
+    def test_preflight_reobserves_unselected_task_toml_and_rejects_links(self):
+        for mutation in ("content", "symlink", "hardlink"):
+            with self.subTest(
+                mutation=mutation
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                os.chmod(root, 0o700)
+                workbuddy = root / "workbuddy"
+                harness = workbuddy / "configs/harnesses/metacodes/docker"
+                harness.mkdir(parents=True)
+                (harness / "Dockerfile").write_text(
+                    "FROM scratch\n", encoding="utf-8"
+                )
+                for task in ("task-a", "task-b"):
+                    environment = (
+                        workbuddy / f"datasets/code/tasks/{task}/environment"
+                    )
+                    environment.mkdir(parents=True)
+                    (environment / "Dockerfile").write_text(
+                        "FROM scratch\n", encoding="utf-8"
+                    )
+                    (environment.parent / "task.toml").write_text(
+                        f"[task]\nname = '{task}'\n", encoding="utf-8"
+                    )
+                docker = root / "docker"
+                docker.write_text("fixture\n", encoding="utf-8")
+                docker.chmod(0o755)
+                receipt = root / "preflight.json"
+                with mock.patch(
+                    "scripts.eval.workbuddy.environment_preflight._run",
+                    side_effect=self._fake_run(),
+                ):
+                    built = prebuild(
+                        workbuddy=workbuddy,
+                        dataset="datasets/code/tasks",
+                        selected_tasks=["task-a"],
+                        output=receipt,
+                        docker=docker,
+                    )
+                self.assertEqual(built["dataset_staging"]["task_count"], 2)
+                target = workbuddy / "datasets/code/tasks/task-b/task.toml"
+                if mutation == "content":
+                    target.write_text(
+                        "[task]\nname = 'task-b-drifted'\n", encoding="utf-8"
+                    )
+                    expected = "staging contract changed"
+                else:
+                    original = target.read_bytes()
+                    target.unlink()
+                    source = root / f"{mutation}-source.toml"
+                    source.write_bytes(original)
+                    if mutation == "symlink":
+                        target.symlink_to(source)
+                        expected = "task.toml is a symlink"
+                    else:
+                        os.link(source, target)
+                        expected = "single-link regular file"
+                with mock.patch(
+                    "scripts.eval.workbuddy.environment_preflight._run",
+                    side_effect=self._fake_run(),
+                ):
+                    with self.assertRaisesRegex(
+                        EnvironmentPreflightError, expected
+                    ):
+                        validate_receipt(
+                            receipt,
+                            workbuddy=workbuddy,
+                            dataset="datasets/code/tasks",
+                            selected_tasks=["task-a"],
+                            inspect_images=True,
+                        )
+
+    def test_preflight_rejects_missing_selected_task_before_docker_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            workbuddy = root / "workbuddy"
+            harness = workbuddy / "configs/harnesses/metacodes/docker"
+            harness.mkdir(parents=True)
+            (harness / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            task = workbuddy / "datasets/code/tasks/task-a"
+            (task / "environment").mkdir(parents=True)
+            (task / "environment/Dockerfile").write_text(
+                "FROM scratch\n", encoding="utf-8"
+            )
+            (task / "task.toml").write_text(
+                "[task]\nname = 'task-a'\n", encoding="utf-8"
+            )
+            docker = root / "docker"
+            docker.write_text("fixture\n", encoding="utf-8")
+            docker.chmod(0o755)
+            calls: list[list[str]] = []
+
+            def observe_run(argv, **kwargs):
+                calls.append([str(item) for item in argv])
+                return self._fake_run()(argv, **kwargs)
+
+            with mock.patch(
+                "scripts.eval.workbuddy.environment_preflight._run",
+                side_effect=observe_run,
+            ):
+                with self.assertRaisesRegex(
+                    EnvironmentPreflightError,
+                    "selected WorkBuddy task is absent.*task-missing",
+                ):
+                    prebuild(
+                        workbuddy=workbuddy,
+                        dataset="datasets/code/tasks",
+                        selected_tasks=["task-missing"],
+                        output=root / "preflight.json",
+                        docker=docker,
+                    )
+            self.assertFalse(
+                any("buildx" in call and "build" in call for call in calls)
+            )
 
 
 class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
