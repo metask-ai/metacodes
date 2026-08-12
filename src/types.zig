@@ -6,6 +6,15 @@ pub const Config = struct {
     model: []const u8 = "claude-sonnet-4-20250514",
     model_explicit: bool = false,
     reasoning_effort: ?ReasoningEffort = null,
+    /// 方言字段覆盖(null = profile 默认,见 RequestOverrides)。
+    /// CLI --temperature/--top-p/--prompt-cache-key/--parallel-tool-calls/--response-format 填充。
+    /// App.init 塞 OpenAIClient/GeminiClient.overrides(Anthropic 不支持方言字段,忽略)。
+    temperature: ?f32 = null,
+    top_p: ?f32 = null,
+    prompt_cache_key: ?[]const u8 = null,
+    parallel_tool_calls: ?bool = null,
+    /// "json_object" / "json_schema"。null = 不发 response_format。
+    response_format: ?[]const u8 = null,
     /// 每次请求的 max_tokens。null = 根据 model 自动挑（util/model.zig 查表）；
     /// 非 null = 用户 CLI 明确指定的值，尊重覆盖。
     max_tokens: ?u32 = null,

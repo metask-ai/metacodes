@@ -852,6 +852,23 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             }
         } else if (std.mem.eql(u8, arg, "--reasoning-effort") or std.mem.eql(u8, arg, "--thinking")) {
             if (args.next()) |e| config.reasoning_effort = types.ReasoningEffort.parse(e);
+        } else if (std.mem.eql(u8, arg, "--temperature")) {
+            if (args.next()) |s| config.temperature = std.fmt.parseFloat(f32, s) catch null;
+        } else if (std.mem.eql(u8, arg, "--top-p")) {
+            if (args.next()) |s| config.top_p = std.fmt.parseFloat(f32, s) catch null;
+        } else if (std.mem.eql(u8, arg, "--prompt-cache-key")) {
+            if (args.next()) |s| config.prompt_cache_key = allocator.dupe(u8, s) catch s;
+        } else if (std.mem.eql(u8, arg, "--parallel-tool-calls")) {
+            if (args.next()) |s| {
+                if (std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "1")) config.parallel_tool_calls = true
+                else if (std.mem.eql(u8, s, "false") or std.mem.eql(u8, s, "0")) config.parallel_tool_calls = false;
+            }
+        } else if (std.mem.eql(u8, arg, "--response-format")) {
+            if (args.next()) |s| {
+                if (std.mem.eql(u8, s, "json_object") or std.mem.eql(u8, s, "json_schema")) {
+                    config.response_format = allocator.dupe(u8, s) catch s;
+                }
+            }
         } else if (std.mem.eql(u8, arg, "--api-key")) {
             if (args.next()) |k| config.api_key = allocator.dupe(u8, k) catch k;
         } else if (std.mem.eql(u8, arg, "--permission") or std.mem.eql(u8, arg, "--permission-mode")) {
@@ -1015,6 +1032,11 @@ fn printHelp() void {
         \\  --resume-response <j> Resume a suspended session with a late tool response (@file to read from a file)
         \\  --model <model>       Model (default: claude-sonnet-4-20250514)
         \\  --reasoning-effort <e> none|minimal|low|medium|high|xhigh
+        \\  --temperature <f>    Override sampling temperature (dialect-gated fields)
+        \\  --top-p <f>          Override nucleus sampling top_p
+        \\  --prompt-cache-key <k>  Kimi K2.6 cache hint (gated by dialect capability)
+        \\  --parallel-tool-calls <bool>  Mistral explicit parallel tools (dialect-gated)
+        \\  --response-format <json_object|json_schema>  Structured output (dialect-gated)
         \\  --api-key <key>       API key (overrides stored credentials by default)
         \\  --permission <mode>   default | acceptEdits | plan | auto | dontAsk | bypassPermissions
         \\  --settings <path>     Extra settings JSON (CLI layer)

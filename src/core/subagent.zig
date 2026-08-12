@@ -60,6 +60,10 @@ pub const SpawnOptions = struct {
     model_override: ?[]const u8 = null,
     /// AgentDef.effort override。Anthropic client 在本 isolated run 期间临时覆盖，结束恢复。
     reasoning_effort_override: ?@import("../types.zig").ReasoningEffort = null,
+    /// AgentDef.overrides override(per-subagent 方言字段:temperature/top_p/prompt_cache_key/
+    /// parallel_tool_calls/response_format)。spawnAgentSink 在本 isolated run 期间临时覆盖,
+    /// 结束恢复。null = inherit 父 provider 的 overrides。
+    overrides_override: ?@import("../api/request_overrides.zig").RequestOverrides = null,
     /// 父 dispatch 传过来的宿主能力(L5)。subagent 通常只用 skill 激活(调用方传 skillOnly 投影);
     /// 见 HostServices.skillOnly。
     host_services: ?@import("../tools/context.zig").HostServices = null,
@@ -142,6 +146,20 @@ pub fn spawnAgentSink(
     defer if (opts.reasoning_effort_override != null) {
         prov.setReasoningEffort(saved_effort) catch unreachable;
     };
+
+    // overrides(per-subagent 方言字段覆盖):同 effort 模式——save/restore,防泄漏回父 session。
+    // provider 不支持 setRequestOverrides(如 Anthropic)→ setRequestOverrides 返 error,跳过(无覆盖)。
+    const saved_overrides = prov.requestOverrides();
+    var overrides_applied = false;
+    if (opts.overrides_override) |o| {
+        if (prov.setRequestOverrides(o)) |_| {
+            overrides_applied = true;
+        } else |_| {
+            // provider 不支持方言字段覆盖(Anthropic 无 temperature/top_p 等);静默跳过。
+            // 与 effort 的 setReasoningEffort 行为对齐:不支持才 error,这里 best-effort 吞掉。
+        }
+    }
+    defer if (overrides_applied) prov.setRequestOverrides(saved_overrides) catch {};
 
     // 预建对话(Ctrl+B 转后台续跑)→ 用它(所有权转移,本函数 defer deinit);否则从 prompt 起新对话。
     var conv = if (opts.prebuilt_conversation) |pc| pc else blk: {

@@ -272,6 +272,7 @@ fn makeBuiltin(
         .memory_scope = .none,
         .background = false,
         .effort = null,
+        .overrides = null,
         .isolation = .none,
         .color = color,
         .initial_prompt = initial_prompt_owned,

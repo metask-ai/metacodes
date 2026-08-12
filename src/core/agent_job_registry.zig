@@ -215,6 +215,7 @@ pub const SpawnParams = struct {
     max_turns: u32 = 0, // 0 = 用 SpawnOptions 默认
     model_override: ?[]const u8 = null,
     reasoning_effort_override: ?@import("../types.zig").ReasoningEffort = null,
+    overrides_override: ?@import("../api/request_overrides.zig").RequestOverrides = null,
     perm_override: ?@import("../types.zig").PermissionMode = null,
     project_dir: []const u8 = "",
     parent_model: []const u8 = "",

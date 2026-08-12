@@ -43,8 +43,18 @@ pub const StatusBar = struct {
             extra = std.fmt.bufPrint(&extra_buf, " · {d}cron", .{cron_count}) catch "";
         }
 
-        try writer.print("{s}{s} · {s} · {s} tok · ${d:.4}{s}{s}", .{
+        // effort 段:非 null 时显示在 model 后(对齐 plan 模式的显式努力档位)。
+        // 读 config.reasoning_effort(直接字段,无需 provider() 的 *App)。
+        // 与 mode_str 分开——effort 是 provider 级,mode 是权限级,语义不同不混。
+        var eb: [16]u8 = undefined;
+        const effort_seg: []const u8 = if (app.config.reasoning_effort) |e|
+            std.fmt.bufPrint(&eb, "{s} · ", .{@tagName(e)}) catch ""
+        else
+            "";
+
+        try writer.print("{s}{s}{s} · {s} · {s} tok · ${d:.4}{s}{s}", .{
             theme.dim,
+            effort_seg,
             app.activeModel(),
             mode_str,
             tok_str,
