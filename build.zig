@@ -274,14 +274,17 @@ pub fn build(b: *std.Build) void {
     var tinykg_artifact: ?*std.Build.Step.Compile = null;
     const vendor_tinykg_step = b.step("vendor:tinykg", "Build and install the vendored TinyKG engine");
     if (build_tinykg) {
-        const tinykg_dependency = b.dependency("tinykg", .{
-            .target = target,
-            .optimize = .ReleaseSafe,
+        const tinykg_exe = b.addExecutable(.{
+            .name = "tinykg",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("lib/tinykg/src/main.zig"),
+                .target = target,
+                .optimize = .ReleaseSafe,
+                .link_libc = true,
+            }),
         });
-        const tinykg_exe = tinykg_dependency.artifact("tinykg");
-        // ReleaseSafe retains absolute source paths in Mach-O debug symbols.
-        // Strip the shipped artifact so identical source snapshots remain
-        // byte-reproducible across worktree locations (including UUID/signature).
+        // ReleaseSafe keeps absolute source paths in Mach-O debug symbols,
+        // which makes otherwise identical TinyKG builds differ by worktree.
         tinykg_exe.root_module.strip = true;
         const install_tinykg = b.addInstallArtifact(tinykg_exe, .{
             .dest_dir = .{ .override = .{ .custom = "vendor/tinykg" } },
