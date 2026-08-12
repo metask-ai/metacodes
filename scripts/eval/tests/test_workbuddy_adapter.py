@@ -829,6 +829,17 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         self.assertEqual(job["n_attempts"], 1)
         self.assertTrue(job["record_full_io"])
         self.assertEqual(job["orchestrator_override"]["n_concurrent_trials"], 1)
+        self.assertEqual(
+            job["harness_params_override"],
+            {
+                "METACODES_PROJECT_RULES_RELATIVE": (
+                    "share/metacodes/workbuddy-w05/project-rules"
+                ),
+                "METACODES_PROJECT_KERNEL_RELATIVE": (
+                    "libexec/metacodes-project-kernel"
+                ),
+            },
+        )
         self.assertEqual(model["name"], "glm-5.2")
         self.assertEqual(model["protocols"], ["anthropic"])
         self.assertEqual(
@@ -856,6 +867,17 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         self.assertEqual(job["n_attempts"], 1)
         self.assertEqual(job["orchestrator_override"]["n_concurrent_trials"], 1)
         self.assertTrue(job["record_full_io"])
+        self.assertEqual(
+            job["harness_params_override"],
+            {
+                "METACODES_PROJECT_RULES_RELATIVE": (
+                    "share/metacodes/workbuddy-w05/project-rules"
+                ),
+                "METACODES_PROJECT_KERNEL_RELATIVE": (
+                    "libexec/metacodes-project-kernel"
+                ),
+            },
+        )
 
 
 class WorkBuddyCredentialFdTest(unittest.TestCase):

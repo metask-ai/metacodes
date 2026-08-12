@@ -2976,6 +2976,9 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
     workbuddy_failure_validate_source = top_source(
         "workbuddy_launch", "validate_authorized_failure_receipt"
     )
+    workbuddy_failure_persist = top_function(
+        "workbuddy_launch", "_persist_authorized_failure_receipt"
+    )
     workbuddy_preflight_source = top_source("workbuddy_preflight", "validate_receipt")
     workbuddy_reobserve_lines = call_lines(
         workbuddy_launch, "_reobserve_launch_inputs"
@@ -2984,6 +2987,7 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
         workbuddy_launch, "journal.authorize_request"
     )
     workbuddy_calls = call_names(workbuddy_launch)
+    workbuddy_failure_persist_calls = call_names(workbuddy_failure_persist)
     alternate_launchers = {
         name
         for name in runner_calls
@@ -3344,8 +3348,10 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                 )
             ),
             "WorkBuddy authorized failure is non-retry evidence with maximum exposure": (
-                "_authorized_failure_receipt" in workbuddy_calls
-                and "validate_authorized_failure_receipt" in workbuddy_calls
+                "_persist_authorized_failure_receipt" in workbuddy_calls
+                and "_authorized_failure_receipt" in workbuddy_failure_persist_calls
+                and "validate_authorized_failure_receipt"
+                in workbuddy_failure_persist_calls
                 and all(
                     marker in workbuddy_launch_source
                     for marker in (

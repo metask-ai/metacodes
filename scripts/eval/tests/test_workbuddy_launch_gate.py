@@ -10,10 +10,18 @@ import time
 from pathlib import Path
 from unittest import mock
 
-from scripts.eval.memory_budget_journal import validate_checkpoint_payload
+import yaml
+
+from scripts.eval.memory_budget_journal import (
+    BudgetAuthority,
+    BudgetJournal,
+    BudgetTransaction,
+    validate_checkpoint_payload,
+)
 from scripts.eval.model import ValidationError, stable_json
 from scripts.eval.workbuddy.launch_gate import (
     AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION,
+    AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION_V1,
     LaunchError,
     PROVIDER_KEY_ENV,
     SCHEMA_VERSION,
@@ -27,7 +35,10 @@ from scripts.eval.workbuddy.launch_gate import (
     _receipt_quality_evidence,
     _reobserve_host_control_plane,
     _reobserve_launch_inputs,
+    _runtime_contract,
+    _validate_trial_project_control,
     execute_launch,
+    recover_authorized_failure_receipt,
     validate_authorized_failure_receipt,
     validate_launch_manifest,
 )
@@ -148,6 +159,18 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
             observed = _artifact_contract(manifest)
             self.assertEqual(observed["project_control"]["kernel"]["sha256"], kernel_sha)
             self.assertEqual(observed["project_control"]["rules"]["files"], 2)
+            self.assertEqual(
+                observed["project_control"]["rules"]["project_root"],
+                "/workspace",
+            )
+            self.assertEqual(
+                observed["project_control"]["kernel"]["relative_path"],
+                "libexec/metacodes-project-kernel",
+            )
+            self.assertEqual(
+                observed["project_control"]["rules"]["relative_path"],
+                "share/metacodes/workbuddy-w05/project-rules",
+            )
 
             staged_bundle = (
                 output
@@ -176,6 +199,7 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
             "cohort": {
                 "subset": "code",
                 "cohort": "dev",
+                "dataset": "datasets/wb-bench-code-v1.0/tasks",
                 "take": 1,
                 "selected_tasks": ["code-task-a"],
                 "selected_tasks_sha256": digest("tasks"),
@@ -435,6 +459,8 @@ raise SystemExit(23)
                 failure["schema_version"],
             )
             self.assertEqual("authorized_failure", failure["state"])
+            self.assertEqual("runner_nonzero", failure["failure_stage"])
+            self.assertEqual("in_band", failure["receipt_mode"])
             self.assertFalse(failure["quality_evidence"])
             self.assertFalse(failure["retry_allowed"])
             self.assertFalse(failure["actual_usage_known"])
@@ -468,6 +494,23 @@ raise SystemExit(23)
             ):
                 self.assertNotIn(forbidden, receipt_text)
 
+            legacy_path = root / "legacy-authorized-failure.json"
+            legacy = dict(failure)
+            legacy["schema_version"] = AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION_V1
+            legacy.pop("failure_stage")
+            legacy.pop("receipt_mode")
+            legacy["runner"].pop("elapsed_seconds_semantics")
+            legacy_path.write_text(
+                json.dumps(legacy, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            os.chmod(legacy_path, 0o600)
+            self.assertEqual(
+                AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION_V1,
+                validate_authorized_failure_receipt(
+                    legacy_path, journal_path=journal
+                )["schema_version"],
+            )
+
             # A fresh receipt path does not mask the durable journal rule: the
             # same run is rejected before another provider request.
             with _Server(journal, response_status=503) as retry_provider:
@@ -480,6 +523,147 @@ raise SystemExit(23)
                         runner_argv=[sys.executable, "-c", "raise SystemExit(99)"],
                     )
             self.assertEqual(0, retry_provider.requests)
+
+    def test_runner_zero_with_invalid_post_run_evidence_writes_failure_receipt(self):
+        """Harbor may return zero even when every agent trial failed.
+
+        The real provider path must still leave a durable, non-retryable
+        receipt when the subsequent trajectory/identity audit rejects the run.
+        This covers the production Code-3 failure mode that a helper-only test
+        cannot establish.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest = self._manifest(root)
+            journal = root / "budget.json"
+            receipt = root / "post-run-audit-failure.json"
+            repo = Path(__file__).resolve().parents[3]
+            runner = r'''
+import os, sys, urllib.request
+sys.path.insert(0, sys.argv[1])
+from scripts.eval.workbuddy.key_fd import resolve_secret_env
+secret = resolve_secret_env("", "METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF")
+assert secret == "private-workbuddy-test-key"
+with urllib.request.urlopen(
+    urllib.request.Request(sys.argv[2], data=b"{}", method="POST"), timeout=5
+) as response:
+    assert response.status == 200
+# Deliberately return zero without the required bound trajectory.  This is the
+# shape of a batch runner that completed orchestration while its trial failed.
+'''
+            with _Server(journal) as provider:
+                with self.assertRaisesRegex(
+                    LaunchError,
+                    "post-run evidence audit failed after runner exit 0.*retry is forbidden",
+                ):
+                    execute_launch(
+                        manifest_path=manifest,
+                        journal_path=journal,
+                        receipt_path=receipt,
+                        credential_fd=self._credential_fd(),
+                        runner_argv=[
+                            sys.executable,
+                            "-c",
+                            runner,
+                            str(repo),
+                            provider.url,
+                        ],
+                    )
+            self.assertEqual(1, provider.requests)
+            self.assertFalse(provider.errors)
+            failure = validate_authorized_failure_receipt(
+                receipt, journal_path=journal
+            )
+            self.assertEqual(0, failure["runner"]["returncode"])
+            self.assertEqual(
+                "post_run_evidence_audit", failure["failure_stage"]
+            )
+            self.assertEqual("in_band", failure["receipt_mode"])
+            self.assertEqual(
+                "request_authorized", failure["budget_transaction"]["state"]
+            )
+            self.assertFalse(failure["retry_allowed"])
+            self.assertFalse(failure["quality_evidence"])
+            self.assertEqual(0o600, receipt.stat().st_mode & 0o777)
+
+            contradictory_path = root / "contradictory-failure.json"
+            contradictory = dict(failure)
+            contradictory["failure_stage"] = "runner_nonzero"
+            contradictory_path.write_text(
+                json.dumps(contradictory, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(LaunchError, "stage contradicts"):
+                validate_authorized_failure_receipt(contradictory_path)
+
+    def test_offline_failure_recovery_reopens_authorized_without_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest_path = self._manifest(root)
+            manifest = validate_launch_manifest(manifest_path)
+            journal_path = root / "budget.json"
+            receipt_path = root / "offline-failure.json"
+            budget = manifest["budget"]
+            model = manifest["model"]
+            authority = BudgetAuthority(
+                manifest_sha256=manifest["content_sha256"],
+                model_fingerprint=model["fingerprint"],
+                provider_identity=model["provider_identity"],
+                total_cost_microusd=budget["total_cost_microusd"],
+                total_metered_tokens=budget["total_metered_tokens"],
+            )
+            transaction = BudgetTransaction(
+                run_id=manifest["run_id"],
+                manifest_sha256=manifest["content_sha256"],
+                model_fingerprint=model["fingerprint"],
+                harness_fingerprint=manifest["harness_fingerprint"],
+                provider_identity=model["provider_identity"],
+                max_cost_microusd=budget["max_cost_microusd"],
+                max_metered_tokens=budget["max_metered_tokens"],
+            )
+            started_ns = time.time_ns() - 1_000_000
+            with BudgetJournal(journal_path, authority) as journal:
+                reserved = journal.reserve(transaction)
+                authorized = journal.authorize_request(
+                    reserved["transaction_id"],
+                    expected_revision=reserved["journal_revision"],
+                    expected_head_sha256=reserved["journal_head_sha256"],
+                )
+                head_before = authorized["journal_head_sha256"]
+
+            receipt = recover_authorized_failure_receipt(
+                manifest_path=manifest_path,
+                journal_path=journal_path,
+                receipt_path=receipt_path,
+                runner_returncode=0,
+                failure_stage="post_run_evidence_audit",
+                started_ns=started_ns,
+            )
+            self.assertEqual("offline_recovery", receipt["receipt_mode"])
+            self.assertEqual(
+                "authorization_to_receipt_upper_bound",
+                receipt["runner"]["elapsed_seconds_semantics"],
+            )
+            self.assertEqual(head_before, receipt["journal"]["head_sha256"])
+            self.assertEqual(
+                "request_authorized", receipt["budget_transaction"]["state"]
+            )
+            self.assertFalse(receipt["retry_allowed"])
+            self.assertFalse(receipt["quality_evidence"])
+            self.assertEqual(0o600, receipt_path.stat().st_mode & 0o777)
+
+            with self.assertRaisesRegex(LaunchError, "already occupied"):
+                recover_authorized_failure_receipt(
+                    manifest_path=manifest_path,
+                    journal_path=journal_path,
+                    receipt_path=receipt_path,
+                    runner_returncode=0,
+                    failure_stage="post_run_evidence_audit",
+                    started_ns=started_ns,
+                )
 
     def test_injected_runner_cannot_create_quality_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1076,6 +1260,113 @@ raise SystemExit(23)
             )
             with self.assertRaisesRegex(LaunchError, "identity is incomplete"):
                 _official_task_identity(trajectory, manifest, [task], route)
+
+    def test_resolved_prepared_and_trial_project_control_are_bound(self):
+        """Bind job YAML through resolver, prepare_job and the trial runtime."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            workbuddy = root / "workbuddy"
+            run_id = "workbuddy-project-control-l2"
+            job_slug = "metacodes-code-l2"
+            instance = workbuddy / "scripts/logs/instances" / run_id
+            runtime_jobs = workbuddy / ".workspace/data/generated/jobs"
+            proxy_logs = workbuddy / "scripts/logs/proxy"
+            for path in (instance, runtime_jobs, proxy_logs):
+                path.mkdir(parents=True)
+            project_sha = hashlib.sha256(
+                b"metacodes-project-identity-v1\x00/workspace"
+            ).hexdigest()
+            rules_relative = "share/metacodes/workbuddy-w05/project-rules"
+            kernel_relative = "libexec/metacodes-project-kernel"
+            resolved = {
+                "selected_tasks": ["code-task-a"],
+                "model_connection": "local_proxy",
+                "record_full_io": True,
+                "harness_resolved_slug": "metacodes/0.1.0",
+                "model_slug": "test-model",
+                "harness_runtime_config": {
+                    "project_control_configured": True,
+                    "translated_env": {
+                        "METACODES_PROJECT_RULES_SOURCE": (
+                            "/opt/metacodes/" + rules_relative
+                        ),
+                        "METACODES_PROJECT_KERNEL_PATH": (
+                            "/opt/metacodes/" + kernel_relative
+                        ),
+                    },
+                },
+            }
+            (instance / "manifest.json").write_text(
+                json.dumps(resolved, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            (instance / "proxy.yaml").write_text(
+                "proxy:\n  backend_retries: 0\n  routes: []\n",
+                encoding="utf-8",
+            )
+            agent_kwargs = {
+                "METACODES_PROJECT_RULES_RELATIVE": rules_relative,
+                "METACODES_PROJECT_KERNEL_RELATIVE": kernel_relative,
+            }
+            runtime_job = runtime_jobs / f"{job_slug}.yaml"
+            runtime_job.write_text(
+                yaml.safe_dump({"agents": [{"kwargs": agent_kwargs}]}),
+                encoding="utf-8",
+            )
+            manifest = {
+                "run_id": run_id,
+                "workbuddy": {"checkout": str(workbuddy)},
+                "cohort": {"selected_tasks": ["code-task-a"]},
+                "job": {"slug": job_slug},
+                "model": {"slug": "test-model"},
+                "artifacts": {
+                    "project_control": {
+                        "rules": {
+                            "project_root": "/workspace",
+                            "project_sha256": project_sha,
+                            "relative_path": rules_relative,
+                        },
+                        "kernel": {"relative_path": kernel_relative},
+                    }
+                },
+            }
+            contract = _runtime_contract(manifest)
+            self.assertTrue(contract["project_control"]["configured"])
+            self.assertEqual(
+                "5807156ecf67bb70",
+                contract["project_control"]["project_state_hash"],
+            )
+            self.assertEqual(
+                hashlib.sha256(runtime_job.read_bytes()).hexdigest(),
+                contract["runtime_job_config"]["sha256"],
+            )
+
+            trial = root / "trial"
+            (trial / "agent").mkdir(parents=True)
+            (trial / "config.json").write_text(
+                json.dumps({"agent": {"kwargs": agent_kwargs}}) + "\n",
+                encoding="utf-8",
+            )
+            (trial / "agent/metacodes-runtime-contract.json").write_text(
+                json.dumps(
+                    {
+                        "project_control": {
+                            "configured": True,
+                            "project_state_hash": "5807156ecf67bb70",
+                        }
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            _validate_trial_project_control(trial, manifest)
+
+            runtime_job.write_text(
+                yaml.safe_dump({"agents": [{"kwargs": {}}]}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(LaunchError, "runtime job project control"):
+                _runtime_contract(manifest)
 
 
 if __name__ == "__main__":

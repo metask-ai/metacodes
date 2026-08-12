@@ -44,6 +44,9 @@ from .stage_artifacts import (
     ELF_MACHINE_X86_64,
     MAX_PROJECT_RULE_BYTES,
     MAX_PROJECT_RULE_FILES,
+    PROJECT_KERNEL_TARGET,
+    PROJECT_ROOT,
+    PROJECT_RULES_TARGET,
     TARGET_PLATFORM,
     _elf_machine,
 )
@@ -52,14 +55,22 @@ from .trace import (
     OBSERVATION_FILENAME,
     TraceError,
     load_control_metrics,
+    project_state_hash,
 )
 
 
 SCHEMA_VERSION = "metacodes-workbuddy-paid-launch-v1"
 RECEIPT_SCHEMA_VERSION = "metacodes-workbuddy-paid-receipt-v1"
-AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION = (
+AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION_V1 = (
     "metacodes-workbuddy-authorized-failure-v1"
 )
+AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION = (
+    "metacodes-workbuddy-authorized-failure-v2"
+)
+AUTHORIZED_FAILURE_STAGES = {
+    "runner_nonzero",
+    "post_run_evidence_audit",
+}
 PROVIDER_KEY_ENV = "METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF"
 MAX_USER_AUTHORITY_MICROUSD = 1000 * 1_000_000
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$")
@@ -77,7 +88,12 @@ HOST_CONTROL_PLANE_MODULES = {
     "memory_budget_journal": Path(__file__).parents[1] / "memory_budget_journal.py",
     "model": Path(__file__).parents[1] / "model.py",
     "stage_artifacts": Path(__file__).with_name("stage_artifacts.py"),
+    "workbuddy_trace": Path(__file__).with_name("trace.py"),
 }
+LEGACY_HOST_CONTROL_PLANE_MODULE_NAMES_V1 = frozenset(
+    set(HOST_CONTROL_PLANE_MODULES) - {"workbuddy_trace"}
+)
+AUTHORIZED_FAILURE_RECEIPT_MODES = {"in_band", "offline_recovery"}
 
 
 class LaunchError(ValidationError):
@@ -314,12 +330,31 @@ def _artifact_contract(path: Path) -> Dict[str, object]:
         for key in ("files", "bytes", "tree_sha256"):
             if rules_identity[key] != rules.get(key):
                 raise LaunchError("split-mount project-rules tree identity drifted")
+        expected_project_sha = _sha256_bytes(
+            b"metacodes-project-identity-v1\x00" + PROJECT_ROOT.encode("utf-8")
+        )
+        if (
+            kernel_relative != PROJECT_KERNEL_TARGET
+            or rules_relative != PROJECT_RULES_TARGET
+            or rules.get("project_root") != PROJECT_ROOT
+            or rules.get("project_sha256") != expected_project_sha
+        ):
+            raise LaunchError("split-mount project control target drifted")
         if rules.get("active_kernel_sha256") != kernel_identity["sha256"]:
             raise LaunchError("split-mount active project rules bind another kernel")
         result["project_control"] = {
             "schema_version": "metacodes-workbuddy-project-control-v1",
-            "kernel": {**kernel_identity, "elf_machine": ELF_MACHINE_X86_64},
-            "rules": rules_identity,
+            "kernel": {
+                **kernel_identity,
+                "elf_machine": ELF_MACHINE_X86_64,
+                "relative_path": kernel_relative.as_posix(),
+            },
+            "rules": {
+                **rules_identity,
+                "relative_path": rules_relative.as_posix(),
+                "project_root": rules["project_root"],
+                "project_sha256": rules["project_sha256"],
+            },
         }
     return result
 
@@ -452,6 +487,38 @@ def build_launch_manifest(
         raise LaunchError("paid WorkBuddy job requires full request audit and n_attempts=1")
     if (job.get("orchestrator_override") or {}).get("n_concurrent_trials") != 1:
         raise LaunchError("paid WorkBuddy job requires one concurrent trial")
+    project_control = artifact_row.get("project_control")
+    project_overrides = job.get("harness_params_override") or {}
+    if not isinstance(project_overrides, dict):
+        raise LaunchError("WorkBuddy harness_params_override must be a mapping")
+    expected_project_overrides = (
+        {
+            "METACODES_PROJECT_RULES_RELATIVE": project_control["rules"][
+                "relative_path"
+            ],
+            "METACODES_PROJECT_KERNEL_RELATIVE": project_control["kernel"][
+                "relative_path"
+            ],
+        }
+        if isinstance(project_control, dict)
+        else {}
+    )
+    observed_project_overrides = {
+        key: project_overrides.get(key)
+        for key in expected_project_overrides
+    }
+    if observed_project_overrides != expected_project_overrides:
+        raise LaunchError(
+            "staged project control is not wired into the paid WorkBuddy job"
+        )
+    if not expected_project_overrides and any(
+        key in project_overrides
+        for key in (
+            "METACODES_PROJECT_RULES_RELATIVE",
+            "METACODES_PROJECT_KERNEL_RELATIVE",
+        )
+    ):
+        raise LaunchError("WorkBuddy job requests project control that was not staged")
     if model.get("backend_key_env") != PROVIDER_KEY_ENV:
         raise LaunchError("WorkBuddy model must require the anonymous credential FD env")
     model_slug = job.get("model")
@@ -607,7 +674,11 @@ def validate_launch_manifest(path: Path) -> Dict[str, Any]:
     host_control_plane = manifest.get("host_control_plane")
     if (
         not isinstance(host_control_plane, dict)
-        or set(host_control_plane) != set(HOST_CONTROL_PLANE_MODULES)
+        or set(host_control_plane)
+        not in {
+            frozenset(HOST_CONTROL_PLANE_MODULES),
+            LEGACY_HOST_CONTROL_PLANE_MODULE_NAMES_V1,
+        }
         or any(
             not isinstance(row, dict)
             or not isinstance(row.get("path"), str)
@@ -774,7 +845,10 @@ def _reobserve_launch_inputs(manifest: Mapping[str, Any]) -> None:
             maximum=512 * 1024 * 1024,
         )
         observed_rules = _project_rule_tree(Path(project["rules"]["path"]))
-        if observed_rules != project["rules"]:
+        if any(
+            observed_rules[key] != project["rules"].get(key)
+            for key in ("path", "files", "bytes", "tree_sha256")
+        ):
             raise LaunchError("split-mount project-rules changed after manifest creation")
     preflight_row = manifest["environment_preflight"]
     _reobserve_identity(
@@ -1238,6 +1312,90 @@ def _official_task_identity(
     return matches[0], result_path, result
 
 
+def _expected_project_control(manifest: Mapping[str, Any]) -> Dict[str, object]:
+    project = manifest.get("artifacts", {}).get("project_control")
+    if project is None:
+        return {
+            "configured": False,
+            "project_root": None,
+            "project_sha256": None,
+            "project_state_hash": None,
+            "rules_relative_path": None,
+            "kernel_relative_path": None,
+        }
+    if not isinstance(project, dict):
+        raise LaunchError("paid launch project control contract is malformed")
+    rules = project.get("rules")
+    kernel = project.get("kernel")
+    if not isinstance(rules, dict) or not isinstance(kernel, dict):
+        raise LaunchError("paid launch project control identity is incomplete")
+    project_root = rules.get("project_root")
+    project_sha256 = rules.get("project_sha256")
+    rules_relative = rules.get("relative_path")
+    kernel_relative = kernel.get("relative_path")
+    if (
+        project_root != PROJECT_ROOT
+        or not isinstance(project_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", project_sha256) is None
+        or project_sha256
+        != _sha256_bytes(
+            b"metacodes-project-identity-v1\x00" + project_root.encode("utf-8")
+        )
+        or rules_relative != PROJECT_RULES_TARGET.as_posix()
+        or kernel_relative != PROJECT_KERNEL_TARGET.as_posix()
+    ):
+        raise LaunchError("paid launch project control target identity drifted")
+    return {
+        "configured": True,
+        "project_root": project_root,
+        "project_sha256": project_sha256,
+        "project_state_hash": project_state_hash(project_root),
+        "rules_relative_path": rules_relative,
+        "kernel_relative_path": kernel_relative,
+    }
+
+
+def _validate_project_control_kwargs(
+    kwargs: object, expected: Mapping[str, object], *, label: str
+) -> None:
+    if not isinstance(kwargs, dict):
+        raise LaunchError(f"{label} has no agent kwargs")
+    observed = {
+        "METACODES_PROJECT_RULES_RELATIVE": kwargs.get(
+            "METACODES_PROJECT_RULES_RELATIVE"
+        ),
+        "METACODES_PROJECT_KERNEL_RELATIVE": kwargs.get(
+            "METACODES_PROJECT_KERNEL_RELATIVE"
+        ),
+    }
+    wanted = {
+        "METACODES_PROJECT_RULES_RELATIVE": expected["rules_relative_path"],
+        "METACODES_PROJECT_KERNEL_RELATIVE": expected["kernel_relative_path"],
+    }
+    if observed != wanted:
+        raise LaunchError(f"{label} project control kwargs drifted")
+
+
+def _validate_trial_project_control(
+    trial_dir: Path, manifest: Mapping[str, Any]
+) -> None:
+    expected = _expected_project_control(manifest)
+    config = _json(trial_dir / "config.json")
+    agent = config.get("agent")
+    if not isinstance(agent, dict):
+        raise LaunchError("official WorkBuddy trial has no agent config")
+    _validate_project_control_kwargs(
+        agent.get("kwargs"), expected, label="official WorkBuddy trial"
+    )
+    runtime = _json(trial_dir / "agent/metacodes-runtime-contract.json")
+    project = runtime.get("project_control")
+    if not isinstance(project, dict) or project != {
+        "configured": expected["configured"],
+        "project_state_hash": expected["project_state_hash"],
+    }:
+        raise LaunchError("official WorkBuddy runtime project control drifted")
+
+
 def _runtime_contract(manifest: Mapping[str, Any]) -> Dict[str, object]:
     workbuddy = Path(manifest["workbuddy"]["checkout"])
     run_id = manifest["run_id"]
@@ -1254,6 +1412,46 @@ def _runtime_contract(manifest: Mapping[str, Any]) -> Dict[str, object]:
         or resolved.get("model_slug") != manifest["model"]["slug"]
     ):
         raise LaunchError("resolved WorkBuddy manifest differs from the paid launch contract")
+    expected_project = _expected_project_control(manifest)
+    harness_runtime = resolved.get("harness_runtime_config")
+    translated_env = (
+        harness_runtime.get("translated_env")
+        if isinstance(harness_runtime, dict)
+        else None
+    )
+    if (
+        not isinstance(harness_runtime, dict)
+        or harness_runtime.get("project_control_configured")
+        is not expected_project["configured"]
+        or not isinstance(translated_env, dict)
+        or translated_env.get("METACODES_PROJECT_RULES_SOURCE")
+        != (
+            "/opt/metacodes/" + str(expected_project["rules_relative_path"])
+            if expected_project["configured"]
+            else None
+        )
+        or translated_env.get("METACODES_PROJECT_KERNEL_PATH")
+        != (
+            "/opt/metacodes/" + str(expected_project["kernel_relative_path"])
+            if expected_project["configured"]
+            else None
+        )
+    ):
+        raise LaunchError("resolved WorkBuddy project control contract drifted")
+    runtime_job_path = (
+        workbuddy
+        / ".workspace/data/generated/jobs"
+        / f"{manifest['job']['slug']}.yaml"
+    )
+    runtime_job = _yaml(runtime_job_path)
+    agents = runtime_job.get("agents")
+    if not isinstance(agents, list) or len(agents) != 1 or not isinstance(agents[0], dict):
+        raise LaunchError("resolved WorkBuddy runtime job has no unique agent")
+    _validate_project_control_kwargs(
+        agents[0].get("kwargs"),
+        expected_project,
+        label="resolved WorkBuddy runtime job",
+    )
     proxy = _yaml(proxy_path).get("proxy")
     if not isinstance(proxy, dict) or proxy.get("backend_retries") != 0:
         raise LaunchError("resolved WorkBuddy proxy does not enforce zero retries")
@@ -1269,7 +1467,9 @@ def _runtime_contract(manifest: Mapping[str, Any]) -> Dict[str, object]:
         raise LaunchError("WorkBuddy left unattributed provider requests outside task receipts")
     return {
         "resolved_manifest": _identity(resolved_path),
+        "runtime_job_config": _identity(runtime_job_path),
         "proxy_config": _identity(proxy_path),
+        "project_control": expected_project,
         "unattributed_provider_requests": 0,
     }
 
@@ -1318,6 +1518,7 @@ def _collect_usage(
                 selected,
                 expected_model_route,
             )
+            _validate_trial_project_control(trajectory_path.parent.parent, manifest)
         else:
             task = _task_for_path(trajectory_path, selected)
         if task is None or task in rows:
@@ -1641,6 +1842,7 @@ def _authorized_failure_artifacts(
         "exception.txt",
         "job.log",
         "metacodes-transcript.jsonl",
+        "metacodes-runtime-contract.json",
         OBSERVATION_FILENAME,
         "proxy.yaml",
         "requests.jsonl",
@@ -1785,6 +1987,7 @@ def validate_authorized_failure_receipt(
     path: Path, *, journal_path: Path | None = None
 ) -> Dict[str, Any]:
     receipt = _json(path)
+    schema_version = receipt.get("schema_version")
     expected_fields = {
         "schema_version",
         "state",
@@ -1803,9 +2006,11 @@ def validate_authorized_failure_receipt(
         "failure_evidence",
         "privacy",
     }
-    if set(receipt) != expected_fields or receipt.get("schema_version") != (
-        AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION
-    ):
+    if schema_version == AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION:
+        expected_fields.update(("failure_stage", "receipt_mode"))
+    elif schema_version != AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION_V1:
+        raise LaunchError("authorized failure receipt schema drifted")
+    if set(receipt) != expected_fields:
         raise LaunchError("authorized failure receipt schema drifted")
     if (
         receipt.get("state") != "authorized_failure"
@@ -1860,17 +2065,39 @@ def validate_authorized_failure_receipt(
         raise LaunchError("authorized failure receipt transaction binding drifted")
     returncode = runner.get("returncode")
     elapsed = runner.get("elapsed_seconds")
+    expected_runner_fields = {"returncode", "elapsed_seconds"}
+    if schema_version == AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION:
+        expected_runner_fields.add("elapsed_seconds_semantics")
     if (
-        set(runner) != {"returncode", "elapsed_seconds"}
+        set(runner) != expected_runner_fields
         or not isinstance(returncode, int)
         or isinstance(returncode, bool)
-        or returncode == 0
         or not isinstance(elapsed, (int, float))
         or isinstance(elapsed, bool)
         or not math.isfinite(elapsed)
         or elapsed < 0
     ):
         raise LaunchError("authorized failure receipt runner evidence is invalid")
+    if schema_version == AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION_V1:
+        if returncode == 0:
+            raise LaunchError("legacy authorized failure receipt cannot bind exit zero")
+    else:
+        failure_stage = receipt.get("failure_stage")
+        receipt_mode = receipt.get("receipt_mode")
+        expected_elapsed_semantics = (
+            "runner_wall_clock"
+            if receipt_mode == "in_band"
+            else "authorization_to_receipt_upper_bound"
+        )
+        if (
+            failure_stage not in AUTHORIZED_FAILURE_STAGES
+            or receipt_mode not in AUTHORIZED_FAILURE_RECEIPT_MODES
+            or runner.get("elapsed_seconds_semantics")
+            != expected_elapsed_semantics
+            or (failure_stage == "runner_nonzero" and returncode == 0)
+            or (failure_stage == "post_run_evidence_audit" and returncode != 0)
+        ):
+            raise LaunchError("authorized failure receipt stage contradicts runner evidence")
     if (
         set(cohort)
         != {
@@ -1947,9 +2174,15 @@ def _authorized_failure_receipt(
     journal: BudgetJournal,
     transaction_id: str,
     runner_returncode: int,
+    failure_stage: str,
+    receipt_mode: str,
     started_ns: int,
     official_runner: bool,
 ) -> Dict[str, object]:
+    if failure_stage not in AUTHORIZED_FAILURE_STAGES:
+        raise LaunchError("authorized failure receipt has an unknown failure stage")
+    if receipt_mode not in AUTHORIZED_FAILURE_RECEIPT_MODES:
+        raise LaunchError("authorized failure receipt has an unknown receipt mode")
     transaction = journal.transaction_receipt(transaction_id)
     if transaction["state"] != "request_authorized":
         raise LaunchError("authorized failure receipt requires durable authorization")
@@ -1979,6 +2212,8 @@ def _authorized_failure_receipt(
     return {
         "schema_version": AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION,
         "state": "authorized_failure",
+        "failure_stage": failure_stage,
+        "receipt_mode": receipt_mode,
         "quality_evidence": False,
         "retry_allowed": False,
         "actual_usage_known": False,
@@ -2012,6 +2247,11 @@ def _authorized_failure_receipt(
         "runner": {
             "returncode": runner_returncode,
             "elapsed_seconds": (time.time_ns() - started_ns) / 1_000_000_000,
+            "elapsed_seconds_semantics": (
+                "runner_wall_clock"
+                if receipt_mode == "in_band"
+                else "authorization_to_receipt_upper_bound"
+            ),
         },
         "failure_evidence": evidence,
         "privacy": {
@@ -2021,6 +2261,132 @@ def _authorized_failure_receipt(
             "memory_text_retained": False,
         },
     }
+
+
+def _persist_authorized_failure_receipt(
+    *,
+    manifest: Mapping[str, Any],
+    journal: BudgetJournal,
+    transaction_id: str,
+    runner_returncode: int,
+    failure_stage: str,
+    receipt_mode: str,
+    started_ns: int,
+    official_runner: bool,
+    receipt_path: Path,
+    receipt_parent_fd: int,
+    journal_path: Path,
+) -> None:
+    """Publish one fail-closed receipt for any post-authorization failure.
+
+    A runner exit code of zero only proves that the process returned normally;
+    it does not prove that every selected task, provider audit, trajectory and
+    scorer artifact passed the bound evidence contract.  In that case the
+    receipt deliberately records returncode=0 while the transaction remains
+    request_authorized at maximum exposure.
+    """
+
+    failure_receipt = _authorized_failure_receipt(
+        manifest=manifest,
+        journal=journal,
+        transaction_id=transaction_id,
+        runner_returncode=runner_returncode,
+        failure_stage=failure_stage,
+        receipt_mode=receipt_mode,
+        started_ns=started_ns,
+        official_runner=official_runner,
+    )
+    _write_private_new(
+        receipt_path,
+        (json.dumps(failure_receipt, sort_keys=True, indent=2) + "\n").encode(
+            "utf-8"
+        ),
+        preopened_parent_fd=receipt_parent_fd,
+    )
+    validate_authorized_failure_receipt(
+        receipt_path, journal_path=journal_path
+    )
+
+
+def recover_authorized_failure_receipt(
+    *,
+    manifest_path: Path,
+    journal_path: Path,
+    receipt_path: Path,
+    runner_returncode: int,
+    failure_stage: str,
+    started_ns: int,
+) -> Dict[str, Any]:
+    """Offline-only receipt recovery for a previously authorized failed run.
+
+    This deliberately has no provider credential parameter and never invokes
+    the WorkBuddy runner.  It reopens the exact authorized transaction and
+    publishes only bounded, privacy-reduced failure evidence.
+    """
+
+    manifest = validate_launch_manifest(manifest_path)
+    if runner_returncode < 0 or failure_stage not in AUTHORIZED_FAILURE_STAGES:
+        raise LaunchError("failure receipt recovery arguments are invalid")
+    if (
+        failure_stage == "runner_nonzero" and runner_returncode == 0
+    ) or (
+        failure_stage == "post_run_evidence_audit" and runner_returncode != 0
+    ):
+        raise LaunchError("failure receipt recovery stage contradicts runner evidence")
+    try:
+        started_ns = int(started_ns)
+    except (TypeError, ValueError) as exc:
+        raise LaunchError("failure receipt recovery start time is invalid") from exc
+    if started_ns <= 0 or started_ns > time.time_ns():
+        raise LaunchError("failure receipt recovery start time is invalid")
+
+    budget = manifest["budget"]
+    model = manifest["model"]
+    authority = BudgetAuthority(
+        manifest_sha256=manifest["content_sha256"],
+        model_fingerprint=model["fingerprint"],
+        provider_identity=model["provider_identity"],
+        total_cost_microusd=budget["total_cost_microusd"],
+        total_metered_tokens=budget["total_metered_tokens"],
+    )
+    receipt_parent, receipt_parent_fd = _open_private_artifact_parent(receipt_path)
+    try:
+        receipt_storage_path = receipt_parent / receipt_path.name
+        if _entry_exists(receipt_parent_fd, receipt_path.name) or _entry_exists(
+            receipt_parent_fd, receipt_path.name + ".tmp"
+        ):
+            raise LaunchError(
+                "paid launch receipt path is already occupied or incomplete"
+            )
+        with BudgetJournal(journal_path, authority) as journal:
+            matches = [
+                transaction
+                for transaction in journal.transaction_receipts()
+                if transaction["run_id"] == manifest["run_id"]
+                and transaction["manifest_sha256"] == manifest["content_sha256"]
+            ]
+            if len(matches) != 1 or matches[0]["state"] != "request_authorized":
+                raise LaunchError(
+                    "failure receipt recovery requires one exact authorized transaction"
+                )
+            _persist_authorized_failure_receipt(
+                manifest=manifest,
+                journal=journal,
+                transaction_id=str(matches[0]["transaction_id"]),
+                runner_returncode=runner_returncode,
+                failure_stage=failure_stage,
+                receipt_mode="offline_recovery",
+                started_ns=started_ns,
+                official_runner=True,
+                receipt_path=receipt_storage_path,
+                receipt_parent_fd=receipt_parent_fd,
+                journal_path=journal_path,
+            )
+        return validate_authorized_failure_receipt(
+            receipt_storage_path, journal_path=journal_path
+        )
+    finally:
+        os.close(receipt_parent_fd)
 
 
 def execute_launch(
@@ -2175,35 +2541,50 @@ def execute_launch(
                 if fault_hook is not None:
                     fault_hook("after_provider_return_before_commit", authorization)
                 if completed.returncode != 0:
-                    failure_receipt = _authorized_failure_receipt(
+                    _persist_authorized_failure_receipt(
                         manifest=manifest,
                         journal=journal,
                         transaction_id=transaction_id,
                         runner_returncode=completed.returncode,
+                        failure_stage="runner_nonzero",
+                        receipt_mode="in_band",
                         started_ns=started_ns,
                         official_runner=official_runner,
-                    )
-                    _write_private_new(
-                        receipt_path,
-                        (
-                            json.dumps(failure_receipt, sort_keys=True, indent=2)
-                            + "\n"
-                        ).encode("utf-8"),
-                        preopened_parent_fd=receipt_parent_fd,
-                    )
-                    validate_authorized_failure_receipt(
-                        receipt_storage_path, journal_path=journal_path
+                        receipt_path=receipt_storage_path,
+                        receipt_parent_fd=receipt_parent_fd,
+                        journal_path=journal_path,
                     )
                     raise LaunchError(
                         f"WorkBuddy runner exited {completed.returncode}; "
                         "authorized maximum remains exposed and retry is forbidden; "
                         f"failure receipt: {receipt_path}"
                     )
-                usage = _collect_usage(
-                    manifest,
-                    started_ns=started_ns,
-                    official_runner=official_runner,
-                )
+                try:
+                    usage = _collect_usage(
+                        manifest,
+                        started_ns=started_ns,
+                        official_runner=official_runner,
+                    )
+                except Exception as exc:
+                    _persist_authorized_failure_receipt(
+                        manifest=manifest,
+                        journal=journal,
+                        transaction_id=transaction_id,
+                        runner_returncode=completed.returncode,
+                        failure_stage="post_run_evidence_audit",
+                        receipt_mode="in_band",
+                        started_ns=started_ns,
+                        official_runner=official_runner,
+                        receipt_path=receipt_storage_path,
+                        receipt_parent_fd=receipt_parent_fd,
+                        journal_path=journal_path,
+                    )
+                    raise LaunchError(
+                        "WorkBuddy post-run evidence audit failed after runner exit 0; "
+                        "authorized maximum remains exposed and retry is forbidden; "
+                        f"failure receipt: {receipt_path}; "
+                        f"audit_error={type(exc).__name__}"
+                    ) from exc
                 committed = journal.commit(
                     transaction_id,
                     actual_cost_microusd=usage["cost_microusd"],
@@ -2287,6 +2668,15 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--budget-journal", type=Path, required=True)
     run.add_argument("--receipt", type=Path, required=True)
     run.add_argument("--credential-fd", type=int, required=True)
+    recover_failure = subparsers.add_parser("recover-failure-receipt")
+    recover_failure.add_argument("--manifest", type=Path, required=True)
+    recover_failure.add_argument("--budget-journal", type=Path, required=True)
+    recover_failure.add_argument("--receipt", type=Path, required=True)
+    recover_failure.add_argument("--runner-returncode", type=int, required=True)
+    recover_failure.add_argument(
+        "--failure-stage", choices=sorted(AUTHORIZED_FAILURE_STAGES), required=True
+    )
+    recover_failure.add_argument("--started-ns", type=int, required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "create":
@@ -2316,6 +2706,26 @@ def main(argv: list[str] | None = None) -> int:
                 (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode("utf-8"),
             )
             print(json.dumps(manifest["dry_run"], sort_keys=True))
+            return 0
+        if args.command == "recover-failure-receipt":
+            receipt = recover_authorized_failure_receipt(
+                manifest_path=args.manifest,
+                journal_path=args.budget_journal,
+                receipt_path=args.receipt,
+                runner_returncode=args.runner_returncode,
+                failure_stage=args.failure_stage,
+                started_ns=args.started_ns,
+            )
+            print(
+                json.dumps(
+                    {
+                        "run_id": receipt["run_id"],
+                        "state": receipt["state"],
+                        "retry_allowed": receipt["retry_allowed"],
+                    },
+                    sort_keys=True,
+                )
+            )
             return 0
         receipt = execute_launch(
             manifest_path=args.manifest,
