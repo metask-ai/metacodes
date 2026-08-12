@@ -17,15 +17,21 @@ zig build                                     # 产出 zig-out/bin/metacodes + z
 ./zig-out/bin/metacodes --api-key <KEY>
 ```
 
-**零下载依赖**:`highlight-zig`(高亮)与 `tinykg`(KG 记忆引擎)的源码作为**快照 vendored 在 `lib/`**(非 submodule,因更新频度低——plain clone 即可构建)。`lib/tinykg` 保留完整 Zig package root，主构建只消费其公共 `artifact("tinykg")`，不依赖上游 `src/` 内部布局。`zig build` 随 `-Dtarget` **交叉编译**它们:tinykg 装到 `zig-out/vendor/tinykg/tinykg`。更新依赖用 `scripts/vendor-deps.sh`。跳过 tinykg 构建:`-Dtinykg=false`。
+**零下载依赖**:`highlight-zig`(高亮)与 `tinykg`(KG 记忆引擎)的源码作为**快照 vendored 在 `lib/`**(非 submodule,因更新频度低——plain clone 即可构建)。主构建从 `lib/tinykg/src/main.zig` 编译兼容 CLI，不依赖上游仓库的 `build.zig`。`zig build` 随 `-Dtarget` **交叉编译**它们:tinykg 装到 `zig-out/vendor/tinykg/tinykg`。更新依赖用 `scripts/vendor-deps.sh`。跳过 tinykg 构建:`-Dtinykg=false`。
 
-共享 TinyKG Store 默认只经 authenticated Web → `tinykgd` → 单一 `StoreActor` 访问；
-启动 Metacodes 前设置 `METACODES_KG_URL`、`METACODES_KG_API_KEY`、
-`METACODES_KG_EXPECTED_BUILD_ID` 和 `METACODES_KG_EXPECTED_SCHEMA_DIGEST`。
-缺少任一项会 fail closed 为 KG degraded，不会回退为直接打开共享 Store。仅隔离的单进程
+共享 TinyKG Store 默认只经 authenticated Web → `tinykgd` → 单一 `StoreActor` 访问。
+Metacodes 复用 TinyKG Skill 的用户级 `remote.json`（用该 Skill 的 `remote set` 管理），
+也接受同名 `TINYKG_REMOTE_*` 环境覆盖；build identity 必须已 pin，schema digest 在
+首次认证响应后锁定到本进程。无安全配置会 fail closed 为 KG degraded，不会回退为直接打开共享 Store。仅隔离的单进程
 开发 Store 可显式设置 `METACODES_KG_TRANSPORT=cli-exclusive`，并用
 `METACODES_KG_BIN` / `METACODES_KG_STORE` 指向该独占实例；不要把 canonical Store
 用于这个兼容模式。
+
+事务边界仍在 Metacodes：`snapshot → proposal → Lean → re-observe → commit/rollback → receipt`。
+`tinykgd` 只提供多客户端共享 Store 所需的单命令串行、generation、commit receipt 和版本化
+存储原语；它不替 Metacodes 决定业务 proposal、恢复歧义写入或完成整条事务闭环。多个
+Metacodes 并发提交受治理迁移时，仍需 TinyKG 提供窄的 `expected_generation`/revision-CAS
+条件写入作为最后执行点；协议与判定始终由 Metacodes 拥有。
 
 常用构建目标:
 

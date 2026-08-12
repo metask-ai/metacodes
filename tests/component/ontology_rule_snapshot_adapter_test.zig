@@ -1,6 +1,6 @@
 //! L2 for the production read-only TinyKG ontology snapshot adapter.
 //!
-//! The fake transport models one atomic TinyKG command. No provider is
+//! The fake transport models one consistent TinyKG snapshot command. No provider is
 //! constructed or called; the real current vendored TinyKG negative test uses
 //! only a private temporary store.
 
@@ -396,7 +396,7 @@ fn writeExecutable(allocator: std.mem.Allocator, path: []const u8, bytes: []cons
     if (std.c.chmod(path_z.ptr, 0o700) != 0) return error.SkipZigTest;
 }
 
-test "L2 atomic TinyKG source becomes bound projection receipt for rule-author v2" {
+test "L2 consistent TinyKG source becomes bound projection receipt for rule-author v2" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

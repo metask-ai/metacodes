@@ -21,7 +21,7 @@ const Fake = struct {
         if (self.last_commit_request) |bytes| self.allocator.free(bytes);
     }
 
-    fn transport(self: *Fake) cc.kg_memory_migration_adapter.AtomicTransport {
+    fn transport(self: *Fake) cc.kg_memory_migration_adapter.StoragePrimitives {
         return .{
             .ptr = self,
             .capabilities_fn = capabilities,
@@ -109,7 +109,7 @@ fn checkerConfig() ?cc.formal_runtime.Config {
     return .{ .checker_path = std.mem.span(raw_checker), .expected_sha256 = expected };
 }
 
-test "L2 atomic memory adapter crosses TinyKG sensor Lean checker CAS receipt and post-state" {
+test "L2 governed memory transaction crosses TinyKG sensor Lean checker CAS receipt and post-state" {
     const config = checkerConfig() orelse return error.SkipZigTest;
     var fake = Fake{ .allocator = std.testing.allocator };
     defer fake.deinit();
@@ -158,7 +158,7 @@ test "L2 atomic memory adapter crosses TinyKG sensor Lean checker CAS receipt an
     try std.testing.expectEqualSlices(u8, persisted.manifest_sha256[0..], verified.manifest_sha256[0..]);
 }
 
-test "L2 atomic memory adapter fails closed before CAS when capability or reobservation drifts" {
+test "L2 governed memory transaction fails closed before CAS when capability or reobservation drifts" {
     const config = checkerConfig() orelse return error.SkipZigTest;
     var unavailable = Fake{ .allocator = std.testing.allocator, .capabilities_ok = false };
     defer unavailable.deinit();
@@ -239,7 +239,7 @@ test "L2 prepared memory migration is single-attempt even after indeterminate co
     try std.testing.expectEqual(@as(usize, 1), fake.commit_calls);
 }
 
-test "L2 atomic memory adapter rejects a sensor snapshot not bound to requested ids" {
+test "L2 governed memory transaction rejects a sensor snapshot not bound to requested ids" {
     const config = checkerConfig() orelse return error.SkipZigTest;
     var fake = Fake{ .allocator = std.testing.allocator, .mismatched_snapshot_ids = true };
     defer fake.deinit();
@@ -256,7 +256,7 @@ test "L2 atomic memory adapter rejects a sensor snapshot not bound to requested 
     try std.testing.expectEqual(@as(usize, 0), fake.commit_calls);
 }
 
-test "L2 atomic memory adapter refuses forged receipt and invalid post-state" {
+test "L2 governed memory transaction refuses forged receipt and invalid post-state" {
     const config = checkerConfig() orelse return error.SkipZigTest;
     var forged = Fake{ .allocator = std.testing.allocator, .malformed_receipt = true };
     defer forged.deinit();

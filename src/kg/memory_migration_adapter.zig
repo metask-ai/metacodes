@@ -1,7 +1,7 @@
-//! Strict TinyKG atomic memory-migration adapter.
+//! Metacodes-owned atomic memory-migration transaction controller.
 //!
 //! This module is deliberately transport-agnostic: the caller supplies the
-//! three versioned TinyKG primitives and this adapter owns their ordering,
+//! narrow versioned TinyKG storage primitives and this adapter owns ordering,
 //! schema validation, hash binding, Lean invocation, full snapshot
 //! re-observation, commit receipt audit, and post-state audit.  It never falls
 //! back to ordinary `add-edge` or property commands.
@@ -29,23 +29,26 @@ pub const Source = struct {
     evidence_id: u64,
 };
 
-pub const AtomicTransport = struct {
+/// Narrow storage actuator supplied by TinyKG. Atomicity here means the final
+/// conditional mutation is indivisible at one Store generation; Metacodes
+/// still owns the complete governed transaction around it.
+pub const StoragePrimitives = struct {
     ptr: *anyopaque,
     capabilities_fn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8,
     snapshot_fn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, source: Source) anyerror![]u8,
     commit_fn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, request: []const u8) anyerror![]u8,
     post_state_fn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, rollback_token: []const u8) anyerror![]u8,
 
-    pub fn capabilities(self: AtomicTransport, allocator: std.mem.Allocator) ![]u8 {
+    pub fn capabilities(self: StoragePrimitives, allocator: std.mem.Allocator) ![]u8 {
         return self.capabilities_fn(self.ptr, allocator);
     }
-    pub fn snapshot(self: AtomicTransport, allocator: std.mem.Allocator, source: Source) ![]u8 {
+    pub fn snapshot(self: StoragePrimitives, allocator: std.mem.Allocator, source: Source) ![]u8 {
         return self.snapshot_fn(self.ptr, allocator, source);
     }
-    pub fn commit(self: AtomicTransport, allocator: std.mem.Allocator, request: []const u8) ![]u8 {
+    pub fn commit(self: StoragePrimitives, allocator: std.mem.Allocator, request: []const u8) ![]u8 {
         return self.commit_fn(self.ptr, allocator, request);
     }
-    pub fn postState(self: AtomicTransport, allocator: std.mem.Allocator, rollback_token: []const u8) ![]u8 {
+    pub fn postState(self: StoragePrimitives, allocator: std.mem.Allocator, rollback_token: []const u8) ![]u8 {
         return self.post_state_fn(self.ptr, allocator, rollback_token);
     }
 };
@@ -221,7 +224,7 @@ const ParsedPostState = std.json.Parsed(RawPostState);
 /// must never issue a fresh semantic migration automatically.
 pub fn execute(
     allocator: std.mem.Allocator,
-    transport: AtomicTransport,
+    transport: StoragePrimitives,
     source: Source,
     config: runtime.Config,
     abort: ?*const AbortSignal,
@@ -237,7 +240,7 @@ pub fn execute(
 /// asking an LLM to reconstruct a proposal.
 pub fn prepare(
     allocator: std.mem.Allocator,
-    transport: AtomicTransport,
+    transport: StoragePrimitives,
     source: Source,
     config: runtime.Config,
     abort: ?*const AbortSignal,
@@ -289,7 +292,7 @@ pub fn prepare(
 /// Any failure from the first call into TinyKG onward is indeterminate and
 /// must be resolved by request-id inspection/rollback, never automatic retry.
 pub fn commitPrepared(
-    transport: AtomicTransport,
+    transport: StoragePrimitives,
     prepared: *Prepared,
 ) !Result {
     if (prepared.transferred or prepared.commit_attempted)

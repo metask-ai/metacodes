@@ -1,11 +1,12 @@
 //! Production read-only TinyKG -> ontology rule-author projection adapter.
 //!
-//! TinyKG owns the atomic source snapshot and semantic revision. metacodes
-//! verifies the exact source wire, merges only locally authenticated generation
-//! evidence and sealed held-out commitments, re-observes the source, then
-//! persists the existing content-addressed projection receipt. No actor
-//! Conversation, system prompt, tool schema, provider, or TinyKG write path is
-//! accepted by this API.
+//! TinyKG owns one consistent read primitive and its semantic revision;
+//! metacodes owns the surrounding transaction/control loop. It verifies the
+//! exact source wire, merges only locally authenticated generation evidence
+//! and sealed held-out commitments, re-observes the source, then persists the
+//! existing content-addressed projection receipt. No actor Conversation,
+//! system prompt, tool schema, provider, or TinyKG write path is accepted by
+//! this API.
 
 const std = @import("std");
 const projection = @import("../core/ontology_rule_projection.zig");
