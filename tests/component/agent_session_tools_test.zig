@@ -158,3 +158,49 @@ test "L2 AgentSession rejects an unadvertised Runtime tool before prefetch or di
     const body = (srv.lastRequest() orelse return error.NoRequestCaptured).body();
     try std.testing.expect(std.mem.indexOf(u8, body, "unknown_tool") != null);
 }
+
+test "L2 AgentSession Bash 子进程 cwd 绑 workspace.root(缺陷 B 回归)" {
+    // 缺陷 B:子进程必须 chdir 到 workspace.root,而非继承父进程(测试进程)cwd。
+    // 验证:workspace.root 设为 tmp 目录(≠ 测试进程 cwd),Bash 跑 `pwd`,
+    // tool_result 在下一请求 body 里出现,且含 workspace.root 路径片段。
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    for (root_buf[0..root_len]) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
+    const root = root_buf[0..root_len];
+
+    const tool_sse = try bashToolSse(a, "pwd");
+    defer a.free(tool_sse);
+    const bodies = [_][]const u8{ tool_sse, FINAL_SSE };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    const Runtime = cc.agent_session.AgentRuntime;
+    const runtime = try Runtime.create(a, .{ .builtin_tools = &.{ "Read", "Bash" } });
+    defer runtime.destroy() catch unreachable;
+    const session = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = url,
+        .permission_mode = .bypass_permissions,
+        .workspace = .{ .root = root, .shell = .unrestricted },
+        .allowed_tools = &.{ "Read", "Bash" },
+    });
+    defer session.destroy() catch unreachable;
+
+    var sink_state: u8 = 0;
+    const result = try session.runText(1, "print working dir", 4, .{ .ctx = &sink_state, .emit = Sink.emit });
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
+
+    // 下一请求 body 应含 tool_result,其 stdout 含 workspace.root(子进程在 root 下跑 pwd)。
+    const body = (srv.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, root) != null);
+}

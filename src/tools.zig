@@ -327,7 +327,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "AskUserQuestion",
-        .description = "Ask the user a multiple-choice question interactively. Only works in TTY. Use when you need user decision to proceed (architecture choices, ambiguous requests).",
+        .description = "Ask the user a multiple-choice question. This is a possibly-unavailable interactive channel; if it fails, continue with a sensible default and explain. Use only when a decision genuinely belongs to the user and cannot be inferred from the request, code, or a reasonable default.",
         .input_schema = .{
             .type = "object",
             .prop_specs = &.{

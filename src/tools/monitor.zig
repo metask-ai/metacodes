@@ -61,7 +61,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     if (sandbox_wrap) |*sw| sw.detached = true; // 后台:profile 不能随本函数返回删
 
     // 启动后台 job(已 sandbox 包裹)
-    const entry = jobs.spawnBackground(eff_command) catch |err| {
+    const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
+    const entry = jobs.spawnBackground(eff_command, cwd_opt) catch |err| {
         return try std.fmt.allocPrint(ctx.allocator, "{{\"error\":\"spawn_failed\",\"message\":\"{s}\"}}", .{@errorName(err)});
     };
 

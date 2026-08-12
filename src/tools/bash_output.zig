@@ -156,7 +156,7 @@ test "BashOutput returns stdout after exit" {
     const a = std.testing.allocator;
     var r = try @import("../core/job_registry.zig").JobRegistry.init(a);
     defer r.deinit();
-    const j = try r.spawnBackground("echo hello; exit 0");
+    const j = try r.spawnBackground("echo hello; exit 0", null);
 
     // 等子进程结束
     time.sleepMs(200);
@@ -179,7 +179,7 @@ test "BashOutput since_byte skips prefix" {
     const a = std.testing.allocator;
     var r = try @import("../core/job_registry.zig").JobRegistry.init(a);
     defer r.deinit();
-    const j = try r.spawnBackground("printf 'ABCDEFG'; exit 0");
+    const j = try r.spawnBackground("printf 'ABCDEFG'; exit 0", null);
 
     time.sleepMs(200);
 
@@ -199,7 +199,7 @@ test "BashOutput max_bytes truncates" {
     const a = std.testing.allocator;
     var r = try @import("../core/job_registry.zig").JobRegistry.init(a);
     defer r.deinit();
-    const j = try r.spawnBackground("printf 'ABCDEFGHIJ'; exit 0");
+    const j = try r.spawnBackground("printf 'ABCDEFGHIJ'; exit 0", null);
 
     time.sleepMs(200);
 

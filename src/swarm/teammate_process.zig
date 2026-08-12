@@ -363,7 +363,7 @@ pub fn createWorktree(a: std.mem.Allocator, wt_path: []const u8, branch: []const
     }
     for ([_][]const u8{ "worktree", "add", "-b", branch, wt_path, base }) |w| try appendZ(a, &argv, w);
     try argv.append(a, null);
-    const out = try common.spawnCaptureWithStderrTimed(argv.items, a, abort, 30_000, null, common.MAX_SPAWN_CAPTURE_BYTES);
+    const out = try common.spawnCaptureWithStderrTimed(argv.items, a, abort, 30_000, null, common.MAX_SPAWN_CAPTURE_BYTES, null);
     defer a.free(out.stdout);
     defer a.free(out.stderr);
     if (out.exit_code != 0) return error.WorktreeAddFailed;
@@ -400,7 +400,7 @@ pub fn removeWorktreeStrict(a: std.mem.Allocator, wt_path: []const u8, repo: []c
     }
     for ([_][]const u8{ "worktree", "remove", "--force", wt_path }) |w| try appendZ(a, &argv, w);
     try argv.append(a, null);
-    const out = try common.spawnCaptureWithStderrTimed(argv.items, a, abort, 30_000, null, common.MAX_SPAWN_CAPTURE_BYTES);
+    const out = try common.spawnCaptureWithStderrTimed(argv.items, a, abort, 30_000, null, common.MAX_SPAWN_CAPTURE_BYTES, null);
     defer a.free(out.stdout);
     defer a.free(out.stderr);
     if (out.exit_code != 0) return error.WorktreeRemoveFailed;

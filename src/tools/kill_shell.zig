@@ -31,7 +31,7 @@ test "KillShell on running job" {
     const a = std.testing.allocator;
     var r = try @import("../core/job_registry.zig").JobRegistry.init(a);
     defer r.deinit();
-    const j = try r.spawnBackground("sleep 30");
+    const j = try r.spawnBackground("sleep 30", null);
 
     var args_buf: [128]u8 = undefined;
     const args = try std.fmt.bufPrint(&args_buf, "{{\"job_id\":\"{s}\"}}", .{j.id[0..]});

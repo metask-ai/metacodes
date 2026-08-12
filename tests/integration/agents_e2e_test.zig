@@ -211,7 +211,7 @@ test "Subagents E2E: subagents section in system prompt" {
     try agset.loadFromStandardPaths("");
 
     const sp = @import("cc").system_prompt;
-    const prompt = try sp.buildWithSkillsAndAgents(a, "claude-opus-4-7", &skset, &agset);
+    const prompt = try sp.buildWithSkillsAndAgents(a, "claude-opus-4-7", &skset, &agset, "/tmp");
     defer a.free(prompt);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "# Available subagents") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "**Explore**") != null);

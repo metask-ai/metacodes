@@ -121,7 +121,8 @@ pub const JobRegistry = struct {
 
     /// spawn 一个子进程跑 `/bin/sh -c command`，stdout/stderr 重定向到落盘文件。
     /// 立刻返回 job_id，不等待进程结束。
-    pub fn spawnBackground(self: *JobRegistry, command: []const u8) !JobEntry {
+    /// cwd 非 null → 子进程 chdir(borrow:spawn 时消费,不存 JobEntry——生命周期不匹配)。
+    pub fn spawnBackground(self: *JobRegistry, command: []const u8, cwd: ?[]const u8) !JobEntry {
         const id = try genId();
 
         const stdout_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.out", .{ self.base_dir, id[0..] });
@@ -143,7 +144,7 @@ pub const JobRegistry = struct {
         defer self.allocator.free(cmd_z);
         var argv: [6]?[*:0]const u8 = undefined;
         shell_mod.deriveExecArgs(shell, cmd_z.ptr, &argv);
-        const proc = process.spawnToFiles(argv[0..], out_fd, err_fd) catch return error.SpawnFailed;
+        const proc = process.spawnToFiles(argv[0..], out_fd, err_fd, cwd) catch return error.SpawnFailed;
         // From this point until registerEntry succeeds, the child has no owner
         // in jobs[]. OOM while allocating the preview/index must not leak a
         // live background process.
@@ -306,7 +307,7 @@ test "spawn and reap echo" {
     var r = try JobRegistry.init(a);
     defer r.deinit();
 
-    const j = try r.spawnBackground("echo hello; sleep 0.05");
+    const j = try r.spawnBackground("echo hello; sleep 0.05", null);
     try std.testing.expect(j.status == .running);
 
     // Windows PowerShell cold start is not bounded by the old fixed 200 ms
@@ -339,7 +340,7 @@ test "kill running job" {
     var r = try JobRegistry.init(a);
     defer r.deinit();
 
-    const j = try r.spawnBackground("sleep 30");
+    const j = try r.spawnBackground("sleep 30", null);
     try std.testing.expect(j.status == .running);
     try r.kill(j.idSlice());
     const j2 = r.get(j.idSlice()).?;
@@ -351,8 +352,8 @@ test "activeCount" {
     var r = try JobRegistry.init(a);
     defer r.deinit();
 
-    const j1 = try r.spawnBackground("sleep 2");
-    const j2 = try r.spawnBackground("sleep 2");
+    const j1 = try r.spawnBackground("sleep 2", null);
+    const j2 = try r.spawnBackground("sleep 2", null);
     _ = j1;
     _ = j2;
     try std.testing.expect(r.activeCount() == 2);

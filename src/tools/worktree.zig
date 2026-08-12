@@ -89,7 +89,7 @@ pub fn enterExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         base_z.ptr,
         null,
     };
-    const out = common.spawnCaptureWithStderrTimed(argv_args[0..], a, ctx.abort, 30_000, ctx.spawn_tick_fn, common.MAX_SPAWN_CAPTURE_BYTES) catch |err| {
+    const out = common.spawnCaptureWithStderrTimed(argv_args[0..], a, ctx.abort, 30_000, ctx.spawn_tick_fn, common.MAX_SPAWN_CAPTURE_BYTES, null) catch |err| {
         return try std.fmt.allocPrint(a, "{{\"error\":\"git_failed\",\"message\":\"{s}\"}}", .{@errorName(err)});
     };
     defer a.free(out.stdout);
@@ -143,7 +143,7 @@ pub fn exitExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         try argv_list.append(a, wt_z.ptr);
         try argv_list.append(a, null);
 
-        const out = common.spawnCaptureWithStderrTimed(argv_list.items, a, ctx.abort, 30_000, ctx.spawn_tick_fn, common.MAX_SPAWN_CAPTURE_BYTES) catch null;
+        const out = common.spawnCaptureWithStderrTimed(argv_list.items, a, ctx.abort, 30_000, ctx.spawn_tick_fn, common.MAX_SPAWN_CAPTURE_BYTES, null) catch null;
         if (out) |o| {
             defer a.free(o.stdout);
             defer a.free(o.stderr);

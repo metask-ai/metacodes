@@ -212,6 +212,7 @@ test "Skills E2E: canonical catalog projects into CLI and system prompt" {
         allocator,
         "claude-opus-4-7",
         &fixture.projection,
+        "/tmp",
     );
     defer allocator.free(prompt);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "**refactor**") != null);

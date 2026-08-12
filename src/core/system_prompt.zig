@@ -183,19 +183,15 @@ const PLATFORM: []const u8 = switch (@import("builtin").os.tag) {
 };
 
 /// 拼 # Environment 段，返回 allocator-owned string。
-fn buildEnvSection(allocator: std.mem.Allocator, model: []const u8) ![]u8 {
+/// cwd 由调用方提供(CLI 传进程 cwd,Session 传 workspace.root)——库不预设 cwd 来源。
+fn buildEnvSection(allocator: std.mem.Allocator, model: []const u8, cwd: []const u8) ![]u8 {
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
 
     try buf.appendSlice(allocator, "# Environment\n");
     try buf.appendSlice(allocator, "You have been invoked in the following environment: \n");
 
-    // CWD
-    const cwd = util_fs.getCwd(allocator) catch |err| blk: {
-        @import("../util/log.zig").debug("sysprompt", "getCwd failed: {s}", .{@errorName(err)});
-        break :blk try allocator.dupe(u8, "(unknown)");
-    };
-    defer allocator.free(cwd);
+    // CWD(由调用方传入;不读进程 cwd——Session 隔离要求 workspace.root)
     {
         const s = try std.fmt.allocPrint(allocator, " - Primary working directory: {s}\n", .{cwd});
         defer allocator.free(s);
@@ -254,8 +250,20 @@ fn buildEnvSection(allocator: std.mem.Allocator, model: []const u8) ![]u8 {
 // ============================================================================
 
 /// 构造完整 system prompt。caller 拥有返回 slice。
-pub fn build(allocator: std.mem.Allocator, model: []const u8) ![]u8 {
-    return buildWithSkills(allocator, model, null);
+/// cwd 为环境段的 Primary working directory(CLI 传进程 cwd)。
+pub fn build(allocator: std.mem.Allocator, model: []const u8, cwd: []const u8) ![]u8 {
+    return buildWithSkills(allocator, model, null, cwd);
+}
+
+/// 子 Agent 系统提示:静态字面量 + 环境段(缺陷 A 修复)。
+/// 两处启动点(abi_v1 / model_skill_tool)共用此函数,确保环境段一致。
+/// cwd 用 workspace.root(非进程 cwd——子 Agent 继承父 Session 的 workspace 隔离)。
+/// 不含工具段——子 Agent 工具描述经 tool_defs 透传,无需在 system_prompt 重复。
+pub fn buildSubagentSystemPrompt(allocator: std.mem.Allocator, model: []const u8, cwd: []const u8) ![]u8 {
+    const literal = "You are a subagent. Complete the task and return a concise final answer.\n";
+    const env = try buildEnvSection(allocator, model, cwd);
+    defer allocator.free(env);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ literal, env });
 }
 
 /// 同 build，外加 skills section（让模型知道有哪些 Skill 可激活、何时激活）。
@@ -264,8 +272,9 @@ pub fn buildWithSkills(
     allocator: std.mem.Allocator,
     model: []const u8,
     skills: ?*const @import("../skills/skill.zig").SkillSet,
+    cwd: []const u8,
 ) ![]u8 {
-    return buildWithSkillsAndAgents(allocator, model, skills, null);
+    return buildWithSkillsAndAgents(allocator, model, skills, null, cwd);
 }
 
 /// 完整版:skills section + subagents section。
@@ -276,8 +285,9 @@ pub fn buildWithSkillsAndAgents(
     model: []const u8,
     skills: ?*const @import("../skills/skill.zig").SkillSet,
     agents: ?*const @import("../agents/set.zig").AgentSet,
+    cwd: []const u8,
 ) ![]u8 {
-    return buildFull(allocator, model, skills, agents, null, "", false);
+    return buildFull(allocator, model, skills, agents, null, "", false, cwd);
 }
 
 /// 最完整版:额外接收 enabled_tool_names,让 # Using your tools 段按工具集动态裁剪
@@ -306,8 +316,9 @@ pub fn buildFull(
     enabled_tool_names: ?[]const []const u8,
     memdir_abs: []const u8,
     kg_ready: bool,
+    cwd: []const u8,
 ) ![]u8 {
-    const env_section = try buildEnvSection(allocator, model);
+    const env_section = try buildEnvSection(allocator, model, cwd);
     defer allocator.free(env_section);
 
     const skills_section = if (skills) |s| try buildSkillsSection(allocator, s) else try allocator.dupe(u8, "");
@@ -482,7 +493,7 @@ fn buildSkillsSection(allocator: std.mem.Allocator, set: *const @import("../skil
 const testing = std.testing;
 
 test "build produces non-empty prompt with MetaCode identity" {
-    const s = try build(testing.allocator, "claude-opus-4-7");
+    const s = try build(testing.allocator, "claude-opus-4-7", "/tmp");
     defer testing.allocator.free(s);
     try testing.expect(s.len > 1000);
     try testing.expect(std.mem.indexOf(u8, s, "MetaCode") != null);
@@ -497,7 +508,7 @@ test "build produces non-empty prompt with MetaCode identity" {
 }
 
 test "KG prompt enforces staged semantic neighborhood only when KG is ready" {
-    const with_kg = try buildFull(testing.allocator, "claude-opus-4-7", null, null, null, "", true);
+    const with_kg = try buildFull(testing.allocator, "claude-opus-4-7", null, null, null, "", true, "/tmp");
     defer testing.allocator.free(with_kg);
     try testing.expect(std.mem.indexOf(u8, with_kg, "computes no embeddings or vector distance") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "2-4 separate compact semantic variants") != null);
@@ -515,7 +526,7 @@ test "KG prompt enforces staged semantic neighborhood only when KG is ready" {
     try testing.expect(std.mem.indexOf(u8, with_kg, "# Deferred tools") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "FormalAuditTask") != null);
 
-    const without_kg = try buildFull(testing.allocator, "claude-opus-4-7", null, null, null, "", false);
+    const without_kg = try buildFull(testing.allocator, "claude-opus-4-7", null, null, null, "", false, "/tmp");
     defer testing.allocator.free(without_kg);
     try testing.expect(std.mem.indexOf(u8, without_kg, "computes no embeddings or vector distance") == null);
     try testing.expect(std.mem.indexOf(u8, without_kg, "ALIAS BRANCH HAS PRIORITY") == null);
@@ -532,7 +543,7 @@ test "knowledge cutoff maps opus-4-7" {
 }
 
 test "env section includes model id" {
-    const s = try buildEnvSection(testing.allocator, "claude-opus-4-7");
+    const s = try buildEnvSection(testing.allocator, "claude-opus-4-7", "/tmp");
     defer testing.allocator.free(s);
     try testing.expect(std.mem.indexOf(u8, s, "claude-opus-4-7") != null);
     try testing.expect(std.mem.indexOf(u8, s, "# Environment") != null);
@@ -541,7 +552,7 @@ test "env section includes model id" {
 test "buildWithSkills empty set behaves like build (no skills section)" {
     var set = @import("../skills/skill.zig").SkillSet.init(testing.allocator);
     defer set.deinit();
-    const s = try buildWithSkills(testing.allocator, "claude-opus-4-7", &set);
+    const s = try buildWithSkills(testing.allocator, "claude-opus-4-7", &set, "/tmp");
     defer testing.allocator.free(s);
     try testing.expect(std.mem.indexOf(u8, s, "# Available skills") == null);
 }
@@ -553,7 +564,7 @@ test "buildWithSkills includes skill name + description" {
     const md = "---\nname: code-review\ndescription: Review pending changes for bugs\n---\nbody\n";
     try set.skills.append(testing.allocator, try skill_mod.parseSkillMd(testing.allocator, md, "/fake"));
 
-    const s = try buildWithSkills(testing.allocator, "claude-opus-4-7", &set);
+    const s = try buildWithSkills(testing.allocator, "claude-opus-4-7", &set, "/tmp");
     defer testing.allocator.free(s);
     try testing.expect(std.mem.indexOf(u8, s, "# Available skills") != null);
     try testing.expect(std.mem.indexOf(u8, s, "**code-review**") != null);
