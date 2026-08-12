@@ -86,8 +86,15 @@ identities and the cached linux/amd64 images, sets
 `DOCKER_DEFAULT_PLATFORM=linux/amd64`, appends
 `request_authorized` to the external journal, then starts the fixed WorkBuddy
 command with the anonymous credential FD. It commits only after every selected
-trajectory has a request audit, usage and cache-prefix hash. A failed or
-interrupted authorized run is not automatically retried.
+trajectory has a request audit, usage, cache-prefix hash, transcript and a
+complete tool-observation journal. The launch gate independently recomputes
+bounded post-run metrics for real tool dispatches, Lean verdicts/timing,
+TinyKG recall/context/remember and task-DAG activity; trajectory self-reports
+are not trusted. Per-task receipt rows bind the transcript and journal hashes,
+while wave summaries aggregate counts and preserve maxima. Raw tool arguments,
+results and memory text remain in isolated local trial artifacts and are not
+copied into the derived metrics. A failed or interrupted authorized run is not
+automatically retried.
 
 Committed token usage includes uncached prompt, completion, cache-read and
 cache-creation tokens. Cache accounting is not allowed to disappear merely
@@ -131,6 +138,15 @@ same single-attempt, single-concurrency and full-I/O rules. A failed probe is
 not widened to Code-3.
 Do not widen that job in place; later Code16 and cross-domain waves get separate
 job files and budget transactions.
+
+The maturation order is intentionally progressive rather than a full-suite
+launch: W0 synthetic → optional one-task provider-recovery probe → Code-3
+canary → Code-16 development slice → all 52 development tasks → promotion A
+(26) → promotion B (26) → sealed holdout (156). Each wave is a separate frozen
+manifest and budget transaction, and widening requires human review of the
+previous wave's success, drift, cost, elapsed time, stability, cache and
+Lean/TinyKG control metrics. Full 260-task repeated runs are optional final
+evidence, never the starting point.
 
 W0 uses a static synthetic ELF, Docker `network_mode: none`, `n_attempts=1`,
 and concurrency 1. The ELF also asserts at runtime that its namespace has no

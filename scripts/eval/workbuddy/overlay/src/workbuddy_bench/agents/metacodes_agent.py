@@ -24,7 +24,12 @@ from harbor.models.trajectories.tool_call import ToolCall
 from harbor.models.trajectories.trajectory import Trajectory
 
 from workbuddy_bench.agents._agent_user import ensure_agent_user
-from workbuddy_bench.agents._metacodes_trace import TraceError, load_trace_ir
+from workbuddy_bench.agents._metacodes_trace import (
+    OBSERVATION_FILENAME,
+    TraceError,
+    load_control_metrics,
+    load_trace_ir,
+)
 
 
 _OUTPUT_FILENAME = "metacodes-output.jsonl"
@@ -124,6 +129,7 @@ class MetacodesAgent(BaseInstalledAgent):
         mount = self._mount_path.rstrip("/")
         output_path = f"/logs/agent/{_OUTPUT_FILENAME}"
         transcript_path = f"/logs/agent/{_TRANSCRIPT_FILENAME}"
+        observation_path = f"/logs/agent/{OBSERVATION_FILENAME}"
         flags = [
             "--model", escaped_model,
             "--permission", "bypassPermissions",
@@ -160,8 +166,14 @@ class MetacodesAgent(BaseInstalledAgent):
             'echo "expected one metacodes transcript, found ${#transcripts[@]}" >&2; '
             "exit 72; }; "
             f'cp -- "${{transcripts[0]}}" {shlex.quote(transcript_path)} || exit 73; '
-            'chmod 0600 "${transcripts[0]}" '
-            f"{shlex.quote(transcript_path)} {shlex.quote(output_path)} || exit 74; "
+            'mapfile -t observations < <(find "$HOME/.metacodes/projects" '
+            "-type f -name tool-observations.jsonl -print 2>/dev/null); "
+            'test "${#observations[@]}" -eq 1 || { '
+            'echo "expected one metacodes observation journal, found ${#observations[@]}" >&2; '
+            "exit 74; }; "
+            f'cp -- "${{observations[0]}}" {shlex.quote(observation_path)} || exit 75; '
+            'chmod 0600 "${transcripts[0]}" "${observations[0]}" '
+            f"{shlex.quote(transcript_path)} {shlex.quote(observation_path)} {shlex.quote(output_path)} || exit 76; "
             'exit "$agent_status"'
         )
         await self.exec_as_agent(
@@ -177,6 +189,11 @@ class MetacodesAgent(BaseInstalledAgent):
                 self.logs_dir / _OUTPUT_FILENAME,
                 self.logs_dir / _TRANSCRIPT_FILENAME,
             )
+            control_metrics = load_control_metrics(
+                self.logs_dir / _TRANSCRIPT_FILENAME,
+                self.logs_dir / OBSERVATION_FILENAME,
+            )
+            trace["control_metrics"] = control_metrics
             trajectory = self._build_trajectory(trace)
         except (OSError, TraceError, ValueError) as exc:
             raise RuntimeError(f"cannot build metacodes ATIF trajectory: {exc}") from exc
@@ -236,6 +253,7 @@ class MetacodesAgent(BaseInstalledAgent):
                 "requested_context_window": self._context_window,
                 "requested_context_compact_pct": self._context_compact_pct,
                 "model_params_via_host_proxy": self._model_params,
+                "control_metrics": trace.get("control_metrics"),
             },
         )
         return Trajectory(

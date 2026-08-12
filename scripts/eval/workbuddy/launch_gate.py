@@ -40,6 +40,12 @@ from .environment_preflight import (
 from .install_overlay import OverlayError, validate_installed_overlay
 from .key_fd import MAX_CREDENTIAL_BYTES
 from .stage_artifacts import ELF_MACHINE_X86_64, TARGET_PLATFORM, _elf_machine
+from .trace import (
+    CONTROL_METRICS_SCHEMA,
+    OBSERVATION_FILENAME,
+    TraceError,
+    load_control_metrics,
+)
 
 
 SCHEMA_VERSION = "metacodes-workbuddy-paid-launch-v1"
@@ -756,6 +762,210 @@ def _task_for_path(path: Path, selected: Sequence[str]) -> str | None:
     return None
 
 
+def _validate_control_metrics(
+    value: object,
+    *,
+    trajectory_path: Path,
+    transcript_path: Path,
+    observation_path: Path,
+) -> Dict[str, Any]:
+    """Validate post-run mechanism evidence before it enters a quality receipt."""
+
+    if not isinstance(value, dict) or value.get("schema_version") != CONTROL_METRICS_SCHEMA:
+        raise LaunchError("trajectory is missing the versioned control metrics")
+    if set(value) != {
+        "schema_version",
+        "source",
+        "tool_runtime",
+        "tinykg",
+        "lean",
+        "privacy",
+    }:
+        raise LaunchError("control metrics top-level schema drifted")
+    source = value.get("source")
+    runtime = value.get("tool_runtime")
+    tinykg = value.get("tinykg")
+    lean = value.get("lean")
+    privacy = value.get("privacy")
+    if not all(isinstance(item, dict) for item in (source, runtime, tinykg, lean, privacy)):
+        raise LaunchError("trajectory control metrics sections are malformed")
+    source_fields = {
+        "transcript_sha256",
+        "observation_journal_sha256",
+        "session_id_sha256",
+        "run_id_sha256",
+        "observation_journal_records",
+    }
+    if set(source) != source_fields:
+        raise LaunchError("control metrics source schema drifted")
+    for name in (
+        "transcript_sha256",
+        "observation_journal_sha256",
+        "session_id_sha256",
+        "run_id_sha256",
+    ):
+        digest = source.get(name)
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise LaunchError(f"control metrics source identity {name} is invalid")
+    if source["transcript_sha256"] != _identity(transcript_path)["sha256"]:
+        raise LaunchError("control metrics transcript hash does not bind the artifact")
+    if source["observation_journal_sha256"] != _identity(observation_path)["sha256"]:
+        raise LaunchError("control metrics observation hash does not bind the artifact")
+    _non_negative_control_int(source.get("observation_journal_records"), "journal records")
+
+    required_runtime = (
+        "transcript_tool_calls",
+        "transcript_tool_results",
+        "transcript_calls_without_result",
+        "dispatch_started",
+        "dispatch_finished",
+        "dispatch_outcomes",
+    )
+    if set(runtime) != set(required_runtime):
+        raise LaunchError("control metrics tool runtime schema drifted")
+    for name in required_runtime[:-1]:
+        _non_negative_control_int(runtime.get(name), f"tool runtime {name}")
+    if runtime["transcript_calls_without_result"] != 0:
+        raise LaunchError("control metrics contain a tool call without a result")
+    if runtime["dispatch_started"] != runtime["dispatch_finished"]:
+        raise LaunchError("control metrics contain an unpaired tool dispatch")
+    outcomes = runtime.get("dispatch_outcomes")
+    if not isinstance(outcomes, dict):
+        raise LaunchError("control metrics dispatch outcomes are malformed")
+    outcome_total = 0
+    for name in (
+        "succeeded",
+        "tool_error",
+        "pending",
+        "host_failed",
+        "host_rejected",
+        "host_fatal",
+    ):
+        count = _non_negative_control_int(outcomes.get(name), f"dispatch outcome {name}")
+        outcome_total += count
+    if outcome_total != runtime["dispatch_finished"]:
+        raise LaunchError("control metrics dispatch outcome total is inconsistent")
+
+    _validate_control_section(tinykg, "tinykg")
+    _validate_control_section(lean, "lean")
+    if privacy != {
+        "tool_arguments_retained": False,
+        "tool_results_retained": False,
+        "memory_text_retained": False,
+    }:
+        raise LaunchError("control metrics privacy contract drifted")
+    observed = load_control_metrics(transcript_path, observation_path)
+    if observed != value:
+        raise LaunchError(
+            f"trajectory control metrics do not match the bound artifacts: {trajectory_path}"
+        )
+    # Never allow a trajectory to smuggle arbitrary text or a second evidence
+    # authority through the derived metrics object.
+    if any(not isinstance(key, str) for key in value):
+        raise LaunchError("control metrics has a non-string key")
+    return value
+
+
+def _non_negative_control_int(value: object, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise LaunchError(f"control metrics {where} must be a non-negative integer")
+    return value
+
+
+def _validate_control_section(value: Mapping[str, Any], section: str) -> None:
+    if not isinstance(value.get("used"), bool):
+        raise LaunchError(f"control metrics {section}.used is invalid")
+    for key, raw in value.items():
+        if key in {"used", "kernel_sha256s", "bundle_sha256s", "actuations", "dispatch_outcomes", "operations"}:
+            continue
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+            raise LaunchError(f"control metrics {section}.{key} is not a non-negative integer")
+    for key in ("kernel_sha256s", "bundle_sha256s"):
+        if key in value:
+            entries = value[key]
+            if not isinstance(entries, list) or any(
+                not isinstance(item, str) or re.fullmatch(r"[0-9a-f]{64}", item) is None
+                for item in entries
+            ):
+                raise LaunchError(f"control metrics {section}.{key} is invalid")
+    if "actuations" in value and (
+        not isinstance(value["actuations"], list)
+        or any(item not in {"enforced", "shadow"} for item in value["actuations"])
+    ):
+        raise LaunchError(f"control metrics {section}.actuations is invalid")
+    for key in ("dispatch_outcomes", "operations"):
+        if key not in value:
+            continue
+        nested = value[key]
+        if not isinstance(nested, dict) or any(
+            not isinstance(name, str)
+            or isinstance(raw, bool)
+            or not isinstance(raw, int)
+            or raw < 0
+            for name, raw in nested.items()
+        ):
+            raise LaunchError(f"control metrics {section}.{key} is invalid")
+
+
+def _aggregate_control_metrics(rows: Mapping[str, Mapping[str, Any]]) -> Dict[str, Any]:
+    totals: Dict[str, Any] = {
+        "tasks": len(rows),
+        "tinykg_used_tasks": 0,
+        "lean_used_tasks": 0,
+        "tool_runtime": {
+            "transcript_tool_calls": 0,
+            "transcript_tool_results": 0,
+            "transcript_calls_without_result": 0,
+            "dispatch_started": 0,
+            "dispatch_finished": 0,
+            "dispatch_outcomes": {
+                name: 0
+                for name in (
+                    "succeeded",
+                    "tool_error",
+                    "pending",
+                    "host_failed",
+                    "host_rejected",
+                    "host_fatal",
+                )
+            },
+        },
+        "tinykg": {},
+        "lean": {},
+    }
+    for metrics in rows.values():
+        if metrics["tinykg"]["used"]:
+            totals["tinykg_used_tasks"] += 1
+        if metrics["lean"]["used"]:
+            totals["lean_used_tasks"] += 1
+        for section in ("tool_runtime", "tinykg", "lean"):
+            target = totals[section]
+            for key, raw in metrics[section].items():
+                if isinstance(raw, int) and not isinstance(raw, bool):
+                    if section == "lean" and key.endswith("_max"):
+                        target[key] = max(target.get(key, 0), raw)
+                    else:
+                        target[key] = target.get(key, 0) + raw
+        for key, raw in metrics["tool_runtime"]["dispatch_outcomes"].items():
+            totals["tool_runtime"]["dispatch_outcomes"][key] += raw
+    totals["lean"]["kernel_sha256s"] = sorted({
+        digest
+        for metrics in rows.values()
+        for digest in metrics["lean"].get("kernel_sha256s", [])
+    })
+    totals["lean"]["bundle_sha256s"] = sorted({
+        digest
+        for metrics in rows.values()
+        for digest in metrics["lean"].get("bundle_sha256s", [])
+    })
+    totals["lean"]["actuations"] = sorted({
+        actuation
+        for metrics in rows.values()
+        for actuation in metrics["lean"].get("actuations", [])
+    })
+    return totals
+
+
 def _official_task_identity(
     trajectory_path: Path,
     manifest: Mapping[str, Any],
@@ -860,6 +1070,7 @@ def _collect_usage(
             f"expected {len(selected)} new WorkBuddy trajectories, observed {len(trajectories)}"
         )
     rows: Dict[str, object] = {}
+    control_rows: Dict[str, Mapping[str, Any]] = {}
     total_cost = 0.0
     total_tokens = 0
     total_cache_read = 0
@@ -893,6 +1104,19 @@ def _collect_usage(
         trajectory = _json(trajectory_path)
         final = trajectory.get("final_metrics") or {}
         extra = final.get("extra") or {}
+        transcript_path = trajectory_path.parent / "metacodes-transcript.jsonl"
+        observation_path = trajectory_path.parent / OBSERVATION_FILENAME
+        try:
+            control_metrics = _validate_control_metrics(
+                extra.get("control_metrics"),
+                trajectory_path=trajectory_path,
+                transcript_path=transcript_path,
+                observation_path=observation_path,
+            )
+        except (OSError, TraceError, ValueError) as exc:
+            raise LaunchError(
+                f"invalid WorkBuddy control metrics for {trajectory_path}: {exc}"
+            ) from exc
         cost = final.get("total_cost_usd")
         prompt = final.get("total_prompt_tokens")
         completion = final.get("total_completion_tokens")
@@ -953,7 +1177,9 @@ def _collect_usage(
             "cache_read_input_tokens": cache_read,
             "cache_creation_input_tokens": cache_create,
             "cost_usd": float(cost),
+            "control_metrics": control_metrics,
         }
+        control_rows[task] = control_metrics
         if trial_result_path is not None and trial_result is not None:
             rows[task].update(
                 {
@@ -970,6 +1196,7 @@ def _collect_usage(
         "metered_tokens": total_tokens,
         "cache_read_input_tokens": total_cache_read,
         "cache_creation_input_tokens": total_cache_create,
+        "control_metrics": _aggregate_control_metrics(control_rows),
     }
     if official_runner:
         result["runtime_contract"] = _runtime_contract(manifest)

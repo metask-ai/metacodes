@@ -120,6 +120,19 @@ int main(int argc, char **argv) {
         "{\"role\":\"user\",\"blocks\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call-w0\",\"content\":\"written\",\"is_error\":false}]}\n"
         "{\"role\":\"assistant\",\"blocks\":[{\"type\":\"text\",\"text\":\"synthetic complete\"}]}\n";
     if (write_all(transcript, messages) != 0) return fail("cannot write transcript");
+    char observations[4096];
+    count = snprintf(
+        observations, sizeof(observations), "%s/tool-observations.jsonl", session_dir
+    );
+    if (count <= 0 || (size_t)count >= sizeof(observations))
+        return fail("observation path overflow");
+    const char *journal =
+        "{\"schema_version\":\"metacodes-tool-observation-journal-v1\",\"sequence\":0,\"monotonic_elapsed_ns\":0,\"session_id\":\"session-w0\",\"run_id\":\"run-w0\",\"event\":{\"run_started\":{}}}\n"
+        "{\"schema_version\":\"metacodes-tool-observation-journal-v1\",\"sequence\":1,\"monotonic_elapsed_ns\":1,\"session_id\":\"session-w0\",\"run_id\":\"run-w0\",\"event\":{\"tool_observation\":{\"dispatch_started\":{\"schema_version\":\"metacodes-tool-observation-v1\",\"id\":\"call-w0\",\"requested_name\":\"Write\",\"dispatched_name\":\"Write\",\"origin\":\"authoritative\",\"agent_depth\":0}}}}\n"
+        "{\"schema_version\":\"metacodes-tool-observation-journal-v1\",\"sequence\":2,\"monotonic_elapsed_ns\":2,\"session_id\":\"session-w0\",\"run_id\":\"run-w0\",\"event\":{\"tool_observation\":{\"dispatch_finished\":{\"schema_version\":\"metacodes-tool-observation-v1\",\"id\":\"call-w0\",\"requested_name\":\"Write\",\"dispatched_name\":\"Write\",\"origin\":\"authoritative\",\"agent_depth\":0,\"outcome\":\"succeeded\"}}}}\n"
+        "{\"schema_version\":\"metacodes-tool-observation-journal-v1\",\"sequence\":3,\"monotonic_elapsed_ns\":3,\"session_id\":\"session-w0\",\"run_id\":\"run-w0\",\"event\":{\"run_finished\":{}}}\n";
+    if (write_all(observations, journal) != 0)
+        return fail("cannot write tool observation journal");
     if (write_all(
             "/logs/agent/fake-runtime-contract.json",
             "{\"anonymous_fd\":true,\"fresh_home\":true,\"local_tinykg\":true,\"network_loopback_only\":true,\"remote_tinykg\":false,\"provider_requests\":0,\"quality_evidence\":false,\"route_scoped_to_model\":true}\n"

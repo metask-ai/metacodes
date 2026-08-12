@@ -19,11 +19,18 @@ from scripts.eval.workbuddy.launch_gate import (
     _paid_host_guard,
     _official_task_identity,
     _collect_usage,
+    _aggregate_control_metrics,
+    _validate_control_metrics,
     _receipt_quality_evidence,
     _reobserve_host_control_plane,
     _reobserve_launch_inputs,
     execute_launch,
     validate_launch_manifest,
+)
+from scripts.eval.workbuddy.trace import (
+    OBSERVATION_JOURNAL_SCHEMA,
+    OBSERVATION_FILENAME,
+    load_control_metrics,
 )
 from scripts.eval.workbuddy import WORKBUDDY_PINNED_COMMIT
 from scripts.eval.workbuddy.install_overlay import _digest
@@ -197,6 +204,7 @@ import json, os, sys, urllib.request
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from scripts.eval.workbuddy.key_fd import resolve_secret_env
+from scripts.eval.workbuddy.trace import OBSERVATION_JOURNAL_SCHEMA, load_control_metrics
 secret = resolve_secret_env("", "METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF")
 assert secret == "private-workbuddy-test-key"
 assert "METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF" not in os.environ
@@ -205,13 +213,25 @@ with urllib.request.urlopen(request, timeout=5) as response:
     assert response.status == 200
 agent = Path(sys.argv[3]) / "results/metacodes-code-l2/run/code-task-a__1/agent"
 agent.mkdir(parents=True)
+transcript = agent / "metacodes-transcript.jsonl"
+transcript.write_text(json.dumps({"role": "user", "blocks": [{"type": "text", "text": "task"}]}) + "\n")
+observation = agent / "metacodes-tool-observations.jsonl"
+observation.write_text(
+    json.dumps({"schema_version": OBSERVATION_JOURNAL_SCHEMA, "sequence": 0,
+                "session_id": "session-l2", "run_id": "run-l2",
+                "monotonic_elapsed_ns": 0, "event": {"run_started": {}}}) + "\n"
+    + json.dumps({"schema_version": OBSERVATION_JOURNAL_SCHEMA, "sequence": 1,
+                  "session_id": "session-l2", "run_id": "run-l2",
+                  "monotonic_elapsed_ns": 1, "event": {"run_finished": {}}}) + "\n"
+)
+control_metrics = load_control_metrics(transcript, observation)
 trajectory = {
   "final_metrics": {
     "total_prompt_tokens": 120,
     "total_completion_tokens": 30,
     "total_cached_tokens": 80,
     "total_cost_usd": 0.01,
-    "extra": {"cache_creation_input_tokens": 10}
+    "extra": {"cache_creation_input_tokens": 10, "control_metrics": control_metrics}
   }
 }
 (agent / "trajectory.json").write_text(json.dumps(trajectory) + "\n")
@@ -261,6 +281,15 @@ record = {"request": {"body": {"model": "volatile-route", "system": "stable", "m
             self.assertEqual(task["cache_creation_input_tokens"], 10)
             self.assertEqual(task["metered_tokens"], 240)
             self.assertEqual(len(task["cacheable_first_request_sha256"]), 64)
+            self.assertFalse(task["control_metrics"]["lean"]["used"])
+            self.assertFalse(task["control_metrics"]["tinykg"]["used"])
+            self.assertEqual(result["usage"]["control_metrics"]["tasks"], 1)
+            self.assertEqual(result["usage"]["control_metrics"]["lean_used_tasks"], 0)
+            self.assertEqual(len(task["control_metrics"]["source"]["transcript_sha256"]), 64)
+            self.assertEqual(
+                len(task["control_metrics"]["source"]["observation_journal_sha256"]),
+                64,
+            )
             self.assertTrue(receipt.is_file())
             self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
             self.assertNotIn("private-workbuddy-test-key", receipt.read_text())
@@ -323,6 +352,25 @@ record = {"request": {"body": {"model": "volatile-route", "system": "stable", "m
                     "extra": {"cache_creation_input_tokens": 1},
                 }
                 metrics[field] = value
+                (agent / "metacodes-transcript.jsonl").write_text(
+                    json.dumps({"role": "user", "blocks": [{"type": "text", "text": "task"}]})
+                    + "\n",
+                    encoding="utf-8",
+                )
+                (agent / OBSERVATION_FILENAME).write_text(
+                    json.dumps({"schema_version": OBSERVATION_JOURNAL_SCHEMA, "sequence": 0,
+                                "session_id": "session-l2", "run_id": "run-l2",
+                                "monotonic_elapsed_ns": 0, "event": {"run_started": {}}})
+                    + "\n"
+                    + json.dumps({"schema_version": OBSERVATION_JOURNAL_SCHEMA, "sequence": 1,
+                                  "session_id": "session-l2", "run_id": "run-l2",
+                                  "monotonic_elapsed_ns": 1, "event": {"run_finished": {}}})
+                    + "\n",
+                    encoding="utf-8",
+                )
+                metrics["extra"]["control_metrics"] = load_control_metrics(
+                    agent / "metacodes-transcript.jsonl", agent / OBSERVATION_FILENAME
+                )
                 (agent / "trajectory.json").write_text(
                     json.dumps({"final_metrics": metrics}) + "\n", encoding="utf-8"
                 )
@@ -337,6 +385,116 @@ record = {"request": {"body": {"model": "volatile-route", "system": "stable", "m
                 }
                 with self.assertRaisesRegex(LaunchError, "invalid .*token usage"):
                     _collect_usage(manifest, started_ns=0, official_runner=False)
+
+    def test_control_metrics_are_recomputed_and_hash_privacy_drift_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "metacodes-transcript.jsonl"
+            observation = root / OBSERVATION_FILENAME
+            trajectory = root / "trajectory.json"
+            transcript.write_text(
+                json.dumps({"role": "user", "blocks": []}) + "\n", encoding="utf-8"
+            )
+            observation.write_text(
+                json.dumps({"schema_version": OBSERVATION_JOURNAL_SCHEMA, "sequence": 0,
+                            "session_id": "session-l2", "run_id": "run-l2",
+                            "monotonic_elapsed_ns": 0, "event": {"run_started": {}}})
+                + "\n"
+                + json.dumps({"schema_version": OBSERVATION_JOURNAL_SCHEMA, "sequence": 1,
+                              "session_id": "session-l2", "run_id": "run-l2",
+                              "monotonic_elapsed_ns": 1, "event": {"run_finished": {}}})
+                + "\n",
+                encoding="utf-8",
+            )
+            trajectory.write_text("{}\n", encoding="utf-8")
+            metrics = load_control_metrics(transcript, observation)
+            _validate_control_metrics(
+                metrics,
+                trajectory_path=trajectory,
+                transcript_path=transcript,
+                observation_path=observation,
+            )
+
+            forged = json.loads(json.dumps(metrics))
+            forged["tinykg"]["recall_hit_calls"] = 99
+            with self.assertRaisesRegex(LaunchError, "do not match"):
+                _validate_control_metrics(
+                    forged,
+                    trajectory_path=trajectory,
+                    transcript_path=transcript,
+                    observation_path=observation,
+                )
+
+            bad_hash = json.loads(json.dumps(metrics))
+            bad_hash["source"]["transcript_sha256"] = "0" * 64
+            with self.assertRaisesRegex(LaunchError, "transcript hash"):
+                _validate_control_metrics(
+                    bad_hash,
+                    trajectory_path=trajectory,
+                    transcript_path=transcript,
+                    observation_path=observation,
+                )
+
+            bad_privacy = json.loads(json.dumps(metrics))
+            bad_privacy["privacy"]["memory_text_retained"] = True
+            with self.assertRaisesRegex(LaunchError, "privacy"):
+                _validate_control_metrics(
+                    bad_privacy,
+                    trajectory_path=trajectory,
+                    transcript_path=transcript,
+                    observation_path=observation,
+                )
+
+            observation.write_text(observation.read_text() + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(LaunchError, "observation hash"):
+                _validate_control_metrics(
+                    metrics,
+                    trajectory_path=trajectory,
+                    transcript_path=transcript,
+                    observation_path=observation,
+                )
+
+    def test_control_metrics_wave_aggregation_sums_counts_but_preserves_maxima(self):
+        def row(*, elapsed: int, maximum: int, kernel: str, used: bool):
+            return {
+                "tool_runtime": {
+                    "transcript_tool_calls": 1,
+                    "transcript_tool_results": 1,
+                    "transcript_calls_without_result": 0,
+                    "dispatch_started": 1,
+                    "dispatch_finished": 1,
+                    "dispatch_outcomes": {
+                        "succeeded": 1,
+                        "tool_error": 0,
+                        "pending": 0,
+                        "host_failed": 0,
+                        "host_rejected": 0,
+                        "host_fatal": 0,
+                    },
+                },
+                "tinykg": {"used": used, "calls": int(used)},
+                "lean": {
+                    "used": True,
+                    "checker_calls": 1,
+                    "checker_elapsed_ns": elapsed,
+                    "checker_elapsed_ns_max": maximum,
+                    "checker_bytes_max": maximum * 10,
+                    "kernel_sha256s": [kernel],
+                    "bundle_sha256s": ["b" * 64],
+                    "actuations": ["enforced"],
+                },
+            }
+
+        aggregate = _aggregate_control_metrics({
+            "task-a": row(elapsed=7, maximum=7, kernel="1" * 64, used=True),
+            "task-b": row(elapsed=5, maximum=5, kernel="2" * 64, used=False),
+        })
+        self.assertEqual(aggregate["tasks"], 2)
+        self.assertEqual(aggregate["tinykg_used_tasks"], 1)
+        self.assertEqual(aggregate["lean"]["checker_elapsed_ns"], 12)
+        self.assertEqual(aggregate["lean"]["checker_elapsed_ns_max"], 7)
+        self.assertEqual(aggregate["lean"]["checker_bytes_max"], 70)
+        self.assertEqual(aggregate["lean"]["kernel_sha256s"], ["1" * 64, "2" * 64])
 
     def test_authorization_crash_consumes_maximum_and_same_run_cannot_retry(self):
         with tempfile.TemporaryDirectory() as directory:

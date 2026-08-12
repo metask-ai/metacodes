@@ -31,8 +31,12 @@ from scripts.eval.workbuddy.key_fd import (
     resolve_secret_env,
 )
 from scripts.eval.workbuddy.trace import (
+    CONTROL_METRICS_SCHEMA,
+    OBSERVATION_JOURNAL_SCHEMA,
+    TOOL_OBSERVATION_SCHEMA,
     TraceError,
     final_result,
+    load_control_metrics,
     read_json_lines,
     transcript_ir,
 )
@@ -43,6 +47,28 @@ ONE_COMMIT = "1" * 40
 
 
 class WorkBuddyTraceTest(unittest.TestCase):
+    @staticmethod
+    def _write_jsonl(path: Path, rows) -> None:
+        path.write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _journal(*events):
+        payloads = [{"run_started": {}}, *events, {"run_finished": {}}]
+        return [
+            {
+                "schema_version": OBSERVATION_JOURNAL_SCHEMA,
+                "sequence": sequence,
+                "monotonic_elapsed_ns": sequence,
+                "session_id": "session-control-l2",
+                "run_id": "run-control-l2",
+                "event": payload,
+            }
+            for sequence, payload in enumerate(payloads)
+        ]
+
     def test_transcript_maps_calls_results_and_cache_metrics_without_dropping_provenance(self):
         result = final_result(
             [
@@ -128,6 +154,196 @@ class WorkBuddyTraceTest(unittest.TestCase):
             path.write_bytes(b'{"type":"result","text":"\xff"}\n')
             with self.assertRaises(TraceError):
                 read_json_lines(path)
+
+    def test_control_metrics_accept_complete_no_tool_run_and_bind_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(
+                transcript,
+                [{"role": "user", "blocks": [{"type": "text", "text": "task"}]}],
+            )
+            self._write_jsonl(observation, self._journal())
+            metrics = load_control_metrics(transcript, observation)
+        self.assertEqual(metrics["schema_version"], CONTROL_METRICS_SCHEMA)
+        self.assertFalse(metrics["lean"]["used"])
+        self.assertFalse(metrics["tinykg"]["used"])
+        self.assertEqual(metrics["tool_runtime"]["dispatch_started"], 0)
+        self.assertEqual(metrics["source"]["observation_journal_records"], 2)
+        self.assertEqual(
+            metrics["privacy"],
+            {
+                "tool_arguments_retained": False,
+                "tool_results_retained": False,
+                "memory_text_retained": False,
+            },
+        )
+
+    def test_control_metrics_count_formal_batch_dispatch_and_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(
+                transcript,
+                [
+                    {"role": "assistant", "blocks": [{
+                        "type": "tool_use", "id": "call-1", "name": "Read",
+                        "input": {"file_path": "README.md"},
+                    }]},
+                    {"role": "user", "blocks": [{
+                        "type": "tool_result", "tool_use_id": "call-1",
+                        "content": "ok", "is_error": False,
+                    }]},
+                ],
+            )
+            formal = {
+                "schema_version": "metacodes-project-formal-decision-batch-v4",
+                "phase": "pre",
+                "actuation": "enforced",
+                "kernel_sha256": "1" * 64,
+                "bundle_sha256": "2" * 64,
+                "checker_call_sha256": "3" * 64,
+                "checker_batch_size": 3,
+                "checker_elapsed_ns": 7000,
+                "checker_bytes": 4096,
+                "decisions": [
+                    {"operation": "pre_decision", "result": "admit", "recovery_action": "none"},
+                    {"operation": "recovery_pre_decision", "result": "block", "recovery_action": "edit_existing_file_exact"},
+                    {"operation": "pre_decision", "result": "fault", "recovery_action": "none"},
+                ],
+            }
+            dispatch_start = {
+                "schema_version": TOOL_OBSERVATION_SCHEMA,
+                "id": "dispatch-1",
+                "requested_name": "Read",
+                "dispatched_name": "Read",
+                "origin": "authoritative",
+                "agent_depth": 0,
+            }
+            dispatch_finish = {
+                **dispatch_start,
+                "outcome": "succeeded",
+            }
+            self._write_jsonl(
+                observation,
+                self._journal(
+                    {"tool_observation": {"formal_decision_batch": formal}},
+                    {"tool_observation": {"dispatch_started": dispatch_start}},
+                    {"tool_observation": {"dispatch_finished": dispatch_finish}},
+                ),
+            )
+            metrics = load_control_metrics(transcript, observation)
+        self.assertEqual(metrics["tool_runtime"]["dispatch_started"], 1)
+        self.assertEqual(metrics["tool_runtime"]["dispatch_outcomes"]["succeeded"], 1)
+        self.assertTrue(metrics["lean"]["used"])
+        self.assertEqual(metrics["lean"]["checker_calls"], 1)
+        self.assertEqual(metrics["lean"]["admit"], 1)
+        self.assertEqual(metrics["lean"]["block"], 1)
+        self.assertEqual(metrics["lean"]["fault"], 1)
+        self.assertEqual(metrics["lean"]["enforced_blocks"], 1)
+        self.assertEqual(metrics["lean"]["recovery_directions"], 1)
+        self.assertEqual(metrics["lean"]["checker_elapsed_ns"], 7000)
+
+    def test_control_metrics_count_tinykg_routing_trust_and_task_commit(self):
+        calls = [
+            ("recall-hit", "KgRecall", {
+                "count": 2,
+                "hits": [
+                    {"node_id": 1, "seen_before": False},
+                    {"node_id": 2, "seen_before": True},
+                ],
+                "lexical_query_plan": {
+                    "schema_version": "lexical-query-plan-v1",
+                    "plan_sha256": "4" * 64,
+                    "seen_state_verified": True,
+                    "ledger_scope": "agent_run_plan",
+                    "new_hit_count": 1,
+                    "repeated_hit_count": 1,
+                },
+            }),
+            ("recall-miss", "KgRecall", {"count": 0, "hits": []}),
+            ("context", "KgContext", {"knowledge_governance": {
+                "schema_version": "metacodes-knowledge-governance-v1",
+                "trust_state": "evidence_connected_candidate",
+            }}),
+            ("remember", "KgRemember", {"node_id": 9}),
+            ("task", "TaskUpdate", {"kg_status": "completed"}),
+        ]
+        transcript_rows = [
+            {"role": "assistant", "blocks": [
+                {"type": "tool_use", "id": call_id, "name": name, "input": {}}
+                for call_id, name, _ in calls
+            ]},
+            {"role": "user", "blocks": [
+                {"type": "tool_result", "tool_use_id": call_id,
+                 "content": json.dumps(result), "is_error": False}
+                for call_id, _, result in calls
+            ]},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(transcript, transcript_rows)
+            self._write_jsonl(observation, self._journal())
+            metrics = load_control_metrics(transcript, observation)
+        tinykg = metrics["tinykg"]
+        self.assertTrue(tinykg["used"])
+        self.assertEqual(tinykg["recall_hit_calls"], 1)
+        self.assertEqual(tinykg["recall_miss_calls"], 1)
+        self.assertEqual(tinykg["recall_new_nodes"], 1)
+        self.assertEqual(tinykg["recall_repeated_nodes"], 1)
+        self.assertEqual(tinykg["context_evidence_connected"], 1)
+        self.assertEqual(tinykg["remember_succeeded"], 1)
+        self.assertEqual(tinykg["task_dag_calls"], 1)
+        self.assertEqual(tinykg["task_terminal_commits"], 1)
+
+    def test_control_metrics_reject_sequence_identity_pairing_and_recall_drift(self):
+        cases = []
+        sequence_gap = self._journal()
+        sequence_gap[1]["sequence"] = 2
+        cases.append(("sequence", sequence_gap, [{"role": "user", "blocks": []}]))
+        identity_drift = self._journal()
+        identity_drift[1]["run_id"] = "different-run"
+        cases.append(("identity", identity_drift, [{"role": "user", "blocks": []}]))
+        unpaired = self._journal({"tool_observation": {"dispatch_started": {
+            "schema_version": TOOL_OBSERVATION_SCHEMA,
+            "id": "dispatch-1", "requested_name": "Read", "dispatched_name": "Read",
+            "origin": "authoritative", "agent_depth": 0,
+        }}})
+        cases.append(("dispatch", unpaired, [{"role": "user", "blocks": []}]))
+        malformed_recall = [
+            {"role": "assistant", "blocks": [{"type": "tool_use", "id": "r", "name": "KgRecall", "input": {}}]},
+            {"role": "user", "blocks": [{"type": "tool_result", "tool_use_id": "r", "content": json.dumps({"count": 2, "hits": [{"id": 1}]}), "is_error": False}]},
+        ]
+        cases.append(("recall", self._journal(), malformed_recall))
+        for label, journal, transcript_rows in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                transcript = root / "transcript.jsonl"
+                observation = root / "tool-observations.jsonl"
+                self._write_jsonl(transcript, transcript_rows)
+                self._write_jsonl(observation, journal)
+                with self.assertRaises(TraceError):
+                    load_control_metrics(transcript, observation)
+
+    def test_control_metrics_reject_symlink_and_hardlink_observation_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            target = root / "target.jsonl"
+            self._write_jsonl(transcript, [{"role": "user", "blocks": []}])
+            self._write_jsonl(target, self._journal())
+            symlink = root / "symlink.jsonl"
+            symlink.symlink_to(target)
+            with self.assertRaises(TraceError):
+                load_control_metrics(transcript, symlink)
+            hardlink = root / "hardlink.jsonl"
+            os.link(target, hardlink)
+            with self.assertRaisesRegex(TraceError, "hard links"):
+                load_control_metrics(transcript, hardlink)
 
 
 class WorkBuddyArtifactStageTest(unittest.TestCase):

@@ -150,14 +150,23 @@ def run_w0(workbuddy: Path, zig: Path, bash: Path, uv: Path) -> Dict[str, object
     trajectory = json.loads(trajectories[0].read_text(encoding="utf-8"))
     final = trajectory.get("final_metrics") or {}
     extra = final.get("extra") or {}
+    control = extra.get("control_metrics") or {}
     if (
         final.get("total_prompt_tokens") != 120
         or final.get("total_completion_tokens") != 30
         or final.get("total_cached_tokens") != 80
         or extra.get("cache_creation_input_tokens") != 10
         or extra.get("metacodes_stop_reason") != "end_turn"
+        or control.get("schema_version")
+        != "metacodes-workbuddy-control-metrics-v1"
+        or (control.get("tool_runtime") or {}).get("dispatch_started") != 1
+        or (control.get("tool_runtime") or {}).get("dispatch_finished") != 1
+        or (control.get("lean") or {}).get("used") is not False
+        or (control.get("tinykg") or {}).get("used") is not False
     ):
-        raise W0Error("ATIF final metrics do not preserve metacodes usage/cache fields")
+        raise W0Error(
+            "ATIF final metrics do not preserve usage/cache/control-plane fields"
+        )
 
     trial_root = trajectories[0].parent.parent
     runtime_contracts = list(trial_root.rglob("fake-runtime-contract.json"))
@@ -221,6 +230,7 @@ def run_w0(workbuddy: Path, zig: Path, bash: Path, uv: Path) -> Dict[str, object
             "cache_read_input_tokens": 80,
             "cache_creation_input_tokens": 10,
             "cost_usd": 0.0,
+            "control_metrics": control,
         },
     }
     receipt_path = workbuddy / ".workspace/metacodes-w0-receipt.json"
