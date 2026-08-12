@@ -1292,6 +1292,74 @@ pub const KgClient = struct {
         return self.allocator.dupe(u8, snapshot) catch KgError.OutOfMemory;
     }
 
+    /// Fetch one bounded ontology snapshot for the isolated rule-author path.
+    /// This is deliberately one TinyKG command: composing `list-recent` and
+    /// `get --meta` in the host would cross store-lock/revision boundaries and
+    /// manufacture a snapshot that TinyKG never observed atomically.
+    pub fn ontologyRuleSnapshot(
+        self: *KgClient,
+        project_id: u64,
+        expected_project_sha256: [64]u8,
+        expected_project_key: []const u8,
+    ) KgError![]u8 {
+        if (project_id == 0 or expected_project_key.len == 0)
+            return self.dataError("ontology-rule-snapshot project identity invalid", .{});
+        var idbuf: [24]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{project_id}) catch unreachable;
+        const out = try self.runChecked(&.{
+            "ontology-rule-snapshot", self.store_path,              id_str,
+            "--project-sha256",       expected_project_sha256[0..], "--project-key",
+            expected_project_key,     "--max-items",                "48",
+            "--max-chars",            "200000",
+        });
+        defer self.freeOut(out);
+        // This command's stdout is a canonical wire artifact. Preserve the
+        // exact bytes so the adapter rejects, rather than silently normalizes,
+        // a CLI-added newline or any other suffix before hashing it.
+        const snapshot = out.stdout;
+        if (snapshot.len < 2 or snapshot[0] != '{' or snapshot[snapshot.len - 1] != '}')
+            return self.dataError(
+                "ontology-rule-snapshot project={d} 非 JSON object: {s}",
+                .{ project_id, trimForLog(snapshot) },
+            );
+        return self.allocator.dupe(u8, snapshot) catch KgError.OutOfMemory;
+    }
+
+    /// Content identity used by read-only control-plane adapters. The file is
+    /// opened without following the final symlink and hashed from one stable
+    /// descriptor; callers still re-hash after the child exits to detect a
+    /// same-path replacement during the operation.
+    pub fn binarySha256(self: *KgClient) KgError![64]u8 {
+        const bin = self.bin_path orelse return KgError.Degraded;
+        const path = self.allocator.dupeZ(u8, bin) catch return KgError.OutOfMemory;
+        defer self.allocator.free(path);
+        const fd = pfs.open(path.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+        if (fd < 0) return KgError.Degraded;
+        defer _ = pfs.close(fd);
+        const before = pfs.fileInfo(fd) catch return KgError.Transient;
+        if (!before.is_regular or before.size == 0 or before.size > 128 * 1024 * 1024)
+            return KgError.Degraded;
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        var buffer: [64 * 1024]u8 = undefined;
+        var observed: u64 = 0;
+        while (true) {
+            const count = pfs.read(fd, &buffer);
+            if (count < 0) return KgError.Transient;
+            if (count == 0) break;
+            const used: usize = @intCast(count);
+            observed = std.math.add(u64, observed, used) catch return KgError.Degraded;
+            if (observed > before.size) return KgError.Degraded;
+            hasher.update(buffer[0..used]);
+        }
+        const after = pfs.fileInfo(fd) catch return KgError.Transient;
+        if (!after.is_regular or after.size != before.size or observed != before.size or
+            after.device != before.device or after.inode != before.inode)
+            return KgError.Transient;
+        var digest: [32]u8 = undefined;
+        hasher.final(&digest);
+        return std.fmt.bytesToHex(digest, .lower);
+    }
+
     /// Agent-facing bounded packet. Unlike the text packet used by taskStatus,
     /// this returns TinyKG's metadata-first JSON envelope: parent goal,
     /// dependencies, evidence links, truncation diagnostics and continuations,
@@ -2139,6 +2207,10 @@ pub const KgClient = struct {
             "ClaimHeld",
             "SchemaProjectScopeViolation",
             "ProjectTreeViolation",
+            // A missing optional control-plane capability is deterministic.
+            // Retrying the identical read cannot install a newer TinyKG and
+            // only delays the required fail-closed result.
+            "UnknownCommand",
             // Deterministic capability/index-state failure.  Retrying the
             // exact search only burns turns and is not lock contention.
             "Unsupported",

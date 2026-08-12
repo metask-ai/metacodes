@@ -16,7 +16,11 @@ const GENERATION_MEMBER = [_]u8{'e'} ** 64;
 const HELD_OUT_MEMBER = [_]u8{'f'} ** 64;
 const HELD_OUT_SUITE = [_]u8{'1'} ** 64;
 const ZERO = [_]u8{'0'} ** 64;
+const TINYKG_BUILD = [_]u8{'3'} ** 64;
+const SOURCE_SEMANTIC_SNAPSHOT = [_]u8{'4'} ** 64;
+const SOURCE_SNAPSHOT = "b33326a10491e7c2bff4d8ad06f30ffb0b57b1fcf6c181f093da83f3f12b7450".*;
 const CORRECTION = "Never let an ontology hypothesis authorize its own promotion.";
+const SOURCE_BYTES = "{\"source\":\"tinykg-test-fixture\"}";
 
 const Fixture = struct {
     root: []const u8,
@@ -95,6 +99,8 @@ fn renderConfigured(
 ) !projection.RenderedSnapshot {
     const summary = "Ontology context is non-authorizing and must retain provenance.";
     const summary_sha = observation.sha256Hex(summary);
+    const falsifier = "A held-out replay shows self-promotion or project-scope leakage.";
+    const falsifier_sha = observation.sha256Hex(falsifier);
     const ontology = [1]projection.OntologyItem{.{
         .node_id = 42,
         .kind = .concept,
@@ -103,7 +109,8 @@ fn renderConfigured(
         .summary = summary,
         .summary_sha256 = summary_sha[0..],
         .provenance_sha256 = PROVENANCE[0..],
-        .falsifier = "A held-out replay shows self-promotion or project-scope leakage.",
+        .falsifier = falsifier,
+        .falsifier_sha256 = falsifier_sha[0..],
         .contradicted = false,
         .deprecated = false,
         .retrieval_excluded = false,
@@ -125,6 +132,11 @@ fn renderConfigured(
         .project_sha256 = PROJECT,
         .project_key = "metacodes:/private/test",
         .revision = REVISION,
+        .source = .{
+            .tinykg_build_id = "sha256:" ++ TINYKG_BUILD,
+            .semantic_snapshot_sha256 = SOURCE_SEMANTIC_SNAPSHOT[0..],
+            .artifact_sha256 = SOURCE_SNAPSHOT[0..],
+        },
         .active_bundle_revision = active_bundle_revision,
         .active_bundle_sha256 = active_bundle_sha256,
         .ontology = &ontology,
@@ -146,16 +158,16 @@ test "L2 ontology projection persists and reopens exact non-authorizing packet" 
     defer value.deinit(a);
     const rendered = try render(a, &value);
     defer a.free(rendered.bytes);
-    var projected = try projection.project(a, rendered.bytes, PROJECT, REVISION, rendered.snapshot_sha256, 0, ZERO);
+    var projected = try projection.project(a, rendered.bytes, PROJECT, REVISION, rendered.snapshot_sha256, 0, ZERO, TINYKG_BUILD, SOURCE_SEMANTIC_SNAPSHOT, SOURCE_SNAPSHOT);
     defer projected.deinit();
     try std.testing.expect(std.mem.indexOf(u8, projected.packet, CORRECTION) != null);
     try std.testing.expect(std.mem.indexOf(u8, projected.packet, "ontology_context_is_authority\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, projected.packet, "promotion_evidence_included\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, projected.packet, "results_visible\":false") != null);
 
-    const persisted = try projection.persist(a, value.session_dir, rendered.bytes, &projected);
+    const persisted = try projection.persist(a, value.session_dir, SOURCE_BYTES, rendered.bytes, &projected);
     try std.testing.expect(persisted.created);
-    const replayed = try projection.persist(a, value.session_dir, rendered.bytes, &projected);
+    const replayed = try projection.persist(a, value.session_dir, SOURCE_BYTES, rendered.bytes, &projected);
     try std.testing.expect(!replayed.created);
     try std.testing.expectEqualSlices(u8, &persisted.receipt_id, &replayed.receipt_id);
     var loaded = try projection.loadBound(a, value.session_dir, persisted.receipt_id);
@@ -186,21 +198,21 @@ test "L2 ontology projection rejects forged prose cross-project evidence and mut
     forged.summary_sha256 = forged_sha[0..];
     const rendered = try renderWith(a, forged, HELD_OUT_MEMBER);
     defer a.free(rendered.bytes);
-    var projected = try projection.project(a, rendered.bytes, PROJECT, REVISION, rendered.snapshot_sha256, 0, ZERO);
+    var projected = try projection.project(a, rendered.bytes, PROJECT, REVISION, rendered.snapshot_sha256, 0, ZERO, TINYKG_BUILD, SOURCE_SEMANTIC_SNAPSHOT, SOURCE_SNAPSHOT);
     defer projected.deinit();
     try std.testing.expectError(
         error.GenerationEvidenceSummaryMismatch,
-        projection.persist(a, value.session_dir, rendered.bytes, &projected),
+        projection.persist(a, value.session_dir, SOURCE_BYTES, rendered.bytes, &projected),
     );
 
     const valid_rendered = try render(a, &value);
     defer a.free(valid_rendered.bytes);
-    var valid = try projection.project(a, valid_rendered.bytes, PROJECT, REVISION, valid_rendered.snapshot_sha256, 0, ZERO);
+    var valid = try projection.project(a, valid_rendered.bytes, PROJECT, REVISION, valid_rendered.snapshot_sha256, 0, ZERO, TINYKG_BUILD, SOURCE_SEMANTIC_SNAPSHOT, SOURCE_SNAPSHOT);
     defer valid.deinit();
     valid.packet_sha256 = .{'9'} ** 64;
     try std.testing.expectError(
         error.ProjectionStateDrift,
-        projection.persist(a, value.session_dir, valid_rendered.bytes, &valid),
+        projection.persist(a, value.session_dir, SOURCE_BYTES, valid_rendered.bytes, &valid),
     );
 }
 
@@ -219,9 +231,9 @@ test "L2 ontology projection rejects held-out overlap and changed transcript" {
 
     const rendered = try render(a, &value);
     defer a.free(rendered.bytes);
-    var projected = try projection.project(a, rendered.bytes, PROJECT, REVISION, rendered.snapshot_sha256, 0, ZERO);
+    var projected = try projection.project(a, rendered.bytes, PROJECT, REVISION, rendered.snapshot_sha256, 0, ZERO, TINYKG_BUILD, SOURCE_SEMANTIC_SNAPSHOT, SOURCE_SNAPSHOT);
     defer projected.deinit();
-    const persisted = try projection.persist(a, value.session_dir, rendered.bytes, &projected);
+    const persisted = try projection.persist(a, value.session_dir, SOURCE_BYTES, rendered.bytes, &projected);
     const transcript_path = try std.fmt.allocPrint(a, "{s}/transcript.jsonl", .{value.session_dir});
     defer a.free(transcript_path);
     try writeFile(transcript_path, "{\"role\":\"user\",\"blocks\":[{\"type\":\"text\",\"text\":\"changed\"}]}\n");
@@ -251,7 +263,7 @@ test "L2 ontology projection rejects strict wire and active bundle identity drif
     defer a.free(unknown);
     try std.testing.expectError(
         error.InvalidOntologySnapshot,
-        projection.project(a, unknown, PROJECT, REVISION, rendered.snapshot_sha256, 0, ZERO),
+        projection.project(a, unknown, PROJECT, REVISION, rendered.snapshot_sha256, 0, ZERO, TINYKG_BUILD, SOURCE_SEMANTIC_SNAPSHOT, SOURCE_SNAPSHOT),
     );
     const duplicate = try std.mem.replaceOwned(
         u8,
@@ -263,7 +275,7 @@ test "L2 ontology projection rejects strict wire and active bundle identity drif
     defer a.free(duplicate);
     try std.testing.expectError(
         error.InvalidOntologySnapshot,
-        projection.project(a, duplicate, PROJECT, REVISION, rendered.snapshot_sha256, 0, ZERO),
+        projection.project(a, duplicate, PROJECT, REVISION, rendered.snapshot_sha256, 0, ZERO, TINYKG_BUILD, SOURCE_SEMANTIC_SNAPSHOT, SOURCE_SNAPSHOT),
     );
     const changed_summary = try std.mem.replaceOwned(
         u8,
@@ -275,11 +287,11 @@ test "L2 ontology projection rejects strict wire and active bundle identity drif
     defer a.free(changed_summary);
     try std.testing.expectError(
         error.OntologySnapshotHashMismatch,
-        projection.project(a, changed_summary, PROJECT, REVISION, rendered.snapshot_sha256, 0, ZERO),
+        projection.project(a, changed_summary, PROJECT, REVISION, rendered.snapshot_sha256, 0, ZERO, TINYKG_BUILD, SOURCE_SEMANTIC_SNAPSHOT, SOURCE_SNAPSHOT),
     );
     try std.testing.expectError(
         error.OntologySnapshotIdentityMismatch,
-        projection.project(a, rendered.bytes, OTHER_PROJECT, REVISION, rendered.snapshot_sha256, 0, ZERO),
+        projection.project(a, rendered.bytes, OTHER_PROJECT, REVISION, rendered.snapshot_sha256, 0, ZERO, TINYKG_BUILD, SOURCE_SEMANTIC_SNAPSHOT, SOURCE_SNAPSHOT),
     );
     try std.testing.expectError(
         error.InvalidActiveRuleIdentity,
@@ -296,9 +308,9 @@ test "L2 ontology projection receipt rejects symlink and hardlink aliases" {
     defer value.deinit(a);
     const rendered = try render(a, &value);
     defer a.free(rendered.bytes);
-    var projected = try projection.project(a, rendered.bytes, PROJECT, REVISION, rendered.snapshot_sha256, 0, ZERO);
+    var projected = try projection.project(a, rendered.bytes, PROJECT, REVISION, rendered.snapshot_sha256, 0, ZERO, TINYKG_BUILD, SOURCE_SEMANTIC_SNAPSHOT, SOURCE_SNAPSHOT);
     defer projected.deinit();
-    const persisted = try projection.persist(a, value.session_dir, rendered.bytes, &projected);
+    const persisted = try projection.persist(a, value.session_dir, SOURCE_BYTES, rendered.bytes, &projected);
 
     const receipt_name = try std.fmt.allocPrint(
         a,

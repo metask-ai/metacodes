@@ -67,6 +67,7 @@ pub const kg_task_projection = @import("kg/task_projection.zig"); // pure TinyKG
 pub const kg_experience_packet = @import("kg/experience_packet.zig"); // prior execution feedback at claim boundary
 pub const kg_lexical_query_plan = @import("kg/lexical_query_plan.zig"); // governed vector-free query plans + host ledger
 pub const kg_memory_migration_adapter = @import("kg/memory_migration_adapter.zig"); // TinyKG atomic snapshot/CAS/receipt actuator
+pub const kg_ontology_rule_snapshot_adapter = @import("kg/ontology_rule_snapshot_adapter.zig");
 pub const formal_runtime = @import("formal/runtime.zig"); // precompiled Lean sidecar trust boundary
 pub const formal_artifact_store = @import("formal/artifact_store.zig"); // immutable research evidence bundles
 pub const formal_provenance = @import("formal/provenance.zig"); // strict sidecar build identity

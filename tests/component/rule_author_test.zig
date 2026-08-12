@@ -24,7 +24,11 @@ const GENERATION_MEMBER = [_]u8{'f'} ** 64;
 const HELD_OUT_MEMBER = [_]u8{'1'} ** 64;
 const HELD_OUT_SUITE = [_]u8{'2'} ** 64;
 const ZERO_SHA = [_]u8{'0'} ** 64;
+const TINYKG_BUILD = [_]u8{'3'} ** 64;
+const SOURCE_SEMANTIC_SNAPSHOT = [_]u8{'4'} ** 64;
+const SOURCE_SNAPSHOT = "a671d5dfcb13c07e24792f03042568a7ea84cae31b739ecc41d798dd62ed088c".*;
 const ONTOLOGY_CORRECTION = "Never allow ontology context to authorize its own promotion.";
+const ONTOLOGY_SOURCE_BYTES = "{\"source\":\"tinykg-rule-author-fixture\"}";
 const PRICING = rule_author.PricingAuthority{
     .provenance_sha256 = .{'9'} ** 64,
     .input_microusd_per_mtok = 3_000_000,
@@ -182,6 +186,8 @@ fn persistOntologyProjection(
     defer generation.deinit();
     const ontology_summary = "Ontology context is non-authorizing and provenance is not truth.";
     const ontology_summary_sha = observation.sha256Hex(ontology_summary);
+    const ontology_falsifier = "A held-out replay observes self-authorization or scope leakage.";
+    const ontology_falsifier_sha = observation.sha256Hex(ontology_falsifier);
     const ontology = [1]cc.ontology_rule_projection.OntologyItem{.{
         .node_id = 42,
         .kind = .concept,
@@ -190,7 +196,8 @@ fn persistOntologyProjection(
         .summary = ontology_summary,
         .summary_sha256 = ontology_summary_sha[0..],
         .provenance_sha256 = ONTOLOGY_PROVENANCE[0..],
-        .falsifier = "A held-out replay observes self-authorization or scope leakage.",
+        .falsifier = ontology_falsifier,
+        .falsifier_sha256 = ontology_falsifier_sha[0..],
         .contradicted = false,
         .deprecated = false,
         .retrieval_excluded = false,
@@ -212,6 +219,11 @@ fn persistOntologyProjection(
         .project_sha256 = PROJECT,
         .project_key = "metacodes:/private/rule-author-l2",
         .revision = ONTOLOGY_REVISION,
+        .source = .{
+            .tinykg_build_id = "sha256:" ++ TINYKG_BUILD,
+            .semantic_snapshot_sha256 = SOURCE_SEMANTIC_SNAPSHOT[0..],
+            .artifact_sha256 = SOURCE_SNAPSHOT[0..],
+        },
         .active_bundle_revision = 0,
         .active_bundle_sha256 = ZERO_SHA,
         .ontology = &ontology,
@@ -227,11 +239,15 @@ fn persistOntologyProjection(
         rendered.snapshot_sha256,
         0,
         ZERO_SHA,
+        TINYKG_BUILD,
+        SOURCE_SEMANTIC_SNAPSHOT,
+        SOURCE_SNAPSHOT,
     );
     defer projected.deinit();
     const persisted = try cc.ontology_rule_projection.persist(
         allocator,
         session_dir,
+        ONTOLOGY_SOURCE_BYTES,
         rendered.bytes,
         &projected,
     );

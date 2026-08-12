@@ -26,12 +26,14 @@ const observation = @import("../tools/observation.zig");
 const source_receipt = @import("rule_source_receipt.zig");
 const impact_receipt = @import("rule_impact_receipt.zig");
 
-pub const SNAPSHOT_SCHEMA_VERSION = "tinykg-ontology-rule-projection-v1";
-pub const PACKET_SCHEMA_VERSION = "metacodes-ontology-to-rule-packet-v1";
-pub const RECEIPT_SCHEMA_VERSION = "metacodes-ontology-rule-projection-receipt-v1";
+pub const SNAPSHOT_SCHEMA_VERSION = "tinykg-ontology-rule-projection-v2";
+pub const PACKET_SCHEMA_VERSION = "metacodes-ontology-to-rule-packet-v2";
+pub const RECEIPT_SCHEMA_VERSION = "metacodes-ontology-rule-projection-receipt-v2";
+pub const SOURCE_CAPABILITY = "tinykg-ontology-rule-snapshot-v1";
 pub const HELD_OUT_COMMITMENT_SCHEMA_VERSION = "metacodes-held-out-window-commitment-v1";
 pub const RULE_IMPACT_SUMMARY_SCHEMA_VERSION = "metacodes-rule-impact-generation-summary-v1";
 pub const SNAPSHOT_FILE_PREFIX = "ontology-rule-snapshot-";
+pub const SOURCE_FILE_PREFIX = "tinykg-ontology-source-";
 pub const RECEIPT_FILE_PREFIX = "ontology-rule-projection-receipt-";
 
 pub const MAX_SNAPSHOT_BYTES: usize = 256 * 1024;
@@ -71,6 +73,16 @@ pub const ActiveRules = struct {
     bundle_sha256: []const u8,
 };
 
+pub const SourceIdentity = struct {
+    capability: []const u8 = SOURCE_CAPABILITY,
+    tinykg_build_id: []const u8,
+    /// TinyKG's commitment to the semantic snapshot body, excluding this
+    /// digest field itself.
+    semantic_snapshot_sha256: []const u8,
+    /// Host observation of the exact canonical JSON bytes returned by TinyKG.
+    artifact_sha256: []const u8,
+};
+
 pub const OntologyItem = struct {
     node_id: u64,
     kind: OntologyKind,
@@ -80,6 +92,7 @@ pub const OntologyItem = struct {
     summary_sha256: []const u8,
     provenance_sha256: []const u8,
     falsifier: []const u8,
+    falsifier_sha256: []const u8,
     contradicted: bool,
     deprecated: bool,
     retrieval_excluded: bool,
@@ -112,6 +125,7 @@ pub const SnapshotInput = struct {
     revision: [64]u8,
     bounded: bool = true,
     truncated: bool = false,
+    source: SourceIdentity,
     active_bundle_revision: u64,
     active_bundle_sha256: [64]u8,
     ontology: []const OntologyItem,
@@ -126,6 +140,7 @@ const SnapshotCommitmentBody = struct {
     revision: []const u8,
     bounded: bool,
     truncated: bool,
+    source: SourceIdentity,
     active_rules: ActiveRules,
     ontology: []const OntologyItem,
     generation_evidence: []const GenerationEvidence,
@@ -140,6 +155,7 @@ const RawSnapshot = struct {
     snapshot_sha256: []const u8,
     bounded: bool,
     truncated: bool,
+    source: SourceIdentity,
     active_rules: ActiveRules,
     ontology: []const OntologyItem,
     generation_evidence: []const GenerationEvidence,
@@ -189,6 +205,7 @@ const PacketOntology = struct {
     summary_sha256: []const u8,
     provenance_sha256: []const u8,
     falsifier: []const u8,
+    falsifier_sha256: []const u8,
     contradicted: bool,
 };
 
@@ -245,6 +262,7 @@ const WirePacket = struct {
     project_key: []const u8,
     ontology_revision: []const u8,
     ontology_snapshot_sha256: []const u8,
+    ontology_source: SourceIdentity,
     active_rules: PacketActiveRules,
     ontology_context_is_authority: bool = false,
     promotion_evidence_included: bool = false,
@@ -262,6 +280,9 @@ pub const Projection = struct {
     ontology_revision: [64]u8,
     ontology_snapshot_sha256: [64]u8,
     raw_snapshot_sha256: [64]u8,
+    tinykg_build_sha256: [64]u8,
+    source_semantic_snapshot_sha256: [64]u8,
+    source_artifact_sha256: [64]u8,
     active_bundle_revision: u64,
     active_bundle_sha256: [64]u8,
     generation_evidence_sha256: [64]u8,
@@ -306,6 +327,10 @@ const ReceiptBody = struct {
     ontology_revision: []const u8,
     ontology_snapshot_sha256: []const u8,
     raw_snapshot_sha256: []const u8,
+    tinykg_build_id: []const u8,
+    source_semantic_snapshot_sha256: []const u8,
+    source_artifact_sha256: []const u8,
+    source_artifact_file: []const u8,
     snapshot_file: []const u8,
     active_bundle_revision: u64,
     active_bundle_sha256: []const u8,
@@ -397,6 +422,7 @@ pub fn renderSnapshot(allocator: std.mem.Allocator, input: SnapshotInput) !Rende
         .revision = input.revision[0..],
         .bounded = input.bounded,
         .truncated = input.truncated,
+        .source = input.source,
         .active_rules = active,
         .ontology = input.ontology,
         .generation_evidence = input.generation_evidence,
@@ -413,6 +439,7 @@ pub fn renderSnapshot(allocator: std.mem.Allocator, input: SnapshotInput) !Rende
         .snapshot_sha256 = snapshot_sha256[0..],
         .bounded = body.bounded,
         .truncated = body.truncated,
+        .source = body.source,
         .active_rules = body.active_rules,
         .ontology = body.ontology,
         .generation_evidence = body.generation_evidence,
@@ -427,6 +454,9 @@ pub fn renderSnapshot(allocator: std.mem.Allocator, input: SnapshotInput) !Rende
         snapshot_sha256,
         input.active_bundle_revision,
         input.active_bundle_sha256,
+        parseBuildId(input.source.tinykg_build_id) orelse return error.InvalidOntologySourceIdentity,
+        parseHex(input.source.semantic_snapshot_sha256) orelse return error.InvalidOntologySourceIdentity,
+        parseHex(input.source.artifact_sha256) orelse return error.InvalidOntologySourceIdentity,
     );
     validated.deinit();
     return .{ .bytes = bytes, .snapshot_sha256 = snapshot_sha256 };
@@ -443,6 +473,9 @@ pub fn project(
     expected_snapshot_sha256: [64]u8,
     expected_active_bundle_revision: u64,
     expected_active_bundle_sha256: [64]u8,
+    expected_tinykg_build_sha256: [64]u8,
+    expected_source_semantic_snapshot_sha256: [64]u8,
+    expected_source_artifact_sha256: [64]u8,
 ) !Projection {
     if (raw_snapshot.len == 0 or raw_snapshot.len > MAX_SNAPSHOT_BYTES)
         return error.InvalidOntologySnapshot;
@@ -450,6 +483,9 @@ pub fn project(
     try requireNonzeroHex(expected_revision);
     try requireNonzeroHex(expected_snapshot_sha256);
     try requireHex(expected_active_bundle_sha256);
+    try requireNonzeroHex(expected_tinykg_build_sha256);
+    try requireNonzeroHex(expected_source_semantic_snapshot_sha256);
+    try requireNonzeroHex(expected_source_artifact_sha256);
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -475,6 +511,18 @@ pub fn project(
         parsed.held_out_commitments.len > MAX_HELD_OUT_COMMITMENTS)
         return error.InvalidOntologySnapshot;
 
+    const tinykg_build_sha = parseBuildId(parsed.source.tinykg_build_id) orelse
+        return error.InvalidOntologySourceIdentity;
+    const source_semantic_snapshot_sha = parseHex(parsed.source.semantic_snapshot_sha256) orelse
+        return error.InvalidOntologySourceIdentity;
+    const source_artifact_sha = parseHex(parsed.source.artifact_sha256) orelse
+        return error.InvalidOntologySourceIdentity;
+    if (!std.mem.eql(u8, parsed.source.capability, SOURCE_CAPABILITY) or
+        !std.mem.eql(u8, &tinykg_build_sha, &expected_tinykg_build_sha256) or
+        !std.mem.eql(u8, &source_semantic_snapshot_sha, &expected_source_semantic_snapshot_sha256) or
+        !std.mem.eql(u8, &source_artifact_sha, &expected_source_artifact_sha256))
+        return error.OntologySourceIdentityMismatch;
+
     const project_sha256 = parseHex(parsed.project_sha256) orelse
         return error.InvalidOntologySnapshot;
     const revision = parseHex(parsed.revision) orelse return error.InvalidOntologySnapshot;
@@ -489,6 +537,7 @@ pub fn project(
         .revision = parsed.revision,
         .bounded = parsed.bounded,
         .truncated = parsed.truncated,
+        .source = parsed.source,
         .active_rules = parsed.active_rules,
         .ontology = parsed.ontology,
         .generation_evidence = parsed.generation_evidence,
@@ -525,8 +574,11 @@ pub fn project(
             return error.InvalidOntologyItem;
         const provenance_sha = parseHex(item.provenance_sha256) orelse
             return error.InvalidOntologyItem;
-        if (isZero(summary_sha) or isZero(provenance_sha) or
-            !std.mem.eql(u8, &summary_sha, &observation.sha256Hex(item.summary)))
+        const falsifier_sha = parseHex(item.falsifier_sha256) orelse
+            return error.InvalidOntologyItem;
+        if (isZero(summary_sha) or isZero(provenance_sha) or isZero(falsifier_sha) or
+            !std.mem.eql(u8, &summary_sha, &observation.sha256Hex(item.summary)) or
+            !std.mem.eql(u8, &falsifier_sha, &observation.sha256Hex(item.falsifier)))
             return error.OntologyItemBindingMismatch;
         output.* = .{
             .node_id = item.node_id,
@@ -537,6 +589,7 @@ pub fn project(
             .summary_sha256 = item.summary_sha256,
             .provenance_sha256 = item.provenance_sha256,
             .falsifier = item.falsifier,
+            .falsifier_sha256 = item.falsifier_sha256,
             .contradicted = item.contradicted,
         };
     }
@@ -633,6 +686,7 @@ pub fn project(
         .project_key = parsed.project_key,
         .ontology_revision = parsed.revision,
         .ontology_snapshot_sha256 = parsed.snapshot_sha256,
+        .ontology_source = parsed.source,
         .active_rules = .{
             .bundle_revision = parsed.active_rules.bundle_revision,
             .bundle_sha256 = parsed.active_rules.bundle_sha256,
@@ -648,6 +702,9 @@ pub fn project(
         .ontology_revision = revision,
         .ontology_snapshot_sha256 = declared_snapshot,
         .raw_snapshot_sha256 = observation.sha256Hex(raw_snapshot),
+        .tinykg_build_sha256 = tinykg_build_sha,
+        .source_semantic_snapshot_sha256 = source_semantic_snapshot_sha,
+        .source_artifact_sha256 = source_artifact_sha,
         .active_bundle_revision = parsed.active_rules.bundle_revision,
         .active_bundle_sha256 = active_bundle,
         .generation_evidence_sha256 = generation_sha256,
@@ -663,9 +720,13 @@ pub fn project(
 pub fn persist(
     allocator: std.mem.Allocator,
     session_dir: []const u8,
+    source_artifact: []const u8,
     raw_snapshot: []const u8,
     projection: *const Projection,
 ) !PersistResult {
+    if (source_artifact.len == 0 or source_artifact.len > MAX_SNAPSHOT_BYTES or
+        !std.mem.eql(u8, &projection.source_artifact_sha256, &observation.sha256Hex(source_artifact)))
+        return error.SourceArtifactMismatch;
     if (!std.mem.eql(u8, &projection.raw_snapshot_sha256, &observation.sha256Hex(raw_snapshot)))
         return error.ProjectionSnapshotMismatch;
     var reprojected = try project(
@@ -676,6 +737,9 @@ pub fn persist(
         projection.ontology_snapshot_sha256,
         projection.active_bundle_revision,
         projection.active_bundle_sha256,
+        projection.tinykg_build_sha256,
+        projection.source_semantic_snapshot_sha256,
+        projection.source_artifact_sha256,
     );
     defer reprojected.deinit();
     if (!projectionEqual(projection, &reprojected))
@@ -686,12 +750,27 @@ pub fn persist(
     const snapshot_name = try std.fmt.bufPrint(&snapshot_name_buffer, "{s}{s}.json", .{
         SNAPSHOT_FILE_PREFIX, projection.ontology_snapshot_sha256[0..],
     });
+    var source_name_buffer: [128]u8 = undefined;
+    const source_name = try std.fmt.bufPrint(&source_name_buffer, "{s}{s}.json", .{
+        SOURCE_FILE_PREFIX, projection.source_artifact_sha256[0..],
+    });
+    _ = try persistExactFile(session_dir, source_name, source_artifact, MAX_SNAPSHOT_BYTES);
     _ = try persistExactFile(session_dir, snapshot_name, raw_snapshot, MAX_SNAPSHOT_BYTES);
+    const tinykg_build_id = try std.fmt.allocPrint(
+        allocator,
+        "sha256:{s}",
+        .{projection.tinykg_build_sha256[0..]},
+    );
+    defer allocator.free(tinykg_build_id);
     const body = ReceiptBody{
         .project_sha256 = projection.project_sha256[0..],
         .ontology_revision = projection.ontology_revision[0..],
         .ontology_snapshot_sha256 = projection.ontology_snapshot_sha256[0..],
         .raw_snapshot_sha256 = projection.raw_snapshot_sha256[0..],
+        .tinykg_build_id = tinykg_build_id,
+        .source_semantic_snapshot_sha256 = projection.source_semantic_snapshot_sha256[0..],
+        .source_artifact_sha256 = projection.source_artifact_sha256[0..],
+        .source_artifact_file = source_name,
         .snapshot_file = snapshot_name,
         .active_bundle_revision = projection.active_bundle_revision,
         .active_bundle_sha256 = projection.active_bundle_sha256[0..],
@@ -740,13 +819,17 @@ pub fn loadBound(
     const revision = parseHex(parsed.body.ontology_revision) orelse return error.InvalidProjectionReceipt;
     const snapshot_sha = parseHex(parsed.body.ontology_snapshot_sha256) orelse return error.InvalidProjectionReceipt;
     const raw_sha = parseHex(parsed.body.raw_snapshot_sha256) orelse return error.InvalidProjectionReceipt;
+    const tinykg_build_sha = parseBuildId(parsed.body.tinykg_build_id) orelse return error.InvalidProjectionReceipt;
+    const source_semantic_snapshot_sha = parseHex(parsed.body.source_semantic_snapshot_sha256) orelse return error.InvalidProjectionReceipt;
+    const source_artifact_sha = parseHex(parsed.body.source_artifact_sha256) orelse return error.InvalidProjectionReceipt;
     const active_sha = parseHex(parsed.body.active_bundle_sha256) orelse return error.InvalidProjectionReceipt;
     const generation_sha = parseHex(parsed.body.generation_evidence_sha256) orelse return error.InvalidProjectionReceipt;
     const held_out_sha = parseHex(parsed.body.held_out_commitments_sha256) orelse return error.InvalidProjectionReceipt;
     const packet_sha = parseHex(parsed.body.packet_sha256) orelse return error.InvalidProjectionReceipt;
     if (!std.mem.eql(u8, parsed.body.schema_version, RECEIPT_SCHEMA_VERSION) or
         !std.mem.eql(u8, &parsed_id, &receipt_id) or
-        !validFileName(parsed.body.snapshot_file))
+        !validFileName(parsed.body.snapshot_file) or
+        !validFileName(parsed.body.source_artifact_file))
         return error.InvalidProjectionReceipt;
     const body_json = try std.json.Stringify.valueAlloc(arena.allocator(), parsed.body, .{});
     if (!std.mem.eql(u8, &observation.sha256Hex(body_json), &receipt_id))
@@ -760,6 +843,15 @@ pub fn loadBound(
     defer allocator.free(raw_snapshot);
     if (!std.mem.eql(u8, &observation.sha256Hex(raw_snapshot), &raw_sha))
         return error.ProjectionSnapshotChanged;
+    const raw_source = try readExactFile(
+        allocator,
+        session_dir,
+        parsed.body.source_artifact_file,
+        MAX_SNAPSHOT_BYTES,
+    );
+    defer allocator.free(raw_source);
+    if (!std.mem.eql(u8, &observation.sha256Hex(raw_source), &source_artifact_sha))
+        return error.SourceArtifactChanged;
     var projection = try project(
         allocator,
         raw_snapshot,
@@ -768,6 +860,9 @@ pub fn loadBound(
         snapshot_sha,
         parsed.body.active_bundle_revision,
         active_sha,
+        tinykg_build_sha,
+        source_semantic_snapshot_sha,
+        source_artifact_sha,
     );
     errdefer projection.deinit();
     if (!std.mem.eql(u8, &projection.generation_evidence_sha256, &generation_sha) or
@@ -849,6 +944,9 @@ fn projectionEqual(left: *const Projection, right: *const Projection) bool {
     return std.mem.eql(u8, &left.project_sha256, &right.project_sha256) and
         std.mem.eql(u8, &left.ontology_revision, &right.ontology_revision) and
         std.mem.eql(u8, &left.ontology_snapshot_sha256, &right.ontology_snapshot_sha256) and
+        std.mem.eql(u8, &left.tinykg_build_sha256, &right.tinykg_build_sha256) and
+        std.mem.eql(u8, &left.source_semantic_snapshot_sha256, &right.source_semantic_snapshot_sha256) and
+        std.mem.eql(u8, &left.source_artifact_sha256, &right.source_artifact_sha256) and
         std.mem.eql(u8, &left.raw_snapshot_sha256, &right.raw_snapshot_sha256) and
         left.active_bundle_revision == right.active_bundle_revision and
         std.mem.eql(u8, &left.active_bundle_sha256, &right.active_bundle_sha256) and
@@ -1056,6 +1154,12 @@ fn parseHex(value: []const u8) ?[64]u8 {
         result[index] = byte;
     }
     return result;
+}
+
+fn parseBuildId(value: []const u8) ?[64]u8 {
+    const prefix = "sha256:";
+    if (!std.mem.startsWith(u8, value, prefix)) return null;
+    return parseHex(value[prefix.len..]);
 }
 
 fn isZero(value: [64]u8) bool {
