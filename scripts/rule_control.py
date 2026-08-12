@@ -3592,7 +3592,7 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
                 )
             ) and all(
                 marker in authority_test
-                for marker in ("1000.01", "must not exceed", "explicit paid-rollout authority")
+                for marker in ("2000.01", "must not exceed", "explicit paid-rollout authority")
             ),
             "quality flag and single physical provider attempt remain gated": (
                 '"quality_evidence": False' in sources["runner"]

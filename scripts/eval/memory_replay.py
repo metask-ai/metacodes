@@ -25,6 +25,7 @@ from .memory_benchmark import (
     validate_memory_row,
 )
 from .memory_budget_journal import (
+    MAX_USER_AUTHORITY_USD,
     usd_to_microusd,
     usd_to_microusd_ceiling,
     validate_checkpoint_payload,
@@ -1886,7 +1887,11 @@ def _validate_production_runtime_receipt(
         minimum=1,
     )
     _integer(budget["max_output_tokens"], f"{where}.budget.max_output_tokens", minimum=1)
-    if max_total_cost <= 0 or max_rollout_cost <= 0 or max_total_cost > 1000:
+    if (
+        max_total_cost <= 0
+        or max_rollout_cost <= 0
+        or max_total_cost > MAX_USER_AUTHORITY_USD
+    ):
         _fail(f"{where}.budget", "invalid paid cost authority")
 
     rollouts = value["rollouts"]

@@ -2430,8 +2430,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             unauthorized.validate(9)
 
         over_limit = copy.copy(valid)
-        object.__setattr__(over_limit, "max_total_cost_usd", 1000.01)
-        with self.assertRaisesRegex(ValidationError, "must not exceed \\$1000"):
+        object.__setattr__(over_limit, "max_total_cost_usd", 2000.01)
+        with self.assertRaisesRegex(ValidationError, "must not exceed \\$2000"):
             over_limit.validate(9)
 
         no_headroom = copy.copy(valid)

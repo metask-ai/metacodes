@@ -234,13 +234,15 @@ L2 command, so a clean checkout cannot turn missing native coverage into a
 machine-local skip.
 
 `eval.memory-local-store-isolation.l2` makes the memory-benchmark storage
-boundary a release rule rather than a convention. Its six fixed obligations
+boundary a release rule rather than a convention. Its seven fixed obligations
 require:
 
 - direct invocation of an explicit hash-pinned TinyKG binary, with no import
   or execution path through the TinyKG skill harness;
 - a sealed child `HOME`/temporary directory and removal of every `TINYKG_*`
-  variable, including local-store and remote URL/key/build/config overrides;
+  and ambient `METACODES_KG_*` variable, including both Skill-remote and
+  Metacodes-daemon URL/key/build/config authority, before injecting the
+  explicit isolated CLI binding;
 - a previously absent run directory whose stores, batches, home, temporary
   files, and output remain below that owned directory;
 - an unnormalized digest of every non-lock store file and directory before and
@@ -254,7 +256,7 @@ require:
   binary/source/manifest/batch/graph/trace identities and explicit zero counts
   for skill-harness calls, remote API calls, and remote-store writes.
 
-`memoryIsolationSignal` fixes this surface at 6/6, so a weakened 5/5 sensor is
+`memoryIsolationSignal` fixes this surface at 7/7, so a weakened 6/6 sensor is
 blocked even if its surviving checks agree. Feedback first builds the vendored
 TinyKG binary, then runs both the sensor counterexamples and the real local
 TinyKG module; any native-environment skip is treated as failure. The

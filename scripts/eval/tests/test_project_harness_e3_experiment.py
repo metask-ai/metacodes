@@ -244,7 +244,7 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
         mutations = (
             ("max_rollout_cost_usd", 0.89),
             ("max_rollout_metered_tokens", 299_999),
-            ("max_total_cost_usd", 1000.01),
+            ("max_total_cost_usd", 2000.01),
             ("max_total_cost_usd", math.nan),
             ("max_total_cost_usd", False),
             ("max_total_metered_tokens", 4_800_000),

@@ -236,7 +236,7 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
                 "max_cost_microusd": 500_000,
                 "max_metered_tokens": 50_000,
                 "prior_exposure_microusd": 0,
-                "user_authority_microusd": 1_000_000_000,
+                "user_authority_microusd": 2_000_000_000,
             },
             "execution": {
                 "n_attempts": 1,
@@ -1125,6 +1125,22 @@ with urllib.request.urlopen(
             with self.assertRaisesRegex(LaunchError, "content hash mismatch"):
                 validate_launch_manifest(manifest)
             self.assertFalse((root / "budget.json").exists())
+
+    def test_manifest_requires_current_two_thousand_dollar_authority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest = self._manifest(root)
+            value = json.loads(manifest.read_text())
+            value["budget"]["user_authority_microusd"] = 1_000_000_000
+            value["content_sha256"] = hashlib.sha256(
+                stable_json({key: row for key, row in value.items() if key != "content_sha256"}).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            manifest.write_text(json.dumps(value, sort_keys=True) + "\n")
+            with self.assertRaisesRegex(LaunchError, "budget authority is inconsistent"):
+                validate_launch_manifest(manifest)
 
     def test_paid_host_rejects_dotenv_and_uv_docker_shadow(self):
         with tempfile.TemporaryDirectory() as directory:

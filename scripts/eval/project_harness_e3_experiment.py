@@ -23,6 +23,7 @@ from .e2e_adapter import _native_trace_metrics
 from .memory_agent_runtime import PRODUCTION_MODEL_FINGERPRINT, SAFE_STOP_REASONS, _parse_result
 from .memory_budget_journal import (
     JOURNAL_SCHEMA_VERSION,
+    MAX_USER_AUTHORITY_USD,
     reopen_checkpoint_transaction,
     usd_to_microusd,
     usd_to_microusd_ceiling,
@@ -981,7 +982,7 @@ def _validate_execution_contract(
     if (
         rollout_cost < E3_MIN_ROLLOUT_COST_USD
         or total_cost <= 0
-        or total_cost > 1000
+        or total_cost > MAX_USER_AUTHORITY_USD
         or rollout_cost * schedule_length >= total_cost
         or rollout_tokens < E3_MIN_ROLLOUT_METERED_TOKENS
         or rollout_tokens * schedule_length >= total_tokens
@@ -1123,7 +1124,11 @@ def freeze_manifest(
     templates = verify_templates(templates_path, repo)
     if templates.get("paid_rollout_eligible") is not True:
         raise E3Error("template setup is not eligible for a paid rollout")
-    if max_total_cost_usd > 1000 or max_total_cost_usd <= 0 or max_rollout_cost_usd <= 0:
+    if (
+        max_total_cost_usd > MAX_USER_AUTHORITY_USD
+        or max_total_cost_usd <= 0
+        or max_rollout_cost_usd <= 0
+    ):
         raise E3Error("invalid paid cost authority")
     if max_rollout_metered_tokens <= 0 or max_total_metered_tokens <= 0 or max_output_tokens <= 0:
         raise E3Error("invalid paid token authority")

@@ -20,6 +20,7 @@ from .model import (
     stable_json,
     validate_suite,
 )
+from .memory_budget_journal import MAX_USER_AUTHORITY_USD
 
 
 EXPERIMENT_SCHEMA_VERSION = 2
@@ -714,8 +715,13 @@ def validate_experiment(
             or float(value) <= 0
         ):
             raise ValidationError(f"experiment.budget.{key} must be finite and > 0")
-    if float(max_aggregate_cost) > 1000.0 or float(max_stage_cost) > float(max_aggregate_cost):
-        raise ValidationError("experiment aggregate budget must be <= $1000 and cover its stage")
+    if (
+        float(max_aggregate_cost) > MAX_USER_AUTHORITY_USD
+        or float(max_stage_cost) > float(max_aggregate_cost)
+    ):
+        raise ValidationError(
+            f"experiment aggregate budget must be <= ${MAX_USER_AUTHORITY_USD} and cover its stage"
+        )
     max_stage_tokens = budget.get("max_stage_tokens")
     max_aggregate_tokens = budget.get("max_aggregate_tokens")
     for key, value in (

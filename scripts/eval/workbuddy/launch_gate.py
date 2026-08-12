@@ -29,6 +29,8 @@ from ..memory_budget_journal import (
     BudgetAuthority,
     BudgetJournal,
     BudgetTransaction,
+    MAX_USER_AUTHORITY_MICROUSD,
+    MAX_USER_AUTHORITY_USD,
     validate_checkpoint_payload,
     usd_to_microusd_ceiling,
 )
@@ -72,7 +74,6 @@ AUTHORIZED_FAILURE_STAGES = {
     "post_run_evidence_audit",
 }
 PROVIDER_KEY_ENV = "METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF"
-MAX_USER_AUTHORITY_MICROUSD = 1000 * 1_000_000
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$")
 MAX_FAILURE_ARTIFACTS = 256
 MAX_FAILURE_ARTIFACT_BYTES = 64 * 1024 * 1024
@@ -553,7 +554,9 @@ def build_launch_manifest(
     if max_cost_microusd > total_cost_microusd or max_metered_tokens > total_metered_tokens:
         raise LaunchError("wave maximum exceeds its journal authority")
     if prior_exposure_microusd + total_cost_microusd > MAX_USER_AUTHORITY_MICROUSD:
-        raise LaunchError("cumulative WorkBuddy authority exceeds the user $1000 limit")
+        raise LaunchError(
+            f"cumulative WorkBuddy authority exceeds the user ${MAX_USER_AUTHORITY_USD} limit"
+        )
     if not isinstance(quality_evidence_on_commit, bool):
         raise LaunchError("quality_evidence_on_commit must be boolean")
 

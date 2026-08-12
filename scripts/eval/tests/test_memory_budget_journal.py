@@ -63,6 +63,13 @@ class MemoryBudgetJournalTest(unittest.TestCase):
     def test_exact_money_and_authority_cap(self):
         self.assertEqual(usd_to_microusd(0.9), 900_000)
         self.assertEqual(usd_to_microusd("1000"), 1_000_000_000)
+        BudgetAuthority(
+            manifest_sha256=digest("manifest"),
+            model_fingerprint=digest("model"),
+            provider_identity="provider",
+            total_cost_microusd=2_000_000_000,
+            total_metered_tokens=1,
+        ).validate()
         self.assertEqual(usd_to_microusd_ceiling("0.0000003"), 1)
         with self.assertRaisesRegex(ValidationError, "precision"):
             usd_to_microusd("0.0000001")
@@ -71,7 +78,7 @@ class MemoryBudgetJournalTest(unittest.TestCase):
                 manifest_sha256=digest("manifest"),
                 model_fingerprint=digest("model"),
                 provider_identity="provider",
-                total_cost_microusd=1_000_000_001,
+                total_cost_microusd=2_000_000_001,
                 total_metered_tokens=1,
             ).validate()
 

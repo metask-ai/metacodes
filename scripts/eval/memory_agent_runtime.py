@@ -43,6 +43,7 @@ from .memory_benchmark import PROTOCOL_ID, file_sha256
 from .memory_budget_journal import (
     BudgetJournal,
     BudgetTransaction,
+    MAX_USER_AUTHORITY_USD,
     validate_checkpoint_payload,
     usd_to_microusd,
     usd_to_microusd_ceiling,
@@ -199,8 +200,11 @@ class ProductionRuntimeConfig:
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 _fail(f"production memory runtime.{name}", "expected an integer > 0")
-        if self.max_total_cost_usd > 1000.0:
-            _fail("production memory runtime.max_total_cost_usd", "must not exceed $1000")
+        if self.max_total_cost_usd > MAX_USER_AUTHORITY_USD:
+            _fail(
+                "production memory runtime.max_total_cost_usd",
+                f"must not exceed ${MAX_USER_AUTHORITY_USD}",
+            )
         if self.max_rollout_cost_usd > self.max_total_cost_usd:
             _fail("production memory runtime", "rollout cost cap exceeds total cost cap")
         if self.max_rollout_metered_tokens > self.max_total_metered_tokens:
