@@ -114,6 +114,7 @@ pub const BlockedVerdictBinding = struct {
 pub const LoadedRunDispatches = struct {
     arena: std.heap.ArenaAllocator,
     interval_sha256: [64]u8,
+    stop_reason: []const u8,
     dispatches: []const RunDispatch,
     formal_decisions: []const RunFormalDecision,
 
@@ -137,6 +138,7 @@ pub const Journal = struct {
     started_ns: i128,
     finished: bool = false,
     failed: bool = false,
+    release_requested: bool = false,
     lock_released: bool = false,
 
     /// Open the session-owned append-only artifact, validate every existing
@@ -211,7 +213,8 @@ pub const Journal = struct {
         // A clean terminal record releases the lease. Any other path leaves the
         // marker behind so a later process cannot mistake a crash window for a
         // safely closed Run. Recovery is an explicit audit action, not init().
-        if (self.finished and !self.lock_released) self.unlinkLock() catch {};
+        if (self.finished and self.release_requested and !self.lock_released)
+            self.unlinkLock() catch {};
     }
 
     pub fn sink(self: *Journal) observation.Sink {
@@ -225,6 +228,14 @@ pub const Journal = struct {
     pub fn runBinding(self: *const Journal) !RunBinding {
         if (!self.finished or !self.lock_released or self.sequence == 0)
             return error.RunNotFinished;
+        return self.finishedRunBinding();
+    }
+
+    /// Return the exact durable interval after `sealRun` but before releasing
+    /// the crash marker.  This is intentionally separate from `runBinding`:
+    /// ordinary consumers must only observe a completely published Run.
+    pub fn finishedRunBinding(self: *const Journal) !RunBinding {
+        if (!self.finished or self.sequence == 0) return error.RunNotFinished;
         return .{
             .session_id = self.session_id,
             .run_id = self.run_id,
@@ -234,6 +245,14 @@ pub const Journal = struct {
     }
 
     pub fn finishRun(self: *Journal, stop_reason: []const u8) !void {
+        try self.sealRun(stop_reason);
+        try self.releaseFinishedRun();
+    }
+
+    /// Durably append the terminal record while deliberately retaining the
+    /// exclusive marker. A caller that must publish a derived artifact can do
+    /// so without opening a crash window in which the next Run starts first.
+    pub fn sealRun(self: *Journal, stop_reason: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.failed) return error.JournalFailed;
@@ -243,6 +262,16 @@ pub const Journal = struct {
             .finished_wall_ns = util_time.nowWallNs(),
         } });
         self.finished = true;
+    }
+
+    /// Complete publication and allow the next Run. Once requested, deinit
+    /// retries marker removal if the first unlink/fsync attempt fails.
+    pub fn releaseFinishedRun(self: *Journal) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.finished) return error.RunNotFinished;
+        if (self.lock_released) return;
+        self.release_requested = true;
         if (self.lock_fd >= 0) _ = pfs.close(self.lock_fd);
         self.lock_fd = -1;
         try self.unlinkLock();
@@ -376,6 +405,7 @@ pub fn loadRunDispatches(
     var interval_hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var records: std.ArrayList(RunDispatch) = .empty;
     var formal_decisions: std.ArrayList(RunFormalDecision) = .empty;
+    var stop_reason: ?[]const u8 = null;
     var open = std.AutoHashMap([32]u8, usize).init(a);
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |line| {
@@ -395,8 +425,11 @@ pub fn loadRunDispatches(
         switch (envelope.event) {
             .run_started => if (envelope.sequence != binding.first_sequence)
                 return error.InvalidRunBinding,
-            .run_finished => if (envelope.sequence != binding.last_sequence)
-                return error.InvalidRunBinding,
+            .run_finished => |finished| {
+                if (envelope.sequence != binding.last_sequence or stop_reason != null)
+                    return error.InvalidRunBinding;
+                stop_reason = finished.stop_reason;
+            },
             .tool_observation => |event| switch (event) {
                 .formal_decision => |formal| try formal_decisions.append(a, .{
                     .sequence = envelope.sequence,
@@ -497,6 +530,7 @@ pub fn loadRunDispatches(
     return .{
         .arena = arena,
         .interval_sha256 = interval_sha256,
+        .stop_reason = stop_reason orelse return error.InvalidRunBinding,
         .dispatches = try records.toOwnedSlice(a),
         .formal_decisions = try formal_decisions.toOwnedSlice(a),
     };
@@ -2065,6 +2099,28 @@ test "tool observation journal lease rejects a concurrent writer" {
     first.deinit();
     try std.testing.expectError(error.JournalBusy, Journal.init(root, sid));
     try second.finishRun("end_turn");
+}
+
+test "sealed run retains crash marker until derived publication releases it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const sid = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
+
+    var journal = try Journal.init(root, sid);
+    try journal.sealRun("end_turn");
+    _ = try journal.finishedRunBinding();
+    try std.testing.expectError(error.RunNotFinished, journal.runBinding());
+    try std.testing.expectError(error.JournalBusy, Journal.init(root, sid));
+
+    try journal.releaseFinishedRun();
+    _ = try journal.runBinding();
+    var next = try Journal.init(root, sid);
+    defer next.deinit();
+    try next.finishRun("end_turn");
+    journal.deinit();
 }
 
 test "tool observation journal rejects a partial existing record" {

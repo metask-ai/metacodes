@@ -2540,6 +2540,130 @@ test "L2 active project rules fail closed before dispatch on artifact or kernel 
     try std.testing.expectEqual(@as(usize, 1), healthy_probe.calls);
 }
 
+test "L2 normal RunControl finish publishes a bound operational observer" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const session_dir = try std.fmt.allocPrint(allocator, "{s}/session", .{root});
+    defer allocator.free(session_dir);
+    const rules_dir = try std.fmt.allocPrint(allocator, "{s}/project-rules", .{root});
+    defer allocator.free(rules_dir);
+    const project = cc.project_rule_bundle.projectIdentity(root);
+    const promoted = try promoteFixture(
+        allocator,
+        session_dir,
+        rules_dir,
+        project,
+        config,
+        .{
+            .target_tool = "Write",
+            .deny_target = true,
+            .max_input_bytes = 8192,
+            .max_agent_depth = 4,
+            .authoritative_only = true,
+            .effect_requirement = .none,
+        },
+        "def spec : RuleSpec := { targetTool := \"Write\", denyTarget := true, maxInputBytes := 8192, maxAgentDepth := 4, authoritativeOnly := true, effectRequirement := .none }; theorem spec_valid : valid spec = true := by rfl",
+    );
+    const checker_path_z = try allocator.dupeZ(u8, config.checker_path);
+    defer allocator.free(checker_path_z);
+    const checker_hash_z = try allocator.dupeZ(u8, &config.expected_sha256);
+    defer allocator.free(checker_hash_z);
+    @import("platform").paths.setEnv("METACODES_PROJECT_KERNEL_PATH", checker_path_z.ptr);
+    defer @import("platform").paths.unsetEnv("METACODES_PROJECT_KERNEL_PATH");
+    @import("platform").paths.setEnv("METACODES_PROJECT_KERNEL_SHA256", checker_hash_z.ptr);
+    defer @import("platform").paths.unsetEnv("METACODES_PROJECT_KERNEL_SHA256");
+
+    // Promotion and the normal Run share one durable session journal.  The
+    // journal deliberately rejects mixed session identities.
+    const sid = cc.session_id.SessionId.fromSlice("fedcba9876543210fedcba98").?;
+    {
+        const control = try cc.project_rule_activation.RunControl.init(
+            allocator,
+            session_dir,
+            sid,
+            root,
+            null,
+        );
+        defer control.deinit();
+        var probe = Probe{};
+        var ctx = cc.tool_context.ToolContext.simple(allocator);
+        ctx.tool_dispatcher = probe.dispatcher();
+        ctx.tool_observer = control.observer();
+        ctx.project_rule_gate = control.formalGate();
+        const result = try cc.tool_exec.executeOne(
+            &ctx,
+            "Read",
+            "{}",
+            "normal-run-control-read",
+            allocator,
+            .{ .bytes = [_]u8{'0'} ** 12 },
+        );
+        switch (result) {
+            .done => |done| {
+                defer if (done.content) |bytes| allocator.free(bytes);
+                try std.testing.expect(!done.is_error);
+            },
+            else => return error.UnexpectedToolResult,
+        }
+        try control.finishRun("end_turn");
+        const observation_id = control.operationalObservationId() orelse
+            return error.MissingOperationalObservation;
+        var loaded = try cc.rule_impact_operational_observation.loadBound(
+            allocator,
+            session_dir,
+            observation_id,
+            .{
+                .project_sha256 = project,
+                .bundle_sha256 = promoted.bundle_sha256,
+                .bundle_revision = promoted.revision,
+            },
+        );
+        defer loaded.deinit();
+        try std.testing.expectEqualStrings("end_turn", loaded.stop_reason);
+        try std.testing.expectEqual(@as(u64, 2), loaded.snapshot.formal_decisions);
+        try std.testing.expectEqual(@as(u64, 2), loaded.snapshot.physical_checker_calls);
+        try std.testing.expectEqual(@as(u64, 1), loaded.snapshot.authoritative_dispatches);
+        try std.testing.expectEqual(@as(u64, 1), loaded.snapshot.authoritative_successes);
+        try std.testing.expect(loaded.snapshot.labels.task_success == null);
+        try std.testing.expect(!loaded.snapshot.evidence.authenticated);
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    }
+
+    // Exercise the product failure path, not only Journal helpers. If the
+    // active pointer drifts after RunControl admission, finish seals the Run
+    // but must retain its marker because no observer was published.
+    const drift_control = try cc.project_rule_activation.RunControl.init(
+        allocator,
+        session_dir,
+        sid,
+        root,
+        null,
+    );
+    const active_path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/{s}",
+        .{ rules_dir, cc.project_rule_bundle.ACTIVE_FILE },
+        0,
+    );
+    defer allocator.free(active_path);
+    try pfs.unlinkPath(active_path.ptr);
+    try std.testing.expectError(
+        error.ActivePointerDisappeared,
+        drift_control.finishRun("end_turn"),
+    );
+    try std.testing.expect(drift_control.operationalObservationId() == null);
+    drift_control.deinit();
+    try std.testing.expectError(
+        error.JournalBusy,
+        cc.tool_observation_journal.Journal.init(session_dir, sid),
+    );
+}
+
 test "L2 extending an active bundle reattests the prior promotion before mutation" {
     const config = testKernel() orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;

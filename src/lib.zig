@@ -30,6 +30,7 @@ pub const subagent = @import("core/subagent.zig");
 pub const tool_exec = @import("core/tool_exec.zig");
 pub const tool_observation_journal = @import("core/tool_observation_journal.zig");
 pub const rule_impact_stats = @import("core/rule_impact_stats.zig");
+pub const rule_impact_operational_observation = @import("core/rule_impact_operational_observation.zig");
 pub const rule_impact_evidence = @import("core/rule_impact_evidence.zig");
 pub const rule_impact_receipt = @import("core/rule_impact_receipt.zig");
 pub const rule_impact_aggregate_receipt = @import("core/rule_impact_aggregate_receipt.zig");

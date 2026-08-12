@@ -10,6 +10,7 @@ const kernel = @import("../formal/project_harness_runtime.zig");
 const protocol = @import("../tools/project_rule_gate.zig");
 const observation = @import("../tools/observation.zig");
 const journal_mod = @import("tool_observation_journal.zig");
+const impact_observer = @import("rule_impact_operational_observation.zig");
 const session_id_mod = @import("session_id.zig");
 const project_harness_build_options = @import("project_harness_build_options");
 
@@ -28,8 +29,10 @@ test "ordinary product and library roots compile project rules enforced" {
 /// adapters from loading an active rule without its evidence sink.
 pub const RunControl = struct {
     allocator: std.mem.Allocator,
+    session_dir: []u8,
     journal: journal_mod.Journal,
     project_gate: ?*RunGate,
+    operational_observation_id: ?[64]u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -40,10 +43,15 @@ pub const RunControl = struct {
     ) !*RunControl {
         const self = try allocator.create(RunControl);
         errdefer allocator.destroy(self);
+        const owned_session_dir = try allocator.dupe(u8, session_dir);
+        errdefer allocator.free(owned_session_dir);
+        const journal = try journal_mod.Journal.init(session_dir, session_id);
         self.* = .{
             .allocator = allocator,
-            .journal = try journal_mod.Journal.init(session_dir, session_id),
+            .session_dir = owned_session_dir,
+            .journal = journal,
             .project_gate = null,
+            .operational_observation_id = null,
         };
         errdefer self.journal.deinit();
         const project_gate = RunGate.load(
@@ -83,13 +91,53 @@ pub const RunControl = struct {
     }
 
     pub fn finishRun(self: *RunControl, stop_reason: []const u8) !void {
-        try self.journal.finishRun(stop_reason);
+        const gate = self.project_gate orelse {
+            try self.journal.finishRun(stop_reason);
+            return;
+        };
+        // Keep the journal marker until the operational observer has been
+        // durably persisted and reopened. A crash or publication error after
+        // run_finished therefore makes the next Run fail closed instead of
+        // silently losing the observer.
+        try self.journal.sealRun(stop_reason);
+        const binding = try self.journal.finishedRunBinding();
+        // Re-attest the active pointer after the durable Run close. A bundle
+        // change during the Run is not attributed to either identity.
+        var current = (try bundle.loadVerifiedActive(
+            self.allocator,
+            gate.directory,
+            gate.active.project_sha256,
+            gate.runtime.config,
+            gate.runtime.abort,
+        )) orelse return error.ActivePointerDisappeared;
+        defer current.deinit();
+        if (current.revision != gate.active.revision or
+            !std.mem.eql(u8, &current.bundle_sha256, &gate.active.bundle_sha256))
+            return error.ActiveBundleChangedDuringRun;
+        const published = try impact_observer.persist(.{
+            .session_dir = self.session_dir,
+            .observation = binding,
+            .active = .{
+                .project_sha256 = gate.active.project_sha256,
+                .bundle_sha256 = gate.active.bundle_sha256,
+                .bundle_revision = gate.active.revision,
+            },
+        });
+        try self.journal.releaseFinishedRun();
+        self.operational_observation_id = published.observation_id;
+    }
+
+    /// Host-only handoff to later TinyKG/Lean control work. The identifier is
+    /// never injected into actor messages, prompts or tool schemas.
+    pub fn operationalObservationId(self: *const RunControl) ?[64]u8 {
+        return self.operational_observation_id;
     }
 
     pub fn deinit(self: *RunControl) void {
         const allocator = self.allocator;
         if (self.project_gate) |gate| gate.deinit();
         self.journal.deinit();
+        allocator.free(self.session_dir);
         allocator.destroy(self);
     }
 };
