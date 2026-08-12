@@ -412,7 +412,7 @@ test "Selection preserves Host tool descriptions (redescribe skips unknown tools
     const host_def = json.ToolDefinition{
         .name = "host_probe",
         .description = "Host-defined probe description",
-        .input_schema = .{ .type = .object, .properties = .empty, .required = .empty },
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{} },
     };
     const host_tools = [_]HostSyncTool{
         .{ .definition = host_def, .ctx = @ptrCast(&probe), .execute = HostProbe.execute },
