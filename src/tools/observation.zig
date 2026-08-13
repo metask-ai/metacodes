@@ -17,7 +17,9 @@ pub const FORMAL_BATCH_SCHEMA_VERSION_V1 = "metacodes-project-formal-decision-ba
 pub const FORMAL_SCHEMA_VERSION = "metacodes-project-formal-decision-v2";
 pub const FORMAL_BATCH_SCHEMA_VERSION_V2 = "metacodes-project-formal-decision-batch-v2";
 pub const FORMAL_BATCH_SCHEMA_VERSION_V3 = "metacodes-project-formal-decision-batch-v3";
-pub const FORMAL_BATCH_SCHEMA_VERSION = "metacodes-project-formal-decision-batch-v4";
+pub const FORMAL_BATCH_SCHEMA_VERSION_V4 = "metacodes-project-formal-decision-batch-v4";
+pub const FORMAL_BATCH_SCHEMA_VERSION = "metacodes-project-formal-decision-batch-v5";
+pub const RULE_FILTER_SCHEMA_VERSION = "metacodes-project-rule-filter-v1";
 
 pub const Origin = enum {
     authoritative,
@@ -73,6 +75,14 @@ pub const FormalRecoveryAction = enum {
 /// an isolated evaluation Run may use `shadow` to record the identical verdict
 /// while deliberately leaving the tool trajectory unchanged.
 pub const FormalActuation = enum { enforced, shadow };
+
+/// Host-side relevance pruning is deliberately not a formal decision. It can
+/// only erase candidates for which the fixed Lean theorem proves both phases
+/// admit; every remaining candidate still traverses the sidecar.
+pub const RuleFilterOperation = enum {
+    ordinary,
+    exact_edit_recovery,
+};
 
 /// Host-observed state of an operation's file target immediately before the
 /// formal gate.  It is carried in the dispatch journal so a later replay can
@@ -185,6 +195,23 @@ pub const EffectSlot = struct {
 };
 
 pub const Event = union(enum) {
+    rule_filter: struct {
+        schema_version: []const u8 = RULE_FILTER_SCHEMA_VERSION,
+        dispatch_id: []const u8,
+        phase: FormalPhase,
+        operation: RuleFilterOperation,
+        project_sha256: [64]u8,
+        bundle_sha256: [64]u8,
+        bundle_revision: u64,
+        kernel_sha256: [64]u8,
+        active_rule_count: u32,
+        checker_rule_count: u32,
+        /// During exact-Edit recovery the source Write rule is deliberately
+        /// retained despite its ordinary target mismatch. This is therefore a
+        /// prune count, not the raw number of mismatching targets.
+        statically_pruned_rule_count: u32,
+        proof: []const u8 = "MetaCodesControl.ProjectRule.target_tool_mismatch_admits_both",
+    },
     formal_decision: struct {
         // This is an additive journal event with a separate schema. Reusing
         // the dispatch-v1 label made a new authority-bearing payload look like

@@ -200,7 +200,7 @@ const AutoRecoveryDispatchProbe = struct {
     fn emit(raw: *anyopaque, event: cc.tools.tool_observation.Event) bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
         switch (event) {
-            .formal_decision, .formal_decision_batch => {},
+            .rule_filter, .formal_decision, .formal_decision_batch => {},
             .dispatch_started => |started| {
                 self.starts += 1;
                 self.requested_write = std.mem.eql(u8, started.requested_name, "Write");
@@ -253,7 +253,7 @@ const RejectDispatchStartSink = struct {
     fn emit(raw: *anyopaque, event: cc.tools.tool_observation.Event) bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
         return switch (event) {
-            .formal_decision, .formal_decision_batch => blk: {
+            .rule_filter, .formal_decision, .formal_decision_batch => blk: {
                 self.formal_events += 1;
                 break :blk true;
             },
@@ -2810,6 +2810,15 @@ fn syntheticActive(
     rule_count: usize,
     config: cc.project_harness_runtime.Config,
 ) !cc.project_rule_bundle.LoadedActive {
+    return syntheticActiveForTool(allocator, rule_count, config, "Write");
+}
+
+fn syntheticActiveForTool(
+    allocator: std.mem.Allocator,
+    rule_count: usize,
+    config: cc.project_harness_runtime.Config,
+    target_tool: []const u8,
+) !cc.project_rule_bundle.LoadedActive {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -2820,16 +2829,13 @@ fn syntheticActive(
         const candidate = cc.tools.tool_observation.sha256Hex(name);
         rule.* = .{
             .candidate_id = try a.dupe(u8, &candidate),
-            // The real dispatch below is Read. Every rule must therefore
-            // admit independently in both phases while still producing one
-            // candidate-bound verdict per entry.
             .rule_spec = cc.project_rule_spec.toWire(.{
-                .target_tool = "Write",
+                .target_tool = target_tool,
                 .deny_target = false,
                 .max_input_bytes = 8192,
                 .max_agent_depth = 4,
                 .authoritative_only = true,
-                .effect_requirement = .file_mutation_v1_reobserved,
+                .effect_requirement = .none,
             }),
         };
     }
@@ -2884,6 +2890,65 @@ fn syntheticOrderedRecoveryActive(
     };
     rules[0] = if (recovery_first) recovery else generic;
     rules[1] = if (recovery_first) generic else recovery;
+    return .{
+        .arena = arena,
+        .project_sha256 = .{'a'} ** 64,
+        .bundle_sha256 = .{'b'} ** 64,
+        .revision = 7,
+        .kernel_sha256 = config.expected_sha256,
+        .promotion_receipt_id = .{'c'} ** 64,
+        .promotion_request_sha256 = .{'d'} ** 64,
+        .promotion_verdict_sha256 = .{'e'} ** 64,
+        .active_pointer_sha256 = .{'f'} ** 64,
+        .rules = rules,
+    };
+}
+
+fn syntheticRecoveryWithEditAndBash(
+    allocator: std.mem.Allocator,
+    config: cc.project_harness_runtime.Config,
+) !cc.project_rule_bundle.LoadedActive {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const rules = try a.alloc(cc.project_rule_bundle.RuleEntry, 3);
+    const source_id = cc.tools.tool_observation.sha256Hex("mixed-recovery-source");
+    const edit_id = cc.tools.tool_observation.sha256Hex("mixed-recovery-edit");
+    const bash_id = cc.tools.tool_observation.sha256Hex("mixed-recovery-bash");
+    rules[0] = .{
+        .candidate_id = try a.dupe(u8, &source_id),
+        .rule_spec = cc.project_rule_spec.toWire(.{
+            .target_tool = "Write",
+            .target_scope = .existing_file,
+            .deny_target = true,
+            .max_input_bytes = 8192,
+            .max_agent_depth = 4,
+            .authoritative_only = true,
+            .effect_requirement = .none,
+        }),
+    };
+    rules[1] = .{
+        .candidate_id = try a.dupe(u8, &edit_id),
+        .rule_spec = cc.project_rule_spec.toWire(.{
+            .target_tool = "Edit",
+            .deny_target = false,
+            .max_input_bytes = 8192,
+            .max_agent_depth = 4,
+            .authoritative_only = true,
+            .effect_requirement = .file_mutation_v1_reobserved,
+        }),
+    };
+    rules[2] = .{
+        .candidate_id = try a.dupe(u8, &bash_id),
+        .rule_spec = cc.project_rule_spec.toWire(.{
+            .target_tool = "Bash",
+            .deny_target = true,
+            .max_input_bytes = 8192,
+            .max_agent_depth = 4,
+            .authoritative_only = true,
+            .effect_requirement = .none,
+        }),
+    };
     return .{
         .arena = arena,
         .project_sha256 = .{'a'} ** 64,
@@ -3221,7 +3286,7 @@ fn runBatchRuntimeFixture(rule_count: usize) !BatchRuntimeStats {
     defer allocator.free(evidence_dir);
     try cc.util_fs.mkdirParents(evidence_dir);
 
-    var active = try syntheticActive(allocator, rule_count, config);
+    var active = try syntheticActiveForTool(allocator, rule_count, config, "Read");
     defer active.deinit();
     var runtime = cc.project_rule_gate.RuntimeGate{
         .allocator = allocator,
@@ -3328,6 +3393,186 @@ test "L2 project rule batch runtime uses two checker calls for 4 rules" {
     _ = try runBatchRuntimeFixture(4);
 }
 
+test "L2 target mismatch skips checker while retaining auditable dispatch filters" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
+    defer allocator.free(evidence_dir);
+    try cc.util_fs.mkdirParents(evidence_dir);
+    const checker_path = try std.fmt.allocPrint(allocator, "{s}/must-not-run", .{root});
+    defer allocator.free(checker_path);
+    const marker_path = try std.fmt.allocPrint(allocator, "{s}/checker-ran", .{root});
+    defer allocator.free(marker_path);
+    const checker_script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\nprintf ran > '{s}'\nexit 91\n",
+        .{marker_path},
+    );
+    defer allocator.free(checker_script);
+    try overwriteArtifact(allocator, checker_path, checker_script);
+    const checker_z = try allocator.dupeZ(u8, checker_path);
+    defer allocator.free(checker_z);
+    if (std.c.chmod(checker_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    const config = cc.project_harness_runtime.Config{
+        .checker_path = checker_path,
+        .expected_sha256 = cc.tools.tool_observation.sha256Hex(checker_script),
+    };
+    var active = try syntheticActive(allocator, 2, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+    };
+    const sid = cc.session_id.SessionId.fromSlice("2123456789abcdef01234567").?;
+    var journal = try cc.tool_observation_journal.Journal.init(evidence_dir, sid);
+    const sink = journal.sink();
+    runtime.evidence_dir = evidence_dir;
+    runtime.observation_sink = sink;
+    var probe = Probe{};
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.tool_dispatcher = probe.dispatcher();
+    ctx.project_rule_gate = runtime.protocolGate();
+    ctx.tool_observer = sink;
+
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Read",
+        "{}",
+        "zero-match-no-checker",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(!done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    const marker_z = try allocator.dupeZ(u8, marker_path);
+    defer allocator.free(marker_z);
+    const marker_fd = pfs.open(marker_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (marker_fd >= 0) {
+        _ = pfs.close(marker_fd);
+        return error.CheckerUnexpectedlyRan;
+    }
+    try journal.finishRun("end_turn");
+    const binding = try journal.runBinding();
+    journal.deinit();
+
+    var observed = try cc.tool_observation_journal.loadRunDispatches(
+        allocator,
+        evidence_dir,
+        binding,
+    );
+    defer observed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), observed.formal_decisions.len);
+    try std.testing.expectEqual(@as(usize, 2), observed.rule_filters.len);
+    for (observed.rule_filters) |filter| {
+        try std.testing.expectEqual(@as(u32, 2), filter.active_rule_count);
+        try std.testing.expectEqual(@as(u32, 0), filter.checker_rule_count);
+        try std.testing.expectEqual(@as(u32, 2), filter.statically_pruned_rule_count);
+    }
+}
+
+test "L2 exact recovery retains source and Edit rules while pruning unrelated tools" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
+    defer allocator.free(evidence_dir);
+    try cc.util_fs.mkdirParents(evidence_dir);
+    const path = try std.fmt.allocPrint(allocator, "{s}/mixed-rules.txt", .{root});
+    defer allocator.free(path);
+    try overwriteArtifact(allocator, path, "before\n");
+
+    var active = try syntheticRecoveryWithEditAndBash(allocator, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+        .auto_exact_edit_recovery = true,
+    };
+    const sid = cc.session_id.SessionId.fromSlice("3123456789abcdef01234567").?;
+    var journal = try cc.tool_observation_journal.Journal.init(evidence_dir, sid);
+    const sink = journal.sink();
+    runtime.evidence_dir = evidence_dir;
+    runtime.observation_sink = sink;
+    var read_state = cc.core_read_state.ReadState.init(allocator);
+    defer read_state.deinit();
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.read_state = &read_state;
+    ctx.project_rule_gate = runtime.protocolGate();
+    ctx.tool_observer = sink;
+    const write_args = try std.json.Stringify.valueAlloc(allocator, .{
+        .file_path = path,
+        .content = "after\n",
+    }, .{});
+    defer allocator.free(write_args);
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        write_args,
+        "mixed-recovery",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(!done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    try journal.finishRun("end_turn");
+    const binding = try journal.runBinding();
+    journal.deinit();
+
+    var observed = try cc.tool_observation_journal.loadRunDispatches(
+        allocator,
+        evidence_dir,
+        binding,
+    );
+    defer observed.deinit();
+    try std.testing.expectEqual(@as(usize, 3), observed.rule_filters.len);
+    try std.testing.expectEqual(
+        cc.tools.tool_observation.RuleFilterOperation.ordinary,
+        observed.rule_filters[0].operation,
+    );
+    try std.testing.expectEqual(@as(u32, 1), observed.rule_filters[0].checker_rule_count);
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        observed.rule_filters[0].statically_pruned_rule_count,
+    );
+    for (observed.rule_filters[1..]) |filter| {
+        try std.testing.expectEqual(
+            cc.tools.tool_observation.RuleFilterOperation.exact_edit_recovery,
+            filter.operation,
+        );
+        try std.testing.expectEqual(@as(u32, 3), filter.active_rule_count);
+        try std.testing.expectEqual(@as(u32, 2), filter.checker_rule_count);
+        try std.testing.expectEqual(@as(u32, 1), filter.statically_pruned_rule_count);
+    }
+    try std.testing.expectEqual(@as(usize, 5), observed.formal_decisions.len);
+    const after = try readArtifact(allocator, path);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings("after\n", after);
+}
+
 test "L2 repeated identical signals retain distinct physical checker calls" {
     const config = testKernel() orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -3340,7 +3585,7 @@ test "L2 repeated identical signals retain distinct physical checker calls" {
     defer allocator.free(evidence_dir);
     try cc.util_fs.mkdirParents(evidence_dir);
 
-    var active = try syntheticActive(allocator, 1, config);
+    var active = try syntheticActiveForTool(allocator, 1, config, "Read");
     defer active.deinit();
     var runtime = cc.project_rule_gate.RuntimeGate{
         .allocator = allocator,

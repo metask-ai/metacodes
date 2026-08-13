@@ -104,6 +104,20 @@ pub const RunFormalDecision = struct {
     checker_bytes: u64,
 };
 
+pub const RunRuleFilter = struct {
+    sequence: u64,
+    dispatch_id: []const u8,
+    phase: observation.FormalPhase,
+    operation: observation.RuleFilterOperation,
+    project_sha256: [64]u8,
+    bundle_sha256: [64]u8,
+    bundle_revision: u64,
+    kernel_sha256: [64]u8,
+    active_rule_count: u32,
+    checker_rule_count: u32,
+    statically_pruned_rule_count: u32,
+};
+
 pub const BlockedVerdictBinding = struct {
     candidate_id: [64]u8,
     project_sha256: [64]u8,
@@ -117,6 +131,7 @@ pub const LoadedRunDispatches = struct {
     stop_reason: []const u8,
     dispatches: []const RunDispatch,
     formal_decisions: []const RunFormalDecision,
+    rule_filters: []const RunRuleFilter,
 
     pub fn deinit(self: *LoadedRunDispatches) void {
         self.arena.deinit();
@@ -405,6 +420,7 @@ pub fn loadRunDispatches(
     var interval_hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var records: std.ArrayList(RunDispatch) = .empty;
     var formal_decisions: std.ArrayList(RunFormalDecision) = .empty;
+    var rule_filters: std.ArrayList(RunRuleFilter) = .empty;
     var stop_reason: ?[]const u8 = null;
     var open = std.AutoHashMap([32]u8, usize).init(a);
     var lines = std.mem.splitScalar(u8, bytes, '\n');
@@ -431,6 +447,19 @@ pub fn loadRunDispatches(
                 stop_reason = finished.stop_reason;
             },
             .tool_observation => |event| switch (event) {
+                .rule_filter => |filter| try rule_filters.append(a, .{
+                    .sequence = envelope.sequence,
+                    .dispatch_id = filter.dispatch_id,
+                    .phase = filter.phase,
+                    .operation = filter.operation,
+                    .project_sha256 = filter.project_sha256,
+                    .bundle_sha256 = filter.bundle_sha256,
+                    .bundle_revision = filter.bundle_revision,
+                    .kernel_sha256 = filter.kernel_sha256,
+                    .active_rule_count = filter.active_rule_count,
+                    .checker_rule_count = filter.checker_rule_count,
+                    .statically_pruned_rule_count = filter.statically_pruned_rule_count,
+                }),
                 .formal_decision => |formal| try formal_decisions.append(a, .{
                     .sequence = envelope.sequence,
                     .dispatch_id = formal.dispatch_id,
@@ -463,6 +492,10 @@ pub fn loadRunDispatches(
                             u8,
                             batch.schema_version,
                             observation.FORMAL_BATCH_SCHEMA_VERSION,
+                        ) or std.mem.eql(
+                            u8,
+                            batch.schema_version,
+                            observation.FORMAL_BATCH_SCHEMA_VERSION_V4,
                         )) decision.operation else standardFormalOperation(batch.phase),
                         .actuation = batch.actuation,
                         .file_target_state = batch.file_target_state,
@@ -533,6 +566,7 @@ pub fn loadRunDispatches(
         .stop_reason = stop_reason orelse return error.InvalidRunBinding,
         .dispatches = try records.toOwnedSlice(a),
         .formal_decisions = try formal_decisions.toOwnedSlice(a),
+        .rule_filters = try rule_filters.toOwnedSlice(a),
     };
 }
 
@@ -605,6 +639,14 @@ fn validateFd(
     defer pre_decisions.deinit();
     var formal_dispatches = std.AutoHashMap([32]u8, FormalDispatchState).init(std.heap.c_allocator);
     defer formal_dispatches.deinit();
+    var pending_rule_filters = std.AutoHashMap([32]u8, PendingRuleFilter).init(
+        std.heap.c_allocator,
+    );
+    defer pending_rule_filters.deinit();
+    var rule_filter_identities = std.AutoHashMap([32]u8, RuleFilterIdentity).init(
+        std.heap.c_allocator,
+    );
+    defer rule_filter_identities.deinit();
     var formal_validation = FormalValidationState{
         .open_dispatches = &open_dispatches,
         .seen_dispatches = &seen_dispatches,
@@ -630,7 +672,8 @@ fn validateFd(
             return error.InvalidRecord;
         switch (envelope.event) {
             .run_started => {
-                if (active_run != null or open_dispatches.count() != 0)
+                if (active_run != null or open_dispatches.count() != 0 or
+                    pending_rule_filters.count() != 0)
                     return error.InvalidRecord;
                 active_run = run_id;
                 active_elapsed_ns = envelope.monotonic_elapsed_ns;
@@ -659,6 +702,13 @@ fn validateFd(
                     }
                 }
                 switch (tool_event) {
+                    .rule_filter => |filter| {
+                        try validateRuleFilter(&rule_filter_identities, filter);
+                        const key = ruleFilterKey(filter.dispatch_id, filter.phase);
+                        const entry = try pending_rule_filters.getOrPut(key);
+                        if (entry.found_existing) return error.InvalidRecord;
+                        entry.value_ptr.* = PendingRuleFilter.from(filter);
+                    },
                     .formal_decision => |formal| {
                         const legacy = std.mem.eql(
                             u8,
@@ -709,12 +759,18 @@ fn validateFd(
                             batch.schema_version,
                             observation.FORMAL_BATCH_SCHEMA_VERSION_V3,
                         );
+                        const legacy_v4 = std.mem.eql(
+                            u8,
+                            batch.schema_version,
+                            observation.FORMAL_BATCH_SCHEMA_VERSION_V4,
+                        );
                         const current_schema = std.mem.eql(
                             u8,
                             batch.schema_version,
                             observation.FORMAL_BATCH_SCHEMA_VERSION,
                         );
-                        if ((!legacy_v1 and !legacy_v2 and !legacy_v3 and !current_schema) or
+                        if ((!legacy_v1 and !legacy_v2 and !legacy_v3 and !legacy_v4 and
+                            !current_schema) or
                             (legacy_v1 and batch.actuation != .enforced) or
                             batch.decisions.len == 0 or
                             batch.decisions.len > batch.checker_batch_size or
@@ -722,8 +778,15 @@ fn validateFd(
                             (batch.decisions.len < batch.checker_batch_size and
                                 batch.decisions[batch.decisions.len - 1].result == .admit))
                             return error.InvalidRecord;
+                        if (current_schema) {
+                            const filter = pending_rule_filters.fetchRemove(ruleFilterKey(
+                                batch.dispatch_id,
+                                batch.phase,
+                            )) orelse return error.InvalidRecord;
+                            if (!filter.value.matchesBatch(batch)) return error.InvalidRecord;
+                        }
                         for (batch.decisions, 0..) |decision, decision_index| {
-                            const operation = if (current_schema)
+                            const operation = if (current_schema or legacy_v4)
                                 decision.operation
                             else
                                 standardFormalOperation(batch.phase);
@@ -765,6 +828,18 @@ fn validateFd(
                             return error.InvalidRecord;
                         const key = dispatchKey(started.id);
                         if (seen_dispatches.contains(key)) return error.InvalidRecord;
+                        if (pending_rule_filters.fetchRemove(ruleFilterKey(
+                            started.id,
+                            .pre,
+                        ))) |entry| {
+                            if (entry.value.phase != .pre or
+                                entry.value.checker_rule_count != 0)
+                                return error.InvalidRecord;
+                        } else if (rule_filter_identities.contains(key) and
+                            formal_dispatches.get(key) == null)
+                        {
+                            return error.InvalidRecord;
+                        }
                         try seen_dispatches.put(key, 0);
                         const formal_state = formal_dispatches.getPtr(key);
                         if (formal_state) |state| {
@@ -796,6 +871,18 @@ fn validateFd(
                             return error.InvalidRecord;
                         const entry = open_dispatches.fetchRemove(dispatchKey(finished.id)) orelse
                             return error.InvalidRecord;
+                        if (pending_rule_filters.fetchRemove(ruleFilterKey(
+                            finished.id,
+                            .post,
+                        ))) |filter_entry| {
+                            if (filter_entry.value.phase != .post or
+                                filter_entry.value.checker_rule_count != 0)
+                                return error.InvalidRecord;
+                        } else if (rule_filter_identities.contains(dispatchKey(finished.id)) and
+                            formal_dispatches.get(dispatchKey(finished.id)) == null)
+                        {
+                            return error.InvalidRecord;
+                        }
                         if (!std.meta.eql(entry.value.identity, dispatchIdentity(
                             finished.requested_name,
                             finished.dispatched_name,
@@ -814,7 +901,7 @@ fn validateFd(
                 const current = active_run orelse return error.InvalidRecord;
                 if (!std.mem.eql(u8, current.asSlice(), run_id.asSlice()) or
                     envelope.monotonic_elapsed_ns < active_elapsed_ns or
-                    open_dispatches.count() != 0)
+                    open_dispatches.count() != 0 or pending_rule_filters.count() != 0)
                     return error.InvalidRecord;
                 var formal_states = formal_dispatches.valueIterator();
                 while (formal_states.next()) |state| {
@@ -840,6 +927,7 @@ fn validateFd(
                 formal_events.clearRetainingCapacity();
                 pre_decisions.clearRetainingCapacity();
                 formal_dispatches.clearRetainingCapacity();
+                rule_filter_identities.clearRetainingCapacity();
             },
         }
         expected_sequence += 1;
@@ -863,6 +951,50 @@ fn dispatchKey(id: []const u8) [32]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(id, &digest, .{});
     return digest;
+}
+
+fn ruleFilterKey(id: []const u8, phase: observation.FormalPhase) [32]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("metacodes-project-rule-filter-key-v1\x00");
+    hasher.update(id);
+    hasher.update(&.{@intFromEnum(phase)});
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn validateRuleFilter(
+    identities: *std.AutoHashMap([32]u8, RuleFilterIdentity),
+    filter: @FieldType(observation.Event, "rule_filter"),
+) !void {
+    if (!std.mem.eql(u8, filter.schema_version, observation.RULE_FILTER_SCHEMA_VERSION) or
+        filter.dispatch_id.len == 0 or filter.dispatch_id.len > 256 or
+        !std.mem.eql(
+            u8,
+            filter.proof,
+            "MetaCodesControl.ProjectRule.target_tool_mismatch_admits_both",
+        ) or
+        filter.bundle_revision == 0 or filter.active_rule_count == 0 or
+        filter.checker_rule_count > filter.active_rule_count or
+        filter.statically_pruned_rule_count !=
+            filter.active_rule_count - filter.checker_rule_count or
+        !validHex(filter.project_sha256) or !validHex(filter.bundle_sha256) or
+        !validHex(filter.kernel_sha256) or
+        (filter.operation == .exact_edit_recovery and filter.checker_rule_count == 0))
+        return error.InvalidRecord;
+    const identity = RuleFilterIdentity{
+        .project_sha256 = filter.project_sha256,
+        .bundle_sha256 = filter.bundle_sha256,
+        .bundle_revision = filter.bundle_revision,
+        .kernel_sha256 = filter.kernel_sha256,
+        .active_rule_count = filter.active_rule_count,
+    };
+    const entry = try identities.getOrPut(dispatchKey(filter.dispatch_id));
+    if (entry.found_existing) {
+        if (!std.meta.eql(entry.value_ptr.*, identity)) return error.InvalidRecord;
+    } else {
+        entry.value_ptr.* = identity;
+    }
 }
 
 fn validHex(value: [64]u8) bool {
@@ -894,6 +1026,54 @@ const FormalControlIdentity = struct {
     bundle_revision: u64,
     kernel_sha256: [64]u8,
     actuation: observation.FormalActuation,
+};
+
+const RuleFilterIdentity = struct {
+    project_sha256: [64]u8,
+    bundle_sha256: [64]u8,
+    bundle_revision: u64,
+    kernel_sha256: [64]u8,
+    active_rule_count: u32,
+};
+
+const PendingRuleFilter = struct {
+    phase: observation.FormalPhase,
+    operation: observation.RuleFilterOperation,
+    identity: RuleFilterIdentity,
+    checker_rule_count: u32,
+
+    fn from(filter: @FieldType(observation.Event, "rule_filter")) PendingRuleFilter {
+        return .{
+            .phase = filter.phase,
+            .operation = filter.operation,
+            .identity = .{
+                .project_sha256 = filter.project_sha256,
+                .bundle_sha256 = filter.bundle_sha256,
+                .bundle_revision = filter.bundle_revision,
+                .kernel_sha256 = filter.kernel_sha256,
+                .active_rule_count = filter.active_rule_count,
+            },
+            .checker_rule_count = filter.checker_rule_count,
+        };
+    }
+
+    fn matchesBatch(
+        self: PendingRuleFilter,
+        batch: @FieldType(observation.Event, "formal_decision_batch"),
+    ) bool {
+        if (self.phase != batch.phase or
+            self.checker_rule_count != batch.checker_batch_size or
+            !std.mem.eql(u8, &self.identity.project_sha256, &batch.project_sha256) or
+            !std.mem.eql(u8, &self.identity.bundle_sha256, &batch.bundle_sha256) or
+            self.identity.bundle_revision != batch.bundle_revision or
+            !std.mem.eql(u8, &self.identity.kernel_sha256, &batch.kernel_sha256))
+            return false;
+        var saw_recovery = false;
+        for (batch.decisions) |decision| {
+            if (decision.operation.isRecovery()) saw_recovery = true;
+        }
+        return (self.operation == .exact_edit_recovery) == saw_recovery;
+    }
 };
 
 const FormalDispatchState = struct {
@@ -1356,7 +1536,7 @@ fn testFormalBatchEvent(
     batch_size: u32,
     decisions: []const observation.FormalCandidateDecision,
 ) observation.Event {
-    return .{ .formal_decision_batch = .{
+    var result = observation.Event{ .formal_decision_batch = .{
         .dispatch_id = dispatch_id,
         .phase = phase,
         .project_sha256 = .{'b'} ** 64,
@@ -1370,6 +1550,42 @@ fn testFormalBatchEvent(
         .checker_bytes = 1,
         .decisions = decisions,
     } };
+    // Existing validator fixtures predate relevance filters and deliberately
+    // exercise the v4 compatibility path. New v5 fixtures opt in explicitly.
+    result.formal_decision_batch.schema_version =
+        observation.FORMAL_BATCH_SCHEMA_VERSION_V4;
+    return result;
+}
+
+fn testRuleFilterEvent(
+    dispatch_id: []const u8,
+    phase: observation.FormalPhase,
+    checker_rule_count: u32,
+    operation: observation.RuleFilterOperation,
+) observation.Event {
+    return .{ .rule_filter = .{
+        .dispatch_id = dispatch_id,
+        .phase = phase,
+        .operation = operation,
+        .project_sha256 = .{'b'} ** 64,
+        .bundle_sha256 = .{'c'} ** 64,
+        .bundle_revision = 1,
+        .kernel_sha256 = .{'d'} ** 64,
+        .active_rule_count = 2,
+        .checker_rule_count = checker_rule_count,
+        .statically_pruned_rule_count = 2 - checker_rule_count,
+    } };
+}
+
+fn testCurrentFormalBatchEvent(
+    dispatch_id: []const u8,
+    phase: observation.FormalPhase,
+    batch_size: u32,
+    decisions: []const observation.FormalCandidateDecision,
+) observation.Event {
+    var result = testFormalBatchEvent(dispatch_id, phase, batch_size, decisions);
+    result.formal_decision_batch.schema_version = observation.FORMAL_BATCH_SCHEMA_VERSION;
+    return result;
 }
 
 fn testDispatchStart(id: []const u8) observation.Event {
@@ -1587,6 +1803,174 @@ test "formal journal enforces pre dispatch post finish wiring and permits pre bl
     };
     try writeTestRun(batch_dir, sid, &batch_complete);
     _ = try validate(batch_dir, sid);
+
+    const current_batch_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/batch-current",
+        .{root},
+    );
+    defer std.testing.allocator.free(current_batch_dir);
+    const current_batch = [_]observation.Event{
+        testRuleFilterEvent("batch-current", .pre, 2, .ordinary),
+        testCurrentFormalBatchEvent("batch-current", .pre, 2, &batch_pre_decisions),
+        testDispatchStart("batch-current"),
+        testRuleFilterEvent("batch-current", .post, 2, .ordinary),
+        testCurrentFormalBatchEvent("batch-current", .post, 2, &batch_post_decisions),
+        testDispatchFinish("batch-current"),
+    };
+    try writeTestRun(current_batch_dir, sid, &current_batch);
+    _ = try validate(current_batch_dir, sid);
+
+    const missing_filter_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/batch-current-missing-filter",
+        .{root},
+    );
+    defer std.testing.allocator.free(missing_filter_dir);
+    const missing_filter = [_]observation.Event{
+        testCurrentFormalBatchEvent(
+            "batch-current-missing-filter",
+            .pre,
+            2,
+            &batch_pre_decisions,
+        ),
+    };
+    try writeTestRun(missing_filter_dir, sid, &missing_filter);
+    try std.testing.expectError(error.InvalidRecord, validate(missing_filter_dir, sid));
+
+    const zero_filter_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/zero-filter",
+        .{root},
+    );
+    defer std.testing.allocator.free(zero_filter_dir);
+    const zero_filter = [_]observation.Event{
+        testRuleFilterEvent("zero-filter", .pre, 0, .ordinary),
+        testDispatchStart("zero-filter"),
+        testRuleFilterEvent("zero-filter", .post, 0, .ordinary),
+        testDispatchFinish("zero-filter"),
+    };
+    try writeTestRun(zero_filter_dir, sid, &zero_filter);
+    _ = try validate(zero_filter_dir, sid);
+
+    const count_mismatch_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/filter-count-mismatch",
+        .{root},
+    );
+    defer std.testing.allocator.free(count_mismatch_dir);
+    const count_mismatch = [_]observation.Event{
+        testRuleFilterEvent("filter-count-mismatch", .pre, 1, .ordinary),
+        testCurrentFormalBatchEvent(
+            "filter-count-mismatch",
+            .pre,
+            2,
+            &batch_pre_decisions,
+        ),
+    };
+    try writeTestRun(count_mismatch_dir, sid, &count_mismatch);
+    try std.testing.expectError(error.InvalidRecord, validate(count_mismatch_dir, sid));
+
+    const proof_mismatch_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/filter-proof-mismatch",
+        .{root},
+    );
+    defer std.testing.allocator.free(proof_mismatch_dir);
+    var wrong_proof = testRuleFilterEvent("filter-proof-mismatch", .pre, 0, .ordinary);
+    wrong_proof.rule_filter.proof = "unproved_host_optimization";
+    const proof_mismatch = [_]observation.Event{wrong_proof};
+    try writeTestRun(proof_mismatch_dir, sid, &proof_mismatch);
+    try std.testing.expectError(error.InvalidRecord, validate(proof_mismatch_dir, sid));
+
+    const revision_mismatch_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/filter-revision-mismatch",
+        .{root},
+    );
+    defer std.testing.allocator.free(revision_mismatch_dir);
+    var wrong_revision = testRuleFilterEvent(
+        "filter-revision-mismatch",
+        .pre,
+        2,
+        .ordinary,
+    );
+    wrong_revision.rule_filter.bundle_revision = 2;
+    const revision_mismatch = [_]observation.Event{
+        wrong_revision,
+        testCurrentFormalBatchEvent(
+            "filter-revision-mismatch",
+            .pre,
+            2,
+            &batch_pre_decisions,
+        ),
+    };
+    try writeTestRun(revision_mismatch_dir, sid, &revision_mismatch);
+    try std.testing.expectError(error.InvalidRecord, validate(revision_mismatch_dir, sid));
+
+    const dangling_filter_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/dangling-filter",
+        .{root},
+    );
+    defer std.testing.allocator.free(dangling_filter_dir);
+    const dangling_filter = [_]observation.Event{
+        testRuleFilterEvent("dangling-filter", .pre, 0, .ordinary),
+    };
+    try writeTestRun(dangling_filter_dir, sid, &dangling_filter);
+    try std.testing.expectError(error.InvalidRecord, validate(dangling_filter_dir, sid));
+
+    // Concurrent tool completion may interleave filter and checker events.
+    // The binding is keyed by dispatch and phase rather than being a fragile
+    // global "next filter" slot.
+    const interleaved_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/interleaved-filters",
+        .{root},
+    );
+    defer std.testing.allocator.free(interleaved_dir);
+    const interleaved = [_]observation.Event{
+        testRuleFilterEvent("interleaved-a", .pre, 2, .ordinary),
+        testRuleFilterEvent("interleaved-b", .pre, 2, .ordinary),
+        testCurrentFormalBatchEvent("interleaved-b", .pre, 2, &batch_pre_decisions),
+        testCurrentFormalBatchEvent("interleaved-a", .pre, 2, &batch_pre_decisions),
+        testDispatchStart("interleaved-a"),
+        testDispatchStart("interleaved-b"),
+        testRuleFilterEvent("interleaved-a", .post, 2, .ordinary),
+        testRuleFilterEvent("interleaved-b", .post, 2, .ordinary),
+        testCurrentFormalBatchEvent("interleaved-b", .post, 2, &batch_post_decisions),
+        testCurrentFormalBatchEvent("interleaved-a", .post, 2, &batch_post_decisions),
+        testDispatchFinish("interleaved-b"),
+        testDispatchFinish("interleaved-a"),
+    };
+    try writeTestRun(interleaved_dir, sid, &interleaved);
+    _ = try validate(interleaved_dir, sid);
+
+    const forged_recovery_filter_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/forged-recovery-filter",
+        .{root},
+    );
+    defer std.testing.allocator.free(forged_recovery_filter_dir);
+    const forged_recovery_filter = [_]observation.Event{
+        testRuleFilterEvent(
+            "forged-recovery-filter",
+            .pre,
+            2,
+            .exact_edit_recovery,
+        ),
+        testCurrentFormalBatchEvent(
+            "forged-recovery-filter",
+            .pre,
+            2,
+            &batch_pre_decisions,
+        ),
+    };
+    try writeTestRun(forged_recovery_filter_dir, sid, &forged_recovery_filter);
+    try std.testing.expectError(
+        error.InvalidRecord,
+        validate(forged_recovery_filter_dir, sid),
+    );
 
     const truncated_batch_dir = try std.fmt.allocPrint(
         std.testing.allocator,
