@@ -32,6 +32,7 @@ from scripts.eval.workbuddy.key_fd import (
 )
 from scripts.eval.workbuddy.trace import (
     CONTROL_METRICS_SCHEMA,
+    RULE_FILTER_PROOF,
     OBSERVATION_JOURNAL_SCHEMA,
     TOOL_OBSERVATION_SCHEMA,
     TraceError,
@@ -272,6 +273,55 @@ class WorkBuddyTraceTest(unittest.TestCase):
         self.assertEqual(metrics["lean"]["enforced_blocks"], 1)
         self.assertEqual(metrics["lean"]["recovery_directions"], 1)
         self.assertEqual(metrics["lean"]["checker_elapsed_ns"], 7000)
+
+    def test_control_metrics_count_zero_checker_rule_filters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(transcript, [{"role": "user", "blocks": []}])
+            identity = {
+                "schema_version": "metacodes-project-rule-filter-v1",
+                "operation": "ordinary",
+                "project_sha256": "1" * 64,
+                "bundle_sha256": "2" * 64,
+                "bundle_revision": 7,
+                "kernel_sha256": "3" * 64,
+                "active_rule_count": 2,
+                "checker_rule_count": 0,
+                "statically_pruned_rule_count": 2,
+                "proof": RULE_FILTER_PROOF,
+            }
+            start = {
+                "schema_version": TOOL_OBSERVATION_SCHEMA,
+                "id": "filtered-read",
+                "requested_name": "Read",
+                "dispatched_name": "Read",
+                "origin": "authoritative",
+                "agent_depth": 0,
+            }
+            self._write_jsonl(
+                observation,
+                self._journal(
+                    {"tool_observation": {"rule_filter": {
+                        **identity, "dispatch_id": "filtered-read", "phase": "pre",
+                    }}},
+                    {"tool_observation": {"dispatch_started": start}},
+                    {"tool_observation": {"rule_filter": {
+                        **identity, "dispatch_id": "filtered-read", "phase": "post",
+                    }}},
+                    {"tool_observation": {"dispatch_finished": {
+                        **start, "outcome": "succeeded",
+                    }}},
+                ),
+            )
+            metrics = load_control_metrics(transcript, observation)
+        self.assertTrue(metrics["lean"]["used"])
+        self.assertEqual(metrics["lean"]["checker_calls"], 0)
+        self.assertEqual(metrics["lean"]["rule_filter_events"], 2)
+        self.assertEqual(metrics["lean"]["active_rule_phases"], 4)
+        self.assertEqual(metrics["lean"]["checker_rule_phases"], 0)
+        self.assertEqual(metrics["lean"]["statically_pruned_rule_phases"], 4)
 
     def test_control_metrics_count_tinykg_routing_trust_and_task_commit(self):
         calls = [

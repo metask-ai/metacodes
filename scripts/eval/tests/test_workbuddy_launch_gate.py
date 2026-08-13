@@ -44,6 +44,7 @@ from scripts.eval.workbuddy.launch_gate import (
     validate_launch_manifest,
 )
 from scripts.eval.workbuddy.trace import (
+    LEGACY_CONTROL_METRICS_SCHEMA,
     OBSERVATION_JOURNAL_SCHEMA,
     OBSERVATION_FILENAME,
     load_control_metrics,
@@ -826,6 +827,62 @@ with urllib.request.urlopen(
                     transcript_path=transcript,
                     observation_path=observation,
                 )
+
+    def test_legacy_control_metrics_are_accepted_only_without_filter_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "metacodes-transcript.jsonl"
+            observation = root / OBSERVATION_FILENAME
+            trajectory = root / "trajectory.json"
+            transcript.write_text(
+                json.dumps({"role": "user", "blocks": []}) + "\n",
+                encoding="utf-8",
+            )
+            rows = [
+                {"schema_version": OBSERVATION_JOURNAL_SCHEMA, "sequence": 0,
+                 "session_id": "legacy-session", "run_id": "legacy-run",
+                 "monotonic_elapsed_ns": 0, "event": {"run_started": {}}},
+                {"schema_version": OBSERVATION_JOURNAL_SCHEMA, "sequence": 1,
+                 "session_id": "legacy-session", "run_id": "legacy-run",
+                 "monotonic_elapsed_ns": 1, "event": {"run_finished": {}}},
+            ]
+            observation.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            trajectory.write_text("{}\n", encoding="utf-8")
+            current = load_control_metrics(transcript, observation)
+            legacy = json.loads(json.dumps(current))
+            legacy["schema_version"] = LEGACY_CONTROL_METRICS_SCHEMA
+            for name in (
+                "rule_filter_events",
+                "active_rule_phases",
+                "checker_rule_phases",
+                "statically_pruned_rule_phases",
+            ):
+                legacy["lean"].pop(name)
+            normalized = _validate_control_metrics(
+                legacy,
+                trajectory_path=trajectory,
+                transcript_path=transcript,
+                observation_path=observation,
+            )
+            self.assertEqual(normalized, current)
+
+            filtered = json.loads(json.dumps(current))
+            filtered["lean"]["rule_filter_events"] = 1
+            filtered["lean"]["active_rule_phases"] = 1
+            with mock.patch(
+                "scripts.eval.workbuddy.launch_gate.load_control_metrics",
+                return_value=filtered,
+            ):
+                with self.assertRaisesRegex(LaunchError, "cannot represent"):
+                    _validate_control_metrics(
+                        legacy,
+                        trajectory_path=trajectory,
+                        transcript_path=transcript,
+                        observation_path=observation,
+                    )
 
     def test_control_metrics_wave_aggregation_sums_counts_but_preserves_maxima(self):
         def row(*, elapsed: int, maximum: int, kernel: str, used: bool):

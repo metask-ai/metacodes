@@ -54,6 +54,7 @@ from .stage_artifacts import (
 )
 from .trace import (
     CONTROL_METRICS_SCHEMA,
+    LEGACY_CONTROL_METRICS_SCHEMA,
     OBSERVATION_FILENAME,
     TraceError,
     load_control_metrics,
@@ -1069,7 +1070,10 @@ def _validate_control_metrics(
 ) -> Dict[str, Any]:
     """Validate post-run mechanism evidence before it enters a quality receipt."""
 
-    if not isinstance(value, dict) or value.get("schema_version") != CONTROL_METRICS_SCHEMA:
+    if not isinstance(value, dict) or value.get("schema_version") not in {
+        LEGACY_CONTROL_METRICS_SCHEMA,
+        CONTROL_METRICS_SCHEMA,
+    }:
         raise LaunchError("trajectory is missing the versioned control metrics")
     if set(value) != {
         "schema_version",
@@ -1153,7 +1157,21 @@ def _validate_control_metrics(
     }:
         raise LaunchError("control metrics privacy contract drifted")
     observed = load_control_metrics(transcript_path, observation_path)
-    if observed != value:
+    comparable = observed
+    if value.get("schema_version") == LEGACY_CONTROL_METRICS_SCHEMA:
+        filter_fields = (
+            "rule_filter_events",
+            "active_rule_phases",
+            "checker_rule_phases",
+            "statically_pruned_rule_phases",
+        )
+        if any(observed["lean"].get(name) != 0 for name in filter_fields):
+            raise LaunchError("legacy control metrics cannot represent project rule filtering")
+        comparable = json.loads(json.dumps(observed))
+        comparable["schema_version"] = LEGACY_CONTROL_METRICS_SCHEMA
+        for name in filter_fields:
+            comparable["lean"].pop(name)
+    if comparable != value:
         raise LaunchError(
             f"trajectory control metrics do not match the bound artifacts: {trajectory_path}"
         )
@@ -1161,7 +1179,7 @@ def _validate_control_metrics(
     # authority through the derived metrics object.
     if any(not isinstance(key, str) for key in value):
         raise LaunchError("control metrics has a non-string key")
-    return value
+    return observed
 
 
 def _non_negative_control_int(value: object, where: str) -> int:

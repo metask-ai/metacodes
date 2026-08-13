@@ -19,16 +19,26 @@ from urllib.parse import urlsplit, urlunsplit
 
 
 MAX_TRACE_BYTES = 64 * 1024 * 1024
-CONTROL_METRICS_SCHEMA = "metacodes-workbuddy-control-metrics-v1"
+LEGACY_CONTROL_METRICS_SCHEMA = "metacodes-workbuddy-control-metrics-v1"
+CONTROL_METRICS_SCHEMA = "metacodes-workbuddy-control-metrics-v2"
+CONTROL_METRICS_SCHEMAS = frozenset(
+    {LEGACY_CONTROL_METRICS_SCHEMA, CONTROL_METRICS_SCHEMA}
+)
 OBSERVATION_JOURNAL_SCHEMA = "metacodes-tool-observation-journal-v1"
 TOOL_OBSERVATION_SCHEMA = "metacodes-tool-observation-v1"
+RULE_FILTER_SCHEMA = "metacodes-project-rule-filter-v1"
+RULE_FILTER_PROOF = (
+    "MetaCodesControl.ProjectRule.target_tool_mismatch_admits_both"
+)
 FORMAL_DECISION_SCHEMAS = {
     "metacodes-project-formal-decision-v1",
     "metacodes-project-formal-decision-v2",
     "metacodes-project-formal-decision-batch-v2",
     "metacodes-project-formal-decision-batch-v3",
     "metacodes-project-formal-decision-batch-v4",
+    "metacodes-project-formal-decision-batch-v5",
 }
+CURRENT_FORMAL_BATCH_SCHEMA = "metacodes-project-formal-decision-batch-v5"
 OBSERVATION_FILENAME = "metacodes-tool-observations.jsonl"
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _KG_TOOLS = {"KgRemember", "KgRecall", "KgContext"}
@@ -621,7 +631,16 @@ def _formal_decision_metrics(payload: Mapping[str, Any], *, batch: bool) -> Dict
     if batch:
         decisions = payload.get("decisions")
         size = _non_negative_int(payload.get("checker_batch_size"), "formal batch size")
-        if not isinstance(decisions, list) or not decisions or size != len(decisions):
+        if (
+            not isinstance(decisions, list)
+            or not decisions
+            or len(decisions) > size
+            or (
+                len(decisions) < size
+                and isinstance(decisions[-1], dict)
+                and decisions[-1].get("result") == "admit"
+            )
+        ):
             raise TraceError("formal decision batch cardinality is inconsistent")
         checker_call = _hex_identity(
             payload.get("checker_call_sha256"), "formal checker call identity"
@@ -686,6 +705,55 @@ def _formal_decision_metrics(payload: Mapping[str, Any], *, batch: bool) -> Dict
     }
 
 
+def _rule_filter_metrics(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    if payload.get("schema_version") != RULE_FILTER_SCHEMA:
+        raise TraceError("project rule filter schema is unsupported")
+    dispatch_id = payload.get("dispatch_id")
+    phase = payload.get("phase")
+    operation = payload.get("operation")
+    if not isinstance(dispatch_id, str) or not dispatch_id:
+        raise TraceError("project rule filter dispatch identity is invalid")
+    if phase not in {"pre", "post"} or operation not in {
+        "ordinary",
+        "exact_edit_recovery",
+    }:
+        raise TraceError("project rule filter phase or operation is invalid")
+    if payload.get("proof") != RULE_FILTER_PROOF:
+        raise TraceError("project rule filter proof identity is invalid")
+    active = _non_negative_int(payload.get("active_rule_count"), "active rule count")
+    checker = _non_negative_int(
+        payload.get("checker_rule_count"), "checker rule count"
+    )
+    pruned = _non_negative_int(
+        payload.get("statically_pruned_rule_count"), "statically pruned rule count"
+    )
+    if active == 0 or checker > active or pruned != active - checker:
+        raise TraceError("project rule filter cardinality is inconsistent")
+    if operation == "exact_edit_recovery" and checker == 0:
+        raise TraceError("exact recovery filter erased its source rule")
+    revision = _non_negative_int(payload.get("bundle_revision"), "filter bundle revision")
+    if revision == 0:
+        raise TraceError("project rule filter bundle revision is invalid")
+    return {
+        "dispatch_id": dispatch_id,
+        "phase": phase,
+        "operation": operation,
+        "project_sha256": _hex_identity(
+            payload.get("project_sha256"), "filter project identity"
+        ),
+        "bundle_sha256": _hex_identity(
+            payload.get("bundle_sha256"), "filter bundle identity"
+        ),
+        "bundle_revision": revision,
+        "kernel_sha256": _hex_identity(
+            payload.get("kernel_sha256"), "filter kernel identity"
+        ),
+        "active_rule_count": active,
+        "checker_rule_count": checker,
+        "statically_pruned_rule_count": pruned,
+    }
+
+
 def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
     records = list(rows)
     if len(records) < 2:
@@ -722,7 +790,14 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
         "post_decisions": 0,
         "recovery_pre_decisions": 0,
         "recovery_post_decisions": 0,
+        "rule_filter_events": 0,
+        "active_rule_phases": 0,
+        "checker_rule_phases": 0,
+        "statically_pruned_rule_phases": 0,
     }
+    rule_filters: Dict[tuple[str, str], Dict[str, Any]] = {}
+    filters_by_dispatch: Dict[str, Dict[str, Any]] = {}
+    consumed_filters: set[tuple[str, str]] = set()
     checker_calls = set()
     kernel_ids = set()
     bundle_ids = set()
@@ -778,6 +853,16 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                 dispatch_id = observation.get("id")
                 if not isinstance(dispatch_id, str) or not dispatch_id or dispatch_id in started:
                     raise TraceError("dispatch start identity is invalid or duplicated")
+                zero_filter = rule_filters.pop((dispatch_id, "pre"), None)
+                if zero_filter is not None and zero_filter["checker_rule_count"] != 0:
+                    raise TraceError("checker-backed pre filter bypassed its formal batch")
+                if zero_filter is not None:
+                    consumed_filters.add((dispatch_id, "pre"))
+                if (
+                    dispatch_id in filters_by_dispatch
+                    and (dispatch_id, "pre") not in consumed_filters
+                ):
+                    raise TraceError("filtered dispatch is missing its pre authorization path")
                 started[dispatch_id] = observation
             elif observation_kind == "dispatch_finished":
                 if observation.get("schema_version") != TOOL_OBSERVATION_SCHEMA:
@@ -788,12 +873,51 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                 outcome = observation.get("outcome")
                 if outcome not in outcome_counts:
                     raise TraceError("dispatch outcome is invalid")
+                zero_filter = rule_filters.pop((dispatch_id, "post"), None)
+                if zero_filter is not None and zero_filter["checker_rule_count"] != 0:
+                    raise TraceError("checker-backed post filter bypassed its formal batch")
+                if zero_filter is not None:
+                    consumed_filters.add((dispatch_id, "post"))
+                if (
+                    dispatch_id in filters_by_dispatch
+                    and (dispatch_id, "post") not in consumed_filters
+                ):
+                    raise TraceError("filtered dispatch is missing its post authorization path")
                 outcome_counts[outcome] += 1
                 finished[dispatch_id] = observation
             elif observation_kind in {"formal_decision", "formal_decision_batch"}:
+                if (
+                    observation_kind == "formal_decision_batch"
+                    and observation.get("schema_version") == CURRENT_FORMAL_BATCH_SCHEMA
+                ):
+                    filter_key = (str(observation.get("dispatch_id")), str(observation.get("phase")))
+                    filter_item = rule_filters.pop(filter_key, None)
+                    if filter_item is None:
+                        raise TraceError("current formal batch is missing its rule filter")
+                    if (
+                        filter_item["checker_rule_count"]
+                        != observation.get("checker_batch_size")
+                        or filter_item["project_sha256"]
+                        != observation.get("project_sha256")
+                        or filter_item["bundle_sha256"] != observation.get("bundle_sha256")
+                        or filter_item["kernel_sha256"] != observation.get("kernel_sha256")
+                        or filter_item["bundle_revision"]
+                        != observation.get("bundle_revision")
+                    ):
+                        raise TraceError("project rule filter does not bind its formal batch")
+                    consumed_filters.add(filter_key)
                 item = _formal_decision_metrics(
                     observation, batch=observation_kind == "formal_decision_batch"
                 )
+                if observation_kind == "formal_decision_batch" and observation.get(
+                    "schema_version"
+                ) == CURRENT_FORMAL_BATCH_SCHEMA:
+                    saw_recovery = (
+                        item["operations"]["recovery_pre_decision"]
+                        + item["operations"]["recovery_post_decision"]
+                    ) > 0
+                    if (filter_item["operation"] == "exact_edit_recovery") != saw_recovery:
+                        raise TraceError("project rule filter operation disagrees with its batch")
                 call_id = item["checker_call_sha256"]
                 if call_id in checker_calls:
                     raise TraceError("formal checker call identity was reused")
@@ -815,12 +939,40 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                 )
                 for operation, count in item["operations"].items():
                     formal[f"{operation.removesuffix('_decision')}_decisions"] += count
+            elif observation_kind == "rule_filter":
+                item = _rule_filter_metrics(observation)
+                key = (item["dispatch_id"], item["phase"])
+                if key in rule_filters:
+                    raise TraceError("project rule filter was duplicated")
+                prior = filters_by_dispatch.get(item["dispatch_id"])
+                identity = {
+                    name: item[name]
+                    for name in (
+                        "project_sha256",
+                        "bundle_sha256",
+                        "bundle_revision",
+                        "kernel_sha256",
+                        "active_rule_count",
+                    )
+                }
+                if prior is not None and prior != identity:
+                    raise TraceError("project rule filter identity drifted")
+                filters_by_dispatch[item["dispatch_id"]] = identity
+                rule_filters[key] = item
+                formal["rule_filter_events"] += 1
+                formal["active_rule_phases"] += item["active_rule_count"]
+                formal["checker_rule_phases"] += item["checker_rule_count"]
+                formal["statically_pruned_rule_phases"] += item[
+                    "statically_pruned_rule_count"
+                ]
             else:
                 raise TraceError("tool observation kind is unsupported")
     if run_started != 1 or run_finished != 1:
         raise TraceError("tool observation journal must contain one complete run")
     if set(started) != set(finished):
         raise TraceError("tool dispatch observation pairs are incomplete")
+    if rule_filters:
+        raise TraceError("project rule filter was not consumed by checker or dispatch")
     for dispatch_id in started:
         before = started[dispatch_id]
         after = finished[dispatch_id]
@@ -836,7 +988,7 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
         "dispatch_outcomes": outcome_counts,
         "formal": {
             **formal,
-            "used": formal["checker_calls"] > 0,
+            "used": formal["checker_calls"] > 0 or formal["rule_filter_events"] > 0,
             "kernel_sha256s": sorted(kernel_ids),
             "bundle_sha256s": sorted(bundle_ids),
             "actuations": sorted(actuations),
