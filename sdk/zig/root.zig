@@ -282,7 +282,7 @@ test "RunContext validator bounds length before pointer slicing" {
     try std.testing.expectEqualStrings(id, valid.session_id);
 }
 
-test "Revision 7 SDK rejects the Revision 6 table from the stable prefix" {
+test "Revision 8 SDK rejects the Revision 7 table from the stable prefix" {
     const Revision5Api = extern struct {
         struct_size: u32,
         abi_version: u32,

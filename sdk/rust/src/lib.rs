@@ -16,7 +16,7 @@ pub enum AbiError {
     LengthOverflow,
 }
 
-/// Validated Revision 7 function table. Discovery rejects every earlier
+/// Validated Revision 8 function table. Discovery rejects every earlier
 /// revision; there is no legacy probe or alternate layout.
 #[derive(Clone, Copy)]
 pub struct Api {
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn revision_seven_layout_codes_and_host_buffer_helpers_are_exact() {
-        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 7);
+        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 8);
         assert_eq!(raw::METASK_AGENTCORE_MCP_NEGOTIATION_AUTO, 1);
         assert_eq!(raw::METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY, 2);
         assert_eq!(raw::METASK_AGENTCORE_MCP_NEGOTIATION_LEGACY_ONLY, 3);

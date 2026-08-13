@@ -1563,12 +1563,26 @@ pub const AgentSession = struct {
         if (already_failed or run_id == 0 or sink == null) return;
 
         if (!sink.?.emit(sink.?.ctx, self.session_id, run_id, event)) {
-            self.mutex.lock();
-            if (!self.callback_failed) {
-                self.callback_failed = true;
-                self.abort_signal.abort(.host_failure);
-            }
-            self.mutex.unlock();
+            self.noteCallbackFailure();
+        }
+    }
+
+    /// Deliver a facade-owned lifecycle edge through the same callback mutex
+    /// as ordinary CoreEvent delivery. Synchronous Host UI requests use this
+    /// path so RunState ordering remains serialized with concurrent tool
+    /// progress events.
+    pub fn emitLifecycleEvent(self: *AgentSession, event: CoreEvent) void {
+        backendEmit(@ptrCast(self), self.session_id, event);
+    }
+
+    /// Record a callback-channel failure from a facade-side observation that
+    /// is not itself delivered through the Core EventSink.
+    pub fn noteCallbackFailure(self: *AgentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.callback_failed) {
+            self.callback_failed = true;
+            self.abort_signal.abort(.host_failure);
         }
     }
 

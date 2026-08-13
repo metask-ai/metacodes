@@ -264,6 +264,9 @@ pub const CoreEvent = union(enum) {
         tool_use_id: []const u8,
         request_json: []const u8,
     },
+    /// Internal synchronous-UI lifecycle edge. It is consumed by the
+    /// AgentCore RunState projector and remains hidden from the public ABI.
+    ui_request_resolved,
 
     // ── L4 诊断变体(可观测性)──────────────────────────────────────────────
     // agent_loop 在现有 log 点旁 emit;渲染 backend(TUI/Writer/JobEntry)一律 no-op,
@@ -281,6 +284,13 @@ pub const CoreEvent = union(enum) {
     /// 评估:一次真实 compact-summary provider 请求。仅在跨过 provider
     /// 边界后发出；纯本地 optimistic preview 不产生该事件。
     diag_compact_request: struct { trace_id: [12]u8, depth: u8, turn: u32, elapsed_ms: u64, outcome: []const u8, cause: []const u8 },
+    /// Internal lifecycle edge emitted when auto-compact is admitted. This is
+    /// deliberately separate from diag_compact_request, whose meaning is the
+    /// completed provider summary request.
+    diag_compact_begin: struct { trace_id: [12]u8, depth: u8, turn: u32, cause: []const u8 },
+    /// Internal lifecycle edge emitted for every auto-compact exit, including
+    /// local no-change and aborted/error paths that have no provider request.
+    diag_compact_end: struct { trace_id: [12]u8, depth: u8, turn: u32, elapsed_ms: u64, outcome: []const u8, cause: []const u8 },
     /// 评估:模型 stream 完成后，本轮权限/Hook/工具执行关键路径的墙钟。
     /// 与 model request 串行，因此两者可从 run wall time 中相减得到 harness residual。
     diag_tool_stage: struct { trace_id: [12]u8, depth: u8, turn: u32, tool_calls: u32, elapsed_ms: u64 },
