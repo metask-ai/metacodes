@@ -153,7 +153,7 @@ wave whose official task outcomes are intended to count as quality evidence.
 Every such wave must also carry an explicit `--comparison-id`; a single arm is
 not sufficient quality evidence for a harness change.
 
-Project-rule outcome studies use two independently created launch manifests
+Paired outcome studies use two independently created launch manifests
 with the same comparison id and frozen covariate digest. The baseline job uses
 `METACODES_PROJECT_CONTROL_MODE=disabled`: it mounts and verifies the exact
 same rule tree and compiled kernel, but does not materialize
@@ -163,6 +163,7 @@ transaction. After both official receipts commit, build the paired report with:
 
 ```bash
 python3 -m scripts.eval.workbuddy.paired_analysis \
+  --study project_control \
   --baseline-manifest /private/baseline-manifest.json \
   --baseline-receipt /private/baseline-receipt.json \
   --baseline-budget-journal /private/baseline-budget.json \
@@ -179,6 +180,19 @@ observed paired difference for that frozen cohort and rule bundle. With one
 model sample per arm it is not a causal effect estimate, and
 `quality_evidence=true` is possible only when both input receipts independently
 carry quality evidence.
+
+The progress-aware verification checkpoint is a separate treatment; never
+infer its effect from a project-control pair. Freeze both arms with project
+control disabled, set `METACODES_VERIFICATION_CHECKPOINT=false` only in the
+baseline and `true` only in the treatment, then run the same analyzer with
+`--study verification_checkpoint`. This profile additionally requires each
+task receipt to carry derived progress evidence bound to the already validated
+transcript/observation hashes, rejects any Lean actuation in either arm, and
+reports calls, mutations and elapsed time after the first host-observed
+post-mutation successful verification. Raw tool arguments/results stay in the
+isolated local trial artifacts. If a treatment task reaches no such
+verification, no checkpoint is expected; the missing milestone remains `null`
+rather than being rewritten as zero improvement.
 
 The overlay also keeps the opaque local-proxy route free of Harbor's ``__``
 eval-group delimiter. Otherwise a completed multi-task job can fail only while

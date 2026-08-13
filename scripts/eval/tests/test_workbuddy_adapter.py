@@ -44,6 +44,7 @@ from scripts.eval.workbuddy.trace import (
     read_json_lines,
     transcript_ir,
 )
+from scripts.eval.workbuddy.progress_analysis import analyze_progress
 
 
 ZERO_COMMIT = "0" * 40
@@ -207,6 +208,283 @@ class WorkBuddyTraceTest(unittest.TestCase):
                 "tool_results_retained": False,
                 "memory_text_retained": False,
             },
+        )
+
+    def test_progress_analysis_derives_green_checkpoint_without_retaining_payloads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            calls = [
+                ("w", "Write", {"file_path": "/secret/project/a.py", "content": "secret"}, "ok"),
+                (
+                    "t",
+                    "Bash",
+                    json.dumps({"command": "cd /workspace && python -m pytest -q"}),
+                    json.dumps({"stdout": "secret test output", "stderr": "", "exit_code": 0}),
+                ),
+                ("e", "Edit", {"file_path": "/secret/project/a.py"}, "ok"),
+            ]
+            rows = []
+            for call_id, name, arguments, result in calls:
+                rows.extend(
+                    [
+                        {
+                            "role": "assistant",
+                            "blocks": [
+                                {
+                                    "type": "tool_use",
+                                    "id": call_id,
+                                    "name": name,
+                                    "input": arguments,
+                                }
+                            ],
+                        },
+                        {
+                            "role": "user",
+                            "blocks": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": call_id,
+                                    "content": result,
+                                    "is_error": False,
+                                }
+                            ],
+                        },
+                    ]
+                )
+            self._write_jsonl(transcript, rows)
+            effect = {
+                "file_mutation_v2": {
+                    "mutation": {"change": "changed"},
+                    "reobservation": {"state": "matched"},
+                }
+            }
+            events = []
+            for index, (call_id, name, _arguments, _result) in enumerate(calls):
+                events.append(
+                    {
+                        "tool_observation": {
+                            "dispatch_finished": {
+                                "id": call_id,
+                                "requested_name": name,
+                                "dispatched_name": name,
+                                "origin": "authoritative",
+                                "agent_depth": 0,
+                                "outcome": "succeeded",
+                                "effect": effect if name in {"Write", "Edit"} else None,
+                                "effect_valid": True,
+                            }
+                        }
+                    }
+                )
+            journal = self._journal(*events)
+            for index, row in enumerate(journal):
+                row["monotonic_elapsed_ns"] = index * 1_000_000_000
+            self._write_jsonl(observation, journal)
+            metrics = analyze_progress(transcript, observation)
+        self.assertEqual(metrics["progress"]["first_mutation_call"], 1)
+        self.assertEqual(metrics["progress"]["first_successful_verification_call"], 2)
+        self.assertEqual(metrics["progress"]["calls_after_first_successful_verification"], 1)
+        self.assertEqual(metrics["progress"]["mutations_after_first_successful_verification"], 1)
+        encoded = json.dumps(metrics, sort_keys=True)
+        self.assertNotIn("secret", encoded)
+        self.assertFalse(metrics["privacy"]["tool_arguments_retained"])
+
+    def test_progress_analysis_rejects_transcript_observation_identity_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(
+                transcript,
+                [
+                    {"role": "assistant", "blocks": [{
+                        "type": "tool_use", "id": "call", "name": "Bash",
+                        "input": {"command": "pytest -q"},
+                    }]},
+                    {"role": "user", "blocks": [{
+                        "type": "tool_result", "tool_use_id": "call",
+                        "content": "{\"exit_code\":0}", "is_error": False,
+                    }]},
+                ],
+            )
+            self._write_jsonl(observation, self._journal())
+            with self.assertRaises(TraceError):
+                analyze_progress(transcript, observation)
+
+    def test_progress_analysis_same_turn_mutation_and_green_is_not_causal_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(
+                transcript,
+                [
+                    {
+                        "role": "assistant",
+                        "blocks": [
+                            {"type": "tool_use", "id": "w", "name": "Write", "input": {}},
+                            {
+                                "type": "tool_use",
+                                "id": "t",
+                                "name": "Bash",
+                                "input": {"command": "pytest -q"},
+                            },
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "blocks": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "w",
+                                "content": "ok",
+                                "is_error": False,
+                            },
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "t",
+                                "content": json.dumps(
+                                    {"stdout": "1 passed", "stderr": "", "exit_code": 0}
+                                ),
+                                "is_error": False,
+                            },
+                        ],
+                    },
+                ],
+            )
+            effect = {
+                "file_mutation_v2": {
+                    "mutation": {"change": "changed"},
+                    "reobservation": {"state": "matched"},
+                }
+            }
+            self._write_jsonl(
+                observation,
+                self._journal(
+                    {"tool_observation": {"dispatch_finished": {
+                        "id": "w", "requested_name": "Write", "dispatched_name": "Write",
+                        "origin": "authoritative", "agent_depth": 0, "outcome": "succeeded",
+                        "effect": effect, "effect_valid": True,
+                    }}},
+                    {"tool_observation": {"dispatch_finished": {
+                        "id": "t", "requested_name": "Bash", "dispatched_name": "Bash",
+                        "origin": "authoritative", "agent_depth": 0, "outcome": "succeeded",
+                        "effect": None, "effect_valid": True,
+                    }}},
+                ),
+            )
+            metrics = analyze_progress(transcript, observation)
+        self.assertEqual(1, metrics["progress"]["successful_verifications"])
+        self.assertIsNone(metrics["progress"]["first_successful_verification_call"])
+
+    def test_progress_analysis_excludes_same_green_turn_parallel_tail_from_after_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            calls = [
+                ("w1", "Write", {}),
+                ("t", "Bash", {"command": "pytest -q"}),
+                ("w2", "Write", {}),
+            ]
+            self._write_jsonl(
+                transcript,
+                [
+                    {"role": "assistant", "blocks": [{
+                        "type": "tool_use", "id": "w1", "name": "Write", "input": {},
+                    }]},
+                    {"role": "user", "blocks": [{
+                        "type": "tool_result", "tool_use_id": "w1", "content": "ok",
+                        "is_error": False,
+                    }]},
+                    {"role": "assistant", "blocks": [
+                        {"type": "tool_use", "id": call_id, "name": name, "input": args}
+                        for call_id, name, args in calls[1:]
+                    ]},
+                    {"role": "user", "blocks": [
+                        {"type": "tool_result", "tool_use_id": "t", "content": json.dumps({
+                            "stdout": "1 passed", "stderr": "", "exit_code": 0,
+                        }), "is_error": False},
+                        {"type": "tool_result", "tool_use_id": "w2", "content": "ok",
+                         "is_error": False},
+                    ]},
+                ],
+            )
+            effect = {"file_mutation_v2": {
+                "mutation": {"change": "changed"},
+                "reobservation": {"state": "matched"},
+            }}
+            self._write_jsonl(
+                observation,
+                self._journal(*[
+                    {"tool_observation": {"dispatch_finished": {
+                        "id": call_id, "requested_name": name, "dispatched_name": name,
+                        "origin": "authoritative", "agent_depth": 0, "outcome": "succeeded",
+                        "effect": effect if name == "Write" else None, "effect_valid": True,
+                    }}}
+                    for call_id, name, _args in calls
+                ]),
+            )
+            metrics = analyze_progress(transcript, observation)["progress"]
+        self.assertEqual(2, metrics["first_successful_verification_call"])
+        self.assertEqual(0, metrics["calls_after_first_successful_verification"])
+        self.assertEqual(0, metrics["mutations_after_first_successful_verification"])
+
+    def test_progress_analysis_counts_injected_checkpoint_only_in_bound_result_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(
+                transcript,
+                [
+                    {"role": "assistant", "blocks": [{
+                        "type": "tool_use", "id": "w", "name": "Write", "input": {},
+                    }]},
+                    {"role": "user", "blocks": [{
+                        "type": "tool_result", "tool_use_id": "w", "content": "ok",
+                        "is_error": False,
+                    }]},
+                    {"role": "assistant", "blocks": [{
+                        "type": "tool_use", "id": "t", "name": "Bash",
+                        "input": {"command": "pytest -q"},
+                    }]},
+                    {"role": "user", "blocks": [
+                        {"type": "tool_result", "tool_use_id": "t", "content": json.dumps({
+                            "stdout": "1 passed", "stderr": "", "exit_code": 0,
+                        }), "is_error": False},
+                        {"type": "text", "text": "[verification checkpoint]\nfinish"},
+                    ]},
+                ],
+            )
+            effect = {"file_mutation_v2": {
+                "mutation": {"change": "changed"},
+                "reobservation": {"state": "matched"},
+            }}
+            self._write_jsonl(
+                observation,
+                self._journal(
+                    {"tool_observation": {"dispatch_finished": {
+                        "id": "w", "requested_name": "Write", "dispatched_name": "Write",
+                        "origin": "authoritative", "agent_depth": 0, "outcome": "succeeded",
+                        "effect": effect, "effect_valid": True,
+                    }}},
+                    {"tool_observation": {"dispatch_finished": {
+                        "id": "t", "requested_name": "Bash", "dispatched_name": "Bash",
+                        "origin": "authoritative", "agent_depth": 0, "outcome": "succeeded",
+                        "effect": None, "effect_valid": True,
+                    }}},
+                ),
+            )
+            metrics = analyze_progress(transcript, observation)
+        self.assertEqual(1, metrics["progress"]["checkpoint_messages"])
+        self.assertEqual(
+            1,
+            metrics["progress"][
+                "checkpoint_messages_after_successful_verification"
+            ],
         )
 
     def test_control_metrics_count_formal_batch_dispatch_and_recovery(self):
@@ -1708,6 +1986,7 @@ asyncio.run(main())
         self.assertEqual(
             job["harness_params_override"],
             {
+                "METACODES_VERIFICATION_CHECKPOINT": False,
                 "METACODES_PROJECT_CONTROL_MODE": "enforced",
                 "METACODES_PROJECT_RULES_RELATIVE": (
                     "share/metacodes/workbuddy-w05/project-rules"
@@ -1751,6 +2030,33 @@ asyncio.run(main())
         self.assertEqual("enforced", treatment_mode)
         self.assertEqual(treatment, baseline)
 
+    def test_checkpoint_pair_differs_only_by_explicit_boolean_and_result_root(self):
+        root = Path(__file__).parents[1] / "workbuddy/overlay/configs/jobs"
+        baseline = yaml.safe_load(
+            (root / "metacodes-glm52-code-1-checkpoint-baseline.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        treatment = yaml.safe_load(
+            (root / "metacodes-glm52-code-1-checkpoint-treatment.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertNotEqual(baseline.pop("jobs_dir"), treatment.pop("jobs_dir"))
+        baseline_checkpoint = baseline["harness_params_override"].pop(
+            "METACODES_VERIFICATION_CHECKPOINT"
+        )
+        treatment_checkpoint = treatment["harness_params_override"].pop(
+            "METACODES_VERIFICATION_CHECKPOINT"
+        )
+        self.assertIs(baseline_checkpoint, False)
+        self.assertIs(treatment_checkpoint, True)
+        self.assertEqual(
+            "disabled",
+            baseline["harness_params_override"]["METACODES_PROJECT_CONTROL_MODE"],
+        )
+        self.assertEqual(treatment, baseline)
+
     def test_adapter_runtime_contract_reobserves_disabled_active_bundle_absence(self):
         source = (
             Path(__file__).parents[1]
@@ -1792,6 +2098,7 @@ asyncio.run(main())
         self.assertEqual(
             job["harness_params_override"],
             {
+                "METACODES_VERIFICATION_CHECKPOINT": False,
                 "METACODES_PROJECT_CONTROL_MODE": "enforced",
                 "METACODES_PROJECT_RULES_RELATIVE": (
                     "share/metacodes/workbuddy-w05/project-rules"

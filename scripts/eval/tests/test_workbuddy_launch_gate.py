@@ -362,6 +362,9 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
                         "model_connection": "local_proxy",
                         "record_full_io": True,
                         "n_attempts": 1,
+                        "harness_params_override": {
+                            "METACODES_VERIFICATION_CHECKPOINT": False
+                        },
                         "task_selection": {"mode": "name", "names": ["task-a"]},
                         "orchestrator_override": {"n_concurrent_trials": 1},
                     }

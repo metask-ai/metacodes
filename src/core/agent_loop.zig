@@ -339,6 +339,10 @@ pub const Options = struct {
     tool_observer: ?tools_mod.ToolObservationSink = null,
     /// Project-specific Lean gate propagated to every ToolContext and depth.
     project_rule_gate: ?tools_mod.ProjectRuleGate = null,
+    /// Opt-in experiment: after a host-reobserved file mutation, append one
+    /// late checkpoint when a conservative test command succeeds. This never
+    /// changes the stable system prompt or tool definitions.
+    verification_checkpoint: bool = false,
     /// 统一 UI 请求回调(替代旧 ask_question/exit_plan 三套;ctx 指 *TuiBackend)。
     /// 仅顶层 TUI 接(agent_depth==0)——子 agent 无 tty。见 UiRequester。
     ui_requester: ?@import("protocol/ui_request.zig").UiRequester = null,
@@ -533,6 +537,7 @@ pub fn run(
     const trace_id = log.genRequestId().bytes;
     const depth = opts.agent_depth;
     var turns: u32 = 0;
+    var verification_progress = @import("verification_progress.zig").State{};
     var total_tool_calls: u32 = 0;
     // max_tokens 续写计数:防止模型一直撞上限导致无限续写。上限 3 次。
     var continuations: u32 = 0;
@@ -1396,6 +1401,8 @@ pub fn run(
                 s.content = pf.content;
                 s.is_error = pf.is_error;
                 s.elapsed_ms = pf.elapsed_ms;
+                s.effect = pf.effect;
+                s.effect_valid = pf.effect_valid;
                 s.prefetched = true;
             }
         }
@@ -1477,6 +1484,9 @@ pub fn run(
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .suspended, .turns = turns + 1, .tool_calls = total_tool_calls, .suspend_info = si });
         }
 
+        const inject_verification_checkpoint = opts.verification_checkpoint and
+            verification_progress.observeTurn(allocator, slots.items);
+
         // 6d. 按原顺序回填 result_blocks。
         // P0.2 PostToolUse:执行后 hook 产出的 additionalContext,拼成一段注入本轮 user 消息(下轮模型可见)。
         var post_ctx: std.ArrayList(u8) = .empty;
@@ -1534,6 +1544,13 @@ pub fn run(
         if (post_ctx.items.len > 0) {
             const ctx_text = try std.fmt.allocPrint(allocator, "[PostToolUse hook]\n{s}", .{post_ctx.items});
             try result_blocks.append(allocator, .{ .text = ctx_text });
+        }
+        if (inject_verification_checkpoint) {
+            const checkpoint = try allocator.dupe(
+                u8,
+                @import("verification_progress.zig").CHECKPOINT_TEXT,
+            );
+            try result_blocks.append(allocator, .{ .text = checkpoint });
         }
 
         const blocks_owned = try result_blocks.toOwnedSlice(allocator);

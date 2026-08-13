@@ -112,6 +112,13 @@ _METACODES_RUNTIME_BUILDER = '''def _build_metacodes_runtime_config(
     project_rules = harness_params.get("METACODES_PROJECT_RULES_RELATIVE")
     project_kernel = harness_params.get("METACODES_PROJECT_KERNEL_RELATIVE")
     project_mode = harness_params.get("METACODES_PROJECT_CONTROL_MODE")
+    verification_checkpoint = harness_params.get(
+        "METACODES_VERIFICATION_CHECKPOINT", False
+    )
+    if not isinstance(verification_checkpoint, bool):
+        raise ValueError(
+            "METACODES_VERIFICATION_CHECKPOINT must be an explicit boolean"
+        )
     project_staged = bool(project_rules and project_kernel)
     if project_staged and project_mode not in ("disabled", "enforced"):
         raise ValueError(
@@ -139,6 +146,7 @@ _METACODES_RUNTIME_BUILDER = '''def _build_metacodes_runtime_config(
         "project_control_configured": project_staged and project_mode == "enforced",
         "transport_model_is_route": connection_mode == "local_proxy",
         "actor_model_identity": backend_model_name,
+        "verification_checkpoint": verification_checkpoint,
         "translated_env": {key: value for key, value in env.items() if value},
         "cleared_env": [
             "TINYKG_REMOTE_URL",

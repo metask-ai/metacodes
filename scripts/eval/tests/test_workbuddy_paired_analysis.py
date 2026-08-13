@@ -21,7 +21,10 @@ from scripts.eval.workbuddy.launch_gate import (
     LaunchError,
 )
 from scripts.eval.workbuddy import WORKBUDDY_PINNED_COMMIT
-from scripts.eval.workbuddy.paired_analysis import build_report
+from scripts.eval.workbuddy.paired_analysis import (
+    VERIFICATION_CHECKPOINT,
+    build_report,
+)
 from scripts.eval.workbuddy import paired_analysis
 
 
@@ -35,8 +38,14 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
         os.chmod(path, 0o600)
         return path
 
-    def _manifest(self, root: Path, arm: str) -> tuple[Path, dict]:
-        mode = {"baseline": "disabled", "treatment": "enforced"}[arm]
+    def _manifest(
+        self, root: Path, arm: str, *, study: str = "project_control"
+    ) -> tuple[Path, dict]:
+        mode = (
+            {"baseline": "disabled", "treatment": "enforced"}[arm]
+            if study == "project_control"
+            else "disabled"
+        )
         covariates = {
             "cohort": ["task-a", "task-b"],
             "artifact_sha256": digest("same-artifact"),
@@ -54,6 +63,9 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                 "actor_prompt_changed": False,
                 "tool_schema_changed": False,
                 "provider_cache_prefix_changed_by_control_plane": False,
+                "verification_checkpoint": (
+                    arm == "treatment" if study == VERIFICATION_CHECKPOINT else False
+                ),
             },
             "comparison": {
                 "schema_version": COMPARISON_SCHEMA_VERSION,
@@ -138,6 +150,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
     def _control(*, used: bool) -> dict:
         return {
             "lean": {
+                "used": used,
                 "checker_calls": int(used),
                 "checker_elapsed_ns": 100 if used else 0,
                 "rule_filter_events": int(used),
@@ -151,11 +164,23 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
         }
 
     def _receipt(
-        self, root: Path, arm: str, manifest: dict
+        self,
+        root: Path,
+        arm: str,
+        manifest: dict,
+        *,
+        study: str = "project_control",
     ) -> tuple[Path, dict, Path]:
         rewards = {"baseline": (0.0, 1.0), "treatment": (1.0, 1.0)}[arm]
         tasks = {}
         for index, (task, reward) in enumerate(zip(("task-a", "task-b"), rewards)):
+            control = self._control(
+                used=study == "project_control" and arm == "treatment"
+            )
+            control["source"] = {
+                "transcript_sha256": digest(f"{arm}-{task}-transcript"),
+                "observation_journal_sha256": digest(f"{arm}-{task}-observation"),
+            }
             tasks[task] = {
                 "task_checksum": digest(task),
                 "cacheable_first_request_sha256": digest(f"prefix-{task}"),
@@ -166,8 +191,45 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                 "provider_requests": 2 + index,
                 "cache_read_input_tokens": 50 + index,
                 "cache_creation_input_tokens": 10 + index,
-                "control_metrics": self._control(used=arm == "treatment"),
+                "control_metrics": control,
             }
+            if study == VERIFICATION_CHECKPOINT:
+                checkpoint = int(arm == "treatment")
+                tasks[task]["progress_metrics"] = {
+                    "schema_version": "metacodes-workbuddy-progress-analysis-v1",
+                    "source": control["source"],
+                    "progress": {
+                        "tool_calls": 8 if arm == "baseline" else 4,
+                        "first_mutation_call": 1,
+                        "first_successful_verification_call": 2,
+                        "calls_after_first_successful_verification": (
+                            6 if arm == "baseline" else 2
+                        ),
+                        "mutation_calls": 2 if arm == "baseline" else 1,
+                        "mutations_after_first_successful_verification": (
+                            1 if arm == "baseline" else 0
+                        ),
+                        "verification_calls": 2,
+                        "successful_verifications": 1,
+                        "exact_repeated_tool_input_result_calls": 0,
+                        "checkpoint_messages": checkpoint,
+                        "checkpoint_messages_after_successful_verification": checkpoint,
+                        "time_to_first_mutation_ms": 1000.0,
+                        "time_to_first_successful_verification_ms": 2000.0,
+                        "time_after_first_successful_verification_ms": (
+                            6000.0 if arm == "baseline" else 2000.0
+                        ),
+                        "time_to_final_dispatch_ms": (
+                            8000.0 if arm == "baseline" else 4000.0
+                        ),
+                    },
+                    "privacy": {
+                        "tool_arguments_retained": False,
+                        "tool_results_retained": False,
+                        "paths_retained": False,
+                        "memory_text_retained": False,
+                    },
+                }
         journal_path = root / f"{arm}-budget.json"
         authority = BudgetAuthority(
             manifest_sha256=manifest["content_sha256"],
@@ -233,11 +295,11 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
         }
         return self._write(root / f"{arm}-receipt.json", value), value, journal_path
 
-    def _pair(self, root: Path):
-        bm, bmv = self._manifest(root, "baseline")
-        tm, tmv = self._manifest(root, "treatment")
-        br, brv, bj = self._receipt(root, "baseline", bmv)
-        tr, trv, tj = self._receipt(root, "treatment", tmv)
+    def _pair(self, root: Path, *, study: str = "project_control"):
+        bm, bmv = self._manifest(root, "baseline", study=study)
+        tm, tmv = self._manifest(root, "treatment", study=study)
+        br, brv, bj = self._receipt(root, "baseline", bmv, study=study)
+        tr, trv, tj = self._receipt(root, "treatment", tmv, study=study)
         return bm, br, bj, tm, tr, tj, bmv, brv, tmv, trv
 
     def test_report_binds_equal_cache_prefix_and_quality_cost_time_deltas(self):
@@ -262,6 +324,101 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
             self.assertEqual(report["tasks"]["task-a"]["lean_delta"]["checker_calls"], 1)
             self.assertIn("observed paired difference", report["claim_boundary"])
             self.assertNotIn("assignment effect", report["claim_boundary"])
+
+    def test_checkpoint_report_requires_single_actuation_and_reports_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bm, br, bj, tm, tr, tj, *_ = self._pair(
+                root, study=VERIFICATION_CHECKPOINT
+            )
+            report = build_report(
+                study=VERIFICATION_CHECKPOINT,
+                baseline_manifest_path=bm,
+                baseline_receipt_path=br,
+                baseline_journal_path=bj,
+                treatment_manifest_path=tm,
+                treatment_receipt_path=tr,
+                treatment_journal_path=tj,
+            )
+            self.assertEqual(VERIFICATION_CHECKPOINT, report["study"])
+            self.assertFalse(report["arms"]["baseline"]["verification_checkpoint"])
+            self.assertTrue(report["arms"]["treatment"]["verification_checkpoint"])
+            progress = report["tasks"]["task-a"]["progress"]
+            self.assertEqual(
+                -4, progress["calls_after_first_successful_verification_delta"]
+            )
+            self.assertEqual(
+                -1, progress["mutations_after_first_successful_verification_delta"]
+            )
+            self.assertEqual(
+                -4000.0,
+                progress["time_after_first_successful_verification_ms_delta"],
+            )
+
+    def test_checkpoint_report_fails_closed_on_treatment_lean_cache_or_progress_drift(self):
+        mutations = (
+            (
+                "false-treatment",
+                lambda tm, tr: tm["evaluation_treatment"].update(
+                    {"verification_checkpoint": False}
+                ),
+            ),
+            (
+                "lean-actuation",
+                lambda tm, tr: tr["usage"]["tasks"]["task-a"][
+                    "control_metrics"
+                ]["lean"].update({"used": True, "checker_calls": 1}),
+            ),
+            (
+                "cache-prefix",
+                lambda tm, tr: tr["usage"]["tasks"]["task-a"].update(
+                    {"cacheable_first_request_sha256": digest("drift")}
+                ),
+            ),
+            (
+                "missing-progress",
+                lambda tm, tr: tr["usage"]["tasks"]["task-a"].pop(
+                    "progress_metrics"
+                ),
+            ),
+            (
+                "forged-checkpoint",
+                lambda tm, tr: tr["usage"]["tasks"]["task-a"][
+                    "progress_metrics"
+                ]["progress"].update({"checkpoint_messages": 0}),
+            ),
+        )
+        for name, mutate in mutations:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                bm, br, bj, tm, tr, tj, _bmv, _brv, tmv, trv = self._pair(
+                    root, study=VERIFICATION_CHECKPOINT
+                )
+                mutate(tmv, trv)
+                if name == "false-treatment":
+                    tmv["content_sha256"] = hashlib.sha256(
+                        stable_json(
+                            {
+                                key: value
+                                for key, value in tmv.items()
+                                if key != "content_sha256"
+                            }
+                        ).encode()
+                    ).hexdigest()
+                    trv["launch_manifest_content_sha256"] = tmv["content_sha256"]
+                    trv["evaluation_treatment"] = tmv["evaluation_treatment"]
+                self._write(tm, tmv)
+                self._write(tr, trv)
+                with self.assertRaises(LaunchError):
+                    build_report(
+                        study=VERIFICATION_CHECKPOINT,
+                        baseline_manifest_path=bm,
+                        baseline_receipt_path=br,
+                        baseline_journal_path=bj,
+                        treatment_manifest_path=tm,
+                        treatment_receipt_path=tr,
+                        treatment_journal_path=tj,
+                    )
 
     def test_covariate_cache_reward_and_budget_drift_fail_closed(self):
         mutations = (

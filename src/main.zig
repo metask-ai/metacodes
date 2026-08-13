@@ -889,6 +889,8 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             if (args.next()) |s| config.allowed_tools = allocator.dupe(u8, s) catch s;
         } else if (std.mem.eql(u8, arg, "--disallowedTools") or std.mem.eql(u8, arg, "--disallowed-tools")) {
             if (args.next()) |s| config.disallowed_tools = allocator.dupe(u8, s) catch s;
+        } else if (std.mem.eql(u8, arg, "--verification-checkpoint")) {
+            config.verification_checkpoint = true;
         } else if (std.mem.eql(u8, arg, "--add-dir")) {
             if (args.next()) |s| config.add_dirs = appendNulList(allocator, config.add_dirs, s);
         } else if (std.mem.eql(u8, arg, "--answers-file")) {
@@ -1053,6 +1055,7 @@ fn printHelp() void {
         \\  --settings <path>     Extra settings JSON (CLI layer)
         \\  --allowedTools <list> Comma-separated allow rules, e.g. "Bash(git *),Read"
         \\  --disallowedTools <l> Comma-separated deny rules
+        \\  --verification-checkpoint  Enable the experimental post-test checkpoint
         \\  --add-dir <path>      Extra read/write directory (repeatable)
         \\  --answers-file <path> Preset answers for permission .ask / AskUserQuestion (non-tty)
         \\  --base-url <url>      Override API endpoint (must end with /v1/messages)

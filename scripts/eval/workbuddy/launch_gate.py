@@ -42,6 +42,7 @@ from .environment_preflight import (
 )
 from .install_overlay import OverlayError, validate_installed_overlay
 from .key_fd import MAX_CREDENTIAL_BYTES
+from .progress_analysis import analyze_progress
 from .stage_artifacts import (
     ELF_MACHINE_X86_64,
     MAX_PROJECT_RULE_BYTES,
@@ -93,6 +94,7 @@ HOST_CONTROL_PLANE_MODULES = {
     "memory_budget_journal": Path(__file__).parents[1] / "memory_budget_journal.py",
     "model": Path(__file__).parents[1] / "model.py",
     "paired_analysis": Path(__file__).with_name("paired_analysis.py"),
+    "progress_analysis": Path(__file__).with_name("progress_analysis.py"),
     "stage_artifacts": Path(__file__).with_name("stage_artifacts.py"),
     "workbuddy_trace": Path(__file__).with_name("trace.py"),
 }
@@ -112,6 +114,13 @@ LEGACY_HOST_CONTROL_PLANE_MODULE_NAMES_V1 = frozenset(
 )
 LEGACY_HOST_CONTROL_PLANE_MODULE_NAMES_V2 = frozenset(
     {*LEGACY_HOST_CONTROL_PLANE_MODULE_NAMES_V1, "workbuddy_trace"}
+)
+# paid-launch-v3 manifests created before the verification-checkpoint study
+# bound the paired analyzer but not its new progress-evidence dependency.
+# Keep that exact source set readable; checkpoint studies reject it below and
+# require the complete current set before authorization.
+LEGACY_HOST_CONTROL_PLANE_MODULE_NAMES_V3 = frozenset(
+    set(HOST_CONTROL_PLANE_MODULES) - {"progress_analysis"}
 )
 AUTHORIZED_FAILURE_RECEIPT_MODES = {"in_band", "offline_recovery"}
 PROJECT_CONTROL_MODES = {"absent", "disabled", "enforced"}
@@ -156,6 +165,7 @@ def _comparison_covariates(
     overrides = normalized_job.get("harness_params_override")
     if isinstance(overrides, dict):
         overrides.pop("METACODES_PROJECT_CONTROL_MODE", None)
+        overrides.pop("METACODES_VERIFICATION_CHECKPOINT", None)
     stable_artifacts = json.loads(json.dumps(artifacts))
     # Absolute staging paths describe where identical bytes were observed, not
     # an experimental variable.  Keep every digest/size/architecture field.
@@ -620,6 +630,16 @@ def build_launch_manifest(
     if not isinstance(project_overrides, dict):
         raise LaunchError("WorkBuddy harness_params_override must be a mapping")
     project_control_mode = project_overrides.get("METACODES_PROJECT_CONTROL_MODE")
+    verification_checkpoint = project_overrides.get(
+        "METACODES_VERIFICATION_CHECKPOINT", False
+    )
+    if (
+        "METACODES_VERIFICATION_CHECKPOINT" not in project_overrides
+        or not isinstance(verification_checkpoint, bool)
+    ):
+        raise LaunchError(
+            "WorkBuddy verification checkpoint treatment must be an explicit boolean"
+        )
     expected_project_overrides = (
         {
             "METACODES_PROJECT_CONTROL_MODE": project_control_mode,
@@ -758,6 +778,7 @@ def build_launch_manifest(
             "actor_prompt_changed": False,
             "tool_schema_changed": False,
             "provider_cache_prefix_changed_by_control_plane": False,
+            "verification_checkpoint": verification_checkpoint,
         },
         "comparison": (
             {
@@ -852,6 +873,11 @@ def _validate_launch_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
         raise LaunchError("unsupported or mislabeled paid launch manifest")
     treatment = manifest.get("evaluation_treatment")
     if paired_schema:
+        checkpoint = (
+            treatment.get("verification_checkpoint")
+            if isinstance(treatment, dict)
+            else None
+        )
         if (
             not isinstance(treatment, dict)
             or treatment
@@ -860,8 +886,14 @@ def _validate_launch_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
                 "actor_prompt_changed": False,
                 "tool_schema_changed": False,
                 "provider_cache_prefix_changed_by_control_plane": False,
+                **(
+                    {"verification_checkpoint": checkpoint}
+                    if "verification_checkpoint" in treatment
+                    else {}
+                ),
             }
             or treatment.get("project_control") not in PROJECT_CONTROL_MODES
+            or ("verification_checkpoint" in treatment and not isinstance(checkpoint, bool))
         ):
             raise LaunchError("paid launch treatment contract is incomplete")
     elif treatment is not None:
@@ -907,7 +939,10 @@ def _validate_launch_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
         raise LaunchError("paid launch installed-overlay identity is incomplete")
     host_control_plane = manifest.get("host_control_plane")
     allowed_host_modules = (
-        {frozenset(HOST_CONTROL_PLANE_MODULES)}
+        {
+            frozenset(HOST_CONTROL_PLANE_MODULES),
+            LEGACY_HOST_CONTROL_PLANE_MODULE_NAMES_V3,
+        }
         if paired_schema
         else {
             LEGACY_HOST_CONTROL_PLANE_MODULE_NAMES_V1,
@@ -1133,6 +1168,11 @@ def _reobserve_launch_inputs(manifest: Mapping[str, Any]) -> None:
     _validate_project_control_kwargs(
         current_job.get("harness_params_override") or {},
         expected_project,
+        label="reobserved WorkBuddy job",
+    )
+    _validate_verification_checkpoint_kwargs(
+        current_job.get("harness_params_override") or {},
+        manifest,
         label="reobserved WorkBuddy job",
     )
     _reobserve_identity(manifest["model"]["config"], "WorkBuddy model config", maximum=16 * 1024 * 1024)
@@ -1693,6 +1733,33 @@ def _validate_actor_model_identity(
         raise LaunchError(f"{label} actor model identity drifted")
 
 
+def _validate_verification_checkpoint_kwargs(
+    kwargs: object, manifest: Mapping[str, Any], *, label: str
+) -> None:
+    if not isinstance(kwargs, dict):
+        raise LaunchError(f"{label} has no agent kwargs")
+    treatment = manifest.get("evaluation_treatment")
+    if not isinstance(treatment, dict) or "verification_checkpoint" not in treatment:
+        if "METACODES_VERIFICATION_CHECKPOINT" in kwargs:
+            raise LaunchError(f"{label} unexpectedly enables verification checkpoint")
+        return
+    expected = _expected_verification_checkpoint(manifest)
+    if kwargs.get("METACODES_VERIFICATION_CHECKPOINT") is not expected:
+        raise LaunchError(f"{label} verification checkpoint treatment drifted")
+
+
+def _expected_verification_checkpoint(
+    manifest: Mapping[str, Any]
+) -> bool | None:
+    treatment = manifest.get("evaluation_treatment")
+    if not isinstance(treatment, dict) or "verification_checkpoint" not in treatment:
+        return None
+    value = treatment.get("verification_checkpoint")
+    if not isinstance(value, bool):
+        raise LaunchError("paid launch verification checkpoint treatment is invalid")
+    return value
+
+
 def _validate_trial_project_control(
     trial_dir: Path, manifest: Mapping[str, Any]
 ) -> None:
@@ -1707,12 +1774,17 @@ def _validate_trial_project_control(
     _validate_actor_model_identity(
         agent.get("kwargs"), manifest, label="official WorkBuddy trial"
     )
+    _validate_verification_checkpoint_kwargs(
+        agent.get("kwargs"), manifest, label="official WorkBuddy trial"
+    )
     runtime = _json(trial_dir / "agent/metacodes-runtime-contract.json")
     backend_model_name = str(manifest.get("model", {}).get("backend_model_name") or "")
     if (
         runtime.get("transport_model_is_route") is not True
         or not backend_model_name
         or runtime.get("actor_model_identity") != backend_model_name
+        or runtime.get("verification_checkpoint")
+        is not _expected_verification_checkpoint(manifest)
     ):
         raise LaunchError("official WorkBuddy runtime model identity drifted")
     project = runtime.get("project_control")
@@ -1760,6 +1832,8 @@ def _runtime_contract(manifest: Mapping[str, Any]) -> Dict[str, object]:
         or harness_runtime.get("transport_model_is_route") is not True
         or harness_runtime.get("actor_model_identity")
         != manifest["model"]["backend_model_name"]
+        or harness_runtime.get("verification_checkpoint")
+        is not _expected_verification_checkpoint(manifest)
         or not isinstance(translated_env, dict)
         or translated_env.get("METACODES_PROJECT_RULES_SOURCE")
         != (
@@ -1790,6 +1864,11 @@ def _runtime_contract(manifest: Mapping[str, Any]) -> Dict[str, object]:
         label="resolved WorkBuddy runtime job",
     )
     _validate_actor_model_identity(
+        agents[0].get("kwargs"),
+        manifest,
+        label="resolved WorkBuddy runtime job",
+    )
+    _validate_verification_checkpoint_kwargs(
         agents[0].get("kwargs"),
         manifest,
         label="resolved WorkBuddy runtime job",
@@ -1884,6 +1963,21 @@ def _collect_usage(
             raise LaunchError(
                 f"invalid WorkBuddy control metrics for {trajectory_path}: {exc}"
             ) from exc
+        try:
+            progress_metrics = analyze_progress(transcript_path, observation_path)
+        except (OSError, TraceError, ValueError) as exc:
+            raise LaunchError(
+                f"invalid WorkBuddy progress metrics for {trajectory_path}: {exc}"
+            ) from exc
+        if progress_metrics.get("source") != {
+            "transcript_sha256": control_metrics["source"]["transcript_sha256"],
+            "observation_journal_sha256": control_metrics["source"][
+                "observation_journal_sha256"
+            ],
+        }:
+            raise LaunchError(
+                f"WorkBuddy progress evidence changed during observation: {trajectory_path}"
+            )
         cost = final.get("total_cost_usd")
         prompt = final.get("total_prompt_tokens")
         completion = final.get("total_completion_tokens")
@@ -1982,6 +2076,7 @@ def _collect_usage(
             "cache_creation_input_tokens": cache_create,
             "cost_usd": float(cost),
             "control_metrics": control_metrics,
+            "progress_metrics": progress_metrics,
         }
         control_rows[task] = control_metrics
         if trial_result_path is not None and trial_result is not None:

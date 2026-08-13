@@ -86,6 +86,9 @@ pub const Config = struct {
     allowed_tools: ?[]const u8 = null,
     /// `--disallowedTools "..."`:逗号分隔,注入 CLI 层 deny。
     disallowed_tools: ?[]const u8 = null,
+    /// Experimental, opt-in progress checkpoint for coding evaluations. Kept
+    /// out of the default product path until measured on fixed benchmarks.
+    verification_checkpoint: bool = false,
     /// `--add-dir <path>`(可重复):额外可读写目录,注入 additionalDirectories。
     /// 多个用 `\x00` 分隔拼一串(parseArgs 累加)。
     add_dirs: ?[]const u8 = null,

@@ -1,9 +1,9 @@
-"""Build a fail-closed paired WorkBuddy project-control effect report.
+"""Build a fail-closed paired WorkBuddy harness-treatment report.
 
-The report compares two independently authorized official WorkBuddy waves that
-share one preregistered covariate identity.  The baseline has the exact staged
-project kernel/rule bytes present but disabled; the treatment enables them.
-No provider request, TinyKG access, or actor-context mutation occurs here.
+The common layer binds independent budgets, official rewards, frozen task and
+cache-prefix identity, cost, tokens and time. A named study profile then proves
+that exactly its intended harness variable changed. No provider request,
+TinyKG access, or actor-context mutation occurs here.
 """
 
 from __future__ import annotations
@@ -36,7 +36,14 @@ from .launch_gate import (
 
 
 REPORT_SCHEMA_VERSION = "metacodes-workbuddy-project-control-paired-report-v1"
-ARMS = {"baseline": "disabled", "treatment": "enforced"}
+CHECKPOINT_REPORT_SCHEMA_VERSION = (
+    "metacodes-workbuddy-verification-checkpoint-paired-report-v1"
+)
+PROJECT_CONTROL = "project_control"
+VERIFICATION_CHECKPOINT = "verification_checkpoint"
+STUDIES = {PROJECT_CONTROL, VERIFICATION_CHECKPOINT}
+PROJECT_CONTROL_ARMS = {"baseline": "disabled", "treatment": "enforced"}
+CHECKPOINT_ARMS = {"baseline": False, "treatment": True}
 
 
 def _number(value: object, where: str, *, minimum: float = 0.0) -> float:
@@ -70,8 +77,6 @@ def _receipt(
     path: Path,
     journal_path: Path,
     manifest: Mapping[str, Any],
-    *,
-    expected_mode: str,
 ) -> tuple[Dict[str, Any], Dict[str, object], Dict[str, object]]:
     receipt, receipt_identity, _ = _observed_json(path)
     required = {
@@ -95,7 +100,6 @@ def _receipt(
         or receipt.get("cohort") != manifest["cohort"]
         or receipt.get("evaluation_treatment") != manifest["evaluation_treatment"]
         or receipt.get("comparison") != manifest["comparison"]
-        or manifest["evaluation_treatment"].get("project_control") != expected_mode
     ):
         raise LaunchError("paired WorkBuddy receipt does not bind its launch arm")
     if not isinstance(receipt.get("quality_evidence"), bool):
@@ -250,6 +254,156 @@ def _receipt(
     return receipt, receipt_identity, journal_identity
 
 
+def _validate_study_treatment(
+    manifests: Mapping[str, Mapping[str, Any]], study: str
+) -> None:
+    if study not in STUDIES:
+        raise LaunchError(f"paired WorkBuddy study is unsupported: {study}")
+    for arm, manifest in manifests.items():
+        treatment = manifest["evaluation_treatment"]
+        project_mode = treatment.get("project_control")
+        checkpoint = treatment.get("verification_checkpoint")
+        if study == PROJECT_CONTROL:
+            if (
+                project_mode != PROJECT_CONTROL_ARMS[arm]
+                or checkpoint not in {None, False}
+            ):
+                raise LaunchError(
+                    f"paired WorkBuddy {arm} has the wrong project-control treatment"
+                )
+        elif project_mode != "disabled" or checkpoint is not CHECKPOINT_ARMS[arm]:
+            raise LaunchError(
+                f"paired WorkBuddy {arm} has the wrong verification-checkpoint treatment"
+            )
+
+
+def _lean_is_inactive(control: object) -> bool:
+    if not isinstance(control, dict):
+        return False
+    lean = control.get("lean")
+    if not isinstance(lean, dict) or lean.get("used") is not False:
+        return False
+    for name, value in lean.items():
+        if name == "used":
+            continue
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, int):
+            if value != 0:
+                return False
+        elif isinstance(value, list):
+            if value:
+                return False
+        elif isinstance(value, dict):
+            if any(
+                isinstance(item, bool)
+                or not isinstance(item, int)
+                or item != 0
+                for item in value.values()
+            ):
+                return False
+        else:
+            return False
+    return True
+
+
+def _optional_progress_number(value: object, where: str) -> float | None:
+    return None if value is None else _number(value, where)
+
+
+def _progress_evidence(
+    row: Mapping[str, Any], *, arm: str, task: str
+) -> Dict[str, Any]:
+    metrics = row.get("progress_metrics")
+    control = row.get("control_metrics")
+    if not isinstance(metrics, dict) or not isinstance(control, dict):
+        raise LaunchError(f"paired WorkBuddy {task} {arm} lacks progress evidence")
+    source = metrics.get("source")
+    progress = metrics.get("progress")
+    if (
+        metrics.get("schema_version") != "metacodes-workbuddy-progress-analysis-v1"
+        or source
+        != {
+            "transcript_sha256": control.get("source", {}).get("transcript_sha256"),
+            "observation_journal_sha256": control.get("source", {}).get(
+                "observation_journal_sha256"
+            ),
+        }
+        or metrics.get("privacy")
+        != {
+            "tool_arguments_retained": False,
+            "tool_results_retained": False,
+            "paths_retained": False,
+            "memory_text_retained": False,
+        }
+        or not isinstance(progress, dict)
+    ):
+        raise LaunchError(f"paired WorkBuddy {task} {arm} progress evidence is invalid")
+    required_ints = (
+        "tool_calls",
+        "mutation_calls",
+        "mutations_after_first_successful_verification",
+        "verification_calls",
+        "successful_verifications",
+        "exact_repeated_tool_input_result_calls",
+        "checkpoint_messages",
+        "checkpoint_messages_after_successful_verification",
+    )
+    for name in required_ints:
+        _integer(progress.get(name), f"{task} {arm} progress {name}")
+    for name in (
+        "first_mutation_call",
+        "first_successful_verification_call",
+        "calls_after_first_successful_verification",
+    ):
+        if progress.get(name) is not None:
+            _integer(progress[name], f"{task} {arm} progress {name}", minimum=1 if name != "calls_after_first_successful_verification" else 0)
+    for name in (
+        "time_to_first_mutation_ms",
+        "time_to_first_successful_verification_ms",
+        "time_after_first_successful_verification_ms",
+        "time_to_final_dispatch_ms",
+    ):
+        _optional_progress_number(progress.get(name), f"{task} {arm} progress {name}")
+    first_green = progress.get("first_successful_verification_call")
+    checkpoint_count = progress["checkpoint_messages"]
+    checkpoint_after_green = progress[
+        "checkpoint_messages_after_successful_verification"
+    ]
+    expected = 1 if arm == "treatment" and first_green is not None else 0
+    if checkpoint_count != expected or checkpoint_after_green != expected:
+        raise LaunchError(
+            f"paired WorkBuddy {task} {arm} checkpoint actuation is inconsistent"
+        )
+    tool_calls = progress["tool_calls"]
+    first_mutation = progress.get("first_mutation_call")
+    after_green = progress.get("calls_after_first_successful_verification")
+    if (
+        (first_mutation is None) != (progress["mutation_calls"] == 0)
+        or (first_green is None) != (after_green is None)
+        or (first_mutation is not None and first_mutation > tool_calls)
+        or (first_green is not None and first_green > tool_calls)
+        or (after_green is not None and after_green > tool_calls - first_green)
+        or progress["mutations_after_first_successful_verification"]
+        > progress["mutation_calls"]
+        or progress["successful_verifications"] > progress["verification_calls"]
+    ):
+        raise LaunchError(
+            f"paired WorkBuddy {task} {arm} progress aggregate is inconsistent"
+        )
+    return {"source": source, "progress": progress}
+
+
+def _progress_delta(
+    baseline: Mapping[str, Any], treatment: Mapping[str, Any], name: str
+) -> float | int | None:
+    before = baseline.get(name)
+    after = treatment.get(name)
+    if before is None or after is None:
+        return None
+    return after - before
+
+
 def _control_delta(
     baseline: Mapping[str, Any], treatment: Mapping[str, Any]
 ) -> Dict[str, object]:
@@ -275,6 +429,7 @@ def _control_delta(
 
 def build_report(
     *,
+    study: str = PROJECT_CONTROL,
     baseline_manifest_path: Path,
     baseline_receipt_path: Path,
     baseline_journal_path: Path,
@@ -305,8 +460,14 @@ def build_report(
             or comparison.get("schema_version") != COMPARISON_SCHEMA_VERSION
         ):
             raise LaunchError("paired WorkBuddy comparison identity is missing")
-        if manifest["evaluation_treatment"].get("project_control") != ARMS[arm]:
-            raise LaunchError(f"paired WorkBuddy {arm} has the wrong treatment")
+    _validate_study_treatment(manifests, study)
+    if study == VERIFICATION_CHECKPOINT:
+        for arm, manifest in manifests.items():
+            host_modules = manifest.get("host_control_plane")
+            if not isinstance(host_modules, dict) or "progress_analysis" not in host_modules:
+                raise LaunchError(
+                    f"paired WorkBuddy {arm} does not bind its progress analyzer"
+                )
     b_comparison = manifests["baseline"]["comparison"]
     t_comparison = manifests["treatment"]["comparison"]
     if (
@@ -322,13 +483,11 @@ def build_report(
             baseline_receipt_path,
             baseline_journal_path,
             manifests["baseline"],
-            expected_mode="disabled",
         ),
         "treatment": _receipt(
             treatment_receipt_path,
             treatment_journal_path,
             manifests["treatment"],
-            expected_mode="enforced",
         ),
     }
     receipts = {arm: observation[0] for arm, observation in receipt_observations.items()}
@@ -369,7 +528,7 @@ def build_report(
         improved += int(delta > 0)
         regressed += int(delta < 0)
         unchanged += int(delta == 0)
-        tasks[task] = {
+        task_report: Dict[str, Any] = {
             "task_checksum": baseline["task_checksum"],
             "cacheable_first_request_sha256": baseline[
                 "cacheable_first_request_sha256"
@@ -413,6 +572,35 @@ def build_report(
                 baseline["control_metrics"], treatment["control_metrics"]
             ),
         }
+        if study == VERIFICATION_CHECKPOINT:
+            if not _lean_is_inactive(baseline.get("control_metrics")) or not _lean_is_inactive(
+                treatment.get("control_metrics")
+            ):
+                raise LaunchError(
+                    f"paired WorkBuddy {task} checkpoint study contains Lean actuation"
+                )
+            b_progress = _progress_evidence(baseline, arm="baseline", task=task)
+            t_progress = _progress_evidence(treatment, arm="treatment", task=task)
+            task_report["progress"] = {
+                "baseline": b_progress,
+                "treatment": t_progress,
+                "calls_after_first_successful_verification_delta": _progress_delta(
+                    b_progress["progress"],
+                    t_progress["progress"],
+                    "calls_after_first_successful_verification",
+                ),
+                "mutations_after_first_successful_verification_delta": _progress_delta(
+                    b_progress["progress"],
+                    t_progress["progress"],
+                    "mutations_after_first_successful_verification",
+                ),
+                "time_after_first_successful_verification_ms_delta": _progress_delta(
+                    b_progress["progress"],
+                    t_progress["progress"],
+                    "time_after_first_successful_verification_ms",
+                ),
+            }
+        tasks[task] = task_report
 
     b_quality = b_usage["quality"]
     t_quality = t_usage["quality"]
@@ -421,7 +609,12 @@ def build_report(
         and receipts["treatment"]["quality_evidence"] is True
     )
     report: Dict[str, object] = {
-        "schema_version": REPORT_SCHEMA_VERSION,
+        "schema_version": (
+            REPORT_SCHEMA_VERSION
+            if study == PROJECT_CONTROL
+            else CHECKPOINT_REPORT_SCHEMA_VERSION
+        ),
+        **({"study": study} if study == VERIFICATION_CHECKPOINT else {}),
         "quality_evidence": quality_evidence,
         "comparison_id": b_comparison["comparison_id"],
         "covariates_sha256": b_comparison["covariates_sha256"],
@@ -431,7 +624,18 @@ def build_report(
                 "receipt": receipt_identities[arm],
                 "budget_journal": journal_identities[arm],
                 "run_id": manifests[arm]["run_id"],
-                "project_control": ARMS[arm],
+                "project_control": manifests[arm]["evaluation_treatment"][
+                    "project_control"
+                ],
+                **(
+                    {
+                        "verification_checkpoint": manifests[arm][
+                            "evaluation_treatment"
+                        ].get("verification_checkpoint", False)
+                    }
+                    if study == VERIFICATION_CHECKPOINT
+                    else {}
+                ),
             }
             for arm in ("baseline", "treatment")
         },
@@ -469,6 +673,10 @@ def build_report(
             "observed paired difference for this frozen task cohort and project-rule "
             "bundle; a single model sample per arm is not a causal effect estimate or "
             "evidence of general Lean/TinyKG superiority"
+            if study == PROJECT_CONTROL
+            else "observed paired difference for this frozen task cohort with only the "
+            "verification-checkpoint treatment intentionally changed; one model sample "
+            "per arm is directional evidence, not a general causal effect estimate"
         ),
     }
     report["content_sha256"] = _canonical_sha256(report)
@@ -477,6 +685,9 @@ def build_report(
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--study", choices=sorted(STUDIES), default=PROJECT_CONTROL
+    )
     parser.add_argument("--baseline-manifest", type=Path, required=True)
     parser.add_argument("--baseline-receipt", type=Path, required=True)
     parser.add_argument("--baseline-budget-journal", type=Path, required=True)
@@ -487,6 +698,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         report = build_report(
+            study=args.study,
             baseline_manifest_path=args.baseline_manifest,
             baseline_receipt_path=args.baseline_receipt,
             baseline_journal_path=args.baseline_budget_journal,

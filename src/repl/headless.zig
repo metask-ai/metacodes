@@ -145,9 +145,7 @@ pub fn run(
         .disallowed_rules = app.config.disallowed_tools orelse "",
         .parent = eval_execution_policy,
     };
-    const effective_execution_policy = if (
-        headless_tool_policy.disallowed_rules.len > 0 or eval_execution_policy != null
-    ) headless_tool_policy.executionPolicy() else null;
+    const effective_execution_policy = if (headless_tool_policy.disallowed_rules.len > 0 or eval_execution_policy != null) headless_tool_policy.executionPolicy() else null;
     defer if (eval_be) |*evaluation| evaluation.deinit();
     var eval_ui: ui_backend_mod.UiBackend = if (eval_be) |*evaluation| evaluation.backend() else be;
     var eval_tee = tee_backend_mod.TeeBackend{ .primary = &be, .secondary = &eval_ui };
@@ -267,6 +265,7 @@ fn buildOptions(
         .execution_policy = execution_policy,
         .tool_observer = tool_observer,
         .project_rule_gate = project_rule_gate,
+        .verification_checkpoint = app.config.verification_checkpoint,
         // Tool lifecycle events are part of the evaluation protocol even
         // though the null writer renders no cards.  Leaving this false made
         // headless traces contain policy decisions without tool attempts.

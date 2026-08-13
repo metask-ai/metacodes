@@ -75,6 +75,14 @@ class MetacodesAgent(BaseInstalledAgent):
         self._disabled_tools = str(
             kwargs.pop("METACODES_DISALLOWED_TOOLS", _DEFAULT_DISABLED_TOOLS)
         )
+        verification_checkpoint = kwargs.pop(
+            "METACODES_VERIFICATION_CHECKPOINT", False
+        )
+        if not isinstance(verification_checkpoint, bool):
+            raise ValueError(
+                "METACODES_VERIFICATION_CHECKPOINT must be an explicit boolean"
+            )
+        self._verification_checkpoint = verification_checkpoint
         project_rules = kwargs.pop("METACODES_PROJECT_RULES_RELATIVE", None)
         project_kernel = kwargs.pop("METACODES_PROJECT_KERNEL_RELATIVE", None)
         project_control_mode = kwargs.pop("METACODES_PROJECT_CONTROL_MODE", None)
@@ -213,6 +221,8 @@ class MetacodesAgent(BaseInstalledAgent):
         ]
         if self._max_output_tokens is not None:
             flags += ["--max-tokens", str(self._max_output_tokens)]
+        if self._verification_checkpoint:
+            flags.append("--verification-checkpoint")
 
         project_setup = ""
         project_postcheck = ""
@@ -295,6 +305,7 @@ class MetacodesAgent(BaseInstalledAgent):
                 "credential_delivery": "anonymous-fd-route-token",
                 "transport_model_is_route": True,
                 "actor_model_identity": self._model_display_name,
+                "verification_checkpoint": self._verification_checkpoint,
                 "project_control": project_contract,
             },
             sort_keys=True,

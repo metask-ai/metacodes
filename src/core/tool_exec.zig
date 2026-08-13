@@ -92,6 +92,10 @@ pub const Slot = struct {
     pending_payload: ?[]u8 = null,
     /// P0.4:该 slot 的结果已由流式预取(stream_prefetch)填好 → executeSlots 跳过,不重复执行。
     prefetched: bool = false,
+    /// Typed effect copied from the real dispatch observation. It is consumed
+    /// by run-local observers only; it is never model-visible.
+    effect: ?tool_observation.Effect = null,
+    effect_valid: bool = true,
 
     /// 释放全部 slot-owned payload(content/pending_kind/pending_payload)并置 null。
     /// agent_loop 用单个 defer 遍历调用,覆盖**所有**退出路径(正常/挂起/fatal/错误);
@@ -129,7 +133,13 @@ const Job = struct {
 /// 单个工具执行的结果(所有 owned 字段挂 parent_allocator,逃逸内部 arena)。
 pub const OneResult = union(enum) {
     /// 正常完成(成功或工具级错误)。
-    done: struct { content: ?[]u8, is_error: bool, elapsed_ms: u64 },
+    done: struct {
+        content: ?[]u8,
+        is_error: bool,
+        elapsed_ms: u64,
+        effect: ?tool_observation.Effect = null,
+        effect_valid: bool = true,
+    },
     /// L3 挂起:工具发起 custom UI(error.UiPending)。kind/payload owned by parent_allocator。
     pending: struct { kind: ?[]u8, payload: ?[]u8, elapsed_ms: u64 },
     /// Host 工具 fatal:类型化控制信号,无 payload——不组装 tool_result,逐层显式传递
@@ -730,7 +740,13 @@ pub fn executeOne(
     const content = try parent_allocator.dupe(u8, result_bytes);
     const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
     log.infoId("agent", rid, "tool.exec done(par) name={s} output_bytes={d} duration_ms={d}", .{ name, result_bytes.len, elapsed });
-    return .{ .done = .{ .content = content, .is_error = false, .elapsed_ms = elapsed } };
+    return .{ .done = .{
+        .content = content,
+        .is_error = false,
+        .elapsed_ms = elapsed,
+        .effect = effect_slot.effect,
+        .effect_valid = effect_slot.valid,
+    } };
 }
 
 fn invalidNativeWriteArgsResult(
@@ -795,6 +811,8 @@ fn runJob(job: *Job) void {
             s.content = d.content;
             s.is_error = d.is_error;
             s.elapsed_ms = d.elapsed_ms;
+            s.effect = d.effect;
+            s.effect_valid = d.effect_valid;
         },
         // fatal 不组装 tool_result:slot 不填 content,信号经 Job.fatal 上传。
         .host_fatal => job.fatal = true,
