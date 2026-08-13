@@ -135,6 +135,8 @@ _METACODES_RUNTIME_BUILDER = '''def _build_metacodes_runtime_config(
         "project_control_staged": project_staged,
         "project_control_mode": project_mode if project_staged else "absent",
         "project_control_configured": project_staged and project_mode == "enforced",
+        "transport_model_is_route": connection_mode == "local_proxy",
+        "actor_model_identity": backend_model_name,
         "translated_env": {key: value for key, value in env.items() if value},
         "cleared_env": [
             "TINYKG_REMOTE_URL",
@@ -209,6 +211,22 @@ _PREPARE_MOUNT_NEW = '''    harness_name = harness.get("name", "")
     if dataset_requires_mount:
 '''
 
+_PREPARE_AGENT_IDENTITY_OLD = '''    kwargs: dict[str, Any] = dict(harness_params)
+    if model_params:
+        kwargs["model_params"] = model_params
+'''
+_PREPARE_AGENT_IDENTITY_NEW = '''    kwargs: dict[str, Any] = dict(harness_params)
+    if harness.get("name") == "metacodes":
+        backend_model_name = str(
+            (manifest or {}).get("backend_model_name") or model.get("name") or ""
+        )
+        if not backend_model_name:
+            raise ValueError("metacodes requires a stable backend model identity")
+        kwargs["METACODES_MODEL_DISPLAY_NAME"] = backend_model_name
+    if model_params:
+        kwargs["model_params"] = model_params
+'''
+
 
 def _run(repo: Path, *args: str) -> str:
     try:
@@ -260,6 +278,13 @@ def _patched_upstream(repo: Path) -> Dict[Path, bytes]:
     resolver = resolver.replace(_RESOLVER_MOUNT_OLD, _RESOLVER_MOUNT_NEW, 1)
 
     prepare_job = _head_file(repo, _PREPARE_JOB_PATH).decode("utf-8")
+    if prepare_job.count(_PREPARE_AGENT_IDENTITY_OLD) != 1:
+        raise OverlayError("WorkBuddy prepare_job model-identity anchor drifted")
+    prepare_job = prepare_job.replace(
+        _PREPARE_AGENT_IDENTITY_OLD,
+        _PREPARE_AGENT_IDENTITY_NEW,
+        1,
+    )
     if prepare_job.count(_PREPARE_MOUNT_OLD) != 1:
         raise OverlayError("WorkBuddy prepare_job mount-requirement anchor drifted")
     prepare_job = prepare_job.replace(_PREPARE_MOUNT_OLD, _PREPARE_MOUNT_NEW, 1)

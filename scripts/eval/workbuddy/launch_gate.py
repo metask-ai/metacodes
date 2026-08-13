@@ -1562,6 +1562,19 @@ def _official_task_identity(
     return matches[0], result_path, result
 
 
+def _cacheable_first_request_sha256(request_body: Mapping[str, Any]) -> str:
+    """Hash exactly the actor-visible first-request body.
+
+    WorkBuddy's local proxy requires a run-specific transport route in
+    ``model``.  That routing envelope is deliberately excluded; everything
+    visible to the actor, including the system prompt and tool schemas, remains
+    byte-significant and must match across paired arms.
+    """
+    body = dict(request_body)
+    body.pop("model", None)
+    return _canonical_sha256(body)
+
+
 def _expected_project_control(manifest: Mapping[str, Any]) -> Dict[str, object]:
     treatment = manifest.get("evaluation_treatment")
     project = manifest.get("artifacts", {}).get("project_control")
@@ -1652,6 +1665,16 @@ def _validate_project_control_kwargs(
         raise LaunchError(f"{label} project control kwargs drifted")
 
 
+def _validate_actor_model_identity(
+    kwargs: object, manifest: Mapping[str, Any], *, label: str
+) -> None:
+    if not isinstance(kwargs, dict):
+        raise LaunchError(f"{label} has no agent kwargs")
+    expected = str(manifest.get("model", {}).get("backend_model_name") or "")
+    if not expected or kwargs.get("METACODES_MODEL_DISPLAY_NAME") != expected:
+        raise LaunchError(f"{label} actor model identity drifted")
+
+
 def _validate_trial_project_control(
     trial_dir: Path, manifest: Mapping[str, Any]
 ) -> None:
@@ -1663,7 +1686,17 @@ def _validate_trial_project_control(
     _validate_project_control_kwargs(
         agent.get("kwargs"), expected, label="official WorkBuddy trial"
     )
+    _validate_actor_model_identity(
+        agent.get("kwargs"), manifest, label="official WorkBuddy trial"
+    )
     runtime = _json(trial_dir / "agent/metacodes-runtime-contract.json")
+    backend_model_name = str(manifest.get("model", {}).get("backend_model_name") or "")
+    if (
+        runtime.get("transport_model_is_route") is not True
+        or not backend_model_name
+        or runtime.get("actor_model_identity") != backend_model_name
+    ):
+        raise LaunchError("official WorkBuddy runtime model identity drifted")
     project = runtime.get("project_control")
     if not isinstance(project, dict) or project != {
         "staged": expected["staged"],
@@ -1706,6 +1739,9 @@ def _runtime_contract(manifest: Mapping[str, Any]) -> Dict[str, object]:
         or harness_runtime.get("project_control_mode") != expected_project["mode"]
         or harness_runtime.get("project_control_configured")
         is not expected_project["configured"]
+        or harness_runtime.get("transport_model_is_route") is not True
+        or harness_runtime.get("actor_model_identity")
+        != manifest["model"]["backend_model_name"]
         or not isinstance(translated_env, dict)
         or translated_env.get("METACODES_PROJECT_RULES_SOURCE")
         != (
@@ -1733,6 +1769,11 @@ def _runtime_contract(manifest: Mapping[str, Any]) -> Dict[str, object]:
     _validate_project_control_kwargs(
         agents[0].get("kwargs"),
         expected_project,
+        label="resolved WorkBuddy runtime job",
+    )
+    _validate_actor_model_identity(
+        agents[0].get("kwargs"),
+        manifest,
         label="resolved WorkBuddy runtime job",
     )
     proxy = _yaml(proxy_path).get("proxy")
@@ -1850,8 +1891,7 @@ def _collect_usage(
             first_body = dict(first_record["request"]["body"])
         except (UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise LaunchError(f"invalid first request audit for {trajectory_path}: {exc}") from exc
-        first_body.pop("model", None)
-        prefix_hash = _canonical_sha256(first_body)
+        prefix_hash = _cacheable_first_request_sha256(first_body)
         cache_read = final.get("total_cached_tokens", 0)
         cache_create = extra.get("cache_creation_input_tokens", 0)
         if cache_read is None:

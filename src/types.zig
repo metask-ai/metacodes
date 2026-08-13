@@ -3,6 +3,11 @@ const std = @import("std");
 /// 通用配置
 pub const Config = struct {
     api_key: ?[]const u8 = null,
+    /// Stable actor-visible identity used only in the system prompt.  The
+    /// transport/request model remains `model`; keeping these separate lets a
+    /// proxy use run-specific route names without leaking them into the
+    /// cacheable prompt prefix.
+    model_display_name: ?[]const u8 = null,
     model: []const u8 = "claude-sonnet-4-20250514",
     model_explicit: bool = false,
     reasoning_effort: ?ReasoningEffort = null,
@@ -302,6 +307,10 @@ pub fn parseArgs(init: std.process.Init, allocator: std.mem.Allocator) Config {
             if (args.next()) |model| {
                 config.model = allocator.dupe(u8, model) catch model;
             }
+        } else if (std.mem.eql(u8, arg, "--model-display-name")) {
+            if (args.next()) |name| {
+                config.model_display_name = allocator.dupe(u8, name) catch name;
+            }
         } else if (std.mem.eql(u8, arg, "--no-theme")) {
             config.no_theme = true;
         } else if (std.mem.eql(u8, arg, "--verbose")) {
@@ -336,6 +345,7 @@ fn printHelp() void {
         \\
         \\Options:
         \\  --model <model>       Model to use (default: claude-sonnet-4-20250514)
+        \\  --model-display-name <name>  Stable model identity shown to the actor
         \\  --api-key <key>       Metask API key (or METASK_API_KEY env)
         \\  --permission <mode>   Permission mode: auto, prompt, plan, bypass
         \\  --no-theme            Disable colors
@@ -354,6 +364,7 @@ pub fn printHelpToWriter(stdout: anytype) !void {
         \\
         \\Options:
         \\  --model <model>       Model to use (default: claude-sonnet-4-20250514)
+        \\  --model-display-name <name>  Stable model identity shown to the actor
         \\  --api-key <key>       Metask API key (or METASK_API_KEY env)
         \\  --permission <mode>   Permission mode: auto, prompt, plan, bypass
         \\  --no-theme            Disable colors

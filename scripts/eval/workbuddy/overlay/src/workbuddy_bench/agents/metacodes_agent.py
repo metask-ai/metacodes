@@ -103,6 +103,12 @@ class MetacodesAgent(BaseInstalledAgent):
             else None
         )
         model_params = kwargs.pop("model_params", None) or {}
+        model_display_name = str(kwargs.pop("METACODES_MODEL_DISPLAY_NAME", ""))
+        if not model_display_name:
+            raise ValueError(
+                "metacodes WorkBuddy runs require a stable backend model identity"
+            )
+        self._model_display_name = model_display_name
         max_output = model_params.get("max_output_tokens")
         self._max_output_tokens = int(max_output) if max_output is not None else None
         self._model_params = dict(model_params)
@@ -167,6 +173,7 @@ class MetacodesAgent(BaseInstalledAgent):
         instruction = self.render_instruction(instruction)
         escaped_instruction = shlex.quote(instruction)
         escaped_model = shlex.quote(self.model_name)
+        escaped_model_display_name = shlex.quote(self._model_display_name)
         try:
             escaped_proxy = anthropic_messages_endpoint(self._proxy_url)
         except TraceError as exc:
@@ -198,6 +205,7 @@ class MetacodesAgent(BaseInstalledAgent):
         runtime_contract_path = f"/logs/agent/{_RUNTIME_CONTRACT_FILENAME}"
         flags = [
             "--model", escaped_model,
+            "--model-display-name", escaped_model_display_name,
             "--permission", "bypassPermissions",
             "--no-theme",
             "--disallowed-tools", shlex.quote(self._disabled_tools),
@@ -284,6 +292,8 @@ class MetacodesAgent(BaseInstalledAgent):
                 "remote_tinykg_env_absent": remote_tinykg_env_absent,
                 "tinykg_store_absent_before_first_provider_request": True,
                 "credential_delivery": "anonymous-fd-route-token",
+                "transport_model_is_route": True,
+                "actor_model_identity": self._model_display_name,
                 "project_control": project_contract,
             },
             sort_keys=True,

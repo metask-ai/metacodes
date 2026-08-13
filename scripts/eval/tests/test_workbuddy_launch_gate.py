@@ -32,6 +32,7 @@ from scripts.eval.workbuddy.launch_gate import (
     _paid_host_guard,
     _official_task_identity,
     _collect_usage,
+    _cacheable_first_request_sha256,
     _aggregate_control_metrics,
     _validate_control_metrics,
     _receipt_quality_evidence,
@@ -114,6 +115,28 @@ class _Server:
 
 
 class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
+    def test_cacheable_first_request_hash_ignores_only_transport_route(self):
+        baseline = {
+            "model": "baseline-run--metacodes-glm52",
+            "system": "You are powered by the model glm-5.2.",
+            "messages": [{"role": "user", "content": "task"}],
+            "tools": [{"name": "Read", "description": "read"}],
+            "stream": True,
+        }
+        treatment = dict(baseline)
+        treatment["model"] = "treatment-run--metacodes-glm52"
+        self.assertEqual(
+            _cacheable_first_request_sha256(baseline),
+            _cacheable_first_request_sha256(treatment),
+        )
+
+        drifted = dict(treatment)
+        drifted["system"] = "You are powered by a run-specific route."
+        self.assertNotEqual(
+            _cacheable_first_request_sha256(baseline),
+            _cacheable_first_request_sha256(drifted),
+        )
+
     def test_artifact_contract_recomputes_project_kernel_and_rule_tree(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1576,7 +1599,15 @@ with urllib.request.urlopen(
             encoding="utf-8",
         )
         (trial / "config.json").write_text(
-            json.dumps({"agent": {"kwargs": {}}}) + "\n", encoding="utf-8"
+            json.dumps(
+                {
+                    "agent": {
+                        "kwargs": {"METACODES_MODEL_DISPLAY_NAME": "glm-5.2"}
+                    }
+                }
+            )
+            + "\n",
+            encoding="utf-8",
         )
         (agent / "metacodes-runtime-contract.json").write_text(
             json.dumps(
@@ -1588,7 +1619,9 @@ with urllib.request.urlopen(
                         "project_state_hash": None,
                         "artifacts_verified": False,
                         "runtime_active_bundle_absent": True,
-                    }
+                    },
+                    "transport_model_is_route": True,
+                    "actor_model_identity": "glm-5.2",
                 }
             )
             + "\n",
@@ -1632,10 +1665,13 @@ with urllib.request.urlopen(
                     "harness_resolved_slug": "metacodes/0.1.0",
                     "model_slug": model_slug,
                     "model_route": model_route,
+                    "backend_model_name": "glm-5.2",
                     "harness_runtime_config": {
                         "project_control_staged": False,
                         "project_control_mode": "absent",
                         "project_control_configured": False,
+                        "transport_model_is_route": True,
+                        "actor_model_identity": "glm-5.2",
                         "translated_env": {},
                     },
                 },
@@ -1648,7 +1684,18 @@ with urllib.request.urlopen(
             "proxy:\n  backend_retries: 0\n  routes: []\n", encoding="utf-8"
         )
         (runtime_jobs / f"{job_slug}.yaml").write_text(
-            yaml.safe_dump({"agents": [{"kwargs": {}}]}), encoding="utf-8"
+            yaml.safe_dump(
+                {
+                    "agents": [
+                        {
+                            "kwargs": {
+                                "METACODES_MODEL_DISPLAY_NAME": "glm-5.2"
+                            }
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
         )
         return {
             "run_id": run_id,
@@ -1658,7 +1705,10 @@ with urllib.request.urlopen(
                 "selected_tasks": [task],
             },
             "job": {"slug": job_slug},
-            "model": {"slug": model_slug},
+            "model": {
+                "slug": model_slug,
+                "backend_model_name": "glm-5.2",
+            },
             "artifacts": {},
         }
 
@@ -1705,6 +1755,8 @@ with urllib.request.urlopen(
                     "project_control_staged": True,
                     "project_control_mode": "enforced",
                     "project_control_configured": True,
+                    "transport_model_is_route": True,
+                    "actor_model_identity": "glm-5.2",
                     "translated_env": {
                         "METACODES_PROJECT_RULES_SOURCE": (
                             "/opt/metacodes/" + rules_relative
@@ -1726,6 +1778,7 @@ with urllib.request.urlopen(
                 "METACODES_PROJECT_CONTROL_MODE": "enforced",
                 "METACODES_PROJECT_RULES_RELATIVE": rules_relative,
                 "METACODES_PROJECT_KERNEL_RELATIVE": kernel_relative,
+                "METACODES_MODEL_DISPLAY_NAME": "glm-5.2",
             }
             runtime_job = runtime_jobs / f"{job_slug}.yaml"
             runtime_job.write_text(
@@ -1737,7 +1790,10 @@ with urllib.request.urlopen(
                 "workbuddy": {"checkout": str(workbuddy)},
                 "cohort": {"selected_tasks": ["code-task-a"]},
                 "job": {"slug": job_slug},
-                "model": {"slug": "test-model"},
+                "model": {
+                    "slug": "test-model",
+                    "backend_model_name": "glm-5.2",
+                },
                 "artifacts": {
                     "project_control": {
                         "rules": {
@@ -1776,7 +1832,9 @@ with urllib.request.urlopen(
                             "project_state_hash": "5807156ecf67bb70",
                             "artifacts_verified": True,
                             "runtime_active_bundle_absent": False,
-                        }
+                        },
+                        "transport_model_is_route": True,
+                        "actor_model_identity": "glm-5.2",
                     }
                 )
                 + "\n",
@@ -1800,6 +1858,7 @@ with urllib.request.urlopen(
             rules_relative = "share/metacodes/workbuddy-w05/project-rules"
             kernel_relative = "libexec/metacodes-project-kernel"
             manifest = {
+                "model": {"backend_model_name": "glm-5.2"},
                 "evaluation_treatment": {"project_control": "disabled"},
                 "artifacts": {
                     "project_control": {
@@ -1831,6 +1890,7 @@ with urllib.request.urlopen(
                 "METACODES_PROJECT_CONTROL_MODE": "disabled",
                 "METACODES_PROJECT_RULES_RELATIVE": rules_relative,
                 "METACODES_PROJECT_KERNEL_RELATIVE": kernel_relative,
+                "METACODES_MODEL_DISPLAY_NAME": "glm-5.2",
             }
             (trial / "config.json").write_text(
                 json.dumps({"agent": {"kwargs": kwargs}}) + "\n", encoding="utf-8"
@@ -1845,7 +1905,9 @@ with urllib.request.urlopen(
                             "project_state_hash": None,
                             "artifacts_verified": True,
                             "runtime_active_bundle_absent": True,
-                        }
+                        },
+                        "transport_model_is_route": True,
+                        "actor_model_identity": "glm-5.2",
                     }
                 )
                 + "\n",

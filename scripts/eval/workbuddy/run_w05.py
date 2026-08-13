@@ -64,6 +64,8 @@ EXPECTED_RUNTIME_CONTRACT = {
     "remote_tinykg_env_absent": True,
     "tinykg_store_absent_before_first_provider_request": True,
     "credential_delivery": "anonymous-fd-route-token",
+    "transport_model_is_route": True,
+    "actor_model_identity": "glm-5.2",
     "project_control": {
         "staged": True,
         "mode": "enforced",

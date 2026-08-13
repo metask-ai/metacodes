@@ -1,5 +1,6 @@
 import json
 import hashlib
+import importlib.util
 import io
 import os
 import subprocess
@@ -1022,7 +1023,10 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
                     + overlay_installer._RESOLVER_MOUNT_OLD
                 ),
                 overlay_installer._PREPARE_JOB_PATH:
-                    overlay_installer._PREPARE_MOUNT_OLD,
+                    (
+                        overlay_installer._PREPARE_AGENT_IDENTITY_OLD
+                        + overlay_installer._PREPARE_MOUNT_OLD
+                    ),
                 overlay_installer._PROXY_CONFIG_PATH: (
                     overlay_installer._PROXY_IMPORT_ANCHOR
                     + overlay_installer._PROXY_KEY_OLD
@@ -1053,9 +1057,75 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
             self.assertIn(overlay_installer._RESOLVER_MOUNT_NEW, resolver)
             self.assertIn(overlay_installer._MODEL_ROUTE_NEW, resolver)
             self.assertIn(overlay_installer._PREPARE_MOUNT_NEW, prepare)
+            self.assertIn(overlay_installer._PREPARE_AGENT_IDENTITY_NEW, prepare)
+            self.assertIn('"actor_model_identity": backend_model_name', resolver)
+            self.assertIn(
+                '"transport_model_is_route": connection_mode == "local_proxy"',
+                resolver,
+            )
             self.assertNotIn(overlay_installer._RESOLVER_MOUNT_OLD, resolver)
             self.assertNotIn(overlay_installer._MODEL_ROUTE_OLD, resolver)
             self.assertNotIn(overlay_installer._PREPARE_MOUNT_OLD, prepare)
+            self.assertNotIn(overlay_installer._PREPARE_AGENT_IDENTITY_OLD, prepare)
+
+    def test_adapter_passes_stable_backend_identity_separately_from_route(self):
+        source = (
+            Path(__file__).parents[1]
+            / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('kwargs.pop("METACODES_MODEL_DISPLAY_NAME", "")', source)
+        self.assertIn('"--model", escaped_model', source)
+        self.assertIn('"--model-display-name", escaped_model_display_name', source)
+        self.assertIn('"transport_model_is_route": True', source)
+        self.assertIn('"actor_model_identity": self._model_display_name', source)
+        self.assertIn(
+            'kwargs["METACODES_MODEL_DISPLAY_NAME"] = backend_model_name',
+            overlay_installer._PREPARE_AGENT_IDENTITY_NEW,
+        )
+
+    def test_installed_prepare_job_preserves_route_and_injects_backend_identity(self):
+        checkout_raw = os.environ.get("METACODES_WORKBUDDY_CHECKOUT")
+        if not checkout_raw:
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        checkout = Path(checkout_raw)
+        if not checkout.is_dir():
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        source = checkout / "src/workbuddy_bench/runner/prepare_job.py"
+        if not source.is_file():
+            self.skipTest("WorkBuddy prepare_job is unavailable")
+        spec = importlib.util.spec_from_file_location("metacodes_prepare_job_l2", source)
+        if spec is None or spec.loader is None:
+            self.skipTest("cannot load WorkBuddy prepare_job")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        route = "paired-control-run--metacodes-glm52"
+        row = module._build_agent_block(
+            harness={
+                "name": "metacodes",
+                "import_path": "workbuddy_bench.agents.metacodes_agent:MetacodesAgent",
+                "params": {},
+            },
+            model_slug="metacodes-glm52",
+            model={"name": "glm-5.2", "params": {}},
+            job={},
+            manifest={
+                "connection": {
+                    "effective": "local_proxy",
+                    "proxy_url": "http://host.docker.internal:1234",
+                },
+                "model_connection": "local_proxy",
+                "model_route": route,
+                "backend_model_name": "glm-5.2",
+                "instance_id": "paired-control-run",
+            },
+        )
+        self.assertEqual(row["model_name"], route)
+        self.assertEqual(
+            row["kwargs"]["connection"]["model_route"], route
+        )
+        self.assertEqual(
+            row["kwargs"]["METACODES_MODEL_DISPLAY_NAME"], "glm-5.2"
+        )
 
     def test_digest_detects_changes_before_owned_overlay_replacement(self):
         rows = [(Path("a"), b"one"), (Path("b"), b"two")]

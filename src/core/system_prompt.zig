@@ -184,7 +184,7 @@ const PLATFORM: []const u8 = switch (@import("builtin").os.tag) {
 
 /// 拼 # Environment 段，返回 allocator-owned string。
 /// cwd 由调用方提供(CLI 传进程 cwd,Session 传 workspace.root)——库不预设 cwd 来源。
-fn buildEnvSection(allocator: std.mem.Allocator, model: []const u8, cwd: []const u8) ![]u8 {
+fn buildEnvSection(allocator: std.mem.Allocator, model_identity: []const u8, cwd: []const u8) ![]u8 {
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
 
@@ -227,12 +227,12 @@ fn buildEnvSection(allocator: std.mem.Allocator, model: []const u8, cwd: []const
 
     // 模型描述 —— 不从 TS 的 marketingName 表里拉（Zig 端没维护），直接用 model id
     {
-        const s = try std.fmt.allocPrint(allocator, " - You are powered by the model {s}.\n", .{model});
+        const s = try std.fmt.allocPrint(allocator, " - You are powered by the model {s}.\n", .{model_identity});
         defer allocator.free(s);
         try buf.appendSlice(allocator, s);
     }
 
-    if (getKnowledgeCutoff(model)) |cut| {
+    if (getKnowledgeCutoff(model_identity)) |cut| {
         const s = try std.fmt.allocPrint(allocator, " - Assistant knowledge cutoff is {s}.\n", .{cut});
         defer allocator.free(s);
         try buf.appendSlice(allocator, s);

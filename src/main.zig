@@ -857,6 +857,10 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
                 config.model = allocator.dupe(u8, m) catch m;
                 config.model_explicit = true;
             }
+        } else if (std.mem.eql(u8, arg, "--model-display-name")) {
+            if (args.next()) |name| {
+                config.model_display_name = allocator.dupe(u8, name) catch name;
+            }
         } else if (std.mem.eql(u8, arg, "--reasoning-effort") or std.mem.eql(u8, arg, "--thinking")) {
             if (args.next()) |e| config.reasoning_effort = types.ReasoningEffort.parse(e);
         } else if (std.mem.eql(u8, arg, "--temperature")) {
@@ -1037,6 +1041,7 @@ fn printHelp() void {
         \\  --web [port]          Serve a web UI (HTTP+SSE) instead of the TUI (default port 7777)
         \\  --resume-response <j> Resume a suspended session with a late tool response (@file to read from a file)
         \\  --model <model>       Model (default: claude-sonnet-4-20250514)
+        \\  --model-display-name <name>  Stable actor-visible model identity
         \\  --reasoning-effort <e> none|minimal|low|medium|high|xhigh
         \\  --temperature <f>    Override sampling temperature (dialect-gated fields)
         \\  --top-p <f>          Override nucleus sampling top_p
