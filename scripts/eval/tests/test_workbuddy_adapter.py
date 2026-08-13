@@ -347,6 +347,13 @@ class WorkBuddyTraceTest(unittest.TestCase):
             }}),
             ("remember", "KgRemember", {"remembered": {"node_id": 9}}),
             ("task-create", "TaskCreate", {"task": {"id": "kg-10"}}),
+            ("task-list", "TaskList", [
+                {
+                    "id": "kg-10", "subject": "Persist result", "status": "pending",
+                    "kg_status": "open", "readiness": "ready", "plan_step": True,
+                },
+                {"parallel_hint": "2 ready tasks can run in parallel"},
+            ]),
             ("task-claim", "TaskUpdate", {
                 "claimed": True, "claimed_by": "agent-l2"
             }),
@@ -378,9 +385,66 @@ class WorkBuddyTraceTest(unittest.TestCase):
         self.assertEqual(tinykg["recall_repeated_nodes"], 1)
         self.assertEqual(tinykg["context_evidence_connected"], 1)
         self.assertEqual(tinykg["remember_succeeded"], 1)
-        self.assertEqual(tinykg["task_dag_calls"], 3)
-        self.assertEqual(tinykg["task_tinykg_status_results"], 3)
+        self.assertEqual(tinykg["task_dag_calls"], 4)
+        self.assertEqual(tinykg["task_list_calls"], 1)
+        self.assertEqual(tinykg["task_tinykg_status_results"], 4)
         self.assertEqual(tinykg["task_terminal_commits"], 1)
+
+    def test_control_metrics_reject_malformed_task_list_array(self):
+        cases = (
+            {"tasks": []},
+            ["not-an-object"],
+            [{"parallel_hint": ""}],
+            [{"id": "kg-1", "subject": "Task", "status": "pending",
+              "kg_status": "unknown"}],
+        )
+        for payload in cases:
+            transcript_rows = [
+                {"role": "assistant", "blocks": [{
+                    "type": "tool_use", "id": "list", "name": "TaskList", "input": {}
+                }]},
+                {"role": "user", "blocks": [{
+                    "type": "tool_result", "tool_use_id": "list",
+                    "content": json.dumps(payload), "is_error": False,
+                }]},
+            ]
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                transcript = root / "transcript.jsonl"
+                observation = root / "tool-observations.jsonl"
+                self._write_jsonl(transcript, transcript_rows)
+                self._write_jsonl(observation, self._journal())
+                with self.assertRaises(TraceError):
+                    load_control_metrics(transcript, observation)
+
+    def test_control_metrics_accept_empty_and_local_task_lists_without_kg_evidence(self):
+        calls = (
+            ("empty", []),
+            ("local", [{
+                "id": "1", "subject": "Session task", "status": "in_progress",
+                "blockedBy": [],
+            }]),
+        )
+        transcript_rows = [
+            {"role": "assistant", "blocks": [
+                {"type": "tool_use", "id": call_id, "name": "TaskList", "input": {}}
+                for call_id, _ in calls
+            ]},
+            {"role": "user", "blocks": [
+                {"type": "tool_result", "tool_use_id": call_id,
+                 "content": json.dumps(payload), "is_error": False}
+                for call_id, payload in calls
+            ]},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(transcript, transcript_rows)
+            self._write_jsonl(observation, self._journal())
+            metrics = load_control_metrics(transcript, observation)
+        self.assertEqual(metrics["tinykg"]["task_list_calls"], 2)
+        self.assertEqual(metrics["tinykg"]["task_tinykg_status_results"], 0)
 
     def test_control_metrics_reject_sequence_identity_pairing_and_recall_drift(self):
         cases = []
@@ -1119,6 +1183,84 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
 
 
 class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
+    def test_installed_adapter_post_run_accepts_real_task_list_contract(self):
+        checkout_raw = os.environ.get("METACODES_WORKBUDDY_CHECKOUT")
+        if not checkout_raw:
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        checkout = Path(checkout_raw).resolve()
+        if not checkout.is_dir():
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        overlay_installer.validate_installed_overlay(checkout)
+        program = r'''
+import json, tempfile
+from pathlib import Path
+from harbor.models.agent.context import AgentContext
+from workbuddy_bench.agents._metacodes_trace import (
+    OBSERVATION_JOURNAL_SCHEMA, OBSERVATION_FILENAME,
+)
+from workbuddy_bench.agents.metacodes_agent import MetacodesAgent
+
+def write_jsonl(path, rows):
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+with tempfile.TemporaryDirectory() as directory:
+    logs = Path(directory) / "trial" / "agent"
+    logs.mkdir(parents=True)
+    write_jsonl(logs / "metacodes-output.jsonl", [{
+        "type": "result", "stop_reason": "end_turn", "turns": 1,
+        "tool_calls": 1, "input_tokens": 120, "output_tokens": 30,
+        "cache_read_input_tokens": 80, "cache_creation_input_tokens": 10,
+        "cost_usd": 0.01, "text": "done",
+    }])
+    write_jsonl(logs / "metacodes-transcript.jsonl", [
+        {"role": "assistant", "blocks": [{
+            "type": "tool_use", "id": "list-1", "name": "TaskList", "input": {}
+        }]},
+        {"role": "user", "blocks": [{
+            "type": "tool_result", "tool_use_id": "list-1", "is_error": False,
+            "content": json.dumps([
+                {"id": "kg-1", "subject": "Task", "status": "pending",
+                 "kg_status": "open", "readiness": "ready", "plan_step": True},
+                {"parallel_hint": "2 ready tasks can run in parallel"},
+            ]),
+        }]},
+        {"role": "assistant", "blocks": [{"type": "text", "text": "done"}]},
+    ])
+    write_jsonl(logs / OBSERVATION_FILENAME, [
+        {"schema_version": OBSERVATION_JOURNAL_SCHEMA, "sequence": 0,
+         "monotonic_elapsed_ns": 0, "session_id": "session-l2", "run_id": "run-l2",
+         "event": {"run_started": {}}},
+        {"schema_version": OBSERVATION_JOURNAL_SCHEMA, "sequence": 1,
+         "monotonic_elapsed_ns": 1, "session_id": "session-l2", "run_id": "run-l2",
+         "event": {"run_finished": {}}},
+    ])
+    agent = MetacodesAgent(
+        logs, model_name="route-l2", model_params={},
+        METACODES_MODEL_DISPLAY_NAME="glm-5.2",
+        connection={"mode": "local_proxy", "proxy_url": "http://127.0.0.1:1"},
+    )
+    context = AgentContext()
+    agent.populate_context_post_run(context)
+    trajectory = json.loads((logs / "trajectory.json").read_text(encoding="utf-8"))
+    control = trajectory["final_metrics"]["extra"]["control_metrics"]
+    assert control["tinykg"]["task_list_calls"] == 1
+    assert control["tinykg"]["task_tinykg_status_results"] == 1
+    assert context.n_input_tokens == 120
+    assert context.n_cache_tokens == 80
+    assert context.n_output_tokens == 30
+    assert context.cost_usd == 0.01
+'''
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(checkout / "src")
+        subprocess.run(
+            [str(checkout / ".venv/bin/python"), "-c", program],
+            cwd=checkout,
+            env=env,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
     def test_adapter_keeps_machine_ndjson_stdout_separate_from_diagnostics(self):
         source = (
             Path(__file__).parents[1]

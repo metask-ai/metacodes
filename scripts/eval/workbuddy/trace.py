@@ -393,16 +393,69 @@ def _hex_identity(value: Any, where: str) -> str:
     return value
 
 
-def _result_object(content: Any, where: str) -> Dict[str, Any]:
+def _result_json(content: Any, where: str) -> Any:
     if not isinstance(content, str):
         raise TraceError(f"{where} content is not text")
     try:
-        value = json.loads(content)
+        return json.loads(content)
     except json.JSONDecodeError as exc:
         raise TraceError(f"{where} returned invalid JSON: {exc}") from exc
+
+
+def _result_object(content: Any, where: str) -> Dict[str, Any]:
+    value = _result_json(content, where)
     if not isinstance(value, dict):
         raise TraceError(f"{where} result is not a JSON object")
     return value
+
+
+def _task_list_has_kg_status(content: Any) -> bool:
+    """Validate TaskList's public array contract and extract KG evidence.
+
+    TaskList is intentionally the one task-DAG query whose result is a JSON
+    array.  Task rows and the optional ``parallel_hint`` navigation row share
+    that array; neither should be coerced into the object contract used by
+    mutation tools merely to simplify the benchmark observer.
+    """
+
+    value = _result_json(content, "TaskList")
+    if not isinstance(value, list):
+        raise TraceError("TaskList result is not a JSON array")
+    observed = False
+    for item in value:
+        if not isinstance(item, dict):
+            raise TraceError("TaskList row is not an object")
+        if "parallel_hint" in item:
+            if set(item) != {"parallel_hint"} or not isinstance(
+                item["parallel_hint"], str
+            ) or not item["parallel_hint"]:
+                raise TraceError("TaskList parallel hint is malformed")
+            continue
+        task_id = item.get("id")
+        subject = item.get("subject")
+        status = item.get("status")
+        if (
+            not isinstance(task_id, str)
+            or not task_id
+            or not isinstance(subject, str)
+            or not subject
+            or status not in {"pending", "in_progress", "completed", "blocked"}
+        ):
+            raise TraceError("TaskList task row is malformed")
+        kg_status = item.get("kg_status")
+        if kg_status is None:
+            continue
+        if not task_id.startswith("kg-") or kg_status not in {
+            "open",
+            "claimed",
+            "completed",
+            "failed",
+        }:
+            raise TraceError("TaskList kg_status is malformed")
+        # One successful list call is one status-bearing observation, not one
+        # state transition per row.  Mixed open/claimed rows are legitimate.
+        observed = True
+    return observed
 
 
 def _tool_control_metrics(messages: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -577,6 +630,10 @@ def _tool_control_metrics(messages: Iterable[Mapping[str, Any]]) -> Dict[str, An
                 "TaskStop": "task_stop_calls",
             }[name]] += 1
             if not failed:
+                if name == "TaskList":
+                    if _task_list_has_kg_status(result["content"]):
+                        tinykg["task_tinykg_status_results"] += 1
+                    continue
                 payload = _result_object(result["content"], name)
                 kg_status = payload.get("kg_status")
                 if kg_status is None and name == "TaskCreate":
