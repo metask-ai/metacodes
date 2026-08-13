@@ -248,7 +248,7 @@ The v1 observation set is:
 | `tool_start` | Tool invocation identity, name, and input |
 | `tool_progress` | Incremental progress text for one tool call |
 | `progress` | Current 1-based turn and cumulative tool-call progress |
-| `tool_result` | Completed tool result, error flag, and elapsed time |
+| `tool_result` | Completed tool result, error flag, elapsed time, and optional successful file observations |
 | `usage` | Token-usage delta |
 | `context_warning` | Context-pressure thresholds and level |
 | `auto_compact` | Conversation compaction summary |
@@ -273,6 +273,17 @@ closed accumulated segments; consecutive boundaries are idempotent and
 all closed segments after the last boundary, or all closed segments when no
 boundary occurred. This preserves max-token continuations while excluding
 pre-tool drafts. Usage events are exact deltas and must use checked arithmetic.
+
+`tool_result.file_refs` is an optional Revision 8 observation field. It is
+present only for successful selected built-in file-tool executions and contains
+at most 32 entries. Each entry has one locator union (`workspace_path`,
+`absolute_path`, or `uri`), an open-ended bounded `kind` string, a bounded
+title, and an optional range whose `start`/`end` each contain 1-based `line`
+and UTF-16 `column` positions (half-open). The v1 limits are 4096
+bytes per path, 8192 bytes per URI, 256 bytes per title, and 64 bytes per kind.
+The field is evidence only: the Host decides whether and how to open a target;
+an absolute locator does not grant authorization. Failed, denied, rejected,
+unobserved, or unavailable executions do not emit write-class references.
 
 ## Contract
 
@@ -834,6 +845,7 @@ allocations or unbounded work:
 | MCP local-schema container entries / validation work units | 256 / 65536 |
 | MCP legacy default TTL / maximum accepted TTL | 30 s / 300 s |
 | one Run | 1000 turns |
+| one tool_result file_refs array / path / URI / title / kind | 32 / 4096 / 8192 / 256 / 64 bytes |
 
 MCP schema and invocation JSON cross the depth/node/container/work admission
 gate before a dynamic JSON tree is allocated. Invocation number lexemes are

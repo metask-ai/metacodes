@@ -140,6 +140,35 @@ pub const RunState = struct {
     in_flight_tools: []const RunStateTool,
 };
 
+pub const FileReferenceLocator = union(enum) {
+    workspace_path: []const u8,
+    absolute_path: []const u8,
+    uri: []const u8,
+};
+
+pub const FileReferencePosition = struct {
+    line: u32,
+    column: u32,
+};
+
+pub const FileReferenceRange = struct {
+    start: FileReferencePosition,
+    end: FileReferencePosition,
+};
+
+pub const FileReference = struct {
+    locator: FileReferenceLocator,
+    title: []const u8,
+    kind: []const u8,
+    range: ?FileReferenceRange = null,
+};
+
+pub const MAX_FILE_REFS_PER_TOOL_RESULT_V1: usize = 32;
+pub const MAX_FILE_REF_PATH_BYTES_V1: usize = 4096;
+pub const MAX_FILE_REF_URI_BYTES_V1: usize = 8192;
+pub const MAX_FILE_REF_TITLE_BYTES_V1: usize = 256;
+pub const MAX_FILE_REF_KIND_BYTES_V1: usize = 64;
+
 pub const CoreEvent = union(enum) {
     text_chunk: []const u8,
     tool_start: struct {
@@ -164,6 +193,7 @@ pub const CoreEvent = union(enum) {
         content: []const u8,
         is_error: bool,
         elapsed_ms: u64 = 0,
+        file_refs: ?[]const FileReference = null,
     },
     usage: UsageDelta,
     context_warning: struct {
@@ -540,6 +570,7 @@ pub fn decodeCoreEvent(allocator: std.mem.Allocator, encoded: []const u8) Decode
         }) catch |err| return normalizeDecodeError(err);
         switch (known) {
             .permission_provenance => |value| try validatePermissionProvenance(value),
+            .tool_result => |value| try validateFileReferences(value.file_refs),
             else => {},
         }
         return .{ .arena = arena, .value = .{ .known = known } };
@@ -562,6 +593,31 @@ pub fn decodeCoreEvent(allocator: std.mem.Allocator, encoded: []const u8) Decode
             .payload_json = payload_json,
         } },
     };
+}
+
+fn validateFileReferences(refs: ?[]const FileReference) DecodeError!void {
+    const values = refs orelse return;
+    if (values.len > MAX_FILE_REFS_PER_TOOL_RESULT_V1) return error.InvalidPayload;
+    for (values) |ref| {
+        if (ref.title.len > MAX_FILE_REF_TITLE_BYTES_V1 or ref.kind.len > MAX_FILE_REF_KIND_BYTES_V1)
+            return error.InvalidPayload;
+        switch (ref.locator) {
+            .workspace_path, .absolute_path => |path| {
+                if (path.len > MAX_FILE_REF_PATH_BYTES_V1) return error.InvalidPayload;
+            },
+            .uri => |uri| {
+                if (uri.len > MAX_FILE_REF_URI_BYTES_V1) return error.InvalidPayload;
+            },
+        }
+        if (ref.range) |range| {
+            if (range.start.line == 0 or range.end.line == 0 or
+                range.start.column == 0 or range.end.column == 0)
+                return error.InvalidPayload;
+            if (range.end.line < range.start.line or
+                (range.end.line == range.start.line and range.end.column < range.start.column))
+                return error.InvalidPayload;
+        }
+    }
 }
 
 pub fn decodeUiRequest(allocator: std.mem.Allocator, encoded: []const u8) DecodeError!ParsedUiRequest {
@@ -1192,6 +1248,39 @@ test "CoreEvent decoder preserves unknown observation tags" {
             try std.testing.expectEqualStrings("{\"answer\":42}", event.payload_json);
         },
     }
+}
+
+test "CoreEvent decoder accepts bounded file references and rejects oversized ones" {
+    var parsed = try decodeCoreEvent(std.testing.allocator,
+        "{\"tool_result\":{\"id\":\"t1\",\"name\":\"Read\",\"input\":\"{}\",\"content\":\"ok\",\"is_error\":false,\"file_refs\":[{\"locator\":{\"workspace_path\":\"src/main.zig\"},\"title\":\"main.zig\",\"kind\":\"read\",\"range\":{\"start\":{\"line\":1,\"column\":1},\"end\":{\"line\":2,\"column\":1}}}]}}",
+    );
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .known => |event| switch (event) {
+            .tool_result => |result| {
+                try std.testing.expect(result.file_refs != null);
+                try std.testing.expectEqual(@as(usize, 1), result.file_refs.?.len);
+                try std.testing.expectEqualStrings("read", result.file_refs.?[0].kind);
+                try std.testing.expectEqual(@as(u32, 2), result.file_refs.?[0].range.?.end.line);
+            },
+            else => return error.UnexpectedEvent,
+        },
+        .unknown => return error.UnexpectedEvent,
+    }
+
+    var oversized = std.ArrayList(u8).empty;
+    defer oversized.deinit(std.testing.allocator);
+    try oversized.appendSlice(std.testing.allocator, "{\"tool_result\":{\"id\":\"t1\",\"name\":\"Read\",\"input\":\"{}\",\"content\":\"ok\",\"is_error\":false,\"file_refs\":[");
+    var i: usize = 0;
+    while (i < MAX_FILE_REFS_PER_TOOL_RESULT_V1 + 1) : (i += 1) {
+        if (i != 0) try oversized.append(std.testing.allocator, ',');
+        try oversized.appendSlice(std.testing.allocator, "{\"locator\":{\"workspace_path\":\"x\"}}");
+    }
+    try oversized.appendSlice(std.testing.allocator, "]}}");
+    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(std.testing.allocator, oversized.items));
+    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(std.testing.allocator,
+        "{\"tool_result\":{\"id\":\"t1\",\"name\":\"Read\",\"input\":\"{}\",\"content\":\"ok\",\"is_error\":false,\"file_refs\":[{\"locator\":{\"workspace_path\":\"x\"},\"title\":\"x\",\"kind\":\"read\",\"range\":{\"start\":{\"line\":3,\"column\":1},\"end\":{\"line\":2,\"column\":1}}}]}}",
+    ));
 }
 
 test "CoreEvent decoder normalizes malformed and invalid inputs" {
