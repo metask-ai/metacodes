@@ -1028,6 +1028,14 @@ with urllib.request.urlopen(
                 (environment.parent / "task.toml").write_text(
                     f"[task]\nname = '{task}'\n", encoding="utf-8"
                 )
+            dataset_root = workbuddy / "datasets/wb-bench-code-v1.0"
+            (dataset_root / "dataset.toml").write_text(
+                '[verifier]\nschema = "workbuddy.verifier.v1"\nengine = "composite"\n',
+                encoding="utf-8",
+            )
+            shared = dataset_root / "shared/verifier"
+            shared.mkdir(parents=True)
+            (shared / "plugin.py").write_text("VALUE = 1\n", encoding="utf-8")
             docker = root / "docker"
             docker.write_text("fixture\n", encoding="utf-8")
             docker.chmod(0o755)

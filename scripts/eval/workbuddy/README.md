@@ -125,6 +125,12 @@ results and memory text remain in isolated local trial artifacts and are not
 copied into the derived metrics. A failed or interrupted authorized run is not
 automatically retried.
 
+For official datasets, preflight also requires and hash-binds the dataset-level
+`dataset.toml`. When it selects the composite verifier, the complete
+`shared/verifier` implementation is bound and re-observed before authorization.
+A checkout containing only selected task directories is not a runnable official
+dataset and fails before credential loading, journal mutation, or provider I/O.
+
 If the runner returns nonzero after authorization, the gate writes a separate
 `metacodes-workbuddy-authorized-failure-v2` receipt before reporting the
 failure. It keeps the journal transaction in `request_authorized`, reports

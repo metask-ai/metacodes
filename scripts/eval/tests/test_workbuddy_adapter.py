@@ -945,6 +945,179 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
                 any("buildx" in call and "build" in call for call in calls)
             )
 
+    def test_preflight_rejects_incomplete_official_composite_dataset_before_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            workbuddy = root / "workbuddy"
+            harness = workbuddy / "configs/harnesses/metacodes/docker"
+            harness.mkdir(parents=True)
+            (harness / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            environment = (
+                workbuddy
+                / "datasets/wb-bench-code-v1.0/tasks/task-a/environment"
+            )
+            environment.mkdir(parents=True)
+            (environment / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            (environment.parent / "task.toml").write_text(
+                "[task]\nname = 'task-a'\n", encoding="utf-8"
+            )
+            docker = root / "docker"
+            docker.write_text("fixture\n", encoding="utf-8")
+            docker.chmod(0o755)
+            calls: list[list[str]] = []
+
+            def observe_run(argv, **kwargs):
+                calls.append([str(item) for item in argv])
+                return self._fake_run()(argv, **kwargs)
+
+            with mock.patch(
+                "scripts.eval.workbuddy.environment_preflight._run",
+                side_effect=observe_run,
+            ):
+                with self.assertRaisesRegex(
+                    EnvironmentPreflightError, "missing dataset.toml"
+                ):
+                    prebuild(
+                        workbuddy=workbuddy,
+                        dataset="datasets/wb-bench-code-v1.0/tasks",
+                        selected_tasks=["task-a"],
+                        output=root / "preflight.json",
+                        docker=docker,
+                    )
+            self.assertFalse(any("buildx" in call for call in calls))
+
+            dataset_root = workbuddy / "datasets/wb-bench-code-v1.0"
+            (dataset_root / "dataset.toml").write_text(
+                '[verifier]\nschema = "workbuddy.verifier.v1"\nengine = "composite"\ntimeout_sec = 600.0\n',
+                encoding="utf-8",
+            )
+            calls.clear()
+            with mock.patch(
+                "scripts.eval.workbuddy.environment_preflight._run",
+                side_effect=observe_run,
+            ):
+                with self.assertRaisesRegex(
+                    EnvironmentPreflightError,
+                    "composite verifier implementation is missing",
+                ):
+                    prebuild(
+                        workbuddy=workbuddy,
+                        dataset="datasets/wb-bench-code-v1.0/tasks",
+                        selected_tasks=["task-a"],
+                        output=root / "preflight.json",
+                        docker=docker,
+                    )
+            self.assertFalse(any("buildx" in call for call in calls))
+
+    def test_preflight_binds_and_reobserves_composite_verifier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            workbuddy = root / "workbuddy"
+            harness = workbuddy / "configs/harnesses/metacodes/docker"
+            harness.mkdir(parents=True)
+            (harness / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            dataset_root = workbuddy / "datasets/wb-bench-code-v1.0"
+            environment = dataset_root / "tasks/task-a/environment"
+            environment.mkdir(parents=True)
+            (environment / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            (environment.parent / "task.toml").write_text(
+                "[task]\nname = 'task-a'\n", encoding="utf-8"
+            )
+            (dataset_root / "dataset.toml").write_text(
+                '[verifier]\nschema = "workbuddy.verifier.v1"\nengine = "composite"\n',
+                encoding="utf-8",
+            )
+            shared = dataset_root / "shared/verifier"
+            shared.mkdir(parents=True)
+            plugin = shared / "plugin.py"
+            plugin.write_text("VALUE = 1\n", encoding="utf-8")
+            docker = root / "docker"
+            docker.write_text("fixture\n", encoding="utf-8")
+            docker.chmod(0o755)
+            receipt = root / "preflight.json"
+            with mock.patch(
+                "scripts.eval.workbuddy.environment_preflight._run",
+                side_effect=self._fake_run(),
+            ):
+                built = prebuild(
+                    workbuddy=workbuddy,
+                    dataset="datasets/wb-bench-code-v1.0/tasks",
+                    selected_tasks=["task-a"],
+                    output=receipt,
+                    docker=docker,
+                )
+            self.assertEqual(
+                built["dataset_execution"]["shared_verifier"]["files"], 1
+            )
+            plugin.write_text("VALUE = 2\n", encoding="utf-8")
+            with mock.patch(
+                "scripts.eval.workbuddy.environment_preflight._run",
+                side_effect=self._fake_run(),
+            ):
+                with self.assertRaisesRegex(
+                    EnvironmentPreflightError, "execution contract changed"
+                ):
+                    validate_receipt(
+                        receipt,
+                        workbuddy=workbuddy,
+                        dataset="datasets/wb-bench-code-v1.0/tasks",
+                        selected_tasks=["task-a"],
+                        inspect_images=True,
+                    )
+
+    def test_preflight_rejects_composite_verifier_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            workbuddy = root / "workbuddy"
+            harness = workbuddy / "configs/harnesses/metacodes/docker"
+            harness.mkdir(parents=True)
+            (harness / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            dataset_root = workbuddy / "datasets/wb-bench-code-v1.0"
+            environment = dataset_root / "tasks/task-a/environment"
+            environment.mkdir(parents=True)
+            (environment / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            (environment.parent / "task.toml").write_text(
+                "[task]\nname = 'task-a'\n", encoding="utf-8"
+            )
+            (dataset_root / "dataset.toml").write_text(
+                '[verifier]\nschema = "workbuddy.verifier.v1"\nengine = "composite"\n',
+                encoding="utf-8",
+            )
+            external = root / "external-verifier"
+            external.mkdir()
+            (external / "plugin.py").write_text("VALUE = 1\n", encoding="utf-8")
+            shared = dataset_root / "shared"
+            shared.mkdir()
+            (shared / "verifier").symlink_to(external, target_is_directory=True)
+            docker = root / "docker"
+            docker.write_text("fixture\n", encoding="utf-8")
+            docker.chmod(0o755)
+            calls: list[list[str]] = []
+
+            def observe_run(argv, **kwargs):
+                calls.append([str(item) for item in argv])
+                return self._fake_run()(argv, **kwargs)
+
+            with mock.patch(
+                "scripts.eval.workbuddy.environment_preflight._run",
+                side_effect=observe_run,
+            ):
+                with self.assertRaisesRegex(
+                    EnvironmentPreflightError,
+                    "composite verifier implementation is unsafe",
+                ):
+                    prebuild(
+                        workbuddy=workbuddy,
+                        dataset="datasets/wb-bench-code-v1.0/tasks",
+                        selected_tasks=["task-a"],
+                        output=root / "preflight.json",
+                        docker=docker,
+                    )
+            self.assertFalse(any("buildx" in call for call in calls))
+
 
 class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
     def test_adapter_keeps_machine_ndjson_stdout_separate_from_diagnostics(self):
