@@ -1966,7 +1966,13 @@ def _collect_usage(
         total_requests += len(request_records)
         rows[task] = {
             "trajectory_sha256": _identity(trajectory_path)["sha256"],
-            "requests_sha256": _identity(request_log)["sha256"],
+            # The request audit was already read above under the explicit 64 MiB
+            # bound.  Reuse that same safety contract for its identity; falling
+            # back to _identity's 16 MiB default would reject a complete long
+            # trajectory after successfully validating the exact same bytes.
+            "requests_sha256": _identity(
+                request_log, maximum=64 * 1024 * 1024
+            )["sha256"],
             "provider_requests": len(request_records),
             "cacheable_first_request_sha256": prefix_hash,
             "prompt_tokens": prompt,

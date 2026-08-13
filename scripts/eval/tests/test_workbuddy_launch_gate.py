@@ -1998,6 +1998,35 @@ with urllib.request.urlopen(
             ):
                 _collect_usage(manifest, started_ns=0, official_runner=True)
 
+    def test_v3_usage_hashes_complete_request_audit_above_default_identity_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self._official_usage_fixture(Path(directory), 1.0)
+            manifest["schema_version"] = SCHEMA_VERSION
+            request_log = next(
+                Path(manifest["workbuddy"]["checkout"]).rglob(
+                    "agent/requests.jsonl"
+                )
+            )
+            trajectory_path = request_log.with_name("trajectory.json")
+            trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+            trajectory["final_metrics"]["extra"]["metacodes_turns"] = 1
+            trajectory_path.write_text(
+                json.dumps(trajectory) + "\n", encoding="utf-8"
+            )
+            row = json.loads(request_log.read_text(encoding="utf-8"))
+            row.update({"seq": 1, "response": {"status": 200}, "error": None})
+            # Keep one valid JSONL record while making it larger than _identity's
+            # generic 16 MiB default and smaller than the request-audit 64 MiB cap.
+            row["request"]["body"]["padding"] = "x" * (17 * 1024 * 1024)
+            request_log.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+            usage = _collect_usage(manifest, started_ns=0, official_runner=True)
+            task = next(iter(usage["tasks"].values()))
+            self.assertEqual(
+                hashlib.sha256(request_log.read_bytes()).hexdigest(),
+                task["requests_sha256"],
+            )
+
     def test_resolved_prepared_and_trial_project_control_are_bound(self):
         """Bind job YAML through resolver, prepare_job and the trial runtime."""
 
