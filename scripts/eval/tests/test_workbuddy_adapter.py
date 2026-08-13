@@ -1,6 +1,7 @@
-import json
+import ast
 import hashlib
 import io
+import json
 import os
 import subprocess
 import tarfile
@@ -1183,6 +1184,46 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
 
 
 class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
+    def test_workbuddy_headless_policy_hides_interactive_plan_without_disabling_tinykg(self):
+        overlay = Path(__file__).parents[1] / "workbuddy/overlay"
+        defaults = yaml.safe_load(
+            (overlay / "configs/harnesses/metacodes/_defaults.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        configured = set(
+            defaults["harness"]["params"]["METACODES_DISALLOWED_TOOLS"].split(",")
+        )
+
+        adapter_path = overlay / "src/workbuddy_bench/agents/metacodes_agent.py"
+        tree = ast.parse(adapter_path.read_text(encoding="utf-8"))
+        adapter_default = None
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if any(
+                isinstance(target, ast.Name)
+                and target.id == "_DEFAULT_DISABLED_TOOLS"
+                for target in node.targets
+            ):
+                adapter_default = ast.literal_eval(node.value)
+                break
+        self.assertIsInstance(adapter_default, str)
+        self.assertEqual(configured, set(adapter_default.split(",")))
+        self.assertTrue(
+            {
+                "Agent", "Task", "TaskBatch", "TeamCreate", "TeamDelete",
+                "SendMessage", "EnterPlanMode", "ExitPlanMode",
+            }.issubset(configured)
+        )
+        self.assertTrue(
+            {
+                "KgRecall", "KgContext", "KgRemember",
+                "TaskCreate", "TaskList", "TaskUpdate",
+            }
+            .isdisjoint(configured)
+        )
+
     def test_installed_adapter_post_run_accepts_real_task_list_contract(self):
         checkout_raw = os.environ.get("METACODES_WORKBUDDY_CHECKOUT")
         if not checkout_raw:

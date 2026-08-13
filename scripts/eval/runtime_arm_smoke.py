@@ -18,6 +18,10 @@ ARMS = ("codex_style", "claude_style", "tinykg")
 KG_TOOL_MARKERS = ("\n----- KgRemember -----\n", "\n----- KgRecall -----\n")
 TASK_TOOL_MARKER = "\n----- TaskList -----\n"
 FORMAL_TOOL_MARKER = "\n----- FormalAuditTask -----\n"
+WORKBUDDY_DISABLED_TOOLS = (
+    "Agent,Task,TaskBatch,TeamCreate,TeamDelete,SendMessage,"
+    "EnterPlanMode,ExitPlanMode"
+)
 
 
 def _headless_protocol_smoke(binary: Path) -> None:
@@ -115,6 +119,111 @@ def _headless_protocol_smoke(binary: Path) -> None:
         _require("[Permission]" not in completed.stdout and "Allow?" not in completed.stdout, "permission prompt polluted NDJSON stdout")
         _require("[Permission]" not in completed.stderr and "Allow?" not in completed.stderr, "headless attempted an interactive permission prompt")
         _require(not target.exists(), "protected Write mutated the workspace")
+
+
+def _workbuddy_tool_policy_smoke(binary: Path, tinykg_binary: Path) -> None:
+    """Exercise the actual CLI-to-provider schema used by WorkBuddy."""
+
+    with tempfile.TemporaryDirectory(prefix="metacodes-workbuddy-tool-policy-") as directory:
+        root = Path(directory)
+        ready = root / "ready.json"
+        request_log = root / "requests.jsonl"
+        repo = Path(__file__).resolve().parents[2]
+        provider = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "scripts.eval.workbuddy.mock_provider",
+                "--ready",
+                str(ready),
+                "--request-log",
+                str(request_log),
+                "--scenario",
+                "guessed-disabled-tool-v1",
+            ],
+            cwd=repo,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 5
+        while not ready.exists() and provider.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        _require(ready.exists(), "WorkBuddy tool-policy provider did not become ready")
+        port = int(json.loads(ready.read_text(encoding="utf-8"))["port"])
+        try:
+            for run in range(2):
+                home = root / f"home-{run}"
+                work = root / "work"
+                home.mkdir()
+                work.mkdir(exist_ok=True)
+                env = _base_env()
+                env.update(
+                    {
+                        "HOME": str(home),
+                        "USERPROFILE": str(home),
+                        "METACODES_LONG_HORIZON_ARM": "tinykg",
+                        "METACODES_KG_TRANSPORT": "cli-exclusive",
+                        "METACODES_KG_BIN": str(tinykg_binary),
+                        "METACODES_KG_STORE": str(home / "tinykg-store"),
+                        "METACODES_NO_PROBE": "1",
+                    }
+                )
+                completed = subprocess.run(
+                    [
+                        str(binary),
+                        "--api-key",
+                        "metacodes-workbuddy-mock-only",
+                        "--base-url",
+                        f"http://127.0.0.1:{port}/v1/messages",
+                        "--model",
+                        "offline",
+                        "--permission",
+                        "bypassPermissions",
+                        "--disallowed-tools",
+                        WORKBUDDY_DISABLED_TOOLS,
+                        "--no-theme",
+                        "--json",
+                        "-p",
+                        "inspect the task and finish",
+                    ],
+                    cwd=work,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                )
+                _require(
+                    completed.returncode == 0,
+                    "WorkBuddy tool-policy run failed: " + completed.stderr[-1000:],
+                )
+        finally:
+            provider.terminate()
+            try:
+                provider.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                provider.kill()
+                provider.wait(timeout=2)
+
+        rows = [
+            json.loads(line)
+            for line in request_log.read_text(encoding="utf-8").splitlines()
+        ]
+        _require(len(rows) == 4, "WorkBuddy tool-policy request count drifted")
+        hidden = set(WORKBUDDY_DISABLED_TOOLS.split(","))
+        required = {"KgRecall", "KgContext", "KgRemember", "TaskCreate", "TaskList", "TaskUpdate"}
+        for row in rows:
+            exposed = set(row.get("tool_names", []))
+            _require(exposed.isdisjoint(hidden), "WorkBuddy exposed a disabled interactive/swarm tool")
+            _require(required <= exposed, "WorkBuddy tool policy disabled TinyKG task/memory tools")
+        schema_hashes = {row.get("tool_schema_sha256") for row in rows}
+        _require(
+            len(schema_hashes) == 1,
+            "WorkBuddy tool schema drifted within or across identical fresh runs",
+        )
 
 
 def _base_env() -> Dict[str, str]:
@@ -236,9 +345,11 @@ def main() -> int:
         "tinykg: TaskCreate still advertises session-only storage",
     )
     _headless_protocol_smoke(binary)
+    _workbuddy_tool_policy_smoke(binary, tinykg_binary)
     print(
         "runtime arm smoke: codex_style/claude_style/tinykg + headless NDJSON "
-        "permission boundary PASS (paid=0, external_network=0)"
+        "permission + WorkBuddy provider-schema boundaries PASS "
+        "(paid=0, external_network=0)"
     )
     return 0
 

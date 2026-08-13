@@ -184,6 +184,16 @@ The overlay also keeps the opaque local-proxy route free of Harbor's ``__``
 eval-group delimiter. Otherwise a completed multi-task job can fail only while
 Harbor formats its final summary, after all provider and scorer work has run.
 
+The production WorkBuddy adapter is deliberately non-interactive and launches
+metacodes with pre-authorized ``bypassPermissions`` authority. Its frozen tool
+policy therefore omits ``EnterPlanMode`` and ``ExitPlanMode``: there is no user
+approval channel to serve, and auto-approving a plan late in a rollout can add
+sampling plus task-DAG bookkeeping without strengthening the decision. This is
+an evaluation-runner policy, not a removal from the normal metacodes TUI. TinyKG
+recall and task tools remain available. The complete disabled-tool string is
+bound into each launch manifest, so changing this policy creates a new
+covariate and requires fresh paired runs rather than reusing prior evidence.
+
 ```bash
 python3 -m scripts.eval.workbuddy.launch_gate create ... \
   --environment-preflight-receipt /private/preflight.json \

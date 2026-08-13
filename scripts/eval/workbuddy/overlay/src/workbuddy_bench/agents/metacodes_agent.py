@@ -38,7 +38,8 @@ _OUTPUT_FILENAME = "metacodes-output.jsonl"
 _TRANSCRIPT_FILENAME = "metacodes-transcript.jsonl"
 _RUNTIME_CONTRACT_FILENAME = "metacodes-runtime-contract.json"
 _DEFAULT_DISABLED_TOOLS = (
-    "Agent,Task,TaskBatch,TeamCreate,TeamDelete,SendMessage"
+    "Agent,Task,TaskBatch,TeamCreate,TeamDelete,SendMessage,"
+    "EnterPlanMode,ExitPlanMode"
 )
 _PROJECT_CONTROL_MODES = {"disabled", "enforced"}
 _REMOTE_TINYKG_ENV = (
