@@ -1,0 +1,457 @@
+import copy
+import hashlib
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from scripts.eval.model import stable_json
+from scripts.eval.memory_budget_journal import (
+    BudgetAuthority,
+    BudgetJournal,
+    BudgetTransaction,
+)
+from scripts.eval.workbuddy.launch_gate import (
+    COMPARISON_SCHEMA_VERSION,
+    RECEIPT_SCHEMA_VERSION,
+    SCHEMA_VERSION,
+    HOST_CONTROL_PLANE_MODULES,
+    LaunchError,
+)
+from scripts.eval.workbuddy import WORKBUDDY_PINNED_COMMIT
+from scripts.eval.workbuddy.paired_analysis import build_report
+from scripts.eval.workbuddy import paired_analysis
+
+
+def digest(label: str) -> str:
+    return hashlib.sha256(label.encode()).hexdigest()
+
+
+class WorkBuddyPairedAnalysisTest(unittest.TestCase):
+    def _write(self, path: Path, value: dict) -> Path:
+        path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+        os.chmod(path, 0o600)
+        return path
+
+    def _manifest(self, root: Path, arm: str) -> tuple[Path, dict]:
+        mode = {"baseline": "disabled", "treatment": "enforced"}[arm]
+        covariates = {
+            "cohort": ["task-a", "task-b"],
+            "artifact_sha256": digest("same-artifact"),
+            "model_sha256": digest("same-model"),
+            "context_window": 200_000,
+            "context_compact_pct": 92,
+            "cache_prefix_contract": "equal",
+        }
+        value = {
+            "schema_version": SCHEMA_VERSION,
+            "quality_evidence": False,
+            "quality_evidence_on_commit": True,
+            "evaluation_treatment": {
+                "project_control": mode,
+                "actor_prompt_changed": False,
+                "tool_schema_changed": False,
+                "provider_cache_prefix_changed_by_control_plane": False,
+            },
+            "comparison": {
+                "schema_version": COMPARISON_SCHEMA_VERSION,
+                "comparison_id": "code-2-project-control-pair",
+                "covariates_sha256": hashlib.sha256(
+                    stable_json(covariates).encode()
+                ).hexdigest(),
+                "covariates": covariates,
+            },
+            "run_id": f"code-2-{arm}",
+            "workbuddy": {
+                "commit": WORKBUDDY_PINNED_COMMIT,
+                "overlay_content_sha256": digest("overlay"),
+            },
+            "cohort": {
+                "selected_tasks": ["task-a", "task-b"],
+                "selected_tasks_sha256": digest("tasks"),
+            },
+            "artifacts": {"project_control": {"same": True}},
+            "environment_preflight": {
+                "target_platform": "linux/amd64",
+                "content_sha256": digest("preflight"),
+                "receipt": {"path": "/fixture/preflight", "bytes": 1, "sha256": digest("p")},
+            },
+            "job": {"slug": f"job-{arm}", "config": {"sha256": digest(arm)}},
+            "model": {
+                "slug": "model",
+                "config": {"sha256": digest("model-config")},
+                "provider_identity": "provider",
+                "fingerprint": digest("model"),
+            },
+            "harness_fingerprint": digest(f"harness-{arm}"),
+            "host_control_plane": {
+                name: {
+                    "path": f"/fixture/{name}.py",
+                    "bytes": 1,
+                    "sha256": digest(name),
+                }
+                for name in HOST_CONTROL_PLANE_MODULES
+            },
+            "budget": {
+                "total_cost_microusd": 1_000_000,
+                "total_metered_tokens": 1_000_000,
+                "max_cost_microusd": 500_000,
+                "max_metered_tokens": 500_000,
+                "prior_exposure_microusd": 0,
+                "user_authority_microusd": 2_000_000_000,
+            },
+            "execution": {
+                "n_attempts": 1,
+                "n_concurrent_trials": 1,
+                "shards": 1,
+                "proxy_max_retries": 0,
+                "shared_proxy": False,
+                "credential_delivery": "anonymous-fd",
+                "provider_key_env": "METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF",
+                "remote_tinykg_env_cleared": True,
+                "local_tinykg": "fresh-home-per-trial",
+                "cacheable_first_request_hash_required": True,
+                "target_platform": "linux/amd64",
+                "docker_default_platform": "linux/amd64",
+                "environment_preflight_required": True,
+                "harbor_force_build": False,
+                "runner_tools": {
+                    "bash": {"path": "/fixture/bash", "sha256": digest("bash"), "version_sha256": digest("bv")},
+                    "uv": {"path": "/fixture/uv", "sha256": digest("uv"), "version_sha256": digest("uvv")},
+                },
+                "runner": ["/fixture/uv", "run", "--frozen", "/fixture/bash", "scripts/run.sh", "--job", f"job-{arm}"],
+            },
+            "dry_run": {
+                "network_requests": 0,
+                "credential_loaded": False,
+                "journal_mutations": 0,
+                "paid_rollouts_authorized": False,
+            },
+        }
+        value["content_sha256"] = hashlib.sha256(stable_json(value).encode()).hexdigest()
+        return self._write(root / f"{arm}-manifest.json", value), value
+
+    @staticmethod
+    def _control(*, used: bool) -> dict:
+        return {
+            "lean": {
+                "checker_calls": int(used),
+                "checker_elapsed_ns": 100 if used else 0,
+                "rule_filter_events": int(used),
+                "active_rule_phases": int(used),
+                "checker_rule_phases": int(used),
+                "statically_pruned_rule_phases": 0,
+                "block": 0,
+                "fault": 0,
+                "enforced_blocks": 0,
+            }
+        }
+
+    def _receipt(
+        self, root: Path, arm: str, manifest: dict
+    ) -> tuple[Path, dict, Path]:
+        rewards = {"baseline": (0.0, 1.0), "treatment": (1.0, 1.0)}[arm]
+        tasks = {}
+        for index, (task, reward) in enumerate(zip(("task-a", "task-b"), rewards)):
+            tasks[task] = {
+                "task_checksum": digest(task),
+                "cacheable_first_request_sha256": digest(f"prefix-{task}"),
+                "verifier_reward": reward,
+                "full_pass": reward == 1.0,
+                "cost_usd": 0.01 + index / 100,
+                "metered_tokens": 100 + index,
+                "provider_requests": 2 + index,
+                "cache_read_input_tokens": 50 + index,
+                "cache_creation_input_tokens": 10 + index,
+                "control_metrics": self._control(used=arm == "treatment"),
+            }
+        journal_path = root / f"{arm}-budget.json"
+        authority = BudgetAuthority(
+            manifest_sha256=manifest["content_sha256"],
+            model_fingerprint=manifest["model"]["fingerprint"],
+            provider_identity=manifest["model"]["provider_identity"],
+            total_cost_microusd=manifest["budget"]["total_cost_microusd"],
+            total_metered_tokens=manifest["budget"]["total_metered_tokens"],
+        )
+        transaction = BudgetTransaction(
+            run_id=manifest["run_id"],
+            manifest_sha256=manifest["content_sha256"],
+            model_fingerprint=manifest["model"]["fingerprint"],
+            harness_fingerprint=manifest["harness_fingerprint"],
+            provider_identity=manifest["model"]["provider_identity"],
+            max_cost_microusd=manifest["budget"]["max_cost_microusd"],
+            max_metered_tokens=manifest["budget"]["max_metered_tokens"],
+        )
+        with BudgetJournal(journal_path, authority) as budget:
+            reserved = budget.reserve(transaction)
+            authorized = budget.authorize_request(
+                str(reserved["transaction_id"]),
+                expected_revision=int(reserved["journal_revision"]),
+                expected_head_sha256=str(reserved["journal_head_sha256"]),
+            )
+            committed = budget.commit(
+                str(authorized["transaction_id"]),
+                actual_cost_microusd=30_000,
+                actual_metered_tokens=201,
+            )
+            snapshot = budget.snapshot()
+        value = {
+            "schema_version": RECEIPT_SCHEMA_VERSION,
+            "quality_evidence": True,
+            "launch_manifest_content_sha256": manifest["content_sha256"],
+            "run_id": manifest["run_id"],
+            "cohort": manifest["cohort"],
+            "usage": {
+                "tasks": tasks,
+                "provider_requests": 5,
+                "cost_microusd": 30_000,
+                "metered_tokens": 201,
+                "cache_read_input_tokens": 101,
+                "cache_creation_input_tokens": 21,
+                "control_metrics": {},
+                "quality": {
+                    "mean_verifier_reward": sum(rewards) / 2,
+                    "full_passes": sum(reward == 1.0 for reward in rewards),
+                    "task_count": 2,
+                    "pass_rate": sum(reward == 1.0 for reward in rewards) / 2,
+                },
+                "runtime_contract": {},
+            },
+            "budget_transaction": committed,
+            "journal": {
+                "journal_id": snapshot["journal_id"],
+                "revision": snapshot["revision"],
+                "head_sha256": snapshot["head_sha256"],
+                "transaction_states": snapshot["transaction_states"],
+            },
+            "elapsed_seconds": 10.0 if arm == "baseline" else 11.0,
+            "evaluation_treatment": manifest["evaluation_treatment"],
+            "comparison": manifest["comparison"],
+        }
+        return self._write(root / f"{arm}-receipt.json", value), value, journal_path
+
+    def _pair(self, root: Path):
+        bm, bmv = self._manifest(root, "baseline")
+        tm, tmv = self._manifest(root, "treatment")
+        br, brv, bj = self._receipt(root, "baseline", bmv)
+        tr, trv, tj = self._receipt(root, "treatment", tmv)
+        return bm, br, bj, tm, tr, tj, bmv, brv, tmv, trv
+
+    def test_report_binds_equal_cache_prefix_and_quality_cost_time_deltas(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bm, br, bj, tm, tr, tj, *_ = self._pair(root)
+            report = build_report(
+                baseline_manifest_path=bm,
+                baseline_receipt_path=br,
+                baseline_journal_path=bj,
+                treatment_manifest_path=tm,
+                treatment_receipt_path=tr,
+                treatment_journal_path=tj,
+            )
+            self.assertTrue(report["quality_evidence"])
+            self.assertEqual(report["mean_reward_delta"], 0.5)
+            self.assertEqual(report["pass_rate_delta"], 0.5)
+            self.assertEqual(report["improved_tasks"], 1)
+            self.assertEqual(report["regressed_tasks"], 0)
+            self.assertEqual(report["elapsed_seconds_delta"], 1.0)
+            self.assertTrue(report["cache_prefix_equal_for_every_task"])
+            self.assertEqual(report["tasks"]["task-a"]["lean_delta"]["checker_calls"], 1)
+            self.assertIn("observed paired difference", report["claim_boundary"])
+            self.assertNotIn("assignment effect", report["claim_boundary"])
+
+    def test_covariate_cache_reward_and_budget_drift_fail_closed(self):
+        mutations = (
+            ("covariate", lambda tm, tr: tm["comparison"].update({"covariates_sha256": digest("other")})),
+            ("cache-prefix", lambda tm, tr: tr["usage"]["tasks"]["task-a"].update({"cacheable_first_request_sha256": digest("other")})),
+            ("reward", lambda tm, tr: tr["usage"]["tasks"]["task-a"].update({"verifier_reward": 0.5})),
+            ("budget", lambda tm, tr: tr["budget_transaction"].update({"manifest_sha256": digest("other")})),
+            ("budget-identity", lambda tm, tr: tr["budget_transaction"].update({"identity_sha256": digest("other")})),
+            ("budget-revision", lambda tm, tr: tr["budget_transaction"].update({"commit_revision": 4})),
+        )
+        for name, mutate in mutations:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                bm, br, bj, tm, tr, tj, _bmv, _brv, tmv, trv = self._pair(root)
+                mutate(tmv, trv)
+                if name == "covariate":
+                    tmv["content_sha256"] = hashlib.sha256(
+                        stable_json({k: v for k, v in tmv.items() if k != "content_sha256"}).encode()
+                    ).hexdigest()
+                    trv["launch_manifest_content_sha256"] = tmv["content_sha256"]
+                    trv["budget_transaction"]["manifest_sha256"] = tmv["content_sha256"]
+                self._write(tm, tmv)
+                self._write(tr, trv)
+                with self.assertRaises(LaunchError):
+                    build_report(
+                        baseline_manifest_path=bm,
+                        baseline_receipt_path=br,
+                        baseline_journal_path=bj,
+                        treatment_manifest_path=tm,
+                        treatment_receipt_path=tr,
+                        treatment_journal_path=tj,
+                    )
+
+    def test_run_transaction_and_journal_reuse_fail_closed(self):
+        for name, mutate in (
+            (
+                "run",
+                lambda bmv, brv, tmv, trv: (
+                    tmv.update({"run_id": bmv["run_id"]}),
+                    trv.update({"run_id": bmv["run_id"]}),
+                    trv["budget_transaction"].update({"run_id": bmv["run_id"]}),
+                ),
+            ),
+            (
+                "transaction",
+                lambda bmv, brv, tmv, trv: trv["budget_transaction"].update(
+                    {"transaction_id": brv["budget_transaction"]["transaction_id"]}
+                ),
+            ),
+            (
+                "journal",
+                lambda bmv, brv, tmv, trv: (
+                    trv["budget_transaction"].update(
+                        {"journal_id": brv["budget_transaction"]["journal_id"]}
+                    ),
+                    trv["journal"].update(
+                        {"journal_id": brv["budget_transaction"]["journal_id"]}
+                    ),
+                ),
+            ),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                bm, br, bj, tm, tr, tj, bmv, brv, tmv, trv = self._pair(root)
+                mutate(bmv, brv, tmv, trv)
+                if name == "run":
+                    tmv["content_sha256"] = hashlib.sha256(
+                        stable_json(
+                            {key: value for key, value in tmv.items() if key != "content_sha256"}
+                        ).encode()
+                    ).hexdigest()
+                    trv["launch_manifest_content_sha256"] = tmv["content_sha256"]
+                    trv["budget_transaction"]["manifest_sha256"] = tmv["content_sha256"]
+                self._write(tm, tmv)
+                self._write(tr, trv)
+                with self.assertRaises(LaunchError):
+                    build_report(
+                        baseline_manifest_path=bm,
+                        baseline_receipt_path=br,
+                        baseline_journal_path=bj,
+                        treatment_manifest_path=tm,
+                        treatment_receipt_path=tr,
+                        treatment_journal_path=tj,
+                    )
+
+    def test_per_task_cost_delta_is_already_in_microusd(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bm, br, bj, tm, tr, tj, _bmv, _brv, _tmv, trv = self._pair(root)
+            trv["usage"]["tasks"]["task-a"]["cost_usd"] = 0.011
+            trv["usage"]["tasks"]["task-b"]["cost_usd"] = 0.019
+            self._write(tr, trv)
+            report = build_report(
+                baseline_manifest_path=bm,
+                baseline_receipt_path=br,
+                baseline_journal_path=bj,
+                treatment_manifest_path=tm,
+                treatment_receipt_path=tr,
+                treatment_journal_path=tj,
+            )
+            self.assertEqual(1_000, report["tasks"]["task-a"]["cost_microusd_delta"])
+
+    def test_tampered_budget_journal_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bm, br, bj, tm, tr, tj, *_ = self._pair(root)
+            document = json.loads(tj.read_text(encoding="utf-8"))
+            document["events"][1]["event_sha256"] = digest("tampered")
+            tj.write_text(json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(LaunchError, "journal cannot be replayed"):
+                build_report(
+                    baseline_manifest_path=bm,
+                    baseline_receipt_path=br,
+                    baseline_journal_path=bj,
+                    treatment_manifest_path=tm,
+                    treatment_receipt_path=tr,
+                    treatment_journal_path=tj,
+                )
+
+    def test_receipt_cannot_elevate_unregistered_quality_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bm, br, bj, tm, tr, tj, bmv, brv, *_ = self._pair(root)
+            bmv["quality_evidence_on_commit"] = False
+            bmv["content_sha256"] = hashlib.sha256(
+                stable_json(
+                    {key: value for key, value in bmv.items() if key != "content_sha256"}
+                ).encode()
+            ).hexdigest()
+            brv["launch_manifest_content_sha256"] = bmv["content_sha256"]
+            self._write(bm, bmv)
+            self._write(br, brv)
+            with self.assertRaisesRegex(LaunchError, "unregistered quality evidence"):
+                build_report(
+                    baseline_manifest_path=bm,
+                    baseline_receipt_path=br,
+                    baseline_journal_path=bj,
+                    treatment_manifest_path=tm,
+                    treatment_receipt_path=tr,
+                    treatment_journal_path=tj,
+                )
+
+    def test_report_identities_use_the_same_bytes_that_were_validated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bm, br, bj, tm, tr, tj, *_ = self._pair(root)
+            expected_receipt_sha = hashlib.sha256(br.read_bytes()).hexdigest()
+            expected_journal_sha = hashlib.sha256(bj.read_bytes()).hexdigest()
+            real_observed_json = paired_analysis._observed_json
+            real_read_regular = paired_analysis._read_regular
+
+            def observed_json(path, **kwargs):
+                result = real_observed_json(path, **kwargs)
+                if path == br:
+                    self._write(br, {"replaced_after_observation": True})
+                return result
+
+            def read_regular(path, **kwargs):
+                payload = real_read_regular(path, **kwargs)
+                if path == bj:
+                    self._write(bj, {"replaced_after_observation": True})
+                return payload
+
+            with mock.patch.object(
+                paired_analysis, "_observed_json", side_effect=observed_json
+            ), mock.patch.object(
+                paired_analysis, "_read_regular", side_effect=read_regular
+            ):
+                report = build_report(
+                    baseline_manifest_path=bm,
+                    baseline_receipt_path=br,
+                    baseline_journal_path=bj,
+                    treatment_manifest_path=tm,
+                    treatment_receipt_path=tr,
+                    treatment_journal_path=tj,
+                )
+
+            self.assertEqual(
+                expected_receipt_sha, report["arms"]["baseline"]["receipt"]["sha256"]
+            )
+            self.assertEqual(
+                expected_journal_sha,
+                report["arms"]["baseline"]["budget_journal"]["sha256"],
+            )
+            self.assertNotEqual(
+                expected_receipt_sha, hashlib.sha256(br.read_bytes()).hexdigest()
+            )
+            self.assertNotEqual(
+                expected_journal_sha, hashlib.sha256(bj.read_bytes()).hexdigest()
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

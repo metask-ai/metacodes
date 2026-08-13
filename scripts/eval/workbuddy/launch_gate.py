@@ -62,8 +62,10 @@ from .trace import (
 )
 
 
-SCHEMA_VERSION = "metacodes-workbuddy-paid-launch-v1"
-RECEIPT_SCHEMA_VERSION = "metacodes-workbuddy-paid-receipt-v1"
+LEGACY_SCHEMA_VERSION = "metacodes-workbuddy-paid-launch-v1"
+SCHEMA_VERSION = "metacodes-workbuddy-paid-launch-v2"
+LEGACY_RECEIPT_SCHEMA_VERSION = "metacodes-workbuddy-paid-receipt-v1"
+RECEIPT_SCHEMA_VERSION = "metacodes-workbuddy-paid-receipt-v2"
 AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION_V1 = (
     "metacodes-workbuddy-authorized-failure-v1"
 )
@@ -89,13 +91,30 @@ HOST_CONTROL_PLANE_MODULES = {
     "launch_gate": Path(__file__),
     "memory_budget_journal": Path(__file__).parents[1] / "memory_budget_journal.py",
     "model": Path(__file__).parents[1] / "model.py",
+    "paired_analysis": Path(__file__).with_name("paired_analysis.py"),
     "stage_artifacts": Path(__file__).with_name("stage_artifacts.py"),
     "workbuddy_trace": Path(__file__).with_name("trace.py"),
 }
+# Freeze every historical source set explicitly.  Computing a legacy set as
+# "current minus one" silently rewrites old protocol history whenever a new
+# host module is added.
 LEGACY_HOST_CONTROL_PLANE_MODULE_NAMES_V1 = frozenset(
-    set(HOST_CONTROL_PLANE_MODULES) - {"workbuddy_trace"}
+    {
+        "environment_preflight",
+        "install_overlay",
+        "key_fd",
+        "launch_gate",
+        "memory_budget_journal",
+        "model",
+        "stage_artifacts",
+    }
+)
+LEGACY_HOST_CONTROL_PLANE_MODULE_NAMES_V2 = frozenset(
+    {*LEGACY_HOST_CONTROL_PLANE_MODULE_NAMES_V1, "workbuddy_trace"}
 )
 AUTHORIZED_FAILURE_RECEIPT_MODES = {"in_band", "offline_recovery"}
+PROJECT_CONTROL_MODES = {"absent", "disabled", "enforced"}
+COMPARISON_SCHEMA_VERSION = "metacodes-workbuddy-project-control-comparison-v1"
 
 
 class LaunchError(ValidationError):
@@ -108,6 +127,89 @@ def _sha256_bytes(payload: bytes) -> str:
 
 def _canonical_sha256(value: object) -> str:
     return _sha256_bytes(stable_json(value).encode("utf-8"))
+
+
+def _comparison_covariates(
+    *,
+    workbuddy_commit: str,
+    overlay_sha256: str,
+    cohort: Mapping[str, Any],
+    artifacts: Mapping[str, Any],
+    environment_preflight_sha256: str,
+    job: Mapping[str, Any],
+    model_fingerprint: str,
+    backend_url_sha256: str,
+    runner_tools: Mapping[str, Any],
+    host_control_plane: Mapping[str, Any],
+    budget: Mapping[str, int],
+) -> Dict[str, object]:
+    """Return the frozen paired-study inputs excluding only actuation.
+
+    Baseline and treatment use separate WorkBuddy job slugs/result roots and
+    separate budget transactions.  Those logistics are intentionally erased;
+    every task, artifact, model, cache/context setting and cap remains bound.
+    """
+
+    normalized_job = json.loads(json.dumps(job))
+    normalized_job.pop("jobs_dir", None)
+    overrides = normalized_job.get("harness_params_override")
+    if isinstance(overrides, dict):
+        overrides.pop("METACODES_PROJECT_CONTROL_MODE", None)
+    stable_artifacts = json.loads(json.dumps(artifacts))
+    # Absolute staging paths describe where identical bytes were observed, not
+    # an experimental variable.  Keep every digest/size/architecture field.
+    def erase_paths(value: object) -> None:
+        if isinstance(value, dict):
+            value.pop("path", None)
+            for child in value.values():
+                erase_paths(child)
+        elif isinstance(value, list):
+            for child in value:
+                erase_paths(child)
+
+    erase_paths(stable_artifacts)
+    stable_host = {
+        name: {key: value for key, value in row.items() if key != "path"}
+        for name, row in host_control_plane.items()
+    }
+    stable_tools = {
+        name: {key: value for key, value in row.items() if key != "path"}
+        for name, row in runner_tools.items()
+    }
+    return {
+        "workbuddy_commit": workbuddy_commit,
+        "overlay_sha256": overlay_sha256,
+        "cohort": {
+            key: cohort[key]
+            for key in (
+                "subset",
+                "cohort",
+                "take",
+                "dataset",
+                "selected_tasks",
+                "selected_tasks_sha256",
+            )
+        },
+        "artifacts": stable_artifacts,
+        "environment_preflight_sha256": environment_preflight_sha256,
+        "job_without_treatment_or_result_root": normalized_job,
+        "model_fingerprint": model_fingerprint,
+        "backend_url_sha256": backend_url_sha256,
+        "runner_tools": stable_tools,
+        "host_control_plane": stable_host,
+        "budget": {
+            key: budget[key]
+            for key in (
+                "total_cost_microusd",
+                "total_metered_tokens",
+                "max_cost_microusd",
+                "max_metered_tokens",
+            )
+        },
+        "actor_prompt_changed": False,
+        "tool_schema_changed": False,
+        "provider_cache_prefix_changed_by_control_plane": False,
+    }
 
 
 def _read_regular(path: Path, *, maximum: int = 16 * 1024 * 1024) -> bytes:
@@ -141,9 +243,7 @@ def _read_regular(path: Path, *, maximum: int = 16 * 1024 * 1024) -> bytes:
         os.close(descriptor)
 
 
-def _json(path: Path) -> Dict[str, Any]:
-    payload = _read_regular(path)
-
+def _parse_json(payload: bytes, path: Path) -> Dict[str, Any]:
     def unique(pairs: list[tuple[str, Any]]) -> Dict[str, Any]:
         result: Dict[str, Any] = {}
         for key, value in pairs:
@@ -158,6 +258,30 @@ def _json(path: Path) -> Dict[str, Any]:
         raise LaunchError(f"invalid JSON in {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise LaunchError(f"expected JSON object in {path}")
+    return value
+
+
+def _observed_json(
+    path: Path, *, maximum: int = 16 * 1024 * 1024
+) -> tuple[Dict[str, Any], Dict[str, object], bytes]:
+    """Parse and identify one immutable observation of a regular JSON file."""
+
+    # Do not resolve this locator after the read: an attacker replacing the
+    # directory entry with a symlink must not change which path the evidence
+    # claims was observed.  _read_regular independently rejects links and
+    # detects mutation of the opened inode.
+    locator = str(path.absolute())
+    payload = _read_regular(path, maximum=maximum)
+    identity = {
+        "path": locator,
+        "bytes": len(payload),
+        "sha256": _sha256_bytes(payload),
+    }
+    return _parse_json(payload, path), identity, payload
+
+
+def _json(path: Path) -> Dict[str, Any]:
+    value, _, _ = _observed_json(path)
     return value
 
 
@@ -443,6 +567,7 @@ def build_launch_manifest(
     max_metered_tokens: int,
     prior_exposure_microusd: int = 0,
     quality_evidence_on_commit: bool = False,
+    comparison_id: str | None = None,
 ) -> Dict[str, object]:
     if not RUN_ID_RE.fullmatch(run_id):
         raise LaunchError("run id must be a safe 3-128 character path component")
@@ -493,8 +618,10 @@ def build_launch_manifest(
     project_overrides = job.get("harness_params_override") or {}
     if not isinstance(project_overrides, dict):
         raise LaunchError("WorkBuddy harness_params_override must be a mapping")
+    project_control_mode = project_overrides.get("METACODES_PROJECT_CONTROL_MODE")
     expected_project_overrides = (
         {
+            "METACODES_PROJECT_CONTROL_MODE": project_control_mode,
             "METACODES_PROJECT_RULES_RELATIVE": project_control["rules"][
                 "relative_path"
             ],
@@ -505,6 +632,13 @@ def build_launch_manifest(
         if isinstance(project_control, dict)
         else {}
     )
+    if isinstance(project_control, dict):
+        if project_control_mode not in {"disabled", "enforced"}:
+            raise LaunchError(
+                "staged project control requires explicit disabled/enforced treatment"
+            )
+    elif project_control_mode is not None:
+        raise LaunchError("project-control treatment requires staged artifacts")
     observed_project_overrides = {
         key: project_overrides.get(key)
         for key in expected_project_overrides
@@ -518,6 +652,7 @@ def build_launch_manifest(
         for key in (
             "METACODES_PROJECT_RULES_RELATIVE",
             "METACODES_PROJECT_KERNEL_RELATIVE",
+            "METACODES_PROJECT_CONTROL_MODE",
         )
     ):
         raise LaunchError("WorkBuddy job requests project control that was not staged")
@@ -560,6 +695,10 @@ def build_launch_manifest(
         )
     if not isinstance(quality_evidence_on_commit, bool):
         raise LaunchError("quality_evidence_on_commit must be boolean")
+    if comparison_id is not None and not RUN_ID_RE.fullmatch(comparison_id):
+        raise LaunchError("comparison id must be a safe 3-128 character component")
+    if quality_evidence_on_commit and comparison_id is None:
+        raise LaunchError("quality evidence requires an explicit paired comparison id")
 
     job_identity = _identity(job_path)
     model_identity = _identity(model_path)
@@ -584,10 +723,51 @@ def build_launch_manifest(
             "model_config": model_identity,
         }
     )
+    budget_contract = {
+        "total_cost_microusd": total_cost_microusd,
+        "total_metered_tokens": total_metered_tokens,
+        "max_cost_microusd": max_cost_microusd,
+        "max_metered_tokens": max_metered_tokens,
+        "prior_exposure_microusd": prior_exposure_microusd,
+        "user_authority_microusd": MAX_USER_AUTHORITY_MICROUSD,
+    }
+    comparison_covariates = _comparison_covariates(
+        workbuddy_commit=WORKBUDDY_PINNED_COMMIT,
+        overlay_sha256=str(overlay["overlay_sha256"]),
+        cohort=cohort_row,
+        artifacts=artifact_row,
+        environment_preflight_sha256=str(environment_preflight["content_sha256"]),
+        job=job,
+        model_fingerprint=model_fingerprint,
+        backend_url_sha256=_sha256_bytes(backend_url.encode("utf-8")),
+        runner_tools={"bash": bash_tool, "uv": uv_tool},
+        host_control_plane=host_control_plane,
+        budget=budget_contract,
+    )
     manifest: Dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "quality_evidence": False,
         "quality_evidence_on_commit": quality_evidence_on_commit,
+        "evaluation_treatment": {
+            "project_control": (
+                str(project_control_mode)
+                if isinstance(project_control, dict)
+                else "absent"
+            ),
+            "actor_prompt_changed": False,
+            "tool_schema_changed": False,
+            "provider_cache_prefix_changed_by_control_plane": False,
+        },
+        "comparison": (
+            {
+                "schema_version": COMPARISON_SCHEMA_VERSION,
+                "comparison_id": comparison_id,
+                "covariates_sha256": _canonical_sha256(comparison_covariates),
+                "covariates": comparison_covariates,
+            }
+            if comparison_id is not None
+            else None
+        ),
         "run_id": run_id,
         "workbuddy": {
             "checkout": str(workbuddy),
@@ -613,14 +793,7 @@ def build_launch_manifest(
         },
         "harness_fingerprint": harness_fingerprint,
         "host_control_plane": host_control_plane,
-        "budget": {
-            "total_cost_microusd": total_cost_microusd,
-            "total_metered_tokens": total_metered_tokens,
-            "max_cost_microusd": max_cost_microusd,
-            "max_metered_tokens": max_metered_tokens,
-            "prior_exposure_microusd": prior_exposure_microusd,
-            "user_authority_microusd": MAX_USER_AUTHORITY_MICROUSD,
-        },
+        "budget": budget_contract,
         "execution": {
             "n_attempts": 1,
             "n_concurrent_trials": 1,
@@ -658,16 +831,55 @@ def build_launch_manifest(
     return manifest
 
 
-def validate_launch_manifest(path: Path) -> Dict[str, Any]:
-    manifest = _json(path)
+def _validate_launch_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
     content_sha = manifest.pop("content_sha256", None)
     if content_sha != _canonical_sha256(manifest):
         raise LaunchError("paid launch manifest content hash mismatch")
     manifest["content_sha256"] = content_sha
-    if manifest.get("schema_version") != SCHEMA_VERSION or manifest.get("quality_evidence") is not False:
+    schema_version = manifest.get("schema_version")
+    if schema_version not in {LEGACY_SCHEMA_VERSION, SCHEMA_VERSION} or manifest.get("quality_evidence") is not False:
         raise LaunchError("unsupported or mislabeled paid launch manifest")
+    treatment = manifest.get("evaluation_treatment")
+    if schema_version == SCHEMA_VERSION:
+        if (
+            not isinstance(treatment, dict)
+            or treatment
+            != {
+                "project_control": treatment.get("project_control"),
+                "actor_prompt_changed": False,
+                "tool_schema_changed": False,
+                "provider_cache_prefix_changed_by_control_plane": False,
+            }
+            or treatment.get("project_control") not in PROJECT_CONTROL_MODES
+        ):
+            raise LaunchError("paid launch treatment contract is incomplete")
+    elif treatment is not None:
+        raise LaunchError("legacy paid launch unexpectedly carries a v2 treatment")
     if not isinstance(manifest.get("quality_evidence_on_commit"), bool):
         raise LaunchError("paid launch commit evidence classification is missing")
+    comparison = manifest.get("comparison")
+    if schema_version == SCHEMA_VERSION:
+        if comparison is not None:
+            if (
+                not isinstance(comparison, dict)
+                or set(comparison)
+                != {
+                    "schema_version",
+                    "comparison_id",
+                    "covariates_sha256",
+                    "covariates",
+                }
+                or comparison.get("schema_version") != COMPARISON_SCHEMA_VERSION
+                or not RUN_ID_RE.fullmatch(str(comparison.get("comparison_id", "")))
+                or not isinstance(comparison.get("covariates"), dict)
+                or comparison.get("covariates_sha256")
+                != _canonical_sha256(comparison["covariates"])
+            ):
+                raise LaunchError("paid launch comparison contract is incomplete")
+        if manifest["quality_evidence_on_commit"] is True and comparison is None:
+            raise LaunchError("quality evidence is missing its paired comparison")
+    elif comparison is not None:
+        raise LaunchError("legacy paid launch unexpectedly carries a comparison")
     if manifest.get("workbuddy", {}).get("commit") != WORKBUDDY_PINNED_COMMIT:
         raise LaunchError("paid launch WorkBuddy commit drifted")
     if not re.fullmatch(
@@ -676,13 +888,18 @@ def validate_launch_manifest(path: Path) -> Dict[str, Any]:
     ):
         raise LaunchError("paid launch installed-overlay identity is incomplete")
     host_control_plane = manifest.get("host_control_plane")
+    allowed_host_modules = (
+        {frozenset(HOST_CONTROL_PLANE_MODULES)}
+        if schema_version == SCHEMA_VERSION
+        else {
+            LEGACY_HOST_CONTROL_PLANE_MODULE_NAMES_V1,
+            LEGACY_HOST_CONTROL_PLANE_MODULE_NAMES_V2,
+        }
+    )
     if (
         not isinstance(host_control_plane, dict)
         or set(host_control_plane)
-        not in {
-            frozenset(HOST_CONTROL_PLANE_MODULES),
-            LEGACY_HOST_CONTROL_PLANE_MODULE_NAMES_V1,
-        }
+        not in allowed_host_modules
         or any(
             not isinstance(row, dict)
             or not isinstance(row.get("path"), str)
@@ -790,6 +1007,11 @@ def validate_launch_manifest(path: Path) -> Dict[str, Any]:
     return manifest
 
 
+def validate_launch_manifest(path: Path) -> Dict[str, Any]:
+    manifest, _, _ = _observed_json(path)
+    return _validate_launch_manifest(manifest)
+
+
 def _reobserve_identity(row: Mapping[str, Any], label: str, *, maximum: int) -> None:
     if not isinstance(row, dict) or set(("path", "bytes", "sha256")) - set(row):
         raise LaunchError(f"{label} has no complete file identity")
@@ -888,6 +1110,13 @@ def _reobserve_launch_inputs(manifest: Mapping[str, Any]) -> None:
         if observed != manifest["execution"]["runner_tools"][name]:
             raise LaunchError(f"WorkBuddy runner tool changed after manifest creation: {name}")
     _reobserve_identity(manifest["job"]["config"], "WorkBuddy job config", maximum=16 * 1024 * 1024)
+    expected_project = _expected_project_control(manifest)
+    current_job = _yaml(Path(manifest["job"]["config"]["path"]))
+    _validate_project_control_kwargs(
+        current_job.get("harness_params_override") or {},
+        expected_project,
+        label="reobserved WorkBuddy job",
+    )
     _reobserve_identity(manifest["model"]["config"], "WorkBuddy model config", maximum=16 * 1024 * 1024)
     backend_url = os.environ.get(manifest["model"]["backend_url_env"], "")
     if _sha256_bytes(backend_url.encode("utf-8")) != manifest["model"]["backend_url_sha256"]:
@@ -1334,18 +1563,32 @@ def _official_task_identity(
 
 
 def _expected_project_control(manifest: Mapping[str, Any]) -> Dict[str, object]:
+    treatment = manifest.get("evaluation_treatment")
     project = manifest.get("artifacts", {}).get("project_control")
+    mode = (
+        str(treatment.get("project_control"))
+        if isinstance(treatment, dict)
+        else ("enforced" if project is not None else "absent")
+    )
     if project is None:
+        if mode != "absent":
+            raise LaunchError("project-control treatment has no staged artifact")
         return {
+            "staged": False,
+            "mode": "absent",
             "configured": False,
             "project_root": None,
             "project_sha256": None,
             "project_state_hash": None,
             "rules_relative_path": None,
             "kernel_relative_path": None,
+            "artifacts_verified": False,
+            "runtime_active_bundle_absent": True,
         }
     if not isinstance(project, dict):
         raise LaunchError("paid launch project control contract is malformed")
+    if mode not in {"disabled", "enforced"}:
+        raise LaunchError("staged project-control treatment is invalid")
     rules = project.get("rules")
     kernel = project.get("kernel")
     if not isinstance(rules, dict) or not isinstance(kernel, dict):
@@ -1367,12 +1610,18 @@ def _expected_project_control(manifest: Mapping[str, Any]) -> Dict[str, object]:
     ):
         raise LaunchError("paid launch project control target identity drifted")
     return {
-        "configured": True,
+        "staged": True,
+        "mode": mode,
+        "configured": mode == "enforced",
         "project_root": project_root,
         "project_sha256": project_sha256,
-        "project_state_hash": project_state_hash(project_root),
+        "project_state_hash": (
+            project_state_hash(project_root) if mode == "enforced" else None
+        ),
         "rules_relative_path": rules_relative,
         "kernel_relative_path": kernel_relative,
+        "artifacts_verified": True,
+        "runtime_active_bundle_absent": mode == "disabled",
     }
 
 
@@ -1382,6 +1631,9 @@ def _validate_project_control_kwargs(
     if not isinstance(kwargs, dict):
         raise LaunchError(f"{label} has no agent kwargs")
     observed = {
+        "METACODES_PROJECT_CONTROL_MODE": kwargs.get(
+            "METACODES_PROJECT_CONTROL_MODE"
+        ),
         "METACODES_PROJECT_RULES_RELATIVE": kwargs.get(
             "METACODES_PROJECT_RULES_RELATIVE"
         ),
@@ -1390,6 +1642,9 @@ def _validate_project_control_kwargs(
         ),
     }
     wanted = {
+        "METACODES_PROJECT_CONTROL_MODE": (
+            expected["mode"] if expected["staged"] else None
+        ),
         "METACODES_PROJECT_RULES_RELATIVE": expected["rules_relative_path"],
         "METACODES_PROJECT_KERNEL_RELATIVE": expected["kernel_relative_path"],
     }
@@ -1411,8 +1666,12 @@ def _validate_trial_project_control(
     runtime = _json(trial_dir / "agent/metacodes-runtime-contract.json")
     project = runtime.get("project_control")
     if not isinstance(project, dict) or project != {
+        "staged": expected["staged"],
+        "mode": expected["mode"],
         "configured": expected["configured"],
         "project_state_hash": expected["project_state_hash"],
+        "artifacts_verified": expected["artifacts_verified"],
+        "runtime_active_bundle_absent": expected["runtime_active_bundle_absent"],
     }:
         raise LaunchError("official WorkBuddy runtime project control drifted")
 
@@ -1442,19 +1701,22 @@ def _runtime_contract(manifest: Mapping[str, Any]) -> Dict[str, object]:
     )
     if (
         not isinstance(harness_runtime, dict)
+        or harness_runtime.get("project_control_staged")
+        is not expected_project["staged"]
+        or harness_runtime.get("project_control_mode") != expected_project["mode"]
         or harness_runtime.get("project_control_configured")
         is not expected_project["configured"]
         or not isinstance(translated_env, dict)
         or translated_env.get("METACODES_PROJECT_RULES_SOURCE")
         != (
             "/opt/metacodes/" + str(expected_project["rules_relative_path"])
-            if expected_project["configured"]
+            if expected_project["staged"]
             else None
         )
         or translated_env.get("METACODES_PROJECT_KERNEL_PATH")
         != (
             "/opt/metacodes/" + str(expected_project["kernel_relative_path"])
-            if expected_project["configured"]
+            if expected_project["staged"]
             else None
         )
     ):
@@ -1518,6 +1780,8 @@ def _collect_usage(
     total_cache_read = 0
     total_cache_create = 0
     total_requests = 0
+    total_reward = 0.0
+    full_passes = 0
     expected_model_route = ""
     if official_runner:
         resolved_path = (
@@ -1624,10 +1888,32 @@ def _collect_usage(
         }
         control_rows[task] = control_metrics
         if trial_result_path is not None and trial_result is not None:
+            verifier_result = trial_result.get("verifier_result")
+            rewards = (
+                verifier_result.get("rewards")
+                if isinstance(verifier_result, dict)
+                else None
+            )
+            reward = rewards.get("reward") if isinstance(rewards, dict) else None
+            if (
+                not isinstance(reward, (int, float))
+                or isinstance(reward, bool)
+                or not math.isfinite(float(reward))
+                or float(reward) < 0.0
+                or float(reward) > 1.0
+            ):
+                raise LaunchError(
+                    f"official WorkBuddy result has invalid verifier reward: {trial_result_path}"
+                )
+            reward = float(reward)
+            total_reward += reward
+            full_passes += int(reward == 1.0)
             rows[task].update(
                 {
                     "trial_result_sha256": _identity(trial_result_path)["sha256"],
                     "task_checksum": trial_result["task_checksum"],
+                    "verifier_reward": reward,
+                    "full_pass": reward == 1.0,
                 }
             )
     if set(rows) != set(selected):
@@ -1642,6 +1928,12 @@ def _collect_usage(
         "control_metrics": _aggregate_control_metrics(control_rows),
     }
     if official_runner:
+        result["quality"] = {
+            "mean_verifier_reward": total_reward / len(selected),
+            "full_passes": full_passes,
+            "task_count": len(selected),
+            "pass_rate": full_passes / len(selected),
+        }
         result["runtime_contract"] = _runtime_contract(manifest)
     return result
 
@@ -2613,7 +2905,11 @@ def execute_launch(
                 )
                 snapshot = journal.snapshot()
                 receipt = {
-                    "schema_version": RECEIPT_SCHEMA_VERSION,
+                    "schema_version": (
+                        RECEIPT_SCHEMA_VERSION
+                        if manifest["schema_version"] == SCHEMA_VERSION
+                        else LEGACY_RECEIPT_SCHEMA_VERSION
+                    ),
                     "quality_evidence": _receipt_quality_evidence(
                         manifest, official_runner=official_runner
                     ),
@@ -2631,6 +2927,11 @@ def execute_launch(
                     "elapsed_seconds": (time.time_ns() - started_ns)
                     / 1_000_000_000,
                 }
+                if manifest["schema_version"] == SCHEMA_VERSION:
+                    receipt["evaluation_treatment"] = manifest[
+                        "evaluation_treatment"
+                    ]
+                    receipt["comparison"] = manifest["comparison"]
                 _write_private_new(
                     receipt_path,
                     (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode(
@@ -2683,6 +2984,7 @@ def main(argv: list[str] | None = None) -> int:
     create.add_argument("--max-metered-tokens", type=int, required=True)
     create.add_argument("--prior-exposure-microusd", type=int, default=0)
     create.add_argument("--quality-evidence-on-commit", action="store_true")
+    create.add_argument("--comparison-id")
     create.add_argument("--output", type=Path, required=True)
     run = subparsers.add_parser("run")
     run.add_argument("--manifest", type=Path, required=True)
@@ -2721,6 +3023,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_metered_tokens=args.max_metered_tokens,
                 prior_exposure_microusd=args.prior_exposure_microusd,
                 quality_evidence_on_commit=args.quality_evidence_on_commit,
+                comparison_id=args.comparison_id,
             )
             _write_private_new(
                 args.output,

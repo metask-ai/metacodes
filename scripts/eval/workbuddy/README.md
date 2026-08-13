@@ -126,7 +126,7 @@ copied into the derived metrics. A failed or interrupted authorized run is not
 automatically retried.
 
 If the runner returns nonzero after authorization, the gate writes a separate
-`metacodes-workbuddy-authorized-failure-v1` receipt before reporting the
+`metacodes-workbuddy-authorized-failure-v2` receipt before reporting the
 failure. It keeps the journal transaction in `request_authorized`, reports
 actual cost/tokens as unknown, marks `quality_evidence=false` and
 `retry_allowed=false`, and binds only bounded status/count/timing summaries
@@ -144,6 +144,35 @@ Receipt evidence classification is also frozen before authorization. Omit
 runs; their committed receipts remain `quality_evidence=false` even though
 they use the official runner. Pass it only for a preregistered real-provider
 wave whose official task outcomes are intended to count as quality evidence.
+Every such wave must also carry an explicit `--comparison-id`; a single arm is
+not sufficient quality evidence for a harness change.
+
+Project-rule outcome studies use two independently created launch manifests
+with the same comparison id and frozen covariate digest. The baseline job uses
+`METACODES_PROJECT_CONTROL_MODE=disabled`: it mounts and verifies the exact
+same rule tree and compiled kernel, but does not materialize
+`$HOME/.metacodes/projects/<project>/project-rules/active.json`. The treatment
+uses `enforced`. Each arm has a distinct run id, budget journal and budget
+transaction. After both official receipts commit, build the paired report with:
+
+```bash
+python3 -m scripts.eval.workbuddy.paired_analysis \
+  --baseline-manifest /private/baseline-manifest.json \
+  --baseline-receipt /private/baseline-receipt.json \
+  --baseline-budget-journal /private/baseline-budget.json \
+  --treatment-manifest /private/treatment-manifest.json \
+  --treatment-receipt /private/treatment-receipt.json \
+  --treatment-budget-journal /private/treatment-budget.json \
+  --output /private/paired-report.json
+```
+
+The analyzer replays both journal hash chains, binds official Harbor verifier
+rewards, requires identical per-task cacheable first-request hashes and reports
+success, time, cost, token, cache and Lean deltas. Its conclusion is only an
+observed paired difference for that frozen cohort and rule bundle. With one
+model sample per arm it is not a causal effect estimate, and
+`quality_evidence=true` is possible only when both input receipts independently
+carry quality evidence.
 
 The overlay also keeps the opaque local-proxy route free of Harbor's ``__``
 eval-group delimiter. Otherwise a completed multi-task job can fail only while
@@ -155,7 +184,8 @@ python3 -m scripts.eval.workbuddy.launch_gate create ... \
   --runner-bash /absolute/path/to/bash \
   --runner-uv /absolute/path/to/uv \
   --output launch.json
-# Real scored waves add: --quality-evidence-on-commit
+# Real scored waves add both:
+#   --quality-evidence-on-commit --comparison-id <frozen-pair-id>
 python3 -m scripts.eval.workbuddy.launch_gate run \
   --manifest launch.json --budget-journal /private/budget.json \
   --receipt /private/receipts/run.json --credential-fd 9

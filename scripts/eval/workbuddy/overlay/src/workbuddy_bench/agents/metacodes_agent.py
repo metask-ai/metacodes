@@ -40,6 +40,7 @@ _RUNTIME_CONTRACT_FILENAME = "metacodes-runtime-contract.json"
 _DEFAULT_DISABLED_TOOLS = (
     "Agent,Task,TaskBatch,TeamCreate,TeamDelete,SendMessage"
 )
+_PROJECT_CONTROL_MODES = {"disabled", "enforced"}
 _REMOTE_TINYKG_ENV = (
     "TINYKG_REMOTE_URL",
     "TINYKG_API_KEY",
@@ -75,10 +76,22 @@ class MetacodesAgent(BaseInstalledAgent):
         )
         project_rules = kwargs.pop("METACODES_PROJECT_RULES_RELATIVE", None)
         project_kernel = kwargs.pop("METACODES_PROJECT_KERNEL_RELATIVE", None)
+        project_control_mode = kwargs.pop("METACODES_PROJECT_CONTROL_MODE", None)
         if (project_rules is None) != (project_kernel is None):
             raise ValueError(
                 "metacodes project rules and project kernel must be configured together"
             )
+        if project_rules is None:
+            if project_control_mode is not None:
+                raise ValueError(
+                    "metacodes project control mode requires staged rules and kernel"
+                )
+            project_control_mode = "absent"
+        elif project_control_mode not in _PROJECT_CONTROL_MODES:
+            raise ValueError(
+                "metacodes staged project control requires explicit disabled/enforced mode"
+            )
+        self._project_control_mode = str(project_control_mode)
         self._project_rules_relative = (
             _relative_mount_path(project_rules, "project rules")
             if project_rules is not None
@@ -193,39 +206,78 @@ class MetacodesAgent(BaseInstalledAgent):
             flags += ["--max-tokens", str(self._max_output_tokens)]
 
         project_setup = ""
+        project_postcheck = ""
         project_contract = {
+            "staged": False,
+            "mode": "absent",
             "configured": False,
             "project_state_hash": None,
+            "artifacts_verified": False,
+            "runtime_active_bundle_absent": True,
         }
-        if self._project_kernel_relative is not None and self._project_rules_relative is not None:
+        project_staged = (
+            self._project_kernel_relative is not None
+            and self._project_rules_relative is not None
+        )
+        if project_staged:
             project_hash = project_state_hash("/workspace")
             project_contract = {
-                "configured": True,
-                "project_state_hash": project_hash,
+                "staged": True,
+                "mode": self._project_control_mode,
+                "configured": self._project_control_mode == "enforced",
+                "project_state_hash": (
+                    project_hash if self._project_control_mode == "enforced" else None
+                ),
+                "artifacts_verified": True,
+                "runtime_active_bundle_absent": (
+                    self._project_control_mode == "disabled"
+                ),
             }
             project_source = mount + "/" + self._project_rules_relative
             project_kernel = mount + "/" + self._project_kernel_relative
             project_setup = (
-                f'project_state="$HOME/.metacodes/projects/{project_hash}"; '
-                'mkdir -p "$project_state" || exit 77; '
                 f'project_source={shlex.quote(project_source)}; '
+                f'project_kernel={shlex.quote(project_kernel)}; '
                 'test -d "$project_source" || exit 78; '
-                'test -z "$(find "$project_source" -type l -print -quit)" || exit 79; '
-                'test ! -e "$project_state/project-rules" || exit 80; '
-                'cp -R -- "$project_source" "$project_state/project-rules" || exit 81; '
-                'chmod -R u=rwX,go= "$project_state/project-rules" || exit 82; '
-                f'export METACODES_PROJECT_KERNEL_PATH={shlex.quote(project_kernel)}; '
-                'project_kernel_sha="$(sha256sum "$METACODES_PROJECT_KERNEL_PATH" | cut -d" " -f1)"; '
-                'test "${#project_kernel_sha}" -eq 64 || exit 83; '
-                'export METACODES_PROJECT_KERNEL_SHA256="$project_kernel_sha"; '
+                'test -x "$project_kernel" || exit 83; '
             )
+            if self._project_control_mode == "enforced":
+                project_setup += (
+                    f'project_state="$HOME/.metacodes/projects/{project_hash}"; '
+                    'mkdir -p "$project_state" || exit 77; '
+                    'test -z "$(find "$project_source" -type l -print -quit)" || exit 79; '
+                    'test ! -e "$project_state/project-rules" || exit 80; '
+                    'cp -R -- "$project_source" "$project_state/project-rules" || exit 81; '
+                    'chmod -R u=rwX,go= "$project_state/project-rules" || exit 82; '
+                    'export METACODES_PROJECT_KERNEL_PATH="$project_kernel"; '
+                    'project_kernel_sha="$(sha256sum "$METACODES_PROJECT_KERNEL_PATH" | cut -d" " -f1)"; '
+                    'test "${#project_kernel_sha}" -eq 64 || exit 83; '
+                    'export METACODES_PROJECT_KERNEL_SHA256="$project_kernel_sha"; '
+                )
+            else:
+                disabled_bundle_check = (
+                    'test ! -e "$HOME/.metacodes/projects/'
+                    + project_hash
+                    + '/project-rules/active.json" || exit 88; '
+                )
+                project_setup += disabled_bundle_check
+                project_postcheck = disabled_bundle_check
+        else:
+            project_contract = {
+                "staged": False,
+                "mode": "absent",
+                "configured": False,
+                "project_state_hash": None,
+                "artifacts_verified": False,
+                "runtime_active_bundle_absent": True,
+            }
 
         remote_tinykg_env_absent = all(name not in env for name in _REMOTE_TINYKG_ENV)
         if not remote_tinykg_env_absent:
             raise ValueError("metacodes WorkBuddy trial received remote TinyKG authority")
         runtime_contract = json.dumps(
             {
-                "schema_version": "metacodes-workbuddy-runtime-contract-v1",
+                "schema_version": "metacodes-workbuddy-runtime-contract-v2",
                 "quality_evidence": False,
                 "fresh_home": True,
                 "local_tinykg": True,
@@ -246,6 +298,7 @@ class MetacodesAgent(BaseInstalledAgent):
             'run_home="/tmp/metacodes-workbuddy-home"; '
             'test ! -e "$run_home" || { echo "fresh HOME already exists" >&2; exit 70; }; '
             'mkdir -p "$run_home" || exit 70; export HOME="$run_home"; '
+            "unset METACODES_PROJECT_KERNEL_PATH METACODES_PROJECT_KERNEL_SHA256; "
             f"{project_setup}"
             "export METACODES_KG_TRANSPORT=cli-exclusive; "
             f'export METACODES_KG_BIN={shlex.quote(mount + "/bin/tinykg")}; '
@@ -272,6 +325,7 @@ class MetacodesAgent(BaseInstalledAgent):
             f"metacodes {' '.join(flags)} -p {escaped_instruction} --json "
             f"2>&1 </dev/null | tee {shlex.quote(output_path)}; "
             "agent_status=${PIPESTATUS[0]}; "
+            f"{project_postcheck}"
             'mapfile -t transcripts < <(find "$HOME/.metacodes/projects" '
             "-type f -name transcript.jsonl -print 2>/dev/null); "
             'test "${#transcripts[@]}" -eq 1 || { '

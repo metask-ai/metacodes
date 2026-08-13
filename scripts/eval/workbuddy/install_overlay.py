@@ -109,6 +109,14 @@ _METACODES_RUNTIME_BUILDER = '''def _build_metacodes_runtime_config(
     })
     project_rules = harness_params.get("METACODES_PROJECT_RULES_RELATIVE")
     project_kernel = harness_params.get("METACODES_PROJECT_KERNEL_RELATIVE")
+    project_mode = harness_params.get("METACODES_PROJECT_CONTROL_MODE")
+    project_staged = bool(project_rules and project_kernel)
+    if project_staged and project_mode not in ("disabled", "enforced"):
+        raise ValueError(
+            "metacodes staged project control requires explicit disabled/enforced mode"
+        )
+    if not project_staged and project_mode is not None:
+        raise ValueError("metacodes project control mode requires staged artifacts")
     if project_rules or project_kernel:
         env.update({
             "METACODES_PROJECT_RULES_SOURCE": (
@@ -124,7 +132,9 @@ _METACODES_RUNTIME_BUILDER = '''def _build_metacodes_runtime_config(
         "connection_policy": "local-proxy-only",
         "credential_delivery": "anonymous-fd-route-token",
         "disabled_tools": harness_params.get("METACODES_DISALLOWED_TOOLS"),
-        "project_control_configured": bool(project_rules and project_kernel),
+        "project_control_staged": project_staged,
+        "project_control_mode": project_mode if project_staged else "absent",
+        "project_control_configured": project_staged and project_mode == "enforced",
         "translated_env": {key: value for key, value in env.items() if value},
         "cleared_env": [
             "TINYKG_REMOTE_URL",

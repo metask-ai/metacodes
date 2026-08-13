@@ -57,7 +57,7 @@ PROVIDER_CREDENTIAL_ENV = (
     "METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF",
 )
 EXPECTED_RUNTIME_CONTRACT = {
-    "schema_version": "metacodes-workbuddy-runtime-contract-v1",
+    "schema_version": "metacodes-workbuddy-runtime-contract-v2",
     "quality_evidence": False,
     "fresh_home": True,
     "local_tinykg": True,
@@ -65,8 +65,12 @@ EXPECTED_RUNTIME_CONTRACT = {
     "tinykg_store_absent_before_first_provider_request": True,
     "credential_delivery": "anonymous-fd-route-token",
     "project_control": {
+        "staged": True,
+        "mode": "enforced",
         "configured": True,
         "project_state_hash": "5807156ecf67bb70",
+        "artifacts_verified": True,
+        "runtime_active_bundle_absent": False,
     },
 }
 

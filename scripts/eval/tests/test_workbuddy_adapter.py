@@ -1095,6 +1095,7 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         self.assertEqual(
             job["harness_params_override"],
             {
+                "METACODES_PROJECT_CONTROL_MODE": "enforced",
                 "METACODES_PROJECT_RULES_RELATIVE": (
                     "share/metacodes/workbuddy-w05/project-rules"
                 ),
@@ -1111,6 +1112,51 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         )
         self.assertEqual(model["max_concurrent"], 1)
         self.assertEqual(model["context_window"], job["context_window"])
+
+    def test_paid_code_baseline_differs_only_by_control_actuation_and_result_root(self):
+        root = Path(__file__).parents[1] / "workbuddy/overlay/configs/jobs"
+        baseline = yaml.safe_load(
+            (root / "metacodes-glm52-code-3-baseline.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        treatment = yaml.safe_load(
+            (root / "metacodes-glm52-code-3-canary.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        baseline_root = baseline.pop("jobs_dir")
+        treatment_root = treatment.pop("jobs_dir")
+        self.assertNotEqual(baseline_root, treatment_root)
+        baseline_mode = baseline["harness_params_override"].pop(
+            "METACODES_PROJECT_CONTROL_MODE"
+        )
+        treatment_mode = treatment["harness_params_override"].pop(
+            "METACODES_PROJECT_CONTROL_MODE"
+        )
+        self.assertEqual("disabled", baseline_mode)
+        self.assertEqual("enforced", treatment_mode)
+        self.assertEqual(treatment, baseline)
+
+    def test_adapter_runtime_contract_reobserves_disabled_active_bundle_absence(self):
+        source = (
+            Path(__file__).parents[1]
+            / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('test -d "$project_source" || exit 78', source)
+        self.assertIn('test -x "$project_kernel" || exit 83', source)
+        self.assertIn(
+            '/project-rules/active.json" || exit 88',
+            source,
+        )
+        self.assertIn("project_setup += disabled_bundle_check", source)
+        self.assertIn("project_postcheck = disabled_bundle_check", source)
+        self.assertIn(
+            "unset METACODES_PROJECT_KERNEL_PATH METACODES_PROJECT_KERNEL_SHA256",
+            source,
+        )
+        self.assertIn('"artifacts_verified": True', source)
+        self.assertIn('"runtime_active_bundle_absent": (', source)
 
     def test_paid_code_probe_is_frozen_to_first_code_dev_task(self):
         root = Path(__file__).parents[1] / "workbuddy"
@@ -1133,6 +1179,7 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         self.assertEqual(
             job["harness_params_override"],
             {
+                "METACODES_PROJECT_CONTROL_MODE": "enforced",
                 "METACODES_PROJECT_RULES_RELATIVE": (
                     "share/metacodes/workbuddy-w05/project-rules"
                 ),

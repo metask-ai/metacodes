@@ -1,9 +1,9 @@
-model: metacodes-w05-mock
+model: metacodes-glm52
 harness: metacodes/0.1.0
-dataset: datasets/metacodes-w05-synthetic/tasks
+dataset: datasets/wb-bench-code-v1.0/tasks
 harness_backend: local
 model_connection: local_proxy
-jobs_dir: results/metacodes-w05-real-control
+jobs_dir: results/metacodes-glm52-code-3-baseline
 n_attempts: 1
 record_full_io: true
 agent_user: dev
@@ -11,12 +11,15 @@ verifier_user: dev
 extra_allowed_hosts:
   - host.docker.internal
 harness_params_override:
-  METACODES_PROJECT_CONTROL_MODE: enforced
+  METACODES_PROJECT_CONTROL_MODE: disabled
   METACODES_PROJECT_RULES_RELATIVE: share/metacodes/workbuddy-w05/project-rules
   METACODES_PROJECT_KERNEL_RELATIVE: libexec/metacodes-project-kernel
 task_selection:
   mode: name
-  names: [metacodes-w05-control]
+  names:
+    - bug_fix-easy-invalid_filterwarnings_regex_error
+    - data_quality-hard-label_conflicts
+    - data_quality-hard-schema_drift
 orchestrator_override:
   n_concurrent_trials: 1
 context_window: 200000
