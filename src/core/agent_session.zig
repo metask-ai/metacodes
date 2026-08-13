@@ -1567,6 +1567,14 @@ pub const AgentSession = struct {
         }
     }
 
+    /// Deliver a facade-owned lifecycle edge through the same callback mutex
+    /// as ordinary CoreEvent delivery. Synchronous Host UI requests use this
+    /// path so RunState ordering remains serialized with concurrent tool
+    /// progress events.
+    pub fn emitLifecycleEvent(self: *AgentSession, event: CoreEvent) void {
+        backendEmit(@ptrCast(self), self.session_id, event);
+    }
+
     /// Record a callback-channel failure from a facade-side observation that
     /// is not itself delivered through the Core EventSink.
     pub fn noteCallbackFailure(self: *AgentSession) void {

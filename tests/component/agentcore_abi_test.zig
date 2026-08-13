@@ -242,6 +242,7 @@ const Probe = struct {
     run_state_sequence_valid: bool = true,
     run_state_saw_starting: bool = false,
     run_state_saw_executing_tools: bool = false,
+    run_state_saw_waiting_ui: bool = false,
     run_state_saw_completed: bool = false,
     run_state_terminal_empty: bool = false,
     run_state_invariant_valid: bool = true,
@@ -280,6 +281,7 @@ const Probe = struct {
                     switch (state.phase) {
                         .starting => self.run_state_saw_starting = true,
                         .executing_tools => self.run_state_saw_executing_tools = true,
+                        .waiting_ui => self.run_state_saw_waiting_ui = true,
                         .completed => {
                             self.run_state_saw_completed = true;
                             self.run_state_terminal_empty = state.in_flight_tools.len == 0;
@@ -4472,6 +4474,7 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
     try std.testing.expectEqual(@as(usize, 1), probe.host_calls);
     try std.testing.expectEqual(@as(usize, 1), probe.host_releases);
     try std.testing.expect(probe.saw_tool_start and probe.saw_tool_result and probe.saw_run_state);
+    try std.testing.expect(probe.run_state_saw_waiting_ui);
     const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
     try std.testing.expect(std.mem.indexOf(u8, body, "Yes") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "host-ok") != null);

@@ -264,6 +264,9 @@ pub const CoreEvent = union(enum) {
         tool_use_id: []const u8,
         request_json: []const u8,
     },
+    /// Internal synchronous-UI lifecycle edge. It is consumed by the
+    /// AgentCore RunState projector and remains hidden from the public ABI.
+    ui_request_resolved,
 
     // ── L4 诊断变体(可观测性)──────────────────────────────────────────────
     // agent_loop 在现有 log 点旁 emit;渲染 backend(TUI/Writer/JobEntry)一律 no-op,

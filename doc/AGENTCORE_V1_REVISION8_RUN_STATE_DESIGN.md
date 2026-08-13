@@ -100,13 +100,17 @@ RunState 不是每个 CoreEvent 的镜像。以下情况产生一个新的 `run_
 工具状态由 in-flight 集合决定：
 
 ```text
-in_flight_count > 0  => executing_tools
-in_flight_count == 0 => 正常路径才允许离开 executing_tools
+in_flight_count > 0  => executing_tools 或 waiting_ui
+phase == generating => in_flight_count == 0
 ```
+
+`waiting_ui` 是同步 Host UI 回调占用 active Run 时的观察阶段，因此它可以与尚未闭合的工具集合同时存在；只有 `generating` 要求工具集合为空。
 
 单个 `tool_result` 不能单独触发 `executing_tools -> generating`，因为同一批次可能仍有其他工具运行。`in_flight_tools` 表示公开层尚未闭合的工具尝试，不承诺每个 `tool_start` 都有配对 `tool_result`；HostTool FATAL 或其他终止路径可以使工具尝试无配对结果。
 
-终态迁移不受上述正常路径约束。进入终态时，RunState 关闭本次 run 的工具集合并在终态快照中呈现空的 `in_flight_tools`。
+终态迁移不受上述正常路径约束。进入终态时，RunState 关闭本次 run 的工具集合并在终态快照中呈现空的 `in_flight_tools`。`tool_start` 不保证一定有配对的 `tool_result`。
+
+投影层的 in-flight 集合有固定容量（当前实现为 64）。容量耗尽属于观察降级：本次 Run 停止继续发 RunState，但不修改 callback status、不 poison Session，也不影响 canonical CoreEvent、同步 RunResult 或工具执行。下一次 Run 会重新启用投影；因此 RunState 从始至终是 best-effort 观察副本。
 
 ### 6.3 UI 等待
 
@@ -116,8 +120,8 @@ R8 RunState 不公开 UI request ID。一个 Session 同时只有一个 active R
 
 ### 6.4 Retry 与 compact
 
-- `retrying` 在重试请求开始时进入；在下一次模型尝试开始（进入 `generating`）、重试失败或重试取消时离开；
-- `compacting` 在 auto-compact 实际开始前进入；在 compact 完成、失败或取消后离开；
+- `retrying` 在重试请求开始时进入；每一次新的模型尝试都发出内部 `stream_begin` 边界并进入 `generating`，重试失败或重试取消时离开；
+- `compacting` 在 auto-compact 实际开始前由内部 `diag_compact_begin` 进入，并由成对的 `diag_compact_end` 在完成、无变化、失败或取消后离开；provider 的 `diag_compact_request` 仅表示已有摘要请求，不承担 compact 生命周期语义；
 - `finalizing` 位于清理 run context 之前；
 - `session_compact` 没有 `run_id` 时，不生成 run_state。
 

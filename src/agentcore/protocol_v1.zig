@@ -88,6 +88,7 @@ pub fn event(value: InternalEvent) ?public.CoreEvent {
         .agent_lifecycle,
         .tasks_changed,
         .ui_request_pending,
+        .ui_request_resolved,
         => null,
     };
 }
