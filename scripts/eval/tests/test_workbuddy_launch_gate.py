@@ -2,6 +2,7 @@ import hashlib
 import http.server
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -528,11 +529,12 @@ trajectory = {
     "total_completion_tokens": 30,
     "total_cached_tokens": 80,
     "total_cost_usd": 0.01,
-    "extra": {"cache_creation_input_tokens": 10, "control_metrics": control_metrics}
+    "extra": {"cache_creation_input_tokens": 10, "control_metrics": control_metrics,
+              "metacodes_turns": 1}
   }
 }
 (agent / "trajectory.json").write_text(json.dumps(trajectory) + "\n")
-record = {"request": {"body": {"model": "volatile-route", "system": "stable", "messages": [{"role": "user", "content": "task"}]}}}
+record = {"seq": 1, "request": {"body": {"model": "volatile-route", "system": "stable", "messages": [{"role": "user", "content": "task"}]}}, "response": {"status": 200}, "error": None}
 (agent / "requests.jsonl").write_text(json.dumps(record) + "\n")
 '''
 
@@ -1895,6 +1897,106 @@ with urllib.request.urlopen(
                 manifest = self._official_usage_fixture(Path(directory), reward)
                 with self.assertRaisesRegex(LaunchError, "invalid verifier reward"):
                     _collect_usage(manifest, started_ns=0, official_runner=True)
+
+    def test_v3_usage_rejects_missing_or_out_of_order_provider_request_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self._official_usage_fixture(Path(directory), 1.0)
+            manifest["schema_version"] = SCHEMA_VERSION
+            workbuddy = Path(manifest["workbuddy"]["checkout"])
+            request_log = next(
+                workbuddy.rglob("agent/requests.jsonl")
+            )
+            trajectory_path = request_log.with_name("trajectory.json")
+            trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+            trajectory["final_metrics"]["extra"]["metacodes_turns"] = 2
+            trajectory_path.write_text(
+                json.dumps(trajectory) + "\n", encoding="utf-8"
+            )
+            row = json.loads(request_log.read_text(encoding="utf-8"))
+            row.update({"seq": 2, "response": {"status": 200}, "error": None})
+            request_log.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                LaunchError, "provider request audit is incomplete or out of order"
+            ):
+                _collect_usage(manifest, started_ns=0, official_runner=True)
+            trajectory["final_metrics"]["extra"]["metacodes_turns"] = 1
+            trajectory_path.write_text(
+                json.dumps(trajectory) + "\n", encoding="utf-8"
+            )
+            row.update({"seq": 1, "response": {"status": 499}})
+            request_log.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                LaunchError, "provider request audit is incomplete or out of order"
+            ):
+                _collect_usage(manifest, started_ns=0, official_runner=True)
+
+    def test_v3_usage_accepts_wave_global_sequences_across_tasks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self._official_usage_fixture(Path(directory), 1.0)
+            manifest["schema_version"] = SCHEMA_VERSION
+            workbuddy = Path(manifest["workbuddy"]["checkout"])
+            first_agent = next(workbuddy.rglob("agent/trajectory.json")).parent
+            first_trajectory = json.loads(
+                (first_agent / "trajectory.json").read_text(encoding="utf-8")
+            )
+            first_trajectory["final_metrics"]["extra"]["metacodes_turns"] = 1
+            (first_agent / "trajectory.json").write_text(
+                json.dumps(first_trajectory) + "\n", encoding="utf-8"
+            )
+            first_request = json.loads(
+                (first_agent / "requests.jsonl").read_text(encoding="utf-8")
+            )
+            first_request.update(
+                {"seq": 1, "response": {"status": 200}, "error": None}
+            )
+            (first_agent / "requests.jsonl").write_text(
+                json.dumps(first_request) + "\n", encoding="utf-8"
+            )
+
+            first_trial = first_agent.parent
+            second_task = "code-task-b"
+            second_trial = first_trial.parent / (second_task + "__2")
+            shutil.copytree(first_trial, second_trial)
+            second_agent = second_trial / "agent"
+            second_request = dict(first_request)
+            second_request["seq"] = 2
+            (second_agent / "requests.jsonl").write_text(
+                json.dumps(second_request) + "\n", encoding="utf-8"
+            )
+            result_path = second_trial / "result.json"
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result["task_name"] = f"workbuddy/{second_task}"
+            result["task_id"]["path"] = result["task_id"]["path"].replace(
+                "code-task-a", second_task
+            )
+            result["trial_uri"] = second_trial.resolve().as_uri()
+            result_path.write_text(
+                json.dumps(result, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            manifest["cohort"]["selected_tasks"].append(second_task)
+            run_manifest = (
+                workbuddy
+                / "scripts/logs/instances"
+                / manifest["run_id"]
+                / "manifest.json"
+            )
+            resolved = json.loads(run_manifest.read_text(encoding="utf-8"))
+            resolved["selected_tasks"].append(second_task)
+            run_manifest.write_text(
+                json.dumps(resolved, sort_keys=True) + "\n", encoding="utf-8"
+            )
+
+            usage = _collect_usage(manifest, started_ns=0, official_runner=True)
+            self.assertEqual(2, usage["provider_requests"])
+            self.assertEqual({"code-task-a", second_task}, set(usage["tasks"]))
+            second_request["seq"] = 3
+            (second_agent / "requests.jsonl").write_text(
+                json.dumps(second_request) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                LaunchError, "provider request audit has a missing or duplicate wave sequence"
+            ):
+                _collect_usage(manifest, started_ns=0, official_runner=True)
 
     def test_resolved_prepared_and_trial_project_control_are_bound(self):
         """Bind job YAML through resolver, prepare_job and the trial runtime."""

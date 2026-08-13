@@ -1,6 +1,5 @@
 import json
 import hashlib
-import importlib.util
 import io
 import os
 import subprocess
@@ -1204,6 +1203,29 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
                     overlay_installer._PROXY_IMPORT_ANCHOR
                     + overlay_installer._PROXY_KEY_OLD
                 ),
+                overlay_installer._PROXY_LOGGER_PATH: (
+                    overlay_installer._PROXY_LOGGER_INIT_OLD
+                    + overlay_installer._PROXY_LOGGER_REQUEST_OLD
+                    + overlay_installer._PROXY_LOGGER_DISCARD_OLD
+                    + overlay_installer._PROXY_LOGGER_SEQ_OLD
+                    + overlay_installer._PROXY_LOGGER_RECORD_SEQ_OLD
+                ),
+                overlay_installer._PROXY_PIPELINE_PATH: (
+                    overlay_installer._PROXY_PIPELINE_A2O_SIGNATURE_OLD
+                    + overlay_installer._PROXY_PIPELINE_PASSTHROUGH_SIGNATURE_OLD
+                    + overlay_installer._PROXY_PIPELINE_A2O_SENDER_OLD
+                    + overlay_installer._PROXY_PIPELINE_PASSTHROUGH_SENDER_OLD
+                    + overlay_installer._PROXY_PIPELINE_SUBSTREAM_CALLS_OLD
+                    + overlay_installer._PROXY_PIPELINE_A2O_START_OLD
+                    + overlay_installer._PROXY_PIPELINE_A2O_EVENTS_OLD
+                    + overlay_installer._PROXY_PIPELINE_A2O_FINISH_OLD
+                    + overlay_installer._PROXY_PIPELINE_PASSTHROUGH_OLD
+                    + overlay_installer._PROXY_PIPELINE_REWRITE_OLD
+                    + overlay_installer._PROXY_PIPELINE_REWRITE_TAIL_OLD
+                    + overlay_installer._PROXY_PIPELINE_STREAM_STATE_OLD
+                    + overlay_installer._PROXY_PIPELINE_STREAM_LOOP_OLD
+                    + overlay_installer._PROXY_PIPELINE_FINALLY_OLD
+                ),
             }
             for relative, content in fixtures.items():
                 path = repo / relative
@@ -1231,6 +1253,12 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
             self.assertIn(overlay_installer._MODEL_ROUTE_NEW, resolver)
             self.assertIn(overlay_installer._PREPARE_MOUNT_NEW, prepare)
             self.assertIn(overlay_installer._PREPARE_AGENT_IDENTITY_NEW, prepare)
+            proxy_logger = patched[overlay_installer._PROXY_LOGGER_PATH].decode("utf-8")
+            proxy_pipeline = patched[overlay_installer._PROXY_PIPELINE_PATH].decode("utf-8")
+            self.assertIn(overlay_installer._PROXY_LOGGER_REQUEST_NEW, proxy_logger)
+            self.assertIn(overlay_installer._PROXY_LOGGER_DISCARD_NEW, proxy_logger)
+            self.assertIn(overlay_installer._PROXY_PIPELINE_FINALLY_NEW, proxy_pipeline)
+            self.assertIn(overlay_installer._PROXY_PIPELINE_PASSTHROUGH_NEW, proxy_pipeline)
             self.assertIn('"actor_model_identity": backend_model_name', resolver)
             self.assertIn(
                 '"transport_model_is_route": connection_mode == "local_proxy"',
@@ -1266,13 +1294,11 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         source = checkout / "src/workbuddy_bench/runner/prepare_job.py"
         if not source.is_file():
             self.skipTest("WorkBuddy prepare_job is unavailable")
-        spec = importlib.util.spec_from_file_location("metacodes_prepare_job_l2", source)
-        if spec is None or spec.loader is None:
-            self.skipTest("cannot load WorkBuddy prepare_job")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
         route = "paired-control-run--metacodes-glm52"
-        row = module._build_agent_block(
+        program = r'''
+import json
+from workbuddy_bench.runner.prepare_job import _build_agent_block
+row = _build_agent_block(
             harness={
                 "name": "metacodes",
                 "import_path": "workbuddy_bench.agents.metacodes_agent:MetacodesAgent",
@@ -1287,17 +1313,164 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
                     "proxy_url": "http://host.docker.internal:1234",
                 },
                 "model_connection": "local_proxy",
-                "model_route": route,
+                "model_route": "paired-control-run--metacodes-glm52",
                 "backend_model_name": "glm-5.2",
                 "instance_id": "paired-control-run",
             },
         )
+print(json.dumps(row))
+'''
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(checkout / "src")
+        completed = subprocess.run(
+            [str(checkout / ".venv/bin/python"), "-c", program],
+            cwd=checkout,
+            env=env,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        row = json.loads(completed.stdout)
         self.assertEqual(row["model_name"], route)
         self.assertEqual(
             row["kwargs"]["connection"]["model_route"], route
         )
         self.assertEqual(
             row["kwargs"]["METACODES_MODEL_DISPLAY_NAME"], "glm-5.2"
+        )
+
+    def test_installed_proxy_persists_terminal_stream_when_client_closes(self):
+        checkout_raw = os.environ.get("METACODES_WORKBUDDY_CHECKOUT")
+        if not checkout_raw:
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        checkout = Path(checkout_raw).resolve()
+        if not checkout.is_dir():
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        overlay_installer.validate_installed_overlay(checkout)
+        program = r'''
+import asyncio, json, tempfile
+from pathlib import Path
+from workbuddy_bench.proxy.config import BackendConfig, ProxyConfig, ProxyMode, RouteConfig
+from workbuddy_bench.proxy.interceptors import RequestContext
+from workbuddy_bench.proxy.pipeline import Pipeline
+
+TERMINAL = (
+    b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1}}}\n\n'
+    b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n'
+    b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+)
+
+class Sender:
+    async def send_stream_raw(self, *args, **kwargs):
+        yield TERMINAL
+
+async def main():
+    with tempfile.TemporaryDirectory() as directory:
+        config = ProxyConfig(log_dir=directory, log_enabled=True)
+        route = RouteConfig(
+            slug="route", mode=ProxyMode.PASSTHROUGH,
+            backend=BackendConfig(url="http://provider.invalid/v1/messages"),
+            backend_model="glm-5.2", client_protocol="anthropic",
+            backend_protocol="anthropic", interceptors=["log"], instance_id="run-l2",
+        )
+        config.routes[route.slug] = route
+        pipeline = Pipeline(config)
+        pipeline.sender = Sender()
+        body = {
+            "model": "route", "system": "stable",
+            "messages": [{"role": "user", "content": "task"}], "stream": True,
+        }
+        context = RequestContext(
+            path="/v1/messages", raw_body=json.dumps(body).encode(),
+            parsed_body=dict(body), route=route,
+        )
+        stream = pipeline.handle_stream(context)
+        assert await anext(stream) == TERMINAL
+        await stream.aclose()
+        rows = [
+            json.loads(line)
+            for line in (Path(directory) / "run-l2.jsonl").read_text().splitlines()
+        ]
+        assert len(rows) == 1
+        assert rows[0]["seq"] == 1
+        assert rows[0]["response"]["status"] == 200
+        assert rows[0]["response"]["stop_reason"] == "end_turn"
+
+asyncio.run(main())
+'''
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(checkout / "src")
+        subprocess.run(
+            [str(checkout / ".venv/bin/python"), "-c", program],
+            cwd=checkout,
+            env=env,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def test_installed_a2o_disconnect_before_sender_is_not_provider_attempt(self):
+        checkout_raw = os.environ.get("METACODES_WORKBUDDY_CHECKOUT")
+        if not checkout_raw:
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        checkout = Path(checkout_raw).resolve()
+        if not checkout.is_dir():
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        overlay_installer.validate_installed_overlay(checkout)
+        program = r'''
+import asyncio, json, tempfile
+from pathlib import Path
+from workbuddy_bench.proxy.config import BackendConfig, ProxyConfig, ProxyMode, RouteConfig
+from workbuddy_bench.proxy.interceptors import RequestContext
+from workbuddy_bench.proxy.pipeline import Pipeline
+
+class Sender:
+    calls = 0
+    async def send_stream(self, *args, **kwargs):
+        self.calls += 1
+        raise AssertionError("provider sender must not start")
+        yield
+
+async def main():
+    with tempfile.TemporaryDirectory() as directory:
+        config = ProxyConfig(log_dir=directory, log_enabled=True)
+        route = RouteConfig(
+            slug="route", mode=ProxyMode.A2O,
+            backend=BackendConfig(url="http://provider.invalid/v1"),
+            backend_model="glm-5.2", client_protocol="anthropic",
+            backend_protocol="openai", interceptors=["log"], instance_id="run-l2",
+        )
+        config.routes[route.slug] = route
+        pipeline = Pipeline(config)
+        pipeline.sender = Sender()
+        body = {
+            "model": "route", "system": "stable",
+            "messages": [{"role": "user", "content": "task"}], "stream": True,
+        }
+        context = RequestContext(
+            path="/v1/messages", raw_body=json.dumps(body).encode(),
+            parsed_body=dict(body), route=route,
+        )
+        stream = pipeline.handle_stream(context)
+        first = await anext(stream)
+        assert b"message_start" in first
+        await stream.aclose()
+        assert pipeline.sender.calls == 0
+        log_path = Path(directory) / "run-l2.jsonl"
+        assert not log_path.exists() or not log_path.read_text().strip()
+
+asyncio.run(main())
+'''
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(checkout / "src")
+        subprocess.run(
+            [str(checkout / ".venv/bin/python"), "-c", program],
+            cwd=checkout,
+            env=env,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
 
     def test_digest_detects_changes_before_owned_overlay_replacement(self):

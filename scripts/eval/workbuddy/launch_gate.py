@@ -1839,6 +1839,7 @@ def _collect_usage(
     total_cache_read = 0
     total_cache_create = 0
     total_requests = 0
+    request_sequences: list[int] = []
     total_reward = 0.0
     full_passes = 0
     expected_model_route = ""
@@ -1905,10 +1906,42 @@ def _collect_usage(
         if not request_lines:
             raise LaunchError(f"trajectory has no provider request audit: {trajectory_path}")
         try:
-            first_record = json.loads(request_lines[0].decode("utf-8"))
+            request_records = [
+                json.loads(line.decode("utf-8")) for line in request_lines
+            ]
+            if manifest.get("schema_version") == SCHEMA_VERSION:
+                request_records.sort(key=lambda row: row["seq"])
+            first_record = request_records[0]
             first_body = dict(first_record["request"]["body"])
         except (UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise LaunchError(f"invalid first request audit for {trajectory_path}: {exc}") from exc
+        if manifest.get("schema_version") == SCHEMA_VERSION:
+            sequences = [record.get("seq") for record in request_records]
+            metacodes_turns = extra.get("metacodes_turns")
+            response_states = [
+                (
+                    (record.get("response") or {}).get("status"),
+                    record.get("error"),
+                )
+                for record in request_records
+            ]
+            if (
+                any(
+                    not isinstance(sequence, int) or isinstance(sequence, bool)
+                    for sequence in sequences
+                )
+                or sequences != sorted(sequences)
+                or len(set(sequences)) != len(sequences)
+                or not isinstance(metacodes_turns, int)
+                or isinstance(metacodes_turns, bool)
+                or metacodes_turns <= 0
+                or len(request_records) != metacodes_turns
+                or any(status != 200 or error is not None for status, error in response_states)
+            ):
+                raise LaunchError(
+                    f"provider request audit is incomplete or out of order: {trajectory_path}"
+                )
+            request_sequences.extend(sequences)
         prefix_hash = _cacheable_first_request_sha256(first_body)
         cache_read = final.get("total_cached_tokens", 0)
         cache_create = extra.get("cache_creation_input_tokens", 0)
@@ -1930,11 +1963,11 @@ def _collect_usage(
         total_tokens += metered_tokens
         total_cache_read += cache_read
         total_cache_create += cache_create
-        total_requests += len(request_lines)
+        total_requests += len(request_records)
         rows[task] = {
             "trajectory_sha256": _identity(trajectory_path)["sha256"],
             "requests_sha256": _identity(request_log)["sha256"],
-            "provider_requests": len(request_lines),
+            "provider_requests": len(request_records),
             "cacheable_first_request_sha256": prefix_hash,
             "prompt_tokens": prompt,
             "completion_tokens": completion,
@@ -1976,6 +2009,10 @@ def _collect_usage(
             )
     if set(rows) != set(selected):
         raise LaunchError("WorkBuddy result set differs from frozen task selection")
+    if manifest.get("schema_version") == SCHEMA_VERSION and sorted(request_sequences) != list(
+        range(1, total_requests + 1)
+    ):
+        raise LaunchError("provider request audit has a missing or duplicate wave sequence")
     result = {
         "tasks": rows,
         "provider_requests": total_requests,
