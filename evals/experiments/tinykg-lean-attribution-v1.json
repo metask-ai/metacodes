@@ -1,0 +1,302 @@
+{
+  "schema_version": 1,
+  "protocol_id": "metacodes-tinykg-lean-attribution-v1",
+  "claim_boundary": "Project-internal mechanism attribution precedes WorkBuddy external validation; smoke and wiring rows never count as quality evidence.",
+  "model": {
+    "provider": "anthropic-compatible",
+    "id": "glm-5.2",
+    "temperature_policy": "provider-default-frozen-within-wave"
+  },
+  "factors": {
+    "tinykg": {
+      "off": "fresh isolated local store with memory tools disabled",
+      "on": "fresh isolated local TinyKG seeded only from the arm-authorized public history"
+    },
+    "lean": {
+      "off": "project rule bundle staged but inactive",
+      "on": "hash-pinned project rule bundle enforced by the compiled project kernel"
+    }
+  },
+  "factorial_cells": [
+    {
+      "id": "control",
+      "tinykg": false,
+      "lean": false
+    },
+    {
+      "id": "memory_only",
+      "tinykg": true,
+      "lean": false
+    },
+    {
+      "id": "lean_only",
+      "tinykg": false,
+      "lean": true
+    },
+    {
+      "id": "combined",
+      "tinykg": true,
+      "lean": true
+    }
+  ],
+  "stages": [
+    {
+      "id": "s0_zero_paid_wiring",
+      "predecessors": [],
+      "runners": [
+        "scripts/eval/memory_agent_runtime_smoke.py",
+        "scripts/eval/run_project_rule_evolution_mac_pilot.py",
+        "scripts/eval/project_harness_experiment.py"
+      ],
+      "network": "loopback-only",
+      "quality_evidence": false,
+      "purpose": "Prove native tool, isolated-store, project-kernel, receipt, and observer wiring before any external paid provider request."
+    },
+    {
+      "id": "s1_tinykg_main_effect",
+      "predecessors": [
+        "s0_zero_paid_wiring"
+      ],
+      "runner": "scripts/eval/memory_agent_runtime_pilot.py",
+      "network": "single-physical-provider-attempt",
+      "quality_evidence": true,
+      "arms": [
+        "no_memory",
+        "tinykg_lexical"
+      ],
+      "purpose": "Measure episodic recall, multi-hop evidence retrieval, procedural transfer, governance, context, time, and cost with Lean disabled."
+    },
+    {
+      "id": "s2_lean_main_effect",
+      "predecessors": [
+        "s0_zero_paid_wiring"
+      ],
+      "runner": "scripts/eval/project_harness_rule_impact_prospective.py",
+      "network": "single-physical-provider-attempt",
+      "quality_evidence": true,
+      "arms": [
+        "signal_only",
+        "evolved_shadow",
+        "evolved_enforced"
+      ],
+      "purpose": "Measure recurrence, formal intervention, false intervention, recovery, task success, checker overhead, time, and cost with memory disabled."
+    },
+    {
+      "id": "s3_factorial_interaction",
+      "predecessors": [
+        "s1_tinykg_main_effect",
+        "s2_lean_main_effect"
+      ],
+      "runner": "scripts/eval/tinykg_lean_factorial.py",
+      "network": "single-physical-provider-attempt",
+      "quality_evidence": true,
+      "arms": [
+        "control",
+        "memory_only",
+        "lean_only",
+        "combined"
+      ],
+      "purpose": "Estimate TinyKG and Lean main effects plus their interaction on long-horizon project tasks."
+    },
+    {
+      "id": "s4_workbuddy_external_validation",
+      "predecessors": [
+        "s3_factorial_interaction"
+      ],
+      "runner": "external:workbuddy-bench",
+      "network": "single-physical-provider-attempt",
+      "quality_evidence": true,
+      "purpose": "Validate only the frozen promoted harness on an external realistic benchmark; never tune on the sealed cohort."
+    }
+  ],
+  "datasets": {
+    "episodic": {
+      "pin": "evals/memory/pins/longmemeval-s-cleaned-500-pin.json",
+      "pin_sha256": "b7952445b7e4b3c0d8d2c02c1e1d2d3107a521197ba3e4ef7b161279647ffd94",
+      "stratify_by": "official-category"
+    },
+    "multihop": {
+      "pin": "evals/memory/pins/hotpotqa-dev-distractor-1000-pin.json",
+      "pin_sha256": "f01d25f72acaf94e0ea357fa2287f34ba943183bd8143eba327cae47108af363",
+      "stratify_by": "question-type"
+    },
+    "procedural_smoke": {
+      "pin": "evals/memory/pins/procedural-coding-intent-families-pin.json",
+      "pin_sha256": "232d03d4196ed65413833e54402cda8b1fe90402763458b2d9fe7b16037edc5b",
+      "quality_evidence": false,
+      "reason": "The checked fixture has only two intent families and is a wiring gate, not a comprehensive transfer benchmark."
+    },
+    "lean_rule_impact": {
+      "cases": "scripts/eval/project_harness_rule_impact_cases.py",
+      "cases_sha256": "117ed8760827094be806c86548d018810769c744551a8a64f77b0a4d4687ba43",
+      "calibration_cases": 4,
+      "heldout_cases": 8,
+      "claim_scope": "one existing-file correction family until additional correction families are frozen"
+    }
+  },
+  "split_policy": {
+    "algorithm": "sha256-protocol-dataset-stratum-case-v1",
+    "seed": "metacodes-tinykg-lean-attribution-v1",
+    "partitions": [
+      "calibration",
+      "development",
+      "internal_holdout"
+    ],
+    "rules": [
+      "freeze ids before reading hidden answers or validators",
+      "preserve benchmark strata in every scored partition",
+      "never promote scripted provider output to quality evidence",
+      "never use internal_holdout outcomes to modify the candidate later scored on that partition"
+    ]
+  },
+  "sample_ladder": [
+    {
+      "id": "calibration",
+      "minimum_memory_cases_per_arm": 12,
+      "minimum_lean_calibration_cases": 4,
+      "minimum_factorial_cases": 4,
+      "trials": 1,
+      "purpose": "actuation, attribution, variance, and failure-mode discovery"
+    },
+    {
+      "id": "development",
+      "minimum_memory_cases_per_arm": 48,
+      "minimum_lean_heldout_cases": 8,
+      "minimum_factorial_cases": 24,
+      "trials": 1,
+      "purpose": "optimize the harness only on the development partition"
+    },
+    {
+      "id": "internal_confirmatory",
+      "minimum_memory_cases_per_arm": 96,
+      "minimum_lean_heldout_cases": 8,
+      "minimum_factorial_cases": 48,
+      "trials": 3,
+      "purpose": "freeze and estimate effects on unseen internal tasks before WorkBuddy"
+    }
+  ],
+  "primary_contrasts": [
+    {
+      "id": "tinykg_main",
+      "before": "control",
+      "after": "memory_only"
+    },
+    {
+      "id": "lean_main",
+      "before": "control",
+      "after": "lean_only"
+    },
+    {
+      "id": "combined_total",
+      "before": "control",
+      "after": "combined"
+    },
+    {
+      "id": "factorial_interaction",
+      "formula": "combined - memory_only - lean_only + control"
+    }
+  ],
+  "metrics": {
+    "quality": [
+      "task_success",
+      "trustworthy_success",
+      "answer_exact_match",
+      "answer_f1",
+      "evidence_recall_at_k",
+      "procedural_transfer_gain"
+    ],
+    "governance": [
+      "error_recurrence",
+      "effective_intervention",
+      "false_intervention",
+      "recovery_success",
+      "provenance_coverage",
+      "stale_or_contradictory_rejection"
+    ],
+    "efficiency": [
+      "cost_usd",
+      "metered_tokens",
+      "provider_requests",
+      "wall_time_ms",
+      "model_time_ms",
+      "tool_time_ms",
+      "checker_time_ms",
+      "memory_exposed_tokens"
+    ],
+    "stability": [
+      "invalid_rollouts",
+      "provider_errors",
+      "tool_errors",
+      "loop_breaks",
+      "run_to_run_variance"
+    ]
+  },
+  "cache_contract": {
+    "stable_core_prefix_equal_all_cells": true,
+    "full_first_request_equal_when_only_lean_changes": true,
+    "full_first_request_equal_when_tinykg_changes": false,
+    "tinykg_increment_measured_separately": true,
+    "report": [
+      "cache_read_tokens",
+      "cache_creation_tokens",
+      "warm_request_hit_rate",
+      "compaction_count",
+      "context_projection_tokens"
+    ]
+  },
+  "statistics": {
+    "binary_primary": "paired-exact-mcnemar-with-wilson-intervals",
+    "continuous_primary": "paired-bootstrap-confidence-interval",
+    "factorial_interaction": "paired-within-case-difference-in-differences-with-randomization-interval",
+    "multiple_primary_contrasts": "holm-correction",
+    "calibration_claim": "directional-and-operational-only",
+    "confirmatory_claim": "requires-frozen-complete-schedule"
+  },
+  "promotion": {
+    "requires": [
+      "all rows valid and treatment actuation verified",
+      "no trustworthy-success regression in either main-effect contrast",
+      "zero unsafe Lean false interventions on the frozen safe set",
+      "zero remote TinyKG writes and zero offline-memory write leakage",
+      "combined arm no worse than control on trustworthy success",
+      "at least one preregistered quality or recurrence metric improves",
+      "cost, token, and wall-time deltas are reported rather than hidden",
+      "cache contract passes",
+      "candidate binary, ontology, rules, model, tools, and prompts are frozen before WorkBuddy"
+    ],
+    "forbids": [
+      "outcome-based early stopping inside a confirmatory schedule",
+      "automatic retry after request_authorized",
+      "using WorkBuddy sealed outcomes for tuning",
+      "claiming general TinyKG or Lean superiority from one correction family"
+    ]
+  },
+  "isolation": {
+    "tinykg": "fresh run-local direct binary store",
+    "remote_skill_harness_forbidden": true,
+    "raw_tasks_traces_journals_local_only": true,
+    "remote_tinykg_content": "roadmap and aggregate conclusions only"
+  },
+  "budget": {
+    "maximum_user_authority_usd": 2000.0,
+    "preflight_paid_rollouts_enabled": false,
+    "provider_retries": 0,
+    "single_runner": true,
+    "journal_required": true,
+    "prior_exposure_source": "live durable journal and receipts; never a mutable process variable"
+  },
+  "source_contract": {
+    "evals/memory/MEMORY_MATURATION_V1.md": "3621d69f26c6e791033a6ba87887942bb620e92ad6103d5b6f2b6c23d7fff582",
+    "scripts/eval/memory_agent_runtime_smoke.py": "b4a3b304de5da8fd52db3eeba654b0a404c2b890a56348806c7b348155ac2be6",
+    "scripts/eval/memory_agent_runtime_pilot.py": "2d549838b762d335040f1c03f43351c7ef32a305f413d57aed0a364475eb7291",
+    "scripts/eval/project_harness_experiment.py": "38c7acfd7a4142e7f2f81ecdf9058658d2f11f262c964def3f20978340d3d0ad",
+    "scripts/eval/project_harness_rule_impact_prospective.py": "ce160017a91696e56ed46af663d546f63a9c93401919857bee8c5afffd594094",
+    "scripts/eval/run_project_rule_evolution_mac_pilot.py": "d85cc8457d90e8b10989047bac3bcb83b3ed3219da2334cb2a04948703e6be07",
+    "scripts/project_harness_eval_driver.zig": "067fc4277aef64433ddb3dc69225f66627fdf7cb20a892cd5a143e202d133f63"
+  },
+  "known_gaps": [
+    "scripts/eval/tinykg_lean_factorial.py must be implemented before s3",
+    "procedural transfer needs more than the two-family smoke fixture before a comprehensive claim",
+    "Lean generality needs correction families beyond existing-file source-CAS before a cross-rule claim"
+  ]
+}

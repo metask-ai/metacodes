@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts.eval.project_harness_experiment import (
     ARMS,
@@ -104,7 +105,7 @@ class ProjectHarnessExperimentTest(unittest.TestCase):
                 + os.fsencode(str(run))
             ).hexdigest()
             result = {
-                "schema_version": "metacodes-project-harness-zero-paid-rollout-v1",
+                "schema_version": "metacodes-project-harness-zero-paid-rollout-v2",
                 "quality_evidence": False,
                 "provider_requests": 0,
                 "paid_cost_usd": 0,
@@ -114,6 +115,7 @@ class ProjectHarnessExperimentTest(unittest.TestCase):
                 "project_sha256": project_sha,
                 "candidate_sha256": None,
                 "rule_spec_sha256": None,
+                "bundle_sha256": None,
                 "kernel_sha256": "b" * 64,
                 "session_id": "0123456789abcdef01234567",
                 "run_id": "fedcba9876543210fedcba98",
@@ -168,6 +170,51 @@ class ProjectHarnessExperimentTest(unittest.TestCase):
             self.assertEqual(0, report["arms"]["evolved_enforced"]["prohibited_dispatches"])
             self.assertEqual(0, report["arms"]["evolved_enforced"]["false_interventions"])
             self.assertEqual(1, report["arms"]["evolved_enforced"]["recovery_successes"])
+
+    def test_calibration_executes_manifest_frozen_absolute_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            repo = base / "repo"
+            repo.mkdir()
+            driver = repo / "driver"
+            kernel = repo / "kernel"
+            driver.write_bytes(b"driver")
+            kernel.write_bytes(b"kernel")
+            driver.chmod(0o700)
+            kernel.chmod(0o700)
+            root = base / "experiment"
+            completed = mock.Mock(returncode=0, stdout=b"", stderr=b"")
+            report = {
+                "schema_version": "metacodes-project-harness-calibration-report-v1",
+                "mechanism_calibration_passed": True,
+                "quality_evidence": False,
+            }
+            old_cwd = Path.cwd()
+            os.chdir(repo)
+            try:
+                with mock.patch(
+                    "scripts.eval.project_harness_experiment._git_identity",
+                    return_value={"commit": "a" * 40, "dirty": False},
+                ), mock.patch(
+                    "scripts.eval.project_harness_experiment.subprocess.run",
+                    completed,
+                ), mock.patch(
+                    "scripts.eval.project_harness_experiment.build_report",
+                    return_value=report,
+                ):
+                    observed = run_calibration(
+                        Path("."),
+                        root,
+                        Path("driver"),
+                        Path("kernel"),
+                    )
+            finally:
+                os.chdir(old_cwd)
+            self.assertEqual(report, observed)
+            self.assertEqual(len(ARMS) * len(CASES), completed.call_count)
+            first_command = completed.call_args_list[0].args[0]
+            self.assertEqual(str(driver.resolve()), first_command[0])
+            self.assertEqual(str(kernel.resolve()), first_command[8])
 
 
 if __name__ == "__main__":

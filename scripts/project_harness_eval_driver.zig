@@ -37,7 +37,7 @@ const ToolOutcome = struct {
 };
 
 const Result = struct {
-    schema_version: []const u8 = "metacodes-project-harness-zero-paid-rollout-v1",
+    schema_version: []const u8 = "metacodes-project-harness-zero-paid-rollout-v2",
     quality_evidence: bool = false,
     provider_requests: u64 = 0,
     paid_cost_usd: f64 = 0,
@@ -47,6 +47,7 @@ const Result = struct {
     project_sha256: []const u8,
     candidate_sha256: ?[]const u8,
     rule_spec_sha256: ?[]const u8,
+    bundle_sha256: ?[]const u8,
     kernel_sha256: []const u8,
     session_id: []const u8,
     run_id: []const u8,
@@ -178,12 +179,14 @@ pub fn main(init: std.process.Init) !void {
 
     var candidate_sha: ?[64]u8 = null;
     var spec_sha: ?[64]u8 = null;
+    var bundle_sha: ?[64]u8 = null;
     if (active) |*value| {
         candidate_sha = parseHex(value.rules[0].candidate_id) orelse
             return error.InvalidCandidateIdentity;
         const spec = try cc.project_rule_spec.fromWire(value.rules[0].rule_spec);
         const canonical = try cc.project_rule_spec.renderCanonical(allocator, spec);
         spec_sha = cc.tools.tool_observation.sha256Hex(canonical);
+        bundle_sha = value.bundle_sha256;
     }
     const project = cc.project_rule_bundle.projectIdentity(options.root);
     const journal_path = try std.fmt.allocPrint(
@@ -201,6 +204,7 @@ pub fn main(init: std.process.Init) !void {
         .project_sha256 = project[0..],
         .candidate_sha256 = if (candidate_sha) |*value| value[0..] else null,
         .rule_spec_sha256 = if (spec_sha) |*value| value[0..] else null,
+        .bundle_sha256 = if (bundle_sha) |*value| value[0..] else null,
         .kernel_sha256 = options.kernel_sha256[0..],
         .session_id = binding.session_id.asSlice(),
         .run_id = binding.run_id.asSlice(),
