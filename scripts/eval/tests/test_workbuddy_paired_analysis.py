@@ -84,6 +84,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                 "config": {"sha256": digest("model-config")},
                 "provider_identity": "provider",
                 "fingerprint": digest("model"),
+                "backend_model_name": "glm-5.2",
             },
             "harness_fingerprint": digest(f"harness-{arm}"),
             "host_control_plane": {

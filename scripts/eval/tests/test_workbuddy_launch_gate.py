@@ -25,6 +25,7 @@ from scripts.eval.workbuddy.launch_gate import (
     AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION_V1,
     LaunchError,
     PROVIDER_KEY_ENV,
+    PAIRED_SCHEMA_VERSION,
     SCHEMA_VERSION,
     HOST_CONTROL_PLANE_MODULES,
     _artifact_contract,
@@ -40,6 +41,8 @@ from scripts.eval.workbuddy.launch_gate import (
     _reobserve_launch_inputs,
     _runtime_contract,
     _validate_trial_project_control,
+    _validate_launch_manifest,
+    build_launch_manifest,
     execute_launch,
     recover_authorized_failure_receipt,
     validate_authorized_failure_receipt,
@@ -253,6 +256,7 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
                 "config": {"sha256": digest("model-config")},
                 "provider_identity": "workbuddy-l2-mock-provider",
                 "fingerprint": digest("model"),
+                "backend_model_name": "glm-5.2",
             },
             "harness_fingerprint": digest("harness"),
             "host_control_plane": {
@@ -332,6 +336,163 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
         path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
         os.chmod(path, 0o600)
         return path
+
+    def test_manifest_builder_persists_actor_model_identity_for_runtime_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            workbuddy = root / "workbuddy"
+            job_path = workbuddy / "configs/jobs/identity-l2.yaml"
+            model_path = workbuddy / "configs/models/model-l2.yaml"
+            split_manifest = (
+                workbuddy
+                / "configs/harnesses/metacodes/docker/artifacts/share/metacodes/artifact-manifest.json"
+            )
+            preflight = root / "preflight.json"
+            cohort_manifest = root / "cohorts.json"
+            for path in (job_path, model_path, split_manifest, preflight, cohort_manifest):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fixture\n", encoding="utf-8")
+            job_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "model": "model-l2",
+                        "harness": "metacodes/0.1.0",
+                        "dataset": "datasets/wb-bench-code-v1.0/tasks",
+                        "model_connection": "local_proxy",
+                        "record_full_io": True,
+                        "n_attempts": 1,
+                        "task_selection": {"mode": "name", "names": ["task-a"]},
+                        "orchestrator_override": {"n_concurrent_trials": 1},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            model_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "model": {
+                            "name": "glm-5.2",
+                            "backend_url_env": "TEST_WORKBUDDY_BASE_URL",
+                            "backend_key_env": PROVIDER_KEY_ENV,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cohort = {
+                "subset": "code",
+                "cohort": "dev",
+                "dataset": "datasets/wb-bench-code-v1.0/tasks",
+                "take": 1,
+                "selected_tasks": ["task-a"],
+                "selected_tasks_sha256": digest("task-a"),
+                "manifest": {"path": str(cohort_manifest), "bytes": 8, "sha256": digest("cohort")},
+                "content_sha256": digest("cohort-content"),
+            }
+            artifact = {
+                "manifest": {"path": str(split_manifest), "bytes": 8, "sha256": digest("artifact")},
+                "executables": {},
+                "target_platform": "linux/amd64",
+            }
+            preflight_row = {
+                "content_sha256": digest("preflight-content"),
+                "target_platform": "linux/amd64",
+            }
+            file_identity = lambda path: {
+                "path": str(Path(path).resolve()),
+                "bytes": Path(path).stat().st_size,
+                "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+            }
+            runner_tools = {
+                "bash": {"path": "/fixture/bash", "bytes": 1, "sha256": digest("bash"), "version_first_line": "bash", "version_sha256": digest("bash-version")},
+                "uv": {"path": "/fixture/uv", "bytes": 1, "sha256": digest("uv"), "version_first_line": "uv", "version_sha256": digest("uv-version")},
+            }
+            host = {
+                name: {"path": f"/fixture/{name}.py", "bytes": 1, "sha256": digest(name)}
+                for name in HOST_CONTROL_PLANE_MODULES
+            }
+            overlay = {
+                "overlay_sha256": digest("overlay-content"),
+                "quality_evidence": False,
+            }
+            overlay_path = workbuddy / "configs/harnesses/metacodes/OVERLAY.json"
+            overlay_path.parent.mkdir(parents=True, exist_ok=True)
+            overlay_path.write_text("{}\n", encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {"TEST_WORKBUDDY_BASE_URL": "https://provider.invalid/v1/messages"},
+            ), mock.patch(
+                "scripts.eval.workbuddy.launch_gate._git",
+                side_effect=[WORKBUDDY_PINNED_COMMIT, "https://github.com/Tencent/workbuddy-bench"],
+            ), mock.patch(
+                "scripts.eval.workbuddy.launch_gate.validate_installed_overlay",
+                return_value=overlay,
+            ), mock.patch(
+                "scripts.eval.workbuddy.launch_gate._cohort", return_value=cohort
+            ), mock.patch(
+                "scripts.eval.workbuddy.launch_gate._artifact_contract",
+                return_value=artifact,
+            ), mock.patch(
+                "scripts.eval.workbuddy.launch_gate.validate_environment_preflight",
+                return_value=preflight_row,
+            ), mock.patch(
+                "scripts.eval.workbuddy.launch_gate._runner_tool",
+                side_effect=[runner_tools["bash"], runner_tools["uv"]],
+            ), mock.patch(
+                "scripts.eval.workbuddy.launch_gate._host_control_plane", return_value=host
+            ), mock.patch(
+                "scripts.eval.workbuddy.launch_gate._identity",
+                side_effect=file_identity,
+            ):
+                manifest = build_launch_manifest(
+                    run_id="workbuddy-actor-identity-l2",
+                    workbuddy_checkout=workbuddy,
+                    cohort_manifest=cohort_manifest,
+                    subset="code",
+                    cohort="dev",
+                    take=1,
+                    split_mount_manifest=split_manifest,
+                    environment_preflight_receipt=preflight,
+                    job_config=job_path,
+                    model_config=model_path,
+                    runner_bash=Path("/fixture/bash"),
+                    runner_uv=Path("/fixture/uv"),
+                    provider_identity="provider-l2",
+                    total_cost_microusd=1_000_000,
+                    total_metered_tokens=100_000,
+                    max_cost_microusd=500_000,
+                    max_metered_tokens=50_000,
+                )
+            self.assertEqual("glm-5.2", manifest["model"]["backend_model_name"])
+            self.assertEqual(
+                "glm-5.2",
+                _validate_launch_manifest(dict(manifest))["model"]["backend_model_name"],
+            )
+
+            missing = dict(manifest)
+            missing["model"] = dict(manifest["model"])
+            missing["model"].pop("backend_model_name")
+            missing["content_sha256"] = hashlib.sha256(
+                stable_json({key: value for key, value in missing.items() if key != "content_sha256"}).encode("utf-8")
+            ).hexdigest()
+            with self.assertRaisesRegex(LaunchError, "actor model identity is incomplete"):
+                _validate_launch_manifest(missing)
+
+            previous = dict(missing)
+            previous["schema_version"] = PAIRED_SCHEMA_VERSION
+            previous["content_sha256"] = hashlib.sha256(
+                stable_json(
+                    {
+                        key: value
+                        for key, value in previous.items()
+                        if key != "content_sha256"
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            self.assertNotIn(
+                "backend_model_name",
+                _validate_launch_manifest(previous)["model"],
+            )
 
     @staticmethod
     def _runner_code() -> str:

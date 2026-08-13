@@ -22,6 +22,7 @@ from ..memory_budget_journal import (
 )
 from .launch_gate import (
     COMPARISON_SCHEMA_VERSION,
+    PAIRED_SCHEMA_VERSION,
     RECEIPT_SCHEMA_VERSION,
     SCHEMA_VERSION,
     LaunchError,
@@ -293,8 +294,11 @@ def build_report(
         arm: observation[1] for arm, observation in manifest_observations.items()
     }
     for arm, manifest in manifests.items():
-        if manifest.get("schema_version") != SCHEMA_VERSION:
-            raise LaunchError("paired WorkBuddy analysis requires v2 launch manifests")
+        if manifest.get("schema_version") not in {
+            PAIRED_SCHEMA_VERSION,
+            SCHEMA_VERSION,
+        }:
+            raise LaunchError("paired WorkBuddy analysis requires paired launch manifests")
         comparison = manifest.get("comparison")
         if (
             not isinstance(comparison, dict)

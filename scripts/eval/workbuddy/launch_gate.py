@@ -63,7 +63,8 @@ from .trace import (
 
 
 LEGACY_SCHEMA_VERSION = "metacodes-workbuddy-paid-launch-v1"
-SCHEMA_VERSION = "metacodes-workbuddy-paid-launch-v2"
+PAIRED_SCHEMA_VERSION = "metacodes-workbuddy-paid-launch-v2"
+SCHEMA_VERSION = "metacodes-workbuddy-paid-launch-v3"
 LEGACY_RECEIPT_SCHEMA_VERSION = "metacodes-workbuddy-paid-receipt-v1"
 RECEIPT_SCHEMA_VERSION = "metacodes-workbuddy-paid-receipt-v2"
 AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION_V1 = (
@@ -788,6 +789,11 @@ def build_launch_manifest(
             "config": model_identity,
             "provider_identity": provider_identity,
             "fingerprint": model_fingerprint,
+            # The proxy route is run-specific transport identity.  Persist the
+            # stable actor-visible backend identity separately so every later
+            # trial/runtime/cache audit compares against the value actually
+            # injected into metacodes rather than an absent manifest field.
+            "backend_model_name": model.get("name"),
             "backend_url_env": backend_url_env,
             "backend_url_sha256": _sha256_bytes(backend_url.encode("utf-8")),
         },
@@ -837,10 +843,15 @@ def _validate_launch_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
         raise LaunchError("paid launch manifest content hash mismatch")
     manifest["content_sha256"] = content_sha
     schema_version = manifest.get("schema_version")
-    if schema_version not in {LEGACY_SCHEMA_VERSION, SCHEMA_VERSION} or manifest.get("quality_evidence") is not False:
+    paired_schema = schema_version in {PAIRED_SCHEMA_VERSION, SCHEMA_VERSION}
+    if schema_version not in {
+        LEGACY_SCHEMA_VERSION,
+        PAIRED_SCHEMA_VERSION,
+        SCHEMA_VERSION,
+    } or manifest.get("quality_evidence") is not False:
         raise LaunchError("unsupported or mislabeled paid launch manifest")
     treatment = manifest.get("evaluation_treatment")
-    if schema_version == SCHEMA_VERSION:
+    if paired_schema:
         if (
             not isinstance(treatment, dict)
             or treatment
@@ -858,7 +869,7 @@ def _validate_launch_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(manifest.get("quality_evidence_on_commit"), bool):
         raise LaunchError("paid launch commit evidence classification is missing")
     comparison = manifest.get("comparison")
-    if schema_version == SCHEMA_VERSION:
+    if paired_schema:
         if comparison is not None:
             if (
                 not isinstance(comparison, dict)
@@ -882,6 +893,13 @@ def _validate_launch_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
         raise LaunchError("legacy paid launch unexpectedly carries a comparison")
     if manifest.get("workbuddy", {}).get("commit") != WORKBUDDY_PINNED_COMMIT:
         raise LaunchError("paid launch WorkBuddy commit drifted")
+    model = manifest.get("model") or {}
+    if schema_version == SCHEMA_VERSION and (
+        not isinstance(model, dict)
+        or not isinstance(model.get("backend_model_name"), str)
+        or not model["backend_model_name"].strip()
+    ):
+        raise LaunchError("paid launch actor model identity is incomplete")
     if not re.fullmatch(
         r"[0-9a-f]{64}",
         str(manifest.get("workbuddy", {}).get("overlay_content_sha256", "")),
@@ -890,7 +908,7 @@ def _validate_launch_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
     host_control_plane = manifest.get("host_control_plane")
     allowed_host_modules = (
         {frozenset(HOST_CONTROL_PLANE_MODULES)}
-        if schema_version == SCHEMA_VERSION
+        if paired_schema
         else {
             LEGACY_HOST_CONTROL_PLANE_MODULE_NAMES_V1,
             LEGACY_HOST_CONTROL_PLANE_MODULE_NAMES_V2,
@@ -2947,7 +2965,8 @@ def execute_launch(
                 receipt = {
                     "schema_version": (
                         RECEIPT_SCHEMA_VERSION
-                        if manifest["schema_version"] == SCHEMA_VERSION
+                        if manifest["schema_version"]
+                        in {PAIRED_SCHEMA_VERSION, SCHEMA_VERSION}
                         else LEGACY_RECEIPT_SCHEMA_VERSION
                     ),
                     "quality_evidence": _receipt_quality_evidence(
@@ -2967,7 +2986,10 @@ def execute_launch(
                     "elapsed_seconds": (time.time_ns() - started_ns)
                     / 1_000_000_000,
                 }
-                if manifest["schema_version"] == SCHEMA_VERSION:
+                if manifest["schema_version"] in {
+                    PAIRED_SCHEMA_VERSION,
+                    SCHEMA_VERSION,
+                }:
                     receipt["evaluation_treatment"] = manifest[
                         "evaluation_treatment"
                     ]
