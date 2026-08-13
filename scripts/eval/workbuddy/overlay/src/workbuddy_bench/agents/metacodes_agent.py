@@ -323,7 +323,10 @@ class MetacodesAgent(BaseInstalledAgent):
             'exec 9<<<"$METACODES_ROUTE_TOKEN"; unset METACODES_ROUTE_TOKEN; '
             "export METACODES_API_KEY_FD=9; "
             f"metacodes {' '.join(flags)} -p {escaped_instruction} --json "
-            f"2>&1 </dev/null | tee {shlex.quote(output_path)}; "
+            # NDJSON stdout is a machine protocol.  Keep diagnostics on the
+            # Harbor-owned stderr stream so a permission warning or other host
+            # message can never merge with the exactly-once result event.
+            f"</dev/null | tee {shlex.quote(output_path)}; "
             "agent_status=${PIPESTATUS[0]}; "
             f"{project_postcheck}"
             'mapfile -t transcripts < <(find "$HOME/.metacodes/projects" '

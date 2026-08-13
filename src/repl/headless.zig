@@ -15,6 +15,7 @@ const pfs = @import("platform").fs;
 const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
+const permission_mod = @import("../permission.zig");
 const project_activation = @import("../core/project_rule_activation.zig");
 const request_gate_mod = @import("../core/request_gate.zig");
 const tee_backend_mod = @import("../core/tee_backend.zig");
@@ -35,6 +36,15 @@ pub fn run(
         std.debug.print("error: empty prompt\n", .{});
         return 1;
     }
+
+    // A headless caller owns stdin and cannot answer an interactive permission
+    // prompt.  This must be set on the session PermissionContext itself (rather
+    // than inferred from isatty) so an .ask decision deterministically denies
+    // without printing a prompt or consuming fd 0.  In particular, protected
+    // paths still override bypassPermissions, but they cannot corrupt --json
+    // stdout while failing closed.
+    const previous_no_interactive = enterNonInteractivePermissionBoundary(&app.permission_ctx);
+    defer restoreInteractivePermissionBoundary(&app.permission_ctx, previous_no_interactive);
 
     try app.conversation.appendText(.user, trimmed);
 
@@ -253,6 +263,9 @@ pub fn resumeSuspended(
     response_json: []const u8,
     json_output: bool,
 ) !u8 {
+    const previous_no_interactive = enterNonInteractivePermissionBoundary(&app.permission_ctx);
+    defer restoreInteractivePermissionBoundary(&app.permission_ctx, previous_no_interactive);
+
     const suspend_state = @import("../core/suspend_state.zig");
     const transcript = @import("../core/transcript.zig");
     const dir = app.sessionDir() orelse {
@@ -344,6 +357,27 @@ pub fn resumeSuspended(
         if (final_text.len == 0 or final_text[final_text.len - 1] != '\n') writeStdout("\n");
     }
     return exitCodeFor(result.stop_reason);
+}
+
+/// Install the process-input ownership boundary used by both fresh headless
+/// runs and subprocess resume.  The previous value is returned so library
+/// consumers that reuse an App can restore their session exactly.
+fn enterNonInteractivePermissionBoundary(ctx: *permission_mod.PermissionContext) bool {
+    const previous = ctx.no_interactive_prompt;
+    ctx.no_interactive_prompt = true;
+    return previous;
+}
+
+fn restoreInteractivePermissionBoundary(ctx: *permission_mod.PermissionContext, previous: bool) void {
+    ctx.no_interactive_prompt = previous;
+}
+
+test "headless permission boundary restores reusable session state" {
+    var permission = permission_mod.createContext(.default, std.testing.allocator);
+    permission.no_interactive_prompt = true;
+    const previous = enterNonInteractivePermissionBoundary(&permission);
+    restoreInteractivePermissionBoundary(&permission, previous);
+    try std.testing.expect(permission.no_interactive_prompt);
 }
 
 /// 把 conversation 最后一条 assistant message 的所有 text block 拼起来（owned）。

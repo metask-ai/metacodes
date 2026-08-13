@@ -946,6 +946,20 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
 
 
 class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
+    def test_adapter_keeps_machine_ndjson_stdout_separate_from_diagnostics(self):
+        source = (
+            Path(__file__).parents[1]
+            / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'f"</dev/null | tee {shlex.quote(output_path)}; "',
+            source,
+        )
+        self.assertNotIn(
+            'f"2>&1 </dev/null | tee {shlex.quote(output_path)}; "',
+            source,
+        )
+
     def test_adapter_remote_environment_assertion_is_one_shell_operand(self):
         source = (
             Path(__file__).parents[1]

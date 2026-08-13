@@ -23,7 +23,7 @@ from typing import Any, Mapping
 SCHEMA_VERSION = "metacodes-workbuddy-mock-provider-v2"
 MOCK_CREDENTIAL = "metacodes-workbuddy-mock-only"
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
-SCENARIOS = ("final-v1", "control-plane-v1")
+SCENARIOS = ("final-v1", "control-plane-v1", "headless-permission-v1")
 CONTROL_MEMORY = (
     "workbuddy-w05-control-marker: real local TinyKG and project Lean gate "
     "must be observed before quality evaluation"
@@ -382,6 +382,21 @@ def _scenario_sse(scenario: str, request_number: int, request: Mapping[str, Any]
         )
     if scenario == "control-plane-v1":
         return _control_plane_sse(request_number, request)
+    if scenario == "headless-permission-v1":
+        _require_tools(request, "Write")
+        if request_number == 1:
+            return _tool_sse(
+                request_number,
+                "headless-protected-write",
+                "Write",
+                {"file_path": ".gitignore", "content": "must-not-write\n"},
+            )
+        if request_number == 2:
+            content, is_error = _result_text(request, "headless-protected-write")
+            if not is_error or '"code":"permission_denied"' not in content:
+                raise ScenarioError("headless protected Write was not denied")
+            return _final_sse(request_number, "protected write was denied safely")
+        raise ScenarioError("headless-permission-v1 received more than two requests")
     raise ScenarioError(f"unsupported scenario: {scenario}")
 
 

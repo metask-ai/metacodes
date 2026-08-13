@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
+import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Dict
 
@@ -15,6 +18,103 @@ ARMS = ("codex_style", "claude_style", "tinykg")
 KG_TOOL_MARKERS = ("\n----- KgRemember -----\n", "\n----- KgRecall -----\n")
 TASK_TOOL_MARKER = "\n----- TaskList -----\n"
 FORMAL_TOOL_MARKER = "\n----- FormalAuditTask -----\n"
+
+
+def _headless_protocol_smoke(binary: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="metacodes-headless-protocol-") as directory:
+        root = Path(directory)
+        home = root / "home"
+        work = root / "work"
+        home.mkdir()
+        work.mkdir()
+        target = work / ".gitignore"
+        ready = root / "ready.json"
+        request_log = root / "requests.jsonl"
+        repo = Path(__file__).resolve().parents[2]
+        provider = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "scripts.eval.workbuddy.mock_provider",
+                "--ready",
+                str(ready),
+                "--request-log",
+                str(request_log),
+                "--scenario",
+                "headless-permission-v1",
+            ],
+            cwd=repo,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 5
+        while not ready.exists() and provider.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        _require(ready.exists(), "headless protocol mock provider did not become ready")
+        port = int(json.loads(ready.read_text(encoding="utf-8"))["port"])
+        env = _base_env()
+        env.update(
+            {
+                "HOME": str(home),
+                "USERPROFILE": str(home),
+                "METACODES_NO_PROBE": "1",
+            }
+        )
+        try:
+            completed = subprocess.run(
+                [
+                    str(binary),
+                    "--api-key",
+                    "metacodes-workbuddy-mock-only",
+                    "--base-url",
+                    f"http://127.0.0.1:{port}/v1/messages",
+                    "--model",
+                    "offline",
+                    "--permission",
+                    "bypassPermissions",
+                    "--no-theme",
+                    "--json",
+                    "-p",
+                    "exercise the protected write boundary",
+                ],
+                cwd=work,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        finally:
+            provider.terminate()
+            try:
+                provider.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                provider.kill()
+                provider.wait(timeout=2)
+
+        requests = request_log.read_text(encoding="utf-8").splitlines()
+        _require(
+            len(requests) == 2,
+            "headless protocol request count drifted: "
+            f"{len(requests)}; exit={completed.returncode}; "
+            f"stdout={completed.stdout!r}; stderr={completed.stderr[-1000:]!r}; "
+            f"target_exists={target.exists()}",
+        )
+        _require(completed.returncode == 0, f"headless protocol exited {completed.returncode}: {completed.stderr[-1000:]}")
+        lines = completed.stdout.splitlines()
+        _require(len(lines) == 1, f"headless --json stdout is not exactly one NDJSON event: {completed.stdout!r}")
+        try:
+            result = json.loads(lines[0])
+        except json.JSONDecodeError as exc:
+            raise SystemExit("headless --json stdout is not valid NDJSON") from exc
+        _require(result.get("type") == "result", "headless --json omitted its result event")
+        _require(result.get("text") == "protected write was denied safely", "headless continuation result drifted")
+        _require("[Permission]" not in completed.stdout and "Allow?" not in completed.stdout, "permission prompt polluted NDJSON stdout")
+        _require("[Permission]" not in completed.stderr and "Allow?" not in completed.stderr, "headless attempted an interactive permission prompt")
+        _require(not target.exists(), "protected Write mutated the workspace")
 
 
 def _base_env() -> Dict[str, str]:
@@ -135,7 +235,11 @@ def main() -> int:
         "persistent task in TinyKG" in tinykg,
         "tinykg: TaskCreate still advertises session-only storage",
     )
-    print("runtime arm smoke: codex_style/claude_style/tinykg PASS (paid=0, network=0)")
+    _headless_protocol_smoke(binary)
+    print(
+        "runtime arm smoke: codex_style/claude_style/tinykg + headless NDJSON "
+        "permission boundary PASS (paid=0, external_network=0)"
+    )
     return 0
 
 
