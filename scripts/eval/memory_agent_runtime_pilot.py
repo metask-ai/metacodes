@@ -181,6 +181,7 @@ def _probe_tinykg_compatibility(binary: Path, expected_sha256: str) -> Mapping[s
         )
         run("init", str(store))
         run("apply", str(store), str(batch))
+        run("rebuild-text", str(store))
         info = {}
         for line in run("store-info", str(store)).splitlines():
             if "=" in line:
@@ -191,15 +192,18 @@ def _probe_tinykg_compatibility(binary: Path, expected_sha256: str) -> Mapping[s
             "edges": "0",
             "storage_format_version": "2",
             "schema_version": "3",
+            "text_current": "1",
+            "text_stale": "0",
         }
         if any(info.get(key) != value for key, value in required.items()):
             raise ValidationError("TinyKG compatibility preflight returned an incompatible store contract")
     if file_sha256(binary) != expected_sha256:
         raise ValidationError("TinyKG binary changed during compatibility preflight")
     return {
-        "commands": ["init", "apply", "store-info"],
+        "commands": ["init", "apply", "rebuild-text", "store-info"],
         "storage_format_version": 2,
         "schema_version": 3,
+        "text_current": True,
     }
 
 

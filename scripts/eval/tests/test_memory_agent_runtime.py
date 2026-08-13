@@ -2551,7 +2551,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 "case \"$1\" in\n"
                 "  init) mkdir \"$2\" ;;\n"
                 "  apply) printf 'apply version=1 nodes_created=1 nodes_existing=0 edges_created=0 edges_existing=0\\n' ;;\n"
-                "  store-info) printf 'nodes=1\\nedges=0\\nstorage_format_version=2\\nschema_version=3\\n' ;;\n"
+                "  rebuild-text) : ;;\n"
+                "  store-info) printf 'nodes=1\\nedges=0\\nstorage_format_version=2\\nschema_version=3\\ntext_current=1\\ntext_stale=0\\n' ;;\n"
                 "  *) exit 91 ;;\n"
                 "esac\n",
                 encoding="utf-8",
@@ -2653,7 +2654,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 "case \"$1\" in\n"
                 "  init) mkdir \"$2\" ;;\n"
                 "  apply) printf 'apply version=1 nodes_created=1 nodes_existing=0 edges_created=0 edges_existing=0\\n' ;;\n"
-                "  store-info) printf 'nodes=1\\nedges=0\\nstorage_format_version=2\\nschema_version=3\\n' ;;\n"
+                "  rebuild-text) : ;;\n"
+                "  store-info) printf 'nodes=1\\nedges=0\\nstorage_format_version=2\\nschema_version=3\\ntext_current=1\\ntext_stale=0\\n' ;;\n"
                 "  *) exit 91 ;;\n"
                 "esac\n",
                 encoding="utf-8",
@@ -2687,8 +2689,9 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             self.assertFalse(plan["credential_loaded"])
             self.assertEqual(
                 plan["tinykg_preflight"]["commands"],
-                ["init", "apply", "store-info"],
+                ["init", "apply", "rebuild-text", "store-info"],
             )
+            self.assertTrue(plan["tinykg_preflight"]["text_current"])
             self.assertFalse(missing_auth.exists())
             self.assertFalse(budget_journal.exists())
 
