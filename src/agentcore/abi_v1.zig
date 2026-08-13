@@ -1093,12 +1093,17 @@ const AbiSession = struct {
     }
 
     fn startRunState(self: *AbiSession, session_id: core.session_id.SessionId, run_id: u64) bool {
+        // `startRunState` establishes the new run id before the first event
+        // reaches observeRunState, so the run boundary must reset observation
+        // degradation here rather than relying on the projector mismatch path.
+        self.run_state_observation_disabled = false;
         self.run_state_projector.begin(run_id);
         return self.emitRunStateSnapshot(session_id, run_id);
     }
 
     fn emitPoisonedRunState(self: *AbiSession, run_id: u64) void {
         if (self.callback_status.load(.acquire) != wire.STATUS_OK) return;
+        if (self.run_state_observation_disabled) return;
         self.run_state_projector.closeForTerminal(.poisoned);
         _ = self.emitRunStateSnapshot(self.core_session.session_id, run_id);
     }
@@ -8151,6 +8156,17 @@ test "RunState observation capacity does not poison the admitted run" {
     }
     try std.testing.expect(fake.run_state_observation_disabled);
     try std.testing.expectEqual(wire.STATUS_OK, fake.callback_status.load(.acquire));
+
+    try std.testing.expect(fake.startRunState(.single, 2));
+    try std.testing.expect(!fake.run_state_observation_disabled);
+    try std.testing.expect(fake.observeRunState(.single, 2, .{ .retry_notice = .{
+        .attempt = 1,
+        .max = 2,
+        .delay_ms = 0,
+    } }));
+    try std.testing.expectEqual(public_protocol.RunStatePhase.retrying, fake.run_state_projector.phase);
+    try std.testing.expect(fake.observeRunState(.single, 2, .stream_begin));
+    try std.testing.expectEqual(public_protocol.RunStatePhase.generating, fake.run_state_projector.phase);
 }
 
 test "Host schema admission rejects ambiguous object contracts" {
