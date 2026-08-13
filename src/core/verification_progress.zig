@@ -94,7 +94,12 @@ pub fn isVerificationCommand(allocator: std.mem.Allocator, command: []const u8) 
 fn verificationEvidence(allocator: std.mem.Allocator, command: []const u8) ?Evidence {
     const pipeline = stripDisplayPipeline(command) orelse return null;
     if (!onlyAndConjunctions(pipeline.command)) return null;
-    const segments = bash_parser.splitCompound(allocator, pipeline.command) catch return null;
+    // The general permission parser deliberately treats every `&` as a shell
+    // separator.  Here `onlyAndConjunctions` has already admitted the narrow
+    // presentation redirect `2>&1`; feeding that string back through the
+    // general parser would split it into `2>` / `1` and silently miss the
+    // normal `pytest 2>&1 | tail` form used by real coding agents.
+    const segments = splitAndConjunctions(allocator, pipeline.command) catch return null;
     defer allocator.free(segments);
     if (segments.len == 0) return null;
 
@@ -112,6 +117,52 @@ fn verificationEvidence(allocator: std.mem.Allocator, command: []const u8) ?Evid
     if (tests != 1) return null;
     if (!pipeline.has_display_pipe) return .shell_exit;
     return if (pytest) .pytest_summary else null;
+}
+
+/// Split the command after `onlyAndConjunctions` has rejected every operator
+/// except `&&` and the exact stderr presentation redirect `2>&1`.  Returned
+/// slices borrow `command`; only the outer slice is allocated.
+fn splitAndConjunctions(
+    allocator: std.mem.Allocator,
+    command: []const u8,
+) ![][]const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(allocator);
+    var start: usize = 0;
+    var in_single = false;
+    var in_double = false;
+    var i: usize = 0;
+    while (i < command.len) : (i += 1) {
+        const c = command[i];
+        if (c == '\\' and !in_single and i + 1 < command.len) {
+            i += 1;
+            continue;
+        }
+        if (c == '\'' and !in_double) {
+            in_single = !in_single;
+            continue;
+        }
+        if (c == '"' and !in_single) {
+            in_double = !in_double;
+            continue;
+        }
+        if (in_single or in_double or c != '&') continue;
+        // `onlyAndConjunctions` proved every remaining ampersand is the first
+        // byte of `&&`; the one in `2>&1` is preceded by `2>`.
+        if (i >= 2 and std.mem.eql(u8, command[i - 2 .. i + 2], "2>&1")) {
+            i += 1;
+            continue;
+        }
+        const segment = std.mem.trim(u8, command[start..i], " \t\r");
+        if (segment.len == 0) return error.InvalidConjunction;
+        try out.append(allocator, segment);
+        i += 1;
+        start = i + 1;
+    }
+    const tail = std.mem.trim(u8, command[start..], " \t\r");
+    if (tail.len == 0) return error.InvalidConjunction;
+    try out.append(allocator, tail);
+    return out.toOwnedSlice(allocator);
 }
 
 const Pipeline = struct { command: []const u8, has_display_pipe: bool };
@@ -163,12 +214,15 @@ fn pytestSummaryPassed(allocator: std.mem.Allocator, content: []const u8) bool {
     defer allocator.free(stdout);
     const stderr = util_json.unescapeString(encoded_err, allocator) catch return false;
     defer allocator.free(stderr);
-    return pytestStreamPassed(stdout) or pytestStreamPassed(stderr);
+    const passed = std.mem.indexOf(u8, stdout, " passed") != null or
+        std.mem.indexOf(u8, stderr, " passed") != null;
+    return passed and pytestStreamHasNoFailure(stdout) and
+        pytestStreamHasNoFailure(stderr);
 }
 
-fn pytestStreamPassed(bytes: []const u8) bool {
-    if (std.mem.indexOf(u8, bytes, " passed") == null) return false;
+fn pytestStreamHasNoFailure(bytes: []const u8) bool {
     return std.mem.indexOf(u8, bytes, " failed") == null and
+        std.mem.indexOf(u8, bytes, " error") == null and
         std.mem.indexOf(u8, bytes, " errors") == null and
         std.mem.indexOf(u8, bytes, " ERROR") == null and
         std.mem.indexOf(u8, bytes, "no tests ran") == null;

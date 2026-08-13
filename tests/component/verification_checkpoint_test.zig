@@ -45,6 +45,22 @@ const RunCapture = struct {
     }
 };
 
+fn successfulTestCommand(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+) ![]u8 {
+    const path = try std.fmt.allocPrint(allocator, "{s}/pytest", .{root});
+    defer allocator.free(path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = path,
+        .data = "#!/bin/sh\nprintf '1 passed in 0.01s\\n'\n",
+    });
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    if (std.c.chmod(path_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    return allocator.dupe(u8, path);
+}
+
 test "CLI verification checkpoint flag is explicit and defaults off" {
     const a = std.testing.allocator;
     const disabled_argv = [_][*:0]const u8{"metacodes"};
@@ -146,14 +162,64 @@ test "L2 post-mutation green test injects one checkpoint without first-request d
     const control_root = control_buf[0..try control_tmp.dir.realPath(std.testing.io, &control_buf)];
     const treatment_root = treatment_buf[0..try treatment_tmp.dir.realPath(std.testing.io, &treatment_buf)];
 
-    var control = try runScenario(a, control_root, false, "zig test checkpoint.zig", false);
+    const control_command = try successfulTestCommand(a, control_root);
+    defer a.free(control_command);
+    const treatment_command = try successfulTestCommand(a, treatment_root);
+    defer a.free(treatment_command);
+    var control = try runScenario(a, control_root, false, control_command, false);
     defer control.deinit(a);
-    var treatment = try runScenario(a, treatment_root, true, "zig test checkpoint.zig", false);
+    var treatment = try runScenario(a, treatment_root, true, treatment_command, false);
     defer treatment.deinit(a);
     try std.testing.expectEqualStrings(control.first, treatment.first);
     try std.testing.expect(std.mem.indexOf(u8, treatment.first, "verification checkpoint") == null);
     try std.testing.expect(std.mem.indexOf(u8, control.after_test, "verification checkpoint") == null);
     try std.testing.expect(std.mem.indexOf(u8, treatment.after_test, "verification checkpoint") != null);
+}
+
+test "L2 checkpoint recognizes pytest stderr redirect before display-only tail" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const pytest_path = try std.fmt.allocPrint(a, "{s}/pytest", .{root});
+    defer a.free(pytest_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = pytest_path,
+        .data = "#!/bin/sh\nprintf '1 passed in 0.01s\\n'\n",
+    });
+    const pytest_z = try a.dupeZ(u8, pytest_path);
+    defer a.free(pytest_z);
+    if (std.c.chmod(pytest_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    const command = try std.fmt.allocPrint(a, "{s} 2>&1 | tail -20", .{pytest_path});
+    defer a.free(command);
+
+    var run = try runScenario(a, root, true, command, false);
+    defer run.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, run.after_test, "verification checkpoint") != null);
+}
+
+test "L2 display-only tail cannot turn a failed pytest summary into progress" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const pytest_path = try std.fmt.allocPrint(a, "{s}/pytest", .{root});
+    defer a.free(pytest_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = pytest_path,
+        .data = "#!/bin/sh\nprintf '1 failed in 0.01s\\n'\nexit 1\n",
+    });
+    const pytest_z = try a.dupeZ(u8, pytest_path);
+    defer a.free(pytest_z);
+    if (std.c.chmod(pytest_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    const command = try std.fmt.allocPrint(a, "{s} 2>&1 | tail -20", .{pytest_path});
+    defer a.free(command);
+
+    var run = try runScenario(a, root, true, command, false);
+    defer run.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, run.after_test, "verification checkpoint") == null);
 }
 
 test "L2 failed or ordinary Bash does not trigger checkpoint" {
@@ -180,7 +246,9 @@ test "L2 checkpoint is steering not a hard stop; a later justified Edit executes
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
-    var run = try runScenario(a, root, true, "zig test checkpoint.zig", true);
+    const command = try successfulTestCommand(a, root);
+    defer a.free(command);
+    var run = try runScenario(a, root, true, command, true);
     defer run.deinit(a);
     try std.testing.expect(std.mem.indexOf(u8, run.after_test, "verification checkpoint") != null);
     try std.testing.expectEqualStrings("test \"two\" {}\n", run.final_file);

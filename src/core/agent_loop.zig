@@ -26,6 +26,7 @@ const api_stream = @import("../api/stream.zig");
 const tool_error = @import("tool_error.zig");
 const context_pressure_mod = @import("context_pressure.zig");
 const compact_kernel = @import("compact_kernel.zig");
+const verification_progress_mod = @import("verification_progress.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
 const ui_backend = @import("protocol/ui_backend.zig");
@@ -537,7 +538,7 @@ pub fn run(
     const trace_id = log.genRequestId().bytes;
     const depth = opts.agent_depth;
     var turns: u32 = 0;
-    var verification_progress = @import("verification_progress.zig").State{};
+    var verification_progress = verification_progress_mod.State{};
     var total_tool_calls: u32 = 0;
     // max_tokens 续写计数:防止模型一直撞上限导致无限续写。上限 3 次。
     var continuations: u32 = 0;
@@ -1548,7 +1549,7 @@ pub fn run(
         if (inject_verification_checkpoint) {
             const checkpoint = try allocator.dupe(
                 u8,
-                @import("verification_progress.zig").CHECKPOINT_TEXT,
+                verification_progress_mod.CHECKPOINT_TEXT,
             );
             try result_blocks.append(allocator, .{ .text = checkpoint });
         }
