@@ -199,6 +199,10 @@ pub const ToolDispatcher = struct {
     /// concurrency-capable by executor kind (shipped header contract), never
     /// guessed from tool names.
     hostSyncFn: *const fn (ctx: *const anyopaque, name: []const u8) bool,
+    /// Exact executor identity from the selected catalog entry. This is
+    /// intentionally separate from dispatcher presence: AgentCore Sessions
+    /// dispatch built-ins through a non-null dispatcher too.
+    builtinFn: ?*const fn (ctx: *const anyopaque, name: []const u8) bool = null,
 
     pub fn dispatch(self: ToolDispatcher, tool_ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror!ToolDispatchOutcome {
         return self.dispatchFn(self.ctx, tool_ctx, name, args);
@@ -214,6 +218,11 @@ pub const ToolDispatcher = struct {
 
     pub fn isHostSync(self: ToolDispatcher, name: []const u8) bool {
         return self.hostSyncFn(self.ctx, name);
+    }
+
+    pub fn isBuiltin(self: ToolDispatcher, name: []const u8) bool {
+        const f = self.builtinFn orelse return false;
+        return f(self.ctx, name);
     }
 };
 

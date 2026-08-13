@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const api_stream = @import("../../api/stream.zig");
+const file_reference = @import("../file_reference.zig");
 const abort = @import("../../util/abort.zig");
 const types = @import("../../types.zig"); // UI-free 核心类型(PermissionMode/ReasoningEffort)
 
@@ -190,6 +191,7 @@ pub const CoreEvent = union(enum) {
         content: []const u8,
         is_error: bool,
         elapsed_ms: u64 = 0,
+        file_refs: ?[]const file_reference.FileReference = null,
     },
 
     /// token 计数增量。

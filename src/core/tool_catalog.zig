@@ -297,7 +297,7 @@ pub const Selection = struct {
     }
 
     pub fn dispatcher(self: *const Selection) tools.ToolDispatcher {
-        return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .prefetchSafeFn = prefetchSafe, .nameAtFn = nameAt, .hostSyncFn = hostSync };
+        return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .prefetchSafeFn = prefetchSafe, .nameAtFn = nameAt, .hostSyncFn = hostSync, .builtinFn = isBuiltinEntry };
     }
 
     fn dispatch(raw: *const anyopaque, tool_ctx: *const tools.ToolContext, name: []const u8, args: []const u8) anyerror!tools.ToolDispatchOutcome {
@@ -356,6 +356,12 @@ pub const Selection = struct {
         return entry.executor == .host_sync;
     }
 
+    fn isBuiltinEntry(raw: *const anyopaque, name: []const u8) bool {
+        const self: *const Selection = @ptrCast(@alignCast(raw));
+        const entry = self.find(name) orelse return false;
+        return entry.executor == .builtin;
+    }
+
     fn nameAt(raw: *const anyopaque, index: usize) ?[]const u8 {
         const self: *const Selection = @ptrCast(@alignCast(raw));
         if (index >= self.entries.len) return null;
@@ -371,6 +377,8 @@ test "Selection rejects names outside Runtime and dispatches only selected entri
 
     try std.testing.expect(selection.contains("Read"));
     try std.testing.expect(!selection.contains("Grep"));
+    try std.testing.expect(selection.dispatcher().isBuiltin("Read"));
+    try std.testing.expect(!selection.dispatcher().isBuiltin("Grep"));
     try std.testing.expectError(error.ToolNotInRuntime, Selection.init(std.testing.allocator, &catalog, &.{"Bash"}));
 
     var ctx = tools.ToolContext{ .allocator = std.testing.allocator, .tool_dispatcher = selection.dispatcher() };
@@ -514,6 +522,18 @@ test "Host sync names cannot duplicate built-ins or each other" {
     var second = HostProbe{};
     try std.testing.expectError(error.DuplicateToolName, Catalog.init(std.testing.allocator, &.{"Read"}, &.{hostTool("Read", &first)}));
     try std.testing.expectError(error.DuplicateToolName, Catalog.init(std.testing.allocator, &.{}, &.{ hostTool("HostEcho", &first), hostTool("HostEcho", &second) }));
+}
+
+test "Host tool named Read is not classified as the built-in file tool" {
+    var probe = HostProbe{};
+    var catalog = try Catalog.init(std.testing.allocator, &.{}, &.{hostTool("Read", &probe)});
+    defer catalog.deinit();
+    var selection = try Selection.init(std.testing.allocator, &catalog, &.{"Read"});
+    defer selection.deinit();
+
+    const dispatcher = selection.dispatcher();
+    try std.testing.expect(dispatcher.isHostSync("Read"));
+    try std.testing.expect(!dispatcher.isBuiltin("Read"));
 }
 
 test "Host sync registration rejects non-object tool schemas" {

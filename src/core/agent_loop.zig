@@ -1524,6 +1524,7 @@ pub fn run(
                     .content = content,
                     .is_error = s.is_error,
                     .elapsed_ms = s.elapsed_ms,
+                    .file_refs = s.file_refs,
                 } });
             }
         }

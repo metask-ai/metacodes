@@ -28,6 +28,7 @@ pub const compact_kernel = @import("core/compact_kernel.zig");
 pub const message = @import("core/message.zig");
 pub const subagent = @import("core/subagent.zig");
 pub const tool_exec = @import("core/tool_exec.zig");
+pub const file_reference = @import("core/file_reference.zig");
 pub const tool_observation_journal = @import("core/tool_observation_journal.zig");
 pub const rule_impact_stats = @import("core/rule_impact_stats.zig");
 pub const rule_impact_operational_observation = @import("core/rule_impact_operational_observation.zig");

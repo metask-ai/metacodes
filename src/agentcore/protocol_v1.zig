@@ -12,6 +12,24 @@ const public = @import("metask_agentcore_protocol");
 const InternalEvent = core.protocol.ui_event.CoreEvent;
 const InternalUiRequest = core.protocol.ui_request.UiRequest;
 const InternalUiResponse = core.protocol.ui_request.UiResponse;
+const internal_file_reference = core.file_reference;
+
+// The event adapter borrows the reference slice for the duration of the
+// synchronous callback. Keep the zero-copy cast, but make its safety claim
+// executable: a change to either side's DTO layout must fail compilation at
+// this ABI boundary instead of silently reinterpreting bytes.
+comptime {
+    if (@sizeOf(internal_file_reference.FileReference) != @sizeOf(public.FileReference) or
+        @offsetOf(internal_file_reference.FileReference, "locator") != @offsetOf(public.FileReference, "locator") or
+        @offsetOf(internal_file_reference.FileReference, "title") != @offsetOf(public.FileReference, "title") or
+        @offsetOf(internal_file_reference.FileReference, "kind") != @offsetOf(public.FileReference, "kind") or
+        @offsetOf(internal_file_reference.FileReference, "range") != @offsetOf(public.FileReference, "range"))
+        @compileError("AgentCore FileReference internal/public layout drift; update the explicit ABI adapter");
+    if (@sizeOf(internal_file_reference.Locator) != @sizeOf(public.FileReferenceLocator) or
+        @sizeOf(internal_file_reference.Range) != @sizeOf(public.FileReferenceRange) or
+        @sizeOf(internal_file_reference.Position) != @sizeOf(public.FileReferencePosition))
+        @compileError("AgentCore file-reference nested DTO layout drift");
+}
 
 /// Map an internal event to the frozen ABI v1 event set. Returning null is an
 /// explicit decision that an internal-only event does not cross this ABI.
@@ -36,6 +54,11 @@ pub fn event(value: InternalEvent) ?public.CoreEvent {
             .content = v.content,
             .is_error = v.is_error,
             .elapsed_ms = v.elapsed_ms,
+            // Internal and public DTOs intentionally have identical frozen
+            // field layouts but live in separate modules. The slice is
+            // borrowed for the synchronous event call; no allocation or UI
+            // policy is introduced at this ABI adapter boundary.
+            .file_refs = if (v.file_refs) |refs| @ptrCast(refs) else null,
         } },
         .usage => |v| .{ .usage = .{
             .input_tokens = v.input_tokens,

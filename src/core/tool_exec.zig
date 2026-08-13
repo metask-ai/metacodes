@@ -21,6 +21,8 @@ const util_time = @import("../util/time.zig");
 const pfs = platform.fs;
 const project_gate_protocol = @import("../tools/project_rule_gate.zig");
 const project_rule_signal = @import("../tools/project_rule_signal.zig");
+const file_reference = @import("file_reference.zig");
+const tool_catalog = @import("tool_catalog.zig");
 
 /// 给任意 allocator 加互斥视图。ArenaAllocator 只隔离自己的链表元数据，它增长时仍会
 /// 调后备 allocator；多个 worker 直接以同一个 session arena 为后备会破坏 arena 状态。
@@ -90,6 +92,8 @@ pub const Slot = struct {
     pending: bool = false,
     pending_kind: ?[]u8 = null,
     pending_payload: ?[]u8 = null,
+    /// Successful built-in file references owned by the parent allocator.
+    file_refs: ?[]file_reference.FileReference = null,
     /// P0.4:该 slot 的结果已由流式预取(stream_prefetch)填好 → executeSlots 跳过,不重复执行。
     prefetched: bool = false,
 
@@ -103,6 +107,11 @@ pub const Slot = struct {
         self.pending_kind = null;
         if (self.pending_payload) |p| allocator.free(p);
         self.pending_payload = null;
+        if (self.file_refs) |refs| {
+            for (refs) |*ref| ref.deinit(allocator);
+            allocator.free(refs);
+        }
+        self.file_refs = null;
     }
 
     /// 转移 content ownership 给调用方并置 null——转移即置空,杜绝与 deinit 双释放。
@@ -129,7 +138,7 @@ const Job = struct {
 /// 单个工具执行的结果(所有 owned 字段挂 parent_allocator,逃逸内部 arena)。
 pub const OneResult = union(enum) {
     /// 正常完成(成功或工具级错误)。
-    done: struct { content: ?[]u8, is_error: bool, elapsed_ms: u64 },
+    done: struct { content: ?[]u8, is_error: bool, elapsed_ms: u64, file_refs: ?[]file_reference.FileReference = null },
     /// L3 挂起:工具发起 custom UI(error.UiPending)。kind/payload owned by parent_allocator。
     pending: struct { kind: ?[]u8, payload: ?[]u8, elapsed_ms: u64 },
     /// Host 工具 fatal:类型化控制信号,无 payload——不组装 tool_result,逐层显式传递
@@ -442,6 +451,7 @@ pub fn executeOne(
         .started_at_ms = t_start,
         .effect_slot = &effect_slot,
     };
+    const builtin_file_tool = isBuiltinFileTool(&job_ctx, dispatched_name);
 
     log.infoId("agent", rid, "tool.exec start(par) name={s} id={s}", .{ name, id });
     if (job_ctx.execution_policy) |policy| {
@@ -493,10 +503,9 @@ pub fn executeOne(
                 rid,
             );
     }
-    // Observe once for both signal-only and formally governed Runs.  If this
-    // were conditional on an active rule, the treatment arm would receive a
-    // different sensor and the causal experiment could not separate sensing
-    // from actuation.
+    // Formal rule/observer runs use the complete pre-dispatch sensor. Ordinary
+    // AgentCore file-reference runs use only the bounded target-state sensor;
+    // neither path is enabled or disabled by the other path's policy switch.
     var project_pre_signal: ?project_gate_protocol.PreSignal = null;
     if (job_ctx.project_rule_gate != null or job_ctx.tool_observer != null) {
         project_pre_signal = project_rule_signal.observePre(
@@ -507,6 +516,17 @@ pub fn executeOne(
         );
         dispatch_observation.file_target_state = project_pre_signal.?.file_target_state;
         dispatch_observation.project_pre_signal = project_pre_signal.?;
+    } else if (builtin_file_tool) {
+        // File references need only the bounded lstat-style target state. Do
+        // not pull the project-rule exact-edit material sensor into ordinary
+        // AgentCore Runs: it reads and hashes full files and may block on a
+        // FIFO. The complete observePre path remains reserved for formal
+        // rules or an explicitly installed observation sink.
+        dispatch_observation.file_target_state = project_rule_signal.observeFileTarget(
+            &job_ctx,
+            dispatched_name,
+            input,
+        );
     }
     if (job_ctx.project_rule_gate) |gate| {
         switch (gate.pre(project_pre_signal.?)) {
@@ -728,9 +748,46 @@ pub fn executeOne(
     // dispatch 结果在 arena 里 → dupe 到父 allocator 逃逸。落盘必须延迟到
     // executeSlots 确认整批无 fatal 之后，否则 fatal 会留下无人引用的 transient 文件。
     const content = try parent_allocator.dupe(u8, result_bytes);
+    errdefer parent_allocator.free(content);
+    const refs = if (builtin_file_tool)
+        try buildFileReferences(parent_allocator, &job_ctx, dispatched_name, dispatch_input, dispatch_observation.file_target_state)
+    else
+        null;
     const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
     log.infoId("agent", rid, "tool.exec done(par) name={s} output_bytes={d} duration_ms={d}", .{ name, result_bytes.len, elapsed });
-    return .{ .done = .{ .content = content, .is_error = false, .elapsed_ms = elapsed } };
+    return .{ .done = .{ .content = content, .is_error = false, .elapsed_ms = elapsed, .file_refs = refs } };
+}
+
+fn isBuiltinFileTool(ctx: *const ToolContext, name: []const u8) bool {
+    if (!file_reference.isBuiltinFileTool(name)) return false;
+    if (ctx.tool_dispatcher) |dispatcher| return dispatcher.isBuiltin(name);
+    return tools_mod.getTool(name) != null;
+}
+
+fn buildFileReferences(
+    allocator: std.mem.Allocator,
+    ctx: *const ToolContext,
+    name: []const u8,
+    input: []const u8,
+    state: tool_observation.FileTargetState,
+) !?[]file_reference.FileReference {
+    // Write/Edit/NotebookEdit references are emitted only when the execution-boundary
+    // sensor produced a reliable pre-state. Unknown observations must never
+    // be guessed as "modified".
+    if ((std.mem.eql(u8, name, "Write") or
+        std.mem.eql(u8, name, "Edit") or
+        std.mem.eql(u8, name, "NotebookEdit")) and
+        state != .missing and state != .regular_existing)
+        return null;
+    const target = (try file_reference.resolveFileTarget(allocator, ctx, name, input, state)) orelse return null;
+    defer allocator.free(target.path);
+    var refs = try allocator.alloc(file_reference.FileReference, 1);
+    refs[0] = file_reference.project(allocator, target, name) catch |err| {
+        allocator.free(refs);
+        if (err == error.FileReferenceTitleTooLong) return null;
+        return error.OutOfMemory;
+    };
+    return refs;
 }
 
 fn invalidNativeWriteArgsResult(
@@ -795,6 +852,7 @@ fn runJob(job: *Job) void {
             s.content = d.content;
             s.is_error = d.is_error;
             s.elapsed_ms = d.elapsed_ms;
+            s.file_refs = d.file_refs;
         },
         // fatal 不组装 tool_result:slot 不填 content,信号经 Job.fatal 上传。
         .host_fatal => job.fatal = true,
@@ -991,6 +1049,104 @@ test "executeOne:成功路径返回 done+content(与 executeSlots 同一入口)"
         .pending, .host_fatal => try std.testing.expect(false),
     }
 }
+
+test "executeOne: built-in Write emits a created file reference without a gate" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+    var ctx = tools_mod.ToolContext{ .allocator = a, .cwd_abs = root, .resolve_relative_paths = true };
+    const input = "{\"file_path\":\"ref-target.txt\",\"content\":\"hello\"}";
+    const result = try executeOne(&ctx, "Write", input, "write-ref", a, .{ .bytes = [_]u8{'0'} ** 12 });
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |content| a.free(content);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(a);
+                a.free(refs);
+            };
+            try std.testing.expect(!done.is_error);
+            try std.testing.expect(done.file_refs != null);
+            const refs = done.file_refs.?;
+            try std.testing.expectEqual(@as(usize, 1), refs.len);
+            try std.testing.expectEqualStrings("created", refs[0].kind);
+            switch (refs[0].locator) {
+                .workspace_path => {},
+                else => return error.UnexpectedLocator,
+            }
+        },
+        else => return error.UnexpectedToolOutcome,
+    }
+}
+
+test "file reference projection never defaults an unobserved Write to modified" {
+    const a = std.testing.allocator;
+    var ctx = tools_mod.ToolContext{ .allocator = a, .cwd_abs = ".", .resolve_relative_paths = true };
+    const refs = try buildFileReferences(
+        a,
+        &ctx,
+        "Write",
+        "{\"file_path\":\"unknown.txt\",\"content\":\"x\"}",
+        .unobserved,
+    );
+    try std.testing.expect(refs == null);
+}
+
+test "executeOne: AgentCore Session Host Read does not emit a builtin file reference" {
+    const a = std.testing.allocator;
+    var probe: SameNameHostProbe = .{};
+    var catalog = try tool_catalog.Catalog.init(a, &.{}, &.{.{
+        .definition = .{
+            .name = "Read",
+            .description = "Host-owned Read",
+            .input_schema = .{ .type = "object", .required = &.{} },
+        },
+        .ctx = @ptrCast(&probe),
+        .execute = SameNameHostProbe.execute,
+    }});
+    defer catalog.deinit();
+    var selection = try tool_catalog.Selection.init(a, &catalog, &.{"Read"});
+    defer selection.deinit();
+
+    var anchor: u8 = 0;
+    var ctx = tools_mod.ToolContext{
+        .allocator = a,
+        .cwd_abs = ".",
+        .tool_dispatcher = selection.dispatcher(),
+        .host_run = .{
+            .identity = .{ .session_id = @import("session_id.zig").SessionId.single, .run_id = 1 },
+            .host_session_ctx = @ptrCast(&anchor),
+        },
+    };
+    const result = try executeOne(&ctx, "Read", "{\"file_path\":\"outside.txt\"}", "host-read", a, .{ .bytes = [_]u8{'0'} ** 12 });
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |content| a.free(content);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(a);
+                a.free(refs);
+            };
+            try std.testing.expect(!done.is_error);
+            try std.testing.expect(done.file_refs == null);
+        },
+        else => return error.UnexpectedToolOutcome,
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+}
+
+const SameNameHostProbe = struct {
+    calls: usize = 0,
+
+    fn execute(raw: *anyopaque, _: tool_catalog.HostRunIdentity, args: []const u8) error{OutOfMemory}!tool_catalog.HostToolOutcome {
+        const self: *SameNameHostProbe = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        return .{ .ok = .{ .bytes = args, .release_ctx = raw, .releaseFn = release } };
+    }
+
+    fn release(_: *anyopaque, _: []const u8) void {}
+};
 
 test "executeOne:UnknownTool → 富错误引导(prefetch/executeSlots 共享此路径)" {
     const a = std.testing.allocator;

@@ -126,10 +126,18 @@ pub fn observeFileTarget(
     tool: []const u8,
     input: []const u8,
 ) project_rule_spec.FileTargetState {
-    if (!std.mem.eql(u8, tool, "Write") and !std.mem.eql(u8, tool, "Edit"))
+    const is_file_target = std.mem.eql(u8, tool, "Write") or
+        std.mem.eql(u8, tool, "Edit") or
+        std.mem.eql(u8, tool, "NotebookEdit");
+    if (!is_file_target)
         return .unobserved;
-    const escaped = common.extractJsonArg(input, "file_path") orelse
-        common.extractJsonArg(input, "path") orelse return .unavailable;
+    const escaped = if (std.mem.eql(u8, tool, "NotebookEdit"))
+        common.extractJsonArg(input, "notebook_path") orelse
+            common.extractJsonArg(input, "file_path") orelse
+            common.extractJsonArg(input, "path") orelse return .unavailable
+    else
+        common.extractJsonArg(input, "file_path") orelse
+            common.extractJsonArg(input, "path") orelse return .unavailable;
     const path_unescaped = util_json.unescapeString(escaped, ctx.allocator) catch
         return .unavailable;
     defer ctx.allocator.free(path_unescaped);
