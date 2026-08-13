@@ -527,44 +527,51 @@ pub const RuntimeGate = struct {
         const request_ids = try self.allocator.alloc([64]u8, checker_rule_count);
         defer self.allocator.free(request_ids);
         var request_index: usize = 0;
-        for (self.active.rules, 0..) |entry, index| {
-            const candidate_id = parseHex(entry.candidate_id) orelse
-                return error.InvalidCandidateId;
-            const is_recovery = index == rule_index;
-            if (!is_recovery and
-                !std.mem.eql(u8, entry.rule_spec.target_tool, ordinaryTool(ordinary_payload)))
-                continue;
-            const operation = if (is_recovery) recovery_operation else ordinary_operation;
-            const payload = if (is_recovery) recovery_payload else ordinary_payload;
-            const signal_json = if (is_recovery) recovery_signal_json else ordinary_signal_json;
-            request_ids[request_index] = kernel.requestId(
-                operation,
-                candidate_id,
-                self.active.bundle_sha256,
-                self.active.revision,
-                signal_json,
-            );
-            requests[request_index] = .{
-                .request_id = request_ids[request_index][0..],
-                .operation = operation,
-                .kernel_sha256 = self.active.kernel_sha256[0..],
-                .candidate_id = entry.candidate_id,
-                .project_sha256 = self.active.project_sha256[0..],
-                .bundle_sha256 = self.active.bundle_sha256[0..],
-                .bundle_revision = self.active.revision,
-                .rule_spec = entry.rule_spec,
-                .payload = payload,
-            };
-            bindings[request_index] = .{
-                .request_id = request_ids[request_index],
-                .operation = operation,
-                .kernel_sha256 = self.active.kernel_sha256,
-                .candidate_id = candidate_id,
-                .project_sha256 = self.active.project_sha256,
-                .bundle_sha256 = self.active.bundle_sha256,
-                .bundle_revision = self.active.revision,
-            };
-            request_index += 1;
+        // The source-bound recovery obligation is the prerequisite for this
+        // host-synthesized transition, so it must be the first recorded
+        // verdict even when an older Edit rule precedes it in bundle order.
+        // The remaining applicable rules preserve their relative order.
+        for (0..2) |pass| {
+            for (self.active.rules, 0..) |entry, index| {
+                const is_recovery = index == rule_index;
+                if ((pass == 0) != is_recovery) continue;
+                if (!is_recovery and
+                    !std.mem.eql(u8, entry.rule_spec.target_tool, ordinaryTool(ordinary_payload)))
+                    continue;
+                const candidate_id = parseHex(entry.candidate_id) orelse
+                    return error.InvalidCandidateId;
+                const operation = if (is_recovery) recovery_operation else ordinary_operation;
+                const payload = if (is_recovery) recovery_payload else ordinary_payload;
+                const signal_json = if (is_recovery) recovery_signal_json else ordinary_signal_json;
+                request_ids[request_index] = kernel.requestId(
+                    operation,
+                    candidate_id,
+                    self.active.bundle_sha256,
+                    self.active.revision,
+                    signal_json,
+                );
+                requests[request_index] = .{
+                    .request_id = request_ids[request_index][0..],
+                    .operation = operation,
+                    .kernel_sha256 = self.active.kernel_sha256[0..],
+                    .candidate_id = entry.candidate_id,
+                    .project_sha256 = self.active.project_sha256[0..],
+                    .bundle_sha256 = self.active.bundle_sha256[0..],
+                    .bundle_revision = self.active.revision,
+                    .rule_spec = entry.rule_spec,
+                    .payload = payload,
+                };
+                bindings[request_index] = .{
+                    .request_id = request_ids[request_index],
+                    .operation = operation,
+                    .kernel_sha256 = self.active.kernel_sha256,
+                    .candidate_id = candidate_id,
+                    .project_sha256 = self.active.project_sha256,
+                    .bundle_sha256 = self.active.bundle_sha256,
+                    .bundle_revision = self.active.revision,
+                };
+                request_index += 1;
+            }
         }
         std.debug.assert(request_index == checker_rule_count);
         var batch = try kernel.invokeBatch(

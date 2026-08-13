@@ -639,7 +639,9 @@ test "L2 rejected auto-recovery dispatch start cancels inflight authorization" {
     const after = try readArtifact(allocator, path);
     defer allocator.free(after);
     try std.testing.expectEqualStrings("before\n", after);
-    try std.testing.expectEqual(@as(usize, 2), sink_state.formal_events);
+    // Both the denied Write and its synthesized Edit emit one non-authority
+    // filter event before their authority-bearing Lean batch.
+    try std.testing.expectEqual(@as(usize, 4), sink_state.formal_events);
     try std.testing.expectEqual(@as(usize, 1), sink_state.rejected_starts);
     try std.testing.expectEqual(@as(usize, 0), runtime.exact_edit_obligations_len);
     try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
@@ -1216,7 +1218,7 @@ test "L2 rejected dispatch start cancels exact recovery inflight state" {
     );
     try std.testing.expect(rejected == .host_fatal);
     try std.testing.expectEqual(@as(usize, 1), sink_state.rejected_starts);
-    try std.testing.expectEqual(@as(usize, 1), sink_state.formal_events);
+    try std.testing.expectEqual(@as(usize, 2), sink_state.formal_events);
     try std.testing.expectEqual(@as(usize, 0), runtime.exact_edit_obligations_len);
     try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
     const unchanged = try readArtifact(allocator, path);
@@ -2225,7 +2227,9 @@ test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edi
     // The unrelated Edit, exact recovery and new-file Write reached dispatch;
     // the prohibited Write, partial Edit and directory Write did not.
     try std.testing.expectEqual(@as(usize, 3), observed.dispatches.len);
-    try std.testing.expectEqual(@as(usize, 9), observed.formal_decisions.len);
+    // The unrelated Edit now closes through zero-checker filter events. It no
+    // longer fabricates two admissions from a Write-targeted rule.
+    try std.testing.expectEqual(@as(usize, 7), observed.formal_decisions.len);
     var blocked_regular: usize = 0;
     var admitted_missing: usize = 0;
     var blocked_other: usize = 0;
@@ -2244,8 +2248,8 @@ test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edi
 
     var impact = try cc.rule_impact_stats.derive(allocator, &observed, .{});
     defer impact.deinit(allocator);
-    try std.testing.expectEqual(@as(u64, 9), impact.formal_decisions);
-    try std.testing.expectEqual(@as(u64, 9), impact.physical_checker_calls);
+    try std.testing.expectEqual(@as(u64, 7), impact.formal_decisions);
+    try std.testing.expectEqual(@as(u64, 7), impact.physical_checker_calls);
     try std.testing.expectEqual(@as(u64, 1), impact.exact_edit_recovery_directions);
     try std.testing.expectEqual(@as(u64, 1), impact.exact_edit_recovery_pre_admits);
     try std.testing.expectEqual(@as(u64, 1), impact.exact_edit_recovery_pre_blocks);
@@ -2625,8 +2629,10 @@ test "L2 normal RunControl finish publishes a bound operational observer" {
         );
         defer loaded.deinit();
         try std.testing.expectEqualStrings("end_turn", loaded.stop_reason);
-        try std.testing.expectEqual(@as(u64, 2), loaded.snapshot.formal_decisions);
-        try std.testing.expectEqual(@as(u64, 2), loaded.snapshot.physical_checker_calls);
+        // This active rule targets Write; the Read is auditable through two
+        // zero-checker filter events and contributes no formal decisions.
+        try std.testing.expectEqual(@as(u64, 0), loaded.snapshot.formal_decisions);
+        try std.testing.expectEqual(@as(u64, 0), loaded.snapshot.physical_checker_calls);
         try std.testing.expectEqual(@as(u64, 1), loaded.snapshot.authoritative_dispatches);
         try std.testing.expectEqual(@as(u64, 1), loaded.snapshot.authoritative_successes);
         try std.testing.expect(loaded.snapshot.labels.task_success == null);
@@ -2915,7 +2921,7 @@ fn syntheticRecoveryWithEditAndBash(
     const source_id = cc.tools.tool_observation.sha256Hex("mixed-recovery-source");
     const edit_id = cc.tools.tool_observation.sha256Hex("mixed-recovery-edit");
     const bash_id = cc.tools.tool_observation.sha256Hex("mixed-recovery-bash");
-    rules[0] = .{
+    const source = cc.project_rule_bundle.RuleEntry{
         .candidate_id = try a.dupe(u8, &source_id),
         .rule_spec = cc.project_rule_spec.toWire(.{
             .target_tool = "Write",
@@ -2927,7 +2933,7 @@ fn syntheticRecoveryWithEditAndBash(
             .effect_requirement = .none,
         }),
     };
-    rules[1] = .{
+    const edit = cc.project_rule_bundle.RuleEntry{
         .candidate_id = try a.dupe(u8, &edit_id),
         .rule_spec = cc.project_rule_spec.toWire(.{
             .target_tool = "Edit",
@@ -2938,7 +2944,8 @@ fn syntheticRecoveryWithEditAndBash(
             .effect_requirement = .file_mutation_v1_reobserved,
         }),
     };
-    rules[2] = .{
+    rules[0] = edit;
+    rules[1] = .{
         .candidate_id = try a.dupe(u8, &bash_id),
         .rule_spec = cc.project_rule_spec.toWire(.{
             .target_tool = "Bash",
@@ -2949,6 +2956,9 @@ fn syntheticRecoveryWithEditAndBash(
             .effect_requirement = .none,
         }),
     };
+    // Deliberately place the source obligation after the Edit rule. Runtime
+    // recovery ordering must still evaluate and record the source first.
+    rules[2] = source;
     return .{
         .arena = arena,
         .project_sha256 = .{'a'} ** 64,
@@ -3108,7 +3118,7 @@ test "L2 multi-target recovery keeps obligations independent and journals one mi
         if (!std.mem.eql(u8, decision.dispatch_id, "multi-target-a-edit") or
             decision.phase != .pre)
             continue;
-        try std.testing.expectEqual(@as(u32, 2), decision.checker_batch_size);
+        try std.testing.expectEqual(@as(u32, 1), decision.checker_batch_size);
         if (pre_sequence) |sequence|
             try std.testing.expectEqual(sequence, decision.sequence)
         else
@@ -3128,11 +3138,11 @@ test "L2 multi-target recovery keeps obligations independent and journals one mi
         }
     }
     try std.testing.expectEqual(@as(usize, 1), recovery_pre);
-    try std.testing.expectEqual(@as(usize, 1), ordinary_pre);
+    try std.testing.expectEqual(@as(usize, 0), ordinary_pre);
 
     var impact = try cc.rule_impact_stats.derive(allocator, &observed, .{});
     defer impact.deinit(allocator);
-    try std.testing.expectEqual(@as(u64, 10), impact.formal_decisions);
+    try std.testing.expectEqual(@as(u64, 6), impact.formal_decisions);
     try std.testing.expectEqual(@as(u64, 6), impact.physical_checker_calls);
     try std.testing.expectEqual(@as(u64, 2), impact.exact_edit_recovery_directions);
     try std.testing.expectEqual(@as(u64, 2), impact.exact_edit_recovery_pre_admits);
@@ -3701,7 +3711,7 @@ test "L2 malformed Lean batch verdict fails before the real dispatcher" {
         .checker_path = checker_path,
         .expected_sha256 = cc.tools.tool_observation.sha256Hex(checker_script),
     };
-    var active = try syntheticActive(allocator, 4, config);
+    var active = try syntheticActiveForTool(allocator, 4, config, "Read");
     defer active.deinit();
     var runtime = cc.project_rule_gate.RuntimeGate{
         .allocator = allocator,
@@ -3872,7 +3882,7 @@ test "L2 same-cardinality batch binding drift has no durable verdict and no disp
         .checker_path = checker_path,
         .expected_sha256 = cc.tools.tool_observation.sha256Hex(checker_script),
     };
-    var active = try syntheticActive(allocator, 4, config);
+    var active = try syntheticActiveForTool(allocator, 4, config, "Read");
     defer active.deinit();
     var runtime = cc.project_rule_gate.RuntimeGate{
         .allocator = allocator,
