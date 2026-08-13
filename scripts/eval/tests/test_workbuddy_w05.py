@@ -45,6 +45,7 @@ class WorkBuddyW05RunnerTest(unittest.TestCase):
         return [
             {
                 "seq": number,
+                "route": "fixture-run--metacodes-w05-mock",
                 "trial_id": f"{TASK_NAME}__fixture",
                 "request": {
                     "upstream_url": "http://127.0.0.1:4123/v1/messages",
@@ -58,7 +59,7 @@ class WorkBuddyW05RunnerTest(unittest.TestCase):
     def _bodies():
         return [
             {
-                "model": "fixture-run--metacodes-w05-mock",
+                "model": "glm-5.2",
                 "stream": True,
                 "messages": [{"role": "user", "content": f"turn-{number}"}],
             }
@@ -72,6 +73,11 @@ class WorkBuddyW05RunnerTest(unittest.TestCase):
 
         drifted = self._proxy_rows(bodies)
         drifted[3]["request"]["upstream_body"]["messages"][0]["content"] = "drift"
+        with self.assertRaisesRegex(W05Error, "drifted at 4"):
+            _proxy_audit(drifted, mock_rows)
+
+        drifted = self._proxy_rows(bodies)
+        drifted[3]["route"] = "another-run--metacodes-w05-mock"
         with self.assertRaisesRegex(W05Error, "drifted at 4"):
             _proxy_audit(drifted, mock_rows)
 

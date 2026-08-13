@@ -368,15 +368,19 @@ def _proxy_audit(
     if len(records) != EXPECTED_PROVIDER_REQUESTS or len(records) != len(mock_rows):
         raise W05Error("WorkBuddy proxy request count differs from mock audit")
     try:
-        expected_model = _model_route_suffix(mock_rows[0].get("model"))
+        expected_route = _model_route_suffix(records[0].get("route"))
+        expected_model = str(mock_rows[0].get("model") or "")
     except IndexError as exc:
         raise W05Error("WorkBuddy proxy/mock request audit is empty") from exc
+    if not expected_model:
+        raise W05Error("WorkBuddy mock provider model identity is missing")
     for number, (row, mock_row) in enumerate(zip(records, mock_rows), 1):
         request = row.get("request")
         upstream = request.get("upstream_body") if isinstance(request, Mapping) else None
         upstream_url = request.get("upstream_url") if isinstance(request, Mapping) else None
         if (
             row.get("seq") != number
+            or row.get("route") != expected_route
             or not str(row.get("trial_id") or "").startswith(f"{TASK_NAME}__")
             or not isinstance(upstream, Mapping)
             or upstream.get("model") != expected_model
