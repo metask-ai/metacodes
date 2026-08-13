@@ -244,6 +244,7 @@ const Probe = struct {
     run_state_saw_executing_tools: bool = false,
     run_state_saw_completed: bool = false,
     run_state_terminal_empty: bool = false,
+    run_state_invariant_valid: bool = true,
     run_state_last_run_id: u64 = 0,
     run_state_last_seq: u64 = 0,
 
@@ -267,6 +268,8 @@ const Probe = struct {
                 .tool_result => self.saw_tool_result = true,
                 .run_state => |state| {
                     self.saw_run_state = true;
+                    if (state.phase == .generating and state.in_flight_tools.len != 0)
+                        self.run_state_invariant_valid = false;
                     if (self.run_state_last_run_id != state.run_id) {
                         self.run_state_last_run_id = state.run_id;
                         self.run_state_last_seq = 0;
@@ -4088,6 +4091,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
     try std.testing.expect(probe.saw_tool_start and probe.saw_tool_result and probe.saw_run_state);
     try std.testing.expect(probe.run_state_sequence_valid);
+    try std.testing.expect(probe.run_state_invariant_valid);
     try std.testing.expect(probe.run_state_saw_starting and
         probe.run_state_saw_executing_tools and
         probe.run_state_saw_completed and

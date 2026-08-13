@@ -1015,7 +1015,12 @@ const AbiSession = struct {
         switch (event) {
             .progress => |value| {
                 changed = self.run_state_projector.observeProgress(value.turn, value.tool_calls);
-                changed = self.run_state_projector.setPhase(.generating) or changed;
+                if (self.run_state_projector.inFlightCount() == 0)
+                    changed = self.run_state_projector.setPhase(.generating) or changed;
+            },
+            .stream_begin => {
+                if (self.run_state_projector.inFlightCount() == 0)
+                    changed = self.run_state_projector.setPhase(.generating);
             },
             .tool_start => |value| {
                 const added = self.run_state_projector.addTool(value.id, value.name) catch {
@@ -1037,11 +1042,14 @@ const AbiSession = struct {
                 changed = self.run_state_projector.setPhase(.waiting_ui);
             },
             .diag_compact_request => |value| {
-                if (std.mem.eql(u8, value.outcome, "started")) {
-                    changed = self.run_state_projector.setPhase(.compacting);
-                } else if (self.run_state_projector.phase == .compacting) {
+                _ = value;
+            },
+            .diag_compact_begin => {
+                changed = self.run_state_projector.setPhase(.compacting);
+            },
+            .diag_compact_end => {
+                if (self.run_state_projector.phase == .compacting)
                     changed = self.run_state_projector.setPhase(.generating);
-                }
             },
             .diag_run_end => |value| {
                 if (self.run_state_projector.setPhase(.finalizing)) {

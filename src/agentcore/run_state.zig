@@ -151,3 +151,14 @@ test "projector owns tool references independently of input buffers" {
     try std.testing.expectEqualStrings("ab", snapshot.in_flight_tools[0].tool_call_id);
     try std.testing.expectEqualStrings("Read", snapshot.in_flight_tools[0].name);
 }
+
+test "progress sampling cannot leave generating with in-flight tools" {
+    var projector = Projector.init(std.testing.allocator);
+    defer projector.deinit();
+    projector.begin(7);
+    _ = try projector.addTool("read", "Read");
+    try std.testing.expect(projector.setPhase(.executing_tools));
+    _ = projector.observeProgress(1, 1);
+    try std.testing.expectEqual(protocol.RunStatePhase.executing_tools, projector.phase);
+    try std.testing.expectEqual(@as(usize, 1), projector.inFlightCount());
+}

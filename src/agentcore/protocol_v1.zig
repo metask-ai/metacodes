@@ -74,6 +74,8 @@ pub fn event(value: InternalEvent) ?public.CoreEvent {
         .diag_turn_end,
         .diag_model_request,
         .diag_compact_request,
+        .diag_compact_begin,
+        .diag_compact_end,
         .diag_tool_stage,
         .diag_breaker_tripped,
         .diag_cache_break,

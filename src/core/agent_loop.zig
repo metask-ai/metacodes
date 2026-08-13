@@ -881,7 +881,10 @@ pub fn run(
             const rid = rid_for_turn;
             log.infoId("agent", rid, "stream opened, reading events", .{});
 
-            if (opts.colorize) backend.emitEvent(sess, .stream_begin);
+            // This is a semantic model-attempt boundary, not only an ANSI
+            // color hint. Consumers that observe lifecycle state must see it
+            // after a retry succeeds even when colorization is disabled.
+            backend.emitEvent(sess, .stream_begin);
             var aborted_during_stream = false;
             var stream_error = false;
             var stream_context_window_exceeded = false;
@@ -2013,16 +2016,23 @@ fn runAutoCompactIfNeeded(
         // 任务锚:进行中的任务确定性追加到摘要尾(压缩有损,闭环纪律硬保底)。
         const task_anchor: ?[]u8 = if (tasks) |ts| compact_summary.buildTaskAnchor(allocator, ts) else null;
         defer if (task_anchor) |a| allocator.free(a);
-        // Lifecycle boundary: the compact request is now admitted. The
-        // completion diagnostic below remains useful for elapsed/outcome
-        // telemetry, while the ABI RunState projector observes this start
-        // boundary before provider work begins.
-        backend.emitEvent(sess, .{ .diag_compact_request = .{
+        // Lifecycle boundary: compact is now admitted. Keep this separate
+        // from diag_compact_request, whose existing meaning is the completed
+        // provider summary request consumed by evaluation telemetry.
+        const compact_started_ns = util_time.nowNs();
+        var compact_lifecycle_outcome: []const u8 = "api_error";
+        backend.emitEvent(sess, .{ .diag_compact_begin = .{
             .trace_id = trace_id,
             .depth = depth,
             .turn = turn,
-            .elapsed_ms = 0,
-            .outcome = "started",
+            .cause = trigger_cause,
+        } });
+        defer backend.emitEvent(sess, .{ .diag_compact_end = .{
+            .trace_id = trace_id,
+            .depth = depth,
+            .turn = turn,
+            .elapsed_ms = elapsedSinceNs(compact_started_ns),
+            .outcome = compact_lifecycle_outcome,
             .cause = trigger_cause,
         } });
         const EstimateContext = struct {
@@ -2100,7 +2110,10 @@ fn runAutoCompactIfNeeded(
             } });
         }
         switch (report.outcome) {
-            .aborted => return .aborted,
+            .aborted => {
+                compact_lifecycle_outcome = "aborted";
+                return .aborted;
+            },
             .no_change => {
                 if (compact_model_override == null and report.summary_request != null) {
                     if (summary_reserve_tokens) |reserve|
@@ -2109,8 +2122,10 @@ fn runAutoCompactIfNeeded(
                 const active_reserve = if (summary_reserve_tokens) |reserve| reserve.* else 0;
                 log.warn("agent", "auto-compact skipped: summary savings below {d}% before_tokens={d} after_tokens={d} summary_reserve_tokens={d} paid_request={} cause={s}", .{ COMPACT_MIN_SAVED_PERCENT, report.before_tokens, report.after_tokens, active_reserve, report.summary_request != null, trigger_cause });
                 outcome = .skipped_no_savings;
+                compact_lifecycle_outcome = "no_change";
             },
             .compacted, .degraded => {
+                compact_lifecycle_outcome = if (report.outcome == .compacted) "compacted" else "degraded";
                 if (compact_model_override == null) {
                     if (summary_reserve_tokens) |reserve| reserve.* = 0;
                 }
@@ -2943,6 +2958,9 @@ test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool s
         compact_requests: u32 = 0,
         compact_request_outcome: ?[]const u8 = null,
         compact_request_cause: ?[]const u8 = null,
+        compact_begins: u32 = 0,
+        compact_ends: u32 = 0,
+        compact_end_outcome: ?[]const u8 = null,
         fn emit(ctx: *anyopaque, _: @import("session_id.zig").SessionId, ev: CoreEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             switch (ev) {
@@ -2954,6 +2972,11 @@ test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool s
                     self.compact_requests += 1;
                     self.compact_request_outcome = request.outcome;
                     self.compact_request_cause = request.cause;
+                },
+                .diag_compact_begin => self.compact_begins += 1,
+                .diag_compact_end => |event| {
+                    self.compact_ends += 1;
+                    self.compact_end_outcome = event.outcome;
                 },
                 else => {},
             }
@@ -2995,6 +3018,9 @@ test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool s
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
     try std.testing.expect(cap.dropped > 0);
     try std.testing.expectEqual(@as(u32, 1), cap.compact_requests);
+    try std.testing.expectEqual(@as(u32, 1), cap.compact_begins);
+    try std.testing.expectEqual(@as(u32, 1), cap.compact_ends);
+    try std.testing.expectEqualStrings("compacted", cap.compact_end_outcome.?);
     try std.testing.expectEqualStrings("success", cap.compact_request_outcome.?);
     try std.testing.expectEqualStrings("post_tool_follow_up_threshold", cap.compact_request_cause.?);
     // 投影:原始消息全量保留(len 不变),收缩的是活跃窗口。
