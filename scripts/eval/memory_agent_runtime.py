@@ -2966,6 +2966,14 @@ def run_memory_agent_schedule(
                     )
                 _write_new(batch_path, batch)
                 local.command("apply", store, (str(batch_path),))
+                # Text search is a derived TinyKG catalog.  A freshly applied
+                # store is intentionally stale until the host publishes that
+                # catalog, so make publication part of store preparation --
+                # before the first digest, read-only sandbox probe, budget
+                # authorization, or provider request.  Reused procedural
+                # stores are published by the online consolidation boundary
+                # and must never be repaired implicitly by an offline reader.
+                local.command("rebuild-text", store, ())
                 abstraction_nodes = counts["abstraction_nodes"]
                 if case["benchmark"] == "procedural_transfer":
                     procedural_stores[family_key] = {

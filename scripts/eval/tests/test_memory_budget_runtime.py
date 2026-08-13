@@ -841,7 +841,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
         platform.system() == "Darwin" and REAL_TINYKG.is_file(),
         "requires macOS Seatbelt and the pinned TinyKG binary",
     )
-    def test_real_tinykg_read_probe_failure_precedes_authorization_and_provider(self):
+    def test_real_tinykg_catalog_publication_and_probe_precede_authorization(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest = copy.deepcopy(load_manifest(FIXTURES / "smoke-manifest.json"))
@@ -856,7 +856,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                 for item in manifest["execution"]["arms"]
                 if item["id"] == "no_memory"
             )
-            manifest["dataset"]["adapter_id"] = "hotpotqa-distractor"
+            manifest["dataset"]["adapter_id"] = "longmemeval-s-cleaned"
             manifest["dataset"]["adapter_revision"] = "real-tinykg-preauth-l2-v1"
             source = {
                 "adapter_id": manifest["dataset"]["adapter_id"],
@@ -864,15 +864,17 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                 "cases": [
                     {
                         "id": case["id"],
-                        "documents": [
+                        "sessions": [
                             {
-                                "id": "document:warning-labels",
-                                "title": "Routine warning labels",
-                                "sentences": [
+                                "id": "session:warning-labels",
+                                "source_position": 0,
+                                "date": "2026/08/13 (Thu) 09:00",
+                                "turns": [
                                     {
-                                        "id": "episode:preference:1",
-                                        "sentence_id": 0,
-                                        "text": "The user chose amber for routine warning labels.",
+                                        "id": "turn:warning-labels:0",
+                                        "turn_index": 0,
+                                        "role": "user",
+                                        "content": "The user chose amber for routine warning labels.",
                                     }
                                 ],
                             }
@@ -906,10 +908,58 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
             manifest_path = root / "manifest.json"
             manifest_path.write_text(stable_json(manifest) + "\n", encoding="utf-8")
             manifest = load_manifest(manifest_path)
+            failed_journal_path = root / "budget-control-failed" / "journal.json"
+            failed_journal_path.parent.mkdir(mode=0o700)
+            original_command = memory_runtime.LocalTinyKg.command
+
+            def fail_catalog_publication(local, action, store, extra):
+                if action == "rebuild-text":
+                    raise ValidationError("injected TinyKG catalog publication failure")
+                return original_command(local, action, store, extra)
+
+            with _AuthorizationObservingServer(failed_journal_path) as failed_provider:
+                failed_fake = root / "fake-metacodes-rebuild-failure"
+                self._write_fake_metacodes(failed_fake, failed_provider.url)
+                with BudgetJournal(
+                    failed_journal_path,
+                    self._authority(manifest),
+                ) as failed_journal:
+                    with mock.patch.object(
+                        memory_runtime.LocalTinyKg,
+                        "command",
+                        new=fail_catalog_publication,
+                    ):
+                        with self.assertRaisesRegex(
+                            ValidationError,
+                            "injected TinyKG catalog publication failure",
+                        ):
+                            failed_run = root / "run-real-tinykg-rebuild-failure"
+                            run_memory_agent_schedule(
+                                metacodes_binary=failed_fake,
+                                expected_metacodes_sha256=file_sha256(failed_fake),
+                                tinykg_binary=REAL_TINYKG,
+                                expected_tinykg_sha256=file_sha256(REAL_TINYKG),
+                                source_path=source_path,
+                                manifest_path=manifest_path,
+                                run_dir=failed_run,
+                                observations_path=failed_run / "observations.jsonl",
+                                runtime_receipt_path=failed_run / "runtime-receipt.json",
+                                timeout_seconds=30,
+                                production=self._production(),
+                                budget_journal=failed_journal,
+                            )
+                    failed_snapshot = failed_journal.snapshot()
+                    self.assertEqual(failed_snapshot["transaction_states"], {})
+                    self.assertEqual(failed_snapshot["exposure_cost_microusd"], 0)
+                    self.assertEqual(failed_snapshot["exposure_metered_tokens"], 0)
+                self.assertEqual(failed_provider.requests, 0)
+                self.assertFalse(failed_provider.errors)
+
             journal_path = root / "budget-control" / "journal.json"
             journal_path.parent.mkdir(mode=0o700)
             production = self._production()
             observed_probe = []
+            prepared_store_digests = []
             original_probe = memory_runtime._run_production_sandbox_probe
 
             def fail_after_real_probe(*args, **kwargs):
@@ -917,8 +967,8 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                     item for item in kwargs["read_only_probes"] if item[1].exists()
                 )
                 probe_binary, probe_store, _probe_query = kwargs["tinykg_read_probe"]
-                rebuilt = subprocess.run(
-                    [str(probe_binary), "rebuild-text", str(probe_store)],
+                store_info = subprocess.run(
+                    [str(probe_binary), "store-info", str(probe_store)],
                     env={"PATH": os.defpath, "LC_ALL": "C", "LANG": "C"},
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
@@ -927,8 +977,14 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                     timeout=30,
                     check=False,
                 )
-                self.assertEqual(rebuilt.returncode, 0, rebuilt.stderr)
+                self.assertEqual(store_info.returncode, 0, store_info.stderr)
+                self.assertIn("text_current=1", store_info.stdout)
+                self.assertIn("text_stale=0", store_info.stdout)
+                prepared_store_digests.append(_artifact_tree_digest(probe_store))
                 evidence = original_probe(*args, **kwargs)
+                self.assertEqual(
+                    _artifact_tree_digest(probe_store), prepared_store_digests[-1]
+                )
                 observed_probe.append(evidence)
                 raise ValidationError("injected after real TinyKG read probe")
 
@@ -942,9 +998,6 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                     with mock.patch(
                         "scripts.eval.memory_agent_runtime._run_production_sandbox_probe",
                         side_effect=fail_after_real_probe,
-                    ), mock.patch(
-                        "scripts.eval.memory_agent_runtime.load_manifest",
-                        return_value=manifest,
                     ):
                         with self.assertRaisesRegex(
                             ValidationError, "injected after real TinyKG read probe"
@@ -970,6 +1023,8 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                     self.assertEqual(snapshot["exposure_metered_tokens"], 0)
                 self.assertEqual(provider.requests, 0)
                 self.assertEqual(len(observed_probe), 1)
+                self.assertEqual(len(prepared_store_digests), 1)
+                self.assertTrue(observed_probe[0]["tinykg_read_probe_performed"])
                 self.assertTrue(observed_probe[0]["tinykg_store_unchanged"])
                 self.assertTrue(observed_probe[0]["tinykg_lock_path_clean"])
 
