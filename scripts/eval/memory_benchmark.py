@@ -31,6 +31,12 @@ PROTOCOL_ID = "metacodes-memory-maturation-v1"
 SCHEMA_VERSION = 2
 BENCHMARKS = frozenset({"episodic_recall", "multihop_retrieval", "procedural_transfer"})
 WRITE_MODES = frozenset({"disabled", "online", "read_only"})
+QA_EXECUTION_INSTRUCTIONS = (
+    "Answer only from context exposed by the harness. Do not inspect or modify "
+    "the workspace, and do not use workspace tools. Dedicated recall tools may "
+    "be used when available. If the evidence is unavailable, answer briefly "
+    "that it is unavailable."
+)
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 TOP_LEVEL_KEYS = frozenset(
     {
@@ -58,6 +64,27 @@ TOP_LEVEL_KEYS = frozenset(
 
 def _fail(where: str, message: str) -> None:
     raise ValidationError(f"{where}: {message}")
+
+
+def is_online_memory_case(case: Mapping[str, Any]) -> bool:
+    """Return the sole lifecycle phase allowed to mutate durable memory.
+
+    QA datasets use ``split=test`` and are read-only.  Keeping this predicate
+    centralized prevents callers from accidentally equating read-only with the
+    procedural benchmark's historical ``offline`` spelling.
+    """
+
+    return case.get("benchmark") == "procedural_transfer" and case.get("split") == "online"
+
+
+def qa_execution_prompt(question: str) -> str:
+    """Apply the arm-independent QA execution boundary frozen by adapters."""
+
+    # Keep the evidence-bearing question first: host-scoped TinyKG recall uses
+    # the first bounded prompt bytes as its exact lexical seed.  The common
+    # execution boundary belongs after that seed and remains identical in all
+    # arms.
+    return f"{question}\n\n{QA_EXECUTION_INSTRUCTIONS}"
 
 
 def _string(value: Any, where: str) -> str:
@@ -360,14 +387,15 @@ def validate_memory_row(row: Mapping[str, Any], where: str = "memory row") -> No
             f"{where}.memory.inserted_nodes",
             f"{write_mode} memory must not insert nodes",
         )
+    online_memory = benchmark == "procedural_transfer" and split == "online"
     if (
-        benchmark == "procedural_transfer"
-        and split == "offline"
+        row["arm"] != "no_memory"
+        and not online_memory
         and write_mode not in {"read_only", "disabled"}
     ):
         _fail(
             f"{where}.memory.write_mode",
-            "offline procedural evaluation must be read_only or disabled",
+            "read-only evaluation must use read_only or disabled memory",
         )
     if split == "offline" and memory["inserted_nodes"] != 0:
         _fail(f"{where}.memory.inserted_nodes", "offline evaluation must not insert nodes")
@@ -416,8 +444,11 @@ def validate_memory_row(row: Mapping[str, Any], where: str = "memory row") -> No
         _fail(f"{where}.governance", "stale rejections exceed stale candidates")
     if governance["contradictory_rejected"] > governance["contradictory_candidates"]:
         _fail(f"{where}.governance", "contradiction rejections exceed candidates")
-    if split == "offline" and governance["offline_write_events"] != 0:
-        _fail(f"{where}.governance.offline_write_events", "offline write leakage is invalid")
+    if not online_memory and governance["offline_write_events"] != 0:
+        _fail(
+            f"{where}.governance.offline_write_events",
+            "offline write leakage is invalid for every read-only lifecycle",
+        )
 
     cost = _object(row["cost"], f"{where}.cost", ("cost_usd", "wall_time_ms"))
     _number(cost["cost_usd"], f"{where}.cost.cost_usd")

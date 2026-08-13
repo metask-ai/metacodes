@@ -22,6 +22,8 @@ from scripts.eval.memory_agent_runtime import (
     _copy_memory_tree,
     _estimated_costs_match,
     _host_recall_covers_missing_explicit_recall,
+    _assert_tinykg_read_transients_clean,
+    _prepare_tinykg_read_transients,
     _project_domain,
     _production_environment,
     _materialize_production_sandbox,
@@ -2795,6 +2797,38 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 os.environ.pop("METASK_API_KEY", None)
                 self.assertEqual(_load_api_key(auth), "private-file-key")
 
+    def test_tinykg_read_transients_fail_closed_on_unsafe_or_leaked_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = root / "store.kg"
+            store.mkdir()
+            _prepare_tinykg_read_transients(store)
+            _assert_tinykg_read_transients_clean(store, "test TinyKG transients")
+
+            leaked = store / ".tinykg_leases" / "reader.lease"
+            leaked.write_text("unreleased\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValidationError, "read lease was not released"):
+                _assert_tinykg_read_transients_clean(store, "test TinyKG transients")
+            leaked.unlink()
+
+            lock = store / ".tinykg-cli.lock"
+            lock.write_text("unreleased\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValidationError, "CLI lock was not released"):
+                _assert_tinykg_read_transients_clean(store, "test TinyKG transients")
+            lock.unlink()
+
+            (store / ".tinykg_leases").rmdir()
+            target = root / "attacker-leases"
+            target.mkdir()
+            (store / ".tinykg_leases").symlink_to(target, target_is_directory=True)
+            with self.assertRaisesRegex(ValidationError, "must be a real directory"):
+                _assert_tinykg_read_transients_clean(store, "test TinyKG transients")
+
+            linked_store = root / "linked-store.kg"
+            linked_store.symlink_to(store, target_is_directory=True)
+            with self.assertRaisesRegex(ValidationError, "store must be a real directory"):
+                _prepare_tinykg_read_transients(linked_store)
+
     @unittest.skipUnless(platform.system() == "Darwin", "requires macOS Seatbelt")
     def test_production_seatbelt_denies_host_sibling_and_process_info(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2823,6 +2857,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             store_manifest = store / ".tinykg" / "store-manifest.json"
             store_manifest.parent.mkdir()
             store_manifest.write_text('{"revision":1}\n', encoding="utf-8")
+            (store / ".tinykg_leases").mkdir(mode=0o700)
             store_before = hashlib.sha256(store_manifest.read_bytes()).hexdigest()
 
             sandbox = _materialize_production_sandbox(
@@ -2941,6 +2976,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             tinykg("init", store)
             tinykg("apply", store, batch)
             tinykg("rebuild-text", store)
+            _prepare_tinykg_read_transients(store)
             store_manifest = store / ".tinykg" / "store-manifest.json"
             store_digest_before = _artifact_tree_digest(store)
             host = root / "host-sentinel.txt"
@@ -2980,6 +3016,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             self.assertRegex(evidence["tinykg_store_info_sha256"], r"^[0-9a-f]{64}$")
             self.assertRegex(evidence["tinykg_recall_sha256"], r"^[0-9a-f]{64}$")
             self.assertFalse((store / ".tinykg-cli.lock").exists())
+            self.assertTrue((store / ".tinykg_leases").is_dir())
+            self.assertEqual(list((store / ".tinykg_leases").iterdir()), [])
             self.assertEqual(_artifact_tree_digest(store), store_digest_before)
             _assert_production_sandbox_identity(sandbox, evidence_path)
 
@@ -4210,10 +4248,10 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 "read_only_roots_enforced": True,
                 "read_only_root_count": (
                     2
-                    if rollout["memory_phase"] == "offline"
+                    if rollout["memory_phase"] != "online"
                     and rollout["memory_backend"] == "tinykg_integrated"
                     else 1
-                    if rollout["memory_phase"] == "offline"
+                    if rollout["memory_phase"] != "online"
                     and rollout["memory_backend"] == "markdown"
                     else 0
                 ),
@@ -4221,30 +4259,30 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                     f"sandbox-read-only-roots:{sequence}"
                 ),
                 "tinykg_read_probe_performed": (
-                    rollout["memory_phase"] == "offline"
+                    rollout["memory_phase"] != "online"
                     and rollout["memory_backend"] == "tinykg_integrated"
                 ),
                 "tinykg_store_info_sha256": (
                     digest(f"tinykg-store-info:{sequence}")
-                    if rollout["memory_phase"] == "offline"
+                    if rollout["memory_phase"] != "online"
                     and rollout["memory_backend"] == "tinykg_integrated"
                     else None
                 ),
                 "tinykg_recall_sha256": (
                     digest(f"tinykg-recall:{sequence}")
-                    if rollout["memory_phase"] == "offline"
+                    if rollout["memory_phase"] != "online"
                     and rollout["memory_backend"] == "tinykg_integrated"
                     else None
                 ),
                 "tinykg_lock_path_clean": (
                     True
-                    if rollout["memory_phase"] == "offline"
+                    if rollout["memory_phase"] != "online"
                     and rollout["memory_backend"] == "tinykg_integrated"
                     else None
                 ),
                 "tinykg_store_unchanged": (
                     True
-                    if rollout["memory_phase"] == "offline"
+                    if rollout["memory_phase"] != "online"
                     and rollout["memory_backend"] == "tinykg_integrated"
                     else None
                 ),

@@ -20,13 +20,13 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
-from .memory_benchmark import PROTOCOL_ID
+from .memory_benchmark import PROTOCOL_ID, qa_execution_prompt
 from .memory_replay import REPLAY_SCHEMA_VERSION, validate_manifest
 from .model import ValidationError, stable_json
 
 
 ADAPTER_ID = "hotpotqa-distractor"
-ADAPTER_REVISION = "official-json-hash-subset-v2"
+ADAPTER_REVISION = "official-json-hash-subset-v3-bounded-qa"
 DATASET_ID = "hotpotqa-distractor-dev-v1"
 SOURCE_SLICE_SCHEMA_VERSION = 1
 SOURCE_POLICY_SCHEMA_VERSION = 1
@@ -486,7 +486,7 @@ def build_manifest(
                 "id": corpus_case["id"],
                 "benchmark": "multihop_retrieval",
                 "split": "test",
-                "prompt": record["question"],
+                "prompt": qa_execution_prompt(record["question"]),
                 "gold_answers": [record["answer"]],
                 "expected_evidence_ids": expected,
                 "grader": {

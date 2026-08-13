@@ -21,6 +21,7 @@ from .memory_benchmark import (
     PROTOCOL_ID,
     SCHEMA_VERSION as RESULT_SCHEMA_VERSION,
     file_sha256,
+    is_online_memory_case,
     normalized_exact_match,
     validate_memory_row,
 )
@@ -2392,7 +2393,7 @@ def _validate_production_runtime_receipt(
         elif scoped_recall_bound and scoped_recall is not None:
             _fail(f"{rollout_where}.scoped_recall", "control arm must use null")
 
-        online = case["benchmark"] == "procedural_transfer" and case["split"] == "online"
+        online = is_online_memory_case(case)
         consolidation = rollout.get("consolidation") if scoped_recall_bound else None
 
         observation = observations[sequence]
@@ -2500,7 +2501,7 @@ def _validate_production_runtime_receipt(
                     _hash(components["tinykg"], f"{rollout_where}.{components_where}.tinykg")
             if state_before != _canonical_sha256(before_components) or state_after != _canonical_sha256(after_components):
                 _fail(rollout_where, "memory state does not bind its components")
-        online = case["benchmark"] == "procedural_transfer" and phase == "online"
+        online = is_online_memory_case(case)
         expected_write_mode = "disabled" if expected_backend == "none" else "online" if online else "read_only"
         if memory.get("write_mode") != expected_write_mode:
             _fail(f"{rollout_where}.observation.memory.write_mode", "lifecycle mismatch")
@@ -2520,7 +2521,7 @@ def _validate_production_runtime_receipt(
                 )
         if not online and (memory_writes != 0 or state_before != state_after):
             _fail(rollout_where, "read-only phase changed durable memory state")
-        if phase == "offline" and governance.get("offline_write_events") != 0:
+        if not online and governance.get("offline_write_events") != 0:
             _fail(f"{rollout_where}.observation.governance", "offline write leakage")
         host_recall_injected = bool(
             isinstance(scoped_recall, dict) and scoped_recall.get("status") == "injected"
@@ -2534,7 +2535,7 @@ def _validate_production_runtime_receipt(
             )
         markdown_activation_missing = bool(
             scoped_recall_bound
-            and phase == "offline"
+            and not online
             and expected_backend == "markdown"
             and auto_injected_bytes <= 0
             and tool_result_bytes <= 0
@@ -2547,7 +2548,7 @@ def _validate_production_runtime_receipt(
         )
         tinykg_activation_missing = bool(
             scoped_recall_bound
-            and phase == "offline"
+            and not online
             and tinykg_enabled
             and not host_recall_injected
             and not explicit_recall
@@ -3048,7 +3049,7 @@ def validate_runtime_receipt(
             rollout["raw_store_digest_after"],
             f"{rollout_where}.raw_store_digest_after",
         )
-        online_memory = case["benchmark"] == "procedural_transfer" and case["split"] == "online"
+        online_memory = is_online_memory_case(case)
         if tinykg_enabled:
             _hash(before, f"{rollout_where}.store_revision_before")
             _hash(after, f"{rollout_where}.store_revision_after")
@@ -3147,7 +3148,7 @@ def validate_runtime_receipt(
                 )
             if graph.get("revision") != state_after:
                 _fail(f"{rollout_where}.observation.graph.revision", "does not bind post-state")
-            if case["split"] == "offline" and governance.get("offline_write_events") != 0:
+            if not online_memory and governance.get("offline_write_events") != 0:
                 _fail(f"{rollout_where}.observation.governance", "offline write leakage")
     estimated_total = sum(float(item["estimated_cost_usd"]) for item in rollouts)
     if not math.isfinite(estimated_total) or abs(estimated_cost_usd - estimated_total) > 1e-12:
@@ -3519,7 +3520,7 @@ def validate_runtime_artifacts(
                     f"{rollout_where}.sandbox.probe.read_only_roots_sha256",
                 )
                 expected_read_only_roots = 0
-                if raw_rollout.get("memory_phase") == "offline":
+                if raw_rollout.get("memory_phase") != "online":
                     memory_backend = raw_rollout.get("memory_backend")
                     expected_read_only_roots = (
                         2
@@ -3535,7 +3536,7 @@ def validate_runtime_artifacts(
                     )
             if tinykg_probe:
                 expected_tinykg_probe = (
-                    raw_rollout.get("memory_phase") == "offline"
+                    raw_rollout.get("memory_phase") != "online"
                     and raw_rollout.get("memory_backend") == "tinykg_integrated"
                 )
                 if evidence["tinykg_read_probe_performed"] is not expected_tinykg_probe:

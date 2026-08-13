@@ -193,6 +193,18 @@ class MemoryBenchmarkTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "offline write leakage"):
             validate_memory_row(row)
 
+    def test_qa_test_rows_share_the_same_read_only_governance(self):
+        row = memory_row(split="test")
+        row["governance"]["offline_write_events"] = 1
+        with self.assertRaisesRegex(ValidationError, "offline write leakage"):
+            validate_memory_row(row)
+
+        row = memory_row(split="test")
+        row["memory"]["write_mode"] = "online"
+        row["memory"]["inserted_nodes"] = 0
+        with self.assertRaisesRegex(ValidationError, "read-only evaluation"):
+            validate_memory_row(row)
+
     def test_read_only_and_offline_rows_cannot_claim_inserted_nodes(self):
         row = memory_row(
             benchmark="procedural_transfer",

@@ -906,12 +906,6 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
             manifest_path = root / "manifest.json"
             manifest_path.write_text(stable_json(manifest) + "\n", encoding="utf-8")
             manifest = load_manifest(manifest_path)
-            # QA manifests intentionally expose only ``test``. Inject the
-            # internal read-only phase after public validation so this L2 can
-            # isolate the runner's offline TinyKG -> budget seam without first
-            # spending an unrelated procedural online transaction.
-            runtime_manifest = copy.deepcopy(manifest)
-            runtime_manifest["cases"][0]["split"] = "offline"
             journal_path = root / "budget-control" / "journal.json"
             journal_path.parent.mkdir(mode=0o700)
             production = self._production()
@@ -943,14 +937,14 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                 self._write_fake_metacodes(fake, provider.url)
                 with BudgetJournal(
                     journal_path,
-                    self._authority(runtime_manifest, production),
+                    self._authority(manifest, production),
                 ) as journal:
                     with mock.patch(
                         "scripts.eval.memory_agent_runtime._run_production_sandbox_probe",
                         side_effect=fail_after_real_probe,
                     ), mock.patch(
                         "scripts.eval.memory_agent_runtime.load_manifest",
-                        return_value=runtime_manifest,
+                        return_value=manifest,
                     ):
                         with self.assertRaisesRegex(
                             ValidationError, "injected after real TinyKG read probe"
