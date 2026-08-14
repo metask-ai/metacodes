@@ -435,6 +435,14 @@ const KG_ENUMERATION_BATCH_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+const KG_ENUMERATION_CONTEXT_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"context\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"context1\",\"name\":\"KgContext\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"node_id\\\":1,\\\"limit\\\":10}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
 const KG_ENUMERATION_FINAL_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"final\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
@@ -551,8 +559,9 @@ test "L2 KG governance: freshness and contradiction contract enters the actual A
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "count/cardinality, exhaustive-list") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "One positive hit proves existence, never completeness") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "successful v3 receipt proves every member ran") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "host records a coverage obligation") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "rejects a premature final answer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "when the governed run has candidates and KgContext is available") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "rejects premature final answers until the available obligations commit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "zero-candidate batch does not create an impossible KgContext obligation") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "necessary, not sufficient") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "mechanism, symptom, desired outcome, or nearby implementation term") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Deduplicate candidates by node_id across every call") != null);
@@ -774,7 +783,7 @@ test "L2 KG governance: v3 batch executes every variant and exposes each node bo
     }
 }
 
-test "L2 KG governance: real agent loop rejects enumeration final until v3 batch commits" {
+test "L2 KG governance: real agent loop requires enumeration batch and recalled-node context" {
     const a = std.testing.allocator;
     const bin = findBin(a) orelse return error.SkipZigTest;
     defer a.free(bin);
@@ -791,19 +800,21 @@ test "L2 KG governance: real agent loop rejects enumeration final until v3 batch
     defer kg.deinit();
     kg.ensureReady();
     if (!kg.ready) return error.SkipZigTest;
-    _ = try kg.remember(.observation, "attended sister commencement", "observation", false);
+    const first_memory_id = try kg.remember(.observation, "attended sister commencement", "observation", false);
+    try std.testing.expectEqual(@as(u64, 1), first_memory_id);
     _ = try kg.remember(.observation, "attended friend degree conferral", "observation", false);
     _ = try kg.remember(.observation, "attended cousin convocation", "observation", false);
 
     // Deliberately reproduce the paid c010 failure: after a fact_lookup seed,
     // the provider tries to finalize as unavailable. The real run path must
-    // reject it, surface a host observation, accept a fixed v3 batch, and only
-    // then allow the final answer. max_turns=2 proves the bounded repair loans
-    // exactly enough turns for batch + final instead of dying at the old cap.
+    // reject it, surface a host observation, accept a fixed v3 batch, require
+    // real KgContext evidence, and only then allow the final answer. max_turns=2
+    // proves the bounded repair loans enough turns for batch + context + final.
     const responses = [_][]const u8{
         KG_ENUMERATION_SEED_SSE,
         KG_ENUMERATION_PREMATURE_FINAL_SSE,
         KG_ENUMERATION_BATCH_SSE,
+        KG_ENUMERATION_CONTEXT_SSE,
         KG_ENUMERATION_FINAL_SSE,
     };
     var srv = try harness.MockServer.startCassette(&responses, 0);
@@ -816,7 +827,7 @@ test "L2 KG governance: real agent loop rejects enumeration final until v3 batch
     var api_client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer api_client.deinit();
 
-    const enabled = [_][]const u8{"KgRecall"};
+    const enabled = [_][]const u8{ "KgRecall", "KgContext" };
     var defs_arena = std.heap.ArenaAllocator.init(a);
     defer defs_arena.deinit();
     var prompt_context = cc.tools.PromptContext{ .enabled_tool_names = &enabled };
@@ -839,9 +850,9 @@ test "L2 KG governance: real agent loop rejects enumeration final until v3 batch
     }, &backend, a);
 
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, run_result.stop_reason);
-    try std.testing.expectEqual(@as(u32, 4), run_result.turns);
-    try std.testing.expectEqual(@as(u32, 2), run_result.tool_calls);
-    try std.testing.expectEqual(@as(usize, 4), srv.requestCount());
+    try std.testing.expectEqual(@as(u32, 5), run_result.turns);
+    try std.testing.expectEqual(@as(u32, 3), run_result.tool_calls);
+    try std.testing.expectEqual(@as(usize, 5), srv.requestCount());
 
     const after_seed = srv.requestAt(1) orelse return error.NoRequestCaptured;
     try std.testing.expect(std.mem.indexOf(u8, after_seed.body(), "lexical-coverage-obligation") != null);
@@ -851,12 +862,17 @@ test "L2 KG governance: real agent loop rejects enumeration final until v3 batch
     try std.testing.expect(std.mem.indexOf(u8, repair_request.body(), "lexical-coverage-rejected-final") != null);
     try std.testing.expect(std.mem.indexOf(u8, repair_request.body(), "Do not answer yet") != null);
 
-    const final_request = srv.requestAt(3) orelse return error.NoRequestCaptured;
-    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "\\\"all_variants_executed\\\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "\\\"executed_variant_count\\\":3") != null);
-    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "\\\"query_anchor_rewritten\\\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "query_anchor_input_sha256") != null);
-    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "query_anchor_effective_sha256") != null);
+    const context_request = srv.requestAt(3) orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, context_request.body(), "\\\"all_variants_executed\\\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_request.body(), "\\\"executed_variant_count\\\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_request.body(), "\\\"query_anchor_rewritten\\\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_request.body(), "query_anchor_input_sha256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_request.body(), "query_anchor_effective_sha256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_request.body(), "lexical-evidence-obligation") != null);
+
+    const final_request = srv.requestAt(4) orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "\"name\":\"KgContext\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "knowledge_governance") != null);
 
     const final_message = conv.messages.items[conv.messages.items.len - 1];
     try std.testing.expectEqual(cc.message.Role.assistant, final_message.role);

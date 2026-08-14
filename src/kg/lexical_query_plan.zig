@@ -199,11 +199,14 @@ pub const Ledger = struct {
     successful_plan_calls: usize = 0,
     enumeration_plan_calls: usize = 0,
     enumeration_batch_committed: bool = false,
+    enumeration_context_committed: bool = false,
 
     pub const CoverageState = struct {
         successful_plan_calls: usize,
         enumeration_plan_calls: usize,
         enumeration_batch_committed: bool,
+        enumeration_context_required: bool,
+        enumeration_context_committed: bool,
     };
 
     fn runNodes(self: *const Ledger) []const u64 {
@@ -220,7 +223,24 @@ pub const Ledger = struct {
             .successful_plan_calls = self.successful_plan_calls,
             .enumeration_plan_calls = self.enumeration_plan_calls,
             .enumeration_batch_committed = self.enumeration_batch_committed,
+            .enumeration_context_required = self.enumeration_batch_committed and
+                self.run_node_count > 0,
+            .enumeration_context_committed = self.enumeration_context_committed,
         };
+    }
+
+    /// Record a successful KgContext observation only when it follows a
+    /// committed enumeration batch and targets a node actually exposed by a
+    /// governed recall in this run. Context before the batch, arbitrary ids,
+    /// and failed tool calls cannot discharge the evidence obligation.
+    pub fn commitContext(self: *Ledger, node_id: u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.enumeration_batch_committed or
+            node_id == 0 or
+            !containsU64(self.runNodes(), node_id)) return false;
+        self.enumeration_context_committed = true;
+        return true;
     }
 
     pub fn lockPlan(self: *Ledger, plan: Plan) LedgerError!Guard {
@@ -362,7 +382,12 @@ pub const Ledger = struct {
             }
             self.ledger.successful_plan_calls += 1;
             if (self.enumeration_intent) self.ledger.enumeration_plan_calls += 1;
-            if (self.enumeration_batch) self.ledger.enumeration_batch_committed = true;
+            if (self.enumeration_batch) {
+                self.ledger.enumeration_batch_committed = true;
+                // A later batch can expose a different scope. Evidence from an
+                // earlier batch must not silently authorize the newer result.
+                self.ledger.enumeration_context_committed = false;
+            }
             self.active = false;
             self.ledger.mutex.unlock();
         }
@@ -796,6 +821,9 @@ test "lexical query plan v3 executes a fixed batch and budgets actual probes" {
     try std.testing.expectEqual(@as(usize, 0), coverage_after_abort.successful_plan_calls);
     try std.testing.expectEqual(@as(usize, 0), coverage_after_abort.enumeration_plan_calls);
     try std.testing.expect(!coverage_after_abort.enumeration_batch_committed);
+    try std.testing.expect(!coverage_after_abort.enumeration_context_required);
+    try std.testing.expect(!coverage_after_abort.enumeration_context_committed);
+    try std.testing.expect(!ledger.commitContext(41));
 
     var first = try ledger.lockPlan(plan);
     defer first.deinit();
@@ -806,6 +834,11 @@ test "lexical query plan v3 executes a fixed batch and budgets actual probes" {
     try std.testing.expectEqual(@as(usize, 1), coverage_after_first.successful_plan_calls);
     try std.testing.expectEqual(@as(usize, 1), coverage_after_first.enumeration_plan_calls);
     try std.testing.expect(coverage_after_first.enumeration_batch_committed);
+    try std.testing.expect(coverage_after_first.enumeration_context_required);
+    try std.testing.expect(!coverage_after_first.enumeration_context_committed);
+    try std.testing.expect(!ledger.commitContext(99));
+    try std.testing.expect(ledger.commitContext(41));
+    try std.testing.expect(ledger.coverageState().enumeration_context_committed);
 
     var second = try ledger.lockPlan(plan);
     defer second.deinit();
@@ -816,6 +849,8 @@ test "lexical query plan v3 executes a fixed batch and budgets actual probes" {
     try std.testing.expectEqual(@as(usize, 2), coverage_after_second.successful_plan_calls);
     try std.testing.expectEqual(@as(usize, 2), coverage_after_second.enumeration_plan_calls);
     try std.testing.expect(coverage_after_second.enumeration_batch_committed);
+    try std.testing.expect(!coverage_after_second.enumeration_context_committed);
+    try std.testing.expect(ledger.commitContext(47));
     try std.testing.expectError(error.SemanticExpansionBudgetExceeded, ledger.lockPlan(plan));
 
     const indexed =

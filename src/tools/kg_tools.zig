@@ -617,7 +617,12 @@ pub fn executeContext(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try out.appendSlice(ctx.allocator, ",\"verification_guidance\":");
     try appendJsonString(&out, ctx.allocator, retrieval_protocol.CONTEXT_RESULT_GUIDANCE);
     try out.appendSlice(ctx.allocator, "}");
-    return out.toOwnedSlice(ctx.allocator);
+    const owned = try out.toOwnedSlice(ctx.allocator);
+    // Advance the enumeration evidence gate only after both real TinyKG reads
+    // and the complete provider-visible result have succeeded. The ledger
+    // itself rejects pre-batch and never-recalled node ids.
+    if (ctx.kg_lexical_ledger) |ledger| _ = ledger.commitContext(node_id);
+    return owned;
 }
 
 const KnowledgeGovernance = struct {

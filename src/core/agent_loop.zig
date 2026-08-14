@@ -556,7 +556,9 @@ pub fn run(
         else
             false);
     var kg_coverage_reminder_emitted = false;
+    var kg_context_reminder_emitted = false;
     var kg_coverage_repair_attempts: u8 = 0;
+    var kg_context_repair_attempts: u8 = 0;
     var kg_coverage_borrowed_turns: u32 = 0;
     // 成本次闸:累计本 run 成本(USD),达 opts.cost_budget_usd → 停(.budget)。
     const cost_rates = @import("../util/pricing.zig").rateFor(provider.model());
@@ -1164,19 +1166,33 @@ pub fn run(
                 try conversation.appendText(.user, "Your previous response was cut off by the token limit. Continue exactly where you left off, without repeating.");
                 continue;
             }
-            if (kgEnumerationCoveragePending(
+            const kg_pending = kgEnumerationPending(
                 &kg_lexical_ledger,
                 gated_tool_defs,
                 kg_enumeration_query_hint,
-            )) {
-                if (kg_coverage_repair_attempts == 0) {
-                    kg_coverage_repair_attempts = 1;
-                    // One request may be needed to emit the mandatory batch
-                    // and one to produce the final answer. Budget/request gates
-                    // still guard both side-effect boundaries.
-                    kg_coverage_borrowed_turns = 2;
+            );
+            if (kg_pending != .none) {
+                const repair_attempts = switch (kg_pending) {
+                    .batch => &kg_coverage_repair_attempts,
+                    .context => &kg_context_repair_attempts,
+                    .none => unreachable,
+                };
+                if (repair_attempts.* == 0) {
+                    repair_attempts.* = 1;
+                    // A rejected batch-final may still need batch + context +
+                    // final; a rejected context-final needs context + final.
+                    // Budget/request gates still guard every provider boundary.
+                    kg_coverage_borrowed_turns +|= switch (kg_pending) {
+                        .batch => 3,
+                        .context => 2,
+                        .none => unreachable,
+                    };
                     backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
-                    try conversation.appendText(.user, kg_retrieval_protocol.ENUMERATION_COVERAGE_REPAIR);
+                    try conversation.appendText(.user, switch (kg_pending) {
+                        .batch => kg_retrieval_protocol.ENUMERATION_COVERAGE_REPAIR,
+                        .context => kg_retrieval_protocol.ENUMERATION_CONTEXT_REPAIR,
+                        .none => unreachable,
+                    });
                     continue;
                 }
                 // A second premature final is not accepted as a valid answer.
@@ -1591,14 +1607,19 @@ pub fn run(
             );
             try result_blocks.append(allocator, .{ .text = checkpoint });
         }
-        if (!kg_coverage_reminder_emitted and kgEnumerationCoveragePending(
+        const kg_pending = kgEnumerationPending(
             &kg_lexical_ledger,
             gated_tool_defs,
             kg_enumeration_query_hint,
-        )) {
+        );
+        if (kg_pending == .batch and !kg_coverage_reminder_emitted) {
             const reminder = try allocator.dupe(u8, kg_retrieval_protocol.ENUMERATION_COVERAGE_REMINDER);
             try result_blocks.append(allocator, .{ .text = reminder });
             kg_coverage_reminder_emitted = true;
+        } else if (kg_pending == .context and !kg_context_reminder_emitted) {
+            const reminder = try allocator.dupe(u8, kg_retrieval_protocol.ENUMERATION_CONTEXT_REMINDER);
+            try result_blocks.append(allocator, .{ .text = reminder });
+            kg_context_reminder_emitted = true;
         }
 
         const blocks_owned = try result_blocks.toOwnedSlice(allocator);
@@ -1650,23 +1671,32 @@ pub fn run(
     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .max_turns, .turns = turns, .tool_calls = total_tool_calls });
 }
 
-fn kgEnumerationCoveragePending(
+const KgEnumerationPending = enum { none, batch, context };
+
+fn kgEnumerationPending(
     ledger: *@import("../kg/lexical_query_plan.zig").Ledger,
     tool_defs: []const json_mod.ToolDefinition,
     query_hint: bool,
-) bool {
+) KgEnumerationPending {
     var kg_recall_visible = false;
+    var kg_context_visible = false;
     for (tool_defs) |definition| {
         if (std.mem.eql(u8, definition.name, "KgRecall")) {
             kg_recall_visible = true;
-            break;
+        } else if (std.mem.eql(u8, definition.name, "KgContext")) {
+            kg_context_visible = true;
         }
     }
-    if (!kg_recall_visible) return false;
+    if (!kg_recall_visible) return .none;
     const coverage = ledger.coverageState();
-    return coverage.successful_plan_calls > 0 and
-        !coverage.enumeration_batch_committed and
+    const enumeration_active = coverage.successful_plan_calls > 0 and
         (query_hint or coverage.enumeration_plan_calls > 0);
+    if (!enumeration_active) return .none;
+    if (!coverage.enumeration_batch_committed) return .batch;
+    if (kg_context_visible and
+        coverage.enumeration_context_required and
+        !coverage.enumeration_context_committed) return .context;
+    return .none;
 }
 
 test "enumeration coverage gate ignores query wording before a successful recall" {
@@ -1677,8 +1707,8 @@ test "enumeration coverage gate ignores query wording before a successful recall
         .input_schema = .{ .prop_specs = &.{}, .required = &.{} },
     }};
 
-    try std.testing.expect(!kgEnumerationCoveragePending(&ledger, &tool_defs, true));
-    try std.testing.expect(!kgEnumerationCoveragePending(&ledger, &.{}, true));
+    try std.testing.expectEqual(KgEnumerationPending.none, kgEnumerationPending(&ledger, &tool_defs, true));
+    try std.testing.expectEqual(KgEnumerationPending.none, kgEnumerationPending(&ledger, &.{}, true));
 }
 
 fn elapsedSinceNs(started_ns: util_time.Nanos) u64 {
