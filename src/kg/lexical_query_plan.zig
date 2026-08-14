@@ -97,6 +97,12 @@ pub const Plan = struct {
     variants: []Variant,
     execution: Execution,
     declared_seen_node_ids: ?[]u64,
+    /// v3 executes the declared variants, so a stale redundant top-level
+    /// `query` can be normalized without another provider turn. The hashes
+    /// bind both observed and effective anchors into the host receipt.
+    query_anchor_rewritten: bool,
+    query_anchor_input_sha256: [64]u8,
+    query_anchor_effective_sha256: [64]u8,
     fingerprint: [64]u8,
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
@@ -437,8 +443,14 @@ pub fn parse(
         break :blk .{ .single = variant_index };
     };
     const normalized_query = std.mem.trim(u8, query, " \t\r\n");
-    if (!validCompactText(normalized_query) or
-        !std.mem.eql(u8, normalized_query, variants.items[execution.queryIndex()].text))
+    if (!validCompactText(normalized_query)) return error.QueryVariantMismatch;
+    const effective_query = variants.items[execution.queryIndex()].text;
+    const query_anchor_rewritten = !std.mem.eql(u8, normalized_query, effective_query);
+    // v1/v2 use the selected top-level query as the single executed probe and
+    // must remain exact. v3 executes its immutable variants directly, making
+    // this a deterministic compatibility-field rewrite rather than a semantic
+    // repair. Never let the host invent or alter a declared variant.
+    if (query_anchor_rewritten and schema_version != .host_batch_v3)
         return error.QueryVariantMismatch;
 
     switch (stage) {
@@ -491,6 +503,9 @@ pub fn parse(
         .variants = owned_variants,
         .execution = execution,
         .declared_seen_node_ids = declared_seen_node_ids,
+        .query_anchor_rewritten = query_anchor_rewritten,
+        .query_anchor_input_sha256 = sha256Hex(normalized_query),
+        .query_anchor_effective_sha256 = sha256Hex(effective_query),
         .fingerprint = fingerprint(schema_version, intent, stage, owned_variants, type_filter),
     };
 }
@@ -509,7 +524,7 @@ pub fn diagnostic(err: Error) []const u8 {
         error.DuplicateVariant => "lexical_plan variants must have distinct text",
         error.InvalidVariantIndex => "lexical_plan.variant_index is outside variants",
         error.UnexpectedVariantIndex => "lexical-query-plan-v3 executes the declared batch; omit variant_index",
-        error.QueryVariantMismatch => "KgRecall query must exactly match the selected variant (v3 uses variants[0] as the batch anchor)",
+        error.QueryVariantMismatch => "KgRecall v1/v2 query must exactly match the selected variant; v3 query must be a valid compatibility field and executes variants[0] as its anchor",
         error.InvalidStageShape => "seed requires one exact/alias variant; v1/v3 semantic_expansion requires 2-4 non-exact variants; v2 allows 1-4; v3 focused_refinement requires one variant",
         error.SeedTypeFilterForbidden => "the seed stage must omit KgRecall type",
         error.InvalidSeenNodeIds => "lexical_plan.seen_node_ids must contain positive integer ids",
@@ -555,6 +570,13 @@ fn hashField(hash: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
     const length = std.fmt.bufPrint(&length_buffer, "{d}:", .{value.len}) catch unreachable;
     hash.update(length);
     hash.update(value);
+}
+
+fn sha256Hex(value: []const u8) [64]u8 {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(value, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 fn containsU64(values: []const u64, expected: u64) bool {
@@ -762,6 +784,8 @@ test "lexical query plan v3 executes a fixed batch and budgets actual probes" {
     try std.testing.expect(plan.executesAll());
     try std.testing.expectEqual(@as(usize, 2), plan.semanticProbeCost());
     try std.testing.expectEqualStrings("graduation ceremony", plan.queryVariant().text);
+    try std.testing.expect(!plan.query_anchor_rewritten);
+    try std.testing.expectEqual(plan.query_anchor_input_sha256, plan.query_anchor_effective_sha256);
 
     var ledger = Ledger{};
     {
@@ -807,6 +831,27 @@ test "lexical query plan v3 executes a fixed batch and budgets actual probes" {
     var singleton_parsed = try std.json.parseFromSlice(std.json.Value, a, singleton, .{});
     defer singleton_parsed.deinit();
     try std.testing.expectError(error.InvalidStageShape, parse(a, singleton_parsed.value.object, "graduation ceremony", null));
+}
+
+test "v3 normalizes a stale compatibility query without changing declared variants" {
+    const a = std.testing.allocator;
+    const raw =
+        \\{"lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"enumeration","stage":"semantic_expansion","variants":[{"kind":"synonym","text":"commencement"},{"kind":"paraphrase","text":"degree conferral"}]}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    var plan = (try parse(a, parsed.value.object, "old graduation seed", null)) orelse return error.TestUnexpectedResult;
+    defer plan.deinit(a);
+
+    try std.testing.expect(plan.query_anchor_rewritten);
+    try std.testing.expectEqualStrings("commencement", plan.queryVariant().text);
+    try std.testing.expectEqual(sha256Hex("old graduation seed"), plan.query_anchor_input_sha256);
+    try std.testing.expectEqual(sha256Hex("commencement"), plan.query_anchor_effective_sha256);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &plan.query_anchor_input_sha256,
+        &plan.query_anchor_effective_sha256,
+    ));
 }
 
 test "fact lookup batch cannot discharge enumeration coverage" {

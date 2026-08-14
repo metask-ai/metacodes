@@ -430,7 +430,7 @@ const KG_ENUMERATION_PREMATURE_FINAL_SSE =
 const KG_ENUMERATION_BATCH_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"batch\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"batch1\",\"name\":\"KgRecall\",\"input\":{}}}\n\n" ++
-    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"commencement\\\",\\\"lexical_plan\\\":{\\\"schema_version\\\":\\\"lexical-query-plan-v3\\\",\\\"intent\\\":\\\"enumeration\\\",\\\"stage\\\":\\\"semantic_expansion\\\",\\\"variants\\\":[{\\\"kind\\\":\\\"synonym\\\",\\\"text\\\":\\\"commencement\\\"},{\\\"kind\\\":\\\"paraphrase\\\",\\\"text\\\":\\\"degree conferral\\\"},{\\\"kind\\\":\\\"broader\\\",\\\"text\\\":\\\"convocation\\\"}]}}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"graduation ceremony\\\",\\\"lexical_plan\\\":{\\\"schema_version\\\":\\\"lexical-query-plan-v3\\\",\\\"intent\\\":\\\"enumeration\\\",\\\"stage\\\":\\\"semantic_expansion\\\",\\\"variants\\\":[{\\\"kind\\\":\\\"synonym\\\",\\\"text\\\":\\\"commencement\\\"},{\\\"kind\\\":\\\"paraphrase\\\",\\\"text\\\":\\\"degree conferral\\\"},{\\\"kind\\\":\\\"broader\\\",\\\"text\\\":\\\"convocation\\\"}]}}\"}}\n\n" ++
     "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
@@ -854,6 +854,9 @@ test "L2 KG governance: real agent loop rejects enumeration final until v3 batch
     const final_request = srv.requestAt(3) orelse return error.NoRequestCaptured;
     try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "\\\"all_variants_executed\\\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "\\\"executed_variant_count\\\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "\\\"query_anchor_rewritten\\\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "query_anchor_input_sha256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "query_anchor_effective_sha256") != null);
 
     const final_message = conv.messages.items[conv.messages.items.len - 1];
     try std.testing.expectEqual(cc.message.Role.assistant, final_message.role);

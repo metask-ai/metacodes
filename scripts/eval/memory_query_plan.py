@@ -179,6 +179,13 @@ BATCH_RECEIPT_KEYS = frozenset(
         "execution",
     }
 )
+BATCH_RECEIPT_ANCHOR_KEYS = frozenset(
+    {
+        "query_anchor_rewritten",
+        "query_anchor_input_sha256",
+        "query_anchor_effective_sha256",
+    }
+)
 BATCH_VARIANT_RECEIPT_KEYS = frozenset(
     {"variant_index", "variant_kind", "node_ids", "new_hit_count", "repeated_hit_count"}
 )
@@ -258,7 +265,16 @@ def _plan_fingerprint(
 
 
 def _parse_plan(tool_input: Mapping[str, Any], where: str) -> Mapping[str, Any]:
-    query = _string(tool_input.get("query"), f"{where}.query").strip()
+    # Match the native Zig protocol exactly.  Python's parameterless strip()
+    # removes additional Unicode whitespace that the host intentionally keeps
+    # as query content, which would make receipt hashes non-replayable.
+    query = _string(tool_input.get("query"), f"{where}.query").strip(" \t\r\n")
+    if (
+        not query
+        or len(query.encode("utf-8")) > 400
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in query)
+    ):
+        _fail(f"{where}.query", "invalid compact query")
     raw_plan = tool_input.get("lexical_plan")
     if not isinstance(raw_plan, dict):
         _fail(f"{where}.lexical_plan", "expected an object")
@@ -294,13 +310,19 @@ def _parse_plan(tool_input: Mapping[str, Any], where: str) -> Mapping[str, Any]:
             ("kind", "text"),
         )
         kind = _string(variant["kind"], f"{where}.lexical_plan.variants[{index}].kind")
-        text = _string(variant["text"], f"{where}.lexical_plan.variants[{index}].text").strip()
+        text = _string(
+            variant["text"], f"{where}.lexical_plan.variants[{index}].text"
+        ).strip(" \t\r\n")
         if kind not in VARIANT_KINDS or (
             schema_version == LEGACY_LEXICAL_PLAN_SCHEMA_VERSION
             and kind == "synonym"
         ):
             _fail(f"{where}.lexical_plan.variants[{index}].kind", "unsupported kind")
-        if len(text.encode("utf-8")) > 400 or any(ord(char) < 0x20 or ord(char) == 0x7F for char in text):
+        if (
+            not text
+            or len(text.encode("utf-8")) > 400
+            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in text)
+        ):
             _fail(f"{where}.lexical_plan.variants[{index}].text", "invalid compact query")
         if text in seen_text:
             _fail(f"{where}.lexical_plan.variants", "duplicate variant text")
@@ -318,7 +340,8 @@ def _parse_plan(tool_input: Mapping[str, Any], where: str) -> Mapping[str, Any]:
     if variant_index is not None and variant_index >= len(variants):
         _fail(f"{where}.lexical_plan.variant_index", "outside variants")
     query_index = 0 if variant_index is None else variant_index
-    if query != variants[query_index]["text"]:
+    query_anchor_rewritten = query != variants[query_index]["text"]
+    if query_anchor_rewritten and schema_version != BATCH_LEXICAL_PLAN_SCHEMA_VERSION:
         _fail(where, "query does not match the selected variant")
     if stage == "seed" and (
         len(variants) != 1
@@ -367,6 +390,11 @@ def _parse_plan(tool_input: Mapping[str, Any], where: str) -> Mapping[str, Any]:
         "execution": "host_batch_all" if batch_all else "single",
         "seen_node_ids": seen_ids,
         "type_filter": type_filter,
+        "query_anchor_rewritten": query_anchor_rewritten,
+        "query_anchor_input_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+        "query_anchor_effective_sha256": hashlib.sha256(
+            variants[query_index]["text"].encode("utf-8")
+        ).hexdigest(),
         "plan_sha256": _plan_fingerprint(
             intent,
             stage,
@@ -384,11 +412,48 @@ def _parse_batch_receipt(
     expected_seen: set[int],
     where: str,
 ) -> Mapping[str, Any]:
-    receipt = _object(
-        result.get("lexical_query_plan"),
-        f"{where}.lexical_query_plan",
-        BATCH_RECEIPT_KEYS,
+    raw_receipt = result.get("lexical_query_plan")
+    if not isinstance(raw_receipt, dict):
+        _fail(f"{where}.lexical_query_plan", "expected an object")
+    present_anchor_keys = set(raw_receipt) & BATCH_RECEIPT_ANCHOR_KEYS
+    if present_anchor_keys and present_anchor_keys != BATCH_RECEIPT_ANCHOR_KEYS:
+        _fail(
+            f"{where}.lexical_query_plan",
+            "query-anchor audit fields must be complete",
+        )
+    receipt_keys = (
+        BATCH_RECEIPT_KEYS | BATCH_RECEIPT_ANCHOR_KEYS
+        if present_anchor_keys
+        else BATCH_RECEIPT_KEYS
     )
+    receipt = _object(raw_receipt, f"{where}.lexical_query_plan", receipt_keys)
+    if present_anchor_keys:
+        expected_anchor = {
+            "query_anchor_rewritten": parsed_plan["query_anchor_rewritten"],
+            "query_anchor_input_sha256": parsed_plan["query_anchor_input_sha256"],
+            "query_anchor_effective_sha256": parsed_plan[
+                "query_anchor_effective_sha256"
+            ],
+        }
+        for key, expected_value in expected_anchor.items():
+            if receipt[key] != expected_value:
+                _fail(
+                    f"{where}.lexical_query_plan.{key}",
+                    "does not match the observed compatibility anchor",
+                )
+        _hash(
+            receipt["query_anchor_input_sha256"],
+            f"{where}.lexical_query_plan.query_anchor_input_sha256",
+        )
+        _hash(
+            receipt["query_anchor_effective_sha256"],
+            f"{where}.lexical_query_plan.query_anchor_effective_sha256",
+        )
+    elif parsed_plan["query_anchor_rewritten"]:
+        _fail(
+            f"{where}.lexical_query_plan",
+            "rewritten query anchor lacks a host audit receipt",
+        )
     expected = {
         "schema_version": BATCH_LEXICAL_PLAN_SCHEMA_VERSION,
         "plan_sha256": parsed_plan["plan_sha256"],

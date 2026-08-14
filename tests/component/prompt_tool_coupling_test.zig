@@ -97,7 +97,8 @@ test "L2: KgRecall and KgContext schemas carry the staged semantic-neighborhood 
     try std.testing.expect(std.mem.indexOf(u8, description, "declare 2-4 separate semantic variants in one v3 batch") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "host executes all members") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "FIRST inspect automatic recall") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "query must exactly equal variants[0].text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "query is a legacy compatibility field") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "audits any stale-query normalization") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "mechanism/symptom/outcome/nearby implementation") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "broader/narrower concept") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "Never combine variants into a keyword bag") != null);

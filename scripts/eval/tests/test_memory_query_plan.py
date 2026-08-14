@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import tempfile
 import unittest
@@ -105,7 +106,17 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             },
         )
 
-    def _batch_call(self, tool_id, *, variants, variant_hits, seen=(), intent="enumeration"):
+    def _batch_call(
+        self,
+        tool_id,
+        *,
+        variants,
+        variant_hits,
+        seen=(),
+        intent="enumeration",
+        query=None,
+        audited_anchor=False,
+    ):
         plan_sha = _plan_fingerprint(
             intent,
             "semantic_expansion",
@@ -161,6 +172,9 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
                     {"node_id": node_id, "seen_before": False, "text": f"node {node_id}"}
                 )
         merged_new = sum(node_id not in seen for node_id in merged)
+        effective_query = variants[0]["text"].strip(" \t\r\n")
+        input_query = effective_query if query is None else query
+        normalized_input_query = input_query.strip(" \t\r\n")
         result = {
             "hits": result_hits,
             "lexical_query_plan": {
@@ -183,12 +197,24 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
                 "execution": "host_batch_all",
             },
         }
+        if audited_anchor:
+            result["lexical_query_plan"].update(
+                {
+                    "query_anchor_rewritten": normalized_input_query != effective_query,
+                    "query_anchor_input_sha256": hashlib.sha256(
+                        normalized_input_query.encode("utf-8")
+                    ).hexdigest(),
+                    "query_anchor_effective_sha256": hashlib.sha256(
+                        effective_query.encode("utf-8")
+                    ).hexdigest(),
+                }
+            )
         return (
             {
                 "type": "tool_use",
                 "id": tool_id,
                 "name": "KgRecall",
-                "input": {"query": variants[0]["text"], "lexical_plan": lexical_plan},
+                "input": {"query": input_query, "lexical_plan": lexical_plan},
             },
             {
                 "type": "tool_result",
@@ -388,6 +414,135 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             )
             self.assertEqual(tampered_trace["status"], "invalid")
             self.assertRegex(tampered_trace["invalid_reasons"][0], "gain counts")
+
+    def test_v3_stale_query_anchor_requires_and_accepts_host_audit_receipt(self):
+        variants = [
+            {"kind": "synonym", "text": "commencement"},
+            {"kind": "paraphrase", "text": "degree conferral"},
+        ]
+        rewritten = self._batch_call(
+            "kg-rewritten",
+            variants=variants,
+            variant_hits=[(7,), (9,)],
+            query="old graduation seed",
+            audited_anchor=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(cassette, [rewritten])
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-v3-rewritten-anchor",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+            self.assertEqual(trace["status"], "verified")
+            self.assertEqual(trace["kg_recall_count"], 1)
+
+            unaudited_use, unaudited_result = copy.deepcopy(rewritten)
+            payload = json.loads(unaudited_result["content"])
+            for key in (
+                "query_anchor_rewritten",
+                "query_anchor_input_sha256",
+                "query_anchor_effective_sha256",
+            ):
+                payload["lexical_query_plan"].pop(key)
+            unaudited_result["content"] = stable_json(payload)
+            self._write_requests(cassette, [(unaudited_use, unaudited_result)])
+            rejected = build_query_plan_trace(
+                cassette,
+                run_id="run-v3-unaudited-anchor",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+            self.assertEqual(rejected["status"], "invalid")
+            self.assertRegex(rejected["invalid_reasons"][0], "lacks a host audit")
+
+            for field, forged_value in (
+                ("query_anchor_rewritten", False),
+                ("query_anchor_input_sha256", "0" * 64),
+                ("query_anchor_effective_sha256", "f" * 64),
+            ):
+                forged_use, forged_result = copy.deepcopy(rewritten)
+                forged_payload = json.loads(forged_result["content"])
+                forged_payload["lexical_query_plan"][field] = forged_value
+                forged_result["content"] = stable_json(forged_payload)
+                self._write_requests(cassette, [(forged_use, forged_result)])
+                forged = build_query_plan_trace(
+                    cassette,
+                    run_id=f"run-v3-forged-{field}",
+                    arm="tinykg_lexical",
+                    memory_backend="tinykg_integrated",
+                )
+                self.assertEqual(forged["status"], "invalid")
+                self.assertRegex(
+                    forged["invalid_reasons"][0],
+                    "does not match the observed compatibility anchor",
+                )
+
+    def test_v3_query_anchor_hashes_use_native_ascii_trim_semantics(self):
+        variants = [
+            {"kind": "synonym", "text": "commencement"},
+            {"kind": "paraphrase", "text": "degree conferral"},
+        ]
+        ascii_padded = self._batch_call(
+            "kg-ascii-trimmed",
+            variants=variants,
+            variant_hits=[(7,), (9,)],
+            query="  old graduation seed\r\n",
+            audited_anchor=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(cassette, [ascii_padded])
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-v3-ascii-trimmed-anchor",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+            self.assertEqual(trace["status"], "verified")
+
+            non_breaking_space = "\u00a0old graduation seed\u00a0"
+            unicode_padded = self._batch_call(
+                "kg-unicode-whitespace",
+                variants=variants,
+                variant_hits=[(7,), (9,)],
+                query=non_breaking_space,
+                audited_anchor=True,
+            )
+            self._write_requests(cassette, [unicode_padded])
+            unicode_trace = build_query_plan_trace(
+                cassette,
+                run_id="run-v3-unicode-whitespace-anchor",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+            self.assertEqual(unicode_trace["status"], "verified")
+
+    def test_query_plan_rejects_invalid_compact_query_before_receipt_replay(self):
+        variants = [
+            {"kind": "synonym", "text": "commencement"},
+            {"kind": "paraphrase", "text": "degree conferral"},
+        ]
+        invalid = self._batch_call(
+            "kg-invalid-query",
+            variants=variants,
+            variant_hits=[(7,), (9,)],
+            query="invalid\u0001query",
+            audited_anchor=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(cassette, [invalid])
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-v3-invalid-query",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+            self.assertEqual(trace["status"], "invalid")
+            self.assertRegex(trace["invalid_reasons"][0], "invalid compact query")
 
     def test_distinct_seed_plans_are_invalid_and_preserved_as_exact(self):
         first = self._call(

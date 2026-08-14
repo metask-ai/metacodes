@@ -411,8 +411,8 @@ fn executeRecallBatch(
     try out.appendSlice(ctx.allocator, "},\"lexical_query_plan\":{");
     try out.print(
         ctx.allocator,
-        "\"schema_version\":\"{s}\",\"plan_sha256\":\"{s}\",\"intent\":\"{s}\",\"stage\":\"{s}\",\"variant_count\":{d},\"executed_variant_count\":{d},\"all_variants_executed\":true,\"seen_node_count\":{d},\"seen_state_verified\":true,\"ledger_scope\":\"{s}\",\"merged_hit_count\":{d},\"merged_new_hit_count\":{d},\"merged_previously_seen_count\":{d},\"probe_new_hit_count\":{d},\"probe_repeated_hit_count\":{d},\"variant_receipts\":[",
-        .{ plan.schema_version.text(), plan.fingerprint, @tagName(plan.intent), @tagName(plan.stage), plan.variants.len, plan.variants.len, ledger_seen_count, ledger_scope, merged_count, merged_new_count, merged_previously_seen_count, probe_new_count, probe_repeated_count },
+        "\"schema_version\":\"{s}\",\"plan_sha256\":\"{s}\",\"intent\":\"{s}\",\"stage\":\"{s}\",\"variant_count\":{d},\"executed_variant_count\":{d},\"all_variants_executed\":true,\"seen_node_count\":{d},\"seen_state_verified\":true,\"ledger_scope\":\"{s}\",\"merged_hit_count\":{d},\"merged_new_hit_count\":{d},\"merged_previously_seen_count\":{d},\"probe_new_hit_count\":{d},\"probe_repeated_hit_count\":{d},\"query_anchor_rewritten\":{s},\"query_anchor_input_sha256\":\"{s}\",\"query_anchor_effective_sha256\":\"{s}\",\"variant_receipts\":[",
+        .{ plan.schema_version.text(), plan.fingerprint, @tagName(plan.intent), @tagName(plan.stage), plan.variants.len, plan.variants.len, ledger_seen_count, ledger_scope, merged_count, merged_new_count, merged_previously_seen_count, probe_new_count, probe_repeated_count, if (plan.query_anchor_rewritten) "true" else "false", plan.query_anchor_input_sha256, plan.query_anchor_effective_sha256 },
     );
     for (plan.variants, 0..) |variant, variant_index| {
         if (variant_index > 0) try out.append(ctx.allocator, ',');
