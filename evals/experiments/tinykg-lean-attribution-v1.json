@@ -292,10 +292,12 @@
     "scripts/eval/project_harness_experiment.py": "38c7acfd7a4142e7f2f81ecdf9058658d2f11f262c964def3f20978340d3d0ad",
     "scripts/eval/project_harness_rule_impact_prospective.py": "ce160017a91696e56ed46af663d546f63a9c93401919857bee8c5afffd594094",
     "scripts/eval/run_project_rule_evolution_mac_pilot.py": "d85cc8457d90e8b10989047bac3bcb83b3ed3219da2334cb2a04948703e6be07",
+    "scripts/eval/tinykg_lean_factorial.py": "d1bbcfea51fbbcfee2da1c8f22b81ec5402ae40ec7d1fb66d0deb47a30986979",
     "scripts/project_harness_eval_driver.zig": "067fc4277aef64433ddb3dc69225f66627fdf7cb20a892cd5a143e202d133f63"
   },
   "known_gaps": [
-    "scripts/eval/tinykg_lean_factorial.py must be implemented before s3",
+    "the factorial admission/report boundary exists, but its unified production executor must be wired before any paid s3 row",
+    "the factorial report remains calibration-only until the preregistered paired randomization interval is implemented",
     "procedural transfer needs more than the two-family smoke fixture before a comprehensive claim",
     "Lean generality needs correction families beyond existing-file source-CAS before a cross-rule claim"
   ]

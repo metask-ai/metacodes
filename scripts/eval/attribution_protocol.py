@@ -168,7 +168,7 @@ def _validate_stages(protocol: Mapping[str, Any], root: Path) -> None:
             runner = stage.get("runner")
             if not isinstance(runner, str) or not runner:
                 _fail(stage_id, "runner is missing")
-            if not runner.startswith("external:") and stage_id != "s3_factorial_interaction":
+            if not runner.startswith("external:"):
                 if not (root / runner).is_file():
                     _fail(stage_id, f"runner is unavailable: {runner}")
 
@@ -280,8 +280,8 @@ def validate_protocol(protocol: Mapping[str, Any], root: Path) -> Mapping[str, A
         _fail("budget", "single-attempt durable-journal boundary drift")
 
     gaps = _sequence(protocol.get("known_gaps"), "known_gaps")
-    if not any("tinykg_lean_factorial.py" in str(gap) for gap in gaps):
-        _fail("known_gaps", "missing factorial runner gap must remain explicit")
+    if not any("production executor" in str(gap) for gap in gaps):
+        _fail("known_gaps", "missing factorial production-executor gap must remain explicit")
     return protocol
 
 
