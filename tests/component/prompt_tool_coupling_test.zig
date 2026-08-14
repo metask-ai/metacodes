@@ -375,3 +375,56 @@ test "L2 e2e: 请求体 tools 携带动态长描述" {
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "exact string replacements") != null); // Edit 长描述
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "ALWAYS use Grep") != null); // Grep 长描述
 }
+
+test "L2 e2e: execution policy hides deferred tools from schema and system prompt" {
+    const a = std.heap.page_allocator;
+    var srv = try harness.MockServer.start(MINIMAL_END_TURN_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    const defs = [_]cc.json_mod.ToolDefinition{
+        .{ .name = "Read", .description = "read", .input_schema = .{} },
+        .{ .name = "ToolSearch", .description = "activate deferred tools", .input_schema = .{} },
+        .{ .name = "FormalAuditTask", .description = "formal audit", .input_schema = .{}, .deferred = true },
+    };
+    const enabled_names = [_][]const u8{ "Read", "ToolSearch", "FormalAuditTask" };
+    const system = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &enabled_names, "", true, "/tmp");
+    defer a.free(system);
+    try std.testing.expect(std.mem.indexOf(u8, system, "# Deferred tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, system, "FormalAuditTask") != null);
+
+    // Even if the upper policy mechanically includes ToolSearch, the runtime
+    // must remove it after the only deferred schema has been denied.
+    const policy_defs = [_]cc.json_mod.ToolDefinition{ defs[0], defs[1] };
+    var policy = cc.tool_context.ToolSetExecutionPolicy{ .definitions = &policy_defs };
+    var activated = std.StringHashMap(void).init(a);
+    defer activated.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "read only");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var wb = cc.writer_backend.WriterBackend.initNull();
+    const be = wb.backend();
+
+    _ = cc.agent_loop.run(&conv, client.provider(), &defs, &perm, .{
+        .max_turns = 1,
+        .system_prompt = system,
+        .activated_tools = &activated,
+        .execution_policy = policy.executionPolicy(),
+    }, &be, a) catch return error.SkipZigTest;
+
+    const request = srv.lastRequest() orelse return error.NoRequestCaptured;
+    const tools_field = request.jsonField("tools") orelse return error.ToolsFieldMissing;
+    const request_system = request.jsonField("system") orelse return error.SystemFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"Read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "ToolSearch") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "FormalAuditTask") == null);
+    try std.testing.expect(std.mem.indexOf(u8, request_system, "# Deferred tools") == null);
+    try std.testing.expect(std.mem.indexOf(u8, request_system, "FormalAuditTask") == null);
+}

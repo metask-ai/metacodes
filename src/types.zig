@@ -132,7 +132,12 @@ pub const LongHorizonArm = enum {
         return switch (self) {
             .native => native_enabled,
             .codex_style => false,
-            .claude_style, .tinykg => true,
+            .claude_style => true,
+            // TinyKG links markdown memory when the native channel is enabled,
+            // but an explicit global disable remains authoritative.  This
+            // permits graph-only deployments without silently enabling a
+            // second persistence channel.
+            .tinykg => native_enabled,
         };
     }
 
@@ -143,6 +148,12 @@ pub const LongHorizonArm = enum {
         };
     }
 };
+
+test "TinyKG arm respects an explicit auto-memory disable" {
+    try std.testing.expect(LongHorizonArm.tinykg.usesAutoMemory(true));
+    try std.testing.expect(!LongHorizonArm.tinykg.usesAutoMemory(false));
+    try std.testing.expect(LongHorizonArm.claude_style.usesAutoMemory(false));
+}
 
 /// LLM 后端协议种类(App 组装层据此选具体 Client;core 只见中立 Provider)。
 pub const ProviderKind = enum { anthropic, openai, gemini };

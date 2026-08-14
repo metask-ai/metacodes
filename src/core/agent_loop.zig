@@ -391,6 +391,7 @@ fn emitProgress(backend: *const UiBackend, sess: @import("session_id.zig").Sessi
 const EffectiveToolSet = struct {
     policy_filtered: ?[]json_mod.ToolDefinition = null,
     filtered_pool: ?[]json_mod.ToolDefinition = null,
+    discovery_filtered: ?[]json_mod.ToolDefinition = null,
     deferred_filtered: ?[]json_mod.ToolDefinition = null,
     cap_filtered: ?[]json_mod.ToolDefinition = null,
     defs: []const json_mod.ToolDefinition = &.{},
@@ -398,6 +399,7 @@ const EffectiveToolSet = struct {
     fn deinit(self: *EffectiveToolSet, allocator: std.mem.Allocator) void {
         if (self.policy_filtered) |pf| allocator.free(pf);
         if (self.filtered_pool) |fp| allocator.free(fp);
+        if (self.discovery_filtered) |df| allocator.free(df);
         if (self.deferred_filtered) |df| allocator.free(df);
         if (self.cap_filtered) |cf| allocator.free(cf);
         self.* = .{};
@@ -432,28 +434,51 @@ fn buildEffectiveToolSet(
     const skill_filtered = if (out.filtered_pool) |fp| fp else policy_filtered;
     out.defs = skill_filtered;
 
-    const effective_tool_defs = blk: {
-        const acts = activated_tools orelse break :blk skill_filtered;
+    // ToolSearch is useful only while at least one deferred schema remains in
+    // the policy/Skill-visible catalog. Reapply the same invariant used by
+    // tools.toToolDefinitionsFull after later runtime filtering, otherwise the
+    // model receives a discovery tool that can only return NoToolMatch.
+    const discovery_filtered = blk: {
         var has_deferred = false;
-        for (skill_filtered) |d| {
+        var has_tool_search = false;
+        for (skill_filtered) |definition| {
+            has_deferred = has_deferred or definition.deferred;
+            has_tool_search = has_tool_search or std.mem.eql(u8, definition.name, "ToolSearch");
+        }
+        if (has_deferred or !has_tool_search) break :blk skill_filtered;
+        var keep: std.ArrayList(json_mod.ToolDefinition) = .empty;
+        errdefer keep.deinit(allocator);
+        for (skill_filtered) |definition| {
+            if (std.mem.eql(u8, definition.name, "ToolSearch")) continue;
+            try keep.append(allocator, definition);
+        }
+        out.discovery_filtered = try keep.toOwnedSlice(allocator);
+        break :blk out.discovery_filtered.?;
+    };
+    out.defs = discovery_filtered;
+
+    const effective_tool_defs = blk: {
+        const acts = activated_tools orelse break :blk discovery_filtered;
+        var has_deferred = false;
+        for (discovery_filtered) |d| {
             if (d.deferred) {
                 has_deferred = true;
                 break;
             }
         }
-        if (!has_deferred) break :blk skill_filtered;
+        if (!has_deferred) break :blk discovery_filtered;
 
         var keep: std.ArrayList(json_mod.ToolDefinition) = .empty;
-        for (skill_filtered) |d| {
+        for (discovery_filtered) |d| {
             if (d.deferred and !acts.contains(d.name)) continue;
             keep.append(allocator, d) catch {
                 keep.deinit(allocator);
-                break :blk skill_filtered;
+                break :blk discovery_filtered;
             };
         }
         out.deferred_filtered = keep.toOwnedSlice(allocator) catch {
             keep.deinit(allocator);
-            break :blk skill_filtered;
+            break :blk discovery_filtered;
         };
         break :blk out.deferred_filtered.?;
     };
@@ -606,26 +631,9 @@ pub fn run(
         // L4 诊断:turn span 起点。
         backend.emitEvent(sess, .{ .diag_turn_begin = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1 } });
 
-        // Plan 模式每轮把 plan 指令追加到 system prompt(对齐 mecode 每轮 developer_instructions):
-        // 根治"指令只在 EnterPlanMode 返回出现一次,后续轮模型忘了 <proposed_plan> 格式"。
-        // turn 作用域 alloc,用后 free;非 plan 模式直接用 opts.system_prompt(零开销)。
-        var sys_prompt_owned: ?[]u8 = null;
-        defer if (sys_prompt_owned) |p| allocator.free(p);
-        const effective_system_prompt: ?[]const u8 = blk: {
-            const in_plan = permission_ctx.modeValue() == .plan;
-            // swarm 纪律:有 team 时追加 addendum(裸文本对 teammate 不可见,必须用 SendMessage;
-            // 对齐 cc teammate addendum,Linus/PM SW2 F3)。lead 与 teammate 都注入。
-            const in_swarm = if (opts.swarm) |s| s.hasTeam() else false;
-            if (!in_plan and !in_swarm) break :blk opts.system_prompt;
-            const base = opts.system_prompt orelse "";
-            const plan_seg = if (in_plan) "\n\n# Plan Mode (active)\n" ++ @import("../tools/plan_mode.zig").PLAN_MODE_INSTRUCTIONS else "";
-            const swarm_seg = if (in_swarm) "\n\n" ++ @import("../swarm/tools.zig").SWARM_ADDENDUM else "";
-            sys_prompt_owned = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ base, plan_seg, swarm_seg }) catch null;
-            break :blk if (sys_prompt_owned) |p| p else opts.system_prompt;
-        };
-
-        // 工具池过滤必须在 compact 判断之前完成。auto-compact 以"实际下一次请求"
-        // 为准，而不是未经过 skill/deferred/capability 门控的全量工具表。
+        // 工具池过滤必须在 prompt 投影和 compact 判断之前完成。App 初始化时构造的
+        // prompt 不知道 per-run execution policy；先算真实 pool，才能避免 prompt 广告
+        // provider schema 已隐藏的 deferred tool。
         var effective_tools = try buildEffectiveToolSet(
             allocator,
             tool_defs,
@@ -638,6 +646,47 @@ pub fn run(
         // 对齐 codex:无 breaker_finalization gate,gated_tool_defs 即 effective_tools.defs。
         // 保留别名减少下游改动,为将来可选 gate 预留。
         const gated_tool_defs: []const json_mod.ToolDefinition = effective_tools.defs;
+        // Deferred catalog sees policy + active-skill filtering, but intentionally
+        // precedes activation filtering: unactivated deferred tools are exactly
+        // the tools the catalog exists to advertise.
+        const deferred_catalog_defs = if (effective_tools.discovery_filtered) |defs|
+            defs
+        else if (effective_tools.filtered_pool) |defs|
+            defs
+        else if (effective_tools.policy_filtered) |defs|
+            defs
+        else
+            tool_defs;
+
+        // Plan 模式每轮把 plan 指令追加到 system prompt(对齐 mecode 每轮 developer_instructions):
+        // 根治"指令只在 EnterPlanMode 返回出现一次,后续轮模型忘了 <proposed_plan> 格式"。
+        // turn 作用域 alloc,用后 free;非 plan 模式直接用 opts.system_prompt(零开销)。
+        var sys_prompt_owned: ?[]u8 = null;
+        defer if (sys_prompt_owned) |p| allocator.free(p);
+        const augmented_system_prompt: ?[]const u8 = blk: {
+            const in_plan = permission_ctx.modeValue() == .plan;
+            // swarm 纪律:有 team 时追加 addendum(裸文本对 teammate 不可见,必须用 SendMessage;
+            // 对齐 cc teammate addendum,Linus/PM SW2 F3)。lead 与 teammate 都注入。
+            const in_swarm = if (opts.swarm) |s| s.hasTeam() else false;
+            if (!in_plan and !in_swarm) break :blk opts.system_prompt;
+            const base = opts.system_prompt orelse "";
+            const plan_seg = if (in_plan) "\n\n# Plan Mode (active)\n" ++ @import("../tools/plan_mode.zig").PLAN_MODE_INSTRUCTIONS else "";
+            const swarm_seg = if (in_swarm) "\n\n" ++ @import("../swarm/tools.zig").SWARM_ADDENDUM else "";
+            sys_prompt_owned = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ base, plan_seg, swarm_seg }) catch null;
+            break :blk if (sys_prompt_owned) |p| p else opts.system_prompt;
+        };
+        var projected_system_prompt_owned: ?[]u8 = null;
+        defer if (projected_system_prompt_owned) |p| allocator.free(p);
+        const effective_system_prompt: ?[]const u8 = blk: {
+            const base = augmented_system_prompt orelse break :blk null;
+            projected_system_prompt_owned = try @import("system_prompt.zig").projectDeferredToolsForExecution(
+                allocator,
+                base,
+                deferred_catalog_defs,
+                gated_tool_defs,
+            );
+            break :blk if (projected_system_prompt_owned) |p| p else base;
+        };
 
         // 自动 compact：发请求前检查 token 估算,超阈值则保留最近 N 条。
         // 阈值 null 时 = input context window * 0.8(逼近 context 上限才压缩,留出回复空间)。
