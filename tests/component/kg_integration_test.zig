@@ -563,6 +563,7 @@ test "L2 KG governance: freshness and contradiction contract enters the actual A
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "rejects premature final answers until the available obligations commit") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "zero-candidate batch does not create an impossible KgContext obligation") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "One best-node KgContext call is sufficient") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "preserve the user's relation or action") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "necessary, not sufficient") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "mechanism, symptom, desired outcome, or nearby implementation term") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Deduplicate candidates by node_id across every call") != null);
