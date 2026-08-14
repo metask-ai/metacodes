@@ -25,7 +25,6 @@ pub fn setErrorDetail(
 
 /// Progress 心跳:子进程长命令"仍在运行"提示。重构前是进程全局 g_progress_cb(多 Session
 /// 串台),已移到 ToolContext.spawn_tick_fn(per-session),作为参数传入 spawnCaptureWithStderrTimed。
-
 /// 从 JSON 对象字符串提取字段值（纯手写解析，适配流式 partial JSON）
 ///
 /// 支持：
@@ -236,6 +235,7 @@ pub const SpawnOut = struct {
     stdout: []u8,
     stderr: []u8,
     exit_code: i32,
+    capture_complete: bool = true,
 };
 
 /// spawn 子进程并同时捕获 stdout 和 stderr 到两个独立 buffer，返回 exit_code。
@@ -294,9 +294,8 @@ pub fn spawnCaptureWithStderrTimed(
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.SpawnError,
     };
-    return .{ .stdout = r.stdout, .stderr = r.stderr, .exit_code = r.exit_code };
+    return .{ .stdout = r.stdout, .stderr = r.stderr, .exit_code = r.exit_code, .capture_complete = r.capture_complete };
 }
-
 
 test "extractJsonArg string value" {
     const data = "{\"path\":\"/etc/hostname\",\"limit\":100}";

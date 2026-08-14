@@ -235,6 +235,10 @@ pub const SessionConfig = struct {
     permission_mode: types.PermissionMode = .default,
     permission_rules: ?permission_settings.RuleSetInput = null,
     workspace: WorkspaceConfig,
+    /// Optional Host-owned private directory for recoverable large tool
+    /// results. It must remain stable across checkpoint restore when artifact
+    /// IDs in the Conversation are expected to stay readable.
+    artifact_root: []const u8 = "",
     /// Explicit authority ceiling. It can only select names present in the
     /// Runtime catalog; an empty list creates a text-only Session deliberately.
     allowed_tools: []const []const u8,
@@ -627,6 +631,8 @@ pub const AgentSession = struct {
     provider: provider_factory.OwnedProvider,
     conversation: Conversation,
     workspace: workspace_mod.WorkspacePolicy,
+    artifact_root: []u8,
+    tool_result_metrics: @import("tool_result_metrics.zig").Metrics = .{},
     tools: tool_catalog.Selection,
     read_state: ReadState,
     jobs: ?JobRegistry,
@@ -709,6 +715,8 @@ pub const AgentSession = struct {
 
         var workspace = try workspace_mod.WorkspacePolicy.init(allocator, config.workspace);
         errdefer workspace.deinit();
+        const artifact_root = try allocator.dupe(u8, config.artifact_root);
+        errdefer allocator.free(artifact_root);
         var selected_tools = try tool_catalog.Selection.init(allocator, &runtime.catalog, config.allowed_tools);
         errdefer selected_tools.deinit();
         for (selected_tools.entries) |entry| {
@@ -783,6 +791,7 @@ pub const AgentSession = struct {
             .provider = owned_provider,
             .conversation = conversation,
             .workspace = workspace,
+            .artifact_root = artifact_root,
             .tools = selected_tools,
             .read_state = ReadState.init(allocator),
             .jobs = jobs,
@@ -861,6 +870,7 @@ pub const AgentSession = struct {
         self.read_state.deinit();
         self.tools.deinit();
         self.workspace.deinit();
+        allocator.free(self.artifact_root);
         if (self.base_url) |url| allocator.free(url);
         allocator.free(self.model);
         secureFree(allocator, self.api_key);
@@ -1354,6 +1364,8 @@ pub const AgentSession = struct {
                 .cwd_abs = self.workspace.root,
                 .resolve_relative_paths = true,
                 .home_dir = self.workspace.home,
+                .artifact_root = self.artifact_root,
+                .tool_result_metrics = &self.tool_result_metrics,
                 .sandbox = self.workspace.sandbox(),
                 .parent_model = self.model,
                 .colorize = false,

@@ -218,6 +218,9 @@ pub const App = struct {
     transcript_writer: ?transcript.Writer = null,
     /// 本 session 累计用量（跨多 turn）
     usage: UsageTotals = .{},
+    /// Internal-only large-result projection/recovery counters. Evaluation
+    /// and formal observation adapters may snapshot these; no UI owns them.
+    tool_result_metrics: @import("core/tool_result_metrics.zig").Metrics = .{},
     /// 从 config.json 加载的细粒度权限规则；null 时仅靠四模式兜底
     rule_set: ?permission_mod.RuleSet = null,
     /// 5 层 settings 聚合(allow/ask/deny + additionalDirectories + disable flags)。

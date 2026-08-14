@@ -1,0 +1,382 @@
+//! One-shot, deterministic projection of completed tool results into Conversation.
+//!
+//! Hooks and UI consume the raw result first. This module then commits either
+//! the original small bytes or one stable artifact envelope; historical
+//! messages are never re-projected before later provider requests.
+
+const std = @import("std");
+const artifact = @import("tool_result_artifact.zig");
+
+pub const SCHEMA = "metacodes.tool-result-projection.v1";
+pub const ENVELOPE_PREFIX = "{\"schema_version\":\"" ++ SCHEMA ++ "\",\"projection\":";
+pub const BASH_SCHEMA = "metacodes.bash-result.v2";
+pub const DEFAULT_PREVIEW_BYTES: usize = 1536;
+
+pub const Item = struct {
+    tool_name: []const u8,
+    content: *[]const u8,
+    is_error: bool,
+};
+
+pub const Config = struct {
+    session_root: []const u8,
+    per_result_bytes: usize,
+    per_turn_bytes: usize,
+    preview_bytes: usize = DEFAULT_PREVIEW_BYTES,
+};
+
+pub const Stats = struct {
+    raw_bytes: usize = 0,
+    projected_bytes: usize = 0,
+    artifact_bytes: usize = 0,
+    artifact_spill_count: usize = 0,
+    unrecoverable_fallback_count: usize = 0,
+    structured_result_count: usize = 0,
+    structured_projection_failures: usize = 0,
+    turn_budget_spills: usize = 0,
+    budget_exhausted: bool = false,
+
+    pub fn changed(self: Stats) bool {
+        return self.artifact_spill_count != 0 or self.unrecoverable_fallback_count != 0;
+    }
+};
+
+pub fn turnBudgetBytes(max_input_tokens: usize) usize {
+    // Approximate four UTF-8 bytes/token, then allocate 30% of one request to
+    // all tool results. The caps match the existing production envelope.
+    const derived = std.math.mul(usize, max_input_tokens, 6) catch std.math.maxInt(usize);
+    const scaled = derived / 5;
+    return @min(@max(scaled, 16 * 1024), 200 * 1024);
+}
+
+pub fn project(allocator: std.mem.Allocator, items: []Item, config: Config) !Stats {
+    var stats = Stats{};
+    const structured = try allocator.alloc(bool, items.len);
+    defer allocator.free(structured);
+    for (items, 0..) |item, index| {
+        stats.raw_bytes +|= item.content.*.len;
+        structured[index] = isStructuredJson(item.content.*);
+        if (structured[index]) stats.structured_result_count += 1;
+    }
+
+    // Per-result bound first. ReadArtifact is itself hard-bounded and must not
+    // spill again, otherwise recovery would recurse forever.
+    for (items, 0..) |item, index| {
+        if (std.mem.eql(u8, item.tool_name, "ReadArtifact")) continue;
+        // Encoded tool errors are bounded semantic control messages, not bulk
+        // content. Replacing them would hide the exact recovery contract from
+        // the model; the aggregate budget may report exhaustion instead.
+        if (item.is_error) continue;
+        if (item.content.*.len <= config.per_result_bytes) continue;
+        try spillOne(allocator, item, structured[index], config, &stats, false);
+    }
+
+    var total = totalBytes(items);
+    while (total > config.per_turn_bytes) {
+        var biggest: ?usize = null;
+        var biggest_len: usize = 0;
+        for (items, 0..) |item, index| {
+            if (std.mem.eql(u8, item.tool_name, "ReadArtifact")) continue;
+            if (item.is_error) continue;
+            if (isProjectionEnvelope(item.content.*)) continue;
+            // Strict > preserves the original ordinal as the deterministic
+            // tie-breaker for equal-size parallel results.
+            if (item.content.*.len > biggest_len) {
+                biggest = index;
+                biggest_len = item.content.*.len;
+            }
+        }
+        const index = biggest orelse break;
+        const before = items[index].content.*.len;
+        try spillOne(allocator, items[index], structured[index], config, &stats, true);
+        const after = items[index].content.*.len;
+        total = total - before + after;
+        if (after >= before) break;
+    }
+    stats.projected_bytes = totalBytes(items);
+    stats.budget_exhausted = stats.projected_bytes > config.per_turn_bytes;
+    return stats;
+}
+
+pub fn isProjectionEnvelope(content: []const u8) bool {
+    return std.mem.startsWith(u8, content, ENVELOPE_PREFIX);
+}
+
+pub fn isRecoverableEnvelope(content: []const u8) bool {
+    return std.mem.startsWith(u8, content, ENVELOPE_PREFIX ++ "\"artifact\"");
+}
+
+/// Whether clearing this completed result would destroy its only bounded
+/// recovery capability. Bash owns its channel artifacts directly, while all
+/// other tools use the generic projection envelope.
+pub fn hasRecoverableArtifact(content: []const u8) bool {
+    if (isRecoverableEnvelope(content)) return true;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, content, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const version = parsed.value.object.get("schema_version") orelse return false;
+    if (version != .string or !std.mem.eql(u8, version.string, BASH_SCHEMA)) return false;
+    return bashChannelRecoverable(parsed.value.object, "stdout_artifact_id", "stdout_recoverable") or
+        bashChannelRecoverable(parsed.value.object, "stderr_artifact_id", "stderr_recoverable");
+}
+
+fn bashChannelRecoverable(object: std.json.ObjectMap, id_key: []const u8, recoverable_key: []const u8) bool {
+    const recoverable = object.get(recoverable_key) orelse return false;
+    if (recoverable != .bool or !recoverable.bool) return false;
+    const id = object.get(id_key) orelse return false;
+    return id == .string and validArtifactId(id.string);
+}
+
+fn validArtifactId(id: []const u8) bool {
+    if (id.len != artifact.ID_BYTES or !std.mem.startsWith(u8, id, artifact.ID_PREFIX)) return false;
+    for (id[artifact.ID_PREFIX.len..]) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
+    return true;
+}
+
+fn spillOne(
+    allocator: std.mem.Allocator,
+    item: Item,
+    structured: bool,
+    config: Config,
+    stats: *Stats,
+    turn_budget: bool,
+) !void {
+    const original = item.content.*;
+    const media_type = if (structured) "application/json" else "text/plain; charset=utf-8";
+    const persisted = artifact.persist(allocator, config.session_root, original);
+    const replacement = if (persisted) |stored| blk: {
+        stats.artifact_spill_count += 1;
+        stats.artifact_bytes +|= original.len;
+        break :blk try renderArtifactEnvelope(allocator, stored, media_type, original, config.preview_bytes);
+    } else |persist_error| blk: {
+        if (persist_error == error.OutOfMemory) return error.OutOfMemory;
+        stats.unrecoverable_fallback_count += 1;
+        if (structured) stats.structured_projection_failures += 1;
+        break :blk try renderFallbackEnvelope(allocator, media_type, original, config.preview_bytes, storageErrorCode(persist_error));
+    };
+    allocator.free(@constCast(original));
+    item.content.* = replacement;
+    if (turn_budget) stats.turn_budget_spills += 1;
+}
+
+fn renderArtifactEnvelope(
+    allocator: std.mem.Allocator,
+    receipt: artifact.Receipt,
+    media_type: []const u8,
+    content: []const u8,
+    preview_bytes: usize,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll(ENVELOPE_PREFIX ++ "\"artifact\",\"artifact_id\":");
+    try std.json.Stringify.encodeJsonString(receipt.id(), .{}, writer);
+    try writer.writeAll(",\"media_type\":");
+    try std.json.Stringify.encodeJsonString(media_type, .{}, writer);
+    try writer.print(",\"original_bytes\":{d},\"sha256\":\"{s}\",\"capture_complete\":true,\"recoverable\":true", .{ receipt.bytes, receipt.sha256[0..] });
+    try appendPreview(writer, content, preview_bytes);
+    try writer.writeAll(",\"read\":{\"tool\":\"ReadArtifact\",\"offset\":0,\"limit_max\":32768}}");
+    return out.toOwnedSlice();
+}
+
+fn renderFallbackEnvelope(
+    allocator: std.mem.Allocator,
+    media_type: []const u8,
+    content: []const u8,
+    preview_bytes: usize,
+    storage_error: []const u8,
+) ![]u8 {
+    const digest = artifact.sha256Hex(content);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll(ENVELOPE_PREFIX ++ "\"fallback\",\"artifact_id\":null,\"media_type\":");
+    try std.json.Stringify.encodeJsonString(media_type, .{}, writer);
+    try writer.print(",\"original_bytes\":{d},\"sha256\":\"{s}\",\"capture_complete\":true,\"recoverable\":false,\"storage_error\":", .{ content.len, digest[0..] });
+    try std.json.Stringify.encodeJsonString(storage_error, .{}, writer);
+    try appendPreview(writer, content, preview_bytes);
+    try writer.writeAll("}");
+    return out.toOwnedSlice();
+}
+
+fn storageErrorCode(err: anyerror) []const u8 {
+    return switch (err) {
+        error.ArtifactRootUnavailable => "artifact_store_unavailable",
+        error.ArtifactTooLarge => "artifact_too_large",
+        error.SessionQuotaExceeded => "artifact_session_quota_exceeded",
+        error.ArtifactPathSymlink,
+        error.ArtifactDirectoryUnsafe,
+        error.ArtifactUnsafeFile,
+        error.ArtifactDirectoryUntrusted,
+        => "artifact_store_unsafe",
+        else => "artifact_persist_failed",
+    };
+}
+
+fn appendPreview(writer: *std.Io.Writer, content: []const u8, preview_bytes: usize) !void {
+    const valid_utf8 = isInlineUtf8(content);
+    const raw_head_budget = @min(content.len, preview_bytes * 3 / 4);
+    const head_end = if (valid_utf8) floorUtf8Boundary(content, raw_head_budget) else raw_head_budget;
+    const raw_tail_budget = @min(content.len - head_end, preview_bytes -| head_end);
+    var tail_start = content.len - raw_tail_budget;
+    if (valid_utf8) tail_start = ceilUtf8Boundary(content, tail_start);
+    if (tail_start < head_end) tail_start = head_end;
+    const head = content[0..head_end];
+    const tail = content[tail_start..];
+
+    try writer.writeAll(if (valid_utf8) ",\"preview_encoding\":\"utf-8\"" else ",\"preview_encoding\":\"base64\"");
+    try writer.writeAll(",\"preview_head\":");
+    try appendPreviewPart(writer, head, valid_utf8);
+    try writer.writeAll(",\"preview_tail\":");
+    try appendPreviewPart(writer, tail, valid_utf8);
+    try writer.print(",\"preview_head_bytes\":{d},\"preview_tail_bytes\":{d},\"omitted_bytes\":{d}", .{
+        head.len,
+        tail.len,
+        tail_start - head_end,
+    });
+}
+
+fn appendPreviewPart(writer: *std.Io.Writer, bytes: []const u8, utf8: bool) !void {
+    if (utf8) return std.json.Stringify.encodeJsonString(bytes, .{}, writer);
+    const encoder = std.base64.standard.Encoder;
+    const encoded = try std.heap.page_allocator.alloc(u8, encoder.calcSize(bytes.len));
+    defer std.heap.page_allocator.free(encoded);
+    _ = encoder.encode(encoded, bytes);
+    try std.json.Stringify.encodeJsonString(encoded, .{}, writer);
+}
+
+fn floorUtf8Boundary(content: []const u8, desired: usize) usize {
+    var end = @min(desired, content.len);
+    if (end == content.len) return end;
+    while (end > 0 and isUtf8ContinuationByte(content[end])) : (end -= 1) {}
+    return end;
+}
+
+fn ceilUtf8Boundary(content: []const u8, desired: usize) usize {
+    var start = @min(desired, content.len);
+    while (start < content.len and isUtf8ContinuationByte(content[start])) : (start += 1) {}
+    return start;
+}
+
+fn isUtf8ContinuationByte(byte: u8) bool {
+    return (byte & 0b1100_0000) == 0b1000_0000;
+}
+
+fn isInlineUtf8(content: []const u8) bool {
+    if (!std.unicode.utf8ValidateSlice(content)) return false;
+    for (content) |byte| {
+        if (byte < 0x20 and byte != '\n' and byte != '\r' and byte != '\t') return false;
+    }
+    return true;
+}
+
+fn isStructuredJson(content: []const u8) bool {
+    var scanner = std.json.Scanner.initCompleteInput(std.heap.page_allocator, content);
+    defer scanner.deinit();
+    while (true) {
+        const token = scanner.next() catch return false;
+        if (token == .end_of_document) return true;
+    }
+}
+
+fn totalBytes(items: []const Item) usize {
+    var total: usize = 0;
+    for (items) |item| total +|= item.content.*.len;
+    return total;
+}
+
+test "structured spill remains valid JSON and exposes no local path" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var content: []const u8 = try allocator.dupe(u8, "{\"rows\":[1,2,3],\"padding\":\"xxxxxxxxxxxxxxxx\"}");
+    var items = [_]Item{.{ .tool_name = "KgContext", .content = &content, .is_error = false }};
+    const stats = try project(allocator, &items, .{ .session_root = root, .per_result_bytes = 16, .per_turn_bytes = 4096 });
+    defer allocator.free(@constCast(content));
+    try std.testing.expectEqual(@as(usize, 1), stats.artifact_spill_count);
+    try std.testing.expect(isRecoverableEnvelope(content));
+    try std.testing.expect(std.mem.indexOf(u8, content, root) == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("application/json", parsed.value.object.get("media_type").?.string);
+}
+
+test "projection preview preserves deterministic UTF-8 head and tail" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var content: []const u8 = try allocator.dupe(u8, "HEAD-中文-abcdefghijklmnopqrstuvwxyz-TAIL🙂");
+    var items = [_]Item{.{ .tool_name = "Probe", .content = &content, .is_error = false }};
+    _ = try project(allocator, &items, .{ .session_root = root, .per_result_bytes = 8, .per_turn_bytes = 4096, .preview_bytes = 36 });
+    defer allocator.free(@constCast(content));
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("utf-8", parsed.value.object.get("preview_encoding").?.string);
+    try std.testing.expect(std.mem.startsWith(u8, parsed.value.object.get("preview_head").?.string, "HEAD-"));
+    try std.testing.expect(std.mem.endsWith(u8, parsed.value.object.get("preview_tail").?.string, "TAIL🙂"));
+    try std.testing.expect(parsed.value.object.get("omitted_bytes").?.integer > 0);
+}
+
+test "recoverable artifact detection includes Bash channel envelopes" {
+    const id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const bash = "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout_artifact_id\":\"" ++ id ++ "\",\"stdout_recoverable\":true}";
+    try std.testing.expect(hasRecoverableArtifact(bash));
+    try std.testing.expect(!hasRecoverableArtifact("{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout_artifact_id\":null,\"stdout_recoverable\":false}"));
+}
+
+test "missing store yields an explicit valid fallback envelope" {
+    const allocator = std.testing.allocator;
+    var content: []const u8 = try allocator.dupe(u8, "{\"large\":true,\"padding\":\"xxxxxxxx\"}");
+    var items = [_]Item{.{ .tool_name = "Probe", .content = &content, .is_error = false }};
+    const stats = try project(allocator, &items, .{ .session_root = "", .per_result_bytes = 8, .per_turn_bytes = 4096 });
+    defer allocator.free(@constCast(content));
+    try std.testing.expectEqual(@as(usize, 1), stats.unrecoverable_fallback_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.structured_projection_failures);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.object.get("recoverable").?.bool);
+    try std.testing.expectEqualStrings("artifact_store_unavailable", parsed.value.object.get("storage_error").?.string);
+}
+
+test "error payloads remain exact even when they exceed projection budgets" {
+    const allocator = std.testing.allocator;
+    var content: []const u8 = try allocator.dupe(u8, "{\"error\":{\"code\":\"retry_with_offset\",\"detail\":\"exact\"}}");
+    defer allocator.free(@constCast(content));
+    var items = [_]Item{.{ .tool_name = "Read", .content = &content, .is_error = true }};
+    const before = try allocator.dupe(u8, content);
+    defer allocator.free(before);
+    const stats = try project(allocator, &items, .{ .session_root = "", .per_result_bytes = 8, .per_turn_bytes = 8 });
+    try std.testing.expectEqualStrings(before, content);
+    try std.testing.expectEqual(@as(usize, 0), stats.artifact_spill_count);
+    try std.testing.expect(stats.budget_exhausted);
+}
+
+test "aggregate spill uses original ordinal as equal-size tie break" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var first: []const u8 = try allocator.dupe(u8, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    var second: []const u8 = try allocator.dupe(u8, "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
+    var items = [_]Item{
+        .{ .tool_name = "A", .content = &first, .is_error = false },
+        .{ .tool_name = "B", .content = &second, .is_error = false },
+    };
+    const stats = try project(allocator, &items, .{ .session_root = root, .per_result_bytes = 4096, .per_turn_bytes = 48, .preview_bytes = 0 });
+    defer allocator.free(@constCast(first));
+    defer allocator.free(@constCast(second));
+    try std.testing.expectEqual(@as(usize, 1), stats.turn_budget_spills);
+    try std.testing.expect(isRecoverableEnvelope(first));
+    try std.testing.expectEqualStrings("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", second);
+}

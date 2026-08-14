@@ -182,6 +182,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
                 .cwd_abs = app.cwdAbs(),
                 .additional_dirs = app.additionalDirs(),
                 .home_dir = home,
+                .artifact_root = app.sessionDir() orelse "",
+                .tool_result_metrics = &app.tool_result_metrics,
                 // agent_ident 仍是进程自己的 24-hex session id，用于通用
                 // agent-loop 身份。TinyKG 租约单独使用 name@team，保证宿主自领与
                 // 模型后续 TaskUpdate/TaskStop 共用完全相同的 holder 字符串。

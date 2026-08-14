@@ -108,6 +108,25 @@ test "L2 smoke: Read 不存在文件 → FileNotFound" {
     try std.testing.expectError(error.FileNotFound, tools.dispatch(&ctx, "Read", "{\"file_path\":\"/tmp/cc-smoke-nope-9z9z.txt\"}"));
 }
 
+test "L2 smoke: ReadArtifact registry schema dispatches bounded recovery" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const receipt = try cc.tool_result_artifact.persist(a, root, "artifact-dispatch-body");
+    var ctx = simpleCtx(a);
+    ctx.artifact_root = root;
+    const args = try std.fmt.allocPrint(a, "{{\"artifact_id\":\"{s}\",\"offset\":9,\"limit\":8}}", .{receipt.id()});
+    defer a.free(args);
+
+    const result = try dispatchOk(&ctx, "ReadArtifact", args);
+    defer a.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "dispatch") != null);
+    try std.testing.expectError(error.MissingArtifactId, tools.dispatch(&ctx, "ReadArtifact", "{}"));
+}
+
 // ============================================================================
 // Edit(文件副作用;simple ctx 无 read_state → 跳过 must-read 校验)
 // ============================================================================

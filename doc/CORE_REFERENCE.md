@@ -195,6 +195,13 @@ emit `text_chunk`/`tool_start`)→ 按权限决策 + 并发安全分批执行工
 tool_result 回灌为 user 消息 → 下一轮。直到无 tool_use(`end_turn`)/ 达 max_turns / abort /
 挂起(`suspended`,见 §5)。`tool_loop` 枚举值保留为 ABI 兼容(无生产者,对齐 codex 无主动熔断)。
 
+**大结果提交协议**:`executeSlots`、PostToolUse hook 和 backend 先观察原始结果；随后
+`result_projection` 只做一次确定性提交。结构化工具应优先返回合法的 bounded envelope
+（`rows/cursor/total/truncated`）；其余超限结果写入 session 下的内容寻址 artifact，模型只看到
+稳定的 SHA-256、head/tail 预览和 `ReadArtifact(offset,limit)` 恢复指令。最后的通用字节截断仅是
+失存储时的显式不可恢复兜底。已提交的 recovery envelope 不在后续 provider 请求前重新投影，
+避免无意义破坏 prompt-cache 前缀。
+
 ### 4.1 Options(全可选,`.{}` 即最简跑)
 
 ~45 字段,分四类——理解分类比记字段重要:
@@ -206,7 +213,7 @@ tool_result 回灌为 user 消息 → 下一轮。直到无 tool_use(`end_turn`)
   `api_client` `tool_defs` `dyn_registry` `agents` `skills_set` `cron_registry` `sandbox`
   `mcp_sessions` …
 - **SESSION/身份**:`session: SessionId` `session_id` `project_dir` `cwd_abs` `home_dir`
-  `parent_model` `plan_file_path` …
+  `parent_model` `plan_file_path` `artifact_root` …
 - **接口回调(类型安全,见 §4.2)**:`usage_sink` `progress_reporter` `ui_requester`
   `skill_activator` `tool_activator` `worktree_hook` + `spawn_tick_fn`(无状态,裸 fn)
 

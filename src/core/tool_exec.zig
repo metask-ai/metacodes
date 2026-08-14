@@ -892,13 +892,9 @@ pub fn executeSlots(
         i = j;
     }
 
-    // 只有整批确认无 fatal/OOM 后才允许产生持久化副作用。
-    persistCompletedResults(slots, base_ctx, parent_allocator);
-
-    // per-message 聚合预算(对齐 cc MAX_TOOL_RESULTS_PER_MESSAGE_CHARS):一轮多个工具
-    // 结果合计超 200k → 按大小降序把最大的落盘(替成 preview)直到达标。批1A 并发后
-    // 多工具同时产大结果更易触发;单结果落盘由上方确认整批成功后统一做,这里管"合计"。
-    enforceMessageBudget(slots, base_ctx, parent_allocator);
+    // Result persistence is intentionally not an execution concern. The
+    // agent loop lets PostToolUse hooks and UI consume raw results, then makes
+    // one deterministic projection immediately before Conversation append.
 }
 
 fn observeSuccessfulExecutions(slots: []const Slot, base_ctx: *const ToolContext) void {
@@ -912,65 +908,6 @@ fn observeSuccessfulExecutions(slots: []const Slot, base_ctx: *const ToolContext
     for (slots) |slot| {
         if (slot.decision != .run or slot.pending or slot.is_error or slot.content == null) continue;
         kg.observeSuccessfulExecution(task_id, slot.name, slot.input, project_dir);
-    }
-}
-
-fn persistCompletedResults(slots: []Slot, base_ctx: *const ToolContext, parent_allocator: std.mem.Allocator) void {
-    const storage = @import("../tools/tool_result_storage.zig");
-    for (slots) |*slot| {
-        // Error payloads are semantic model input, not bulk output. Replacing
-        // them with a persisted/truncated envelope would destroy the Host
-        // FAILED/REJECTED detail contract after it was safely serialized.
-        if (slot.is_error) continue;
-        const content = slot.content orelse continue;
-        if (storage.maybePersist(parent_allocator, slot.name, content, base_ctx.home_dir) catch null) |preview| {
-            parent_allocator.free(content);
-            slot.content = preview;
-        }
-    }
-}
-
-const MAX_TOOL_RESULTS_PER_MESSAGE: usize = 200_000;
-
-fn enforceMessageBudget(slots: []Slot, base_ctx: *const ToolContext, parent_allocator: std.mem.Allocator) void {
-    const storage = @import("../tools/tool_result_storage.zig");
-    var total: usize = 0;
-    for (slots) |s| {
-        // Error payloads are deliberately outside the bulk-result budget: the
-        // encoded error cap bounds them, and persistence must not rewrite them.
-        if (s.is_error) continue;
-        total += if (s.content) |c| c.len else 0;
-    }
-    if (total <= MAX_TOOL_RESULTS_PER_MESSAGE) return;
-
-    // 反复挑当前最大且"还没落盘"的 slot 落盘,直到达标或没得落。
-    while (total > MAX_TOOL_RESULTS_PER_MESSAGE) {
-        var biggest: ?usize = null;
-        var biggest_len: usize = 0;
-        for (slots, 0..) |s, k| {
-            if (s.is_error) continue;
-            const c = s.content orelse continue;
-            // Read(maxResultChars==maxInt)永不落盘——它自有 maxTokens 上限,落盘会造
-            // Read→file→Read 环(对齐 cc FileRead Infinity + per-message frozen/skip)。
-            if (storage.maxResultChars(s.name) == std.math.maxInt(usize)) continue;
-            // 已是 persisted/truncated preview 的不再处理(幂等)。
-            if (std.mem.indexOf(u8, c, "\"persisted\":true") != null or std.mem.indexOf(u8, c, "\"truncated\":true") != null) continue;
-            if (c.len > biggest_len) {
-                biggest_len = c.len;
-                biggest = k;
-            }
-        }
-        const idx = biggest orelse break; // 没有可落盘的了
-        const s = &slots[idx];
-        const old = s.content.?;
-        // 强制落盘:用 0 阈值确保这个一定被落(maybePersist 内部按 maxResultChars 判,
-        // 这里直接调 persistForced 绕过阈值)。
-        const preview = storage.persistForced(parent_allocator, s.name, old, base_ctx.home_dir) catch null;
-        if (preview) |p| {
-            total = total - old.len + p.len;
-            parent_allocator.free(old);
-            s.content = p;
-        } else break; // 落盘失败 → 停(避免死循环)
     }
 }
 
@@ -1501,15 +1438,16 @@ test "Host error detail bypasses result persistence and aggregate budget" {
     try std.testing.expect(std.mem.indexOf(u8, mixed_slots[1].content.?, "\"persisted\":true") == null);
     try std.testing.expect(!platform.fs.exists(result_dir.ptr));
 
-    // Normal bulk output still follows the existing persistence policy.
+    // Even normal bulk output remains raw at the dispatch seam. Projection is
+    // an agent-loop commit concern so hooks/UI can inspect the exact result.
     const success_probe = FailureDispatcher{ .detail = &.{}, .fail = false };
     var success_ctx = tools_mod.ToolContext{ .allocator = allocator, .home_dir = home, .tool_dispatcher = success_probe.dispatcher() };
     var success_slots = [_]Slot{.{ .decision = .run, .name = "HostPersistenceProbe", .id = "success", .input = detail_60k }};
     defer success_slots[0].deinit(allocator);
     try executeSlots(&success_slots, &success_ctx, allocator, .{ .bytes = [_]u8{'0'} ** 12 });
     try std.testing.expect(!success_slots[0].is_error);
-    try std.testing.expect(std.mem.indexOf(u8, success_slots[0].content.?, "\"persisted\":true") != null);
-    try std.testing.expect(platform.fs.exists(result_dir.ptr));
+    try std.testing.expectEqualStrings(detail_60k, success_slots[0].content.?);
+    try std.testing.expect(!platform.fs.exists(result_dir.ptr));
 }
 
 test "Host detail JSON is exact when valid and falls back when encoded payload exceeds cap" {

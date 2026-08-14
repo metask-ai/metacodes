@@ -397,6 +397,13 @@ pub const ToolContext = struct {
     additional_dirs: []const []const u8 = &.{},
     /// HOME(sandbox profile ~/ 展开)。
     home_dir: []const u8 = "",
+    /// Session-scoped root for content-addressed tool-result artifacts.
+    /// Empty means persistence/recovery is unavailable and projection must
+    /// return an explicit non-recoverable fallback envelope.
+    artifact_root: []const u8 = "",
+    /// Optional UI-independent counters shared by all execution depths in a
+    /// session. Atomic fields make parallel tools/subagents safe observers.
+    tool_result_metrics: ?*@import("../core/tool_result_metrics.zig").Metrics = null,
     /// 当前 session plan 文件全路径(ExitPlanMode 模型未传 plan 时从此读回兜底)。空=无。
     plan_file_path: []const u8 = "",
     /// 末轮助手消息里提取的 `<proposed_plan>` 内容(agent_loop 在 plan 模式末轮填;

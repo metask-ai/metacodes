@@ -292,6 +292,8 @@ fn buildOptions(
         .cwd_abs = app.cwdAbs(),
         .additional_dirs = app.additionalDirs(),
         .home_dir = app.homeDir(),
+        .artifact_root = app.sessionDir() orelse "",
+        .tool_result_metrics = &app.tool_result_metrics,
         .agents = &app.agents,
         .parent_model = app.activeModel(),
         .skills_set = &app.skills,

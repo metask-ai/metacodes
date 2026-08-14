@@ -6,6 +6,8 @@ const security = @import("security.zig");
 const util_time = @import("../util/time.zig");
 const util_json = @import("../util/json.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const artifact = @import("../core/tool_result_artifact.zig");
+const ResultMetrics = @import("../core/tool_result_metrics.zig").Metrics;
 
 /// nowMs：毫秒时间戳，复用 util/time.zig
 fn nowMs() util_time.Millis {
@@ -22,6 +24,23 @@ pub const AUTO_BACKGROUND_MS: u64 = 15_000;
 /// 前台 Bash 单股(stdout/stderr)输出上限,超出截断(对齐 Claude Code 30K 字符)。
 /// 防止 `cat huge` / `seq 1000000` 等把整个输出灌进上下文。
 pub const MAX_OUTPUT_BYTES: usize = 30_000;
+/// A completed Bash result is a bounded structured envelope. Each channel
+/// keeps only this preview inline; omitted bytes are recovered through the
+/// content-addressed artifact id, keeping the whole JSON below the generic
+/// 8KiB minimum result budget.
+pub const CHANNEL_PREVIEW_BYTES: usize = 1536;
+const PREVIEW_OMISSION_MARKER = "\n...[middle omitted]...\n";
+
+const ChannelPreview = struct {
+    content: []u8,
+    shown_source_bytes: u64,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *ChannelPreview) void {
+        self.allocator.free(self.content);
+        self.* = undefined;
+    }
+};
 
 /// 把输出截断到 ≤ MAX_OUTPUT_BYTES(保留头部),超出时追加 `... [N lines truncated] ...`。
 /// 切点回退到不超过上限的最近 UTF-8 字符边界 + 最近换行(不切坏多字节/半行)。
@@ -65,25 +84,229 @@ fn formatCompletedOutput(
     stdout: []const u8,
     stderr: []const u8,
     exit_code: i32,
+    artifact_root: []const u8,
+    capture_complete: bool,
+    metrics: ?*ResultMetrics,
 ) ![]u8 {
-    const stdout_hash = sha256Hex(stdout);
-    const stderr_hash = sha256Hex(stderr);
-    const out_trunc = try truncateHead(allocator, stdout);
-    defer allocator.free(out_trunc);
-    const err_trunc = try truncateHead(allocator, stderr);
-    defer allocator.free(err_trunc);
-
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    try aw.writer.writeAll("{\"stdout\":");
-    try std.json.Stringify.encodeJsonString(out_trunc, .{}, &aw.writer);
-    try aw.writer.writeAll(",\"stderr\":");
-    try std.json.Stringify.encodeJsonString(err_trunc, .{}, &aw.writer);
-    try aw.writer.print(
-        ",\"exit_code\":{d},\"stdout_original_bytes\":{d},\"stderr_original_bytes\":{d},\"stdout_sha256\":\"{s}\",\"stderr_sha256\":\"{s}\"}}",
-        .{ exit_code, stdout.len, stderr.len, stdout_hash[0..], stderr_hash[0..] },
-    );
+    try aw.writer.writeAll("{\"schema_version\":\"metacodes.bash-result.v2\",");
+    try appendMemoryChannel(&aw.writer, allocator, "stdout", stdout, artifact_root, capture_complete, metrics);
+    try aw.writer.writeByte(',');
+    try appendMemoryChannel(&aw.writer, allocator, "stderr", stderr, artifact_root, capture_complete, metrics);
+    try aw.writer.print(",\"exit_code\":{d}}}", .{exit_code});
     return try aw.toOwnedSlice();
+}
+
+fn appendMemoryChannel(
+    writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    label: []const u8,
+    bytes: []const u8,
+    artifact_root: []const u8,
+    capture_complete: bool,
+    metrics: ?*ResultMetrics,
+) !void {
+    const digest = sha256Hex(bytes);
+    const stored: ?artifact.Receipt = if (bytes.len > CHANNEL_PREVIEW_BYTES)
+        artifact.persist(allocator, artifact_root, bytes) catch null
+    else
+        null;
+    var preview = try headTailPreview(allocator, bytes, CHANNEL_PREVIEW_BYTES);
+    defer preview.deinit();
+    try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, bytes.len, digest, stored, capture_complete, metrics);
+}
+
+fn appendFileChannel(
+    writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    label: []const u8,
+    path: []const u8,
+    artifact_root: []const u8,
+    metrics: ?*ResultMetrics,
+) !void {
+    const inspected = artifact.inspectFile(allocator, path) catch {
+        const observed_bytes = artifact.observeFileBytes(allocator, path) catch 0;
+        var preview: ChannelPreview = if (observed_bytes > 0)
+            headTailFilePreview(allocator, path, observed_bytes, CHANNEL_PREVIEW_BYTES) catch .{
+                .content = try allocator.dupe(u8, ""),
+                .shown_source_bytes = 0,
+                .allocator = allocator,
+            }
+        else
+            .{ .content = try allocator.dupe(u8, ""), .shown_source_bytes = 0, .allocator = allocator };
+        defer preview.deinit();
+        try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, observed_bytes, null, null, false, metrics);
+        return;
+    };
+    const stored: ?artifact.Receipt = if (inspected.bytes > CHANNEL_PREVIEW_BYTES)
+        artifact.persistInspectedFile(allocator, artifact_root, path, inspected) catch null
+    else
+        null;
+    var preview = try headTailFilePreview(allocator, path, inspected.bytes, CHANNEL_PREVIEW_BYTES);
+    defer preview.deinit();
+    try appendChannel(writer, allocator, label, preview.content, preview.shown_source_bytes, inspected.bytes, inspected.sha256, stored, true, metrics);
+}
+
+fn appendChannel(
+    writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    label: []const u8,
+    preview: []const u8,
+    shown_source_bytes: u64,
+    captured_bytes: u64,
+    digest: ?[64]u8,
+    stored: ?artifact.Receipt,
+    capture_complete: bool,
+    metrics: ?*ResultMetrics,
+) !void {
+    if (metrics) |m| m.recordCapturedStream(captured_bytes);
+    if (captured_bytes > shown_source_bytes) {
+        if (stored != null) {
+            if (metrics) |m| m.recordDirectArtifact(captured_bytes);
+        } else if (metrics) |m| {
+            m.recordDirectFallback();
+        }
+    }
+    try writer.print("\"{s}\":", .{label});
+    if (isInlineUtf8(preview)) {
+        try std.json.Stringify.encodeJsonString(preview, .{}, writer);
+        try writer.print(",\"{s}_encoding\":\"utf-8\"", .{label});
+    } else {
+        const encoder = std.base64.standard.Encoder;
+        const encoded = try allocator.alloc(u8, encoder.calcSize(preview.len));
+        defer allocator.free(encoded);
+        _ = encoder.encode(encoded, preview);
+        try std.json.Stringify.encodeJsonString(encoded, .{}, writer);
+        try writer.print(",\"{s}_encoding\":\"base64\"", .{label});
+    }
+    try writer.print(",\"{s}_captured_bytes\":{d},\"{s}_original_bytes\":", .{ label, captured_bytes, label });
+    if (capture_complete) try writer.print("{d}", .{captured_bytes}) else try writer.writeAll("null");
+    try writer.print(",\"{s}_sha256\":", .{label});
+    if (digest) |committed_digest| {
+        try writer.print("\"{s}\"", .{committed_digest[0..]});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.print(",\"{s}_capture_complete\":{s},\"{s}_truncated\":{s},\"{s}_artifact_id\":", .{
+        label,
+        if (capture_complete) "true" else "false",
+        label,
+        if (captured_bytes > shown_source_bytes) "true" else "false",
+        label,
+    });
+    if (stored) |receipt| {
+        try std.json.Stringify.encodeJsonString(receipt.id(), .{}, writer);
+        try writer.print(",\"{s}_recoverable\":true,\"{s}_read\":{{\"tool\":\"ReadArtifact\",\"artifact_id\":", .{ label, label });
+        try std.json.Stringify.encodeJsonString(receipt.id(), .{}, writer);
+        try writer.writeAll(",\"offset\":0,\"limit_max\":32768}");
+    } else {
+        try writer.writeAll("null");
+        try writer.print(",\"{s}_recoverable\":{s}", .{ label, if (captured_bytes <= shown_source_bytes and capture_complete) "true" else "false" });
+    }
+}
+
+fn headTailPreview(allocator: std.mem.Allocator, bytes: []const u8, max_bytes: usize) !ChannelPreview {
+    if (bytes.len <= max_bytes or max_bytes <= PREVIEW_OMISSION_MARKER.len) {
+        const shown = @min(bytes.len, max_bytes);
+        return .{
+            .content = try allocator.dupe(u8, bytes[0..shown]),
+            .shown_source_bytes = shown,
+            .allocator = allocator,
+        };
+    }
+    const source_budget = max_bytes - PREVIEW_OMISSION_MARKER.len;
+    const wanted_head = source_budget * 3 / 4;
+    const wanted_tail = source_budget - wanted_head;
+    const valid_utf8 = std.unicode.utf8ValidateSlice(bytes);
+    const head_end = if (valid_utf8) floorUtf8Boundary(bytes, wanted_head) else wanted_head;
+    var tail_start = bytes.len - wanted_tail;
+    if (valid_utf8) tail_start = ceilUtf8Boundary(bytes, tail_start);
+    if (tail_start < head_end) tail_start = head_end;
+    const result = try std.mem.concat(allocator, u8, &.{ bytes[0..head_end], PREVIEW_OMISSION_MARKER, bytes[tail_start..] });
+    return .{
+        .content = result,
+        .shown_source_bytes = head_end + bytes.len - tail_start,
+        .allocator = allocator,
+    };
+}
+
+fn headTailFilePreview(allocator: std.mem.Allocator, path: []const u8, total_bytes: u64, max_bytes: usize) !ChannelPreview {
+    if (total_bytes <= max_bytes or max_bytes <= PREVIEW_OMISSION_MARKER.len) {
+        const content = try readWholeFile(path, allocator, max_bytes);
+        return .{ .content = content, .shown_source_bytes = content.len, .allocator = allocator };
+    }
+    const source_budget = max_bytes - PREVIEW_OMISSION_MARKER.len;
+    const wanted_head = source_budget * 3 / 4;
+    const wanted_tail = source_budget - wanted_head;
+    var path_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= path_buffer.len) return error.PathTooLong;
+    @memcpy(path_buffer[0..path.len], path);
+    path_buffer[path.len] = 0;
+    const fd = pfs.open(@ptrCast(&path_buffer), .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.OpenFailed;
+    defer _ = pfs.close(fd);
+
+    const result = try allocator.alloc(u8, wanted_head + PREVIEW_OMISSION_MARKER.len + wanted_tail);
+    errdefer allocator.free(result);
+    try readExactFd(fd, result[0..wanted_head]);
+    @memcpy(result[wanted_head .. wanted_head + PREVIEW_OMISSION_MARKER.len], PREVIEW_OMISSION_MARKER);
+    const tail_offset: i64 = @intCast(total_bytes - wanted_tail);
+    if (pfs.lseek(fd, tail_offset, .set) != tail_offset) return error.SeekFailed;
+    try readExactFd(fd, result[wanted_head + PREVIEW_OMISSION_MARKER.len ..]);
+    return .{ .content = result, .shown_source_bytes = wanted_head + wanted_tail, .allocator = allocator };
+}
+
+fn readExactFd(fd: pfs.Fd, bytes: []u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const count = pfs.read(fd, bytes[offset..]);
+        if (count <= 0) return error.ReadFailed;
+        offset += @intCast(count);
+    }
+}
+
+fn floorUtf8Boundary(content: []const u8, desired: usize) usize {
+    var end = @min(desired, content.len);
+    if (end == content.len) return end;
+    while (end > 0 and isUtf8ContinuationByte(content[end])) : (end -= 1) {}
+    return end;
+}
+
+fn ceilUtf8Boundary(content: []const u8, desired: usize) usize {
+    var start = @min(desired, content.len);
+    while (start < content.len and isUtf8ContinuationByte(content[start])) : (start += 1) {}
+    return start;
+}
+
+fn isUtf8ContinuationByte(byte: u8) bool {
+    return (byte & 0b1100_0000) == 0b1000_0000;
+}
+
+fn isInlineUtf8(content: []const u8) bool {
+    if (!std.unicode.utf8ValidateSlice(content)) return false;
+    for (content) |byte| {
+        if (byte < 0x20 and byte != '\n' and byte != '\r' and byte != '\t') return false;
+    }
+    return true;
+}
+
+fn formatCompletedFiles(
+    allocator: std.mem.Allocator,
+    stdout_path: []const u8,
+    stderr_path: []const u8,
+    exit_code: i32,
+    artifact_root: []const u8,
+    metrics: ?*ResultMetrics,
+) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try aw.writer.writeAll("{\"schema_version\":\"metacodes.bash-result.v2\",");
+    try appendFileChannel(&aw.writer, allocator, "stdout", stdout_path, artifact_root, metrics);
+    try aw.writer.writeByte(',');
+    try appendFileChannel(&aw.writer, allocator, "stderr", stderr_path, artifact_root, metrics);
+    try aw.writer.print(",\"exit_code\":{d}}}", .{exit_code});
+    return aw.toOwnedSlice();
 }
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
@@ -175,14 +398,23 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     //   - 进程已退出 → 读 stdout/stderr 文件返回
     //   - 未退出 + 达到 AUTO_BACKGROUND_MS & ctx.jobs 可用 → 返回 {auto_backgrounded, job_id}
     //   - 未退出 + 达到用户 timeout → kill + error.Timeout
-    if (ctx.project_rule_gate == null) {
-        if (ctx.jobs) |registry| {
-            // 走 job_registry:命令可能自动转后台,届时 profile 文件不能删 → detach。
-            // 代价:即便命令同步完成,profile 也泄漏到 TMPDIR(系统/重启清理),换取正确性。
-            if (sandbox_wrap) |*sw| sw.detached = true;
-            const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
-            return try runAutoBackgroundable(allocator, registry, command, timeout_ms, ctx.abort, cwd_opt);
-        }
+    if (ctx.jobs) |registry| {
+        // Start spooling at byte zero even for governed synchronous runs. A
+        // project-rule gate disables only auto-backgrounding; the process is
+        // still awaited before PostToolUse/formal re-observation.
+        if (sandbox_wrap) |*sw| sw.detached = true;
+        const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
+        return try runAutoBackgroundable(
+            allocator,
+            registry,
+            command,
+            timeout_ms,
+            ctx.abort,
+            cwd_opt,
+            ctx.artifact_root,
+            ctx.project_rule_gate == null,
+            ctx.tool_result_metrics,
+        );
     }
 
     // 可移植 shell(复刻 codex):POSIX /bin/sh -c;Windows 原生 PowerShell/cmd,零 git-bash。
@@ -198,7 +430,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer allocator.free(out.stderr);
 
     // 截断到 MAX_OUTPUT_BYTES(保留头部),防大输出撑爆上下文。
-    return try formatCompletedOutput(allocator, out.stdout, out.stderr, out.exit_code);
+    return try formatCompletedOutput(allocator, out.stdout, out.stderr, out.exit_code, ctx.artifact_root, out.capture_complete, ctx.tool_result_metrics);
 }
 
 /// 新路径：总是 spawn 到 job_registry（stdout/stderr 落盘），父端轮询等待。
@@ -212,11 +444,14 @@ fn runAutoBackgroundable(
     timeout_ms: u64,
     abort: ?*const @import("../util/abort.zig").AbortSignal,
     cwd: ?[]const u8,
+    artifact_root: []const u8,
+    allow_auto_background: bool,
+    metrics: ?*ResultMetrics,
 ) ![]u8 {
     const j_entry = try registry.spawnBackground(command, cwd);
     const job_id = j_entry.id; // 值拷贝，不持指针（registry 可能扩容移动）
 
-    const effective_budget = @min(timeout_ms, AUTO_BACKGROUND_MS);
+    const effective_budget = if (allow_auto_background) @min(timeout_ms, AUTO_BACKGROUND_MS) else timeout_ms;
     const start = nowMs();
     // 轮询循环
     while (true) {
@@ -230,7 +465,7 @@ fn runAutoBackgroundable(
         const j = registry.get(job_id[0..]) orelse return error.JobNotFound; // 值快照
         if (j.status != .running) {
             // 正常退出：读文件构造完整输出
-            return try readJobAsSync(allocator, &j);
+            return try readJobAsSync(allocator, &j, artifact_root, metrics);
         }
 
         const elapsed: u64 = @intCast(nowMs() - start);
@@ -239,20 +474,15 @@ fn runAutoBackgroundable(
             registry.kill(job_id[0..]) catch {};
             return error.Timeout;
         }
-        if (elapsed >= effective_budget) {
+        if (allow_auto_background and elapsed >= effective_budget) {
             // 达到 auto-background 阈值但未到 timeout：返回 auto_backgrounded
             return try formatAutoBackgrounded(allocator, &j);
         }
     }
 }
 
-fn readJobAsSync(allocator: std.mem.Allocator, j: *const @import("../core/job_registry.zig").JobEntry) ![]u8 {
-    const out_bytes = readWholeFile(j.stdout_path, allocator, common.MAX_SPAWN_CAPTURE_BYTES) catch try allocator.dupe(u8, "");
-    defer allocator.free(out_bytes);
-    const err_bytes = readWholeFile(j.stderr_path, allocator, common.MAX_SPAWN_CAPTURE_BYTES) catch try allocator.dupe(u8, "");
-    defer allocator.free(err_bytes);
-
-    return try formatCompletedOutput(allocator, out_bytes, err_bytes, j.exit_code orelse 0);
+fn readJobAsSync(allocator: std.mem.Allocator, j: *const @import("../core/job_registry.zig").JobEntry, artifact_root: []const u8, metrics: ?*ResultMetrics) ![]u8 {
+    return try formatCompletedFiles(allocator, j.stdout_path, j.stderr_path, j.exit_code orelse 0, artifact_root, metrics);
 }
 
 fn formatAutoBackgrounded(allocator: std.mem.Allocator, j: *const @import("../core/job_registry.zig").JobEntry) ![]u8 {
@@ -297,10 +527,11 @@ fn readWholeFile(path: []const u8, allocator: std.mem.Allocator, max_bytes: usiz
     errdefer out.deinit(allocator);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = pfs.read(fd, buf[0..buf.len]);
+        if (max_bytes > 0 and out.items.len >= max_bytes) break;
+        const wanted = if (max_bytes > 0) @min(buf.len, max_bytes - out.items.len) else buf.len;
+        const n = pfs.read(fd, buf[0..wanted]);
         if (n <= 0) break;
         try out.appendSlice(allocator, buf[0..@intCast(n)]);
-        if (max_bytes > 0 and out.items.len >= max_bytes) break; // 轴A:读够上限止血
     }
     return try out.toOwnedSlice(allocator);
 }
@@ -406,6 +637,71 @@ test "formatAutoBackgrounded 返回 stdout_path/stderr_path 供 Read 直接读" 
     try std.testing.expect(std.mem.indexOf(u8, result, "Read on stdout_path") != null);
 }
 
+test "completed job output becomes a bounded recoverable channel artifact" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(allocator);
+    defer registry.deinit();
+    const spawned = try registry.spawnBackground("awk 'BEGIN { for(i=0;i<40000;i++) printf \"x\"; printf \"BASH_TAIL\" }'", null);
+    util_time.sleepMs(300);
+    registry.reapExited();
+    const job = registry.get(spawned.idSlice()) orelse return error.JobNotFound;
+    var metrics = ResultMetrics{};
+    const result = try readJobAsSync(allocator, &job, root, &metrics);
+    defer allocator.free(result);
+    try std.testing.expect(result.len < 8 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, result, root) == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    const artifact_id = parsed.value.object.get("stdout_artifact_id").?.string;
+    try std.testing.expect(parsed.value.object.get("stdout_recoverable").?.bool);
+    try std.testing.expectEqual(@as(i64, 40_009), parsed.value.object.get("stdout_original_bytes").?.integer);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.object.get("stdout").?.string, "...[middle omitted]...") != null);
+    try std.testing.expect(std.mem.endsWith(u8, parsed.value.object.get("stdout").?.string, "BASH_TAIL"));
+    try std.testing.expectEqual(@as(u64, 1), metrics.snapshot().artifact_spill_count);
+    try std.testing.expectEqual(@as(u64, 40_009), metrics.snapshot().captured_stream_bytes);
+    var tail = try artifact.readChunk(allocator, root, artifact_id, 39_990, 32);
+    defer tail.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, tail.bytes, "BASH_TAIL") != null);
+}
+
+test "over-limit completed spool reports true size without a false commitment" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const stdout_path = try std.fmt.allocPrintSentinel(allocator, "{s}/oversize.log", .{root}, 0);
+    defer allocator.free(stdout_path);
+    const stderr_path = try std.fmt.allocPrintSentinel(allocator, "{s}/empty.err", .{root}, 0);
+    defer allocator.free(stderr_path);
+    const stdout_fd = pfs.open(stdout_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
+    if (stdout_fd < 0) return error.OpenFailed;
+    try pfs.setSize(stdout_fd, artifact.MAX_ARTIFACT_BYTES + 1);
+    _ = pfs.close(stdout_fd);
+    const stderr_fd = pfs.open(stderr_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
+    if (stderr_fd < 0) return error.OpenFailed;
+    _ = pfs.close(stderr_fd);
+
+    const result = try formatCompletedFiles(allocator, stdout_path, stderr_path, 0, root, null);
+    defer allocator.free(result);
+    try std.testing.expect(result.len < 8 * 1024);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, artifact.MAX_ARTIFACT_BYTES + 1), parsed.value.object.get("stdout_captured_bytes").?.integer);
+    try std.testing.expect(parsed.value.object.get("stdout_original_bytes").? == .null);
+    try std.testing.expect(parsed.value.object.get("stdout_sha256").? == .null);
+    try std.testing.expect(!parsed.value.object.get("stdout_capture_complete").?.bool);
+    try std.testing.expect(parsed.value.object.get("stdout_truncated").?.bool);
+    try std.testing.expect(!parsed.value.object.get("stdout_recoverable").?.bool);
+}
+
 test "truncateHead: 小输出原样,大输出截断 + 标记" {
     const a = std.testing.allocator;
     // 小输出不截。
@@ -428,14 +724,16 @@ test "truncateHead: 小输出原样,大输出截断 + 标记" {
     try std.testing.expect(marker <= MAX_OUTPUT_BYTES);
 }
 
-test "BashTool 大输出被截断(防撑爆上下文)" {
+test "BashTool 大输出 becomes bounded even when artifact storage is unavailable" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // bash 语法命令经 PowerShell 输出/stderr 语义不同,POSIX 专属
     const a = std.testing.allocator;
     const ctx = ToolContext{ .allocator = a };
-    // seq 到很大 → stdout 远超 30K → 应截断 + 含 truncated 标记。
+    // seq 到很大 → stdout 远超 inline budget。无 artifact root 时必须显式
+    // recoverable=false，但仍保持合法有界 JSON，不能伪装成完整输出。
     const r = try execute(&ctx, "{\"command\":\"seq 1 100000\"}");
     defer a.free(r);
-    try std.testing.expect(std.mem.indexOf(u8, r, "lines truncated") != null);
-    // 整个返回 JSON 不该是完整 100000 行(粗略:远小于 ~600KB)。
-    try std.testing.expect(r.len < 60_000);
+    try std.testing.expect(std.mem.indexOf(u8, r, "\"stdout_truncated\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "\"stdout_recoverable\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "\"stdout_capture_complete\":true") != null);
+    try std.testing.expect(r.len < 8 * 1024);
 }

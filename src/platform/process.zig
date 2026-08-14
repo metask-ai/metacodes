@@ -59,6 +59,7 @@ pub const Captured = struct {
     stderr: []u8, // owned（want_stderr=false 时为空 slice）
     exit_code: i32,
     timed_out: bool = false, // 仅 timeout_partial=true 时有意义：超时被 kill 但返了部分输出。
+    capture_complete: bool = true,
     // 超时(非 timeout_partial) → error.Timeout；abort → error.Aborted；cap 命中 → Ok（返部分，进程已 kill）。
 };
 
@@ -584,6 +585,7 @@ fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts
     var out_done = false;
     var err_done = !opts.want_stderr;
     var timed_out = false;
+    var capture_complete = true;
     const label = labelOf(argv);
 
     while (!(out_done and err_done)) {
@@ -639,6 +641,7 @@ fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts
         }
         if (out.items.len + err.items.len >= opts.max_bytes) {
             killGroupPosix(pid); // cap 命中：止血，返已读部分（Ok，非错误，对齐 common.zig）
+            capture_complete = false;
             break;
         }
     }
@@ -654,6 +657,7 @@ fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts
         .stderr = try err.toOwnedSlice(allocator),
         .exit_code = posixExitCode(status),
         .timed_out = timed_out,
+        .capture_complete = capture_complete and !timed_out,
     };
 }
 
@@ -900,6 +904,7 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
         .stderr = try err.toOwnedSlice(allocator),
         .exit_code = @bitCast(code),
         .timed_out = timed_out,
+        .capture_complete = !capped.load(.acquire) and !timed_out,
     };
 }
 

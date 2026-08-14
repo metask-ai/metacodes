@@ -10,6 +10,7 @@ const glob_tool = @import("tools/glob.zig");
 const bash_tool = @import("tools/bash.zig");
 const grep_tool = @import("tools/grep.zig");
 const bash_output_tool = @import("tools/bash_output.zig");
+const read_artifact_tool = @import("tools/read_artifact.zig");
 const task_output_tool = @import("tools/task_output.zig");
 const swarm_tools = @import("swarm/tools.zig");
 const kill_shell_tool = @import("tools/kill_shell.zig");
@@ -216,6 +217,16 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "job_id", .type = "string", .description = "The id of the backgrounded Bash job to read" },
         }, .required = &.{"job_id"} },
         .execute = bash_output_tool.execute,
+    },
+    .{
+        .name = "ReadArtifact",
+        .description = "Read a bounded byte range from a recoverable tool-result artifact. Use the sha256 artifact_id returned by a tool-result projection; offset is zero-based bytes and limit is capped at 32768 bytes. The result is always bounded and never spills recursively.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "artifact_id", .type = "string", .description = "Content-addressed id in sha256:<64 lowercase hex> form" },
+            .{ .name = "offset", .type = "integer", .description = "Zero-based byte offset (default 0)" },
+            .{ .name = "limit", .type = "integer", .description = "Maximum bytes to return (default 16384, maximum 32768)" },
+        }, .required = &.{"artifact_id"} },
+        .execute = read_artifact_tool.execute,
     },
     .{
         .name = "KillShell",
@@ -818,6 +829,7 @@ fn missingRequiredFieldError(field: []const u8) anyerror {
     if (std.mem.eql(u8, field, "query")) return error.MissingQuery;
     if (std.mem.eql(u8, field, "url")) return error.MissingUrl;
     if (std.mem.eql(u8, field, "items")) return error.MissingItems;
+    if (std.mem.eql(u8, field, "artifact_id")) return error.MissingArtifactId;
     return error.MissingRequiredField;
 }
 
@@ -1142,7 +1154,7 @@ fn similarity(a: []const u8, b: []const u8) f32 {
 ///   Write/Edit/Bash/Task*/NotebookEdit/MCP/Skill 等有副作用或写共享态 → unsafe。
 /// 一期按工具名判定(cc 是 per-input;cc-zig 工具名足够,Bash 即便 readonly 也保守串行)。
 pub fn isConcurrencySafe(name: []const u8) bool {
-    const safe = [_][]const u8{ "Read", "Glob", "Grep", "WebFetch", "BashOutput" };
+    const safe = [_][]const u8{ "Read", "ReadArtifact", "Glob", "Grep", "WebFetch", "BashOutput" };
     for (safe) |s| if (std.mem.eql(u8, name, s)) return true;
     return false;
 }

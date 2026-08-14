@@ -687,6 +687,8 @@ pub fn handleSlash(
             .cwd_abs = app.cwdAbs(),
             .additional_dirs = app.additionalDirs(),
             .home_dir = app.homeDir(),
+            .artifact_root = app.sessionDir() orelse "",
+            .tool_result_metrics = &app.tool_result_metrics,
             .plan_file_path = app.plan_file_path,
             .emit_tool_cards = true,
         },

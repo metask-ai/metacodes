@@ -104,6 +104,11 @@ pub const SpawnOptions = struct {
     cwd_abs: []const u8 = "",
     resolve_relative_paths: bool = false,
     home_dir: []const u8 = "",
+    /// Parent session-owned content-addressed result store. Synchronous
+    /// children borrow it for the duration of the run; background callers
+    /// must pass a job-owned copy.
+    artifact_root: []const u8 = "",
+    tool_result_metrics: ?*@import("tool_result_metrics.zig").Metrics = null,
     additional_dirs: []const []const u8 = &.{},
     /// AgentDef.mcpServers 过滤后的 session 视图。
     mcp_sessions: ?*const []@import("mcp_session.zig").McpSessionEntry = null,
@@ -242,6 +247,8 @@ pub fn spawnAgentSink(
             .cwd_abs = opts.cwd_abs,
             .resolve_relative_paths = opts.resolve_relative_paths,
             .home_dir = opts.home_dir,
+            .artifact_root = opts.artifact_root,
+            .tool_result_metrics = opts.tool_result_metrics,
             .additional_dirs = opts.additional_dirs,
             .mcp_sessions = opts.mcp_sessions,
         },

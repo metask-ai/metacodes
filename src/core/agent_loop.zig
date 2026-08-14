@@ -26,6 +26,7 @@ const api_stream = @import("../api/stream.zig");
 const tool_error = @import("tool_error.zig");
 const context_pressure_mod = @import("context_pressure.zig");
 const compact_kernel = @import("compact_kernel.zig");
+const result_projection = @import("result_projection.zig");
 const verification_progress_mod = @import("verification_progress.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
@@ -313,6 +314,10 @@ pub const Options = struct {
     /// embedding AgentSession 显式开启，使 Host 提供的 Workspace 真正成为工具执行基准。
     resolve_relative_paths: bool = false,
     home_dir: []const u8 = "",
+    /// Session directory that owns recoverable tool-result artifacts. The
+    /// artifact envelope never exposes this path to the model.
+    artifact_root: []const u8 = "",
+    tool_result_metrics: ?*@import("tool_result_metrics.zig").Metrics = null,
     /// 额外工作目录(--add-dir / additionalDirectories,绝对路径;sandbox 可写白名单)。
     additional_dirs: []const []const u8 = &.{},
     /// 当前 session plan 文件路径(ExitPlanMode 读盘兜底用;仅顶层接)。
@@ -803,6 +808,8 @@ pub fn run(
             .cwd_abs = opts.cwd_abs,
             .resolve_relative_paths = opts.resolve_relative_paths,
             .home_dir = opts.home_dir,
+            .artifact_root = opts.artifact_root,
+            .tool_result_metrics = opts.tool_result_metrics,
             .additional_dirs = opts.additional_dirs,
             .plan_file_path = opts.plan_file_path,
             .agents = opts.agents,
@@ -1387,6 +1394,8 @@ pub fn run(
             .cwd_abs = opts.cwd_abs,
             .resolve_relative_paths = opts.resolve_relative_paths,
             .home_dir = opts.home_dir,
+            .artifact_root = opts.artifact_root,
+            .tool_result_metrics = opts.tool_result_metrics,
             .additional_dirs = opts.additional_dirs,
             .plan_file_path = opts.plan_file_path,
             .last_proposed_plan = if (proposed_plan_buf) |p| p else "",
@@ -1493,7 +1502,15 @@ pub fn run(
             // 收集**所有非挂起点**工具的结果(已完成的用真实结果;其余 pending 用错误占位)——
             // 它们都要在 resume 时与挂起点的迟来结果同 turn 补齐,满足 API 配对。
             var completed: std.ArrayList(SuspendInfo.CompletedResult) = .empty;
-            errdefer completed.deinit(allocator);
+            errdefer {
+                for (completed.items) |entry| {
+                    allocator.free(entry.tool_use_id);
+                    allocator.free(entry.content);
+                }
+                completed.deinit(allocator);
+            }
+            var completed_names: std.ArrayList([]const u8) = .empty;
+            defer completed_names.deinit(allocator);
             for (slots.items) |*o| {
                 if (o == s or o.decision != .run) continue;
                 const content: []const u8 = if (o.pending)
@@ -1506,6 +1523,7 @@ pub fn run(
                     .content = content,
                     .is_error = if (o.pending) true else o.is_error,
                 });
+                try completed_names.append(allocator, o.name);
                 // 释放 slot 原 owned 内存(content 已 dupe 进 completed;pending 的 kind/payload
                 // 不进 SuspendInfo)——否则泄漏(正常路径 content 移交 result_blocks,此处改 dupe)。
                 if (o.content) |c| {
@@ -1519,6 +1537,24 @@ pub fn run(
                     o.pending_payload = null;
                 }
             }
+            // Suspended sibling results are persisted before suspend.json is
+            // written. They cannot bypass the same one-shot projection simply
+            // because another tool requested asynchronous UI.
+            const suspended_items = try allocator.alloc(result_projection.Item, completed.items.len);
+            defer allocator.free(suspended_items);
+            for (completed.items, 0..) |*entry, index| {
+                suspended_items[index] = .{
+                    .tool_name = completed_names.items[index],
+                    .content = &entry.content,
+                    .is_error = entry.is_error,
+                };
+            }
+            const suspended_projection_stats = try result_projection.project(allocator, suspended_items, .{
+                .session_root = opts.artifact_root,
+                .per_result_bytes = conversation_mod.toolResultContextBytes(provider.maxInputTokens()),
+                .per_turn_bytes = result_projection.turnBudgetBytes(provider.maxInputTokens()),
+            });
+            if (opts.tool_result_metrics) |metrics| metrics.recordProjection(suspended_projection_stats);
             // result_blocks 这轮不提交(挂起不落 partial user 消息);释放已 append 的(本应为空)。
             result_blocks.clearAndFree(allocator);
             const kind = s.pending_kind orelse "";
@@ -1593,6 +1629,38 @@ pub fn run(
         if (result_blocks.items.len == 0) {
             result_blocks.deinit(allocator);
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_error, .turns = turns + 1, .tool_calls = total_tool_calls });
+        }
+
+        // Hooks and UI above observe the exact execution result. Only now do
+        // we commit the deterministic model-visible representation. This runs
+        // once per result; later requests reuse the same Conversation bytes,
+        // preserving provider prompt-cache prefixes.
+        const projection_items = try allocator.alloc(result_projection.Item, result_blocks.items.len);
+        defer allocator.free(projection_items);
+        for (result_blocks.items, 0..) |*block, index| {
+            if (block.* != .tool_result) unreachable;
+            projection_items[index] = .{
+                .tool_name = slots.items[index].name,
+                .content = &block.tool_result.content,
+                .is_error = block.tool_result.is_error,
+            };
+        }
+        const projection_stats = try result_projection.project(allocator, projection_items, .{
+            .session_root = opts.artifact_root,
+            .per_result_bytes = conversation_mod.toolResultContextBytes(provider.maxInputTokens()),
+            .per_turn_bytes = result_projection.turnBudgetBytes(provider.maxInputTokens()),
+        });
+        if (opts.tool_result_metrics) |metrics| metrics.recordProjection(projection_stats);
+        if (projection_stats.changed() or projection_stats.budget_exhausted) {
+            log.info("agent", "tool-result projection: raw={d} projected={d} artifact_bytes={d} spills={d} fallback={d} turn_spills={d} budget_exhausted={}", .{
+                projection_stats.raw_bytes,
+                projection_stats.projected_bytes,
+                projection_stats.artifact_bytes,
+                projection_stats.artifact_spill_count,
+                projection_stats.unrecoverable_fallback_count,
+                projection_stats.turn_budget_spills,
+                projection_stats.budget_exhausted,
+            });
         }
 
         // PostToolUse additionalContext → 同一 user 消息追加一个 text block(下轮模型可见)。
@@ -2093,13 +2161,6 @@ fn runAutoCompactIfNeeded(
     abort: ?*const AbortSignal,
 ) !AutoCompactOutcome {
     var outcome: AutoCompactOutcome = .not_needed;
-    const tool_result_limit = conversation_mod.toolResultContextBytes(provider.maxInputTokens());
-    const preflight_truncated = conversation.truncateLargeToolResults(tool_result_limit);
-    if (preflight_truncated.changed()) {
-        outcome = .compacted;
-        log.info("agent", "tool-result truncate: truncated={d} cleared={d} bytes={d}->{d} max_inline={d}", .{ preflight_truncated.truncated, preflight_truncated.cleared, preflight_truncated.bytes_before, preflight_truncated.bytes_after, tool_result_limit });
-        emitContextProjection(backend, sess, conversation, "large_tool_result_truncation", trigger_cause, preflight_truncated);
-    }
 
     var request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
     var pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), configured_threshold, request_tokens_before);
@@ -2785,7 +2846,7 @@ test "usage anchor suppresses false blocking-limit nuke (glm-5.2 并发工具风
     }
 }
 
-test "auto-compact preflight truncates huge recent tool_result before next request estimate" {
+test "auto-compact preflight never rewrites an already committed tool_result" {
     const a = std.testing.allocator;
     var c = Conversation.init(a);
     defer c.deinit();
@@ -2875,13 +2936,10 @@ test "auto-compact preflight truncates huge recent tool_result before next reque
         null,
         null,
     );
-    try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
-    try std.testing.expectEqual(@as(u32, 1), cap.count);
-    try std.testing.expectEqualStrings("large_tool_result_truncation", cap.kind.?);
-    try std.testing.expectEqual(@as(u32, 1), cap.changed_items);
-    try std.testing.expect(cap.bytes_after < cap.bytes_before);
+    try std.testing.expectEqual(AutoCompactOutcome.not_needed, outcome);
+    try std.testing.expectEqual(@as(u32, 0), cap.count);
     const after = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
-    try std.testing.expect(after < before);
+    try std.testing.expectEqual(before, after);
 
     var api = try buildApiMessages(&c, a, null, null);
     defer freeApiMessages(&api, a);
@@ -2893,11 +2951,10 @@ test "auto-compact preflight truncates huge recent tool_result before next reque
         .tools = &.{},
     }, a);
     defer a.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "original_bytes") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "toolu_huge") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "Z") != null);
     try std.testing.expectEqual(Conversation.estimateTokens(body), after);
-    try std.testing.expect(body.len < body_before.len);
+    try std.testing.expectEqualStrings(body_before, body);
 }
 
 test "auto-compact emits stale tool-result projection from the real microcompact path" {

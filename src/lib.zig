@@ -29,6 +29,9 @@ pub const message = @import("core/message.zig");
 pub const subagent = @import("core/subagent.zig");
 pub const tool_exec = @import("core/tool_exec.zig");
 pub const tool_observation_journal = @import("core/tool_observation_journal.zig");
+pub const tool_result_artifact = @import("core/tool_result_artifact.zig");
+pub const result_projection = @import("core/result_projection.zig");
+pub const tool_result_metrics = @import("core/tool_result_metrics.zig");
 pub const rule_impact_stats = @import("core/rule_impact_stats.zig");
 pub const rule_impact_operational_observation = @import("core/rule_impact_operational_observation.zig");
 pub const rule_impact_evidence = @import("core/rule_impact_evidence.zig");
@@ -101,6 +104,7 @@ pub const config = @import("app/config.zig");
 // ── 工具 ─────────────────────────────────────────────────────────────────
 pub const tools = @import("tools.zig"); // registry + dispatch
 pub const tool_context = @import("tools/context.zig"); // ToolContext
+pub const read_artifact = @import("tools/read_artifact.zig");
 pub const tools_dynamic = @import("tools/dynamic.zig"); // Skill/MCP DynRegistry
 
 // ── 权限 ─────────────────────────────────────────────────────────────────

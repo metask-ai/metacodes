@@ -235,6 +235,8 @@ pub const SpawnParams = struct {
     sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
     cwd_abs: []const u8 = "",
     home_dir: []const u8 = "",
+    artifact_root: []const u8 = "",
+    tool_result_metrics: ?*@import("tool_result_metrics.zig").Metrics = null,
     additional_dirs: []const []const u8 = &.{},
     /// AgentDef.mcpServers 过滤后的 session 视图；registry 复制外层 slice，entry 本体借 App。
     mcp_sessions: []const @import("mcp_session.zig").McpSessionEntry = &.{},
@@ -277,6 +279,8 @@ const JobInput = struct {
     sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings,
     cwd_abs: []u8,
     home_dir: []u8,
+    artifact_root: []u8,
+    tool_result_metrics: ?*@import("tool_result_metrics.zig").Metrics,
     additional_dirs: [][]u8,
     memdir_owned: []u8,
     mcp_sessions_owned: []@import("mcp_session.zig").McpSessionEntry,
@@ -312,6 +316,7 @@ const JobInput = struct {
         a.free(self.parent_model);
         a.free(self.cwd_abs); // task#12
         a.free(self.home_dir);
+        a.free(self.artifact_root);
         for (self.additional_dirs) |d| a.free(d);
         a.free(self.additional_dirs);
         a.free(self.memdir_owned);
@@ -510,6 +515,8 @@ pub const AgentJobRegistry = struct {
         errdefer if (!committed) a.free(cwd_owned);
         const home_owned = try a.dupe(u8, p.home_dir);
         errdefer if (!committed) a.free(home_owned);
+        const artifact_root_owned = try a.dupe(u8, p.artifact_root);
+        errdefer if (!committed) a.free(artifact_root_owned);
         const adirs_owned = try a.alloc([]u8, p.additional_dirs.len);
         errdefer if (!committed) a.free(adirs_owned);
         var nad: usize = 0;
@@ -556,6 +563,8 @@ pub const AgentJobRegistry = struct {
             .sandbox = p.sandbox, // task#12:borrow(App-lifetime)
             .cwd_abs = cwd_owned,
             .home_dir = home_owned,
+            .artifact_root = artifact_root_owned,
+            .tool_result_metrics = p.tool_result_metrics,
             .additional_dirs = adirs_owned,
             .memdir_owned = memdir_owned,
             .mcp_sessions_owned = mcp_sessions_owned,
@@ -1019,6 +1028,8 @@ fn jobThreadMain(input: *JobInput) void {
         .sandbox = input.sandbox,
         .cwd_abs = input.cwd_abs,
         .home_dir = input.home_dir,
+        .artifact_root = input.artifact_root,
+        .tool_result_metrics = input.tool_result_metrics,
         .additional_dirs = input.additional_dirs,
         .mcp_sessions = &input.mcp_sessions_owned,
         // Ctrl+B 转后台:move 预建对话给 spawnAgentSink(它 defer deinit)。**move 后立即置 null**:
