@@ -598,6 +598,8 @@ test "L2 KG governance: lexical query plan binds variants and measures informati
         if (hit.object.get("node_id").?.integer != @as(i64, @intCast(memory_id))) continue;
         first_found = true;
         try std.testing.expect(!hit.object.get("seen_before").?.bool);
+        try std.testing.expect(hit.object.get("text") != null);
+        try std.testing.expect(hit.object.get("content_ref") == null);
     }
     try std.testing.expect(first_found);
 
@@ -621,12 +623,15 @@ test "L2 KG governance: lexical query plan binds variants and measures informati
         if (hit.object.get("node_id").?.integer != @as(i64, @intCast(memory_id))) continue;
         repeated_found = true;
         try std.testing.expect(hit.object.get("seen_before").?.bool);
+        try std.testing.expect(hit.object.get("text") == null);
+        try std.testing.expectEqualStrings("exposed_elsewhere_in_run", hit.object.get("content_ref").?.string);
     }
     try std.testing.expect(repeated_found);
 
     try std.testing.expect(std.mem.indexOf(u8, first_out, "\"retrieval_mode\":\"lexical_bm25_no_embeddings\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_out, "Semantically judge these lexical candidates") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_out, "deduplicate node_id values across calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_out, "content_ref=exposed_elsewhere_in_run") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_out, "KgContext") != null);
 
     var detail: ?[]const u8 = null;

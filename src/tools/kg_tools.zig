@@ -219,6 +219,28 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     for (hits, 0..) |h, i| {
         hit_ids[i] = h.node_id;
         if (i > 0) try out.appendSlice(ctx.allocator, ",");
+        var seen_before = false;
+        if (ledger_guard) |*guard| {
+            seen_before = guard.wasSeen(h.node_id);
+            const duplicate_in_batch = containsNodeId(hit_ids[0..i], h.node_id);
+            if (!duplicate_in_batch) {
+                if (seen_before) {
+                    repeated_hit_count += 1;
+                } else {
+                    new_hit_count += 1;
+                }
+            }
+        }
+        const compact_repeat = if (plan) |value|
+            value.schema_version == .host_managed_v2 and seen_before
+        else
+            false;
+        if (compact_repeat) {
+            const row = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d},\"seen_before\":true,\"content_ref\":\"exposed_elsewhere_in_run\"}}", .{h.node_id});
+            defer ctx.allocator.free(row);
+            try out.appendSlice(ctx.allocator, row);
+            continue;
+        }
         const type_str = if (h.schema_type.len > 0) h.schema_type else h.kind;
         const row = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d},\"type\":\"{s}\",\"scope\":\"{s}\",\"score\":{d:.2},\"text\":", .{
             h.node_id, type_str, if (std.mem.eql(u8, h.domain, "global")) "global" else "project", h.score,
@@ -232,16 +254,7 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             try out.appendSlice(ctx.allocator, ",\"source\":");
             try appendJsonString(&out, ctx.allocator, h.source_label);
         }
-        if (ledger_guard) |*guard| {
-            const seen_before = guard.wasSeen(h.node_id);
-            const duplicate_in_batch = containsNodeId(hit_ids[0..i], h.node_id);
-            if (!duplicate_in_batch) {
-                if (seen_before) {
-                    repeated_hit_count += 1;
-                } else {
-                    new_hit_count += 1;
-                }
-            }
+        if (ledger_guard != null) {
             try out.appendSlice(ctx.allocator, if (seen_before) ",\"seen_before\":true" else ",\"seen_before\":false");
         }
         try out.appendSlice(ctx.allocator, "}");
