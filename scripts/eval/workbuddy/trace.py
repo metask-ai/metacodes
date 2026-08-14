@@ -559,10 +559,15 @@ def _tool_control_metrics(messages: Iterable[Mapping[str, Any]]) -> Dict[str, An
                 if plan is not None:
                     if not isinstance(plan, dict):
                         raise TraceError("KgRecall lexical plan receipt is malformed")
+                    plan_version = plan.get("schema_version")
+                    expected_scope = {
+                        "lexical-query-plan-v1": "agent_run_plan",
+                        "lexical-query-plan-v2": "agent_run_explicit",
+                    }.get(plan_version)
                     if (
-                        plan.get("schema_version") != "lexical-query-plan-v1"
+                        expected_scope is None
                         or plan.get("seen_state_verified") is not True
-                        or plan.get("ledger_scope") != "agent_run_plan"
+                        or plan.get("ledger_scope") != expected_scope
                     ):
                         raise TraceError("KgRecall lexical plan governance receipt is invalid")
                     _hex_identity(plan.get("plan_sha256"), "KgRecall plan identity")

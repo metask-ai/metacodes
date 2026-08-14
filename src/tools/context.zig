@@ -293,7 +293,8 @@ pub const ToolContext = struct {
     /// null = 未配置(缺二进制)——KG 工具此时不会注册;non-null 但 !ready = degraded。
     kg: ?*@import("../kg/client.zig").KgClient = null,
     /// 本次 agent run 的无向量检索事实账本。lexical_plan 存在时必须非 null：
-    /// 宿主据此校验模型声明的 seen_node_ids，并在同一锁内计算/提交真实命中增益。
+    /// v2 seen state 完全由宿主管理；v1 兼容路径仍校验模型声明，并在同一锁内
+    /// 计算/提交真实命中增益。
     /// legacy query-only 路径不读取它。由 agent_loop.run 创建，绝不进 TinyKG store。
     kg_lexical_ledger: ?*@import("../kg/lexical_query_plan.zig").Ledger = null,
     /// KG per-project 指针目录(`{home}/.metacodes/projects/<git根hash>`)。plan 落图写 kg_root

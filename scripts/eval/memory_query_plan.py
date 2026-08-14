@@ -21,10 +21,18 @@ from .model import ValidationError, stable_json
 
 TRACE_SCHEMA_VERSION = "metacodes-memory-query-plan-trace-v1"
 REPORT_SCHEMA_VERSION = "metacodes-memory-query-plan-report-v3"
-LEXICAL_PLAN_SCHEMA_VERSION = "lexical-query-plan-v1"
+LEXICAL_PLAN_SCHEMA_VERSION = "lexical-query-plan-v2"
+LEGACY_LEXICAL_PLAN_SCHEMA_VERSION = "lexical-query-plan-v1"
+LEXICAL_PLAN_SCHEMA_VERSIONS = frozenset(
+    {LEXICAL_PLAN_SCHEMA_VERSION, LEGACY_LEXICAL_PLAN_SCHEMA_VERSION}
+)
 SIDECAR_NAME = "query-plan.json"
 QUERY_PLAN_INVALID_PREFIX = "query-plan trace invalid: "
 MULTIPLE_DISTINCT_SEED_PLANS_REASON = "multiple distinct seed plans in one run"
+V2_SEMANTIC_EXPANSION_BUDGET_REASON = (
+    "more than four v2 semantic expansion calls in one run"
+)
+MAX_V2_SEMANTIC_EXPANSION_CALLS = 4
 PRE_SEARCH_REJECTION_REASON = re.compile(
     r"^call (?P<call_index>[0-9]+): host rejected lexical plan before search "
     r"\((?:parser|ledger)\)(?:: .+)?$"
@@ -48,6 +56,7 @@ VARIANT_KINDS = frozenset(
     {
         "exact",
         "alias",
+        "synonym",
         "paraphrase",
         "mechanism",
         "symptom",
@@ -91,8 +100,11 @@ CALL_KEYS = frozenset(
         "repeated_hit_count",
     }
 )
-PLAN_KEYS = frozenset(
+LEGACY_PLAN_KEYS = frozenset(
     {"schema_version", "intent", "stage", "variants", "variant_index", "seen_node_ids"}
+)
+PLAN_KEYS = frozenset(
+    {"schema_version", "intent", "stage", "variants", "variant_index"}
 )
 RECEIPT_KEYS = frozenset(
     {
@@ -173,9 +185,11 @@ def _plan_fingerprint(
     stage: str,
     variants: Sequence[Mapping[str, str]],
     type_filter: str | None,
+    *,
+    schema_version: str,
 ) -> str:
     digest = hashlib.sha256()
-    for value in (LEXICAL_PLAN_SCHEMA_VERSION, intent, stage, type_filter or ""):
+    for value in (schema_version, intent, stage, type_filter or ""):
         _hash_field(digest, value)
     for variant in variants:
         _hash_field(digest, variant["kind"])
@@ -186,9 +200,18 @@ def _plan_fingerprint(
 def _parse_plan(tool_input: Mapping[str, Any], where: str) -> Mapping[str, Any]:
     query = _string(tool_input.get("query"), f"{where}.query").strip()
     raw_plan = tool_input.get("lexical_plan")
-    plan = _object(raw_plan, f"{where}.lexical_plan", PLAN_KEYS)
-    if plan["schema_version"] != LEXICAL_PLAN_SCHEMA_VERSION:
+    if not isinstance(raw_plan, dict):
+        _fail(f"{where}.lexical_plan", "expected an object")
+    schema_version = raw_plan.get("schema_version")
+    if schema_version not in LEXICAL_PLAN_SCHEMA_VERSIONS:
         _fail(f"{where}.lexical_plan.schema_version", "unsupported schema")
+    plan = _object(
+        raw_plan,
+        f"{where}.lexical_plan",
+        LEGACY_PLAN_KEYS
+        if schema_version == LEGACY_LEXICAL_PLAN_SCHEMA_VERSION
+        else PLAN_KEYS,
+    )
     intent = _string(plan["intent"], f"{where}.lexical_plan.intent")
     if intent not in INTENTS:
         _fail(f"{where}.lexical_plan.intent", "unsupported intent")
@@ -208,7 +231,10 @@ def _parse_plan(tool_input: Mapping[str, Any], where: str) -> Mapping[str, Any]:
         )
         kind = _string(variant["kind"], f"{where}.lexical_plan.variants[{index}].kind")
         text = _string(variant["text"], f"{where}.lexical_plan.variants[{index}].text").strip()
-        if kind not in VARIANT_KINDS:
+        if kind not in VARIANT_KINDS or (
+            schema_version == LEGACY_LEXICAL_PLAN_SCHEMA_VERSION
+            and kind == "synonym"
+        ):
             _fail(f"{where}.lexical_plan.variants[{index}].kind", "unsupported kind")
         if len(text.encode("utf-8")) > 400 or any(ord(char) < 0x20 or ord(char) == 0x7F for char in text):
             _fail(f"{where}.lexical_plan.variants[{index}].text", "invalid compact query")
@@ -232,18 +258,24 @@ def _parse_plan(tool_input: Mapping[str, Any], where: str) -> Mapping[str, Any]:
     ):
         _fail(f"{where}.lexical_plan", "invalid seed shape")
     if stage == "semantic_expansion" and (
-        len(variants) < 2 or any(variant["kind"] == "exact" for variant in variants)
+        (
+            schema_version == LEGACY_LEXICAL_PLAN_SCHEMA_VERSION
+            and len(variants) < 2
+        )
+        or any(variant["kind"] == "exact" for variant in variants)
     ):
         _fail(f"{where}.lexical_plan", "invalid semantic expansion shape")
-    raw_seen = plan["seen_node_ids"]
-    if not isinstance(raw_seen, list) or len(raw_seen) > 32:
-        _fail(f"{where}.lexical_plan.seen_node_ids", "expected at most 32 ids")
-    seen_ids: List[int] = []
-    for index, raw_id in enumerate(raw_seen):
-        node_id = _integer(raw_id, f"{where}.lexical_plan.seen_node_ids[{index}]", minimum=1)
-        if node_id in seen_ids:
-            _fail(f"{where}.lexical_plan.seen_node_ids", "duplicate node id")
-        seen_ids.append(node_id)
+    seen_ids: List[int] | None = None
+    if schema_version == LEGACY_LEXICAL_PLAN_SCHEMA_VERSION:
+        raw_seen = plan["seen_node_ids"]
+        if not isinstance(raw_seen, list) or len(raw_seen) > 32:
+            _fail(f"{where}.lexical_plan.seen_node_ids", "expected at most 32 ids")
+        seen_ids = []
+        for index, raw_id in enumerate(raw_seen):
+            node_id = _integer(raw_id, f"{where}.lexical_plan.seen_node_ids[{index}]", minimum=1)
+            if node_id in seen_ids:
+                _fail(f"{where}.lexical_plan.seen_node_ids", "duplicate node id")
+            seen_ids.append(node_id)
     type_filter = (
         _canonical_type(tool_input["type"], f"{where}.type")
         if "type" in tool_input
@@ -251,18 +283,30 @@ def _parse_plan(tool_input: Mapping[str, Any], where: str) -> Mapping[str, Any]:
     )
     return {
         "query": query,
+        "schema_version": schema_version,
         "intent": intent,
         "stage": stage,
         "variants": variants,
         "variant_index": variant_index,
         "seen_node_ids": seen_ids,
         "type_filter": type_filter,
-        "plan_sha256": _plan_fingerprint(intent, stage, variants, type_filter),
+        "plan_sha256": _plan_fingerprint(
+            intent,
+            stage,
+            variants,
+            type_filter,
+            schema_version=schema_version,
+        ),
         "variants_sha256": hashlib.sha256(stable_json(variants).encode("utf-8")).hexdigest(),
     }
 
 
-def _parse_receipt(raw_result: str, parsed_plan: Mapping[str, Any], where: str) -> Mapping[str, Any]:
+def _parse_receipt(
+    raw_result: str,
+    parsed_plan: Mapping[str, Any],
+    expected_seen: set[int],
+    where: str,
+) -> Mapping[str, Any]:
     try:
         result = json.loads(raw_result)
     except json.JSONDecodeError as exc:
@@ -271,16 +315,20 @@ def _parse_receipt(raw_result: str, parsed_plan: Mapping[str, Any], where: str) 
         _fail(where, "KgRecall result is not an object")
     receipt = _object(result.get("lexical_query_plan"), f"{where}.lexical_query_plan", RECEIPT_KEYS)
     expected = {
-        "schema_version": LEXICAL_PLAN_SCHEMA_VERSION,
+        "schema_version": parsed_plan["schema_version"],
         "plan_sha256": parsed_plan["plan_sha256"],
         "intent": parsed_plan["intent"],
         "stage": parsed_plan["stage"],
         "variant_index": parsed_plan["variant_index"],
         "variant_count": len(parsed_plan["variants"]),
         "variant_kind": parsed_plan["variants"][parsed_plan["variant_index"]]["kind"],
-        "seen_node_count": len(parsed_plan["seen_node_ids"]),
+        "seen_node_count": len(expected_seen),
         "seen_state_verified": True,
-        "ledger_scope": "agent_run_plan",
+        "ledger_scope": (
+            "agent_run_plan"
+            if parsed_plan["schema_version"] == LEGACY_LEXICAL_PLAN_SCHEMA_VERSION
+            else "agent_run_explicit"
+        ),
     }
     for key, expected_value in expected.items():
         if receipt[key] != expected_value:
@@ -300,24 +348,25 @@ def _parse_receipt(raw_result: str, parsed_plan: Mapping[str, Any], where: str) 
     distinct_hits: List[int] = []
     observed_new = 0
     observed_repeated = 0
-    declared_seen = set(parsed_plan["seen_node_ids"])
     for index, raw_hit in enumerate(hits):
         if not isinstance(raw_hit, dict):
             _fail(f"{where}.hits[{index}]", "expected an object")
         node_id = _integer(raw_hit.get("node_id"), f"{where}.hits[{index}].node_id", minimum=1)
-        expected_seen = node_id in declared_seen
-        if raw_hit.get("seen_before") is not expected_seen:
-            _fail(f"{where}.hits[{index}].seen_before", "does not match declared seen state")
+        was_seen = node_id in expected_seen
+        if raw_hit.get("seen_before") is not was_seen:
+            _fail(f"{where}.hits[{index}].seen_before", "does not match host seen state")
         if node_id in distinct_hits:
             continue
         distinct_hits.append(node_id)
-        if expected_seen:
+        if was_seen:
             observed_repeated += 1
         else:
             observed_new += 1
     if (new_count, repeated_count) != (observed_new, observed_repeated):
         _fail(where, "host gain counts do not match distinct returned hits")
     return {
+        "seen_node_count": len(expected_seen),
+        "ledger_scope": receipt["ledger_scope"],
         "new_hit_count": new_count,
         "repeated_hit_count": repeated_count,
         "hit_node_ids": distinct_hits,
@@ -454,6 +503,7 @@ def build_query_plan_trace(
     reasons: List[str] = []
     calls: List[Mapping[str, Any]] = []
     plan_seen: MutableMapping[str, set[int]] = defaultdict(set)
+    run_seen: set[int] = set()
     declared_seed_plans: set[str] = set()
     for call_index, (_tool_id, _name, tool_input, raw_result, is_error) in enumerate(recall_tools):
         # Invalid reasons are persisted evidence. Keep them independent from
@@ -482,15 +532,26 @@ def build_query_plan_trace(
                         f"call {call_index}: KgRecall has no successful observable result"
                     )
                 continue
-            expected_seen = plan_seen[plan_sha]
-            if set(parsed_plan["seen_node_ids"]) != expected_seen:
+            expected_seen = (
+                plan_seen[plan_sha]
+                if parsed_plan["schema_version"]
+                == LEGACY_LEXICAL_PLAN_SCHEMA_VERSION
+                else run_seen
+            )
+            declared_seen = parsed_plan["seen_node_ids"]
+            if declared_seen is not None and set(declared_seen) != expected_seen:
                 _fail(call_where, "declared seen ids do not match prior hits for this plan")
-            receipt = _parse_receipt(raw_result, parsed_plan, call_where)
+            receipt = _parse_receipt(
+                raw_result,
+                parsed_plan,
+                expected_seen,
+                call_where,
+            )
             expected_seen.update(receipt["hit_node_ids"])
             calls.append(
                 {
                     "call_index": call_index,
-                    "schema_version": LEXICAL_PLAN_SCHEMA_VERSION,
+                    "schema_version": parsed_plan["schema_version"],
                     "plan_sha256": plan_sha,
                     "variants_sha256": parsed_plan["variants_sha256"],
                     "intent": parsed_plan["intent"],
@@ -499,9 +560,9 @@ def build_query_plan_trace(
                     "variant_count": len(parsed_plan["variants"]),
                     "variant_kind": parsed_plan["variants"][parsed_plan["variant_index"]]["kind"],
                     "query": parsed_plan["query"],
-                    "seen_node_count": len(parsed_plan["seen_node_ids"]),
+                    "seen_node_count": int(receipt["seen_node_count"]),
                     "seen_state_verified": True,
-                    "ledger_scope": "agent_run_plan",
+                    "ledger_scope": receipt["ledger_scope"],
                     "new_hit_count": receipt["new_hit_count"],
                     "repeated_hit_count": receipt["repeated_hit_count"],
                 }
@@ -516,6 +577,12 @@ def build_query_plan_trace(
                 reasons.append(f"call {call_index}: {exc}")
     if len(declared_seed_plans) > 1:
         reasons.append(MULTIPLE_DISTINCT_SEED_PLANS_REASON)
+    if sum(
+        call["schema_version"] == LEXICAL_PLAN_SCHEMA_VERSION
+        and call["stage"] == "semantic_expansion"
+        for call in calls
+    ) > MAX_V2_SEMANTIC_EXPANSION_CALLS:
+        reasons.append(V2_SEMANTIC_EXPANSION_BUDGET_REASON)
     if not recall_tools:
         reasons.append("TinyKG backend executed no KgRecall")
     status = "verified" if not reasons and len(calls) == len(recall_tools) else "invalid"
@@ -638,22 +705,36 @@ def validate_query_plan_trace(trace: Mapping[str, Any], where: str = "query-plan
         if call_index <= prior_index:
             _fail(f"{where}.calls[{index}].call_index", "must be strictly increasing")
         prior_index = call_index
-        if call["schema_version"] != LEXICAL_PLAN_SCHEMA_VERSION:
+        if call["schema_version"] not in LEXICAL_PLAN_SCHEMA_VERSIONS:
             _fail(f"{where}.calls[{index}].schema_version", "unsupported plan schema")
         _hash(call["plan_sha256"], f"{where}.calls[{index}].plan_sha256")
         _hash(call["variants_sha256"], f"{where}.calls[{index}].variants_sha256")
         if call["intent"] not in INTENTS or call["stage"] not in STAGES:
             _fail(f"{where}.calls[{index}]", "unsupported intent or stage")
-        if call["variant_kind"] not in VARIANT_KINDS:
+        if call["variant_kind"] not in VARIANT_KINDS or (
+            call["schema_version"] == LEGACY_LEXICAL_PLAN_SCHEMA_VERSION
+            and call["variant_kind"] == "synonym"
+        ):
             _fail(f"{where}.calls[{index}].variant_kind", "unsupported kind")
         variant_count = _integer(call["variant_count"], f"{where}.calls[{index}].variant_count", minimum=1)
         variant_index = _integer(call["variant_index"], f"{where}.calls[{index}].variant_index")
         if variant_count > 4 or variant_index >= variant_count:
             _fail(f"{where}.calls[{index}]", "invalid variant bounds")
+        if (
+            call["schema_version"] == LEGACY_LEXICAL_PLAN_SCHEMA_VERSION
+            and call["stage"] == "semantic_expansion"
+            and variant_count < 2
+        ):
+            _fail(f"{where}.calls[{index}]", "invalid legacy expansion bounds")
         _string(call["query"], f"{where}.calls[{index}].query")
         for key in ("seen_node_count", "new_hit_count", "repeated_hit_count"):
             _integer(call[key], f"{where}.calls[{index}].{key}")
-        if call["seen_state_verified"] is not True or call["ledger_scope"] != "agent_run_plan":
+        expected_scope = (
+            "agent_run_plan"
+            if call["schema_version"] == LEGACY_LEXICAL_PLAN_SCHEMA_VERSION
+            else "agent_run_explicit"
+        )
+        if call["seen_state_verified"] is not True or call["ledger_scope"] != expected_scope:
             _fail(f"{where}.calls[{index}]", "host verification claim is absent")
     distinct_seed_plans = {
         str(call["plan_sha256"])
@@ -665,6 +746,16 @@ def validate_query_plan_trace(trace: Mapping[str, Any], where: str = "query-plan
             _fail(where, "verified trace contains multiple distinct seed plans")
         if MULTIPLE_DISTINCT_SEED_PLANS_REASON not in reasons:
             _fail(where, "multiple seed plans are missing their invalid reason")
+    v2_semantic_expansion_calls = sum(
+        call["schema_version"] == LEXICAL_PLAN_SCHEMA_VERSION
+        and call["stage"] == "semantic_expansion"
+        for call in calls
+    )
+    if v2_semantic_expansion_calls > MAX_V2_SEMANTIC_EXPANSION_CALLS:
+        if status == "verified":
+            _fail(where, "verified trace exceeds the v2 semantic expansion budget")
+        if V2_SEMANTIC_EXPANSION_BUDGET_REASON not in reasons:
+            _fail(where, "v2 semantic expansion overflow is missing its invalid reason")
     if status == "verified" and (
         backend not in TINYKG_BACKENDS
         or reasons

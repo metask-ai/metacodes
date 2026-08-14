@@ -513,8 +513,8 @@ test "KG prompt enforces staged semantic neighborhood only when KG is ready" {
     const with_kg = try buildFull(testing.allocator, "claude-opus-4-7", null, null, null, "", true, "/tmp");
     defer testing.allocator.free(with_kg);
     try testing.expect(std.mem.indexOf(u8, with_kg, "computes no embeddings or vector distance") != null);
-    try testing.expect(std.mem.indexOf(u8, with_kg, "2-4 separate compact semantic variants") != null);
-    try testing.expect(std.mem.indexOf(u8, with_kg, "make at most four semantic-variant calls") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "one non-exact probe chosen now or a fixed 2-4 member batch") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "host permits at most four v2 semantic-expansion calls") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "ALIAS BRANCH HAS PRIORITY") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "EXACT/HIGH-PRECISION SEED") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "mechanism, symptom, desired outcome, or nearby implementation term") != null);

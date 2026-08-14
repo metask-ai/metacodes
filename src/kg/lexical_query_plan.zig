@@ -2,16 +2,19 @@
 //!
 //! The model still chooses aliases, paraphrases, mechanisms, and nearby
 //! concepts. The host only makes that choice bounded and replayable: one seed
-//! probe, or one selected member of a fixed 2-4 variant expansion plan.
+//! probe, or one selected member of a fixed 1-4 variant expansion plan.
 
 const std = @import("std");
 const platform = @import("platform");
 
-pub const SCHEMA_VERSION = "lexical-query-plan-v1";
+pub const SCHEMA_VERSION = "lexical-query-plan-v2";
+pub const LEGACY_SCHEMA_VERSION = "lexical-query-plan-v1";
 pub const MAX_QUERY_BYTES: usize = 400;
 pub const MAX_VARIANTS: usize = 4;
 pub const MAX_SEEN_NODE_IDS: usize = 32;
 pub const MAX_TRACKED_PLANS: usize = 32;
+pub const MAX_RUN_SEEN_NODE_IDS: usize = MAX_SEEN_NODE_IDS * MAX_TRACKED_PLANS;
+pub const MAX_V2_SEMANTIC_EXPANSION_CALLS: usize = 4;
 
 pub const Intent = enum {
     fact_lookup,
@@ -30,9 +33,22 @@ pub const Stage = enum {
     focused_refinement,
 };
 
+pub const SchemaVersion = enum {
+    legacy_v1,
+    host_managed_v2,
+
+    pub fn text(self: SchemaVersion) []const u8 {
+        return switch (self) {
+            .legacy_v1 => LEGACY_SCHEMA_VERSION,
+            .host_managed_v2 => SCHEMA_VERSION,
+        };
+    }
+};
+
 pub const VariantKind = enum {
     exact,
     alias,
+    synonym,
     paraphrase,
     mechanism,
     symptom,
@@ -55,17 +71,18 @@ pub const Variant = struct {
 };
 
 pub const Plan = struct {
+    schema_version: SchemaVersion,
     intent: Intent,
     stage: Stage,
     variants: []Variant,
     variant_index: usize,
-    seen_node_ids: []u64,
+    declared_seen_node_ids: ?[]u64,
     fingerprint: [64]u8,
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         for (self.variants) |*variant| variant.deinit(allocator);
         allocator.free(self.variants);
-        allocator.free(self.seen_node_ids);
+        if (self.declared_seen_node_ids) |ids| allocator.free(ids);
         self.* = undefined;
     }
 
@@ -74,7 +91,7 @@ pub const Plan = struct {
     }
 
     pub fn hasSeen(self: Plan, node_id: u64) bool {
-        return containsU64(self.seen_node_ids, node_id);
+        return if (self.declared_seen_node_ids) |ids| containsU64(ids, node_id) else false;
     }
 };
 
@@ -95,12 +112,14 @@ pub const Error = error{
     InvalidSeenNodeIds,
     TooManySeenNodeIds,
     DuplicateSeenNodeId,
+    UnexpectedSeenNodeIds,
 };
 
 pub const LedgerError = error{
     SeenStateMismatch,
     PlanCapacityExceeded,
     HitCapacityExceeded,
+    SemanticExpansionBudgetExceeded,
 };
 
 const LedgerEntry = struct {
@@ -124,33 +143,62 @@ pub const Ledger = struct {
     mutex: platform.sync.Mutex = .{},
     entries: [MAX_TRACKED_PLANS]LedgerEntry = [_]LedgerEntry{.{}} ** MAX_TRACKED_PLANS,
     entry_count: usize = 0,
+    run_node_ids: [MAX_RUN_SEEN_NODE_IDS]u64 = [_]u64{0} ** MAX_RUN_SEEN_NODE_IDS,
+    run_node_count: usize = 0,
+    v2_semantic_expansion_calls: usize = 0,
+
+    fn runNodes(self: *const Ledger) []const u64 {
+        return self.run_node_ids[0..self.run_node_count];
+    }
 
     pub fn lockPlan(self: *Ledger, plan: Plan) LedgerError!Guard {
         self.mutex.lock();
         errdefer self.mutex.unlock();
 
+        const counts_v2_semantic_expansion = plan.schema_version == .host_managed_v2 and
+            plan.stage == .semantic_expansion;
+        if (counts_v2_semantic_expansion and
+            self.v2_semantic_expansion_calls == MAX_V2_SEMANTIC_EXPANSION_CALLS)
+            return error.SemanticExpansionBudgetExceeded;
+
         for (self.entries[0..self.entry_count], 0..) |*entry, index| {
             if (!std.mem.eql(u8, &entry.fingerprint, &plan.fingerprint)) continue;
-            if (!sameSet(entry.nodes(), plan.seen_node_ids)) return error.SeenStateMismatch;
-            return .{ .ledger = self, .entry_index = index };
+            if (plan.declared_seen_node_ids) |declared| {
+                if (!sameSet(entry.nodes(), declared)) return error.SeenStateMismatch;
+            }
+            return .{
+                .ledger = self,
+                .entry_index = index,
+                .schema_version = plan.schema_version,
+                .counts_v2_semantic_expansion = counts_v2_semantic_expansion,
+            };
         }
 
-        // A new fixed plan has no host history. Letting the model seed it with
-        // arbitrary ids would recreate the exact forged-metric bug this ledger
-        // exists to prevent.
-        if (plan.seen_node_ids.len != 0) return error.SeenStateMismatch;
+        // A new fixed plan has no host history. Legacy v1 declarations must
+        // therefore be empty; v2 carries no caller-owned seen state at all.
+        if (plan.declared_seen_node_ids) |declared| {
+            if (declared.len != 0) return error.SeenStateMismatch;
+        }
         if (self.entry_count == MAX_TRACKED_PLANS) return error.PlanCapacityExceeded;
 
         const index = self.entry_count;
         self.entries[index] = .{ .fingerprint = plan.fingerprint };
         self.entry_count += 1;
-        return .{ .ledger = self, .entry_index = index, .created = true };
+        return .{
+            .ledger = self,
+            .entry_index = index,
+            .schema_version = plan.schema_version,
+            .created = true,
+            .counts_v2_semantic_expansion = counts_v2_semantic_expansion,
+        };
     }
 
     pub const Guard = struct {
         ledger: *Ledger,
         entry_index: usize,
+        schema_version: SchemaVersion,
         created: bool = false,
+        counts_v2_semantic_expansion: bool = false,
         active: bool = true,
 
         /// Abort the in-flight observation. Existing history is untouched; a
@@ -169,7 +217,26 @@ pub const Ledger = struct {
 
         pub fn wasSeen(self: *const Guard, node_id: u64) bool {
             std.debug.assert(self.active);
-            return containsU64(self.ledger.entries[self.entry_index].nodes(), node_id);
+            return containsU64(self.seenNodes(), node_id);
+        }
+
+        pub fn seenCount(self: *const Guard) usize {
+            std.debug.assert(self.active);
+            return self.seenNodes().len;
+        }
+
+        pub fn scope(self: *const Guard) []const u8 {
+            return switch (self.schema_version) {
+                .legacy_v1 => "agent_run_plan",
+                .host_managed_v2 => "agent_run_explicit",
+            };
+        }
+
+        fn seenNodes(self: *const Guard) []const u64 {
+            return switch (self.schema_version) {
+                .legacy_v1 => self.ledger.entries[self.entry_index].nodes(),
+                .host_managed_v2 => self.ledger.runNodes(),
+            };
         }
 
         /// Atomically extend host history with the ids that will be returned
@@ -177,19 +244,37 @@ pub const Ledger = struct {
         /// may contain duplicates; the ledger stores each positive id once.
         pub fn commit(self: *Guard, hit_ids: []const u64) LedgerError!void {
             std.debug.assert(self.active);
-            var entry = &self.ledger.entries[self.entry_index];
+            const existing = self.seenNodes();
             var new_count: usize = 0;
             for (hit_ids, 0..) |node_id, index| {
-                if (node_id == 0 or containsU64(entry.nodes(), node_id) or
+                if (node_id == 0 or containsU64(existing, node_id) or
                     containsU64(hit_ids[0..index], node_id)) continue;
                 new_count += 1;
             }
-            if (entry.node_count + new_count > MAX_SEEN_NODE_IDS) return error.HitCapacityExceeded;
-            for (hit_ids, 0..) |node_id, index| {
-                if (node_id == 0 or containsU64(entry.nodes(), node_id) or
-                    containsU64(hit_ids[0..index], node_id)) continue;
-                entry.node_ids[entry.node_count] = node_id;
-                entry.node_count += 1;
+            switch (self.schema_version) {
+                .legacy_v1 => {
+                    var entry = &self.ledger.entries[self.entry_index];
+                    if (entry.node_count + new_count > MAX_SEEN_NODE_IDS) return error.HitCapacityExceeded;
+                    for (hit_ids, 0..) |node_id, index| {
+                        if (node_id == 0 or containsU64(entry.nodes(), node_id) or
+                            containsU64(hit_ids[0..index], node_id)) continue;
+                        entry.node_ids[entry.node_count] = node_id;
+                        entry.node_count += 1;
+                    }
+                },
+                .host_managed_v2 => {
+                    if (self.ledger.run_node_count + new_count > MAX_RUN_SEEN_NODE_IDS) return error.HitCapacityExceeded;
+                    for (hit_ids, 0..) |node_id, index| {
+                        if (node_id == 0 or containsU64(self.ledger.runNodes(), node_id) or
+                            containsU64(hit_ids[0..index], node_id)) continue;
+                        self.ledger.run_node_ids[self.ledger.run_node_count] = node_id;
+                        self.ledger.run_node_count += 1;
+                    }
+                },
+            }
+            if (self.counts_v2_semantic_expansion) {
+                std.debug.assert(self.ledger.v2_semantic_expansion_calls < MAX_V2_SEMANTIC_EXPANSION_CALLS);
+                self.ledger.v2_semantic_expansion_calls += 1;
             }
             self.active = false;
             self.ledger.mutex.unlock();
@@ -209,8 +294,13 @@ pub fn parse(
     if (raw_plan != .object) return error.InvalidPlanObject;
     const object = raw_plan.object;
 
-    const version = stringField(object, "schema_version") orelse return error.InvalidSchemaVersion;
-    if (!std.mem.eql(u8, version, SCHEMA_VERSION)) return error.InvalidSchemaVersion;
+    const version_text = stringField(object, "schema_version") orelse return error.InvalidSchemaVersion;
+    const schema_version: SchemaVersion = if (std.mem.eql(u8, version_text, SCHEMA_VERSION))
+        .host_managed_v2
+    else if (std.mem.eql(u8, version_text, LEGACY_SCHEMA_VERSION))
+        .legacy_v1
+    else
+        return error.InvalidSchemaVersion;
     const intent_text = stringField(object, "intent") orelse return error.InvalidIntent;
     const intent = std.meta.stringToEnum(Intent, intent_text) orelse return error.InvalidIntent;
     const stage_text = stringField(object, "stage") orelse return error.InvalidStage;
@@ -230,6 +320,7 @@ pub fn parse(
         if (raw_variant != .object) return error.InvalidVariant;
         const kind_text = stringField(raw_variant.object, "kind") orelse return error.InvalidVariant;
         const kind = std.meta.stringToEnum(VariantKind, kind_text) orelse return error.InvalidVariant;
+        if (schema_version == .legacy_v1 and kind == .synonym) return error.InvalidVariant;
         const raw_text = stringField(raw_variant.object, "text") orelse return error.InvalidVariant;
         const text = std.mem.trim(u8, raw_text, " \t\r\n");
         if (!validCompactText(text)) return error.InvalidVariant;
@@ -260,7 +351,7 @@ pub fn parse(
             if (type_filter != null) return error.SeedTypeFilterForbidden;
         },
         .semantic_expansion => {
-            if (variants.items.len < 2) return error.InvalidStageShape;
+            if (schema_version == .legacy_v1 and variants.items.len < 2) return error.InvalidStageShape;
             for (variants.items) |variant| {
                 if (variant.kind == .exact) return error.InvalidStageShape;
             }
@@ -268,17 +359,23 @@ pub fn parse(
         .focused_refinement => {},
     }
 
-    var seen_ids: std.ArrayList(u64) = .empty;
-    var seen_transferred = false;
-    defer if (!seen_transferred) seen_ids.deinit(allocator);
-    const raw_seen = object.get("seen_node_ids") orelse return error.InvalidSeenNodeIds;
-    if (raw_seen != .array) return error.InvalidSeenNodeIds;
-    if (raw_seen.array.items.len > MAX_SEEN_NODE_IDS) return error.TooManySeenNodeIds;
-    for (raw_seen.array.items) |value| {
-        if (value != .integer or value.integer < 1) return error.InvalidSeenNodeIds;
-        const node_id = std.math.cast(u64, value.integer) orelse return error.InvalidSeenNodeIds;
-        if (containsU64(seen_ids.items, node_id)) return error.DuplicateSeenNodeId;
-        try seen_ids.append(allocator, node_id);
+    var declared_seen_node_ids: ?[]u64 = null;
+    errdefer if (declared_seen_node_ids) |ids| allocator.free(ids);
+    if (schema_version == .legacy_v1) {
+        var seen_ids: std.ArrayList(u64) = .empty;
+        errdefer seen_ids.deinit(allocator);
+        const raw_seen = object.get("seen_node_ids") orelse return error.InvalidSeenNodeIds;
+        if (raw_seen != .array) return error.InvalidSeenNodeIds;
+        if (raw_seen.array.items.len > MAX_SEEN_NODE_IDS) return error.TooManySeenNodeIds;
+        for (raw_seen.array.items) |value| {
+            if (value != .integer or value.integer < 1) return error.InvalidSeenNodeIds;
+            const node_id = std.math.cast(u64, value.integer) orelse return error.InvalidSeenNodeIds;
+            if (containsU64(seen_ids.items, node_id)) return error.DuplicateSeenNodeId;
+            try seen_ids.append(allocator, node_id);
+        }
+        declared_seen_node_ids = try seen_ids.toOwnedSlice(allocator);
+    } else if (object.get("seen_node_ids") != null) {
+        return error.UnexpectedSeenNodeIds;
     }
 
     const owned_variants = try variants.toOwnedSlice(allocator);
@@ -287,15 +384,14 @@ pub fn parse(
         for (owned_variants) |*variant| variant.deinit(allocator);
         allocator.free(owned_variants);
     }
-    const owned_seen = try seen_ids.toOwnedSlice(allocator);
-    seen_transferred = true;
     return .{
+        .schema_version = schema_version,
         .intent = intent,
         .stage = stage,
         .variants = owned_variants,
         .variant_index = variant_index,
-        .seen_node_ids = owned_seen,
-        .fingerprint = fingerprint(intent, stage, owned_variants, type_filter),
+        .declared_seen_node_ids = declared_seen_node_ids,
+        .fingerprint = fingerprint(schema_version, intent, stage, owned_variants, type_filter),
     };
 }
 
@@ -303,7 +399,7 @@ pub fn diagnostic(err: Error) []const u8 {
     return switch (err) {
         error.OutOfMemory => "lexical_plan allocation failed",
         error.InvalidPlanObject => "lexical_plan must be an object",
-        error.InvalidSchemaVersion => "lexical_plan.schema_version must be lexical-query-plan-v1",
+        error.InvalidSchemaVersion => "lexical_plan.schema_version must be lexical-query-plan-v2 (v1 remains a compatibility path)",
         error.InvalidIntent => "lexical_plan.intent is missing or unsupported",
         error.InvalidStage => "lexical_plan.stage is missing or unsupported",
         error.InvalidVariants => "lexical_plan.variants must contain 1-4 typed variants",
@@ -312,11 +408,12 @@ pub fn diagnostic(err: Error) []const u8 {
         error.DuplicateVariant => "lexical_plan variants must have distinct text",
         error.InvalidVariantIndex => "lexical_plan.variant_index is outside variants",
         error.QueryVariantMismatch => "KgRecall query must exactly match lexical_plan.variants[variant_index].text",
-        error.InvalidStageShape => "seed requires one exact/alias variant; semantic_expansion requires 2-4 non-exact variants",
+        error.InvalidStageShape => "seed requires one exact/alias variant; v1 semantic_expansion requires 2-4 non-exact variants; v2 allows 1-4",
         error.SeedTypeFilterForbidden => "the seed stage must omit KgRecall type",
         error.InvalidSeenNodeIds => "lexical_plan.seen_node_ids must contain positive integer ids",
         error.TooManySeenNodeIds => "lexical_plan.seen_node_ids exceeds 32 ids",
         error.DuplicateSeenNodeId => "lexical_plan.seen_node_ids must be unique",
+        error.UnexpectedSeenNodeIds => "lexical-query-plan-v2 host-manages seen state; omit seen_node_ids",
     };
 }
 
@@ -324,7 +421,8 @@ pub fn ledgerDiagnostic(err: LedgerError) []const u8 {
     return switch (err) {
         error.SeenStateMismatch => "lexical_plan.seen_node_ids does not exactly match the host ledger for this plan",
         error.PlanCapacityExceeded => "the agent run exceeded 32 distinct governed lexical plans",
-        error.HitCapacityExceeded => "this lexical plan would exceed the 32-node host ledger; stop or begin a new plan",
+        error.HitCapacityExceeded => "the bounded host seen ledger is full; stop retrieval",
+        error.SemanticExpansionBudgetExceeded => "the agent run already used all four v2 semantic-expansion calls; stop retrieval",
     };
 }
 
@@ -334,10 +432,10 @@ fn validCompactText(value: []const u8) bool {
     return true;
 }
 
-fn fingerprint(intent: Intent, stage: Stage, variants: []const Variant, type_filter: ?[]const u8) [64]u8 {
+fn fingerprint(schema_version: SchemaVersion, intent: Intent, stage: Stage, variants: []const Variant, type_filter: ?[]const u8) [64]u8 {
     const Sha256 = std.crypto.hash.sha2.Sha256;
     var hash = Sha256.init(.{});
-    hashField(&hash, SCHEMA_VERSION);
+    hashField(&hash, schema_version.text());
     hashField(&hash, @tagName(intent));
     hashField(&hash, @tagName(stage));
     hashField(&hash, type_filter orelse "");
@@ -466,6 +564,86 @@ test "lexical query ledger rejects forged or omitted seen ids" {
     defer exact_guard.deinit();
     try std.testing.expect(exact_guard.wasSeen(41));
     try exact_guard.commit(&.{43});
+}
+
+test "lexical query plan v2 host owns seen state and accepts one synonym expansion" {
+    const a = std.testing.allocator;
+    const raw =
+        \\{"lexical_plan":{"schema_version":"lexical-query-plan-v2","intent":"fact_lookup","stage":"semantic_expansion","variants":[{"kind":"synonym","text":"commencement"}],"variant_index":0}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    var plan = (try parse(a, parsed.value.object, "commencement", null)) orelse return error.TestUnexpectedResult;
+    defer plan.deinit(a);
+    try std.testing.expectEqual(SchemaVersion.host_managed_v2, plan.schema_version);
+    try std.testing.expectEqual(VariantKind.synonym, plan.selected().kind);
+    try std.testing.expect(plan.declared_seen_node_ids == null);
+
+    var ledger = Ledger{};
+    var first = try ledger.lockPlan(plan);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 0), first.seenCount());
+    try std.testing.expectEqualStrings("agent_run_explicit", first.scope());
+    try first.commit(&.{ 41, 43 });
+
+    var second = try ledger.lockPlan(plan);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 2), second.seenCount());
+    try std.testing.expect(second.wasSeen(41));
+    try second.commit(&.{ 43, 47 });
+
+    const different_plan_raw =
+        \\{"lexical_plan":{"schema_version":"lexical-query-plan-v2","intent":"fact_lookup","stage":"semantic_expansion","variants":[{"kind":"paraphrase","text":"graduation event"}],"variant_index":0}}
+    ;
+    var different_plan_parsed = try std.json.parseFromSlice(std.json.Value, a, different_plan_raw, .{});
+    defer different_plan_parsed.deinit();
+    var different_plan = (try parse(a, different_plan_parsed.value.object, "graduation event", null)) orelse return error.TestUnexpectedResult;
+    defer different_plan.deinit(a);
+    var cross_plan = try ledger.lockPlan(different_plan);
+    defer cross_plan.deinit();
+    try std.testing.expectEqual(@as(usize, 3), cross_plan.seenCount());
+    try std.testing.expect(cross_plan.wasSeen(41));
+    try cross_plan.commit(&.{41});
+
+    var fourth = try ledger.lockPlan(plan);
+    defer fourth.deinit();
+    try fourth.commit(&.{49});
+    try std.testing.expectError(error.SemanticExpansionBudgetExceeded, ledger.lockPlan(different_plan));
+
+    const caller_seen =
+        \\{"lexical_plan":{"schema_version":"lexical-query-plan-v2","intent":"fact_lookup","stage":"semantic_expansion","variants":[{"kind":"synonym","text":"commencement"}],"variant_index":0,"seen_node_ids":[41]}}
+    ;
+    var caller_seen_parsed = try std.json.parseFromSlice(std.json.Value, a, caller_seen, .{});
+    defer caller_seen_parsed.deinit();
+    try std.testing.expectError(error.UnexpectedSeenNodeIds, parse(a, caller_seen_parsed.value.object, "commencement", null));
+}
+
+test "lexical query ledger capacity failure has no partial write" {
+    const a = std.testing.allocator;
+    const raw =
+        \\{"lexical_plan":{"schema_version":"lexical-query-plan-v2","intent":"fact_lookup","stage":"seed","variants":[{"kind":"exact","text":"needle"}],"variant_index":0}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    var plan = (try parse(a, parsed.value.object, "needle", null)) orelse return error.TestUnexpectedResult;
+    defer plan.deinit(a);
+
+    var ledger = Ledger{};
+    ledger.run_node_count = MAX_RUN_SEEN_NODE_IDS - 1;
+    const count_before = ledger.run_node_count;
+    {
+        var guard = try ledger.lockPlan(plan);
+        defer guard.deinit();
+        try std.testing.expectError(error.HitCapacityExceeded, guard.commit(&.{ 9001, 9002 }));
+    }
+    try std.testing.expectEqual(count_before, ledger.run_node_count);
+    try std.testing.expectEqual(@as(usize, 0), ledger.entry_count);
+    try std.testing.expectEqual(@as(u64, 0), ledger.run_node_ids[count_before]);
+
+    var retry = try ledger.lockPlan(plan);
+    defer retry.deinit();
+    try retry.commit(&.{9001});
+    try std.testing.expectEqual(MAX_RUN_SEEN_NODE_IDS, ledger.run_node_count);
 }
 
 test "lexical query ledger serializes concurrent declarations" {

@@ -41,7 +41,7 @@ def call(index, plan, query):
         "query": query,
         "seen_node_count": 0,
         "seen_state_verified": True,
-        "ledger_scope": "agent_run_plan",
+        "ledger_scope": "agent_run_explicit",
         "new_hit_count": 0,
         "repeated_hit_count": 0,
     }

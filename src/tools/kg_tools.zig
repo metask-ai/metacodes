@@ -178,6 +178,8 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // run-scoped host ledger before TinyKG is touched; legacy query-only calls
     // intentionally preserve their old behavior.
     var ledger_guard: ?lexical_query_plan.Ledger.Guard = null;
+    var ledger_seen_count: usize = 0;
+    var ledger_scope: []const u8 = "agent_run_plan";
     defer if (ledger_guard) |*guard| guard.deinit();
     if (plan) |value| {
         const ledger = ctx.kg_lexical_ledger orelse {
@@ -188,9 +190,12 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall lexical_plan host ledger rejected the call: {s}", .{lexical_query_plan.ledgerDiagnostic(err)});
             return error.InvalidLexicalPlanState;
         };
+        ledger_seen_count = ledger_guard.?.seenCount();
+        ledger_scope = ledger_guard.?.scope();
     }
     // 采用率埋点(PM:kill-criterion 的 load-bearing 仪器,measure 模型是否用 --type)。
-    log.info("kg", "kg_recall type_filter={s} lexical_plan={s}", .{ type_canon orelse "none", if (plan == null) "legacy" else "v1" });
+    const plan_version = if (plan) |value| value.schema_version.text() else "query-only";
+    log.info("kg", "kg_recall type_filter={s} lexical_plan={s}", .{ type_canon orelse "none", plan_version });
 
     const hits = kg.recallTyped(query, 8, false, type_canon) catch |e| {
         return kgErrorResult(ctx, kg, e, "KgRecall");
@@ -265,7 +270,7 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try out.appendSlice(ctx.allocator, ",\"types_in_results\":{");
     try out.appendSlice(ctx.allocator, facet.items);
     try out.append(ctx.allocator, '}');
-    if (plan) |value| try appendLexicalPlanReceipt(&out, ctx.allocator, value, new_hit_count, repeated_hit_count);
+    if (plan) |value| try appendLexicalPlanReceipt(&out, ctx.allocator, value, ledger_scope, ledger_seen_count, new_hit_count, repeated_hit_count);
     try out.appendSlice(ctx.allocator, ",\"retrieval_mode\":\"lexical_bm25_no_embeddings\",\"knowledge_status\":\"unverified_candidates\",\"lexical_guidance\":");
     try appendJsonString(&out, ctx.allocator, retrieval_protocol.RESULT_GUIDANCE);
     const tail = "}";
@@ -296,22 +301,25 @@ fn appendLexicalPlanReceipt(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     plan: lexical_query_plan.Plan,
+    ledger_scope: []const u8,
+    seen_node_count: usize,
     new_hit_count: usize,
     repeated_hit_count: usize,
 ) !void {
     const selected = plan.selected();
     const receipt = try std.fmt.allocPrint(
         allocator,
-        ",\"lexical_query_plan\":{{\"schema_version\":\"{s}\",\"plan_sha256\":\"{s}\",\"intent\":\"{s}\",\"stage\":\"{s}\",\"variant_index\":{d},\"variant_count\":{d},\"variant_kind\":\"{s}\",\"seen_node_count\":{d},\"seen_state_verified\":true,\"ledger_scope\":\"agent_run_plan\",\"new_hit_count\":{d},\"repeated_hit_count\":{d}}}",
+        ",\"lexical_query_plan\":{{\"schema_version\":\"{s}\",\"plan_sha256\":\"{s}\",\"intent\":\"{s}\",\"stage\":\"{s}\",\"variant_index\":{d},\"variant_count\":{d},\"variant_kind\":\"{s}\",\"seen_node_count\":{d},\"seen_state_verified\":true,\"ledger_scope\":\"{s}\",\"new_hit_count\":{d},\"repeated_hit_count\":{d}}}",
         .{
-            lexical_query_plan.SCHEMA_VERSION,
+            plan.schema_version.text(),
             plan.fingerprint,
             @tagName(plan.intent),
             @tagName(plan.stage),
             plan.variant_index,
             plan.variants.len,
             @tagName(selected.kind),
-            plan.seen_node_ids.len,
+            seen_node_count,
+            ledger_scope,
             new_hit_count,
             repeated_hit_count,
         },

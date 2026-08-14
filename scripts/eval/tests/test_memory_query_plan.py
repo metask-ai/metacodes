@@ -6,6 +6,7 @@ from pathlib import Path
 
 from scripts.eval.memory_query_plan import (
     MULTIPLE_DISTINCT_SEED_PLANS_REASON,
+    V2_SEMANTIC_EXPANSION_BUDGET_REASON,
     SIDECAR_NAME,
     _plan_fingerprint,
     build_query_plan_trace,
@@ -31,18 +32,27 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
         intent="fact_lookup",
         stage="seed",
         count_override=None,
+        schema_version="lexical-query-plan-v1",
     ):
-        plan_sha = _plan_fingerprint(intent, stage, variants, None)
+        plan_sha = _plan_fingerprint(
+            intent,
+            stage,
+            variants,
+            None,
+            schema_version=schema_version,
+        )
+        lexical_plan = {
+            "schema_version": schema_version,
+            "intent": intent,
+            "stage": stage,
+            "variants": variants,
+            "variant_index": variant_index,
+        }
+        if schema_version == "lexical-query-plan-v1":
+            lexical_plan["seen_node_ids"] = list(seen)
         tool_input = {
             "query": variants[variant_index]["text"],
-            "lexical_plan": {
-                "schema_version": "lexical-query-plan-v1",
-                "intent": intent,
-                "stage": stage,
-                "variants": variants,
-                "variant_index": variant_index,
-                "seen_node_ids": list(seen),
-            },
+            "lexical_plan": lexical_plan,
         }
         distinct = []
         new_count = 0
@@ -63,7 +73,7 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
         result = {
             "hits": result_hits,
             "lexical_query_plan": {
-                "schema_version": "lexical-query-plan-v1",
+                "schema_version": schema_version,
                 "plan_sha256": plan_sha,
                 "intent": intent,
                 "stage": stage,
@@ -72,7 +82,11 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
                 "variant_kind": variants[variant_index]["kind"],
                 "seen_node_count": len(seen),
                 "seen_state_verified": True,
-                "ledger_scope": "agent_run_plan",
+                "ledger_scope": (
+                    "agent_run_plan"
+                    if schema_version == "lexical-query-plan-v1"
+                    else "agent_run_explicit"
+                ),
                 "new_hit_count": new_count,
                 "repeated_hit_count": repeated_count,
             },
@@ -152,6 +166,60 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             self.assertEqual(summary["repeated_hit_count"], 1)
             self.assertEqual(summary["unique_gain_ratio"], 0.75)
 
+    def test_v2_host_owned_seen_state_accepts_single_synonym_expansion(self):
+        variants = [{"kind": "synonym", "text": "commencement"}]
+        first = self._call(
+            "kg-1",
+            variants=variants,
+            hits=(7, 9),
+            stage="semantic_expansion",
+            schema_version="lexical-query-plan-v2",
+        )
+        second = self._call(
+            "kg-2",
+            variants=variants,
+            seen=(7, 9),
+            hits=(7, 11),
+            stage="semantic_expansion",
+            schema_version="lexical-query-plan-v2",
+        )
+        cross_plan = self._call(
+            "kg-3",
+            variants=[{"kind": "paraphrase", "text": "graduation event"}],
+            seen=(7, 9, 11),
+            hits=(7, 13),
+            stage="semantic_expansion",
+            schema_version="lexical-query-plan-v2",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(cassette, [first, second, cross_plan])
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-v2-host-seen",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+
+        self.assertEqual(trace["status"], "verified")
+        self.assertEqual(
+            [call["schema_version"] for call in trace["calls"]],
+            [
+                "lexical-query-plan-v2",
+                "lexical-query-plan-v2",
+                "lexical-query-plan-v2",
+            ],
+        )
+        self.assertEqual(
+            [call["seen_node_count"] for call in trace["calls"]],
+            [0, 2, 3],
+        )
+        self.assertEqual(
+            [call["variant_kind"] for call in trace["calls"]],
+            ["synonym", "synonym", "paraphrase"],
+        )
+        self.assertEqual(trace["calls"][2]["repeated_hit_count"], 1)
+
     def test_distinct_seed_plans_are_invalid_and_preserved_as_exact(self):
         first = self._call(
             "kg-1",
@@ -187,6 +255,36 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
         forged["status"] = "verified"
         forged["invalid_reasons"] = []
         with self.assertRaisesRegex(ValidationError, "multiple distinct seed plans"):
+            validate_query_plan_trace(forged)
+
+    def test_more_than_four_successful_v2_expansions_are_invalid(self):
+        calls = [
+            self._call(
+                f"kg-{index}",
+                variants=[{"kind": "synonym", "text": f"probe {index}"}],
+                seen=tuple(range(1, index)),
+                hits=(index,),
+                stage="semantic_expansion",
+                schema_version="lexical-query-plan-v2",
+            )
+            for index in range(1, 6)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(cassette, calls)
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-v2-expansion-overflow",
+                arm="tinykg_lexical",
+                memory_backend="tinykg",
+            )
+
+        self.assertEqual(trace["status"], "invalid")
+        self.assertIn(V2_SEMANTIC_EXPANSION_BUDGET_REASON, trace["invalid_reasons"])
+        forged = copy.deepcopy(trace)
+        forged["status"] = "verified"
+        forged["invalid_reasons"] = []
+        with self.assertRaisesRegex(ValidationError, "semantic expansion budget"):
             validate_query_plan_trace(forged)
 
     def test_forged_gain_receipt_is_invalid_not_zero_gain(self):
