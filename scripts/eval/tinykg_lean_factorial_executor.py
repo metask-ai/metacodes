@@ -20,7 +20,14 @@ import stat
 import sys
 from typing import Any, Mapping, Sequence
 
-from .attribution_protocol import CELL_IDS, EXPECTED_CELLS, PROTOCOL_ID
+from .attribution_protocol import (
+    CELL_IDS,
+    EXPECTED_CELLS,
+    PROTOCOL_ID,
+    balanced_factorial_schedule,
+    load_protocol,
+    validate_protocol,
+)
 from .e2e_adapter import _native_trace_metrics
 from .memory_agent_runtime import (
     _assert_executable_identity,
@@ -55,6 +62,8 @@ from .project_harness_e3_templates import verify_templates
 from .tinykg_lean_factorial import (
     REFERENCE_SCHEMA,
     ROLLOUT_SCHEMA,
+    build_report,
+    load_receipts,
 )
 
 
@@ -64,6 +73,32 @@ CALIBRATION_CHECKPOINT_SCHEMA = "metacodes-tinykg-lean-factorial-calibration-che
 CALIBRATION_SUMMARY_SCHEMA = "metacodes-tinykg-lean-factorial-calibration-summary-v1"
 CALIBRATION_PREFLIGHT_SCHEMA = "metacodes-tinykg-lean-factorial-calibration-preflight-v1"
 CALIBRATION_CELLS = ("control", "memory_only", "combined", "lean_only")
+BLOCK_CHECKPOINT_SCHEMA = "metacodes-tinykg-lean-factorial-block-checkpoint-v1"
+BLOCK_SUMMARY_SCHEMA = "metacodes-tinykg-lean-factorial-block-summary-v1"
+BLOCK_PREFLIGHT_SCHEMA = "metacodes-tinykg-lean-factorial-block-preflight-v1"
+BLOCK_CASES_RELATIVE = Path(
+    "evals/experiments/tinykg-lean-factorial-block-v1-cases.json"
+)
+ATTRIBUTION_PROTOCOL_RELATIVE = Path(
+    "evals/experiments/tinykg-lean-attribution-v1.json"
+)
+BLOCK_CASE_IDS = (
+    "canonicalize_archive_limits_env_v4",
+    "replace_node_inventory_json_v4",
+    "regenerate_lifecycle_yaml_v4",
+    "rewrite_proxy_conf_v4",
+)
+PROCEDURAL_MEMORY_QUERY = (
+    "existing file inspect read replace regenerate canonical exact preserve verify"
+)
+PROCEDURAL_MEMORY_TEXT = (
+    "Verified historical procedural lesson for exact existing-file replacement: "
+    "inspect and Read the existing file before modifying it; preserve the requested "
+    "canonical bytes and final newline; use Edit with the observed source as a "
+    "source-CAS precondition instead of Write; create no unrelated files; then Read "
+    "again and verify the complete result byte-for-byte. This is general workflow "
+    "guidance, not a task answer, and current instructions remain authoritative."
+)
 MAX_JSON_BYTES = 64 * 1024 * 1024
 _TINYKG_DYNAMIC_SECTION = re.compile(
     r"(?ms)^# (?:Memory|Knowledge Graph|Deferred tools)\n.*?"
@@ -80,6 +115,27 @@ class CalibrationContext:
     manifest: Mapping[str, Any]
     templates: Mapping[str, Any]
     case: Mapping[str, Any]
+    root: Path
+    workspace: Path
+    run_dir: Path
+    budget_path: Path
+    ripgrep: Path
+    ripgrep_sha256: str
+    tinykg_binary: Path
+    tinykg_sha256: str
+    seed_batch: bytes
+    recall_query: str
+    identity: Mapping[str, Any]
+    schedules: tuple[Mapping[str, Any], ...]
+    authority: BudgetAuthority
+
+
+@dataclass(frozen=True)
+class BlockContext:
+    repo: Path
+    manifest: Mapping[str, Any]
+    templates: Mapping[str, Any]
+    case_ids: tuple[str, ...]
     root: Path
     workspace: Path
     run_dir: Path
@@ -672,6 +728,38 @@ def _calibration_seed(
     return payload, query
 
 
+def _block_seed(*, workspace: Path) -> tuple[bytes, str]:
+    """Freeze a reusable, answer-free procedural treatment.
+
+    The lesson deliberately contains no case id, filename, opaque value, or
+    expected payload from the scored cohort.  Its value is the historical
+    workflow constraint: observe an existing file, make a source-CAS edit,
+    and re-observe the exact result.
+    """
+
+    rows = (
+        {"version": 1},
+        {
+            "op": "node",
+            "id": 1,
+            "kind": "project",
+            "name": _project_domain(workspace),
+        },
+        {
+            "op": "node",
+            "id": 2,
+            "kind": "decision",
+            "name": PROCEDURAL_MEMORY_TEXT,
+        },
+        {"op": "edge", "id": 1, "src": 1, "rel": "contain", "dst": 2},
+    )
+    payload = ("\n".join(stable_json(row) for row in rows) + "\n").encode("utf-8")
+    forbidden = (*BLOCK_CASE_IDS, ".archive.env", "nodes.json", "lifecycle.yaml", "proxy.conf")
+    if any(value.encode("utf-8") in payload for value in forbidden):
+        _fail("factorial block memory", "procedural seed leaks scored case identity")
+    return payload, PROCEDURAL_MEMORY_QUERY
+
+
 def _calibration_identity(
     *,
     manifest: Mapping[str, Any],
@@ -697,6 +785,40 @@ def _calibration_identity(
     return {**body, "calibration_id": _canonical_sha256(body)}
 
 
+def _block_identity(
+    *,
+    manifest: Mapping[str, Any],
+    case_ids: Sequence[str],
+    schedules: Sequence[Mapping[str, Any]],
+    tinykg_sha256: str,
+    ripgrep_sha256: str,
+    seed_batch: bytes,
+    recall_query: str,
+    protocol_sha256: str,
+    case_ids_sha256: str,
+) -> Mapping[str, Any]:
+    body = {
+        "schema_version": EXECUTOR_SCHEMA,
+        "evidence_mode": "quality-factorial-block",
+        "executor_source_sha256": _sha256_file(Path(__file__).resolve(strict=True)),
+        "manifest_id": manifest["manifest_id"],
+        "manifest_sha256": _canonical_sha256(manifest),
+        "repository_commit": manifest["repository"]["commit"],
+        "protocol_sha256": protocol_sha256,
+        "case_ids_sha256": case_ids_sha256,
+        "case_ids": list(case_ids),
+        "schedule": list(schedules),
+        "tinykg_binary_sha256": tinykg_sha256,
+        "ripgrep_binary_sha256": ripgrep_sha256,
+        "seed_batch_sha256": hashlib.sha256(seed_batch).hexdigest(),
+        "procedural_memory_sha256": hashlib.sha256(
+            PROCEDURAL_MEMORY_TEXT.encode("utf-8")
+        ).hexdigest(),
+        "recall_query": recall_query,
+    }
+    return {**body, "block_id": _canonical_sha256(body)}
+
+
 def _relative_to_run(path: Path, run_dir: Path, where: str) -> str:
     try:
         return path.resolve(strict=True).relative_to(run_dir.resolve(strict=True)).as_posix()
@@ -710,10 +832,11 @@ def _checkpoint_value(
     completed: Sequence[Mapping[str, Any]],
     budget: BudgetJournal,
     references: Mapping[str, Any] | None,
+    schema_version: str = CALIBRATION_CHECKPOINT_SCHEMA,
 ) -> Mapping[str, Any]:
     snapshot = budget.snapshot()
     return {
-        "schema_version": CALIBRATION_CHECKPOINT_SCHEMA,
+        "schema_version": schema_version,
         "identity": dict(identity),
         "completed": list(completed),
         "references": dict(references) if references is not None else None,
@@ -730,6 +853,7 @@ def _persist_checkpoint(
     completed: Sequence[Mapping[str, Any]],
     budget: BudgetJournal,
     references: Mapping[str, Any] | None,
+    schema_version: str = CALIBRATION_CHECKPOINT_SCHEMA,
 ) -> None:
     payload = (
         stable_json(
@@ -738,6 +862,7 @@ def _persist_checkpoint(
                 completed=completed,
                 budget=budget,
                 references=references,
+                schema_version=schema_version,
             )
         )
         + "\n"
@@ -772,6 +897,7 @@ def _reopen_completed(
     run_dir: Path,
     manifest: Mapping[str, Any],
     budget: BudgetJournal,
+    quality_evidence: bool = False,
 ) -> Mapping[str, Any]:
     if (
         set(entry)
@@ -798,7 +924,7 @@ def _reopen_completed(
         schedule=schedule,
         budget_journal=budget,
     )
-    projection = {**projection, "quality_evidence": False}
+    projection = {**projection, "quality_evidence": quality_evidence}
     receipt_path = run_dir / str(entry["receipt_path"])
     payload = _read_regular(
         receipt_path,
@@ -902,6 +1028,42 @@ def _validate_paid_calibration_sources(
             _fail(
                 "factorial calibration source",
                 f"row {index} is not a real paid provider rollout",
+            )
+
+
+def _validate_paid_block_sources(
+    results: Sequence[Mapping[str, Any]], *, run_dir: Path
+) -> None:
+    for index, result in enumerate(results):
+        source_item = result.get("source")
+        if not isinstance(source_item, Mapping):
+            _fail("factorial block source", f"row {index} has no source receipt")
+        source_path = Path(str(source_item.get("receipt_path", "")))
+        payload = _read_regular(
+            source_path,
+            root=run_dir,
+            where=f"factorial block source {index}",
+        )
+        if hashlib.sha256(payload).hexdigest() != source_item.get("receipt_sha256"):
+            _fail("factorial block source", f"row {index} SHA-256 drift")
+        source = _json(payload, f"factorial block source {index}")
+        projection = result.get("projection")
+        usage = projection.get("usage") if isinstance(projection, Mapping) else None
+        if (
+            source.get("schema_version") != SOURCE_SCHEMA
+            or source.get("evidence_level") != "E3-paid-model-rollout"
+            or source.get("quality_evidence") is not True
+            or not isinstance(source.get("provider_requests"), int)
+            or int(source["provider_requests"]) <= 0
+            or not isinstance(usage, Mapping)
+            or int(usage.get("cost_microusd", 0)) <= 0
+            or int(usage.get("metered_tokens", 0)) <= 0
+            or int(usage.get("provider_requests", 0)) <= 0
+            or projection.get("quality_evidence") is not True
+        ):
+            _fail(
+                "factorial block source",
+                f"row {index} is not an admissible paid quality rollout",
             )
 
 
@@ -1130,6 +1292,173 @@ def _load_checkpoint(path: Path, *, context: CalibrationContext) -> Mapping[str,
     return checkpoint
 
 
+def _prepare_block(
+    *,
+    repo: Path,
+    manifest_path: Path,
+    tinykg_binary: Path,
+    ripgrep: Path,
+    run_dir: Path,
+    budget_path: Path,
+    resume: bool,
+) -> BlockContext:
+    # Reuse the already-audited filesystem, executable, manifest, budget, and
+    # private-path boundary.  The scored block then replaces only the case
+    # cohort, schedule, seed, and evidence identity.
+    base = _prepare_calibration(
+        repo=repo,
+        manifest_path=manifest_path,
+        case_id=BLOCK_CASE_IDS[0],
+        tinykg_binary=tinykg_binary,
+        ripgrep=ripgrep,
+        run_dir=run_dir,
+        budget_path=budget_path,
+        resume=resume,
+    )
+    protocol_path = base.repo / ATTRIBUTION_PROTOCOL_RELATIVE
+    validate_protocol(load_protocol(protocol_path), base.repo)
+    cases_path = base.repo / BLOCK_CASES_RELATIVE
+    cases_payload = _read_regular(
+        cases_path,
+        root=base.repo,
+        where="factorial block case cohort",
+    )
+    try:
+        raw_case_ids = json.loads(cases_payload)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        _fail("factorial block case cohort", f"invalid JSON: {exc}")
+    if (
+        not isinstance(raw_case_ids, list)
+        or tuple(raw_case_ids) != BLOCK_CASE_IDS
+        or len(set(raw_case_ids)) != len(raw_case_ids)
+    ):
+        _fail("factorial block case cohort", "frozen four-case identity drift")
+    available = {
+        str(case.get("id"))
+        for case in base.manifest["cases"]
+        if isinstance(case, Mapping)
+    }
+    if any(case_id not in available for case_id in BLOCK_CASE_IDS):
+        _fail("factorial block case cohort", "case is outside the frozen manifest")
+    if not resume and (
+        base.budget_path.exists()
+        or base.budget_path.is_symlink()
+        or base.budget_path.with_name(base.budget_path.name + ".lock").exists()
+    ):
+        _fail("factorial block budget", "fresh block requires a fresh journal path")
+    schedules = tuple(balanced_factorial_schedule(BLOCK_CASE_IDS))
+    seed_batch, recall_query = _block_seed(workspace=base.workspace)
+    identity = _block_identity(
+        manifest=base.manifest,
+        case_ids=BLOCK_CASE_IDS,
+        schedules=schedules,
+        tinykg_sha256=base.tinykg_sha256,
+        ripgrep_sha256=base.ripgrep_sha256,
+        seed_batch=seed_batch,
+        recall_query=recall_query,
+        protocol_sha256=_sha256_file(protocol_path),
+        case_ids_sha256=hashlib.sha256(cases_payload).hexdigest(),
+    )
+    return BlockContext(
+        repo=base.repo,
+        manifest=base.manifest,
+        templates=base.templates,
+        case_ids=BLOCK_CASE_IDS,
+        root=base.root,
+        workspace=base.workspace,
+        run_dir=base.run_dir,
+        budget_path=base.budget_path,
+        ripgrep=base.ripgrep,
+        ripgrep_sha256=base.ripgrep_sha256,
+        tinykg_binary=base.tinykg_binary,
+        tinykg_sha256=base.tinykg_sha256,
+        seed_batch=seed_batch,
+        recall_query=recall_query,
+        identity=identity,
+        schedules=schedules,
+        authority=base.authority,
+    )
+
+
+def _load_block_checkpoint(path: Path, *, context: BlockContext) -> Mapping[str, Any]:
+    _validate_private_path_if_present(path, "factorial block checkpoint")
+    checkpoint = _json(
+        _read_regular(
+            path,
+            root=context.run_dir,
+            where="factorial block checkpoint",
+        ),
+        "factorial block checkpoint",
+    )
+    if (
+        set(checkpoint)
+        != {
+            "schema_version",
+            "identity",
+            "completed",
+            "references",
+            "budget_journal_id",
+            "budget_revision",
+            "budget_head_sha256",
+        }
+        or checkpoint.get("schema_version") != BLOCK_CHECKPOINT_SCHEMA
+        or stable_json(checkpoint.get("identity")) != stable_json(context.identity)
+        or not isinstance(checkpoint.get("completed"), list)
+    ):
+        _fail("factorial block checkpoint", "identity or field drift")
+    return checkpoint
+
+
+def preflight_block(
+    *,
+    repo: Path,
+    manifest_path: Path,
+    tinykg_binary: Path,
+    ripgrep: Path,
+    run_dir: Path,
+    budget_path: Path,
+    resume: bool,
+) -> Mapping[str, Any]:
+    context = _prepare_block(
+        repo=repo,
+        manifest_path=manifest_path,
+        tinykg_binary=tinykg_binary,
+        ripgrep=ripgrep,
+        run_dir=run_dir,
+        budget_path=budget_path,
+        resume=resume,
+    )
+    completed = 0
+    if resume:
+        checkpoint = _load_block_checkpoint(
+            context.run_dir / "factorial-block-checkpoint.json",
+            context=context,
+        )
+        completed = len(checkpoint["completed"])
+        if completed > len(context.schedules):
+            _fail("factorial block checkpoint", "completed prefix is too long")
+    return {
+        "schema_version": BLOCK_PREFLIGHT_SCHEMA,
+        "block_id": context.identity["block_id"],
+        "case_ids": list(context.case_ids),
+        "mode": "resume" if resume else "fresh",
+        "completed_rollouts_observed": completed,
+        "planned_rollouts": len(context.schedules),
+        "schedule": list(context.schedules),
+        "provider_requests": 0,
+        "credential_read": False,
+        "budget_journal_modified": False,
+        "run_directory_modified": False,
+        "quality_evidence": False,
+        "quality_eligible_after_paid_execution": True,
+        "raw_artifacts_local_only": True,
+        "remote_tinykg_forbidden": True,
+        "procedural_memory_sha256": context.identity["procedural_memory_sha256"],
+        "budget_authority_cost_microusd": context.authority.total_cost_microusd,
+        "budget_authority_metered_tokens": context.authority.total_metered_tokens,
+    }
+
+
 def preflight_calibration(
     *,
     repo: Path,
@@ -1344,6 +1673,202 @@ def run_calibration(
             "committed_metered_tokens": snapshot["committed_metered_tokens"],
             "budget_revision": snapshot["revision"],
             "budget_head_sha256": snapshot["head_sha256"],
+        }
+
+
+def _persist_or_verify_private(path: Path, value: Mapping[str, Any], where: str) -> str:
+    payload = (stable_json(value) + "\n").encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    if path.exists() or path.is_symlink():
+        observed = _read_regular(path, root=path.parent, where=where)
+        if observed != payload:
+            _fail(where, "existing artifact drift")
+    else:
+        _write_private(path, payload)
+    return digest
+
+
+def run_block(
+    *,
+    repo: Path,
+    manifest_path: Path,
+    tinykg_binary: Path,
+    ripgrep: Path,
+    run_dir: Path,
+    budget_path: Path,
+    auth_file: Path,
+    resume: bool,
+) -> Mapping[str, Any]:
+    context = _prepare_block(
+        repo=repo,
+        manifest_path=manifest_path,
+        tinykg_binary=tinykg_binary,
+        ripgrep=ripgrep,
+        run_dir=run_dir,
+        budget_path=budget_path,
+        resume=resume,
+    )
+    if not resume:
+        context.run_dir.mkdir(mode=0o700)
+        (context.run_dir / "rollouts").mkdir(mode=0o700)
+    checkpoint_path = context.run_dir / "factorial-block-checkpoint.json"
+    execution = context.manifest["execution"]
+
+    with BudgetJournal(context.budget_path, context.authority) as budget:
+        budget.checkpoint_payload()
+        completed_entries: list[Mapping[str, Any]] = []
+        results: list[Mapping[str, Any]] = []
+        references_info: Mapping[str, Any] | None = None
+        if resume:
+            checkpoint = _load_block_checkpoint(checkpoint_path, context=context)
+            completed_entries = list(checkpoint["completed"])
+            snapshot = budget.snapshot()
+            if (
+                checkpoint.get("budget_journal_id") != snapshot["journal_id"]
+                or checkpoint.get("budget_revision") != snapshot["revision"]
+                or checkpoint.get("budget_head_sha256") != snapshot["head_sha256"]
+                or snapshot["transaction_states"].get("request_authorized", 0) != 0
+                or snapshot["transaction_states"].get("reserved", 0) != 0
+                or snapshot["transaction_states"].get("committed", 0)
+                != len(completed_entries)
+                or len(completed_entries) > len(context.schedules)
+            ):
+                _fail("factorial block checkpoint", "budget or prefix drift")
+            for index, entry in enumerate(completed_entries):
+                if not isinstance(entry, Mapping):
+                    _fail("factorial block checkpoint", "invalid completed row")
+                results.append(
+                    _reopen_completed(
+                        entry=entry,
+                        schedule=context.schedules[index],
+                        run_dir=context.run_dir,
+                        manifest=context.manifest,
+                        budget=budget,
+                        quality_evidence=True,
+                    )
+                )
+            raw_references = checkpoint.get("references")
+            if raw_references is not None:
+                if not isinstance(raw_references, Mapping):
+                    _fail("factorial block checkpoint", "references drift")
+                references_info = dict(raw_references)
+        else:
+            _persist_checkpoint(
+                path=checkpoint_path,
+                identity=context.identity,
+                completed=completed_entries,
+                budget=budget,
+                references=None,
+                schema_version=BLOCK_CHECKPOINT_SCHEMA,
+            )
+
+        pending = context.schedules[len(results) :]
+        if pending:
+            api_key = _load_api_key(auth_file.expanduser().resolve(strict=True))
+            try:
+                for schedule in pending:
+                    result = execute_cell(
+                        repo=context.repo,
+                        manifest=context.manifest,
+                        templates=context.templates,
+                        schedule=schedule,
+                        run_dir=context.run_dir,
+                        ripgrep=context.ripgrep,
+                        ripgrep_sha256=context.ripgrep_sha256,
+                        api_key=api_key,
+                        budget=budget,
+                        timeout_seconds=int(execution["rollout_timeout_seconds"]),
+                        tinykg_binary=context.tinykg_binary,
+                        tinykg_binary_sha256=context.tinykg_sha256,
+                        seed_batch=context.seed_batch,
+                        recall_query=context.recall_query,
+                        quality_evidence_eligible=True,
+                    )
+                    results.append(result)
+                    completed_entries.append(_checkpoint_entry(result, context.run_dir))
+                    _persist_checkpoint(
+                        path=checkpoint_path,
+                        identity=context.identity,
+                        completed=completed_entries,
+                        budget=budget,
+                        references=None,
+                        schema_version=BLOCK_CHECKPOINT_SCHEMA,
+                    )
+            finally:
+                _assert_production_secret_absent(context.run_dir, api_key)
+
+        projections = [result["projection"] for result in results]
+        # The unauthenticated call validates the complete schedule, treatments,
+        # cache identity, and row schema before references are admitted.
+        build_report(projections, context.case_ids)
+        _validate_paid_block_sources(results, run_dir=context.run_dir)
+        if references_info is None:
+            references_path = context.run_dir / "factorial-references.json"
+            if not references_path.exists() and not references_path.is_symlink():
+                references_path = persist_references(
+                    receipts=results,
+                    run_dir=context.run_dir,
+                )
+            references_info = {
+                "path": _relative_to_run(
+                    references_path,
+                    context.run_dir,
+                    "factorial block references",
+                ),
+                "sha256": _sha256_file(references_path),
+            }
+            references_path = _reopen_references(
+                info=references_info,
+                results=results,
+                run_dir=context.run_dir,
+            )
+            _persist_checkpoint(
+                path=checkpoint_path,
+                identity=context.identity,
+                completed=completed_entries,
+                budget=budget,
+                references=references_info,
+                schema_version=BLOCK_CHECKPOINT_SCHEMA,
+            )
+        else:
+            references_path = _reopen_references(
+                info=references_info,
+                results=results,
+                run_dir=context.run_dir,
+            )
+
+        evidence = load_receipts(
+            references_path=references_path,
+            evidence_root=context.run_dir,
+            case_ids=context.case_ids,
+        )
+        report = build_report(evidence.projections, context.case_ids, evidence=evidence)
+        report_path = context.run_dir / "factorial-report.json"
+        report_sha256 = _persist_or_verify_private(
+            report_path,
+            report,
+            "factorial block report",
+        )
+        budget.checkpoint_payload()
+        snapshot = budget.snapshot()
+        return {
+            "schema_version": BLOCK_SUMMARY_SCHEMA,
+            "block_id": context.identity["block_id"],
+            "case_ids": list(context.case_ids),
+            "rollouts": len(results),
+            "quality_evidence": report["quality_evidence"],
+            "claim_boundary": report["claim_boundary"],
+            "references_path": str(references_path),
+            "references_sha256": references_info["sha256"],
+            "report_path": str(report_path),
+            "report_sha256": report_sha256,
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_sha256": _sha256_file(checkpoint_path),
+            "committed_cost_microusd": snapshot["committed_cost_microusd"],
+            "committed_metered_tokens": snapshot["committed_metered_tokens"],
+            "budget_revision": snapshot["revision"],
+            "budget_head_sha256": snapshot["head_sha256"],
+            "report": report,
         }
 
 

@@ -72,6 +72,25 @@ class AttributionProtocolTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "predecessor drift"):
             validate_protocol(broken, ROOT)
 
+    def test_factorial_stage_binds_executor_and_analyzer(self) -> None:
+        for field, value in (
+            ("runner", "scripts/eval/tinykg_lean_factorial.py"),
+            ("analyzer", "scripts/eval/tinykg_lean_factorial_block.py"),
+        ):
+            with self.subTest(field=field):
+                broken = copy.deepcopy(self.protocol)
+                broken["stages"][3][field] = value
+                with self.assertRaisesRegex(
+                    ValidationError, "unified native factorial executor|analyzer"
+                ):
+                    validate_protocol(broken, ROOT)
+
+    def test_resolved_production_executor_gap_cannot_return(self) -> None:
+        broken = copy.deepcopy(self.protocol)
+        broken["known_gaps"].append("production executor still missing")
+        with self.assertRaisesRegex(ValidationError, "resolved.*stale"):
+            validate_protocol(broken, ROOT)
+
     def test_smoke_cannot_claim_quality_evidence(self) -> None:
         broken = copy.deepcopy(self.protocol)
         broken["stages"][0]["quality_evidence"] = True

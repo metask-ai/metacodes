@@ -260,6 +260,28 @@ class TinyKgLeanFactorialTest(unittest.TestCase):
                     case_ids=CASES,
                 )
 
+    def test_negative_outcome_remains_quality_evidence_but_cannot_promote(self) -> None:
+        rows = self.rows()
+        for row in rows:
+            if row["cell"] == "control":
+                row["outcomes"]["task_success"] = True
+                row["outcomes"]["trustworthy_success"] = True
+            if row["cell"] == "combined":
+                row["outcomes"]["trustworthy_success"] = False
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            references = write_evidence(root, rows)
+            reopened = load_receipts(
+                references_path=references,
+                evidence_root=root,
+                case_ids=CASES,
+            )
+            report = build_report(reopened.projections, CASES, evidence=reopened)
+        self.assertTrue(report["quality_evidence"])
+        self.assertTrue(report["evidence_gates_passed"])
+        self.assertFalse(report["promotion_gates_passed"])
+        self.assertFalse(report["all_gates_passed"])
+
 
 if __name__ == "__main__":
     unittest.main()

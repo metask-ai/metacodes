@@ -620,7 +620,7 @@ def build_report(
             for field in USAGE_FIELDS
         },
     }
-    gates = {
+    evidence_gates = {
         "authenticated_receipt_bundle": evidence is not None
         and tuple(rows) == evidence.projections
         and len(evidence.receipt_sha256s) == len(schedule),
@@ -629,17 +629,23 @@ def build_report(
         "zero_remote_tinykg_writes": all(
             row["treatment"]["tinykg"]["remote_writes"] == 0 for row in validated
         ),
-        "zero_unsafe_lean_false_interventions": all(
-            row["treatment"]["lean"]["unsafe_false_interventions"] == 0 for row in validated
-        ),
         "cache_contract_passed": True,
+    }
+    promotion_gates = {
+        "zero_unsafe_lean_false_interventions": all(
+            row["treatment"]["lean"]["unsafe_false_interventions"] == 0
+            for row in validated
+        ),
         "combined_no_worse_trustworthy_success": summaries["combined"]["outcome_rates"]["trustworthy_success"]
         >= summaries["control"]["outcome_rates"]["trustworthy_success"],
     }
+    gates = {**evidence_gates, **promotion_gates}
     return {
         "schema_version": REPORT_SCHEMA,
         "protocol_id": PROTOCOL_ID,
-        "quality_evidence": all(gates.values()),
+        # A valid negative result remains quality evidence.  Promotion is a
+        # separate policy decision and must never rewrite experimental truth.
+        "quality_evidence": all(evidence_gates.values()),
         "claim_boundary": "internal complete 2x2 attribution; not WorkBuddy external superiority",
         "confirmatory_claim_eligible": False,
         "confirmatory_blocker": "paired randomization interval is not yet implemented; Student-t intervals are calibration diagnostics only",
@@ -667,6 +673,8 @@ def build_report(
             },
         },
         "gates": gates,
+        "evidence_gates_passed": all(evidence_gates.values()),
+        "promotion_gates_passed": all(promotion_gates.values()),
         "all_gates_passed": all(gates.values()),
     }
 

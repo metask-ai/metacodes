@@ -87,7 +87,8 @@
         "s1_tinykg_main_effect",
         "s2_lean_main_effect"
       ],
-      "runner": "scripts/eval/tinykg_lean_factorial.py",
+      "runner": "scripts/eval/tinykg_lean_factorial_block.py",
+      "analyzer": "scripts/eval/tinykg_lean_factorial.py",
       "network": "single-physical-provider-attempt",
       "quality_evidence": true,
       "arms": [
@@ -286,17 +287,19 @@
     "prior_exposure_source": "live durable journal and receipts; never a mutable process variable"
   },
   "source_contract": {
+    "evals/experiments/tinykg-lean-factorial-block-v1-cases.json": "9a563ae27db1c5840339b2bda47c3f535dda06cc05a95be21a32779bc2ed2542",
     "evals/memory/MEMORY_MATURATION_V1.md": "3621d69f26c6e791033a6ba87887942bb620e92ad6103d5b6f2b6c23d7fff582",
     "scripts/eval/memory_agent_runtime_smoke.py": "b4a3b304de5da8fd52db3eeba654b0a404c2b890a56348806c7b348155ac2be6",
     "scripts/eval/memory_agent_runtime_pilot.py": "8ce7f983f1ca401099a9c76e6c571de8c7f0a43a3a21894aacaa6b1ebac06987",
     "scripts/eval/project_harness_experiment.py": "38c7acfd7a4142e7f2f81ecdf9058658d2f11f262c964def3f20978340d3d0ad",
     "scripts/eval/project_harness_rule_impact_prospective.py": "ce160017a91696e56ed46af663d546f63a9c93401919857bee8c5afffd594094",
     "scripts/eval/run_project_rule_evolution_mac_pilot.py": "d85cc8457d90e8b10989047bac3bcb83b3ed3219da2334cb2a04948703e6be07",
-    "scripts/eval/tinykg_lean_factorial.py": "d1bbcfea51fbbcfee2da1c8f22b81ec5402ae40ec7d1fb66d0deb47a30986979",
+    "scripts/eval/tinykg_lean_factorial.py": "a460b167a1f6dae85495a9b950d451d2f43c9b8a05d0b0fe65910da82cded26d",
+    "scripts/eval/tinykg_lean_factorial_block.py": "aa665516f59694aa436bcbe2683524d4fc9c6bfa34c30f7586d1f7f063255344",
+    "scripts/eval/tinykg_lean_factorial_executor.py": "a37659cafb82c730ede13cda6cffcf34cc47073816315cba636df717be01776d",
     "scripts/project_harness_eval_driver.zig": "067fc4277aef64433ddb3dc69225f66627fdf7cb20a892cd5a143e202d133f63"
   },
   "known_gaps": [
-    "the factorial admission/report boundary exists, but its unified production executor must be wired before any paid s3 row",
     "the factorial report remains calibration-only until the preregistered paired randomization interval is implemented",
     "procedural transfer needs more than the two-family smoke fixture before a comprehensive claim",
     "Lean generality needs correction families beyond existing-file source-CAS before a cross-rule claim"

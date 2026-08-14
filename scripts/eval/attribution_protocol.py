@@ -171,6 +171,14 @@ def _validate_stages(protocol: Mapping[str, Any], root: Path) -> None:
             if not runner.startswith("external:"):
                 if not (root / runner).is_file():
                     _fail(stage_id, f"runner is unavailable: {runner}")
+        if stage_id == "s3_factorial_interaction":
+            if stage.get("runner") != "scripts/eval/tinykg_lean_factorial_block.py":
+                _fail(stage_id, "must use the unified native factorial executor")
+            analyzer = stage.get("analyzer")
+            if analyzer != "scripts/eval/tinykg_lean_factorial.py" or not (
+                root / str(analyzer)
+            ).is_file():
+                _fail(stage_id, "authenticated factorial analyzer is unavailable")
 
 
 def _validate_sources(protocol: Mapping[str, Any], root: Path) -> None:
@@ -280,8 +288,8 @@ def validate_protocol(protocol: Mapping[str, Any], root: Path) -> Mapping[str, A
         _fail("budget", "single-attempt durable-journal boundary drift")
 
     gaps = _sequence(protocol.get("known_gaps"), "known_gaps")
-    if not any("production executor" in str(gap) for gap in gaps):
-        _fail("known_gaps", "missing factorial production-executor gap must remain explicit")
+    if any("production executor" in str(gap) for gap in gaps):
+        _fail("known_gaps", "resolved factorial production-executor gap is stale")
     return protocol
 
 
