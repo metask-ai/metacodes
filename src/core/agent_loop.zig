@@ -891,6 +891,7 @@ pub fn run(
             var aborted_during_stream = false;
             var stream_error = false;
             var stream_context_window_exceeded = false;
+            var response_usage = @import("cache_break.zig").ResponseUsage{};
             while (true) {
                 const ev_opt = stream.next() catch |err| switch (err) {
                     error.Aborted => {
@@ -982,20 +983,27 @@ pub fn run(
                         backend.emitEvent(sess, .{ .usage = u });
                         // 成本次闸累计(本 run):按模型单价把本响应 usage 折算成本。
                         run_cost_usd += @import("../util/pricing.zig").computeCost(cost_rates, u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens);
-                        // usage 锚点:服务端实计 prompt tokens(in+cache_r+cache_w)。
-                        // auto-compact 估算以此为基准,只对之后新 append 的消息做本地估算
-                        // (估算器 vs 各家 tokenizer 偏差不再随会话放大;glm-5.2 262K 窗口
-                        // 下旧的纯字节估算超估 ~3.5x,在真实 ~65K 时就误触发 blocking 清空)。
-                        const anchor_tokens = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens;
-                        conversation.setUsageAnchor(@intCast(anchor_tokens));
-                        if (cache_detector.checkResponse(u.cache_read_input_tokens, u.cache_creation_input_tokens)) |reason| {
-                            log.warnId("cache", rid, "PROMPT CACHE BREAK: {s} [cache_read {d} creation {d}]", .{ reason, u.cache_read_input_tokens, u.cache_creation_input_tokens });
-                            // L4 诊断:cache 击穿。
-                            backend.emitEvent(sess, .{ .diag_cache_break = .{ .trace_id = trace_id, .depth = depth, .cache_read = u.cache_read_input_tokens, .cache_creation = u.cache_creation_input_tokens } });
-                        }
+                        response_usage.observe(u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens);
                         log.infoId("agent", rid, "usage in={d} out={d} cache_r={d} cache_w={d}", .{ u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens });
                     },
                     .done => {},
+                }
+            }
+
+            // message_start/message_delta usage 是同一个 provider response 的片段，而不是
+            // 两个请求。只在成功收完整条响应后更新 token anchor 和 cache detector；否则
+            // preliminary zero usage 会把每个 warm request 误报成 cache break，partial error
+            // 也会污染下一轮基线。
+            if (!aborted_during_stream and !stream_error and response_usage.has_metering) {
+                conversation.setUsageAnchor(@intCast(response_usage.promptTokens()));
+                if (cache_detector.checkResponse(response_usage.cache_read_tokens, response_usage.cache_write_tokens)) |reason| {
+                    log.warnId("cache", rid, "PROMPT CACHE BREAK: {s} [cache_read {d} creation {d}]", .{ reason, response_usage.cache_read_tokens, response_usage.cache_write_tokens });
+                    backend.emitEvent(sess, .{ .diag_cache_break = .{
+                        .trace_id = trace_id,
+                        .depth = depth,
+                        .cache_read = response_usage.cache_read_tokens,
+                        .cache_creation = response_usage.cache_write_tokens,
+                    } });
                 }
             }
             backend.emitEvent(sess, .{ .diag_model_request = .{

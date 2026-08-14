@@ -87,14 +87,13 @@ test "L2: KgRecall and KgContext schemas carry the staged semantic-neighborhood 
     }
     const description = query_description orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, description, "exact/high-precision query") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "ONE compact semantic variant") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "2-4 separate variants") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "at most four variant calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "at most four separate semantic probes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "one selected probe or a fixed 2-4 member batch") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "FIRST inspect automatic recall") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "MUST contain ONLY that exact term") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "mechanism/symptom/outcome/nearby implementation") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "broader or narrower concept") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "Do not combine all variants into one keyword bag") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "never combine probes into one keyword bag") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "Extra keywords are safe") == null);
 
     var type_description: ?[]const u8 = null;

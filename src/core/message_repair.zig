@@ -39,10 +39,11 @@ pub fn isValidJson(data: []const u8) bool {
 
 /// 尽力把 raw 修成合法 JSON。返回 owned(调用方 free);已合法则 dupe 原样返回。修不好兜底 `"{}"`。
 /// 修复顺序(每步后重试解析,命中即返回):① 空/None/null → `{}` ② 剥 markdown 代码围栏
-/// ③ **抽取首个完整 JSON value**(同时吃掉前置**和尾部**噪声——弱模型高频:`{...} 我的理由是…`)
-/// ④ 删 trailing comma ⑤ 补缺失闭合括号 ⑥ 补括号后再删 trailing comma(治 `{"a":1,`)⑦ 兜底 `{}`。
+/// ③ 删除一个错位的闭括号（仅当删除后整个 object 立即合法）
+/// ④ **抽取首个完整 JSON value**(同时吃掉前置**和尾部**噪声——弱模型高频:`{...} 我的理由是…`)
+/// ⑤ 删 trailing comma ⑥ 补缺失闭合括号 ⑦ 补括号后再删 trailing comma(治 `{"a":1,`)⑧ 兜底 `{}`。
 ///
-/// **明确不处理**(命中即落 ⑦ 兜底 `{}`,静默丢整个参数对象——弱模型这两类较少见,登记为已知缺口):
+/// **明确不处理**(命中即落 ⑧ 兜底 `{}`,静默丢整个参数对象——弱模型这两类较少见,登记为已知缺口):
 ///   - 单引号→双引号(风险高:字符串内合法单引号会被误伤);
 ///   - Python 值字面量 `{"x": True/False/None}`(值位置,非 key);
 ///   - 未闭合字符串 `{"a":"hel`(缺闭合引号,非缺括号)。
@@ -63,7 +64,14 @@ pub fn repairToolArgs(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     cur = std.mem.trim(u8, cur, " \t\r\n");
     if (isValidJson(cur)) return allocator.dupe(u8, cur);
 
-    // ③ 抽取首个**完整** JSON value(depth 归零处截断)。这同时吃掉前置噪声(从首个 {/[ 起)
+    // ③ 删除一个错位的闭括号。必须在抽取首个 value 之前做：无类型 depth 计数会
+    // 把错位的 `}` 当作合法闭合并过早截掉其后的完整字段。
+    if (try removeSingleMismatchedCloser(allocator, cur)) |repaired| {
+        defer allocator.free(repaired);
+        if (isValidJson(repaired)) return allocator.dupe(u8, repaired);
+    }
+
+    // ④ 抽取首个**完整** JSON value(depth 归零处截断)。这同时吃掉前置噪声(从首个 {/[ 起)
     //   和**尾部噪声**(完整 value 之后的 prose)。前缀合法+尾部废话是弱模型最高频畸形。
     if (extractFirstJsonValue(cur)) |v| {
         if (isValidJson(v)) return allocator.dupe(u8, v);
@@ -74,24 +82,66 @@ pub fn repairToolArgs(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     cur = std.mem.trim(u8, cur, " \t\r\n");
     if (isValidJson(cur)) return allocator.dupe(u8, cur);
 
-    // ④ 删 trailing comma(`,` 后仅空白再跟 `}`/`]`)。
+    // ⑤ 删 trailing comma(`,` 后仅空白再跟 `}`/`]`)。
     const no_trailing = try removeTrailingCommas(allocator, cur);
     defer allocator.free(no_trailing);
     if (isValidJson(no_trailing)) return allocator.dupe(u8, no_trailing);
 
-    // ⑤ 补缺失闭合括号(按 stack 逆序补 `}`/`]`;跳过字符串内)。
+    // ⑥ 补缺失闭合括号(按 stack 逆序补 `}`/`]`;跳过字符串内)。
     const balanced = try balanceBrackets(allocator, no_trailing);
     defer allocator.free(balanced);
     if (isValidJson(balanced)) return allocator.dupe(u8, balanced);
 
-    // ⑥ 补括号可能在 trailing comma 后追加了 `}`(如 `{"a":1,` → `{"a":1,}`)→ 再删一次 trailing comma。
+    // ⑦ 补括号可能在 trailing comma 后追加了 `}`(如 `{"a":1,` → `{"a":1,}`)→ 再删一次 trailing comma。
     const balanced_notrail = try removeTrailingCommas(allocator, balanced);
     defer allocator.free(balanced_notrail);
     if (isValidJson(balanced_notrail)) return allocator.dupe(u8, balanced_notrail);
 
-    // ⑦ 兜底:保证请求不崩(工具执行时缺参会再报错给模型,总比整轮 400 好)。
+    // ⑧ 兜底:保证请求不崩(工具执行时缺参会再报错给模型,总比整轮 400 好)。
     log.warn("repair", "tool args 无法 salvage,兜底 {{}}(原文 {d} 字节)", .{raw.len});
     return allocator.dupe(u8, "{}");
+}
+
+/// 删除字符串外恰好一个与 delimiter stack 顶不匹配的闭括号。返回 null 表示没有
+/// 错位闭括号或存在多个错位点；caller 只会在结果整体通过 JSON parser 时采用它。
+fn removeSingleMismatchedCloser(allocator: std.mem.Allocator, s: []const u8) !?[]u8 {
+    var expected = std.ArrayList(u8).empty;
+    defer expected.deinit(allocator);
+
+    var mismatch_index: ?usize = null;
+    var in_str = false;
+    var escaped = false;
+    for (s, 0..) |c, i| {
+        if (in_str) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_str = false;
+            }
+            continue;
+        }
+        switch (c) {
+            '"' => in_str = true,
+            '{' => try expected.append(allocator, '}'),
+            '[' => try expected.append(allocator, ']'),
+            '}', ']' => {
+                if (expected.items.len > 0 and expected.items[expected.items.len - 1] == c) {
+                    _ = expected.pop();
+                } else {
+                    if (mismatch_index != null) return null;
+                    mismatch_index = i;
+                }
+            },
+            else => {},
+        }
+    }
+    const remove_at = mismatch_index orelse return null;
+    const out = try allocator.alloc(u8, s.len - 1);
+    @memcpy(out[0..remove_at], s[0..remove_at]);
+    @memcpy(out[remove_at..], s[remove_at + 1 ..]);
+    return out;
 }
 
 /// 抽取字符串里第一个**完整**的 JSON value(object 或 array)——从首个 `{`/`[` 到其配平的
@@ -459,6 +509,30 @@ test "repairToolArgs: 尾部逗号 + 截断(补括号后再删逗号)" {
     try testing.expect(isValidJson(r));
     try testing.expect(std.mem.indexOf(u8, r, "1") != null); // 值没丢
     try testing.expect(std.mem.indexOf(u8, r, ",}") == null);
+}
+
+test "repairToolArgs: GLM nested array boundary extra closer preserves complete tool input" {
+    const raw =
+        "{\"lexical_plan\":{\"intent\":\"fact_lookup\",\"schema_version\":\"lexical-query-plan-v2\"," ++
+        "\"stage\":\"semantic_expansion\",\"variant_index\":0,\"variants\":[" ++
+        "{\"kind\":\"synonym\",\"text\":\"commencement\"}," ++
+        "{\"kind\":\"synonym\",\"text\":\"graduation ceremony\"}," ++
+        "{\"kind\":\"synonym\",\"text\":\"convocation\"}," ++
+        "{\"kind\":\"synonym\",\"text\":\"degree ceremony\"}}]}," ++
+        "\"query\":\"commencement\"}";
+    const repaired = try repairToolArgs(testing.allocator, raw);
+    defer testing.allocator.free(repaired);
+    try testing.expect(isValidJson(repaired));
+    try testing.expectEqualStrings(
+        "{\"lexical_plan\":{\"intent\":\"fact_lookup\",\"schema_version\":\"lexical-query-plan-v2\"," ++
+            "\"stage\":\"semantic_expansion\",\"variant_index\":0,\"variants\":[" ++
+            "{\"kind\":\"synonym\",\"text\":\"commencement\"}," ++
+            "{\"kind\":\"synonym\",\"text\":\"graduation ceremony\"}," ++
+            "{\"kind\":\"synonym\",\"text\":\"convocation\"}," ++
+            "{\"kind\":\"synonym\",\"text\":\"degree ceremony\"}]}," ++
+            "\"query\":\"commencement\"}",
+        repaired,
+    );
 }
 
 test "repairToolArgs: 前置+尾部双噪声(抽取中段完整 value)" {

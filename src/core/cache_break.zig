@@ -11,6 +11,39 @@ const std = @import("std");
 /// cache_read 跌幅超过此(且占上次 >5%)才判击穿,避免噪声。对齐 cc MIN_CACHE_MISS_TOKENS。
 const MIN_DROP_TOKENS: u64 = 2000;
 
+/// Anthropic-compatible streams may report usage twice: a preliminary
+/// message_start fragment and a final message_delta fragment. Providers vary
+/// between split fields and a complete final snapshot, so the request-level
+/// view takes the maximum observed value for each monotonically reported
+/// counter. Cache diagnostics and the conversation token anchor must consume
+/// this view exactly once per successful request, never each SSE fragment.
+pub const ResponseUsage = struct {
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    cache_read_tokens: u64 = 0,
+    cache_write_tokens: u64 = 0,
+    has_metering: bool = false,
+
+    pub fn observe(
+        self: *ResponseUsage,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+    ) void {
+        self.input_tokens = @max(self.input_tokens, input_tokens);
+        self.output_tokens = @max(self.output_tokens, output_tokens);
+        self.cache_read_tokens = @max(self.cache_read_tokens, cache_read_tokens);
+        self.cache_write_tokens = @max(self.cache_write_tokens, cache_write_tokens);
+        self.has_metering = self.has_metering or input_tokens != 0 or output_tokens != 0 or
+            cache_read_tokens != 0 or cache_write_tokens != 0;
+    }
+
+    pub fn promptTokens(self: ResponseUsage) u64 {
+        return self.input_tokens +| self.cache_read_tokens +| self.cache_write_tokens;
+    }
+};
+
 pub const CacheBreakDetector = struct {
     prev_cache_read: ?u64 = null,
     prev_system_hash: u64 = 0,

@@ -148,6 +148,16 @@ const FINAL_ANTHROPIC_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+// Exact malformed shape observed from a paid GLM-5.2 KgRecall: all fields are
+// present, but one extra `}` appears before the variants array closes.
+const GLM_BAD_NESTED_ARGS_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m3\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c3\",\"name\":\"echo_tool\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"lexical_plan\\\":{\\\"intent\\\":\\\"fact_lookup\\\",\\\"schema_version\\\":\\\"lexical-query-plan-v2\\\",\\\"stage\\\":\\\"semantic_expansion\\\",\\\"variant_index\\\":0,\\\"variants\\\":[{\\\"kind\\\":\\\"synonym\\\",\\\"text\\\":\\\"commencement\\\"},{\\\"kind\\\":\\\"synonym\\\",\\\"text\\\":\\\"convocation\\\"}}]},\\\"query\\\":\\\"commencement\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"input_tokens\":100,\"output_tokens\":10}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
 test "P0.6 e2e: 畸形 JSON 参数(trailing comma)经修复,工具收到合法参数" {
     const a = std.testing.allocator;
     var srv = try harness.MockServer.startCassette(&[_][]const u8{ BAD_ARGS_ANTHROPIC_SSE, FINAL_ANTHROPIC_SSE }, 0);
@@ -195,6 +205,52 @@ test "P0.6 e2e: 畸形 JSON 参数(trailing comma)经修复,工具收到合法�
         else => {},
     };
     try std.testing.expect(checked);
+}
+
+test "P0.6 e2e: GLM extra nested closer preserves complete tool input" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ GLM_BAD_NESTED_ARGS_SSE, FINAL_ANTHROPIC_SSE }, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "glm-5.2", url);
+    defer client.deinit();
+    var dyn = cc.tools_dynamic.DynRegistry.init(a);
+    defer dyn.deinit();
+    try dyn.register("echo_tool", "Echo", &.{}, echoExec, null, false);
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "echo lexical plan");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    const tool_defs = try cc.tools.toToolDefinitionsFull(a, &dyn, null);
+    defer a.free(tool_defs);
+    var render = writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    const result = try agent_loop.run(&conv, client.provider(), tool_defs, &perm, .{ .max_turns = 4, .dyn_registry = &dyn }, &be, a);
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+
+    var saw_use = false;
+    var saw_result = false;
+    for (conv.messages.items) |m| for (m.blocks) |b| switch (b) {
+        .tool_use => |tu| if (std.mem.eql(u8, tu.id, "c3")) {
+            saw_use = true;
+            try std.testing.expect(cc.message_repair.isValidJson(tu.input));
+            try std.testing.expect(std.mem.indexOf(u8, tu.input, "commencement") != null);
+            try std.testing.expect(std.mem.indexOf(u8, tu.input, "convocation") != null);
+            try std.testing.expect(!std.mem.eql(u8, tu.input, "{}"));
+        },
+        .tool_result => |tr| if (std.mem.eql(u8, tr.tool_use_id, "c3")) {
+            saw_result = true;
+            try std.testing.expect(!tr.is_error);
+            try std.testing.expect(cc.message_repair.isValidJson(tr.content));
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_use and saw_result);
 }
 
 // ── 3. 消息序列规范化在**真请求体**里生效(证明 normalizeApiMessages 跑在生产路径) ──────
