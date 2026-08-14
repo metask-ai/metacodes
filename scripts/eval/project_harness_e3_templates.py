@@ -85,6 +85,7 @@ KERNEL_PROVENANCE_FIELDS = frozenset(
         "linker",
         "lean_version",
         "native_smoke",
+        "native_rule_author_promotion_smoke",
         "native_batch_smoke",
         "native_recovery_smoke",
         "native_impact_smoke",
@@ -167,6 +168,7 @@ def _verified_kernel_artifact(repo: Path, kernel: Path) -> Dict[str, Any]:
         or provenance.get("axiom_policy") != "propext"
         or provenance.get("axiom_audit") != "passed"
         or provenance.get("native_smoke") != "passed"
+        or provenance.get("native_rule_author_promotion_smoke") != "passed"
         or provenance.get("native_batch_smoke") != "passed"
         or provenance.get("native_recovery_smoke") != "passed"
         or provenance.get("native_impact_smoke") != "passed"

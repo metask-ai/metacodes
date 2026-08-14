@@ -529,6 +529,154 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
         self.assertTrue(result["task_success"])
         self.assertFalse(result["trustworthy_task_success"])
 
+    def test_current_rule_filters_authorize_pruned_reads_and_bind_recovery(self) -> None:
+        project = "1" * 64
+        kernel = "2" * 64
+        candidate = "3" * 64
+        bundle = "4" * 64
+
+        def rule_filter(
+            dispatch_id: str,
+            phase: str,
+            operation: str,
+            checker_count: int,
+        ) -> dict:
+            return {"tool_observation": {"rule_filter": {
+                "schema_version": "metacodes-project-rule-filter-v1",
+                "dispatch_id": dispatch_id,
+                "phase": phase,
+                "operation": operation,
+                "project_sha256": project,
+                "bundle_sha256": bundle,
+                "bundle_revision": 1,
+                "kernel_sha256": kernel,
+                "active_rule_count": 1,
+                "checker_rule_count": checker_count,
+                "statically_pruned_rule_count": 1 - checker_count,
+                "proof": "MetaCodesControl.ProjectRule.target_tool_mismatch_admits_both",
+            }}}
+
+        def decision_batch(
+            phase: str,
+            operation: str,
+            result: str,
+            recovery_action: str,
+            token: str,
+        ) -> dict:
+            return {"tool_observation": {"formal_decision_batch": {
+                "schema_version": "metacodes-project-formal-decision-batch-v5",
+                "dispatch_id": "write-1",
+                "phase": phase,
+                "actuation": "enforced",
+                "file_target_state": "regular_existing",
+                "project_sha256": project,
+                "bundle_sha256": bundle,
+                "bundle_revision": 1,
+                "kernel_sha256": kernel,
+                "checker_call_sha256": token * 64,
+                "checker_verdict_sha256": token * 64,
+                "checker_batch_size": 1,
+                "checker_elapsed_ns": 1,
+                "checker_bytes": 1,
+                "decisions": [{
+                    "operation": operation,
+                    "candidate_id": candidate,
+                    "result": result,
+                    "recovery_action": recovery_action,
+                    "request_sha256": token * 64,
+                    "verdict_sha256": token * 64,
+                    "checker_failure": None,
+                }],
+            }}}
+
+        events = [
+            {"run_started": {}},
+            rule_filter("read-1", "pre", "ordinary", 0),
+            {"tool_observation": {"dispatch_started": {
+                "id": "read-1", "requested_name": "Read", "dispatched_name": "Read",
+                "origin": "speculative_prefetch",
+            }}},
+            rule_filter("read-1", "post", "ordinary", 0),
+            {"tool_observation": {"dispatch_finished": {
+                "id": "read-1", "requested_name": "Read", "dispatched_name": "Read",
+                "origin": "speculative_prefetch", "outcome": "succeeded",
+            }}},
+            rule_filter("write-1", "pre", "ordinary", 1),
+            decision_batch("pre", "pre_decision", "block", "edit_existing_file_exact", "5"),
+            rule_filter("write-1", "pre", "exact_edit_recovery", 1),
+            decision_batch("pre", "recovery_pre_decision", "admit", "none", "6"),
+            {"tool_observation": {"dispatch_started": {
+                "id": "write-1", "requested_name": "Write", "dispatched_name": "Edit",
+                "origin": "authoritative", "file_target_state": "regular_existing",
+            }}},
+            rule_filter("write-1", "post", "exact_edit_recovery", 1),
+            decision_batch("post", "recovery_post_decision", "admit", "none", "7"),
+            {"tool_observation": {"dispatch_finished": {
+                "id": "write-1", "requested_name": "Write", "dispatched_name": "Edit",
+                "origin": "authoritative", "outcome": "succeeded", "effect_valid": True,
+                "effect": None,
+            }}},
+            {"run_finished": {"stop_reason": "end_turn"}},
+        ]
+
+        def journal_bytes(items: list[dict]) -> bytes:
+            return b"".join(_record(index, event) for index, event in enumerate(items))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            journal = Path(temporary) / "tool-observations.jsonl"
+            journal.write_bytes(journal_bytes(events))
+            result = analyze_journal(
+                path=journal,
+                arm="evolved_enforced",
+                oracle_class="hazard_recurrence",
+                project_sha256=project,
+                kernel_sha256=kernel,
+                candidate_id=candidate,
+                task_success=True,
+            )
+            self.assertEqual(3, result["physical_checker_calls"])
+            self.assertTrue(result["trustworthy_task_success"])
+
+            missing_pruned_post = [
+                event
+                for event in events
+                if event != rule_filter("read-1", "post", "ordinary", 0)
+            ]
+            journal.write_bytes(journal_bytes(missing_pruned_post))
+            with self.assertRaisesRegex(E3Error, "phase has no rule filter"):
+                analyze_journal(
+                    path=journal,
+                    arm="evolved_enforced",
+                    oracle_class="hazard_recurrence",
+                    project_sha256=project,
+                    kernel_sha256=kernel,
+                    candidate_id=candidate,
+                    task_success=True,
+                )
+
+            forged_checker = list(events)
+            forged_checker.insert(
+                2,
+                {"tool_observation": {"formal_decision_batch": {
+                    **decision_batch(
+                        "pre", "pre_decision", "admit", "none", "8"
+                    )["tool_observation"]["formal_decision_batch"],
+                    "dispatch_id": "read-1",
+                    "file_target_state": "unobserved",
+                }}},
+            )
+            journal.write_bytes(journal_bytes(forged_checker))
+            with self.assertRaisesRegex(E3Error, "rule-filter/formal batch binding"):
+                analyze_journal(
+                    path=journal,
+                    arm="evolved_enforced",
+                    oracle_class="hazard_recurrence",
+                    project_sha256=project,
+                    kernel_sha256=kernel,
+                    candidate_id=candidate,
+                    task_success=True,
+                )
+
     def test_enforced_block_and_edit_recovery_are_distinct_events(self) -> None:
         project = "1" * 64
         kernel = "2" * 64

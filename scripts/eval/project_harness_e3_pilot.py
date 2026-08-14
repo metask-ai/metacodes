@@ -13,6 +13,7 @@ import stat
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Sequence
 
 if __package__ in {None, ""}:
@@ -29,6 +30,9 @@ if __package__ in {None, ""}:
         _assert_production_secret_absent,
         _artifact_tree_digest,
         _cassette_context_cache,
+        _verify_scoped_recall_activation,
+        _assert_tinykg_read_transients_clean,
+        _prepare_tinykg_read_transients,
         _copy_memory_tree,
         _estimated_costs_match,
         _materialize_pinned_ripgrep,
@@ -42,6 +46,11 @@ if __package__ in {None, ""}:
     )
     from scripts.eval.memory_agent_runtime_pilot import _load_api_key  # type: ignore
     from scripts.eval.memory_benchmark import file_sha256  # type: ignore
+    from scripts.eval.memory_tinykg_local import (  # type: ignore
+        LocalTinyKg,
+        _store_info,
+        _tree_digest,
+    )
     from scripts.eval.memory_budget_journal import (  # type: ignore
         BudgetAuthority,
         BudgetJournal,
@@ -56,6 +65,9 @@ if __package__ in {None, ""}:
         PRODUCTION_PROVIDER_ID,
         PRODUCTION_SANDBOX_BACKEND,
         _validate_production_provider_tool_schema,
+        _cassette_memory_activity,
+        _cassette_memory_exposure,
+        _cassette_scoped_recall_injections,
     )
     from scripts.eval.model import stable_json  # type: ignore
     from scripts.eval.project_harness_e3_experiment import (  # type: ignore
@@ -90,6 +102,9 @@ else:
         _assert_production_secret_absent,
         _artifact_tree_digest,
         _cassette_context_cache,
+        _verify_scoped_recall_activation,
+        _assert_tinykg_read_transients_clean,
+        _prepare_tinykg_read_transients,
         _copy_memory_tree,
         _estimated_costs_match,
         _materialize_pinned_ripgrep,
@@ -103,6 +118,7 @@ else:
     )
     from .memory_agent_runtime_pilot import _load_api_key
     from .memory_benchmark import file_sha256
+    from .memory_tinykg_local import LocalTinyKg, _store_info, _tree_digest
     from .memory_budget_journal import (
         BudgetAuthority,
         BudgetJournal,
@@ -117,6 +133,9 @@ else:
         PRODUCTION_PROVIDER_ID,
         PRODUCTION_SANDBOX_BACKEND,
         _validate_production_provider_tool_schema,
+        _cassette_memory_activity,
+        _cassette_memory_exposure,
+        _cassette_scoped_recall_injections,
     )
     from .model import stable_json
     from .project_harness_e3_experiment import (
@@ -147,6 +166,57 @@ CHECKPOINT_NAME = "checkpoint.json"
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 MAX_TIMEOUT_STREAM_BYTES = 1024 * 1024
 TIMEOUT_TRUNCATION_MARKER = b"\n[metacodes timeout diagnostic truncated]\n"
+
+FACTORIAL_ALLOWED_TOOLS = (*E3_ALLOWED_TOOLS, "KgRecall", "KgContext")
+FACTORIAL_DISALLOWED_TOOLS = tuple(
+    tool for tool in E3_DISALLOWED_TOOLS if tool not in {"KgRecall", "KgContext"}
+) + ("FormalAuditTask", "ToolSearch")
+FACTORIAL_LONG_HORIZON_ARM = "tinykg"
+FACTORIAL_AUTO_MEMORY_POLICY = "markdown-disabled-local-tinykg-read-only-v1"
+
+
+@dataclass(frozen=True)
+class FactorialRuntimeTreatment:
+    """Narrow treatment seam for a real TinyKG x Lean rollout.
+
+    Both factor levels still execute through ``_run_one``.  TinyKG-off keeps
+    the same provider-visible read-only graph schemas but receives an explicit
+    unusable local CLI path, preventing vendored, daemon, or remote fallback.
+    Lean is controlled only by the already verified E3 active-bundle arm.
+    """
+
+    cell: str
+    tinykg_enabled: bool
+    lean_enabled: bool
+    tinykg_binary: Path
+    tinykg_binary_sha256: str
+    seed_batch: bytes = b""
+    recall_query: str = ""
+
+    def validate(self, arm_config: Mapping[str, Any]) -> None:
+        expected = {
+            "control": (False, False),
+            "memory_only": (True, False),
+            "lean_only": (False, True),
+            "combined": (True, True),
+        }.get(self.cell)
+        if expected != (self.tinykg_enabled, self.lean_enabled):
+            raise E3Error("factorial cell/factor declaration drift")
+        if (arm_config.get("rule_flavor") is not None) != self.lean_enabled:
+            raise E3Error("factorial Lean factor disagrees with the E3 arm")
+        if self.lean_enabled and arm_config.get("actuation") != "enforced":
+            raise E3Error("factorial Lean treatment must use enforced actuation")
+        binary = self.tinykg_binary.expanduser().resolve(strict=True)
+        _assert_executable_identity(
+            binary,
+            self.tinykg_binary_sha256,
+            "factorial TinyKG binary",
+        )
+        if self.tinykg_enabled:
+            if not self.seed_batch or not self.recall_query.strip():
+                raise E3Error("factorial TinyKG-on requires a seed batch and recall query")
+        elif self.seed_batch or self.recall_query:
+            raise E3Error("factorial TinyKG-off must not receive seed or recall data")
 
 
 def _safe_component(value: str) -> str:
@@ -252,6 +322,9 @@ def _environment_fingerprint(
     sandbox_sha256: str,
     ripgrep_sha256: str,
     kernel_sha256: str,
+    long_horizon_arm: str = E3_LONG_HORIZON_ARM,
+    auto_memory_policy: str = E3_AUTO_MEMORY_POLICY,
+    tinykg_binary_sha256: str | None = None,
 ) -> str:
     return _canonical_sha256(
         {
@@ -264,8 +337,9 @@ def _environment_fingerprint(
             "kernel_sha256": kernel_sha256,
             "child_path": PRODUCTION_CHILD_PATH,
             "auto_compact_policy": PRODUCTION_AUTO_COMPACT_POLICY,
-            "auto_memory_policy": E3_AUTO_MEMORY_POLICY,
-            "long_horizon_arm": E3_LONG_HORIZON_ARM,
+            "auto_memory_policy": auto_memory_policy,
+            "long_horizon_arm": long_horizon_arm,
+            "tinykg_binary_sha256": tinykg_binary_sha256,
         }
     )
 
@@ -279,6 +353,7 @@ def _runtime_metadata(
     run_id: str,
     harness_fingerprint: str,
     environment_fingerprint: str,
+    allowed_tools: Sequence[str] = E3_ALLOWED_TOOLS,
 ) -> Mapping[str, Any]:
     execution = manifest["execution"]
     return {
@@ -300,7 +375,7 @@ def _runtime_metadata(
         "grader_fingerprint": case["grader"]["fingerprint"],
         "max_metered_tokens": execution["max_rollout_metered_tokens"],
         "max_cost_usd": execution["max_rollout_cost_usd"],
-        "allowed_tools": list(E3_ALLOWED_TOOLS),
+        "allowed_tools": list(allowed_tools),
     }
 
 
@@ -401,6 +476,7 @@ def _run_one(
     test_base_url: str | None = None,
     receipt_schema: str | None = None,
     run_authorization: Mapping[str, Any] | None = None,
+    factorial_treatment: FactorialRuntimeTreatment | None = None,
 ) -> Mapping[str, Any]:
     sequence = int(schedule["sequence"])
     arm = str(schedule["arm"])
@@ -421,7 +497,13 @@ def _run_one(
     root = Path(str(manifest["root"]))
     workspace = Path(str(manifest["project_root"]))
     _reset_workspace(workspace, case, root)
-    component = _safe_component(f"{sequence:05d}-{case['id']}-{arm}")
+    arm_config = manifest["arms"][arm]
+    if factorial_treatment is not None:
+        factorial_treatment.validate(arm_config)
+    cell_suffix = (
+        f"-{factorial_treatment.cell}" if factorial_treatment is not None else ""
+    )
+    component = _safe_component(f"{sequence:05d}-{case['id']}-{arm}{cell_suffix}")
     artifact_dir = run_dir / "rollouts" / component
     artifact_dir.mkdir(mode=0o700, parents=True)
     sealed_home = artifact_dir / "sealed-home"
@@ -431,7 +513,6 @@ def _run_one(
         directory.mkdir(mode=0o700)
     pinned_ripgrep = _materialize_pinned_ripgrep(ripgrep, ripgrep_sha256, sealed_home)
 
-    arm_config = manifest["arms"][arm]
     binary_item = manifest["artifacts"][arm_config["binary"]]
     binary = Path(str(binary_item["path"]))
     binary_sha256 = str(binary_item["sha256"])
@@ -454,8 +535,46 @@ def _run_one(
         rules_target = _rule_target(sealed_home, template)
         candidate_id = str(template["candidate_id"])
 
+    factorial_local: LocalTinyKg | None = None
+    factorial_store: Path | None = None
+    factorial_store_revision: str | None = None
+    factorial_store_raw_before: str | None = None
+    factorial_store_info: Mapping[str, str] | None = None
+    if factorial_treatment is not None and factorial_treatment.tinykg_enabled:
+        factorial_root = artifact_dir / "tinykg-local"
+        factorial_local = LocalTinyKg(
+            factorial_treatment.tinykg_binary,
+            expected_sha256=factorial_treatment.tinykg_binary_sha256,
+            run_dir=factorial_root,
+        )
+        factorial_store = factorial_local.store_root / "factorial.kg"
+        batch = factorial_local.batch_root / "factorial.jsonl"
+        _write_new(batch, factorial_treatment.seed_batch)
+        factorial_local.command("init", factorial_store, ())
+        factorial_local.command("apply", factorial_store, (str(batch),))
+        factorial_local.command("rebuild-text", factorial_store, ())
+        _prepare_tinykg_read_transients(factorial_store)
+        factorial_store_info = _store_info(
+            factorial_local.command("store-info", factorial_store, ())
+        )
+        if (
+            factorial_store_info.get("storage_format_version") != "2"
+            or factorial_store_info.get("schema_version") != "3"
+            or factorial_store_info.get("text_current") != "1"
+            or factorial_store_info.get("text_stale") != "0"
+        ):
+            raise E3Error("factorial TinyKG store is not current and recall-ready")
+        factorial_store_revision = _tree_digest(
+            factorial_store,
+            normalize_store_manifest=True,
+        )
+        factorial_store_raw_before = _tree_digest(factorial_store)
+
     profile_path = artifact_dir / "production-seatbelt.sb"
     evidence_path = artifact_dir / "production-seatbelt-probe.json"
+    read_only_roots = tuple(
+        root for root in (rules_target, factorial_store) if root is not None
+    )
     sandbox = _materialize_production_sandbox(
         profile_path=profile_path,
         evidence_path=evidence_path,
@@ -463,19 +582,32 @@ def _run_one(
         workspace=workspace,
         store=None,
         metacodes=binary,
-        tinykg=None,
+        tinykg=(
+            factorial_treatment.tinykg_binary
+            if factorial_treatment is not None
+            and factorial_treatment.tinykg_enabled
+            else None
+        ),
         ripgrep=pinned_ripgrep,
         additional_read_only_files=(kernel, *kernel_dependency_paths),
-        read_only_roots=((rules_target,) if rules_target is not None else ()),
+        read_only_roots=read_only_roots,
+        tinykg_read_only_store=factorial_store,
     )
     sentinels = run_dir / "isolation-sentinels"
     sentinels.mkdir(exist_ok=True)
     sibling = sentinels / f"{component}.sentinel"
     _write_new(sibling, f"forbidden:{component}\n".encode("utf-8"))
-    read_only_probes = (
-        ((rules_target, rules_target / "active.json"),)
-        if rules_target is not None
-        else ()
+    read_only_probes = tuple(
+        probe
+        for probe in (
+            (rules_target, rules_target / "active.json")
+            if rules_target is not None
+            else None,
+            (factorial_store, factorial_store / ".tinykg/store-manifest.json")
+            if factorial_store is not None
+            else None,
+        )
+        if probe is not None
     )
     _run_production_sandbox_probe(
         sandbox,
@@ -484,6 +616,17 @@ def _run_one(
         writable_root=child_tmp,
         evidence_path=evidence_path,
         read_only_probes=read_only_probes,
+        tinykg_read_probe=(
+            (
+                factorial_treatment.tinykg_binary,
+                factorial_store,
+                factorial_treatment.recall_query,
+            )
+            if factorial_treatment is not None
+            and factorial_treatment.tinykg_enabled
+            and factorial_store is not None
+            else None
+        ),
     )
     _assert_production_sandbox_identity(sandbox, evidence_path)
 
@@ -494,7 +637,23 @@ def _run_one(
         ripgrep_sha256,
         run_authorization,
     )
-    run_id = f"{manifest['manifest_id']}:{sequence}:{case['id']}:{arm}"
+    if factorial_treatment is not None:
+        harness_fingerprint = _canonical_sha256(
+            {
+                "base_harness_fingerprint": harness_fingerprint,
+                "factorial_cell": factorial_treatment.cell,
+                "tinykg_enabled": factorial_treatment.tinykg_enabled,
+                "lean_enabled": factorial_treatment.lean_enabled,
+                "tinykg_binary_sha256": factorial_treatment.tinykg_binary_sha256,
+                "seed_batch_sha256": (
+                    hashlib.sha256(factorial_treatment.seed_batch).hexdigest()
+                    if factorial_treatment.tinykg_enabled
+                    else None
+                ),
+                "allowed_tools": list(FACTORIAL_ALLOWED_TOOLS),
+            }
+        )
+    run_id = f"{manifest['manifest_id']}:{sequence}:{case['id']}:{arm}{cell_suffix}"
     events = artifact_dir / "native-events.jsonl"
     metadata_path = artifact_dir / "runtime-metadata.json"
     metadata = _runtime_metadata(
@@ -509,6 +668,26 @@ def _run_one(
             sandbox_sha256=sandbox.profile_sha256,
             ripgrep_sha256=ripgrep_sha256,
             kernel_sha256=kernel_sha256,
+            long_horizon_arm=(
+                FACTORIAL_LONG_HORIZON_ARM
+                if factorial_treatment is not None
+                else E3_LONG_HORIZON_ARM
+            ),
+            auto_memory_policy=(
+                FACTORIAL_AUTO_MEMORY_POLICY
+                if factorial_treatment is not None
+                else E3_AUTO_MEMORY_POLICY
+            ),
+            tinykg_binary_sha256=(
+                factorial_treatment.tinykg_binary_sha256
+                if factorial_treatment is not None
+                else None
+            ),
+        ),
+        allowed_tools=(
+            FACTORIAL_ALLOWED_TOOLS
+            if factorial_treatment is not None
+            else E3_ALLOWED_TOOLS
         ),
     )
     _write_new(metadata_path, (stable_json(metadata) + "\n").encode("utf-8"))
@@ -532,18 +711,43 @@ def _run_one(
             "METACODES_FORCE_COMPACT_AT": PRODUCTION_FORCE_COMPACT_AT,
             "METACODES_NO_AUTO_RECALL": "1",
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
-            "METACODES_LONG_HORIZON_ARM": E3_LONG_HORIZON_ARM,
+            "METACODES_LONG_HORIZON_ARM": (
+                FACTORIAL_LONG_HORIZON_ARM
+                if factorial_treatment is not None
+                else E3_LONG_HORIZON_ARM
+            ),
             "METACODES_PROJECT_KERNEL_PATH": str(kernel),
             "METACODES_PROJECT_KERNEL_SHA256": kernel_sha256,
             "RG_BIN": str(pinned_ripgrep),
         }
     )
+    if factorial_treatment is not None:
+        env.pop("METACODES_NO_AUTO_RECALL", None)
+        env["METACODES_KG_TRANSPORT"] = "cli-exclusive"
+        if factorial_treatment.tinykg_enabled:
+            assert factorial_store is not None
+            env["METACODES_KG_BIN"] = str(
+                factorial_treatment.tinykg_binary.resolve(strict=True)
+            )
+            env["METACODES_KG_STORE"] = str(factorial_store)
+        else:
+            disabled_binary = artifact_dir / "tinykg-disabled"
+            disabled_store = artifact_dir / "tinykg-disabled-store"
+            if disabled_binary.exists() or disabled_store.exists():
+                raise E3Error("factorial TinyKG-off sentinel unexpectedly exists")
+            env["METACODES_KG_BIN"] = str(disabled_binary)
+            env["METACODES_KG_STORE"] = str(disabled_store)
     execution = manifest["execution"]
+    disallowed_tools = (
+        FACTORIAL_DISALLOWED_TOOLS
+        if factorial_treatment is not None
+        else E3_DISALLOWED_TOOLS
+    )
     child_args = [
             str(binary),
             "--model", str(execution["model_id"]),
             "--max-tokens", str(execution["max_output_tokens"]),
-            "--disallowedTools", ",".join(E3_DISALLOWED_TOOLS),
+            "--disallowedTools", ",".join(disallowed_tools),
             "--permission", "bypassPermissions",
             "--no-theme",
             "--record", str(cassette),
@@ -691,6 +895,12 @@ def _run_one(
         _assert_production_secret_absent(root, api_key)
     _assert_executable_identity(binary, binary_sha256, "E3 metacodes binary after rollout")
     _assert_executable_identity(kernel, kernel_sha256, "E3 project kernel after rollout")
+    if factorial_treatment is not None:
+        _assert_executable_identity(
+            factorial_treatment.tinykg_binary,
+            factorial_treatment.tinykg_binary_sha256,
+            "factorial TinyKG binary after rollout",
+        )
     if kernel_item.get("runtime_dependencies") != _kernel_runtime_dependencies(kernel):
         raise E3Error("E3 kernel runtime dependency drift after rollout")
     _assert_production_sandbox_identity(sandbox, evidence_path)
@@ -735,7 +945,16 @@ def _run_one(
     requests = sorted(cassette.glob("req-*.json"))
     if not requests:
         raise E3Error("E3 provider cassette is empty")
-    _validate_production_provider_tool_schema(cassette, f"E3 rollout {sequence}", E3_ALLOWED_TOOLS)
+    allowed_tools = (
+        FACTORIAL_ALLOWED_TOOLS
+        if factorial_treatment is not None
+        else E3_ALLOWED_TOOLS
+    )
+    _validate_production_provider_tool_schema(
+        cassette,
+        f"E3 rollout {sequence}",
+        allowed_tools,
+    )
     cache = _cassette_context_cache(cassette, str(execution["model_id"]), f"E3 rollout {sequence} cache")
     first_request = requests[0]
     journal = _find_project_journal(sealed_home)
@@ -749,6 +968,135 @@ def _run_one(
         candidate_id=candidate_id,
         task_success=bool(grader["passed"]),
     )
+    factorial_evidence: Mapping[str, Any] | None = None
+    if factorial_treatment is not None:
+        memory_activity = _cassette_memory_activity(
+            cassette,
+            f"factorial rollout {sequence} memory activity",
+        )
+        if factorial_treatment.tinykg_enabled:
+            scoped_recall = _verify_scoped_recall_activation(
+                native,
+                cassette,
+                str(case["prompt"]),
+                tinykg_enabled=True,
+                where=f"factorial rollout {sequence} scoped recall",
+            )
+        else:
+            raw_scoped = native.get("scoped_recalls")
+            injected = _cassette_scoped_recall_injections(
+                cassette,
+                f"factorial rollout {sequence} disabled recall",
+            )
+            if (
+                not isinstance(raw_scoped, list)
+                or len(raw_scoped) != 1
+                or not isinstance(raw_scoped[0], dict)
+                or raw_scoped[0].get("status") != "kg_not_ready"
+                or injected
+            ):
+                raise E3Error(
+                    "factorial TinyKG-off did not fail closed before graph retrieval"
+                )
+            scoped_recall = None
+        exposure = _cassette_memory_exposure(
+            cassette,
+            f"factorial rollout {sequence} memory exposure",
+            memory_root=None,
+            expected_memory_index=b"",
+            count_graph_context=factorial_treatment.tinykg_enabled,
+        )
+        if factorial_treatment.tinykg_enabled:
+            assert factorial_store is not None
+            assert factorial_store_revision is not None
+            assert factorial_store_raw_before is not None
+            assert factorial_store_info is not None
+            _assert_tinykg_read_transients_clean(
+                factorial_store,
+                f"factorial rollout {sequence} TinyKG post-state",
+            )
+            if (
+                scoped_recall is None
+                or scoped_recall.get("status") != "injected"
+                or int(exposure["total_bytes"]) <= 0
+                or _tree_digest(
+                    factorial_store,
+                    normalize_store_manifest=True,
+                )
+                != factorial_store_revision
+                or _tree_digest(factorial_store) != factorial_store_raw_before
+            ):
+                raise E3Error("factorial TinyKG treatment was not durably observed")
+            sandbox_evidence = _read_json(evidence_path)
+            if (
+                sandbox_evidence.get("tinykg_read_probe_performed") is not True
+                or sandbox_evidence.get("tinykg_store_unchanged") is not True
+            ):
+                raise E3Error("factorial TinyKG sandbox read probe is missing")
+        elif (
+            scoped_recall is not None
+            or int(memory_activity["tinykg_reads"]) != 0
+            or int(memory_activity["tinykg_writes"]) != 0
+            or int(exposure["total_bytes"]) != 0
+        ):
+            raise E3Error("factorial TinyKG-off cell exposed graph treatment")
+
+        checker_calls = int(governance["physical_checker_calls"])
+        formal_decisions = int(governance["formal_decisions"])
+        if not factorial_treatment.lean_enabled and (
+            checker_calls != 0 or formal_decisions != 0
+        ):
+            raise E3Error("factorial Lean-off cell exposed formal authority")
+        factorial_evidence = {
+            "cell": factorial_treatment.cell,
+            "tinykg": {
+                "enabled": factorial_treatment.tinykg_enabled,
+                "transport": (
+                    "cli-exclusive"
+                    if factorial_treatment.tinykg_enabled
+                    else "disabled"
+                ),
+                "store_scope": (
+                    "fresh-run-local"
+                    if factorial_treatment.tinykg_enabled
+                    else "none"
+                ),
+                "remote_writes": 0,
+                "recall_receipt_verified": (
+                    factorial_treatment.tinykg_enabled
+                ),
+                "read_count": (
+                    int(memory_activity["tinykg_reads"]) + 1
+                    if factorial_treatment.tinykg_enabled
+                    else 0
+                ),
+                "store_revision_sha256": factorial_store_revision,
+                "memory_exposed_bytes": int(exposure["total_bytes"]),
+                "store_info_sha256": (
+                    _canonical_sha256(dict(factorial_store_info))
+                    if factorial_store_info is not None
+                    else None
+                ),
+            },
+            "lean": {
+                "enabled": factorial_treatment.lean_enabled,
+                "bundle_loaded": factorial_treatment.lean_enabled,
+                "checker_sha256": (
+                    kernel_sha256 if factorial_treatment.lean_enabled else None
+                ),
+                "bundle_sha256": (
+                    templates["templates"][flavor]["bundle_sha256"]
+                    if factorial_treatment.lean_enabled and flavor is not None
+                    else None
+                ),
+                "checker_calls": checker_calls,
+                "formal_decisions": formal_decisions,
+                "unsafe_false_interventions": int(
+                    bool(governance.get("safe_action_false_intervention", False))
+                    or bool(governance.get("safe_case_intervention", False))
+                ),
+            },
+        }
     snapshot = artifact_dir / "workspace-final"
     _copy_workspace_snapshot(workspace, snapshot)
     receipt: Mapping[str, Any] = {
@@ -757,8 +1105,16 @@ def _run_one(
             "E3-paid-model-rollout" if test_base_url is None else "E2-loopback-runner-boundary"
         ),
         "quality_evidence": test_base_url is None,
-        "auto_memory_policy": E3_AUTO_MEMORY_POLICY,
-        "long_horizon_arm": E3_LONG_HORIZON_ARM,
+        "auto_memory_policy": (
+            FACTORIAL_AUTO_MEMORY_POLICY
+            if factorial_treatment is not None
+            else E3_AUTO_MEMORY_POLICY
+        ),
+        "long_horizon_arm": (
+            FACTORIAL_LONG_HORIZON_ARM
+            if factorial_treatment is not None
+            else E3_LONG_HORIZON_ARM
+        ),
         "sequence": sequence,
         "case_id": case["id"],
         "trial": schedule["trial"],
@@ -831,6 +1187,19 @@ def _run_one(
         receipt = {**receipt, "phase": schedule["phase"]}
     if run_authorization is not None:
         receipt = {**receipt, "run_authorization": dict(run_authorization)}
+    if factorial_evidence is not None:
+        assert factorial_treatment is not None
+        receipt = {
+            **receipt,
+            "factorial_treatment": factorial_evidence,
+            "factorial_tool_schema_sha256": cache["tools_schema_sha256"],
+            "factorial_cacheable_prefix_sha256": cache[
+                "cacheable_prefix_sha256"
+            ],
+            "factorial_tinykg_binary_sha256": (
+                factorial_treatment.tinykg_binary_sha256
+            ),
+        }
     receipt_path = artifact_dir / "rollout-receipt.json"
     _write_new(receipt_path, (stable_json(receipt) + "\n").encode("utf-8"))
     _assert_production_secret_absent(root, api_key)
