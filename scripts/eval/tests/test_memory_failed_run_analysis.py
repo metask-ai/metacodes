@@ -17,10 +17,10 @@ from scripts.eval.memory_failed_run_analysis import (
     verify_reanalysis_bundle,
 )
 from scripts.eval.memory_query_plan import (
+    LEGACY_TRACE_SCHEMA_VERSION,
     LEXICAL_PLAN_SCHEMA_VERSION,
     MULTIPLE_DISTINCT_SEED_PLANS_REASON,
     QUERY_PLAN_INVALID_PREFIX,
-    TRACE_SCHEMA_VERSION,
 )
 from scripts.eval.memory_agent_runtime import _query_plan_evaluator_invalid_reason
 from scripts.eval.model import ValidationError
@@ -60,7 +60,7 @@ class FailedMemoryRunAnalysisTest(unittest.TestCase):
             },
         }
         trace = {
-            "schema_version": TRACE_SCHEMA_VERSION,
+            "schema_version": LEGACY_TRACE_SCHEMA_VERSION,
             "run_id": "run-recovered",
             "arm": "tinykg_lexical",
             "memory_backend": "tinykg_integrated",
@@ -113,7 +113,7 @@ class FailedMemoryRunAnalysisTest(unittest.TestCase):
             }
         )
         trace = {
-            "schema_version": TRACE_SCHEMA_VERSION,
+            "schema_version": LEGACY_TRACE_SCHEMA_VERSION,
             "run_id": "run-host-parser-recovery",
             "arm": "tinykg_lexical",
             "memory_backend": "tinykg_integrated",
@@ -178,7 +178,7 @@ class FailedMemoryRunAnalysisTest(unittest.TestCase):
         ]
         traces = [
             {
-                "schema_version": TRACE_SCHEMA_VERSION,
+                "schema_version": LEGACY_TRACE_SCHEMA_VERSION,
                 "run_id": "run-bad",
                 "arm": "tinykg_lexical",
                 "memory_backend": "tinykg_integrated",
@@ -191,7 +191,7 @@ class FailedMemoryRunAnalysisTest(unittest.TestCase):
                 ],
             },
             {
-                "schema_version": TRACE_SCHEMA_VERSION,
+                "schema_version": LEGACY_TRACE_SCHEMA_VERSION,
                 "run_id": "run-host",
                 "arm": "tinykg_lexical",
                 "memory_backend": "tinykg_integrated",

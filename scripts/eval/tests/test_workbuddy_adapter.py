@@ -611,12 +611,28 @@ class WorkBuddyTraceTest(unittest.TestCase):
                     {"node_id": 2, "seen_before": True},
                 ],
                 "lexical_query_plan": {
-                    "schema_version": "lexical-query-plan-v1",
+                    "schema_version": "lexical-query-plan-v3",
                     "plan_sha256": "4" * 64,
+                    "intent": "fact_lookup",
+                    "stage": "seed",
+                    "variant_count": 1,
                     "seen_state_verified": True,
-                    "ledger_scope": "agent_run_plan",
-                    "new_hit_count": 1,
-                    "repeated_hit_count": 1,
+                    "ledger_scope": "agent_run_batch",
+                    "execution": "host_batch_all",
+                    "all_variants_executed": True,
+                    "executed_variant_count": 1,
+                    "merged_hit_count": 2,
+                    "merged_new_hit_count": 1,
+                    "merged_previously_seen_count": 1,
+                    "probe_new_hit_count": 1,
+                    "probe_repeated_hit_count": 1,
+                    "variant_receipts": [{
+                        "variant_index": 0,
+                        "variant_kind": "exact",
+                        "node_ids": [1, 2],
+                        "new_hit_count": 1,
+                        "repeated_hit_count": 1,
+                    }],
                 },
             }),
             ("recall-miss", "KgRecall", {"count": 0, "hits": []}),
@@ -640,7 +656,26 @@ class WorkBuddyTraceTest(unittest.TestCase):
         ]
         transcript_rows = [
             {"role": "assistant", "blocks": [
-                {"type": "tool_use", "id": call_id, "name": name, "input": {}}
+                {
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": name,
+                    "input": (
+                        {
+                            "query": "control memory",
+                            "lexical_plan": {
+                                "schema_version": "lexical-query-plan-v3",
+                                "intent": "fact_lookup",
+                                "stage": "seed",
+                                "variants": [
+                                    {"kind": "exact", "text": "control memory"}
+                                ],
+                            },
+                        }
+                        if call_id == "recall-hit"
+                        else {}
+                    ),
+                }
                 for call_id, name, _ in calls
             ]},
             {"role": "user", "blocks": [
@@ -668,6 +703,62 @@ class WorkBuddyTraceTest(unittest.TestCase):
         self.assertEqual(tinykg["task_list_calls"], 1)
         self.assertEqual(tinykg["task_tinykg_status_results"], 4)
         self.assertEqual(tinykg["task_terminal_commits"], 1)
+
+    def test_control_metrics_reject_v3_variant_receipt_unbound_to_input_or_hits(self):
+        tool_input = {
+            "query": "control memory",
+            "lexical_plan": {
+                "schema_version": "lexical-query-plan-v3",
+                "intent": "fact_lookup",
+                "stage": "seed",
+                "variants": [{"kind": "exact", "text": "control memory"}],
+            },
+        }
+        payload = {
+            "count": 1,
+            "hits": [{"node_id": 1, "seen_before": False}],
+            "lexical_query_plan": {
+                "schema_version": "lexical-query-plan-v3",
+                "plan_sha256": "4" * 64,
+                "intent": "fact_lookup",
+                "stage": "seed",
+                "variant_count": 1,
+                "executed_variant_count": 1,
+                "all_variants_executed": True,
+                "seen_state_verified": True,
+                "ledger_scope": "agent_run_batch",
+                "execution": "host_batch_all",
+                "merged_hit_count": 1,
+                "merged_new_hit_count": 1,
+                "merged_previously_seen_count": 0,
+                "probe_new_hit_count": 1,
+                "probe_repeated_hit_count": 0,
+                "variant_receipts": [{
+                    "variant_index": 0,
+                    "variant_kind": "exact",
+                    "node_ids": [2],
+                    "new_hit_count": 1,
+                    "repeated_hit_count": 0,
+                }],
+            },
+        }
+        rows = [
+            {"role": "assistant", "blocks": [{
+                "type": "tool_use", "id": "recall", "name": "KgRecall", "input": tool_input,
+            }]},
+            {"role": "user", "blocks": [{
+                "type": "tool_result", "tool_use_id": "recall",
+                "content": json.dumps(payload), "is_error": False,
+            }]},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(transcript, rows)
+            self._write_jsonl(observation, self._journal())
+            with self.assertRaisesRegex(TraceError, "unmerged node"):
+                load_control_metrics(transcript, observation)
 
     def test_control_metrics_reject_malformed_task_list_array(self):
         cases = (

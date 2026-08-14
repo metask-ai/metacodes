@@ -478,7 +478,7 @@ def _tool_control_metrics(messages: Iterable[Mapping[str, Any]]) -> Dict[str, An
                     raise TraceError("control metrics found an invalid or duplicate tool call id")
                 if not isinstance(name, str) or not name:
                     raise TraceError("control metrics found a tool call without a name")
-                calls[call_id] = {"name": name}
+                calls[call_id] = {"name": name, "input": block.get("input")}
             elif kind == "tool_result":
                 call_id = block.get("tool_use_id")
                 if not isinstance(call_id, str) or not call_id or call_id in results:
@@ -563,6 +563,7 @@ def _tool_control_metrics(messages: Iterable[Mapping[str, Any]]) -> Dict[str, An
                     expected_scope = {
                         "lexical-query-plan-v1": "agent_run_plan",
                         "lexical-query-plan-v2": "agent_run_explicit",
+                        "lexical-query-plan-v3": "agent_run_batch",
                     }.get(plan_version)
                     if (
                         expected_scope is None
@@ -571,11 +572,14 @@ def _tool_control_metrics(messages: Iterable[Mapping[str, Any]]) -> Dict[str, An
                     ):
                         raise TraceError("KgRecall lexical plan governance receipt is invalid")
                     _hex_identity(plan.get("plan_sha256"), "KgRecall plan identity")
+                    batch_v3 = plan_version == "lexical-query-plan-v3"
                     new_count = _non_negative_int(
-                        plan.get("new_hit_count"), "KgRecall new_hit_count"
+                        plan.get("probe_new_hit_count" if batch_v3 else "new_hit_count"),
+                        "KgRecall new_hit_count",
                     )
                     repeated_count = _non_negative_int(
-                        plan.get("repeated_hit_count"), "KgRecall repeated_hit_count"
+                        plan.get("probe_repeated_hit_count" if batch_v3 else "repeated_hit_count"),
+                        "KgRecall repeated_hit_count",
                     )
                     seen_ids = set()
                     observed_new = 0
@@ -598,7 +602,110 @@ def _tool_control_metrics(messages: Iterable[Mapping[str, Any]]) -> Dict[str, An
                             observed_repeated += 1
                         else:
                             observed_new += 1
-                    if (new_count, repeated_count) != (
+                    if batch_v3:
+                        call_input = call.get("input")
+                        declared_plan = (
+                            call_input.get("lexical_plan")
+                            if isinstance(call_input, dict)
+                            else None
+                        )
+                        declared_variants = (
+                            declared_plan.get("variants")
+                            if isinstance(declared_plan, dict)
+                            else None
+                        )
+                        variant_receipts = plan.get("variant_receipts")
+                        executed = _non_negative_int(
+                            plan.get("executed_variant_count"),
+                            "KgRecall executed_variant_count",
+                        )
+                        variant_count = _non_negative_int(
+                            plan.get("variant_count"),
+                            "KgRecall variant_count",
+                        )
+                        if (
+                            not isinstance(call_input, dict)
+                            or not isinstance(declared_plan, dict)
+                            or declared_plan.get("schema_version") != plan_version
+                            or not isinstance(declared_variants, list)
+                            or not 1 <= len(declared_variants) <= 4
+                            or variant_count != len(declared_variants)
+                            or executed != variant_count
+                            or plan.get("intent") != declared_plan.get("intent")
+                            or plan.get("stage") != declared_plan.get("stage")
+                            or plan.get("execution") != "host_batch_all"
+                            or plan.get("all_variants_executed") is not True
+                            or not isinstance(variant_receipts, list)
+                            or len(variant_receipts) != executed
+                            or _non_negative_int(plan.get("merged_hit_count"), "KgRecall merged_hit_count") != count
+                            or _non_negative_int(plan.get("merged_new_hit_count"), "KgRecall merged_new_hit_count") != observed_new
+                            or _non_negative_int(plan.get("merged_previously_seen_count"), "KgRecall merged_previously_seen_count") != observed_repeated
+                        ):
+                            raise TraceError("KgRecall batch coverage receipt is inconsistent")
+                        receipt_new = 0
+                        receipt_repeated = 0
+                        probe_seen = {
+                            hit["node_id"] for hit in hits if hit["seen_before"]
+                        }
+                        ordered_merged = []
+                        for variant_index, (variant_receipt, declared_variant) in enumerate(
+                            zip(variant_receipts, declared_variants)
+                        ):
+                            if (
+                                not isinstance(variant_receipt, dict)
+                                or not isinstance(declared_variant, dict)
+                                or variant_receipt.get("variant_index") != variant_index
+                                or variant_receipt.get("variant_kind")
+                                != declared_variant.get("kind")
+                            ):
+                                raise TraceError("KgRecall batch variant receipt is malformed")
+                            node_ids = variant_receipt.get("node_ids")
+                            if (
+                                not isinstance(node_ids, list)
+                                or len(node_ids) > 8
+                                or any(
+                                    isinstance(node_id, bool)
+                                    or not isinstance(node_id, int)
+                                    or node_id <= 0
+                                    for node_id in node_ids
+                                )
+                                or len(node_ids) != len(set(node_ids))
+                            ):
+                                raise TraceError("KgRecall batch variant node ids are malformed")
+                            observed_probe_new = 0
+                            observed_probe_repeated = 0
+                            for node_id in node_ids:
+                                if node_id not in seen_ids:
+                                    raise TraceError("KgRecall batch variant references an unmerged node")
+                                if node_id in probe_seen:
+                                    observed_probe_repeated += 1
+                                else:
+                                    observed_probe_new += 1
+                                    probe_seen.add(node_id)
+                                if node_id not in ordered_merged:
+                                    ordered_merged.append(node_id)
+                            declared_new = _non_negative_int(
+                                variant_receipt.get("new_hit_count"),
+                                "KgRecall batch new_hit_count",
+                            )
+                            declared_repeated = _non_negative_int(
+                                variant_receipt.get("repeated_hit_count"),
+                                "KgRecall batch repeated_hit_count",
+                            )
+                            if (declared_new, declared_repeated) != (
+                                observed_probe_new,
+                                observed_probe_repeated,
+                            ):
+                                raise TraceError("KgRecall batch variant gain evidence is inconsistent")
+                            receipt_new += declared_new
+                            receipt_repeated += declared_repeated
+                        if (
+                            ordered_merged != [hit["node_id"] for hit in hits]
+                            or (receipt_new, receipt_repeated)
+                            != (new_count, repeated_count)
+                        ):
+                            raise TraceError("KgRecall batch information-gain receipt is inconsistent")
+                    elif (new_count, repeated_count) != (
                         observed_new,
                         observed_repeated,
                     ):

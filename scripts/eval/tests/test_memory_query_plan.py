@@ -105,6 +105,98 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             },
         )
 
+    def _batch_call(self, tool_id, *, variants, variant_hits, seen=(), intent="enumeration"):
+        plan_sha = _plan_fingerprint(
+            intent,
+            "semantic_expansion",
+            variants,
+            None,
+            schema_version="lexical-query-plan-v3",
+        )
+        lexical_plan = {
+            "schema_version": "lexical-query-plan-v3",
+            "intent": intent,
+            "stage": "semantic_expansion",
+            "variants": variants,
+        }
+        probe_seen = set(seen)
+        merged = []
+        receipts = []
+        new_total = 0
+        repeated_total = 0
+        for index, (variant, node_ids) in enumerate(zip(variants, variant_hits)):
+            new_count = 0
+            repeated_count = 0
+            for node_id in node_ids:
+                if node_id in probe_seen:
+                    repeated_count += 1
+                else:
+                    new_count += 1
+                    probe_seen.add(node_id)
+                if node_id not in merged:
+                    merged.append(node_id)
+            new_total += new_count
+            repeated_total += repeated_count
+            receipts.append(
+                {
+                    "variant_index": index,
+                    "variant_kind": variant["kind"],
+                    "node_ids": list(node_ids),
+                    "new_hit_count": new_count,
+                    "repeated_hit_count": repeated_count,
+                }
+            )
+        result_hits = []
+        for node_id in merged:
+            if node_id in seen:
+                result_hits.append(
+                    {
+                        "node_id": node_id,
+                        "seen_before": True,
+                        "content_ref": "exposed_elsewhere_in_run",
+                    }
+                )
+            else:
+                result_hits.append(
+                    {"node_id": node_id, "seen_before": False, "text": f"node {node_id}"}
+                )
+        merged_new = sum(node_id not in seen for node_id in merged)
+        result = {
+            "hits": result_hits,
+            "lexical_query_plan": {
+                "schema_version": "lexical-query-plan-v3",
+                "plan_sha256": plan_sha,
+                "intent": intent,
+                "stage": "semantic_expansion",
+                "variant_count": len(variants),
+                "executed_variant_count": len(variants),
+                "all_variants_executed": True,
+                "seen_node_count": len(seen),
+                "seen_state_verified": True,
+                "ledger_scope": "agent_run_batch",
+                "merged_hit_count": len(merged),
+                "merged_new_hit_count": merged_new,
+                "merged_previously_seen_count": len(merged) - merged_new,
+                "probe_new_hit_count": new_total,
+                "probe_repeated_hit_count": repeated_total,
+                "variant_receipts": receipts,
+                "execution": "host_batch_all",
+            },
+        }
+        return (
+            {
+                "type": "tool_use",
+                "id": tool_id,
+                "name": "KgRecall",
+                "input": {"query": variants[0]["text"], "lexical_plan": lexical_plan},
+            },
+            {
+                "type": "tool_result",
+                "tool_use_id": tool_id,
+                "content": stable_json(result),
+            },
+        )
+
     def _write_requests(self, root, calls):
         observed = []
         for request_index, call in enumerate(calls, start=1):
@@ -220,6 +312,83 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
         )
         self.assertEqual(trace["calls"][2]["repeated_hit_count"], 1)
 
+    def test_v3_batch_replays_all_probes_and_one_merged_result(self):
+        variants = [
+            {"kind": "synonym", "text": "graduation ceremony"},
+            {"kind": "broader", "text": "education milestone events"},
+        ]
+        batch = self._batch_call(
+            "kg-batch",
+            variants=variants,
+            variant_hits=[(7, 9), (9, 11)],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(cassette, [batch])
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-v3-batch",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+            self.assertEqual(
+                trace["schema_version"],
+                "metacodes-memory-query-plan-trace-v2",
+            )
+            self.assertEqual(trace["status"], "verified")
+            self.assertEqual(trace["kg_recall_count"], 1)
+            self.assertEqual(len(trace["calls"]), 1)
+            call = trace["calls"][0]
+            self.assertEqual(call["execution"], "host_batch_all")
+            self.assertEqual(
+                [
+                    (probe["new_hit_count"], probe["repeated_hit_count"])
+                    for probe in call["probes"]
+                ],
+                [(2, 0), (1, 1)],
+            )
+            self.assertEqual(project_query_variants(trace), [
+                {"kind": "semantic", "text": "graduation ceremony"},
+                {"kind": "semantic", "text": "education milestone events"},
+            ])
+            summary = summarize_query_plan_traces([trace])
+            self.assertEqual(summary["explicit_verified_calls"], 1)
+            self.assertEqual(summary["explicit_verified_probes"], 2)
+            self.assertEqual(summary["new_hit_count"], 3)
+            self.assertEqual(summary["repeated_hit_count"], 1)
+
+            (cassette / SIDECAR_NAME).write_text(
+                stable_json(trace) + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                load_and_verify_query_plan_sidecar(
+                    cassette,
+                    run_id="run-v3-batch",
+                    arm="tinykg_lexical",
+                    memory_backend="tinykg_integrated",
+                    required=True,
+                    where="v3 batch",
+                ),
+                trace,
+            )
+
+            tampered_use, tampered_result = copy.deepcopy(batch)
+            tampered_payload = json.loads(tampered_result["content"])
+            tampered_payload["lexical_query_plan"]["variant_receipts"][1][
+                "repeated_hit_count"
+            ] = 0
+            tampered_result["content"] = stable_json(tampered_payload)
+            self._write_requests(cassette, [(tampered_use, tampered_result)])
+            tampered_trace = build_query_plan_trace(
+                cassette,
+                run_id="run-v3-tampered",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+            self.assertEqual(tampered_trace["status"], "invalid")
+            self.assertRegex(tampered_trace["invalid_reasons"][0], "gain counts")
+
     def test_distinct_seed_plans_are_invalid_and_preserved_as_exact(self):
         first = self._call(
             "kg-1",
@@ -275,6 +444,36 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             trace = build_query_plan_trace(
                 cassette,
                 run_id="run-v2-expansion-overflow",
+                arm="tinykg_lexical",
+                memory_backend="tinykg",
+            )
+
+        self.assertEqual(trace["status"], "invalid")
+        self.assertIn(V2_SEMANTIC_EXPANSION_BUDGET_REASON, trace["invalid_reasons"])
+        forged = copy.deepcopy(trace)
+        forged["status"] = "verified"
+        forged["invalid_reasons"] = []
+        with self.assertRaisesRegex(ValidationError, "semantic expansion budget"):
+            validate_query_plan_trace(forged)
+
+    def test_focused_refinement_cannot_bypass_post_seed_probe_budget(self):
+        calls = [
+            self._call(
+                f"kg-focused-{index}",
+                variants=[{"kind": "type", "text": f"decision probe {index}"}],
+                seen=tuple(range(1, index)),
+                hits=(index,),
+                stage="focused_refinement",
+                schema_version="lexical-query-plan-v2",
+            )
+            for index in range(1, 6)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(cassette, calls)
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-v2-focused-overflow",
                 arm="tinykg_lexical",
                 memory_backend="tinykg",
             )

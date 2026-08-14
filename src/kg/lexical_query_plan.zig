@@ -1,20 +1,22 @@
 //! Machine-observable contract for TinyKG's vector-free lexical probes.
 //!
 //! The model still chooses aliases, paraphrases, mechanisms, and nearby
-//! concepts. The host only makes that choice bounded and replayable: one seed
-//! probe, or one selected member of a fixed 1-4 variant expansion plan.
+//! concepts. The host makes that choice bounded and replayable: v1/v2 execute
+//! one selected probe, while v3 executes one declared seed or an entire fixed
+//! 2-4 member semantic batch without asking the model to re-emit indices.
 
 const std = @import("std");
 const platform = @import("platform");
 
-pub const SCHEMA_VERSION = "lexical-query-plan-v2";
+pub const SCHEMA_VERSION = "lexical-query-plan-v3";
+pub const V2_SCHEMA_VERSION = "lexical-query-plan-v2";
 pub const LEGACY_SCHEMA_VERSION = "lexical-query-plan-v1";
 pub const MAX_QUERY_BYTES: usize = 400;
 pub const MAX_VARIANTS: usize = 4;
 pub const MAX_SEEN_NODE_IDS: usize = 32;
 pub const MAX_TRACKED_PLANS: usize = 32;
 pub const MAX_RUN_SEEN_NODE_IDS: usize = MAX_SEEN_NODE_IDS * MAX_TRACKED_PLANS;
-pub const MAX_V2_SEMANTIC_EXPANSION_CALLS: usize = 4;
+pub const MAX_SEMANTIC_EXPANSION_PROBES: usize = 4;
 
 pub const Intent = enum {
     fact_lookup,
@@ -36,11 +38,13 @@ pub const Stage = enum {
 pub const SchemaVersion = enum {
     legacy_v1,
     host_managed_v2,
+    host_batch_v3,
 
     pub fn text(self: SchemaVersion) []const u8 {
         return switch (self) {
             .legacy_v1 => LEGACY_SCHEMA_VERSION,
-            .host_managed_v2 => SCHEMA_VERSION,
+            .host_managed_v2 => V2_SCHEMA_VERSION,
+            .host_batch_v3 => SCHEMA_VERSION,
         };
     }
 };
@@ -70,12 +74,28 @@ pub const Variant = struct {
     }
 };
 
+pub const Execution = union(enum) {
+    single: usize,
+    batch_all,
+
+    pub fn queryIndex(self: Execution) usize {
+        return switch (self) {
+            .single => |index| index,
+            .batch_all => 0,
+        };
+    }
+
+    pub fn executesAll(self: Execution) bool {
+        return self == .batch_all;
+    }
+};
+
 pub const Plan = struct {
     schema_version: SchemaVersion,
     intent: Intent,
     stage: Stage,
     variants: []Variant,
-    variant_index: usize,
+    execution: Execution,
     declared_seen_node_ids: ?[]u64,
     fingerprint: [64]u8,
 
@@ -86,8 +106,30 @@ pub const Plan = struct {
         self.* = undefined;
     }
 
+    /// Query anchor used by the top-level `query` compatibility field. For a
+    /// v3 batch this is the first variant; every member is still executed.
+    pub fn queryVariant(self: Plan) Variant {
+        return self.variants[self.execution.queryIndex()];
+    }
+
     pub fn selected(self: Plan) Variant {
-        return self.variants[self.variant_index];
+        return self.queryVariant();
+    }
+
+    pub fn executesAll(self: Plan) bool {
+        return self.execution.executesAll();
+    }
+
+    pub fn semanticProbeCost(self: Plan) usize {
+        // `focused_refinement` is still a model-chosen post-seed lexical
+        // probe. Counting only the stage label `semantic_expansion` would let
+        // callers bypass the four-probe run budget by relabeling the same
+        // query. Seeds are the sole zero-cost compatibility anchor.
+        if (self.stage == .seed) return 0;
+        return switch (self.execution) {
+            .single => 1,
+            .batch_all => self.variants.len,
+        };
     }
 
     pub fn hasSeen(self: Plan, node_id: u64) bool {
@@ -98,6 +140,7 @@ pub const Plan = struct {
 pub const Error = error{
     OutOfMemory,
     InvalidPlanObject,
+    UnexpectedPlanField,
     InvalidSchemaVersion,
     InvalidIntent,
     InvalidStage,
@@ -106,6 +149,7 @@ pub const Error = error{
     InvalidVariant,
     DuplicateVariant,
     InvalidVariantIndex,
+    UnexpectedVariantIndex,
     QueryVariantMismatch,
     InvalidStageShape,
     SeedTypeFilterForbidden,
@@ -145,7 +189,7 @@ pub const Ledger = struct {
     entry_count: usize = 0,
     run_node_ids: [MAX_RUN_SEEN_NODE_IDS]u64 = [_]u64{0} ** MAX_RUN_SEEN_NODE_IDS,
     run_node_count: usize = 0,
-    v2_semantic_expansion_calls: usize = 0,
+    semantic_expansion_probes: usize = 0,
 
     fn runNodes(self: *const Ledger) []const u64 {
         return self.run_node_ids[0..self.run_node_count];
@@ -155,10 +199,11 @@ pub const Ledger = struct {
         self.mutex.lock();
         errdefer self.mutex.unlock();
 
-        const counts_v2_semantic_expansion = plan.schema_version == .host_managed_v2 and
-            plan.stage == .semantic_expansion;
-        if (counts_v2_semantic_expansion and
-            self.v2_semantic_expansion_calls == MAX_V2_SEMANTIC_EXPANSION_CALLS)
+        const semantic_probe_cost = switch (plan.schema_version) {
+            .legacy_v1 => 0,
+            .host_managed_v2, .host_batch_v3 => plan.semanticProbeCost(),
+        };
+        if (semantic_probe_cost > MAX_SEMANTIC_EXPANSION_PROBES -| self.semantic_expansion_probes)
             return error.SemanticExpansionBudgetExceeded;
 
         for (self.entries[0..self.entry_count], 0..) |*entry, index| {
@@ -170,7 +215,7 @@ pub const Ledger = struct {
                 .ledger = self,
                 .entry_index = index,
                 .schema_version = plan.schema_version,
-                .counts_v2_semantic_expansion = counts_v2_semantic_expansion,
+                .semantic_probe_cost = semantic_probe_cost,
             };
         }
 
@@ -189,7 +234,7 @@ pub const Ledger = struct {
             .entry_index = index,
             .schema_version = plan.schema_version,
             .created = true,
-            .counts_v2_semantic_expansion = counts_v2_semantic_expansion,
+            .semantic_probe_cost = semantic_probe_cost,
         };
     }
 
@@ -198,7 +243,7 @@ pub const Ledger = struct {
         entry_index: usize,
         schema_version: SchemaVersion,
         created: bool = false,
-        counts_v2_semantic_expansion: bool = false,
+        semantic_probe_cost: usize = 0,
         active: bool = true,
 
         /// Abort the in-flight observation. Existing history is untouched; a
@@ -229,13 +274,14 @@ pub const Ledger = struct {
             return switch (self.schema_version) {
                 .legacy_v1 => "agent_run_plan",
                 .host_managed_v2 => "agent_run_explicit",
+                .host_batch_v3 => "agent_run_batch",
             };
         }
 
         fn seenNodes(self: *const Guard) []const u64 {
             return switch (self.schema_version) {
                 .legacy_v1 => self.ledger.entries[self.entry_index].nodes(),
-                .host_managed_v2 => self.ledger.runNodes(),
+                .host_managed_v2, .host_batch_v3 => self.ledger.runNodes(),
             };
         }
 
@@ -262,7 +308,7 @@ pub const Ledger = struct {
                         entry.node_count += 1;
                     }
                 },
-                .host_managed_v2 => {
+                .host_managed_v2, .host_batch_v3 => {
                     if (self.ledger.run_node_count + new_count > MAX_RUN_SEEN_NODE_IDS) return error.HitCapacityExceeded;
                     for (hit_ids, 0..) |node_id, index| {
                         if (node_id == 0 or containsU64(self.ledger.runNodes(), node_id) or
@@ -272,9 +318,9 @@ pub const Ledger = struct {
                     }
                 },
             }
-            if (self.counts_v2_semantic_expansion) {
-                std.debug.assert(self.ledger.v2_semantic_expansion_calls < MAX_V2_SEMANTIC_EXPANSION_CALLS);
-                self.ledger.v2_semantic_expansion_calls += 1;
+            if (self.semantic_probe_cost > 0) {
+                std.debug.assert(self.semantic_probe_cost <= MAX_SEMANTIC_EXPANSION_PROBES - self.ledger.semantic_expansion_probes);
+                self.ledger.semantic_expansion_probes += self.semantic_probe_cost;
             }
             self.active = false;
             self.ledger.mutex.unlock();
@@ -296,11 +342,21 @@ pub fn parse(
 
     const version_text = stringField(object, "schema_version") orelse return error.InvalidSchemaVersion;
     const schema_version: SchemaVersion = if (std.mem.eql(u8, version_text, SCHEMA_VERSION))
+        .host_batch_v3
+    else if (std.mem.eql(u8, version_text, V2_SCHEMA_VERSION))
         .host_managed_v2
     else if (std.mem.eql(u8, version_text, LEGACY_SCHEMA_VERSION))
         .legacy_v1
     else
         return error.InvalidSchemaVersion;
+    // Recognize fields reserved by adjacent protocol versions here, then let
+    // the version-specific branches below produce precise diagnostics such as
+    // UnexpectedVariantIndex / UnexpectedSeenNodeIds. Arbitrary fields still
+    // fail before TinyKG is touched.
+    const allowed_plan_fields: []const []const u8 = &.{
+        "schema_version", "intent", "stage", "variants", "variant_index", "seen_node_ids",
+    };
+    if (!hasOnlyFields(object, allowed_plan_fields)) return error.UnexpectedPlanField;
     const intent_text = stringField(object, "intent") orelse return error.InvalidIntent;
     const intent = std.meta.stringToEnum(Intent, intent_text) orelse return error.InvalidIntent;
     const stage_text = stringField(object, "stage") orelse return error.InvalidStage;
@@ -318,6 +374,7 @@ pub fn parse(
     };
     for (raw_variants.array.items) |raw_variant| {
         if (raw_variant != .object) return error.InvalidVariant;
+        if (!hasOnlyFields(raw_variant.object, &.{ "kind", "text" })) return error.InvalidVariant;
         const kind_text = stringField(raw_variant.object, "kind") orelse return error.InvalidVariant;
         const kind = std.meta.stringToEnum(VariantKind, kind_text) orelse return error.InvalidVariant;
         if (schema_version == .legacy_v1 and kind == .synonym) return error.InvalidVariant;
@@ -334,29 +391,37 @@ pub fn parse(
         };
     }
 
-    const index_value = object.get("variant_index") orelse return error.InvalidVariantIndex;
-    if (index_value != .integer or index_value.integer < 0) return error.InvalidVariantIndex;
-    const variant_index = std.math.cast(usize, index_value.integer) orelse return error.InvalidVariantIndex;
-    if (variant_index >= variants.items.len) return error.InvalidVariantIndex;
+    const execution: Execution = if (schema_version == .host_batch_v3) blk: {
+        if (object.get("variant_index") != null) return error.UnexpectedVariantIndex;
+        break :blk .batch_all;
+    } else blk: {
+        const index_value = object.get("variant_index") orelse return error.InvalidVariantIndex;
+        if (index_value != .integer or index_value.integer < 0) return error.InvalidVariantIndex;
+        const variant_index = std.math.cast(usize, index_value.integer) orelse return error.InvalidVariantIndex;
+        if (variant_index >= variants.items.len) return error.InvalidVariantIndex;
+        break :blk .{ .single = variant_index };
+    };
     const normalized_query = std.mem.trim(u8, query, " \t\r\n");
     if (!validCompactText(normalized_query) or
-        !std.mem.eql(u8, normalized_query, variants.items[variant_index].text))
+        !std.mem.eql(u8, normalized_query, variants.items[execution.queryIndex()].text))
         return error.QueryVariantMismatch;
 
     switch (stage) {
         .seed => {
-            if (variants.items.len != 1 or variant_index != 0 or
+            if (variants.items.len != 1 or execution.queryIndex() != 0 or
                 (variants.items[0].kind != .exact and variants.items[0].kind != .alias))
                 return error.InvalidStageShape;
             if (type_filter != null) return error.SeedTypeFilterForbidden;
         },
         .semantic_expansion => {
-            if (schema_version == .legacy_v1 and variants.items.len < 2) return error.InvalidStageShape;
+            if ((schema_version == .legacy_v1 or schema_version == .host_batch_v3) and
+                variants.items.len < 2) return error.InvalidStageShape;
             for (variants.items) |variant| {
                 if (variant.kind == .exact) return error.InvalidStageShape;
             }
         },
-        .focused_refinement => {},
+        .focused_refinement => if (schema_version == .host_batch_v3 and variants.items.len != 1)
+            return error.InvalidStageShape,
     }
 
     var declared_seen_node_ids: ?[]u64 = null;
@@ -389,7 +454,7 @@ pub fn parse(
         .intent = intent,
         .stage = stage,
         .variants = owned_variants,
-        .variant_index = variant_index,
+        .execution = execution,
         .declared_seen_node_ids = declared_seen_node_ids,
         .fingerprint = fingerprint(schema_version, intent, stage, owned_variants, type_filter),
     };
@@ -399,7 +464,8 @@ pub fn diagnostic(err: Error) []const u8 {
     return switch (err) {
         error.OutOfMemory => "lexical_plan allocation failed",
         error.InvalidPlanObject => "lexical_plan must be an object",
-        error.InvalidSchemaVersion => "lexical_plan.schema_version must be lexical-query-plan-v2 (v1 remains a compatibility path)",
+        error.UnexpectedPlanField => "lexical_plan contains a field outside its versioned schema",
+        error.InvalidSchemaVersion => "lexical_plan.schema_version must be lexical-query-plan-v3 (v1/v2 remain compatibility paths)",
         error.InvalidIntent => "lexical_plan.intent is missing or unsupported",
         error.InvalidStage => "lexical_plan.stage is missing or unsupported",
         error.InvalidVariants => "lexical_plan.variants must contain 1-4 typed variants",
@@ -407,13 +473,14 @@ pub fn diagnostic(err: Error) []const u8 {
         error.InvalidVariant => "each lexical_plan variant needs a supported kind and compact text <=400 bytes",
         error.DuplicateVariant => "lexical_plan variants must have distinct text",
         error.InvalidVariantIndex => "lexical_plan.variant_index is outside variants",
-        error.QueryVariantMismatch => "KgRecall query must exactly match lexical_plan.variants[variant_index].text",
-        error.InvalidStageShape => "seed requires one exact/alias variant; v1 semantic_expansion requires 2-4 non-exact variants; v2 allows 1-4",
+        error.UnexpectedVariantIndex => "lexical-query-plan-v3 executes the declared batch; omit variant_index",
+        error.QueryVariantMismatch => "KgRecall query must exactly match the selected variant (v3 uses variants[0] as the batch anchor)",
+        error.InvalidStageShape => "seed requires one exact/alias variant; v1/v3 semantic_expansion requires 2-4 non-exact variants; v2 allows 1-4; v3 focused_refinement requires one variant",
         error.SeedTypeFilterForbidden => "the seed stage must omit KgRecall type",
         error.InvalidSeenNodeIds => "lexical_plan.seen_node_ids must contain positive integer ids",
         error.TooManySeenNodeIds => "lexical_plan.seen_node_ids exceeds 32 ids",
         error.DuplicateSeenNodeId => "lexical_plan.seen_node_ids must be unique",
-        error.UnexpectedSeenNodeIds => "lexical-query-plan-v2 host-manages seen state; omit seen_node_ids",
+        error.UnexpectedSeenNodeIds => "lexical-query-plan-v2/v3 host-manages seen state; omit seen_node_ids",
     };
 }
 
@@ -422,7 +489,7 @@ pub fn ledgerDiagnostic(err: LedgerError) []const u8 {
         error.SeenStateMismatch => "lexical_plan.seen_node_ids does not exactly match the host ledger for this plan",
         error.PlanCapacityExceeded => "the agent run exceeded 32 distinct governed lexical plans",
         error.HitCapacityExceeded => "the bounded host seen ledger is full; stop retrieval",
-        error.SemanticExpansionBudgetExceeded => "the agent run already used all four v2 semantic-expansion calls; stop retrieval",
+        error.SemanticExpansionBudgetExceeded => "the agent run would exceed the four host-executed semantic-expansion probes; stop retrieval",
     };
 }
 
@@ -469,6 +536,21 @@ fn sameSet(expected: []const u64, declared: []const u64) bool {
 fn stringField(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
     const value = object.get(name) orelse return null;
     return if (value == .string) value.string else null;
+}
+
+fn hasOnlyFields(object: std.json.ObjectMap, allowed: []const []const u8) bool {
+    var fields = object.iterator();
+    while (fields.next()) |field| {
+        var found = false;
+        for (allowed) |name| {
+            if (std.mem.eql(u8, field.key_ptr.*, name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
 }
 
 const valid_expansion =
@@ -524,6 +606,20 @@ test "lexical query plan rejects mismatch, duplicate state, and typed seed" {
     var missing_seen_parsed = try std.json.parseFromSlice(std.json.Value, a, missing_seen, .{});
     defer missing_seen_parsed.deinit();
     try std.testing.expectError(error.InvalidSeenNodeIds, parse(a, missing_seen_parsed.value.object, "needle", null));
+
+    const unknown_plan_field =
+        \\{"lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"fact_lookup","stage":"seed","variants":[{"kind":"exact","text":"needle"}],"bogus":0}}
+    ;
+    var unknown_plan_parsed = try std.json.parseFromSlice(std.json.Value, a, unknown_plan_field, .{});
+    defer unknown_plan_parsed.deinit();
+    try std.testing.expectError(error.UnexpectedPlanField, parse(a, unknown_plan_parsed.value.object, "needle", null));
+
+    const unknown_variant_field =
+        \\{"lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"fact_lookup","stage":"seed","variants":[{"kind":"exact","text":"needle","weight":1}]}}
+    ;
+    var unknown_variant_parsed = try std.json.parseFromSlice(std.json.Value, a, unknown_variant_field, .{});
+    defer unknown_variant_parsed.deinit();
+    try std.testing.expectError(error.InvalidVariant, parse(a, unknown_variant_parsed.value.object, "needle", null));
 }
 
 test "lexical query ledger rejects forged or omitted seen ids" {
@@ -616,6 +712,70 @@ test "lexical query plan v2 host owns seen state and accepts one synonym expansi
     var caller_seen_parsed = try std.json.parseFromSlice(std.json.Value, a, caller_seen, .{});
     defer caller_seen_parsed.deinit();
     try std.testing.expectError(error.UnexpectedSeenNodeIds, parse(a, caller_seen_parsed.value.object, "commencement", null));
+}
+
+test "lexical query plan v3 executes a fixed batch and budgets actual probes" {
+    const a = std.testing.allocator;
+    const raw =
+        \\{"lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"enumeration","stage":"semantic_expansion","variants":[{"kind":"synonym","text":"graduation ceremony"},{"kind":"broader","text":"education milestone events"}]}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    var plan = (try parse(a, parsed.value.object, "graduation ceremony", null)) orelse return error.TestUnexpectedResult;
+    defer plan.deinit(a);
+    try std.testing.expectEqual(SchemaVersion.host_batch_v3, plan.schema_version);
+    try std.testing.expect(plan.executesAll());
+    try std.testing.expectEqual(@as(usize, 2), plan.semanticProbeCost());
+    try std.testing.expectEqualStrings("graduation ceremony", plan.queryVariant().text);
+
+    var ledger = Ledger{};
+    var first = try ledger.lockPlan(plan);
+    defer first.deinit();
+    try std.testing.expectEqualStrings("agent_run_batch", first.scope());
+    try first.commit(&.{ 41, 43 });
+    try std.testing.expectEqual(@as(usize, 2), ledger.semantic_expansion_probes);
+
+    var second = try ledger.lockPlan(plan);
+    defer second.deinit();
+    try std.testing.expect(second.wasSeen(41));
+    try second.commit(&.{ 43, 47 });
+    try std.testing.expectEqual(@as(usize, 4), ledger.semantic_expansion_probes);
+    try std.testing.expectError(error.SemanticExpansionBudgetExceeded, ledger.lockPlan(plan));
+
+    const indexed =
+        \\{"lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"enumeration","stage":"semantic_expansion","variants":[{"kind":"synonym","text":"graduation ceremony"},{"kind":"broader","text":"education milestone events"}],"variant_index":0}}
+    ;
+    var indexed_parsed = try std.json.parseFromSlice(std.json.Value, a, indexed, .{});
+    defer indexed_parsed.deinit();
+    try std.testing.expectError(error.UnexpectedVariantIndex, parse(a, indexed_parsed.value.object, "graduation ceremony", null));
+
+    const singleton =
+        \\{"lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"enumeration","stage":"semantic_expansion","variants":[{"kind":"synonym","text":"graduation ceremony"}]}}
+    ;
+    var singleton_parsed = try std.json.parseFromSlice(std.json.Value, a, singleton, .{});
+    defer singleton_parsed.deinit();
+    try std.testing.expectError(error.InvalidStageShape, parse(a, singleton_parsed.value.object, "graduation ceremony", null));
+}
+
+test "lexical query ledger counts focused refinement against the post-seed budget" {
+    const a = std.testing.allocator;
+    const raw =
+        \\{"lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"fact_lookup","stage":"focused_refinement","variants":[{"kind":"type","text":"decision checkpoint"}]}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    var plan = (try parse(a, parsed.value.object, "decision checkpoint", "decision")) orelse return error.TestUnexpectedResult;
+    defer plan.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), plan.semanticProbeCost());
+
+    var ledger = Ledger{};
+    for (0..MAX_SEMANTIC_EXPANSION_PROBES) |_| {
+        var guard = try ledger.lockPlan(plan);
+        defer guard.deinit();
+        try guard.commit(&.{});
+    }
+    try std.testing.expectEqual(MAX_SEMANTIC_EXPANSION_PROBES, ledger.semantic_expansion_probes);
+    try std.testing.expectError(error.SemanticExpansionBudgetExceeded, ledger.lockPlan(plan));
 }
 
 test "lexical query ledger capacity failure has no partial write" {

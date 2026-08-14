@@ -273,11 +273,10 @@ def _control_plane_sse(request_number: int, request: Mapping[str, Any]) -> bytes
             {
                 "query": CONTROL_MEMORY,
                 "lexical_plan": {
-                    "schema_version": "lexical-query-plan-v2",
+                    "schema_version": "lexical-query-plan-v3",
                     "intent": "fact_lookup",
                     "stage": "seed",
                     "variants": [{"kind": "exact", "text": CONTROL_MEMORY}],
-                    "variant_index": 0,
                 },
             },
         )

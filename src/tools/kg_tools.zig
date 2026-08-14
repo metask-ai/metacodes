@@ -197,6 +197,20 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const plan_version = if (plan) |value| value.schema_version.text() else "query-only";
     log.info("kg", "kg_recall type_filter={s} lexical_plan={s}", .{ type_canon orelse "none", plan_version });
 
+    if (plan) |value| {
+        if (value.executesAll()) {
+            return executeRecallBatch(
+                ctx,
+                kg,
+                value,
+                type_canon,
+                &ledger_guard.?,
+                ledger_scope,
+                ledger_seen_count,
+            );
+        }
+    }
+
     const hits = kg.recallTyped(query, 8, false, type_canon) catch |e| {
         return kgErrorResult(ctx, kg, e, "KgRecall");
     };
@@ -241,23 +255,7 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             try out.appendSlice(ctx.allocator, row);
             continue;
         }
-        const type_str = if (h.schema_type.len > 0) h.schema_type else h.kind;
-        const row = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d},\"type\":\"{s}\",\"scope\":\"{s}\",\"score\":{d:.2},\"text\":", .{
-            h.node_id, type_str, if (std.mem.eql(u8, h.domain, "global")) "global" else "project", h.score,
-        });
-        defer ctx.allocator.free(row);
-        try out.appendSlice(ctx.allocator, row);
-        try appendJsonString(&out, ctx.allocator, h.text);
-        // 溯源(PM P0-2):hit 带 source 的是记忆 markdown 文件——模型该**更新该文件**而非
-        // 另存/KgRemember(否则 "update rather than duplicate" 指令不可执行)。
-        if (h.source_label.len > 0) {
-            try out.appendSlice(ctx.allocator, ",\"source\":");
-            try appendJsonString(&out, ctx.allocator, h.source_label);
-        }
-        if (ledger_guard != null) {
-            try out.appendSlice(ctx.allocator, if (seen_before) ",\"seen_before\":true" else ",\"seen_before\":false");
-        }
-        try out.appendSlice(ctx.allocator, "}");
+        try appendRecallHitRow(&out, ctx.allocator, h, seen_before, ledger_guard != null);
     }
     // 搭车 facet(PM:可见性,零额外调用):结果里各类型计数,让模型知道有哪些类型 → 可 --type 精化。
     const known_types = [_][]const u8{ "decision", "module", "bug", "user_preference", "observation" };
@@ -310,6 +308,165 @@ fn containsNodeId(values: []const u64, expected: u64) bool {
     return false;
 }
 
+const BatchVariantReceipt = struct {
+    node_ids: [8]u64 = [_]u64{0} ** 8,
+    node_count: usize = 0,
+    new_hit_count: usize = 0,
+    repeated_hit_count: usize = 0,
+};
+
+/// Execute every member of a v3 plan under one host-ledger guard. TinyKG reads
+/// remain ordered and read-only; the model receives one merged result envelope,
+/// each node body at most once, plus replayable per-variant node-id receipts.
+/// This deliberately does not claim a cross-query snapshot: a shared daemon
+/// may accept a writer between probes, so freshness is rechecked via KgContext.
+fn executeRecallBatch(
+    ctx: *const ToolContext,
+    kg: *kg_mod.KgClient,
+    plan: lexical_query_plan.Plan,
+    type_canon: ?[]const u8,
+    guard: *lexical_query_plan.Ledger.Guard,
+    ledger_scope: []const u8,
+    ledger_seen_count: usize,
+) anyerror![]u8 {
+    std.debug.assert(plan.schema_version == .host_batch_v3);
+    std.debug.assert(plan.executesAll());
+
+    var hit_rows: std.ArrayList(u8) = .empty;
+    defer hit_rows.deinit(ctx.allocator);
+    var receipts = [_]BatchVariantReceipt{.{}} ** lexical_query_plan.MAX_VARIANTS;
+    var merged_ids: [lexical_query_plan.MAX_SEEN_NODE_IDS]u64 = [_]u64{0} ** lexical_query_plan.MAX_SEEN_NODE_IDS;
+    var merged_count: usize = 0;
+    var merged_new_count: usize = 0;
+    var merged_previously_seen_count: usize = 0;
+    var probe_new_count: usize = 0;
+    var probe_repeated_count: usize = 0;
+    const known_types = [_][]const u8{ "decision", "module", "bug", "user_preference", "observation" };
+    var facet_counts = [_]usize{0} ** known_types.len;
+
+    for (plan.variants, 0..) |variant, variant_index| {
+        const hits = kg.recallTyped(variant.text, 8, false, type_canon) catch |e| {
+            return kgErrorResult(ctx, kg, e, "KgRecall");
+        };
+        defer {
+            for (hits) |*hit| hit.deinit(kg.allocator);
+            kg.allocator.free(hits);
+        }
+        var receipt = &receipts[variant_index];
+        for (hits) |hit| {
+            if (containsNodeId(receipt.node_ids[0..receipt.node_count], hit.node_id)) continue;
+            if (receipt.node_count == receipt.node_ids.len) {
+                common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall batch variant returned more than eight distinct hits", .{});
+                return error.InvalidLexicalPlanState;
+            }
+            receipt.node_ids[receipt.node_count] = hit.node_id;
+            receipt.node_count += 1;
+
+            const seen_before_run = guard.wasSeen(hit.node_id);
+            const seen_earlier_in_batch = containsNodeId(merged_ids[0..merged_count], hit.node_id);
+            if (seen_before_run or seen_earlier_in_batch) {
+                receipt.repeated_hit_count += 1;
+                probe_repeated_count += 1;
+            } else {
+                receipt.new_hit_count += 1;
+                probe_new_count += 1;
+            }
+            if (seen_earlier_in_batch) continue;
+            if (merged_count == merged_ids.len) {
+                common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall batch exceeded the governed 32-node merged-result bound", .{});
+                return error.InvalidLexicalPlanState;
+            }
+            if (merged_count > 0) try hit_rows.append(ctx.allocator, ',');
+            merged_ids[merged_count] = hit.node_id;
+            merged_count += 1;
+            if (seen_before_run) {
+                merged_previously_seen_count += 1;
+                const row = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d},\"seen_before\":true,\"content_ref\":\"exposed_elsewhere_in_run\"}}", .{hit.node_id});
+                defer ctx.allocator.free(row);
+                try hit_rows.appendSlice(ctx.allocator, row);
+            } else {
+                merged_new_count += 1;
+                try appendRecallHitRow(&hit_rows, ctx.allocator, hit, false, true);
+            }
+            const type_str = if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
+            for (known_types, 0..) |type_name, facet_index| {
+                if (std.mem.eql(u8, type_str, type_name)) facet_counts[facet_index] += 1;
+            }
+        }
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(ctx.allocator);
+    try out.appendSlice(ctx.allocator, "{\"hits\":[");
+    try out.appendSlice(ctx.allocator, hit_rows.items);
+    try out.appendSlice(ctx.allocator, "],\"count\":");
+    try out.print(ctx.allocator, "{d},\"types_in_results\":{{", .{merged_count});
+    var facet_first = true;
+    for (known_types, facet_counts) |type_name, count| {
+        if (count == 0) continue;
+        if (!facet_first) try out.append(ctx.allocator, ',');
+        facet_first = false;
+        try out.print(ctx.allocator, "\"{s}\":{d}", .{ type_name, count });
+    }
+    try out.appendSlice(ctx.allocator, "},\"lexical_query_plan\":{");
+    try out.print(
+        ctx.allocator,
+        "\"schema_version\":\"{s}\",\"plan_sha256\":\"{s}\",\"intent\":\"{s}\",\"stage\":\"{s}\",\"variant_count\":{d},\"executed_variant_count\":{d},\"all_variants_executed\":true,\"seen_node_count\":{d},\"seen_state_verified\":true,\"ledger_scope\":\"{s}\",\"merged_hit_count\":{d},\"merged_new_hit_count\":{d},\"merged_previously_seen_count\":{d},\"probe_new_hit_count\":{d},\"probe_repeated_hit_count\":{d},\"variant_receipts\":[",
+        .{ plan.schema_version.text(), plan.fingerprint, @tagName(plan.intent), @tagName(plan.stage), plan.variants.len, plan.variants.len, ledger_seen_count, ledger_scope, merged_count, merged_new_count, merged_previously_seen_count, probe_new_count, probe_repeated_count },
+    );
+    for (plan.variants, 0..) |variant, variant_index| {
+        if (variant_index > 0) try out.append(ctx.allocator, ',');
+        const receipt = receipts[variant_index];
+        try out.print(
+            ctx.allocator,
+            "{{\"variant_index\":{d},\"variant_kind\":\"{s}\",\"node_ids\":[",
+            .{ variant_index, @tagName(variant.kind) },
+        );
+        for (receipt.node_ids[0..receipt.node_count], 0..) |node_id, node_index| {
+            if (node_index > 0) try out.append(ctx.allocator, ',');
+            try out.print(ctx.allocator, "{d}", .{node_id});
+        }
+        try out.print(
+            ctx.allocator,
+            "],\"new_hit_count\":{d},\"repeated_hit_count\":{d}}}",
+            .{ receipt.new_hit_count, receipt.repeated_hit_count },
+        );
+    }
+    try out.appendSlice(ctx.allocator, "],\"execution\":\"host_batch_all\"},\"retrieval_mode\":\"lexical_bm25_no_embeddings\",\"knowledge_status\":\"unverified_candidates\",\"lexical_guidance\":");
+    try appendJsonString(&out, ctx.allocator, retrieval_protocol.RESULT_GUIDANCE);
+    try out.append(ctx.allocator, '}');
+
+    const owned = try out.toOwnedSlice(ctx.allocator);
+    errdefer ctx.allocator.free(owned);
+    guard.commit(merged_ids[0..merged_count]) catch |err| {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall lexical_plan host ledger could not commit the observed batch: {s}", .{lexical_query_plan.ledgerDiagnostic(err)});
+        return error.InvalidLexicalPlanState;
+    };
+    return owned;
+}
+
+fn appendRecallHitRow(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    hit: kg_mod.RecallHit,
+    seen_before: bool,
+    include_seen: bool,
+) !void {
+    const type_str = if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
+    const row = try std.fmt.allocPrint(allocator, "{{\"node_id\":{d},\"type\":\"{s}\",\"scope\":\"{s}\",\"score\":{d:.2},\"text\":", .{
+        hit.node_id, type_str, if (std.mem.eql(u8, hit.domain, "global")) "global" else "project", hit.score,
+    });
+    defer allocator.free(row);
+    try out.appendSlice(allocator, row);
+    try appendJsonString(out, allocator, hit.text);
+    if (hit.source_label.len > 0) {
+        try out.appendSlice(allocator, ",\"source\":");
+        try appendJsonString(out, allocator, hit.source_label);
+    }
+    if (include_seen) try out.appendSlice(allocator, if (seen_before) ",\"seen_before\":true" else ",\"seen_before\":false");
+    try out.append(allocator, '}');
+}
+
 fn appendLexicalPlanReceipt(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -319,6 +476,10 @@ fn appendLexicalPlanReceipt(
     new_hit_count: usize,
     repeated_hit_count: usize,
 ) !void {
+    const variant_index = switch (plan.execution) {
+        .single => |index| index,
+        .batch_all => unreachable,
+    };
     const selected = plan.selected();
     const receipt = try std.fmt.allocPrint(
         allocator,
@@ -328,7 +489,7 @@ fn appendLexicalPlanReceipt(
             plan.fingerprint,
             @tagName(plan.intent),
             @tagName(plan.stage),
-            plan.variant_index,
+            variant_index,
             plan.variants.len,
             @tagName(selected.kind),
             seen_node_count,

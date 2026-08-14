@@ -212,9 +212,10 @@ test "L2 KG governance: scoped recall exposes stable node ids and candidate-only
         try std.testing.expect(std.mem.indexOf(u8, inj.?, "exact canonical alias/symbol") != null);
         try std.testing.expect(std.mem.indexOf(u8, inj.?, "exact/high-precision") != null);
         try std.testing.expect(std.mem.indexOf(u8, inj.?, "强制下一步 / MANDATORY NEXT ACTION") != null);
-        try std.testing.expect(std.mem.indexOf(u8, inj.?, "只能包含该精确词和用户已要求的字段名") != null);
-        try std.testing.expect(std.mem.indexOf(u8, inj.?, "1-4 个彼此分开的紧凑语义变体") != null);
-        try std.testing.expect(std.mem.indexOf(u8, inj.?, "机制、症状、期望结果、邻近实现") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "canonical alias/代码符号") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "2-4 个分离的语义变体") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "宿主整批执行") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "按 node_id 合并") != null);
     }
     // 负向:零重合无关请求 → 不注入(相关性门挡答案缺席噪声;PM P0 逼可证伪的两侧测试)。
     {
@@ -509,16 +510,16 @@ test "L2 KG governance: freshness and contradiction contract enters the actual A
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "MUST contain only that exact term plus field names") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "EXACT/HIGH-PRECISION SEED") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "RECORD THE PLAN") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "lexical-query-plan-v2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "stable per-plan plan_sha256 plus host-measured new/repeated hit counts across all v2 KgRecall calls") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "host ledger exclusively owns seen state") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "1-4 separate compact semantic variants") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "host permits at most four v2 semantic-expansion calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "lexical-query-plan-v3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "executes every declared member in order") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "run-scoped host ledger owns seen state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "2-4 separate compact probes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "at most four semantic probes per run") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "ENUMERATION REQUIRES COVERAGE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "count/cardinality, an exhaustive list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "count/cardinality, exhaustive-list") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "One positive hit proves existence, never completeness") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "execute every member") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "necessary, not sufficient, for completeness") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "successful v3 receipt proves every member ran") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "necessary, not sufficient") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "mechanism, symptom, desired outcome, or nearby implementation term") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Deduplicate candidates by node_id across every call") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "KgContext") != null);
@@ -542,10 +543,11 @@ test "L2 KG governance: freshness and contradiction contract enters the actual A
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"KgRecall\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"lexical_plan\":{\"type\":\"object\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"schema_version\":{\"type\":\"string\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"enum\":[\"lexical-query-plan-v2\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"enum\":[\"lexical-query-plan-v3\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"variants\":{\"type\":\"array\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"synonym\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"seen_node_ids\":{\"type\":\"array\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"variant_index\":{\"type\":\"integer\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"KgContext\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "authoritative node text") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "bounded TinyKG task_packet") != null);
@@ -629,8 +631,8 @@ test "L2 KG governance: lexical query plan binds variants and measures informati
     try std.testing.expect(repeated_found);
 
     try std.testing.expect(std.mem.indexOf(u8, first_out, "\"retrieval_mode\":\"lexical_bm25_no_embeddings\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first_out, "Semantically judge these lexical candidates") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first_out, "deduplicate node_id values across calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_out, "Semantically judge the merged lexical candidates") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_out, "do not issue its members separately") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_out, "content_ref=exposed_elsewhere_in_run") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_out, "KgContext") != null);
 
@@ -682,6 +684,60 @@ test "L2 KG governance: lexical query plan binds variants and measures informati
     const long_args = try std.fmt.allocPrint(a, "{{\"query\":\"{s}\"}}", .{&long_query});
     defer a.free(long_args);
     try std.testing.expectError(error.InvalidQuery, @import("cc").kg_tools.executeRecall(&ctx, long_args));
+}
+
+test "L2 KG governance: v3 batch executes every variant and exposes each node body once" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kg-batch-v3.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-batch-v3");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+    const memory_id = try kg.remember(.decision, "panic crash checkpoint recovery procedure", "decision", false);
+
+    var ledger = @import("cc").kg_lexical_query_plan.Ledger{};
+    const ctx = @import("cc").tool_context.ToolContext{ .allocator = a, .kg = &kg, .kg_lexical_ledger = &ledger };
+    const args =
+        \\{"query":"panic crash checkpoint","type":"decision","lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"enumeration","stage":"semantic_expansion","variants":[{"kind":"synonym","text":"panic crash checkpoint"},{"kind":"mechanism","text":"checkpoint recovery procedure"}]}}
+    ;
+    const output = try @import("cc").kg_tools.executeRecall(&ctx, args);
+    defer a.free(output);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, output, .{});
+    defer parsed.deinit();
+
+    const receipt = parsed.value.object.get("lexical_query_plan").?.object;
+    try std.testing.expectEqualStrings("lexical-query-plan-v3", receipt.get("schema_version").?.string);
+    try std.testing.expectEqualStrings("host_batch_all", receipt.get("execution").?.string);
+    try std.testing.expectEqualStrings("agent_run_batch", receipt.get("ledger_scope").?.string);
+    try std.testing.expect(receipt.get("all_variants_executed").?.bool);
+    try std.testing.expectEqual(@as(i64, 2), receipt.get("executed_variant_count").?.integer);
+    try std.testing.expectEqual(@as(usize, 2), receipt.get("variant_receipts").?.array.items.len);
+    try std.testing.expect(receipt.get("probe_repeated_hit_count").?.integer >= 1);
+
+    var body_count: usize = 0;
+    for (parsed.value.object.get("hits").?.array.items) |hit| {
+        if (hit.object.get("node_id").?.integer != @as(i64, @intCast(memory_id))) continue;
+        body_count += 1;
+        try std.testing.expect(hit.object.get("text") != null);
+        try std.testing.expect(hit.object.get("content_ref") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), body_count);
+    for (receipt.get("variant_receipts").?.array.items) |variant_receipt| {
+        var found = false;
+        for (variant_receipt.object.get("node_ids").?.array.items) |node_id| {
+            if (node_id.integer == @as(i64, @intCast(memory_id))) found = true;
+        }
+        try std.testing.expect(found);
+    }
 }
 
 test "L2 KG governance: KgContext emits evidence, freshness, and supersession signals" {
@@ -2578,7 +2634,9 @@ test "L2 KG experience feedback: claim exposes verified prior execution before w
     const second_request = srv.requestAt(1) orelse return error.NoRequestCaptured;
     try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "LEXICAL EXPANSION") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "2-4 separate compact semantic variants") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "Deduplicate candidates by node_id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "lexical-query-plan-v3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "host executes the fixed batch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "merges by node_id") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "repair parser checkpoint recovery corruption") == null);
     try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "parser checkpoint replay verified") == null);
     try std.testing.expect(std.mem.indexOf(u8, second_request.body(), "metacodes-experience-packet-v1") != null);

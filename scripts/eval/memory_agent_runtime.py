@@ -1145,11 +1145,10 @@ class _ScriptedPlanner:
                         {
                             "query": query,
                             "lexical_plan": {
-                                "schema_version": "lexical-query-plan-v2",
+                                "schema_version": "lexical-query-plan-v3",
                                 "intent": intent,
                                 "stage": "seed",
                                 "variants": [{"kind": "exact", "text": query}],
-                                "variant_index": 0,
                             },
                         },
                     )

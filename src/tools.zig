@@ -395,7 +395,7 @@ pub const registry: []const ToolEntry = &.{
                 .type = "object",
                 .description = kg_retrieval.PLAN_DESCRIPTION,
                 .object_props = &.{
-                    .{ .name = "schema_version", .type = "string", .enum_values = &.{"lexical-query-plan-v2"} },
+                    .{ .name = "schema_version", .type = "string", .enum_values = &.{"lexical-query-plan-v3"} },
                     .{ .name = "intent", .type = "string", .description = "Use enumeration for count/cardinality, exhaustive-list, all/every-match, or absence questions; one positive hit is not complete coverage.", .enum_values = &.{ "fact_lookup", "procedure_reuse", "task_recovery", "enumeration", "temporal", "causal", "entity", "other" } },
                     .{ .name = "stage", .type = "string", .enum_values = &.{ "seed", "semantic_expansion", "focused_refinement" } },
                     .{
@@ -407,9 +407,8 @@ pub const registry: []const ToolEntry = &.{
                         },
                         .items_required = &.{ "kind", "text" },
                     },
-                    .{ .name = "variant_index", .type = "integer", .description = "Zero-based member of variants executed by this call." },
                 },
-                .object_required = &.{ "schema_version", "intent", "stage", "variants", "variant_index" },
+                .object_required = &.{ "schema_version", "intent", "stage", "variants" },
             },
         }, .required = &.{ "query", "lexical_plan" } },
         .execute = kg_tools.executeRecall,

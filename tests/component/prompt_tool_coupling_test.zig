@@ -93,16 +93,16 @@ test "L2: KgRecall and KgContext schemas carry the staged semantic-neighborhood 
         }
     }
     const description = query_description orelse return error.TestUnexpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, description, "exact/high-precision query") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "at most four separate semantic probes") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "one selected probe or a fixed 2-4 member batch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "one untyped exact/alias variant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "declare 2-4 separate semantic variants in one v3 batch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "host executes all members") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "FIRST inspect automatic recall") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "MUST contain ONLY that exact term") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "query must exactly equal variants[0].text") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "mechanism/symptom/outcome/nearby implementation") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "broader or narrower concept") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "never combine probes into one keyword bag") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "broader/narrower concept") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "Never combine variants into a keyword bag") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "intent=enumeration") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "execute every member") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "require batch coverage") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "Extra keywords are safe") == null);
     const intent_desc = intent_description orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, intent_desc, "count/cardinality") != null);

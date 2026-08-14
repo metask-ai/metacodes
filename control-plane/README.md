@@ -104,8 +104,9 @@ of that ontology loop. It fixes five non-substitutable obligations:
   after claim, and again when `TaskGet` recovers a claimed task after restart or
   compaction, before the next model request can perform work;
 - because TinyKG has no vector search, the system and task contracts require the
-  model to derive at most 2-4 separate semantic variants when the exact probe is
-  insufficient, deduplicate node ids, and treat recalled text as untrusted data;
+  model to derive 2-4 separate semantic variants when the exact probe is
+  insufficient, while the host executes that fixed batch, deduplicates node ids,
+  and keeps recalled text as untrusted data;
 - `test:kg-experience-feedback` drives a real TinyKG process and proves that a
   verified completed task enters the new claim result, while an unfinished
   lexically close decoy is rejected, then proves the packet is serialized into

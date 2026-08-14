@@ -19,18 +19,25 @@ from typing import Any, Dict, List, Mapping, MutableMapping, Sequence, Tuple
 from .model import ValidationError, stable_json
 
 
-TRACE_SCHEMA_VERSION = "metacodes-memory-query-plan-trace-v1"
-REPORT_SCHEMA_VERSION = "metacodes-memory-query-plan-report-v3"
+TRACE_SCHEMA_VERSION = "metacodes-memory-query-plan-trace-v2"
+LEGACY_TRACE_SCHEMA_VERSION = "metacodes-memory-query-plan-trace-v1"
+TRACE_SCHEMA_VERSIONS = frozenset({TRACE_SCHEMA_VERSION, LEGACY_TRACE_SCHEMA_VERSION})
+REPORT_SCHEMA_VERSION = "metacodes-memory-query-plan-report-v4"
 LEXICAL_PLAN_SCHEMA_VERSION = "lexical-query-plan-v2"
+BATCH_LEXICAL_PLAN_SCHEMA_VERSION = "lexical-query-plan-v3"
 LEGACY_LEXICAL_PLAN_SCHEMA_VERSION = "lexical-query-plan-v1"
 LEXICAL_PLAN_SCHEMA_VERSIONS = frozenset(
-    {LEXICAL_PLAN_SCHEMA_VERSION, LEGACY_LEXICAL_PLAN_SCHEMA_VERSION}
+    {
+        BATCH_LEXICAL_PLAN_SCHEMA_VERSION,
+        LEXICAL_PLAN_SCHEMA_VERSION,
+        LEGACY_LEXICAL_PLAN_SCHEMA_VERSION,
+    }
 )
 SIDECAR_NAME = "query-plan.json"
 QUERY_PLAN_INVALID_PREFIX = "query-plan trace invalid: "
 MULTIPLE_DISTINCT_SEED_PLANS_REASON = "multiple distinct seed plans in one run"
 V2_SEMANTIC_EXPANSION_BUDGET_REASON = (
-    "more than four v2 semantic expansion calls in one run"
+    "more than four host-executed semantic expansion probes in one run"
 )
 MAX_V2_SEMANTIC_EXPANSION_CALLS = 4
 PRE_SEARCH_REJECTION_REASON = re.compile(
@@ -100,12 +107,41 @@ CALL_KEYS = frozenset(
         "repeated_hit_count",
     }
 )
+CALL_V2_KEYS = frozenset(
+    {
+        "call_index",
+        "schema_version",
+        "plan_sha256",
+        "variants_sha256",
+        "intent",
+        "stage",
+        "execution",
+        "variant_count",
+        "seen_node_count",
+        "seen_state_verified",
+        "ledger_scope",
+        "new_hit_count",
+        "repeated_hit_count",
+        "probes",
+    }
+)
+PROBE_KEYS = frozenset(
+    {
+        "variant_index",
+        "variant_kind",
+        "query",
+        "new_hit_count",
+        "repeated_hit_count",
+        "hit_node_ids",
+    }
+)
 LEGACY_PLAN_KEYS = frozenset(
     {"schema_version", "intent", "stage", "variants", "variant_index", "seen_node_ids"}
 )
 PLAN_KEYS = frozenset(
     {"schema_version", "intent", "stage", "variants", "variant_index"}
 )
+BATCH_PLAN_KEYS = frozenset({"schema_version", "intent", "stage", "variants"})
 RECEIPT_KEYS = frozenset(
     {
         "schema_version",
@@ -121,6 +157,30 @@ RECEIPT_KEYS = frozenset(
         "new_hit_count",
         "repeated_hit_count",
     }
+)
+BATCH_RECEIPT_KEYS = frozenset(
+    {
+        "schema_version",
+        "plan_sha256",
+        "intent",
+        "stage",
+        "variant_count",
+        "executed_variant_count",
+        "all_variants_executed",
+        "seen_node_count",
+        "seen_state_verified",
+        "ledger_scope",
+        "merged_hit_count",
+        "merged_new_hit_count",
+        "merged_previously_seen_count",
+        "probe_new_hit_count",
+        "probe_repeated_hit_count",
+        "variant_receipts",
+        "execution",
+    }
+)
+BATCH_VARIANT_RECEIPT_KEYS = frozenset(
+    {"variant_index", "variant_kind", "node_ids", "new_hit_count", "repeated_hit_count"}
 )
 
 
@@ -208,9 +268,13 @@ def _parse_plan(tool_input: Mapping[str, Any], where: str) -> Mapping[str, Any]:
     plan = _object(
         raw_plan,
         f"{where}.lexical_plan",
-        LEGACY_PLAN_KEYS
-        if schema_version == LEGACY_LEXICAL_PLAN_SCHEMA_VERSION
-        else PLAN_KEYS,
+        (
+            LEGACY_PLAN_KEYS
+            if schema_version == LEGACY_LEXICAL_PLAN_SCHEMA_VERSION
+            else BATCH_PLAN_KEYS
+            if schema_version == BATCH_LEXICAL_PLAN_SCHEMA_VERSION
+            else PLAN_KEYS
+        ),
     )
     intent = _string(plan["intent"], f"{where}.lexical_plan.intent")
     if intent not in INTENTS:
@@ -242,29 +306,41 @@ def _parse_plan(tool_input: Mapping[str, Any], where: str) -> Mapping[str, Any]:
             _fail(f"{where}.lexical_plan.variants", "duplicate variant text")
         seen_text.add(text)
         variants.append({"kind": kind, "text": text})
-    variant_index = _integer(
-        plan["variant_index"],
-        f"{where}.lexical_plan.variant_index",
+    batch_all = schema_version == BATCH_LEXICAL_PLAN_SCHEMA_VERSION
+    variant_index = (
+        None
+        if batch_all
+        else _integer(
+            plan["variant_index"],
+            f"{where}.lexical_plan.variant_index",
+        )
     )
-    if variant_index >= len(variants):
+    if variant_index is not None and variant_index >= len(variants):
         _fail(f"{where}.lexical_plan.variant_index", "outside variants")
-    if query != variants[variant_index]["text"]:
+    query_index = 0 if variant_index is None else variant_index
+    if query != variants[query_index]["text"]:
         _fail(where, "query does not match the selected variant")
     if stage == "seed" and (
         len(variants) != 1
-        or variant_index != 0
+        or query_index != 0
         or variants[0]["kind"] not in {"exact", "alias"}
         or "type" in tool_input
     ):
         _fail(f"{where}.lexical_plan", "invalid seed shape")
     if stage == "semantic_expansion" and (
         (
-            schema_version == LEGACY_LEXICAL_PLAN_SCHEMA_VERSION
+            schema_version
+            in {
+                LEGACY_LEXICAL_PLAN_SCHEMA_VERSION,
+                BATCH_LEXICAL_PLAN_SCHEMA_VERSION,
+            }
             and len(variants) < 2
         )
         or any(variant["kind"] == "exact" for variant in variants)
     ):
         _fail(f"{where}.lexical_plan", "invalid semantic expansion shape")
+    if batch_all and stage == "focused_refinement" and len(variants) != 1:
+        _fail(f"{where}.lexical_plan", "invalid focused refinement shape")
     seen_ids: List[int] | None = None
     if schema_version == LEGACY_LEXICAL_PLAN_SCHEMA_VERSION:
         raw_seen = plan["seen_node_ids"]
@@ -288,6 +364,7 @@ def _parse_plan(tool_input: Mapping[str, Any], where: str) -> Mapping[str, Any]:
         "stage": stage,
         "variants": variants,
         "variant_index": variant_index,
+        "execution": "host_batch_all" if batch_all else "single",
         "seen_node_ids": seen_ids,
         "type_filter": type_filter,
         "plan_sha256": _plan_fingerprint(
@@ -298,6 +375,161 @@ def _parse_plan(tool_input: Mapping[str, Any], where: str) -> Mapping[str, Any]:
             schema_version=schema_version,
         ),
         "variants_sha256": hashlib.sha256(stable_json(variants).encode("utf-8")).hexdigest(),
+    }
+
+
+def _parse_batch_receipt(
+    result: Mapping[str, Any],
+    parsed_plan: Mapping[str, Any],
+    expected_seen: set[int],
+    where: str,
+) -> Mapping[str, Any]:
+    receipt = _object(
+        result.get("lexical_query_plan"),
+        f"{where}.lexical_query_plan",
+        BATCH_RECEIPT_KEYS,
+    )
+    expected = {
+        "schema_version": BATCH_LEXICAL_PLAN_SCHEMA_VERSION,
+        "plan_sha256": parsed_plan["plan_sha256"],
+        "intent": parsed_plan["intent"],
+        "stage": parsed_plan["stage"],
+        "variant_count": len(parsed_plan["variants"]),
+        "executed_variant_count": len(parsed_plan["variants"]),
+        "all_variants_executed": True,
+        "seen_node_count": len(expected_seen),
+        "seen_state_verified": True,
+        "ledger_scope": "agent_run_batch",
+        "execution": "host_batch_all",
+    }
+    for key, expected_value in expected.items():
+        if receipt[key] != expected_value:
+            _fail(f"{where}.lexical_query_plan.{key}", "does not match the batch input")
+    _hash(receipt["plan_sha256"], f"{where}.lexical_query_plan.plan_sha256")
+
+    raw_variant_receipts = receipt["variant_receipts"]
+    if not isinstance(raw_variant_receipts, list) or len(raw_variant_receipts) != len(
+        parsed_plan["variants"]
+    ):
+        _fail(f"{where}.lexical_query_plan.variant_receipts", "must cover every variant")
+    probe_seen = set(expected_seen)
+    ordered_merged: List[int] = []
+    probes: List[Mapping[str, Any]] = []
+    probe_new_total = 0
+    probe_repeated_total = 0
+    for variant_index, (raw_receipt, variant) in enumerate(
+        zip(raw_variant_receipts, parsed_plan["variants"])
+    ):
+        variant_receipt = _object(
+            raw_receipt,
+            f"{where}.lexical_query_plan.variant_receipts[{variant_index}]",
+            BATCH_VARIANT_RECEIPT_KEYS,
+        )
+        if variant_receipt["variant_index"] != variant_index:
+            _fail(
+                f"{where}.lexical_query_plan.variant_receipts[{variant_index}].variant_index",
+                "does not preserve declared order",
+            )
+        if variant_receipt["variant_kind"] != variant["kind"]:
+            _fail(
+                f"{where}.lexical_query_plan.variant_receipts[{variant_index}].variant_kind",
+                "does not match the declared variant",
+            )
+        raw_node_ids = variant_receipt["node_ids"]
+        if not isinstance(raw_node_ids, list) or len(raw_node_ids) > 8:
+            _fail(
+                f"{where}.lexical_query_plan.variant_receipts[{variant_index}].node_ids",
+                "expected at most eight node ids",
+            )
+        node_ids: List[int] = []
+        observed_new = 0
+        observed_repeated = 0
+        for node_index, raw_node_id in enumerate(raw_node_ids):
+            node_id = _integer(
+                raw_node_id,
+                f"{where}.lexical_query_plan.variant_receipts[{variant_index}].node_ids[{node_index}]",
+                minimum=1,
+            )
+            if node_id in node_ids:
+                _fail(
+                    f"{where}.lexical_query_plan.variant_receipts[{variant_index}].node_ids",
+                    "duplicate node id",
+                )
+            node_ids.append(node_id)
+            if node_id in probe_seen:
+                observed_repeated += 1
+            else:
+                observed_new += 1
+                probe_seen.add(node_id)
+            if node_id not in ordered_merged:
+                ordered_merged.append(node_id)
+        new_count = _integer(
+            variant_receipt["new_hit_count"],
+            f"{where}.lexical_query_plan.variant_receipts[{variant_index}].new_hit_count",
+        )
+        repeated_count = _integer(
+            variant_receipt["repeated_hit_count"],
+            f"{where}.lexical_query_plan.variant_receipts[{variant_index}].repeated_hit_count",
+        )
+        if (new_count, repeated_count) != (observed_new, observed_repeated):
+            _fail(
+                f"{where}.lexical_query_plan.variant_receipts[{variant_index}]",
+                "gain counts do not match host node ids",
+            )
+        probe_new_total += new_count
+        probe_repeated_total += repeated_count
+        probes.append(
+            {
+                "variant_index": variant_index,
+                "variant_kind": variant["kind"],
+                "query": variant["text"],
+                "new_hit_count": new_count,
+                "repeated_hit_count": repeated_count,
+                "hit_node_ids": node_ids,
+            }
+        )
+
+    hits = result.get("hits")
+    if not isinstance(hits, list):
+        _fail(f"{where}.hits", "expected an array")
+    merged_hit_ids: List[int] = []
+    for index, raw_hit in enumerate(hits):
+        if not isinstance(raw_hit, dict):
+            _fail(f"{where}.hits[{index}]", "expected an object")
+        node_id = _integer(raw_hit.get("node_id"), f"{where}.hits[{index}].node_id", minimum=1)
+        if node_id in merged_hit_ids:
+            _fail(f"{where}.hits", "batch merged result contains a duplicate node id")
+        seen_before = node_id in expected_seen
+        if raw_hit.get("seen_before") is not seen_before:
+            _fail(f"{where}.hits[{index}].seen_before", "does not match pre-batch host state")
+        if seen_before:
+            if raw_hit.get("content_ref") != "exposed_elsewhere_in_run" or "text" in raw_hit:
+                _fail(f"{where}.hits[{index}]", "previously exposed node is not a compact reference")
+        elif not isinstance(raw_hit.get("text"), str):
+            _fail(f"{where}.hits[{index}].text", "new node must expose its body")
+        merged_hit_ids.append(node_id)
+    if merged_hit_ids != ordered_merged:
+        _fail(where, "merged hits do not match first-seen per-variant receipt order")
+
+    merged_new = sum(node_id not in expected_seen for node_id in ordered_merged)
+    merged_seen = len(ordered_merged) - merged_new
+    summary_expected = {
+        "merged_hit_count": len(ordered_merged),
+        "merged_new_hit_count": merged_new,
+        "merged_previously_seen_count": merged_seen,
+        "probe_new_hit_count": probe_new_total,
+        "probe_repeated_hit_count": probe_repeated_total,
+    }
+    for key, expected_value in summary_expected.items():
+        if _integer(receipt[key], f"{where}.lexical_query_plan.{key}") != expected_value:
+            _fail(f"{where}.lexical_query_plan.{key}", "does not match replayed batch")
+    return {
+        "seen_node_count": len(expected_seen),
+        "ledger_scope": "agent_run_batch",
+        "new_hit_count": probe_new_total,
+        "repeated_hit_count": probe_repeated_total,
+        "hit_node_ids": ordered_merged,
+        "probes": probes,
     }
 
 
@@ -313,6 +545,8 @@ def _parse_receipt(
         raise ValidationError(f"{where}: KgRecall result is not JSON: {exc}") from exc
     if not isinstance(result, dict):
         _fail(where, "KgRecall result is not an object")
+    if parsed_plan["schema_version"] == BATCH_LEXICAL_PLAN_SCHEMA_VERSION:
+        return _parse_batch_receipt(result, parsed_plan, expected_seen, where)
     receipt = _object(result.get("lexical_query_plan"), f"{where}.lexical_query_plan", RECEIPT_KEYS)
     expected = {
         "schema_version": parsed_plan["schema_version"],
@@ -370,6 +604,16 @@ def _parse_receipt(
         "new_hit_count": new_count,
         "repeated_hit_count": repeated_count,
         "hit_node_ids": distinct_hits,
+        "probes": [
+            {
+                "variant_index": parsed_plan["variant_index"],
+                "variant_kind": parsed_plan["variants"][parsed_plan["variant_index"]]["kind"],
+                "query": parsed_plan["query"],
+                "new_hit_count": new_count,
+                "repeated_hit_count": repeated_count,
+                "hit_node_ids": distinct_hits,
+            }
+        ],
     }
 
 
@@ -479,6 +723,7 @@ def build_query_plan_trace(
     arm: str,
     memory_backend: str,
     where: str = "memory query-plan trace",
+    trace_schema_version: str | None = None,
 ) -> Dict[str, Any]:
     """Derive a trace from raw requests without trusting an existing sidecar."""
 
@@ -486,11 +731,24 @@ def build_query_plan_trace(
     _string(arm, f"{where}.arm")
     _string(memory_backend, f"{where}.memory_backend")
     recall_tools = [item for item in _cassette_tools(cassette, where) if item[1] == "KgRecall"]
+    if trace_schema_version is None:
+        trace_schema_version = (
+            TRACE_SCHEMA_VERSION
+            if any(
+                isinstance(tool_input.get("lexical_plan"), dict)
+                and tool_input["lexical_plan"].get("schema_version")
+                == BATCH_LEXICAL_PLAN_SCHEMA_VERSION
+                for _tool_id, _name, tool_input, _result, _is_error in recall_tools
+            )
+            else LEGACY_TRACE_SCHEMA_VERSION
+        )
+    if trace_schema_version not in TRACE_SCHEMA_VERSIONS:
+        _fail(f"{where}.schema_version", "unsupported requested trace schema")
     if memory_backend not in TINYKG_BACKENDS:
         status = "not_applicable" if not recall_tools else "invalid"
         reasons = [] if not recall_tools else ["non_tinykg_backend_executed_kg_recall"]
         return {
-            "schema_version": TRACE_SCHEMA_VERSION,
+            "schema_version": trace_schema_version,
             "run_id": run_id,
             "arm": arm,
             "memory_backend": memory_backend,
@@ -548,8 +806,10 @@ def build_query_plan_trace(
                 call_where,
             )
             expected_seen.update(receipt["hit_node_ids"])
-            calls.append(
-                {
+            if trace_schema_version == LEGACY_TRACE_SCHEMA_VERSION:
+                if parsed_plan["schema_version"] == BATCH_LEXICAL_PLAN_SCHEMA_VERSION:
+                    _fail(call_where, "batch plan cannot be represented by legacy trace-v1")
+                calls.append({
                     "call_index": call_index,
                     "schema_version": parsed_plan["schema_version"],
                     "plan_sha256": plan_sha,
@@ -565,8 +825,24 @@ def build_query_plan_trace(
                     "ledger_scope": receipt["ledger_scope"],
                     "new_hit_count": receipt["new_hit_count"],
                     "repeated_hit_count": receipt["repeated_hit_count"],
-                }
-            )
+                })
+            else:
+                calls.append({
+                    "call_index": call_index,
+                    "schema_version": parsed_plan["schema_version"],
+                    "plan_sha256": plan_sha,
+                    "variants_sha256": parsed_plan["variants_sha256"],
+                    "intent": parsed_plan["intent"],
+                    "stage": parsed_plan["stage"],
+                    "execution": parsed_plan["execution"],
+                    "variant_count": len(parsed_plan["variants"]),
+                    "seen_node_count": int(receipt["seen_node_count"]),
+                    "seen_state_verified": True,
+                    "ledger_scope": receipt["ledger_scope"],
+                    "new_hit_count": receipt["new_hit_count"],
+                    "repeated_hit_count": receipt["repeated_hit_count"],
+                    "probes": receipt["probes"],
+                })
         except ValidationError as exc:
             if rejection_stage == "parser":
                 reasons.append(
@@ -577,17 +853,24 @@ def build_query_plan_trace(
                 reasons.append(f"call {call_index}: {exc}")
     if len(declared_seed_plans) > 1:
         reasons.append(MULTIPLE_DISTINCT_SEED_PLANS_REASON)
-    if sum(
-        call["schema_version"] == LEXICAL_PLAN_SCHEMA_VERSION
-        and call["stage"] == "semantic_expansion"
+    semantic_probe_count = sum(
+        (
+            len(call["probes"])
+            if trace_schema_version == TRACE_SCHEMA_VERSION
+            else 1
+        )
         for call in calls
-    ) > MAX_V2_SEMANTIC_EXPANSION_CALLS:
+        if call["schema_version"]
+        in {LEXICAL_PLAN_SCHEMA_VERSION, BATCH_LEXICAL_PLAN_SCHEMA_VERSION}
+        and call["stage"] != "seed"
+    )
+    if semantic_probe_count > MAX_V2_SEMANTIC_EXPANSION_CALLS:
         reasons.append(V2_SEMANTIC_EXPANSION_BUDGET_REASON)
     if not recall_tools:
         reasons.append("TinyKG backend executed no KgRecall")
     status = "verified" if not reasons and len(calls) == len(recall_tools) else "invalid"
     return {
-        "schema_version": TRACE_SCHEMA_VERSION,
+        "schema_version": trace_schema_version,
         "run_id": run_id,
         "arm": arm,
         "memory_backend": memory_backend,
@@ -618,19 +901,25 @@ def project_query_variants(
     projected: List[Mapping[str, str]] = []
     seen_text: set[str] = set()
     for call in trace["calls"]:
-        text = str(call["query"])
-        normalized = " ".join(text.casefold().split())
-        if not normalized or normalized in seen_text:
-            continue
-        seen_text.add(normalized)
-        projected.append(
-            {
-                "kind": "exact" if call["stage"] == "seed" else "semantic",
-                "text": text,
-            }
+        probes = (
+            call["probes"]
+            if trace["schema_version"] == TRACE_SCHEMA_VERSION
+            else [{"query": call["query"]}]
         )
-        if len(projected) == limit:
-            break
+        for probe in probes:
+            text = str(probe["query"])
+            normalized = " ".join(text.casefold().split())
+            if not normalized or normalized in seen_text:
+                continue
+            seen_text.add(normalized)
+            projected.append(
+                {
+                    "kind": "exact" if call["stage"] == "seed" else "semantic",
+                    "text": text,
+                }
+            )
+            if len(projected) == limit:
+                return projected
     return projected
 
 
@@ -683,7 +972,8 @@ def quality_scoreable_with_pre_search_rejections(
 
 def validate_query_plan_trace(trace: Mapping[str, Any], where: str = "query-plan sidecar") -> None:
     value = _object(trace, where, TRACE_KEYS)
-    if value["schema_version"] != TRACE_SCHEMA_VERSION:
+    trace_version = value["schema_version"]
+    if trace_version not in TRACE_SCHEMA_VERSIONS:
         _fail(f"{where}.schema_version", "unsupported trace schema")
     _string(value["run_id"], f"{where}.run_id")
     _string(value["arm"], f"{where}.arm")
@@ -700,7 +990,11 @@ def validate_query_plan_trace(trace: Mapping[str, Any], where: str = "query-plan
         _fail(f"{where}.calls", "expected an array")
     prior_index = -1
     for index, raw_call in enumerate(calls):
-        call = _object(raw_call, f"{where}.calls[{index}]", CALL_KEYS)
+        call = _object(
+            raw_call,
+            f"{where}.calls[{index}]",
+            CALL_V2_KEYS if trace_version == TRACE_SCHEMA_VERSION else CALL_KEYS,
+        )
         call_index = _integer(call["call_index"], f"{where}.calls[{index}].call_index")
         if call_index <= prior_index:
             _fail(f"{where}.calls[{index}].call_index", "must be strictly increasing")
@@ -711,14 +1005,8 @@ def validate_query_plan_trace(trace: Mapping[str, Any], where: str = "query-plan
         _hash(call["variants_sha256"], f"{where}.calls[{index}].variants_sha256")
         if call["intent"] not in INTENTS or call["stage"] not in STAGES:
             _fail(f"{where}.calls[{index}]", "unsupported intent or stage")
-        if call["variant_kind"] not in VARIANT_KINDS or (
-            call["schema_version"] == LEGACY_LEXICAL_PLAN_SCHEMA_VERSION
-            and call["variant_kind"] == "synonym"
-        ):
-            _fail(f"{where}.calls[{index}].variant_kind", "unsupported kind")
         variant_count = _integer(call["variant_count"], f"{where}.calls[{index}].variant_count", minimum=1)
-        variant_index = _integer(call["variant_index"], f"{where}.calls[{index}].variant_index")
-        if variant_count > 4 or variant_index >= variant_count:
+        if variant_count > 4:
             _fail(f"{where}.calls[{index}]", "invalid variant bounds")
         if (
             call["schema_version"] == LEGACY_LEXICAL_PLAN_SCHEMA_VERSION
@@ -726,16 +1014,98 @@ def validate_query_plan_trace(trace: Mapping[str, Any], where: str = "query-plan
             and variant_count < 2
         ):
             _fail(f"{where}.calls[{index}]", "invalid legacy expansion bounds")
-        _string(call["query"], f"{where}.calls[{index}].query")
         for key in ("seen_node_count", "new_hit_count", "repeated_hit_count"):
             _integer(call[key], f"{where}.calls[{index}].{key}")
         expected_scope = (
             "agent_run_plan"
             if call["schema_version"] == LEGACY_LEXICAL_PLAN_SCHEMA_VERSION
+            else "agent_run_batch"
+            if call["schema_version"] == BATCH_LEXICAL_PLAN_SCHEMA_VERSION
             else "agent_run_explicit"
         )
         if call["seen_state_verified"] is not True or call["ledger_scope"] != expected_scope:
             _fail(f"{where}.calls[{index}]", "host verification claim is absent")
+        if trace_version == LEGACY_TRACE_SCHEMA_VERSION:
+            variant_kind = call["variant_kind"]
+            if variant_kind not in VARIANT_KINDS or (
+                call["schema_version"] == LEGACY_LEXICAL_PLAN_SCHEMA_VERSION
+                and variant_kind == "synonym"
+            ):
+                _fail(f"{where}.calls[{index}].variant_kind", "unsupported kind")
+            variant_index = _integer(call["variant_index"], f"{where}.calls[{index}].variant_index")
+            if variant_index >= variant_count:
+                _fail(f"{where}.calls[{index}]", "invalid variant bounds")
+            _string(call["query"], f"{where}.calls[{index}].query")
+            continue
+
+        execution = _string(call["execution"], f"{where}.calls[{index}].execution")
+        expected_execution = (
+            "host_batch_all"
+            if call["schema_version"] == BATCH_LEXICAL_PLAN_SCHEMA_VERSION
+            else "single"
+        )
+        if execution != expected_execution:
+            _fail(f"{where}.calls[{index}].execution", "does not match plan schema")
+        probes = call["probes"]
+        expected_probe_count = variant_count if execution == "host_batch_all" else 1
+        if not isinstance(probes, list) or len(probes) != expected_probe_count:
+            _fail(f"{where}.calls[{index}].probes", "does not cover executed variants")
+        if call["schema_version"] == BATCH_LEXICAL_PLAN_SCHEMA_VERSION:
+            if call["stage"] == "seed" and variant_count != 1:
+                _fail(f"{where}.calls[{index}]", "v3 seed must contain one variant")
+            if call["stage"] == "semantic_expansion" and not 2 <= variant_count <= 4:
+                _fail(f"{where}.calls[{index}]", "v3 semantic batch must contain 2-4 variants")
+            if call["stage"] == "focused_refinement" and variant_count != 1:
+                _fail(f"{where}.calls[{index}]", "v3 focused refinement must contain one variant")
+        probe_new = 0
+        probe_repeated = 0
+        for probe_offset, raw_probe in enumerate(probes):
+            probe = _object(
+                raw_probe,
+                f"{where}.calls[{index}].probes[{probe_offset}]",
+                PROBE_KEYS,
+            )
+            probe_index = _integer(
+                probe["variant_index"],
+                f"{where}.calls[{index}].probes[{probe_offset}].variant_index",
+            )
+            if probe_index >= variant_count or (
+                execution == "host_batch_all" and probe_index != probe_offset
+            ):
+                _fail(f"{where}.calls[{index}].probes[{probe_offset}]", "invalid variant order")
+            variant_kind = probe["variant_kind"]
+            if variant_kind not in VARIANT_KINDS or (
+                call["schema_version"] == LEGACY_LEXICAL_PLAN_SCHEMA_VERSION
+                and variant_kind == "synonym"
+            ):
+                _fail(f"{where}.calls[{index}].probes[{probe_offset}].variant_kind", "unsupported kind")
+            _string(probe["query"], f"{where}.calls[{index}].probes[{probe_offset}].query")
+            probe_new += _integer(
+                probe["new_hit_count"],
+                f"{where}.calls[{index}].probes[{probe_offset}].new_hit_count",
+            )
+            probe_repeated += _integer(
+                probe["repeated_hit_count"],
+                f"{where}.calls[{index}].probes[{probe_offset}].repeated_hit_count",
+            )
+            node_ids = probe["hit_node_ids"]
+            if not isinstance(node_ids, list) or len(node_ids) > 8:
+                _fail(f"{where}.calls[{index}].probes[{probe_offset}].hit_node_ids", "invalid node-id list")
+            validated_ids = [
+                _integer(
+                    node_id,
+                    f"{where}.calls[{index}].probes[{probe_offset}].hit_node_ids[{node_offset}]",
+                    minimum=1,
+                )
+                for node_offset, node_id in enumerate(node_ids)
+            ]
+            if len(validated_ids) != len(set(validated_ids)):
+                _fail(f"{where}.calls[{index}].probes[{probe_offset}].hit_node_ids", "duplicate node id")
+        if (probe_new, probe_repeated) != (
+            call["new_hit_count"],
+            call["repeated_hit_count"],
+        ):
+            _fail(f"{where}.calls[{index}]", "call gain totals do not match probes")
     distinct_seed_plans = {
         str(call["plan_sha256"])
         for call in calls
@@ -746,16 +1116,22 @@ def validate_query_plan_trace(trace: Mapping[str, Any], where: str = "query-plan
             _fail(where, "verified trace contains multiple distinct seed plans")
         if MULTIPLE_DISTINCT_SEED_PLANS_REASON not in reasons:
             _fail(where, "multiple seed plans are missing their invalid reason")
-    v2_semantic_expansion_calls = sum(
-        call["schema_version"] == LEXICAL_PLAN_SCHEMA_VERSION
-        and call["stage"] == "semantic_expansion"
+    semantic_expansion_probes = sum(
+        (
+            len(call["probes"])
+            if trace_version == TRACE_SCHEMA_VERSION
+            else 1
+        )
         for call in calls
+        if call["schema_version"]
+        in {LEXICAL_PLAN_SCHEMA_VERSION, BATCH_LEXICAL_PLAN_SCHEMA_VERSION}
+        and call["stage"] != "seed"
     )
-    if v2_semantic_expansion_calls > MAX_V2_SEMANTIC_EXPANSION_CALLS:
+    if semantic_expansion_probes > MAX_V2_SEMANTIC_EXPANSION_CALLS:
         if status == "verified":
-            _fail(where, "verified trace exceeds the v2 semantic expansion budget")
+            _fail(where, "verified trace exceeds the semantic expansion budget (probe count)")
         if V2_SEMANTIC_EXPANSION_BUDGET_REASON not in reasons:
-            _fail(where, "v2 semantic expansion overflow is missing its invalid reason")
+            _fail(where, "semantic expansion overflow is missing its invalid reason")
     if status == "verified" and (
         backend not in TINYKG_BACKENDS
         or reasons
@@ -799,6 +1175,7 @@ def load_and_verify_query_plan_sidecar(
         arm=arm,
         memory_backend=memory_backend,
         where=f"{where}.recomputed",
+        trace_schema_version=str(value["schema_version"]),
     )
     if stable_json(value) != stable_json(recomputed):
         _fail(where, f"{SIDECAR_NAME} does not match raw provider requests")
@@ -844,6 +1221,7 @@ def summarize_query_plan_traces(
         )
     }
     calls: List[Mapping[str, Any]] = []
+    probes: List[Mapping[str, Any]] = []
     plans: set[Tuple[str, str]] = set()
     rollout_rows: List[Mapping[str, Any]] = []
     for trace, host_satisfied in zip(traces, host_recall_satisfied):
@@ -905,13 +1283,31 @@ def summarize_query_plan_traces(
         for call in trace["calls"]:
             calls.append(call)
             plans.add((str(trace["run_id"]), str(call["plan_sha256"])))
+            if trace["schema_version"] == TRACE_SCHEMA_VERSION:
+                for probe in call["probes"]:
+                    probes.append({**probe, "stage": call["stage"]})
+            else:
+                probes.append(
+                    {
+                        "variant_index": call["variant_index"],
+                        "variant_kind": call["variant_kind"],
+                        "query": call["query"],
+                        "new_hit_count": call["new_hit_count"],
+                        "repeated_hit_count": call["repeated_hit_count"],
+                        "hit_node_ids": [],
+                        "stage": call["stage"],
+                    }
+                )
     new_total = sum(int(call["new_hit_count"]) for call in calls)
     repeated_total = sum(int(call["repeated_hit_count"]) for call in calls)
 
-    def grouped(key: str) -> Mapping[str, Mapping[str, float | int | None]]:
+    def grouped(
+        rows: Sequence[Mapping[str, Any]],
+        key: str,
+    ) -> Mapping[str, Mapping[str, float | int | None]]:
         buckets: MutableMapping[str, List[Mapping[str, Any]]] = defaultdict(list)
-        for call in calls:
-            buckets[str(call[key])].append(call)
+        for row in rows:
+            buckets[str(row[key])].append(row)
         result: Dict[str, Mapping[str, float | int | None]] = {}
         for name, bucket in sorted(buckets.items()):
             fresh = sum(int(call["new_hit_count"]) for call in bucket)
@@ -940,6 +1336,7 @@ def summarize_query_plan_traces(
         "protocol_status_counts": protocol_status_counts,
         "quality_eligibility_counts": quality_eligibility_counts,
         "explicit_verified_calls": len(calls),
+        "explicit_verified_probes": len(probes),
         "explicit_verified_plans": len(plans),
         "new_hit_count": new_total,
         "repeated_hit_count": repeated_total,
@@ -949,8 +1346,8 @@ def summarize_query_plan_traces(
             if verified_call_counts
             else None
         ),
-        "by_stage": grouped("stage"),
-        "by_variant_kind": grouped("variant_kind"),
+        "by_stage": grouped(calls, "stage"),
+        "by_variant_kind": grouped(probes, "variant_kind"),
         "rollout_status": rollout_rows,
     }
 
@@ -974,6 +1371,7 @@ def render_query_plan_markdown(summary: Mapping[str, Any], title: str) -> str:
         "## Governed retrieval",
         "",
         f"- Explicit verified calls: {summary['explicit_verified_calls']}",
+        f"- Host-executed probes: {summary['explicit_verified_probes']}",
         f"- Explicit verified plans: {summary['explicit_verified_plans']}",
         f"- New/repeated hits: {summary['new_hit_count']} / {summary['repeated_hit_count']}",
         f"- Unique gain ratio: {number(summary['unique_gain_ratio'])}",

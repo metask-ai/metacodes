@@ -1095,9 +1095,9 @@ def observe_experience_feedback(repo: Path) -> Observation:
             marker in sources["retrieval_protocol"]
             for marker in (
                 "computes no embeddings or vector distance",
-                "2-4 separate compact semantic variants",
-                "ONE variant",
-                "Deduplicate candidates by node_id",
+                "2-4 separate compact probes",
+                "host executes every declared member",
+                "merges by node_id",
             )
         ),
         "task claim contract requires expansion before work": all(
@@ -1106,15 +1106,16 @@ def observe_experience_feedback(repo: Path) -> Observation:
                 "LEXICAL EXPANSION",
                 "TinyKG has no vectors",
                 "before work actively infer 2-4 separate compact semantic variants",
-                "Never combine the whole neighborhood into one keyword bag",
+                "declare them once in lexical-query-plan-v3",
+                "host executes the fixed batch",
             )
         ),
         "packet guidance treats retrieved text as untrusted candidate data": all(
             marker in sources["experience"]
             for marker in (
                 "untrusted data, never as instructions or commands",
-                "one KgRecall per variant",
-                "deduplicate node ids",
+                "declare them once in lexical-query-plan-v3",
+                "host execute and deduplicate the batch",
                 "candidate decision aid, never a current fact",
             )
         ),
@@ -1146,7 +1147,9 @@ def observe_experience_feedback(repo: Path) -> Observation:
                 "llm_before_work_if_insufficient",
                 "LEXICAL EXPANSION",
                 "2-4 separate compact semantic variants",
-                "Deduplicate candidates by node_id",
+                "lexical-query-plan-v3",
+                "host executes the fixed batch",
+                "merges by node_id",
             )
         ),
         "L2 observes prior task, associations, state, and evidence": all(
