@@ -202,6 +202,10 @@ tool_result 回灌为 user 消息 → 下一轮。直到无 tool_use(`end_turn`)
 失存储时的显式不可恢复兜底。已提交的 recovery envelope 不在后续 provider 请求前重新投影，
 避免无意义破坏 prompt-cache 前缀。
 
+真实 rollout 的非敏感证据用 `scripts/eval/tool_result_projection_eval.py <cassette>
+--headless-result <result.ndjson> --time-file <time.txt>` 导出；报告只含尺寸、hash、usage、
+恢复/前缀判定和时延，原始 cassette、artifact 与模型文本必须留在隔离本地目录。
+
 ### 4.1 Options(全可选,`.{}` 即最简跑)
 
 ~45 字段,分四类——理解分类比记字段重要:
