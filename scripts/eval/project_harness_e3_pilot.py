@@ -477,6 +477,7 @@ def _run_one(
     receipt_schema: str | None = None,
     run_authorization: Mapping[str, Any] | None = None,
     factorial_treatment: FactorialRuntimeTreatment | None = None,
+    quality_evidence_eligible: bool = True,
 ) -> Mapping[str, Any]:
     sequence = int(schedule["sequence"])
     arm = str(schedule["arm"])
@@ -1102,9 +1103,15 @@ def _run_one(
     receipt: Mapping[str, Any] = {
         "schema_version": receipt_schema or rollout_schema_for_manifest(manifest),
         "evidence_level": (
-            "E3-paid-model-rollout" if test_base_url is None else "E2-loopback-runner-boundary"
+            (
+                "E3-paid-model-rollout"
+                if quality_evidence_eligible
+                else "paid-model-wiring-calibration"
+            )
+            if test_base_url is None
+            else "E2-loopback-runner-boundary"
         ),
-        "quality_evidence": test_base_url is None,
+        "quality_evidence": test_base_url is None and quality_evidence_eligible,
         "auto_memory_policy": (
             FACTORIAL_AUTO_MEMORY_POLICY
             if factorial_treatment is not None

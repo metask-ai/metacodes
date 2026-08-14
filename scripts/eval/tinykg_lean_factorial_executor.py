@@ -9,18 +9,34 @@ presence of an already verified active project-rule bundle.
 
 from __future__ import annotations
 
+import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import stat
+import sys
 from typing import Any, Mapping, Sequence
 
-from .attribution_protocol import EXPECTED_CELLS, PROTOCOL_ID
+from .attribution_protocol import CELL_IDS, EXPECTED_CELLS, PROTOCOL_ID
 from .e2e_adapter import _native_trace_metrics
-from .memory_budget_journal import BudgetJournal, usd_to_microusd_ceiling
-from .memory_replay import _artifact_tree_digest
+from .memory_agent_runtime import (
+    _assert_executable_identity,
+    _assert_production_secret_absent,
+    _project_domain,
+    _replace_private_file,
+)
+from .memory_agent_runtime_pilot import _load_api_key
+from .memory_benchmark import file_sha256
+from .memory_budget_journal import (
+    BudgetAuthority,
+    BudgetJournal,
+    usd_to_microusd,
+    usd_to_microusd_ceiling,
+)
+from .memory_replay import PRODUCTION_PROVIDER_ID, _artifact_tree_digest
 from .model import ValidationError, stable_json
 from .project_harness_e3_experiment import (
     E3Error,
@@ -28,12 +44,14 @@ from .project_harness_e3_experiment import (
     _validate_committed_budget_receipt,
     analyze_journal,
     grade_workspace,
+    validate_manifest,
 )
 from .project_harness_e3_pilot import (
     FactorialRuntimeTreatment,
     _run_one,
 )
 from .project_harness_evolution import _sha256_file
+from .project_harness_e3_templates import verify_templates
 from .tinykg_lean_factorial import (
     REFERENCE_SCHEMA,
     ROLLOUT_SCHEMA,
@@ -42,6 +60,10 @@ from .tinykg_lean_factorial import (
 
 SOURCE_SCHEMA = "metacodes-tinykg-lean-factorial-source-v1"
 EXECUTOR_SCHEMA = "metacodes-tinykg-lean-factorial-executor-v1"
+CALIBRATION_CHECKPOINT_SCHEMA = "metacodes-tinykg-lean-factorial-calibration-checkpoint-v1"
+CALIBRATION_SUMMARY_SCHEMA = "metacodes-tinykg-lean-factorial-calibration-summary-v1"
+CALIBRATION_PREFLIGHT_SCHEMA = "metacodes-tinykg-lean-factorial-calibration-preflight-v1"
+CALIBRATION_CELLS = ("control", "memory_only", "combined", "lean_only")
 MAX_JSON_BYTES = 64 * 1024 * 1024
 _TINYKG_DYNAMIC_SECTION = re.compile(
     r"(?ms)^# (?:Memory|Knowledge Graph|Deferred tools)\n.*?"
@@ -50,6 +72,27 @@ _TINYKG_DYNAMIC_SECTION = re.compile(
 _DEFERRED_SECTION = re.compile(
     r"(?ms)^# Deferred tools\n(.*?)(?:\n\n(?=^# )|\Z)"
 )
+
+
+@dataclass(frozen=True)
+class CalibrationContext:
+    repo: Path
+    manifest: Mapping[str, Any]
+    templates: Mapping[str, Any]
+    case: Mapping[str, Any]
+    root: Path
+    workspace: Path
+    run_dir: Path
+    budget_path: Path
+    ripgrep: Path
+    ripgrep_sha256: str
+    tinykg_binary: Path
+    tinykg_sha256: str
+    seed_batch: bytes
+    recall_query: str
+    identity: Mapping[str, Any]
+    schedules: tuple[Mapping[str, Any], ...]
+    authority: BudgetAuthority
 
 
 def _fail(where: str, detail: str) -> None:
@@ -474,6 +517,7 @@ def execute_cell(
     seed_batch: bytes,
     recall_query: str,
     test_base_url: str | None = None,
+    quality_evidence_eligible: bool = True,
 ) -> Mapping[str, Any]:
     cell = str(schedule["cell"])
     try:
@@ -512,6 +556,7 @@ def execute_cell(
             test_base_url=test_base_url,
             receipt_schema=SOURCE_SCHEMA,
             factorial_treatment=treatment,
+            quality_evidence_eligible=quality_evidence_eligible,
         )
     except (E3Error, ValidationError) as exc:
         raise type(exc)(f"factorial cell {cell}: {exc}") from exc
@@ -522,6 +567,8 @@ def execute_cell(
         schedule=schedule,
         budget_journal=budget,
     )
+    if not quality_evidence_eligible:
+        projection = {**projection, "quality_evidence": False}
     persisted = persist_projection(projection=projection, run_dir=run_dir)
     return {**persisted, "source": source_item}
 
@@ -562,3 +609,772 @@ def persist_references(
     ).encode("utf-8")
     _write_private(path, payload)
     return path
+
+
+def _calibration_schedules(case_id: str) -> tuple[Mapping[str, Any], ...]:
+    if not case_id:
+        _fail("factorial calibration", "case id is empty")
+    return tuple(
+        {
+            "sequence": sequence,
+            "case_id": case_id,
+            "position": sequence,
+            "cell": cell,
+        }
+        for sequence, cell in enumerate(CALIBRATION_CELLS)
+    )
+
+
+def _calibration_seed(
+    *, case: Mapping[str, Any], workspace: Path
+) -> tuple[bytes, str]:
+    case_id = str(case["id"])
+    query = f"{case_id} factorial calibration marker isolated TinyKG recall"
+    decision = (
+        f"{query}. This synthetic marker proves only that the isolated local TinyKG "
+        "treatment was recalled for the scheduled cell. It is not a task instruction, "
+        "does not contain an expected answer, and is not quality evidence."
+    )
+    rows = (
+        {"version": 1},
+        {
+            "op": "node",
+            "id": 1,
+            "kind": "project",
+            "name": _project_domain(workspace),
+        },
+        {"op": "node", "id": 2, "kind": "decision", "name": decision},
+        {"op": "edge", "id": 1, "src": 1, "rel": "contain", "dst": 2},
+    )
+    payload = ("\n".join(stable_json(row) for row in rows) + "\n").encode("utf-8")
+    return payload, query
+
+
+def _calibration_identity(
+    *,
+    manifest: Mapping[str, Any],
+    case_id: str,
+    tinykg_sha256: str,
+    ripgrep_sha256: str,
+    seed_batch: bytes,
+    recall_query: str,
+) -> Mapping[str, Any]:
+    body = {
+        "schema_version": EXECUTOR_SCHEMA,
+        "manifest_id": manifest["manifest_id"],
+        "manifest_sha256": _canonical_sha256(manifest),
+        "repository_commit": manifest["repository"]["commit"],
+        "case_id": case_id,
+        "schedule": list(_calibration_schedules(case_id)),
+        "tinykg_binary_sha256": tinykg_sha256,
+        "ripgrep_binary_sha256": ripgrep_sha256,
+        "seed_batch_sha256": hashlib.sha256(seed_batch).hexdigest(),
+        "recall_query": recall_query,
+    }
+    return {**body, "calibration_id": _canonical_sha256(body)}
+
+
+def _relative_to_run(path: Path, run_dir: Path, where: str) -> str:
+    try:
+        return path.resolve(strict=True).relative_to(run_dir.resolve(strict=True)).as_posix()
+    except (OSError, ValueError) as exc:
+        _fail(where, f"escaped the run directory: {exc}")
+
+
+def _checkpoint_value(
+    *,
+    identity: Mapping[str, Any],
+    completed: Sequence[Mapping[str, Any]],
+    budget: BudgetJournal,
+    references: Mapping[str, Any] | None,
+) -> Mapping[str, Any]:
+    snapshot = budget.snapshot()
+    return {
+        "schema_version": CALIBRATION_CHECKPOINT_SCHEMA,
+        "identity": dict(identity),
+        "completed": list(completed),
+        "references": dict(references) if references is not None else None,
+        "budget_journal_id": snapshot["journal_id"],
+        "budget_revision": snapshot["revision"],
+        "budget_head_sha256": snapshot["head_sha256"],
+    }
+
+
+def _persist_checkpoint(
+    *,
+    path: Path,
+    identity: Mapping[str, Any],
+    completed: Sequence[Mapping[str, Any]],
+    budget: BudgetJournal,
+    references: Mapping[str, Any] | None,
+) -> None:
+    payload = (
+        stable_json(
+            _checkpoint_value(
+                identity=identity,
+                completed=completed,
+                budget=budget,
+                references=references,
+            )
+        )
+        + "\n"
+    ).encode("utf-8")
+    _replace_private_file(path, payload)
+
+
+def _checkpoint_entry(result: Mapping[str, Any], run_dir: Path) -> Mapping[str, Any]:
+    source = result.get("source")
+    if not isinstance(source, Mapping):
+        _fail("factorial calibration checkpoint", "source receipt is missing")
+    return {
+        "sequence": int(result["sequence"]),
+        "cell": str(result["projection"]["cell"]),
+        "receipt_path": _relative_to_run(
+            Path(str(result["path"])), run_dir, "factorial calibration receipt"
+        ),
+        "receipt_sha256": str(result["sha256"]),
+        "source_receipt_path": _relative_to_run(
+            Path(str(source["receipt_path"])),
+            run_dir,
+            "factorial calibration source receipt",
+        ),
+        "source_receipt_sha256": str(source["receipt_sha256"]),
+    }
+
+
+def _reopen_completed(
+    *,
+    entry: Mapping[str, Any],
+    schedule: Mapping[str, Any],
+    run_dir: Path,
+    manifest: Mapping[str, Any],
+    budget: BudgetJournal,
+) -> Mapping[str, Any]:
+    if (
+        set(entry)
+        != {
+            "sequence",
+            "cell",
+            "receipt_path",
+            "receipt_sha256",
+            "source_receipt_path",
+            "source_receipt_sha256",
+        }
+        or entry.get("sequence") != schedule["sequence"]
+        or entry.get("cell") != schedule["cell"]
+    ):
+        _fail("factorial calibration checkpoint", "completed prefix drift")
+    source_item = {
+        "receipt_path": str(run_dir / str(entry["source_receipt_path"])),
+        "receipt_sha256": entry["source_receipt_sha256"],
+    }
+    projection = build_projection(
+        item=source_item,
+        run_dir=run_dir,
+        manifest=manifest,
+        schedule=schedule,
+        budget_journal=budget,
+    )
+    projection = {**projection, "quality_evidence": False}
+    receipt_path = run_dir / str(entry["receipt_path"])
+    payload = _read_regular(
+        receipt_path,
+        root=run_dir,
+        where="factorial calibration projected receipt",
+    )
+    if hashlib.sha256(payload).hexdigest() != entry["receipt_sha256"]:
+        _fail("factorial calibration projected receipt", "SHA-256 drift")
+    receipt = _json(payload, "factorial calibration projected receipt")
+    if (
+        set(receipt)
+        != {
+            "schema_version",
+            "protocol_id",
+            "projection_sha256",
+            "host_reopened_source_evidence",
+            "raw_artifacts_local_only",
+            "projection",
+        }
+        or receipt.get("schema_version") != ROLLOUT_SCHEMA
+        or receipt.get("protocol_id") != PROTOCOL_ID
+        or receipt.get("projection_sha256")
+        != hashlib.sha256(stable_json(projection).encode("utf-8")).hexdigest()
+        or receipt.get("host_reopened_source_evidence") is not True
+        or receipt.get("raw_artifacts_local_only") is not True
+        or stable_json(receipt.get("projection")) != stable_json(projection)
+    ):
+        _fail("factorial calibration projected receipt", "projection replay drift")
+    return {
+        "sequence": schedule["sequence"],
+        "path": receipt_path,
+        "sha256": entry["receipt_sha256"],
+        "projection": projection,
+        "source": source_item,
+    }
+
+
+def _validate_calibration_projections(
+    rows: Sequence[Mapping[str, Any]],
+) -> None:
+    if (
+        len(rows) != len(CELL_IDS)
+        or {str(row.get("cell")) for row in rows} != set(CELL_IDS)
+        or [int(row.get("sequence", -1)) for row in rows]
+        != list(range(len(CELL_IDS)))
+    ):
+        _fail("factorial calibration", "cell set is incomplete or reordered")
+    by_cell = {str(row["cell"]): row for row in rows}
+    if len({row["identity"]["tool_schema_sha256"] for row in rows}) != 1:
+        _fail("factorial calibration", "provider tool schema drift")
+    if len({row["identity"]["stable_core_prefix_sha256"] for row in rows}) != 1:
+        _fail("factorial calibration", "stable provider prefix drift")
+    for left, right in (("control", "lean_only"), ("memory_only", "combined")):
+        if (
+            by_cell[left]["identity"]["first_request_sha256"]
+            != by_cell[right]["identity"]["first_request_sha256"]
+        ):
+            _fail("factorial calibration", "Lean changed the first provider request")
+    for cell in ("control", "lean_only"):
+        if by_cell[cell]["usage"]["memory_exposed_tokens"] != 0:
+            _fail("factorial calibration", "TinyKG-off cell exposed memory")
+    for cell in ("memory_only", "combined"):
+        if by_cell[cell]["usage"]["memory_exposed_tokens"] <= 0:
+            _fail("factorial calibration", "TinyKG-on cell exposed no memory")
+    for cell in ("lean_only", "combined"):
+        if by_cell[cell]["treatment"]["lean"]["checker_calls"] <= 0:
+            _fail("factorial calibration", "Lean-on cell called no checker")
+    if any(row.get("quality_evidence") is not False for row in rows):
+        _fail("factorial calibration", "calibration row entered the quality-evidence path")
+
+
+def _validate_paid_calibration_sources(
+    results: Sequence[Mapping[str, Any]], *, run_dir: Path
+) -> None:
+    for index, result in enumerate(results):
+        source_item = result.get("source")
+        if not isinstance(source_item, Mapping):
+            _fail("factorial calibration source", f"row {index} has no source receipt")
+        source_path = Path(str(source_item.get("receipt_path", "")))
+        payload = _read_regular(
+            source_path,
+            root=run_dir,
+            where=f"factorial calibration source {index}",
+        )
+        if hashlib.sha256(payload).hexdigest() != source_item.get("receipt_sha256"):
+            _fail("factorial calibration source", f"row {index} SHA-256 drift")
+        source = _json(payload, f"factorial calibration source {index}")
+        projection = result.get("projection")
+        usage = projection.get("usage") if isinstance(projection, Mapping) else None
+        if (
+            source.get("schema_version") != SOURCE_SCHEMA
+            or source.get("evidence_level") != "paid-model-wiring-calibration"
+            or source.get("quality_evidence") is not False
+            or not isinstance(source.get("provider_requests"), int)
+            or int(source["provider_requests"]) <= 0
+            or not isinstance(usage, Mapping)
+            or int(usage.get("cost_microusd", 0)) <= 0
+            or int(usage.get("metered_tokens", 0)) <= 0
+            or int(usage.get("provider_requests", 0)) <= 0
+        ):
+            _fail(
+                "factorial calibration source",
+                f"row {index} is not a real paid provider rollout",
+            )
+
+
+def _reopen_references(
+    *,
+    info: Mapping[str, Any],
+    results: Sequence[Mapping[str, Any]],
+    run_dir: Path,
+) -> Path:
+    if set(info) != {"path", "sha256"}:
+        _fail("factorial calibration references", "checkpoint field drift")
+    relative = info.get("path")
+    if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+        _fail("factorial calibration references", "path must be relative")
+    path = run_dir / relative
+    payload = _read_regular(
+        path,
+        root=run_dir,
+        where="factorial calibration references",
+    )
+    if hashlib.sha256(payload).hexdigest() != info.get("sha256"):
+        _fail("factorial calibration references", "SHA-256 drift")
+    references = _json(payload, "factorial calibration references")
+    rows = references.get("receipts")
+    if (
+        set(references) != {"schema_version", "protocol_id", "receipts"}
+        or references.get("schema_version") != REFERENCE_SCHEMA
+        or references.get("protocol_id") != PROTOCOL_ID
+        or not isinstance(rows, list)
+        or len(rows) != len(results)
+    ):
+        _fail("factorial calibration references", "schema or receipt-set drift")
+    for index, (row, result) in enumerate(zip(rows, results)):
+        if not isinstance(row, Mapping) or set(row) != {"sequence", "path", "sha256"}:
+            _fail("factorial calibration references", f"row {index} field drift")
+        expected_path = _relative_to_run(
+            Path(str(result["path"])),
+            run_dir,
+            f"factorial calibration result {index}",
+        )
+        if (
+            row.get("sequence") != index
+            or row.get("path") != expected_path
+            or row.get("sha256") != result.get("sha256")
+        ):
+            _fail("factorial calibration references", f"row {index} binding drift")
+        receipt_payload = _read_regular(
+            run_dir / expected_path,
+            root=run_dir,
+            where=f"factorial calibration referenced receipt {index}",
+        )
+        if hashlib.sha256(receipt_payload).hexdigest() != row["sha256"]:
+            _fail("factorial calibration references", f"row {index} receipt drift")
+    return path
+
+
+def _validate_private_path_if_present(path: Path, where: str) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        _fail(where, f"cannot inspect: {exc}")
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or (hasattr(os, "geteuid") and info.st_uid != os.geteuid())
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        _fail(where, "must be an owned single-link private regular file")
+
+
+def _prepare_calibration(
+    *,
+    repo: Path,
+    manifest_path: Path,
+    case_id: str,
+    tinykg_binary: Path,
+    ripgrep: Path,
+    run_dir: Path,
+    budget_path: Path,
+    resume: bool,
+) -> CalibrationContext:
+    repo = repo.resolve(strict=True)
+    manifest = validate_manifest(manifest_path.resolve(strict=True), repo)
+    templates = verify_templates(
+        Path(str(manifest["templates_manifest"]["path"])), repo
+    )
+    case_by_id = {
+        str(case["id"]): case
+        for case in manifest["cases"]
+        if isinstance(case, Mapping)
+    }
+    case = case_by_id.get(case_id)
+    if case is None:
+        _fail("factorial calibration", "case is outside the frozen manifest")
+    root = Path(str(manifest["root"])).resolve(strict=True)
+    workspace = Path(str(manifest["project_root"])).resolve(strict=True)
+    run_dir = run_dir.expanduser().absolute()
+    if run_dir.parent.resolve(strict=True) != root:
+        _fail(
+            "factorial calibration",
+            "run directory must be a direct child of the frozen root",
+        )
+    if resume:
+        try:
+            run_info = run_dir.lstat()
+        except OSError as exc:
+            _fail("factorial calibration", f"resume run directory is unavailable: {exc}")
+        if (
+            stat.S_ISLNK(run_info.st_mode)
+            or not stat.S_ISDIR(run_info.st_mode)
+            or (hasattr(os, "geteuid") and run_info.st_uid != os.geteuid())
+            or stat.S_IMODE(run_info.st_mode) & 0o077
+        ):
+            _fail("factorial calibration", "resume requires an owned private real directory")
+    elif run_dir.exists() or run_dir.is_symlink():
+        _fail("factorial calibration", "fresh run directory already exists")
+
+    ripgrep = ripgrep.resolve(strict=True)
+    ripgrep_sha256 = file_sha256(ripgrep)
+    frozen_ripgrep = manifest["artifacts"]["ripgrep"]
+    if (
+        str(ripgrep) != frozen_ripgrep["path"]
+        or ripgrep_sha256 != frozen_ripgrep["sha256"]
+    ):
+        _fail("factorial calibration", "ripgrep artifact drift")
+    _assert_executable_identity(ripgrep, ripgrep_sha256, "factorial ripgrep")
+    tinykg_binary = tinykg_binary.resolve(strict=True)
+    tinykg_sha256 = file_sha256(tinykg_binary)
+    _assert_executable_identity(tinykg_binary, tinykg_sha256, "factorial TinyKG")
+    seed_batch, recall_query = _calibration_seed(case=case, workspace=workspace)
+    identity = _calibration_identity(
+        manifest=manifest,
+        case_id=case_id,
+        tinykg_sha256=tinykg_sha256,
+        ripgrep_sha256=ripgrep_sha256,
+        seed_batch=seed_batch,
+        recall_query=recall_query,
+    )
+    schedules = _calibration_schedules(case_id)
+
+    budget_candidate = budget_path.expanduser().absolute()
+    budget_parent = budget_candidate.parent.resolve(strict=True)
+    parent_info = budget_parent.stat()
+    if (
+        not stat.S_ISDIR(parent_info.st_mode)
+        or (hasattr(os, "geteuid") and parent_info.st_uid != os.geteuid())
+        or stat.S_IMODE(parent_info.st_mode) & 0o022
+    ):
+        _fail("factorial calibration budget", "parent directory is not private and owned")
+    budget_candidate = budget_parent / budget_candidate.name
+    if budget_candidate == run_dir or run_dir in budget_candidate.parents:
+        _fail("factorial calibration", "budget journal must remain outside the run directory")
+    _validate_private_path_if_present(budget_candidate, "factorial calibration budget")
+    _validate_private_path_if_present(
+        budget_candidate.with_name(budget_candidate.name + ".lock"),
+        "factorial calibration budget lock",
+    )
+    temporary = budget_candidate.with_name(budget_candidate.name + ".tmp")
+    if temporary.exists() or temporary.is_symlink():
+        _fail("factorial calibration budget", "incomplete temporary file requires inspection")
+
+    execution = manifest["execution"]
+    total_cost_microusd = usd_to_microusd(execution["max_total_cost_usd"])
+    if total_cost_microusd > usd_to_microusd(2000):
+        _fail("factorial calibration", "frozen authority exceeds the user-approved $2000 cap")
+    authority = BudgetAuthority(
+        manifest_sha256=_canonical_sha256(manifest),
+        model_fingerprint=str(execution["model_fingerprint"]),
+        provider_identity=PRODUCTION_PROVIDER_ID,
+        total_cost_microusd=total_cost_microusd,
+        total_metered_tokens=int(execution["max_total_metered_tokens"]),
+    )
+    authority.validate()
+    return CalibrationContext(
+        repo=repo,
+        manifest=manifest,
+        templates=templates,
+        case=case,
+        root=root,
+        workspace=workspace,
+        run_dir=run_dir,
+        budget_path=budget_candidate,
+        ripgrep=ripgrep,
+        ripgrep_sha256=ripgrep_sha256,
+        tinykg_binary=tinykg_binary,
+        tinykg_sha256=tinykg_sha256,
+        seed_batch=seed_batch,
+        recall_query=recall_query,
+        identity=identity,
+        schedules=schedules,
+        authority=authority,
+    )
+
+
+def _load_checkpoint(path: Path, *, context: CalibrationContext) -> Mapping[str, Any]:
+    _validate_private_path_if_present(path, "factorial calibration checkpoint")
+    checkpoint = _json(
+        _read_regular(
+            path,
+            root=context.run_dir,
+            where="factorial calibration checkpoint",
+        ),
+        "factorial calibration checkpoint",
+    )
+    if (
+        set(checkpoint)
+        != {
+            "schema_version",
+            "identity",
+            "completed",
+            "references",
+            "budget_journal_id",
+            "budget_revision",
+            "budget_head_sha256",
+        }
+        or checkpoint.get("schema_version") != CALIBRATION_CHECKPOINT_SCHEMA
+        or stable_json(checkpoint.get("identity")) != stable_json(context.identity)
+        or not isinstance(checkpoint.get("completed"), list)
+    ):
+        _fail("factorial calibration checkpoint", "identity or field drift")
+    return checkpoint
+
+
+def preflight_calibration(
+    *,
+    repo: Path,
+    manifest_path: Path,
+    case_id: str,
+    tinykg_binary: Path,
+    ripgrep: Path,
+    run_dir: Path,
+    budget_path: Path,
+    resume: bool,
+) -> Mapping[str, Any]:
+    context = _prepare_calibration(
+        repo=repo,
+        manifest_path=manifest_path,
+        case_id=case_id,
+        tinykg_binary=tinykg_binary,
+        ripgrep=ripgrep,
+        run_dir=run_dir,
+        budget_path=budget_path,
+        resume=resume,
+    )
+    completed = 0
+    if resume:
+        checkpoint = _load_checkpoint(
+            context.run_dir / "calibration-checkpoint.json",
+            context=context,
+        )
+        completed = len(checkpoint["completed"])
+        if completed > len(context.schedules):
+            _fail("factorial calibration checkpoint", "completed prefix is too long")
+    return {
+        "schema_version": CALIBRATION_PREFLIGHT_SCHEMA,
+        "calibration_id": context.identity["calibration_id"],
+        "case_id": case_id,
+        "mode": "resume" if resume else "fresh",
+        "completed_cells_observed": completed,
+        "planned_cells": list(CALIBRATION_CELLS),
+        "provider_requests": 0,
+        "credential_read": False,
+        "budget_journal_modified": False,
+        "run_directory_modified": False,
+        "quality_evidence": False,
+        "raw_artifacts_local_only": True,
+        "remote_tinykg_forbidden": True,
+        "budget_authority_cost_microusd": context.authority.total_cost_microusd,
+        "budget_authority_metered_tokens": context.authority.total_metered_tokens,
+    }
+
+
+def run_calibration(
+    *,
+    repo: Path,
+    manifest_path: Path,
+    case_id: str,
+    tinykg_binary: Path,
+    ripgrep: Path,
+    run_dir: Path,
+    budget_path: Path,
+    auth_file: Path,
+    resume: bool,
+) -> Mapping[str, Any]:
+    context = _prepare_calibration(
+        repo=repo,
+        manifest_path=manifest_path,
+        case_id=case_id,
+        tinykg_binary=tinykg_binary,
+        ripgrep=ripgrep,
+        run_dir=run_dir,
+        budget_path=budget_path,
+        resume=resume,
+    )
+    if not resume:
+        context.run_dir.mkdir(mode=0o700)
+        (context.run_dir / "rollouts").mkdir(mode=0o700)
+    checkpoint_path = context.run_dir / "calibration-checkpoint.json"
+    execution = context.manifest["execution"]
+
+    with BudgetJournal(context.budget_path, context.authority) as budget:
+        budget.checkpoint_payload()
+        completed_entries: list[Mapping[str, Any]] = []
+        results: list[Mapping[str, Any]] = []
+        references_info: Mapping[str, Any] | None = None
+        if resume:
+            checkpoint = _load_checkpoint(checkpoint_path, context=context)
+            raw_completed = checkpoint["completed"]
+            completed_entries = list(raw_completed)
+            snapshot = budget.snapshot()
+            if (
+                checkpoint.get("budget_journal_id") != snapshot["journal_id"]
+                or checkpoint.get("budget_revision") != snapshot["revision"]
+                or checkpoint.get("budget_head_sha256") != snapshot["head_sha256"]
+                or snapshot["transaction_states"].get("request_authorized", 0) != 0
+                or snapshot["transaction_states"].get("reserved", 0) != 0
+                or snapshot["transaction_states"].get("committed", 0)
+                != len(completed_entries)
+                or len(completed_entries) > len(context.schedules)
+            ):
+                _fail("factorial calibration checkpoint", "budget or prefix drift")
+            for index, entry in enumerate(completed_entries):
+                if not isinstance(entry, Mapping):
+                    _fail("factorial calibration checkpoint", "invalid completed row")
+                results.append(
+                    _reopen_completed(
+                        entry=entry,
+                        schedule=context.schedules[index],
+                        run_dir=context.run_dir,
+                        manifest=context.manifest,
+                        budget=budget,
+                    )
+                )
+            raw_references = checkpoint.get("references")
+            if raw_references is not None:
+                if not isinstance(raw_references, Mapping):
+                    _fail("factorial calibration checkpoint", "references drift")
+                references_info = dict(raw_references)
+        else:
+            _persist_checkpoint(
+                path=checkpoint_path,
+                identity=context.identity,
+                completed=completed_entries,
+                budget=budget,
+                references=None,
+            )
+
+        pending = context.schedules[len(results) :]
+        if pending:
+            api_key = _load_api_key(auth_file.expanduser().resolve(strict=True))
+            try:
+                for schedule in pending:
+                    result = execute_cell(
+                        repo=context.repo,
+                        manifest=context.manifest,
+                        templates=context.templates,
+                        schedule=schedule,
+                        run_dir=context.run_dir,
+                        ripgrep=context.ripgrep,
+                        ripgrep_sha256=context.ripgrep_sha256,
+                        api_key=api_key,
+                        budget=budget,
+                        timeout_seconds=int(execution["rollout_timeout_seconds"]),
+                        tinykg_binary=context.tinykg_binary,
+                        tinykg_binary_sha256=context.tinykg_sha256,
+                        seed_batch=context.seed_batch,
+                        recall_query=context.recall_query,
+                        quality_evidence_eligible=False,
+                    )
+                    results.append(result)
+                    completed_entries.append(
+                        _checkpoint_entry(result, context.run_dir)
+                    )
+                    _persist_checkpoint(
+                        path=checkpoint_path,
+                        identity=context.identity,
+                        completed=completed_entries,
+                        budget=budget,
+                        references=None,
+                    )
+            finally:
+                _assert_production_secret_absent(context.run_dir, api_key)
+
+        _validate_calibration_projections([result["projection"] for result in results])
+        _validate_paid_calibration_sources(results, run_dir=context.run_dir)
+        if references_info is None:
+            references_path = context.run_dir / "factorial-references.json"
+            if not references_path.exists() and not references_path.is_symlink():
+                references_path = persist_references(
+                    receipts=results,
+                    run_dir=context.run_dir,
+                )
+            references_info = {
+                "path": _relative_to_run(
+                    references_path,
+                    context.run_dir,
+                    "factorial calibration references",
+                ),
+                "sha256": _sha256_file(references_path),
+            }
+            references_path = _reopen_references(
+                info=references_info,
+                results=results,
+                run_dir=context.run_dir,
+            )
+            _persist_checkpoint(
+                path=checkpoint_path,
+                identity=context.identity,
+                completed=completed_entries,
+                budget=budget,
+                references=references_info,
+            )
+        else:
+            references_path = _reopen_references(
+                info=references_info,
+                results=results,
+                run_dir=context.run_dir,
+            )
+
+        budget.checkpoint_payload()
+        snapshot = budget.snapshot()
+        return {
+            "schema_version": CALIBRATION_SUMMARY_SCHEMA,
+            "calibration_id": context.identity["calibration_id"],
+            "case_id": case_id,
+            "rollouts": len(results),
+            "cells": list(CALIBRATION_CELLS),
+            "quality_evidence": False,
+            "claim_boundary": "paid wiring calibration; not confirmatory factorial evidence",
+            "references_path": str(references_path),
+            "references_sha256": references_info["sha256"],
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_sha256": _sha256_file(checkpoint_path),
+            "committed_cost_microusd": snapshot["committed_cost_microusd"],
+            "committed_metered_tokens": snapshot["committed_metered_tokens"],
+            "budget_revision": snapshot["revision"],
+            "budget_head_sha256": snapshot["head_sha256"],
+        }
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--case-id", required=True)
+    parser.add_argument("--tinykg", type=Path, required=True)
+    parser.add_argument("--ripgrep", type=Path, required=True)
+    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--budget-journal", type=Path, required=True)
+    parser.add_argument(
+        "--auth-file", type=Path, default=Path.home() / ".metacodes/auth.json"
+    )
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--allow-paid-rollouts", action="store_true")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    if args.dry_run:
+        summary = preflight_calibration(
+            repo=args.repo,
+            manifest_path=args.manifest,
+            case_id=args.case_id,
+            tinykg_binary=args.tinykg,
+            ripgrep=args.ripgrep,
+            run_dir=args.run_dir,
+            budget_path=args.budget_journal,
+            resume=args.resume,
+        )
+        print(stable_json(summary))
+        return 0
+    if not args.allow_paid_rollouts:
+        _fail("factorial calibration", "paid run requires --allow-paid-rollouts")
+    summary = run_calibration(
+        repo=args.repo,
+        manifest_path=args.manifest,
+        case_id=args.case_id,
+        tinykg_binary=args.tinykg,
+        ripgrep=args.ripgrep,
+        run_dir=args.run_dir,
+        budget_path=args.budget_journal,
+        auth_file=args.auth_file,
+        resume=args.resume,
+    )
+    print(stable_json(summary))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except ValidationError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(2) from exc

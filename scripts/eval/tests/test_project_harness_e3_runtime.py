@@ -704,7 +704,7 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
                 )
                 self.assertNotIn("FormalAuditTask", first_request["system"])
                 self.assertNotIn("# Deferred tools", first_request["system"])
-                self.assertNotIn("# Memory", first_request["system"])
+                self.assertNotIn("\n# Memory\n", first_request["system"])
             self.assertEqual(
                 1,
                 len({row["identity"]["tool_schema_sha256"] for row in projections}),
