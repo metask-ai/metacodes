@@ -223,6 +223,21 @@ class TinyKgLeanFactorialCalibrationTest(unittest.TestCase):
             self.assertEqual(4, summary["rollouts"])
             self.assertFalse(summary["quality_evidence"])
 
+    def test_historical_receipt_survives_later_commits_but_not_transaction_drift(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="factorial-history-") as temporary:
+            root = Path(temporary)
+            context = self._context(root, resume=False)
+            with BudgetJournal(context.budget_path, context.authority) as budget:
+                self._commit(budget, 0)
+                first = budget.transaction_receipts()[0]
+                self._commit(budget, 1)
+                executor._assert_historical_budget_receipt(budget, first)
+                tampered = {**first, "actual_metered_tokens": 101}
+                with self.assertRaisesRegex(
+                    ValidationError, "durable journal transaction drift"
+                ):
+                    executor._assert_historical_budget_receipt(budget, tampered)
+
     def test_completed_resume_does_not_read_credential_or_reexecute(self) -> None:
         with tempfile.TemporaryDirectory(prefix="factorial-resume-") as temporary:
             root = Path(temporary)

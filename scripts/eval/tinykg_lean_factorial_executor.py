@@ -203,6 +203,29 @@ def _stable_core_prefix(first_request: Mapping[str, Any]) -> str:
     ).hexdigest()
 
 
+def _assert_historical_budget_receipt(
+    budget_journal: BudgetJournal,
+    historical: Mapping[str, Any],
+) -> None:
+    transaction_id = str(historical.get("transaction_id", ""))
+    current = budget_journal.transaction_receipt(transaction_id)
+    evolving_journal_fields = {"journal_revision", "journal_head_sha256"}
+    if (
+        set(current) != set(historical)
+        or any(
+            current[field] != historical[field]
+            for field in current
+            if field not in evolving_journal_fields
+        )
+        or int(current["journal_revision"]) < int(historical["journal_revision"])
+        or (
+            current["journal_revision"] == historical["journal_revision"]
+            and current["journal_head_sha256"] != historical["journal_head_sha256"]
+        )
+    ):
+        _fail("factorial source budget", "durable journal transaction drift")
+
+
 def _reopen_source(
     *,
     item: Mapping[str, Any],
@@ -318,8 +341,7 @@ def _reopen_source(
         actual_cost_microusd=actual_cost_microusd,
         actual_metered_tokens=actual_metered_tokens,
     )
-    if budget_journal.transaction_receipt(str(budget["transaction_id"])) != budget:
-        _fail("factorial source budget", "durable journal receipt drift")
+    _assert_historical_budget_receipt(budget_journal, budget)
     return source, native
 
 
@@ -661,6 +683,7 @@ def _calibration_identity(
 ) -> Mapping[str, Any]:
     body = {
         "schema_version": EXECUTOR_SCHEMA,
+        "executor_source_sha256": _sha256_file(Path(__file__).resolve(strict=True)),
         "manifest_id": manifest["manifest_id"],
         "manifest_sha256": _canonical_sha256(manifest),
         "repository_commit": manifest["repository"]["commit"],
@@ -964,6 +987,8 @@ def _prepare_calibration(
     resume: bool,
 ) -> CalibrationContext:
     repo = repo.resolve(strict=True)
+    if Path(__file__).resolve(strict=True) != repo / "scripts/eval/tinykg_lean_factorial_executor.py":
+        _fail("factorial calibration", "executor source is outside the frozen repository")
     manifest = validate_manifest(manifest_path.resolve(strict=True), repo)
     templates = verify_templates(
         Path(str(manifest["templates_manifest"]["path"])), repo
