@@ -244,6 +244,125 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             },
         )
 
+    def _seed_shape_rewrite_call(
+        self,
+        tool_id,
+        *,
+        variants,
+        hits=(),
+        seen=(),
+        intent="enumeration",
+        query="stale compatibility query",
+    ):
+        input_plan_sha = _plan_fingerprint(
+            intent,
+            "semantic_expansion",
+            variants,
+            None,
+            schema_version="lexical-query-plan-v3",
+        )
+        effective_variants = variants[:1]
+        effective_plan_sha = _plan_fingerprint(
+            intent,
+            "seed",
+            effective_variants,
+            None,
+            schema_version="lexical-query-plan-v3",
+        )
+        seed = variants[0]
+        distinct_hits = list(dict.fromkeys(hits))
+        new_count = sum(node_id not in seen for node_id in distinct_hits)
+        repeated_count = len(distinct_hits) - new_count
+        result_hits = [
+            (
+                {
+                    "node_id": node_id,
+                    "seen_before": True,
+                    "content_ref": "exposed_elsewhere_in_run",
+                }
+                if node_id in seen
+                else {
+                    "node_id": node_id,
+                    "seen_before": False,
+                    "text": f"node {node_id}",
+                }
+            )
+            for node_id in distinct_hits
+        ]
+        normalized_query = query.strip(" \t\r\n")
+        effective_query = seed["text"].strip(" \t\r\n")
+        rewrite = {
+            "schema_version": "metacodes-seed-shape-rewrite-v1",
+            "reason": "exact_prefix_in_semantic_expansion",
+            "input_plan_sha256": input_plan_sha,
+            "effective_plan_sha256": effective_plan_sha,
+            "effective_seed_sha256": hashlib.sha256(
+                effective_query.encode("utf-8")
+            ).hexdigest(),
+            "input_stage": "semantic_expansion",
+            "effective_stage": "seed",
+            "declared_variant_count": len(variants),
+            "executed_variant_count": 1,
+            "unexecuted_semantic_variant_count": len(variants) - 1,
+        }
+        lexical_plan = {
+            "schema_version": "lexical-query-plan-v3",
+            "intent": intent,
+            "stage": "semantic_expansion",
+            "variants": variants,
+        }
+        result = {
+            "hits": result_hits,
+            "lexical_query_plan": {
+                "schema_version": "lexical-query-plan-v3",
+                "plan_sha256": input_plan_sha,
+                "intent": intent,
+                "stage": "semantic_expansion",
+                "variant_count": len(variants),
+                "executed_variant_count": 1,
+                "all_variants_executed": False,
+                "seen_node_count": len(seen),
+                "seen_state_verified": True,
+                "ledger_scope": "agent_run_batch",
+                "merged_hit_count": len(distinct_hits),
+                "merged_new_hit_count": new_count,
+                "merged_previously_seen_count": repeated_count,
+                "probe_new_hit_count": new_count,
+                "probe_repeated_hit_count": repeated_count,
+                "query_anchor_rewritten": normalized_query != effective_query,
+                "query_anchor_input_sha256": hashlib.sha256(
+                    normalized_query.encode("utf-8")
+                ).hexdigest(),
+                "query_anchor_effective_sha256": hashlib.sha256(
+                    effective_query.encode("utf-8")
+                ).hexdigest(),
+                "variant_receipts": [
+                    {
+                        "variant_index": 0,
+                        "variant_kind": seed["kind"],
+                        "node_ids": distinct_hits,
+                        "new_hit_count": new_count,
+                        "repeated_hit_count": repeated_count,
+                    }
+                ],
+                "execution": "host_seed_shape_rewrite",
+                "rewrite": rewrite,
+            },
+        }
+        return (
+            {
+                "type": "tool_use",
+                "id": tool_id,
+                "name": "KgRecall",
+                "input": {"query": query, "lexical_plan": lexical_plan},
+            },
+            {
+                "type": "tool_result",
+                "tool_use_id": tool_id,
+                "content": stable_json(result),
+            },
+        )
+
     def _write_requests(self, root, calls):
         observed = []
         for request_index, call in enumerate(calls, start=1):
@@ -419,6 +538,106 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
                 ),
                 trace,
             )
+
+    def test_v3_exact_prefixed_expansion_replays_as_one_effective_seed(self):
+        variants = [
+            {"kind": "exact", "text": "kitchen preferences"},
+            {"kind": "paraphrase", "text": "foods enjoyed while cooking"},
+            {"kind": "relation", "text": "favorite cuisine and dislikes"},
+        ]
+        recovered = self._seed_shape_rewrite_call(
+            "kg-seed-rewrite",
+            variants=variants,
+            hits=(7, 9),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(cassette, [recovered])
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-v3-seed-rewrite",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+            self.assertEqual(trace["status"], "verified")
+            self.assertEqual(len(trace["calls"]), 1)
+            call = trace["calls"][0]
+            self.assertEqual(call["stage"], "seed")
+            self.assertEqual(call["execution"], "host_seed_shape_rewrite")
+            self.assertEqual(call["variant_count"], 1)
+            self.assertEqual(len(call["probes"]), 1)
+            self.assertEqual(call["probes"][0]["query"], "kitchen preferences")
+            summary = summarize_query_plan_traces([trace])
+            self.assertEqual(summary["seed_shape_rewrite_count"], 1)
+            self.assertEqual(summary["explicit_verified_probes"], 1)
+            self.assertEqual(
+                project_query_variants(trace),
+                [{"kind": "exact", "text": "kitchen preferences"}],
+            )
+
+            explicit_seed_sha = _plan_fingerprint(
+                "enumeration",
+                "seed",
+                variants[:1],
+                None,
+                schema_version="lexical-query-plan-v3",
+            )
+            self.assertEqual(call["plan_sha256"], explicit_seed_sha)
+            (cassette / SIDECAR_NAME).write_text(
+                stable_json(trace) + "\n", encoding="utf-8"
+            )
+            self.assertEqual(
+                load_and_verify_query_plan_sidecar(
+                    cassette,
+                    run_id="run-v3-seed-rewrite",
+                    arm="tinykg_lexical",
+                    memory_backend="tinykg_integrated",
+                    required=True,
+                    where="v3 seed rewrite",
+                ),
+                trace,
+            )
+
+            tampered_use, tampered_result = copy.deepcopy(recovered)
+            payload = json.loads(tampered_result["content"])
+            payload["lexical_query_plan"]["rewrite"]["effective_plan_sha256"] = (
+                "0" * 64
+            )
+            tampered_result["content"] = stable_json(payload)
+            self._write_requests(cassette, [(tampered_use, tampered_result)])
+            invalid = build_query_plan_trace(
+                cassette,
+                run_id="run-v3-seed-rewrite-tampered",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+            self.assertEqual(invalid["status"], "invalid")
+            self.assertTrue(
+                any("deterministic rewrite" in reason for reason in invalid["invalid_reasons"])
+            )
+
+    def test_v3_alias_prefixed_semantic_batch_remains_a_real_batch(self):
+        batch = self._batch_call(
+            "kg-alias-batch",
+            variants=[
+                {"kind": "alias", "text": "GLM"},
+                {"kind": "mechanism", "text": "provider model routing"},
+            ],
+            variant_hits=[(7,), (9,)],
+            intent="fact_lookup",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(cassette, [batch])
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-v3-alias-batch",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+        self.assertEqual(trace["status"], "verified")
+        self.assertEqual(trace["calls"][0]["execution"], "host_batch_all")
+        self.assertEqual(trace["calls"][0]["variant_count"], 2)
 
     def test_v3_auto_context_is_bound_to_deterministic_batch_selection(self):
         variants = [
@@ -1219,11 +1438,12 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             self.assertEqual(
                 summary["quality_eligibility_counts"]["host_recall_satisfied"], 1
             )
-            self.assertEqual(summary["protocol_status_counts"]["invalid"], 1)
+            self.assertEqual(summary["protocol_status_counts"]["host_satisfied"], 1)
+            self.assertEqual(summary["protocol_status_counts"]["invalid"], 0)
             self.assertEqual(summary["quality_eligibility_counts"]["ineligible"], 0)
             self.assertEqual(
                 summary["rollout_status"][0]["protocol_status"],
-                "invalid",
+                "host_satisfied",
             )
 
     def test_host_recall_cannot_launder_malformed_explicit_plan(self):

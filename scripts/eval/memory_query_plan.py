@@ -22,7 +22,7 @@ from .model import ValidationError, stable_json
 TRACE_SCHEMA_VERSION = "metacodes-memory-query-plan-trace-v2"
 LEGACY_TRACE_SCHEMA_VERSION = "metacodes-memory-query-plan-trace-v1"
 TRACE_SCHEMA_VERSIONS = frozenset({TRACE_SCHEMA_VERSION, LEGACY_TRACE_SCHEMA_VERSION})
-REPORT_SCHEMA_VERSION = "metacodes-memory-query-plan-report-v4"
+REPORT_SCHEMA_VERSION = "metacodes-memory-query-plan-report-v5"
 LEXICAL_PLAN_SCHEMA_VERSION = "lexical-query-plan-v2"
 BATCH_LEXICAL_PLAN_SCHEMA_VERSION = "lexical-query-plan-v3"
 AUTO_CONTEXT_SCHEMA_VERSION = "metacodes-auto-context-v1"
@@ -30,6 +30,8 @@ AUTO_CONTEXT_SELECTION_POLICY = "first_new_evidence_then_new_then_merged_v1"
 BOUNDED_RECALL_SCHEMA_VERSION = "metacodes-bounded-recall-v1"
 BOUNDED_RECALL_MAX_RESULT_BYTES = 24 * 1024
 BOUNDED_RECALL_EXCERPT_POLICY = "utf8_head_tail_v1"
+SEED_SHAPE_REWRITE_SCHEMA_VERSION = "metacodes-seed-shape-rewrite-v1"
+SEED_SHAPE_REWRITE_REASON = "exact_prefix_in_semantic_expansion"
 LEGACY_LEXICAL_PLAN_SCHEMA_VERSION = "lexical-query-plan-v1"
 LEXICAL_PLAN_SCHEMA_VERSIONS = frozenset(
     {
@@ -191,6 +193,20 @@ BATCH_RECEIPT_ANCHOR_KEYS = frozenset(
         "query_anchor_effective_sha256",
     }
 )
+SEED_SHAPE_REWRITE_KEYS = frozenset(
+    {
+        "schema_version",
+        "reason",
+        "input_plan_sha256",
+        "effective_plan_sha256",
+        "effective_seed_sha256",
+        "input_stage",
+        "effective_stage",
+        "declared_variant_count",
+        "executed_variant_count",
+        "unexecuted_semantic_variant_count",
+    }
+)
 BATCH_VARIANT_RECEIPT_KEYS = frozenset(
     {"variant_index", "variant_kind", "node_ids", "new_hit_count", "repeated_hit_count"}
 )
@@ -348,6 +364,21 @@ def _parse_plan(tool_input: Mapping[str, Any], where: str) -> Mapping[str, Any]:
     query_anchor_rewritten = query != variants[query_index]["text"]
     if query_anchor_rewritten and schema_version != BATCH_LEXICAL_PLAN_SCHEMA_VERSION:
         _fail(where, "query does not match the selected variant")
+    type_filter = (
+        _canonical_type(tool_input["type"], f"{where}.type")
+        if "type" in tool_input
+        else None
+    )
+    seed_kinds = {"exact", "alias"}
+    seed_shape_rewrite = (
+        schema_version == BATCH_LEXICAL_PLAN_SCHEMA_VERSION
+        and stage == "semantic_expansion"
+        and len(variants) >= 2
+        and variants[0]["kind"] == "exact"
+        and all(variant["kind"] != "exact" for variant in variants[1:])
+    )
+    if seed_shape_rewrite and type_filter is not None:
+        _fail(f"{where}.lexical_plan", "recovered seed must omit type")
     if stage == "seed" and (
         len(variants) != 1
         or query_index != 0
@@ -355,18 +386,16 @@ def _parse_plan(tool_input: Mapping[str, Any], where: str) -> Mapping[str, Any]:
         or "type" in tool_input
     ):
         _fail(f"{where}.lexical_plan", "invalid seed shape")
-    if stage == "semantic_expansion" and (
-        (
+    if stage == "semantic_expansion" and not seed_shape_rewrite:
+        if (
             schema_version
             in {
                 LEGACY_LEXICAL_PLAN_SCHEMA_VERSION,
                 BATCH_LEXICAL_PLAN_SCHEMA_VERSION,
             }
             and len(variants) < 2
-        )
-        or any(variant["kind"] == "exact" for variant in variants)
-    ):
-        _fail(f"{where}.lexical_plan", "invalid semantic expansion shape")
+        ) or any(variant["kind"] == "exact" for variant in variants):
+            _fail(f"{where}.lexical_plan", "invalid semantic expansion shape")
     if batch_all and stage == "focused_refinement" and len(variants) != 1:
         _fail(f"{where}.lexical_plan", "invalid focused refinement shape")
     seen_ids: List[int] | None = None
@@ -380,34 +409,286 @@ def _parse_plan(tool_input: Mapping[str, Any], where: str) -> Mapping[str, Any]:
             if node_id in seen_ids:
                 _fail(f"{where}.lexical_plan.seen_node_ids", "duplicate node id")
             seen_ids.append(node_id)
-    type_filter = (
-        _canonical_type(tool_input["type"], f"{where}.type")
-        if "type" in tool_input
-        else None
+    input_plan_sha256 = _plan_fingerprint(
+        intent,
+        stage,
+        variants,
+        type_filter,
+        schema_version=schema_version,
+    )
+    effective_stage = "seed" if seed_shape_rewrite else stage
+    effective_variants = variants[:1] if seed_shape_rewrite else variants
+    effective_type_filter = None if seed_shape_rewrite else type_filter
+    effective_plan_sha256 = _plan_fingerprint(
+        intent,
+        effective_stage,
+        effective_variants,
+        effective_type_filter,
+        schema_version=schema_version,
     )
     return {
         "query": query,
         "schema_version": schema_version,
         "intent": intent,
-        "stage": stage,
-        "variants": variants,
+        "stage": effective_stage,
+        "variants": effective_variants,
         "variant_index": variant_index,
-        "execution": "host_batch_all" if batch_all else "single",
+        "execution": (
+            "host_seed_shape_rewrite"
+            if seed_shape_rewrite
+            else "host_batch_all"
+            if batch_all
+            else "single"
+        ),
         "seen_node_ids": seen_ids,
-        "type_filter": type_filter,
+        "type_filter": effective_type_filter,
         "query_anchor_rewritten": query_anchor_rewritten,
         "query_anchor_input_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
         "query_anchor_effective_sha256": hashlib.sha256(
             variants[query_index]["text"].encode("utf-8")
         ).hexdigest(),
-        "plan_sha256": _plan_fingerprint(
-            intent,
-            stage,
-            variants,
-            type_filter,
-            schema_version=schema_version,
+        "plan_sha256": effective_plan_sha256,
+        "variants_sha256": hashlib.sha256(
+            stable_json(effective_variants).encode("utf-8")
+        ).hexdigest(),
+        "seed_shape_rewrite": (
+            {
+                "schema_version": SEED_SHAPE_REWRITE_SCHEMA_VERSION,
+                "reason": SEED_SHAPE_REWRITE_REASON,
+                "input_plan_sha256": input_plan_sha256,
+                "effective_plan_sha256": effective_plan_sha256,
+                "effective_seed_sha256": hashlib.sha256(
+                    effective_variants[0]["text"].encode("utf-8")
+                ).hexdigest(),
+                "input_stage": "semantic_expansion",
+                "effective_stage": "seed",
+                "declared_variant_count": len(variants),
+                "executed_variant_count": 1,
+                "unexecuted_semantic_variant_count": len(variants) - 1,
+            }
+            if seed_shape_rewrite
+            else None
         ),
-        "variants_sha256": hashlib.sha256(stable_json(variants).encode("utf-8")).hexdigest(),
+    }
+
+
+def _parse_seed_shape_rewrite_receipt(
+    result: Mapping[str, Any],
+    parsed_plan: Mapping[str, Any],
+    expected_seen: set[int],
+    where: str,
+    raw_result: str,
+) -> Mapping[str, Any]:
+    expected_rewrite = parsed_plan["seed_shape_rewrite"]
+    if not isinstance(expected_rewrite, dict):
+        _fail(where, "missing parsed seed-shape rewrite")
+    receipt = _object(
+        result.get("lexical_query_plan"),
+        f"{where}.lexical_query_plan",
+        BATCH_RECEIPT_KEYS | BATCH_RECEIPT_ANCHOR_KEYS | {"rewrite"},
+    )
+    expected_top = {
+        "schema_version": BATCH_LEXICAL_PLAN_SCHEMA_VERSION,
+        "plan_sha256": expected_rewrite["input_plan_sha256"],
+        "intent": parsed_plan["intent"],
+        "stage": "semantic_expansion",
+        "variant_count": expected_rewrite["declared_variant_count"],
+        "executed_variant_count": 1,
+        "all_variants_executed": False,
+        "seen_node_count": len(expected_seen),
+        "seen_state_verified": True,
+        "ledger_scope": "agent_run_batch",
+        "execution": "host_seed_shape_rewrite",
+        "query_anchor_rewritten": parsed_plan["query_anchor_rewritten"],
+        "query_anchor_input_sha256": parsed_plan["query_anchor_input_sha256"],
+        "query_anchor_effective_sha256": parsed_plan[
+            "query_anchor_effective_sha256"
+        ],
+    }
+    for key, expected_value in expected_top.items():
+        if receipt[key] != expected_value:
+            _fail(
+                f"{where}.lexical_query_plan.{key}",
+                "does not match the audited seed recovery",
+            )
+    for key in (
+        "plan_sha256",
+        "query_anchor_input_sha256",
+        "query_anchor_effective_sha256",
+    ):
+        _hash(receipt[key], f"{where}.lexical_query_plan.{key}")
+
+    rewrite = _object(
+        receipt["rewrite"],
+        f"{where}.lexical_query_plan.rewrite",
+        SEED_SHAPE_REWRITE_KEYS,
+    )
+    for key, expected_value in expected_rewrite.items():
+        if rewrite[key] != expected_value:
+            _fail(
+                f"{where}.lexical_query_plan.rewrite.{key}",
+                "does not match the deterministic rewrite",
+            )
+    for key in (
+        "input_plan_sha256",
+        "effective_plan_sha256",
+        "effective_seed_sha256",
+    ):
+        _hash(rewrite[key], f"{where}.lexical_query_plan.rewrite.{key}")
+
+    raw_variant_receipts = receipt["variant_receipts"]
+    if not isinstance(raw_variant_receipts, list) or len(raw_variant_receipts) != 1:
+        _fail(
+            f"{where}.lexical_query_plan.variant_receipts",
+            "seed recovery must receipt exactly one executed variant",
+        )
+    variant_receipt = _object(
+        raw_variant_receipts[0],
+        f"{where}.lexical_query_plan.variant_receipts[0]",
+        BATCH_VARIANT_RECEIPT_KEYS,
+    )
+    seed_variant = parsed_plan["variants"][0]
+    if (
+        variant_receipt["variant_index"] != 0
+        or variant_receipt["variant_kind"] != seed_variant["kind"]
+    ):
+        _fail(
+            f"{where}.lexical_query_plan.variant_receipts[0]",
+            "does not bind the effective seed",
+        )
+    raw_node_ids = variant_receipt["node_ids"]
+    if not isinstance(raw_node_ids, list) or len(raw_node_ids) > 8:
+        _fail(
+            f"{where}.lexical_query_plan.variant_receipts[0].node_ids",
+            "expected at most eight node ids",
+        )
+    node_ids = [
+        _integer(
+            node_id,
+            f"{where}.lexical_query_plan.variant_receipts[0].node_ids[{index}]",
+            minimum=1,
+        )
+        for index, node_id in enumerate(raw_node_ids)
+    ]
+    if len(node_ids) != len(set(node_ids)):
+        _fail(
+            f"{where}.lexical_query_plan.variant_receipts[0].node_ids",
+            "duplicate node id",
+        )
+    observed_new = sum(node_id not in expected_seen for node_id in node_ids)
+    observed_repeated = len(node_ids) - observed_new
+    new_count = _integer(
+        variant_receipt["new_hit_count"],
+        f"{where}.lexical_query_plan.variant_receipts[0].new_hit_count",
+    )
+    repeated_count = _integer(
+        variant_receipt["repeated_hit_count"],
+        f"{where}.lexical_query_plan.variant_receipts[0].repeated_hit_count",
+    )
+    if (new_count, repeated_count) != (observed_new, observed_repeated):
+        _fail(where, "seed recovery gain counts do not match host node ids")
+
+    hits = result.get("hits")
+    if not isinstance(hits, list):
+        _fail(f"{where}.hits", "expected an array")
+    result_ids: List[int] = []
+    for index, raw_hit in enumerate(hits):
+        if not isinstance(raw_hit, dict):
+            _fail(f"{where}.hits[{index}]", "expected an object")
+        node_id = _integer(
+            raw_hit.get("node_id"), f"{where}.hits[{index}].node_id", minimum=1
+        )
+        if node_id in result_ids:
+            _fail(f"{where}.hits", "seed recovery contains a duplicate node id")
+        seen_before = node_id in expected_seen
+        if raw_hit.get("seen_before") is not seen_before:
+            _fail(f"{where}.hits[{index}].seen_before", "does not match host state")
+        if seen_before:
+            if (
+                raw_hit.get("content_ref") != "exposed_elsewhere_in_run"
+                or "text" in raw_hit
+            ):
+                _fail(f"{where}.hits[{index}]", "repeated seed hit is not compact")
+        elif not isinstance(raw_hit.get("text"), str):
+            _fail(f"{where}.hits[{index}].text", "new seed hit must expose its body")
+        result_ids.append(node_id)
+    if result_ids != node_ids:
+        _fail(where, "seed recovery hits do not match its variant receipt")
+    if result.get("auto_context") is not None:
+        _fail(where, "seed recovery cannot claim enumeration auto-context")
+
+    summary_expected = {
+        "merged_hit_count": len(node_ids),
+        "merged_new_hit_count": observed_new,
+        "merged_previously_seen_count": observed_repeated,
+        "probe_new_hit_count": observed_new,
+        "probe_repeated_hit_count": observed_repeated,
+    }
+    for key, expected_value in summary_expected.items():
+        if _integer(receipt[key], f"{where}.lexical_query_plan.{key}") != expected_value:
+            _fail(f"{where}.lexical_query_plan.{key}", "does not match seed recovery")
+
+    raw_envelope = result.get("recall_envelope")
+    if raw_envelope is not None:
+        envelope = _object(
+            raw_envelope,
+            f"{where}.recall_envelope",
+            {
+                "schema_version",
+                "complete_json",
+                "max_result_bytes",
+                "text_excerpt_policy",
+            },
+        )
+        if envelope != {
+            "schema_version": BOUNDED_RECALL_SCHEMA_VERSION,
+            "complete_json": True,
+            "max_result_bytes": BOUNDED_RECALL_MAX_RESULT_BYTES,
+            "text_excerpt_policy": BOUNDED_RECALL_EXCERPT_POLICY,
+        }:
+            _fail(f"{where}.recall_envelope", "unsupported bounded-recall contract")
+        if len(raw_result.encode("utf-8")) > BOUNDED_RECALL_MAX_RESULT_BYTES:
+            _fail(where, "bounded KgRecall result exceeds its declared byte cap")
+        for index, raw_hit in enumerate(hits):
+            if raw_hit.get("seen_before") is True:
+                continue
+            text = raw_hit.get("text")
+            returned = _integer(
+                raw_hit.get("text_returned_bytes"),
+                f"{where}.hits[{index}].text_returned_bytes",
+            )
+            total = _integer(
+                raw_hit.get("text_total_bytes"),
+                f"{where}.hits[{index}].text_total_bytes",
+            )
+            truncated = raw_hit.get("text_truncated")
+            policy = raw_hit.get("text_excerpt_policy")
+            if (
+                not isinstance(text, str)
+                or returned != len(text.encode("utf-8"))
+                or total < returned
+                or not isinstance(truncated, bool)
+                or truncated != (total > returned)
+                or policy != BOUNDED_RECALL_EXCERPT_POLICY
+            ):
+                _fail(f"{where}.hits[{index}]", "invalid bounded text excerpt receipt")
+
+    return {
+        "seen_node_count": len(expected_seen),
+        "ledger_scope": "agent_run_batch",
+        "new_hit_count": observed_new,
+        "repeated_hit_count": observed_repeated,
+        "hit_node_ids": node_ids,
+        "probes": [
+            {
+                "variant_index": 0,
+                "variant_kind": seed_variant["kind"],
+                "query": seed_variant["text"],
+                "new_hit_count": observed_new,
+                "repeated_hit_count": observed_repeated,
+                "hit_node_ids": node_ids,
+            }
+        ],
     }
 
 
@@ -721,6 +1002,10 @@ def _parse_receipt(
         raise ValidationError(f"{where}: KgRecall result is not JSON: {exc}") from exc
     if not isinstance(result, dict):
         _fail(where, "KgRecall result is not an object")
+    if parsed_plan["seed_shape_rewrite"] is not None:
+        return _parse_seed_shape_rewrite_receipt(
+            result, parsed_plan, expected_seen, where, raw_result
+        )
     if parsed_plan["schema_version"] == BATCH_LEXICAL_PLAN_SCHEMA_VERSION:
         return _parse_batch_receipt(result, parsed_plan, expected_seen, where, raw_result)
     receipt = _object(result.get("lexical_query_plan"), f"{where}.lexical_query_plan", RECEIPT_KEYS)
@@ -1215,24 +1500,34 @@ def validate_query_plan_trace(trace: Mapping[str, Any], where: str = "query-plan
             continue
 
         execution = _string(call["execution"], f"{where}.calls[{index}].execution")
-        expected_execution = (
-            "host_batch_all"
+        allowed_executions = (
+            {"host_batch_all", "host_seed_shape_rewrite"}
             if call["schema_version"] == BATCH_LEXICAL_PLAN_SCHEMA_VERSION
-            else "single"
+            else {"single"}
         )
-        if execution != expected_execution:
+        if execution not in allowed_executions:
             _fail(f"{where}.calls[{index}].execution", "does not match plan schema")
         probes = call["probes"]
         expected_probe_count = variant_count if execution == "host_batch_all" else 1
         if not isinstance(probes, list) or len(probes) != expected_probe_count:
             _fail(f"{where}.calls[{index}].probes", "does not cover executed variants")
-        if call["schema_version"] == BATCH_LEXICAL_PLAN_SCHEMA_VERSION:
+        if (
+            call["schema_version"] == BATCH_LEXICAL_PLAN_SCHEMA_VERSION
+            and execution == "host_batch_all"
+        ):
             if call["stage"] == "seed" and variant_count != 1:
                 _fail(f"{where}.calls[{index}]", "v3 seed must contain one variant")
             if call["stage"] == "semantic_expansion" and not 2 <= variant_count <= 4:
                 _fail(f"{where}.calls[{index}]", "v3 semantic batch must contain 2-4 variants")
             if call["stage"] == "focused_refinement" and variant_count != 1:
                 _fail(f"{where}.calls[{index}]", "v3 focused refinement must contain one variant")
+        if execution == "host_seed_shape_rewrite" and (
+            call["stage"] != "seed" or variant_count != 1
+        ):
+            _fail(
+                f"{where}.calls[{index}]",
+                "seed-shape rewrite must project one effective seed",
+            )
         probe_new = 0
         probe_repeated = 0
         for probe_offset, raw_probe in enumerate(probes):
@@ -1277,6 +1572,11 @@ def validate_query_plan_trace(trace: Mapping[str, Any], where: str = "query-plan
             ]
             if len(validated_ids) != len(set(validated_ids)):
                 _fail(f"{where}.calls[{index}].probes[{probe_offset}].hit_node_ids", "duplicate node id")
+        if execution == "host_seed_shape_rewrite" and probes[0]["variant_kind"] != "exact":
+            _fail(
+                f"{where}.calls[{index}].probes[0].variant_kind",
+                "seed-shape rewrite must execute exact",
+            )
         if (probe_new, probe_repeated) != (
             call["new_hit_count"],
             call["repeated_hit_count"],
@@ -1381,6 +1681,7 @@ def summarize_query_plan_traces(
         for key in (
             "verified",
             "invalid",
+            "host_satisfied",
             "not_applicable",
             "legacy_unavailable",
         )
@@ -1420,7 +1721,17 @@ def summarize_query_plan_traces(
                 "memory query-plan summary",
                 "non-TinyKG trace cannot claim host recall",
             )
-        protocol_status_counts[trace_status] += 1
+        host_only_satisfied = (
+            trace_status == "invalid"
+            and host_satisfied
+            and trace["kg_recall_count"] == 0
+            and not trace["calls"]
+            and trace["invalid_reasons"] == ["TinyKG backend executed no KgRecall"]
+        )
+        reported_protocol_status = (
+            "host_satisfied" if host_only_satisfied else trace_status
+        )
+        protocol_status_counts[reported_protocol_status] += 1
         if trace_status == "verified":
             quality_eligibility = "explicit_plan_verified"
         elif quality_scoreable_with_pre_search_rejections(
@@ -1428,11 +1739,7 @@ def summarize_query_plan_traces(
             host_recall_satisfied=host_satisfied,
         ):
             quality_eligibility = "scoreable_with_pre_search_rejections"
-        elif (
-            trace_status == "invalid"
-            and host_satisfied
-            and trace["invalid_reasons"] == ["TinyKG backend executed no KgRecall"]
-        ):
+        elif host_only_satisfied:
             quality_eligibility = "host_recall_satisfied"
         elif trace_status == "not_applicable":
             quality_eligibility = "not_applicable"
@@ -1444,7 +1751,7 @@ def summarize_query_plan_traces(
                 "run_id": trace["run_id"],
                 "arm": trace["arm"],
                 "memory_backend": trace["memory_backend"],
-                "protocol_status": trace_status,
+                "protocol_status": reported_protocol_status,
                 "quality_eligibility": quality_eligibility,
                 "host_recall_satisfied": host_satisfied,
                 "kg_recall_count": trace["kg_recall_count"],
@@ -1514,6 +1821,9 @@ def summarize_query_plan_traces(
         "explicit_verified_calls": len(calls),
         "explicit_verified_probes": len(probes),
         "explicit_verified_plans": len(plans),
+        "seed_shape_rewrite_count": sum(
+            call.get("execution") == "host_seed_shape_rewrite" for call in calls
+        ),
         "new_hit_count": new_total,
         "repeated_hit_count": repeated_total,
         "unique_gain_ratio": new_total / denominator if denominator else None,
@@ -1549,6 +1859,7 @@ def render_query_plan_markdown(summary: Mapping[str, Any], title: str) -> str:
         f"- Explicit verified calls: {summary['explicit_verified_calls']}",
         f"- Host-executed probes: {summary['explicit_verified_probes']}",
         f"- Explicit verified plans: {summary['explicit_verified_plans']}",
+        f"- Seed-shape recoveries: {summary['seed_shape_rewrite_count']}",
         f"- New/repeated hits: {summary['new_hit_count']} / {summary['repeated_hit_count']}",
         f"- Unique gain ratio: {number(summary['unique_gain_ratio'])}",
         f"- Mean calls before stopping: {number(summary['mean_calls_before_stopping'])}",

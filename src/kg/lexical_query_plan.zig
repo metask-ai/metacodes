@@ -17,6 +17,8 @@ pub const MAX_SEEN_NODE_IDS: usize = 32;
 pub const MAX_TRACKED_PLANS: usize = 32;
 pub const MAX_RUN_SEEN_NODE_IDS: usize = MAX_SEEN_NODE_IDS * MAX_TRACKED_PLANS;
 pub const MAX_SEMANTIC_EXPANSION_PROBES: usize = 4;
+pub const SEED_SHAPE_REWRITE_SCHEMA_VERSION = "metacodes-seed-shape-rewrite-v1";
+pub const SEED_SHAPE_REWRITE_REASON = "exact_prefix_in_semantic_expansion";
 
 pub const Intent = enum {
     fact_lookup,
@@ -77,17 +79,28 @@ pub const Variant = struct {
 pub const Execution = union(enum) {
     single: usize,
     batch_all,
+    /// Recover a v3 semantic batch whose first member is an exact seed.
+    /// Only variants[0] executes; the remaining declarations stay auditable
+    /// but cannot consume semantic budget or claim coverage.
+    seed_shape_rewrite,
 
     pub fn queryIndex(self: Execution) usize {
         return switch (self) {
             .single => |index| index,
-            .batch_all => 0,
+            .batch_all, .seed_shape_rewrite => 0,
         };
     }
 
     pub fn executesAll(self: Execution) bool {
         return self == .batch_all;
     }
+};
+
+pub const SeedShapeRewrite = struct {
+    input_plan_sha256: [64]u8,
+    effective_seed_sha256: [64]u8,
+    declared_variant_count: usize,
+    unexecuted_semantic_variant_count: usize,
 };
 
 pub const Plan = struct {
@@ -103,6 +116,7 @@ pub const Plan = struct {
     query_anchor_rewritten: bool,
     query_anchor_input_sha256: [64]u8,
     query_anchor_effective_sha256: [64]u8,
+    seed_shape_rewrite: ?SeedShapeRewrite,
     fingerprint: [64]u8,
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
@@ -126,6 +140,10 @@ pub const Plan = struct {
         return self.execution.executesAll();
     }
 
+    pub fn isSeedShapeRewrite(self: Plan) bool {
+        return self.seed_shape_rewrite != null;
+    }
+
     pub fn semanticProbeCost(self: Plan) usize {
         // `focused_refinement` is still a model-chosen post-seed lexical
         // probe. Counting only the stage label `semantic_expansion` would let
@@ -135,6 +153,7 @@ pub const Plan = struct {
         return switch (self.execution) {
             .single => 1,
             .batch_all => self.variants.len,
+            .seed_shape_rewrite => 0,
         };
     }
 
@@ -470,9 +489,30 @@ pub fn parse(
         };
     }
 
+    const seed_prefix_shape = schema_version == .host_batch_v3 and
+        stage == .semantic_expansion and variants.items.len >= 2 and
+        variants.items[0].kind == .exact;
+    var trailing_variants_are_semantic = true;
+    if (seed_prefix_shape) {
+        for (variants.items[1..]) |variant| {
+            // An alias remains a legitimate semantic alternative after the
+            // first position. A second exact declaration is ambiguous and is
+            // never silently discarded.
+            if (variant.kind == .exact) {
+                trailing_variants_are_semantic = false;
+                break;
+            }
+        }
+        // A recovered seed has the same untyped invariant as an explicitly
+        // declared seed. Do not let a malformed semantic wrapper bypass it.
+        if (type_filter != null and trailing_variants_are_semantic)
+            return error.SeedTypeFilterForbidden;
+    }
+    const apply_seed_shape_rewrite = seed_prefix_shape and trailing_variants_are_semantic;
+
     const execution: Execution = if (schema_version == .host_batch_v3) blk: {
         if (object.get("variant_index") != null) return error.UnexpectedVariantIndex;
-        break :blk .batch_all;
+        break :blk if (apply_seed_shape_rewrite) .seed_shape_rewrite else .batch_all;
     } else blk: {
         const index_value = object.get("variant_index") orelse return error.InvalidVariantIndex;
         if (index_value != .integer or index_value.integer < 0) return error.InvalidVariantIndex;
@@ -499,10 +539,14 @@ pub fn parse(
             if (type_filter != null) return error.SeedTypeFilterForbidden;
         },
         .semantic_expansion => {
-            if ((schema_version == .legacy_v1 or schema_version == .host_batch_v3) and
+            if (!apply_seed_shape_rewrite and
+                (schema_version == .legacy_v1 or schema_version == .host_batch_v3) and
                 variants.items.len < 2) return error.InvalidStageShape;
-            for (variants.items) |variant| {
-                if (variant.kind == .exact) return error.InvalidStageShape;
+            if (!apply_seed_shape_rewrite) {
+                for (variants.items) |variant| {
+                    if (variant.kind == .exact)
+                        return error.InvalidStageShape;
+                }
             }
         },
         .focused_refinement => if (schema_version == .host_batch_v3 and variants.items.len != 1)
@@ -534,17 +578,27 @@ pub fn parse(
         for (owned_variants) |*variant| variant.deinit(allocator);
         allocator.free(owned_variants);
     }
+    const input_fingerprint = fingerprint(schema_version, intent, stage, owned_variants, type_filter);
+    const effective_stage: Stage = if (apply_seed_shape_rewrite) .seed else stage;
+    const effective_variants = if (apply_seed_shape_rewrite) owned_variants[0..1] else owned_variants;
+    const effective_type_filter = if (apply_seed_shape_rewrite) null else type_filter;
     return .{
         .schema_version = schema_version,
         .intent = intent,
-        .stage = stage,
+        .stage = effective_stage,
         .variants = owned_variants,
         .execution = execution,
         .declared_seen_node_ids = declared_seen_node_ids,
         .query_anchor_rewritten = query_anchor_rewritten,
         .query_anchor_input_sha256 = sha256Hex(normalized_query),
         .query_anchor_effective_sha256 = sha256Hex(effective_query),
-        .fingerprint = fingerprint(schema_version, intent, stage, owned_variants, type_filter),
+        .seed_shape_rewrite = if (apply_seed_shape_rewrite) .{
+            .input_plan_sha256 = input_fingerprint,
+            .effective_seed_sha256 = sha256Hex(owned_variants[0].text),
+            .declared_variant_count = owned_variants.len,
+            .unexecuted_semantic_variant_count = owned_variants.len - 1,
+        } else null,
+        .fingerprint = fingerprint(schema_version, intent, effective_stage, effective_variants, effective_type_filter),
     };
 }
 
@@ -563,7 +617,7 @@ pub fn diagnostic(err: Error) []const u8 {
         error.InvalidVariantIndex => "lexical_plan.variant_index is outside variants",
         error.UnexpectedVariantIndex => "lexical-query-plan-v3 executes the declared batch; omit variant_index",
         error.QueryVariantMismatch => "KgRecall v1/v2 query must exactly match the selected variant; v3 query must be a valid compatibility field and executes variants[0] as its anchor",
-        error.InvalidStageShape => "seed requires one exact/alias variant; v1/v3 semantic_expansion requires 2-4 non-exact variants; v2 allows 1-4; v3 focused_refinement requires one variant",
+        error.InvalidStageShape => "seed requires one exact/alias variant; v1 semantic_expansion requires 2-4 non-exact variants; v2 allows 1-4; v3 semantic_expansion requires 2-4 variants without exact (an exact prefix is recovered as seed only); v3 focused_refinement requires one variant",
         error.SeedTypeFilterForbidden => "the seed stage must omit KgRecall type",
         error.InvalidSeenNodeIds => "lexical_plan.seen_node_ids must contain positive integer ids",
         error.TooManySeenNodeIds => "lexical_plan.seen_node_ids exceeds 32 ids",
@@ -586,6 +640,10 @@ fn validCompactText(value: []const u8) bool {
     if (value.len == 0 or value.len > MAX_QUERY_BYTES or !std.unicode.utf8ValidateSlice(value)) return false;
     for (value) |byte| if (byte < 0x20 or byte == 0x7f) return false;
     return true;
+}
+
+fn isSeedKind(kind: VariantKind) bool {
+    return kind == .exact or kind == .alias;
 }
 
 fn fingerprint(schema_version: SchemaVersion, intent: Intent, stage: Stage, variants: []const Variant, type_filter: ?[]const u8) [64]u8 {
@@ -889,6 +947,95 @@ test "lexical query plan v3 executes a fixed batch and budgets actual probes" {
     var singleton_parsed = try std.json.parseFromSlice(std.json.Value, a, singleton, .{});
     defer singleton_parsed.deinit();
     try std.testing.expectError(error.InvalidStageShape, parse(a, singleton_parsed.value.object, "graduation ceremony", null));
+}
+
+test "v3 exact-prefixed semantic batch recovers only the seed without claiming coverage" {
+    const a = std.testing.allocator;
+    const raw =
+        \\{"lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"enumeration","stage":"semantic_expansion","variants":[{"kind":"exact","text":"kitchen preferences"},{"kind":"paraphrase","text":"foods enjoyed while cooking"},{"kind":"relation","text":"cuisine likes and dislikes"}]}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    var plan = (try parse(a, parsed.value.object, "stale compatibility query", null)) orelse return error.TestUnexpectedResult;
+    defer plan.deinit(a);
+
+    try std.testing.expect(plan.isSeedShapeRewrite());
+    try std.testing.expect(!plan.executesAll());
+    try std.testing.expect(plan.execution == .seed_shape_rewrite);
+    try std.testing.expectEqual(Stage.seed, plan.stage);
+    try std.testing.expectEqual(@as(usize, 0), plan.semanticProbeCost());
+    try std.testing.expectEqualStrings("kitchen preferences", plan.selected().text);
+    try std.testing.expect(plan.query_anchor_rewritten);
+    const rewrite = plan.seed_shape_rewrite.?;
+    try std.testing.expectEqual(@as(usize, 3), rewrite.declared_variant_count);
+    try std.testing.expectEqual(@as(usize, 2), rewrite.unexecuted_semantic_variant_count);
+    try std.testing.expectEqual(sha256Hex("kitchen preferences"), rewrite.effective_seed_sha256);
+    try std.testing.expect(!std.mem.eql(u8, &rewrite.input_plan_sha256, &plan.fingerprint));
+
+    const explicit_seed =
+        \\{"lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"enumeration","stage":"seed","variants":[{"kind":"exact","text":"kitchen preferences"}]}}
+    ;
+    var seed_parsed = try std.json.parseFromSlice(std.json.Value, a, explicit_seed, .{});
+    defer seed_parsed.deinit();
+    var seed_plan = (try parse(a, seed_parsed.value.object, "kitchen preferences", null)) orelse return error.TestUnexpectedResult;
+    defer seed_plan.deinit(a);
+    try std.testing.expectEqualSlices(u8, &seed_plan.fingerprint, &plan.fingerprint);
+
+    var ledger = Ledger{};
+    var guard = try ledger.lockPlan(plan);
+    defer guard.deinit();
+    try guard.commit(&.{41});
+    const coverage = ledger.coverageState();
+    try std.testing.expectEqual(@as(usize, 1), coverage.successful_plan_calls);
+    try std.testing.expectEqual(@as(usize, 1), coverage.enumeration_plan_calls);
+    try std.testing.expect(!coverage.enumeration_batch_committed);
+    try std.testing.expectEqual(@as(usize, 0), ledger.semantic_expansion_probes);
+}
+
+test "v3 seed-shape recovery rejects typed or ambiguous seed declarations" {
+    const a = std.testing.allocator;
+    const typed =
+        \\{"lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"fact_lookup","stage":"semantic_expansion","variants":[{"kind":"exact","text":"GLM"},{"kind":"mechanism","text":"provider model routing"}]}}
+    ;
+    var typed_parsed = try std.json.parseFromSlice(std.json.Value, a, typed, .{});
+    defer typed_parsed.deinit();
+    try std.testing.expectError(error.SeedTypeFilterForbidden, parse(a, typed_parsed.value.object, "GLM", "decision"));
+
+    const alias_first =
+        \\{"lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"fact_lookup","stage":"semantic_expansion","variants":[{"kind":"alias","text":"GLM"},{"kind":"mechanism","text":"provider model routing"}]}}
+    ;
+    var alias_first_parsed = try std.json.parseFromSlice(std.json.Value, a, alias_first, .{});
+    defer alias_first_parsed.deinit();
+    var alias_first_plan = (try parse(a, alias_first_parsed.value.object, "GLM", "decision")) orelse return error.TestUnexpectedResult;
+    defer alias_first_plan.deinit(a);
+    try std.testing.expect(alias_first_plan.executesAll());
+    try std.testing.expect(!alias_first_plan.isSeedShapeRewrite());
+    try std.testing.expectEqual(@as(usize, 2), alias_first_plan.semanticProbeCost());
+
+    const later_alias =
+        \\{"lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"fact_lookup","stage":"semantic_expansion","variants":[{"kind":"paraphrase","text":"provider routing"},{"kind":"alias","text":"GLM"}]}}
+    ;
+    var later_alias_parsed = try std.json.parseFromSlice(std.json.Value, a, later_alias, .{});
+    defer later_alias_parsed.deinit();
+    var later_alias_plan = (try parse(a, later_alias_parsed.value.object, "provider routing", null)) orelse return error.TestUnexpectedResult;
+    defer later_alias_plan.deinit(a);
+    try std.testing.expect(later_alias_plan.executesAll());
+
+    const two_seeds =
+        \\{"lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"fact_lookup","stage":"semantic_expansion","variants":[{"kind":"exact","text":"GLM 5.2"},{"kind":"alias","text":"GLM"}]}}
+    ;
+    var two_seeds_parsed = try std.json.parseFromSlice(std.json.Value, a, two_seeds, .{});
+    defer two_seeds_parsed.deinit();
+    var two_seeds_plan = (try parse(a, two_seeds_parsed.value.object, "GLM 5.2", null)) orelse return error.TestUnexpectedResult;
+    defer two_seeds_plan.deinit(a);
+    try std.testing.expect(two_seeds_plan.isSeedShapeRewrite());
+
+    const two_exact =
+        \\{"lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"fact_lookup","stage":"semantic_expansion","variants":[{"kind":"exact","text":"GLM 5.2"},{"kind":"exact","text":"GLM provider"}]}}
+    ;
+    var two_exact_parsed = try std.json.parseFromSlice(std.json.Value, a, two_exact, .{});
+    defer two_exact_parsed.deinit();
+    try std.testing.expectError(error.InvalidStageShape, parse(a, two_exact_parsed.value.object, "GLM 5.2", null));
 }
 
 test "v3 normalizes a stale compatibility query without changing declared variants" {

@@ -787,6 +787,67 @@ test "L2 KG governance: v3 batch executes every variant and exposes each node bo
     }
 }
 
+test "L2 KG governance: v3 exact-prefixed expansion is audited as seed recovery" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kg-seed-shape-rewrite-v3.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-seed-shape-rewrite-v3");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+    const memory_id = try kg.remember(.observation, "kitchenpreferencesexacttoken favorite cuisine cooking evidence", "evidence", false);
+
+    var ledger = cc.kg_lexical_query_plan.Ledger{};
+    const ctx = cc.tool_context.ToolContext{ .allocator = a, .kg = &kg, .kg_lexical_ledger = &ledger };
+    const malformed_batch =
+        \\{"query":"stale kitchen query","lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"enumeration","stage":"semantic_expansion","variants":[{"kind":"exact","text":"kitchenpreferencesexacttoken"},{"kind":"paraphrase","text":"foods enjoyed while cooking"},{"kind":"relation","text":"favorite cuisine preferences"}]}}
+    ;
+    const recovered_output = try cc.kg_tools.executeRecall(&ctx, malformed_batch);
+    defer a.free(recovered_output);
+    var recovered = try std.json.parseFromSlice(std.json.Value, a, recovered_output, .{});
+    defer recovered.deinit();
+
+    const receipt = recovered.value.object.get("lexical_query_plan").?.object;
+    try std.testing.expectEqualStrings("host_seed_shape_rewrite", receipt.get("execution").?.string);
+    try std.testing.expectEqualStrings("semantic_expansion", receipt.get("stage").?.string);
+    try std.testing.expect(!receipt.get("all_variants_executed").?.bool);
+    try std.testing.expectEqual(@as(i64, 3), receipt.get("variant_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), receipt.get("executed_variant_count").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), receipt.get("variant_receipts").?.array.items.len);
+    const rewrite = receipt.get("rewrite").?.object;
+    try std.testing.expectEqualStrings("metacodes-seed-shape-rewrite-v1", rewrite.get("schema_version").?.string);
+    try std.testing.expectEqualStrings("seed", rewrite.get("effective_stage").?.string);
+    try std.testing.expectEqual(@as(i64, 2), rewrite.get("unexecuted_semantic_variant_count").?.integer);
+    try std.testing.expect(!std.mem.eql(u8, rewrite.get("input_plan_sha256").?.string, rewrite.get("effective_plan_sha256").?.string));
+    try std.testing.expectEqual(@as(i64, @intCast(memory_id)), recovered.value.object.get("hits").?.array.items[0].object.get("node_id").?.integer);
+    try std.testing.expect(recovered.value.object.get("auto_context") == null);
+    const after_rewrite = ledger.coverageState();
+    try std.testing.expectEqual(@as(usize, 1), after_rewrite.enumeration_plan_calls);
+    try std.testing.expect(!after_rewrite.enumeration_batch_committed);
+    try std.testing.expectEqual(@as(usize, 0), ledger.semantic_expansion_probes);
+
+    const corrected_batch =
+        \\{"query":"kitchen cooking preferences","lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"enumeration","stage":"semantic_expansion","variants":[{"kind":"paraphrase","text":"kitchen cooking preferences"},{"kind":"relation","text":"favorite cuisine cooking"}]}}
+    ;
+    const batch_output = try cc.kg_tools.executeRecall(&ctx, corrected_batch);
+    defer a.free(batch_output);
+    var batch = try std.json.parseFromSlice(std.json.Value, a, batch_output, .{});
+    defer batch.deinit();
+    try std.testing.expect(batch.value.object.get("lexical_query_plan").?.object.get("all_variants_executed").?.bool);
+    const after_batch = ledger.coverageState();
+    try std.testing.expect(after_batch.enumeration_batch_committed);
+    try std.testing.expect(after_batch.enumeration_context_committed);
+    try std.testing.expectEqual(@as(usize, 2), ledger.semantic_expansion_probes);
+}
+
 test "L2 KG governance: large v3 recall stays complete JSON below projection cap" {
     const a = std.testing.allocator;
     const bin = findBin(a) orelse return error.SkipZigTest;
