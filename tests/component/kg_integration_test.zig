@@ -559,10 +559,12 @@ test "L2 KG governance: freshness and contradiction contract enters the actual A
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "count/cardinality, exhaustive-list") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "One positive hit proves existence, never completeness") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "successful v3 receipt proves every member ran") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "when the governed run has candidates and KgContext is available") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "host deterministically runs one real KgContext re-observation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Use a valid host-generated auto_context when present") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "inspect it instead of repeating KgContext") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "rejects premature final answers until the available obligations commit") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "zero-candidate batch does not create an impossible KgContext obligation") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "One best-node KgContext call is sufficient") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "attaches it as auto_context in the same tool result") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "preserve the user's relation or action") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "necessary, not sufficient") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "mechanism, symptom, desired outcome, or nearby implementation term") != null);
@@ -785,7 +787,7 @@ test "L2 KG governance: v3 batch executes every variant and exposes each node bo
     }
 }
 
-test "L2 KG governance: real agent loop requires enumeration batch and recalled-node context" {
+test "L2 KG governance: real agent loop batches enumeration recall and host context" {
     const a = std.testing.allocator;
     const bin = findBin(a) orelse return error.SkipZigTest;
     defer a.free(bin);
@@ -809,14 +811,13 @@ test "L2 KG governance: real agent loop requires enumeration batch and recalled-
 
     // Deliberately reproduce the paid c010 failure: after a fact_lookup seed,
     // the provider tries to finalize as unavailable. The real run path must
-    // reject it, surface a host observation, accept a fixed v3 batch, require
-    // real KgContext evidence, and only then allow the final answer. max_turns=2
-    // proves the bounded repair loans enough turns for batch + context + final.
+    // reject it, surface a host observation, accept a fixed v3 batch, attach
+    // real host-owned KgContext evidence, and only then allow the final answer.
+    // max_turns=2 proves the repair needs no model-owned context round-trip.
     const responses = [_][]const u8{
         KG_ENUMERATION_SEED_SSE,
         KG_ENUMERATION_PREMATURE_FINAL_SSE,
         KG_ENUMERATION_BATCH_SSE,
-        KG_ENUMERATION_CONTEXT_SSE,
         KG_ENUMERATION_FINAL_SSE,
     };
     var srv = try harness.MockServer.startCassette(&responses, 0);
@@ -852,9 +853,9 @@ test "L2 KG governance: real agent loop requires enumeration batch and recalled-
     }, &backend, a);
 
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, run_result.stop_reason);
-    try std.testing.expectEqual(@as(u32, 5), run_result.turns);
-    try std.testing.expectEqual(@as(u32, 3), run_result.tool_calls);
-    try std.testing.expectEqual(@as(usize, 5), srv.requestCount());
+    try std.testing.expectEqual(@as(u32, 4), run_result.turns);
+    try std.testing.expectEqual(@as(u32, 2), run_result.tool_calls);
+    try std.testing.expectEqual(@as(usize, 4), srv.requestCount());
 
     const after_seed = srv.requestAt(1) orelse return error.NoRequestCaptured;
     try std.testing.expect(std.mem.indexOf(u8, after_seed.body(), "lexical-coverage-obligation") != null);
@@ -864,17 +865,30 @@ test "L2 KG governance: real agent loop requires enumeration batch and recalled-
     try std.testing.expect(std.mem.indexOf(u8, repair_request.body(), "lexical-coverage-rejected-final") != null);
     try std.testing.expect(std.mem.indexOf(u8, repair_request.body(), "Do not answer yet") != null);
 
-    const context_request = srv.requestAt(3) orelse return error.NoRequestCaptured;
-    try std.testing.expect(std.mem.indexOf(u8, context_request.body(), "\\\"all_variants_executed\\\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, context_request.body(), "\\\"executed_variant_count\\\":3") != null);
-    try std.testing.expect(std.mem.indexOf(u8, context_request.body(), "\\\"query_anchor_rewritten\\\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, context_request.body(), "query_anchor_input_sha256") != null);
-    try std.testing.expect(std.mem.indexOf(u8, context_request.body(), "query_anchor_effective_sha256") != null);
-    try std.testing.expect(std.mem.indexOf(u8, context_request.body(), "lexical-evidence-obligation") != null);
-
-    const final_request = srv.requestAt(4) orelse return error.NoRequestCaptured;
-    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "\"name\":\"KgContext\"") != null);
+    const final_request = srv.requestAt(3) orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "\\\"all_variants_executed\\\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "\\\"executed_variant_count\\\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "\\\"query_anchor_rewritten\\\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "query_anchor_input_sha256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "query_anchor_effective_sha256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "metacodes-auto-context-v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "first_new_evidence_then_new_then_merged_v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "lexical-evidence-obligation") == null);
     try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "knowledge_governance") != null);
+
+    // Tool definitions legitimately mention KgContext in every request. Prove
+    // the model did not issue it by inspecting the real structured transcript,
+    // rather than substring-matching the request schema.
+    var explicit_context_calls: usize = 0;
+    for (conv.messages.items) |message| {
+        for (message.blocks) |block| switch (block) {
+            .tool_use => |tool_use| if (std.mem.eql(u8, tool_use.name, "KgContext")) {
+                explicit_context_calls += 1;
+            },
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 0), explicit_context_calls);
 
     const final_message = conv.messages.items[conv.messages.items.len - 1];
     try std.testing.expectEqual(cc.message.Role.assistant, final_message.role);

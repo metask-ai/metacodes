@@ -341,6 +341,8 @@ fn executeRecallBatch(
     var merged_previously_seen_count: usize = 0;
     var probe_new_count: usize = 0;
     var probe_repeated_count: usize = 0;
+    var first_new_node_id: u64 = 0;
+    var first_new_evidence_node_id: u64 = 0;
     const known_types = [_][]const u8{ "decision", "module", "bug", "user_preference", "observation" };
     var facet_counts = [_]usize{0} ** known_types.len;
 
@@ -386,6 +388,11 @@ fn executeRecallBatch(
                 try hit_rows.appendSlice(ctx.allocator, row);
             } else {
                 merged_new_count += 1;
+                if (first_new_node_id == 0) first_new_node_id = hit.node_id;
+                const exposed_type = if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
+                if (first_new_evidence_node_id == 0 and std.mem.eql(u8, exposed_type, "evidence")) {
+                    first_new_evidence_node_id = hit.node_id;
+                }
                 try appendRecallHitRow(&hit_rows, ctx.allocator, hit, false, true);
             }
             const type_str = if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
@@ -434,11 +441,38 @@ fn executeRecallBatch(
     }
     try out.appendSlice(ctx.allocator, "],\"execution\":\"host_batch_all\"},\"retrieval_mode\":\"lexical_bm25_no_embeddings\",\"knowledge_status\":\"unverified_candidates\",\"lexical_guidance\":");
     try appendJsonString(&out, ctx.allocator, retrieval_protocol.RESULT_GUIDANCE);
+    // Enumeration needs one real graph re-observation, but spending a whole
+    // provider turn merely to ask the model to echo a recalled node_id is pure
+    // orchestration tax. Deterministically build the exact KgContext result in
+    // the same tool envelope before committing either observation. Selection
+    // prefers newly exposed evidence, then any new node, then the first merged
+    // node. This does not decide truth; it only removes model-owned parameter
+    // reconstruction from the governance read.
+    var auto_context_node_id: ?u64 = null;
+    if (plan.intent == .enumeration and plan.stage == .semantic_expansion and merged_count > 0) {
+        const context_node_id = if (first_new_evidence_node_id != 0)
+            first_new_evidence_node_id
+        else if (first_new_node_id != 0)
+            first_new_node_id
+        else
+            merged_ids[0];
+        const context_args = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d}}}", .{context_node_id});
+        defer ctx.allocator.free(context_args);
+        const context_observation = try executeContextObserved(ctx, context_args);
+        defer ctx.allocator.free(context_observation.result);
+        try out.appendSlice(ctx.allocator, ",\"auto_context\":{\"schema_version\":\"metacodes-auto-context-v1\",\"selection_policy\":\"first_new_evidence_then_new_then_merged_v1\",\"context\":");
+        try out.appendSlice(ctx.allocator, context_observation.result);
+        try out.append(ctx.allocator, '}');
+        auto_context_node_id = context_observation.observed_node_id;
+    }
     try out.append(ctx.allocator, '}');
 
     const owned = try out.toOwnedSlice(ctx.allocator);
     errdefer ctx.allocator.free(owned);
-    guard.commit(merged_ids[0..merged_count]) catch |err| {
+    // Commit only after every provider-visible byte, including auto_context,
+    // has been constructed. Otherwise an OOM/protocol failure after commit
+    // would mark node bodies as exposed even though the tool result was lost.
+    guard.commitWithContext(merged_ids[0..merged_count], auto_context_node_id) catch |err| {
         common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall lexical_plan host ledger could not commit the observed batch: {s}", .{lexical_query_plan.ledgerDiagnostic(err)});
         return error.InvalidLexicalPlanState;
     };
@@ -511,8 +545,23 @@ const MAX_GRAPH_BYTES: usize = 64 * 1024;
 /// 读取一个候选节点的权威正文页 + 有界本地图邻域。检索与遍历分开：KgRecall 找种子，
 /// KgContext 验证种子和 evidence；不能让模型仅凭 BM25 摘要或边名下结论。
 pub fn executeContext(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
-    const kg = requireKg(ctx) orelse return degradedResult(ctx.allocator, null);
-    if (!kg.ready) return degradedResult(ctx.allocator, kg);
+    const observation = try executeContextObserved(ctx, args);
+    if (observation.observed_node_id) |node_id| {
+        if (ctx.kg_lexical_ledger) |ledger| _ = ledger.commitContext(node_id);
+    }
+    return observation.result;
+}
+
+const ContextObservation = struct {
+    result: []u8,
+    /// Set only after both real TinyKG reads and the complete result body
+    /// succeed. Degraded output is useful to the model but is not evidence.
+    observed_node_id: ?u64 = null,
+};
+
+fn executeContextObserved(ctx: *const ToolContext, args: []const u8) anyerror!ContextObservation {
+    const kg = requireKg(ctx) orelse return .{ .result = try degradedResult(ctx.allocator, null) };
+    if (!kg.ready) return .{ .result = try degradedResult(ctx.allocator, kg) };
     kg.setAbort(ctx.abort);
 
     var parsed_args = std.json.parseFromSlice(std.json.Value, ctx.allocator, args, .{}) catch |err| switch (err) {
@@ -556,7 +605,7 @@ pub fn executeContext(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
     const text_limit = std.math.cast(usize, text_limit_u64) orelse return error.InvalidLimit;
 
-    const metadata_raw = kg.nodeMetadataJson(node_id, true) catch |e| return kgErrorResult(ctx, kg, e, "KgContext");
+    const metadata_raw = kg.nodeMetadataJson(node_id, true) catch |e| return .{ .result = try kgErrorResult(ctx, kg, e, "KgContext") };
     defer kg.allocator.free(metadata_raw);
     var parsed_metadata = std.json.parseFromSlice(std.json.Value, ctx.allocator, metadata_raw, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -571,7 +620,7 @@ pub fn executeContext(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         return error.InvalidGraphProtocol;
     };
     const text = metadata.text;
-    const graph_raw = kg.neighborsJson(node_id, limit) catch |e| return kgErrorResult(ctx, kg, e, "KgContext");
+    const graph_raw = kg.neighborsJson(node_id, limit) catch |e| return .{ .result = try kgErrorResult(ctx, kg, e, "KgContext") };
     defer kg.allocator.free(graph_raw);
     const graph = std.mem.trim(u8, graph_raw, " \t\r\n");
     if (graph.len > MAX_GRAPH_BYTES) {
@@ -617,12 +666,10 @@ pub fn executeContext(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try out.appendSlice(ctx.allocator, ",\"verification_guidance\":");
     try appendJsonString(&out, ctx.allocator, retrieval_protocol.CONTEXT_RESULT_GUIDANCE);
     try out.appendSlice(ctx.allocator, "}");
-    const owned = try out.toOwnedSlice(ctx.allocator);
-    // Advance the enumeration evidence gate only after both real TinyKG reads
-    // and the complete provider-visible result have succeeded. The ledger
-    // itself rejects pre-batch and never-recalled node ids.
-    if (ctx.kg_lexical_ledger) |ledger| _ = ledger.commitContext(node_id);
-    return owned;
+    return .{
+        .result = try out.toOwnedSlice(ctx.allocator),
+        .observed_node_id = node_id,
+    };
 }
 
 const KnowledgeGovernance = struct {

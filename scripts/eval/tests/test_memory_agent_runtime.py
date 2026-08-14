@@ -471,6 +471,74 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             ],
         )
 
+    def test_host_auto_context_counts_as_verified_memory_without_extra_tool_call(self):
+        recall_result = {
+            "hits": [
+                {
+                    "node_id": 7,
+                    "type": "evidence",
+                    "scope": "project",
+                    "text": "attended commencement",
+                    "seen_before": False,
+                }
+            ],
+            "auto_context": {
+                "schema_version": "metacodes-auto-context-v1",
+                "selection_policy": "first_new_evidence_then_new_then_merged_v1",
+                "context": {
+                    "node_id": 7,
+                    "graph": {
+                        "query": {"root_id": 7},
+                        "summary": {"truncated": False},
+                    },
+                    "knowledge_governance": {
+                        "schema_version": "metacodes-knowledge-governance-v1",
+                        "graph_truncated": False,
+                    },
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            (cassette / "req-001.json").write_text(
+                stable_json(
+                    {
+                        "messages": [
+                            {
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "id": "recall-1",
+                                        "name": "KgRecall",
+                                        "input": {"query": "graduation attended"},
+                                    }
+                                ]
+                            },
+                            {
+                                "content": [
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": "recall-1",
+                                        "content": stable_json(recall_result),
+                                    }
+                                ]
+                            },
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            observed = _cassette_tool_data(
+                cassette,
+                {7: "longmem:session:7"},
+                "graduation attended",
+            )
+
+        self.assertEqual(observed["retrieved"], ["longmem:session:7"])
+        self.assertEqual(observed["verified"], ["longmem:session:7"])
+        self.assertFalse(observed["graph_truncated"])
+
     def test_failed_recall_deduplicates_equivalent_query_variants(self):
         with tempfile.TemporaryDirectory() as directory:
             cassette = Path(directory)

@@ -170,6 +170,7 @@ pub const LedgerError = error{
     PlanCapacityExceeded,
     HitCapacityExceeded,
     SemanticExpansionBudgetExceeded,
+    ContextNodeNotRecalled,
 };
 
 const LedgerEntry = struct {
@@ -347,8 +348,20 @@ pub const Ledger = struct {
         /// to the model. Capacity is preflighted before mutation. `hit_ids`
         /// may contain duplicates; the ledger stores each positive id once.
         pub fn commit(self: *Guard, hit_ids: []const u64) LedgerError!void {
+            return self.commitWithContext(hit_ids, null);
+        }
+
+        /// Atomically commit a batch and its host-built context observation.
+        /// Keeping both facts under this guard's existing mutex prevents a
+        /// concurrent batch from being authorized by the wrong observation.
+        pub fn commitWithContext(self: *Guard, hit_ids: []const u64, context_node_id: ?u64) LedgerError!void {
             std.debug.assert(self.active);
             const existing = self.seenNodes();
+            if (context_node_id) |node_id| {
+                if (!self.enumeration_batch or node_id == 0 or
+                    (!containsU64(existing, node_id) and !containsU64(hit_ids, node_id)))
+                    return error.ContextNodeNotRecalled;
+            }
             var new_count: usize = 0;
             for (hit_ids, 0..) |node_id, index| {
                 if (node_id == 0 or containsU64(existing, node_id) or
@@ -386,7 +399,7 @@ pub const Ledger = struct {
                 self.ledger.enumeration_batch_committed = true;
                 // A later batch can expose a different scope. Evidence from an
                 // earlier batch must not silently authorize the newer result.
-                self.ledger.enumeration_context_committed = false;
+                self.ledger.enumeration_context_committed = context_node_id != null;
             }
             self.active = false;
             self.ledger.mutex.unlock();
@@ -565,6 +578,7 @@ pub fn ledgerDiagnostic(err: LedgerError) []const u8 {
         error.PlanCapacityExceeded => "the agent run exceeded 32 distinct governed lexical plans",
         error.HitCapacityExceeded => "the bounded host seen ledger is full; stop retrieval",
         error.SemanticExpansionBudgetExceeded => "the agent run would exceed the four host-executed semantic-expansion probes; stop retrieval",
+        error.ContextNodeNotRecalled => "auto_context must target a node returned by the same governed enumeration batch",
     };
 }
 
@@ -825,20 +839,29 @@ test "lexical query plan v3 executes a fixed batch and budgets actual probes" {
     try std.testing.expect(!coverage_after_abort.enumeration_context_committed);
     try std.testing.expect(!ledger.commitContext(41));
 
+    {
+        var invalid_context = try ledger.lockPlan(plan);
+        defer invalid_context.deinit();
+        try std.testing.expectError(
+            error.ContextNodeNotRecalled,
+            invalid_context.commitWithContext(&.{ 41, 43 }, 99),
+        );
+    }
+    try std.testing.expectEqual(@as(usize, 0), ledger.coverageState().successful_plan_calls);
+    try std.testing.expectEqual(@as(usize, 0), ledger.semantic_expansion_probes);
+
     var first = try ledger.lockPlan(plan);
     defer first.deinit();
     try std.testing.expectEqualStrings("agent_run_batch", first.scope());
-    try first.commit(&.{ 41, 43 });
+    try first.commitWithContext(&.{ 41, 43 }, 41);
     try std.testing.expectEqual(@as(usize, 2), ledger.semantic_expansion_probes);
     const coverage_after_first = ledger.coverageState();
     try std.testing.expectEqual(@as(usize, 1), coverage_after_first.successful_plan_calls);
     try std.testing.expectEqual(@as(usize, 1), coverage_after_first.enumeration_plan_calls);
     try std.testing.expect(coverage_after_first.enumeration_batch_committed);
     try std.testing.expect(coverage_after_first.enumeration_context_required);
-    try std.testing.expect(!coverage_after_first.enumeration_context_committed);
+    try std.testing.expect(coverage_after_first.enumeration_context_committed);
     try std.testing.expect(!ledger.commitContext(99));
-    try std.testing.expect(ledger.commitContext(41));
-    try std.testing.expect(ledger.coverageState().enumeration_context_committed);
 
     var second = try ledger.lockPlan(plan);
     defer second.deinit();

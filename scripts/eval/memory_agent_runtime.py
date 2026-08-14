@@ -1485,6 +1485,39 @@ def _cassette_tool_data(
                         logical = logical_ids.get(node_id) if isinstance(node_id, int) else None
                         if logical is not None and logical not in retrieved:
                             retrieved.append(logical)
+                auto_context = parsed.get("auto_context") if isinstance(parsed, dict) else None
+                if isinstance(auto_context, dict):
+                    context = auto_context.get("context")
+                    if (
+                        auto_context.get("schema_version") == "metacodes-auto-context-v1"
+                        and auto_context.get("selection_policy")
+                        == "first_new_evidence_then_new_then_merged_v1"
+                        and isinstance(context, dict)
+                        and isinstance(context.get("graph"), dict)
+                        and isinstance(context.get("knowledge_governance"), dict)
+                    ):
+                        node_id = context.get("node_id")
+                        graph_query = context["graph"].get("query")
+                        governance = context["knowledge_governance"]
+                        if (
+                            isinstance(node_id, int)
+                            and not isinstance(node_id, bool)
+                            and isinstance(graph_query, dict)
+                            and graph_query.get("root_id") == node_id
+                            and governance.get("schema_version")
+                            == "metacodes-knowledge-governance-v1"
+                        ):
+                            logical = logical_ids.get(node_id)
+                            if logical is not None and logical not in verified:
+                                verified.append(logical)
+                            graph_summary = context["graph"].get("summary")
+                            graph_truncated = graph_truncated or bool(
+                                governance.get("graph_truncated")
+                                or (
+                                    isinstance(graph_summary, dict)
+                                    and graph_summary.get("truncated")
+                                )
+                            )
             elif name == "KgContext":
                 node_id = tool_input.get("node_id")
                 logical = logical_ids.get(node_id) if isinstance(node_id, int) else None

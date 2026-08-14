@@ -116,6 +116,7 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
         intent="enumeration",
         query=None,
         audited_anchor=False,
+        auto_context_node_id=None,
     ):
         plan_sha = _plan_fingerprint(
             intent,
@@ -169,7 +170,12 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
                 )
             else:
                 result_hits.append(
-                    {"node_id": node_id, "seen_before": False, "text": f"node {node_id}"}
+                    {
+                        "node_id": node_id,
+                        "seen_before": False,
+                        "text": f"node {node_id}",
+                        **({"type": "evidence"} if node_id == auto_context_node_id else {}),
+                    }
                 )
         merged_new = sum(node_id not in seen for node_id in merged)
         effective_query = variants[0]["text"].strip(" \t\r\n")
@@ -209,6 +215,21 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
                     ).hexdigest(),
                 }
             )
+        if auto_context_node_id is not None:
+            result["auto_context"] = {
+                "schema_version": "metacodes-auto-context-v1",
+                "selection_policy": "first_new_evidence_then_new_then_merged_v1",
+                "context": {
+                    "node_id": auto_context_node_id,
+                    "graph": {
+                        "query": {"root_id": auto_context_node_id},
+                        "summary": {"truncated": False},
+                    },
+                    "knowledge_governance": {
+                        "schema_version": "metacodes-knowledge-governance-v1",
+                    },
+                },
+            }
         return (
             {
                 "type": "tool_use",
@@ -399,10 +420,53 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
                 trace,
             )
 
+    def test_v3_auto_context_is_bound_to_deterministic_batch_selection(self):
+        variants = [
+            {"kind": "synonym", "text": "attended commencement"},
+            {"kind": "relation", "text": "degree conferral I went to"},
+        ]
+        batch = self._batch_call(
+            "kg-auto-context",
+            variants=variants,
+            variant_hits=[(7, 9), (11,)],
+            auto_context_node_id=7,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(cassette, [batch])
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-v3-auto-context",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+            self.assertEqual(trace["status"], "verified")
+
+            request = json.loads((cassette / "req-001.json").read_text(encoding="utf-8"))
+            result_item = request["messages"][1]["content"][0]
+            result = json.loads(result_item["content"])
+            result["auto_context"]["context"]["node_id"] = 9
+            result["auto_context"]["context"]["graph"]["query"]["root_id"] = 9
+            result_item["content"] = stable_json(result)
+            (cassette / "req-001.json").write_text(
+                stable_json(request) + "\n",
+                encoding="utf-8",
+            )
+            tampered = build_query_plan_trace(
+                cassette,
+                run_id="run-v3-auto-context",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+            self.assertEqual(tampered["status"], "invalid")
+            self.assertTrue(
+                any("deterministic selection" in reason for reason in tampered["invalid_reasons"])
+            )
+
             tampered_use, tampered_result = copy.deepcopy(batch)
             tampered_payload = json.loads(tampered_result["content"])
             tampered_payload["lexical_query_plan"]["variant_receipts"][1][
-                "repeated_hit_count"
+                "new_hit_count"
             ] = 0
             tampered_result["content"] = stable_json(tampered_payload)
             self._write_requests(cassette, [(tampered_use, tampered_result)])

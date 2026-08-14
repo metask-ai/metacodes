@@ -25,6 +25,8 @@ TRACE_SCHEMA_VERSIONS = frozenset({TRACE_SCHEMA_VERSION, LEGACY_TRACE_SCHEMA_VER
 REPORT_SCHEMA_VERSION = "metacodes-memory-query-plan-report-v4"
 LEXICAL_PLAN_SCHEMA_VERSION = "lexical-query-plan-v2"
 BATCH_LEXICAL_PLAN_SCHEMA_VERSION = "lexical-query-plan-v3"
+AUTO_CONTEXT_SCHEMA_VERSION = "metacodes-auto-context-v1"
+AUTO_CONTEXT_SELECTION_POLICY = "first_new_evidence_then_new_then_merged_v1"
 LEGACY_LEXICAL_PLAN_SCHEMA_VERSION = "lexical-query-plan-v1"
 LEXICAL_PLAN_SCHEMA_VERSIONS = frozenset(
     {
@@ -576,6 +578,61 @@ def _parse_batch_receipt(
     if merged_hit_ids != ordered_merged:
         _fail(where, "merged hits do not match first-seen per-variant receipt order")
 
+    auto_context_node_id: int | None = None
+    raw_auto_context = result.get("auto_context")
+    if raw_auto_context is not None:
+        auto_context = _object(
+            raw_auto_context,
+            f"{where}.auto_context",
+            frozenset({"schema_version", "selection_policy", "context"}),
+        )
+        if auto_context["schema_version"] != AUTO_CONTEXT_SCHEMA_VERSION:
+            _fail(f"{where}.auto_context.schema_version", "unsupported auto-context schema")
+        if auto_context["selection_policy"] != AUTO_CONTEXT_SELECTION_POLICY:
+            _fail(f"{where}.auto_context.selection_policy", "unsupported selection policy")
+        if not (
+            parsed_plan["intent"] == "enumeration"
+            and parsed_plan["stage"] == "semantic_expansion"
+            and ordered_merged
+        ):
+            _fail(where, "auto-context is only valid for a non-empty enumeration batch")
+        context = auto_context["context"]
+        if not isinstance(context, dict):
+            _fail(f"{where}.auto_context.context", "expected an object")
+        auto_context_node_id = _integer(
+            context.get("node_id"),
+            f"{where}.auto_context.context.node_id",
+            minimum=1,
+        )
+        first_new_evidence = next(
+            (
+                _integer(hit.get("node_id"), f"{where}.hits.node_id", minimum=1)
+                for hit in hits
+                if hit.get("seen_before") is False and hit.get("type") == "evidence"
+            ),
+            None,
+        )
+        first_new = next(
+            (
+                _integer(hit.get("node_id"), f"{where}.hits.node_id", minimum=1)
+                for hit in hits
+                if hit.get("seen_before") is False
+            ),
+            None,
+        )
+        expected_context_node_id = first_new_evidence or first_new or ordered_merged[0]
+        if auto_context_node_id != expected_context_node_id:
+            _fail(f"{where}.auto_context.context.node_id", "does not match deterministic selection")
+        graph = context.get("graph")
+        governance = context.get("knowledge_governance")
+        if not isinstance(graph, dict) or not isinstance(governance, dict):
+            _fail(f"{where}.auto_context.context", "missing graph governance receipt")
+        query = graph.get("query")
+        if not isinstance(query, dict) or query.get("root_id") != auto_context_node_id:
+            _fail(f"{where}.auto_context.context.graph", "root does not bind selected node")
+        if governance.get("schema_version") != "metacodes-knowledge-governance-v1":
+            _fail(f"{where}.auto_context.context.knowledge_governance", "unsupported governance receipt")
+
     merged_new = sum(node_id not in expected_seen for node_id in ordered_merged)
     merged_seen = len(ordered_merged) - merged_new
     summary_expected = {
@@ -595,6 +652,7 @@ def _parse_batch_receipt(
         "repeated_hit_count": probe_repeated_total,
         "hit_node_ids": ordered_merged,
         "probes": probes,
+        "auto_context_node_id": auto_context_node_id,
     }
 
 
