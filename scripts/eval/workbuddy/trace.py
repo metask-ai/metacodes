@@ -20,9 +20,14 @@ from urllib.parse import urlsplit, urlunsplit
 
 MAX_TRACE_BYTES = 64 * 1024 * 1024
 LEGACY_CONTROL_METRICS_SCHEMA = "metacodes-workbuddy-control-metrics-v1"
-CONTROL_METRICS_SCHEMA = "metacodes-workbuddy-control-metrics-v2"
+PROJECT_RULE_CONTROL_METRICS_SCHEMA = "metacodes-workbuddy-control-metrics-v2"
+CONTROL_METRICS_SCHEMA = "metacodes-workbuddy-control-metrics-v3"
 CONTROL_METRICS_SCHEMAS = frozenset(
-    {LEGACY_CONTROL_METRICS_SCHEMA, CONTROL_METRICS_SCHEMA}
+    {
+        LEGACY_CONTROL_METRICS_SCHEMA,
+        PROJECT_RULE_CONTROL_METRICS_SCHEMA,
+        CONTROL_METRICS_SCHEMA,
+    }
 )
 OBSERVATION_JOURNAL_SCHEMA = "metacodes-tool-observation-journal-v1"
 TOOL_OBSERVATION_SCHEMA = "metacodes-tool-observation-v1"
@@ -409,6 +414,89 @@ def _result_object(content: Any, where: str) -> Dict[str, Any]:
     return value
 
 
+def _record_context_governance(
+    tinykg: Dict[str, int], context: Mapping[str, Any], where: str
+) -> None:
+    """Validate and count one real TinyKG graph-governance observation.
+
+    The observation can come from an explicit ``KgContext`` tool call or from
+    the deterministic ``auto_context`` attached to a governed v3 recall.  The
+    latter is not another model-issued tool call, but it is still a real host
+    read and must not disappear from mechanism-effect statistics.
+    """
+
+    governance = context.get("knowledge_governance")
+    if not isinstance(governance, dict):
+        raise TraceError(f"{where} is missing knowledge governance evidence")
+    if governance.get("schema_version") != "metacodes-knowledge-governance-v1":
+        raise TraceError(f"{where} knowledge governance schema is unsupported")
+    trust = governance.get("trust_state")
+    trust_keys = {
+        "evidence_connected_candidate": "context_evidence_connected",
+        "unverified_candidate": "context_unverified",
+        "contradicted": "context_contradicted",
+        "superseded": "context_superseded",
+        "incomplete_graph": "context_incomplete_graph",
+    }
+    if trust not in trust_keys:
+        raise TraceError(f"{where} trust_state is unknown")
+    tinykg["context_observations"] += 1
+    tinykg[trust_keys[trust]] += 1
+
+
+def _record_auto_context(
+    tinykg: Dict[str, int],
+    payload: Mapping[str, Any],
+    hits: List[Mapping[str, Any]],
+    declared_plan: Mapping[str, Any],
+) -> None:
+    raw = payload.get("auto_context")
+    if raw is None:
+        return
+    if not isinstance(raw, dict):
+        raise TraceError("KgRecall auto_context is malformed")
+    if (
+        raw.get("schema_version") != "metacodes-auto-context-v1"
+        or raw.get("selection_policy")
+        != "first_new_evidence_then_new_then_merged_v1"
+        or declared_plan.get("intent") != "enumeration"
+        or declared_plan.get("stage") != "semantic_expansion"
+        or not hits
+    ):
+        raise TraceError("KgRecall auto_context contract is invalid")
+    context = raw.get("context")
+    if not isinstance(context, dict):
+        raise TraceError("KgRecall auto_context context is malformed")
+    node_id = context.get("node_id")
+    graph = context.get("graph")
+    graph_query = graph.get("query") if isinstance(graph, dict) else None
+    if (
+        isinstance(node_id, bool)
+        or not isinstance(node_id, int)
+        or node_id <= 0
+        or not isinstance(graph_query, dict)
+        or graph_query.get("root_id") != node_id
+    ):
+        raise TraceError("KgRecall auto_context is not bound to its graph root")
+    first_new_evidence = next(
+        (
+            hit["node_id"]
+            for hit in hits
+            if hit.get("seen_before") is False and hit.get("type") == "evidence"
+        ),
+        None,
+    )
+    first_new = next(
+        (hit["node_id"] for hit in hits if hit.get("seen_before") is False),
+        None,
+    )
+    expected = first_new_evidence or first_new or hits[0]["node_id"]
+    if node_id != expected:
+        raise TraceError("KgRecall auto_context violates deterministic selection")
+    _record_context_governance(tinykg, context, "KgRecall auto_context")
+    tinykg["auto_context_succeeded"] += 1
+
+
 def _task_list_has_kg_status(content: Any) -> bool:
     """Validate TaskList's public array contract and extract KG evidence.
 
@@ -512,6 +600,8 @@ def _tool_control_metrics(messages: Iterable[Mapping[str, Any]]) -> Dict[str, An
         "recall_governed_calls": 0,
         "context_calls": 0,
         "context_succeeded": 0,
+        "auto_context_succeeded": 0,
+        "context_observations": 0,
         "context_evidence_connected": 0,
         "context_unverified": 0,
         "context_contradicted": 0,
@@ -705,6 +795,9 @@ def _tool_control_metrics(messages: Iterable[Mapping[str, Any]]) -> Dict[str, An
                             != (new_count, repeated_count)
                         ):
                             raise TraceError("KgRecall batch information-gain receipt is inconsistent")
+                        _record_auto_context(
+                            tinykg, payload, hits, declared_plan
+                        )
                     elif (new_count, repeated_count) != (
                         observed_new,
                         observed_repeated,
@@ -714,23 +807,8 @@ def _tool_control_metrics(messages: Iterable[Mapping[str, Any]]) -> Dict[str, An
                     tinykg["recall_new_nodes"] += new_count
                     tinykg["recall_repeated_nodes"] += repeated_count
             else:
-                governance = payload.get("knowledge_governance")
-                if not isinstance(governance, dict):
-                    raise TraceError("KgContext is missing knowledge governance evidence")
-                if governance.get("schema_version") != "metacodes-knowledge-governance-v1":
-                    raise TraceError("KgContext knowledge governance schema is unsupported")
-                trust = governance.get("trust_state")
-                trust_keys = {
-                    "evidence_connected_candidate": "context_evidence_connected",
-                    "unverified_candidate": "context_unverified",
-                    "contradicted": "context_contradicted",
-                    "superseded": "context_superseded",
-                    "incomplete_graph": "context_incomplete_graph",
-                }
-                if trust not in trust_keys:
-                    raise TraceError("KgContext trust_state is unknown")
+                _record_context_governance(tinykg, payload, "KgContext")
                 tinykg["context_succeeded"] += 1
-                tinykg[trust_keys[trust]] += 1
         elif name in _TASK_DAG_TOOLS:
             tinykg["task_dag_calls"] += 1
             tinykg["task_dag_failed" if failed else "task_dag_succeeded"] += 1

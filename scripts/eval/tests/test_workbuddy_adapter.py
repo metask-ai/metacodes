@@ -697,12 +697,104 @@ class WorkBuddyTraceTest(unittest.TestCase):
         self.assertEqual(tinykg["recall_miss_calls"], 1)
         self.assertEqual(tinykg["recall_new_nodes"], 1)
         self.assertEqual(tinykg["recall_repeated_nodes"], 1)
+        self.assertEqual(tinykg["auto_context_succeeded"], 0)
+        self.assertEqual(tinykg["context_observations"], 1)
         self.assertEqual(tinykg["context_evidence_connected"], 1)
         self.assertEqual(tinykg["remember_succeeded"], 1)
         self.assertEqual(tinykg["task_dag_calls"], 4)
         self.assertEqual(tinykg["task_list_calls"], 1)
         self.assertEqual(tinykg["task_tinykg_status_results"], 4)
         self.assertEqual(tinykg["task_terminal_commits"], 1)
+
+    def test_control_metrics_count_bound_auto_context_as_real_observation(self):
+        tool_input = {
+            "query": "commencement attendance",
+            "lexical_plan": {
+                "schema_version": "lexical-query-plan-v3",
+                "intent": "enumeration",
+                "stage": "semantic_expansion",
+                "variants": [
+                    {"kind": "synonym", "text": "commencement attendance"},
+                    {"kind": "relation", "text": "graduation ceremonies attended"},
+                ],
+            },
+        }
+        payload = {
+            "count": 1,
+            "hits": [{
+                "node_id": 7,
+                "type": "evidence",
+                "seen_before": False,
+                "text": "attended commencement",
+            }],
+            "lexical_query_plan": {
+                "schema_version": "lexical-query-plan-v3",
+                "plan_sha256": "4" * 64,
+                "intent": "enumeration",
+                "stage": "semantic_expansion",
+                "variant_count": 2,
+                "executed_variant_count": 2,
+                "all_variants_executed": True,
+                "seen_state_verified": True,
+                "ledger_scope": "agent_run_batch",
+                "execution": "host_batch_all",
+                "merged_hit_count": 1,
+                "merged_new_hit_count": 1,
+                "merged_previously_seen_count": 0,
+                "probe_new_hit_count": 1,
+                "probe_repeated_hit_count": 1,
+                "variant_receipts": [
+                    {
+                        "variant_index": 0,
+                        "variant_kind": "synonym",
+                        "node_ids": [7],
+                        "new_hit_count": 1,
+                        "repeated_hit_count": 0,
+                    },
+                    {
+                        "variant_index": 1,
+                        "variant_kind": "relation",
+                        "node_ids": [7],
+                        "new_hit_count": 0,
+                        "repeated_hit_count": 1,
+                    },
+                ],
+            },
+            "auto_context": {
+                "schema_version": "metacodes-auto-context-v1",
+                "selection_policy": "first_new_evidence_then_new_then_merged_v1",
+                "context": {
+                    "node_id": 7,
+                    "graph": {"query": {"root_id": 7}},
+                    "knowledge_governance": {
+                        "schema_version": "metacodes-knowledge-governance-v1",
+                        "trust_state": "evidence_connected_candidate",
+                    },
+                },
+            },
+        }
+        rows = [
+            {"role": "assistant", "blocks": [{
+                "type": "tool_use", "id": "recall", "name": "KgRecall",
+                "input": tool_input,
+            }]},
+            {"role": "user", "blocks": [{
+                "type": "tool_result", "tool_use_id": "recall",
+                "content": json.dumps(payload), "is_error": False,
+            }]},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(transcript, rows)
+            self._write_jsonl(observation, self._journal())
+            tinykg = load_control_metrics(transcript, observation)["tinykg"]
+        self.assertEqual(tinykg["context_calls"], 0)
+        self.assertEqual(tinykg["context_succeeded"], 0)
+        self.assertEqual(tinykg["auto_context_succeeded"], 1)
+        self.assertEqual(tinykg["context_observations"], 1)
+        self.assertEqual(tinykg["context_evidence_connected"], 1)
 
     def test_control_metrics_reject_v3_variant_receipt_unbound_to_input_or_hits(self):
         tool_input = {

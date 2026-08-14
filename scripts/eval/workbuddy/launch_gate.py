@@ -55,6 +55,7 @@ from .stage_artifacts import (
 )
 from .trace import (
     CONTROL_METRICS_SCHEMA,
+    CONTROL_METRICS_SCHEMAS,
     LEGACY_CONTROL_METRICS_SCHEMA,
     OBSERVATION_FILENAME,
     TraceError,
@@ -1357,10 +1358,10 @@ def _validate_control_metrics(
 ) -> Dict[str, Any]:
     """Validate post-run mechanism evidence before it enters a quality receipt."""
 
-    if not isinstance(value, dict) or value.get("schema_version") not in {
-        LEGACY_CONTROL_METRICS_SCHEMA,
-        CONTROL_METRICS_SCHEMA,
-    }:
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") not in CONTROL_METRICS_SCHEMAS
+    ):
         raise LaunchError("trajectory is missing the versioned control metrics")
     if set(value) != {
         "schema_version",
@@ -1445,7 +1446,13 @@ def _validate_control_metrics(
         raise LaunchError("control metrics privacy contract drifted")
     observed = load_control_metrics(transcript_path, observation_path)
     comparable = observed
-    if value.get("schema_version") == LEGACY_CONTROL_METRICS_SCHEMA:
+    input_schema = value.get("schema_version")
+    if input_schema != CONTROL_METRICS_SCHEMA:
+        comparable = json.loads(json.dumps(observed))
+        comparable["schema_version"] = input_schema
+        for name in ("auto_context_succeeded", "context_observations"):
+            comparable["tinykg"].pop(name)
+    if input_schema == LEGACY_CONTROL_METRICS_SCHEMA:
         filter_fields = (
             "rule_filter_events",
             "active_rule_phases",
@@ -1454,8 +1461,6 @@ def _validate_control_metrics(
         )
         if any(observed["lean"].get(name) != 0 for name in filter_fields):
             raise LaunchError("legacy control metrics cannot represent project rule filtering")
-        comparable = json.loads(json.dumps(observed))
-        comparable["schema_version"] = LEGACY_CONTROL_METRICS_SCHEMA
         for name in filter_fields:
             comparable["lean"].pop(name)
     if comparable != value:

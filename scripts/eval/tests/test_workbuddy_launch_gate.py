@@ -53,6 +53,7 @@ from scripts.eval.workbuddy.trace import (
     LEGACY_CONTROL_METRICS_SCHEMA,
     OBSERVATION_JOURNAL_SCHEMA,
     OBSERVATION_FILENAME,
+    PROJECT_RULE_CONTROL_METRICS_SCHEMA,
     load_control_metrics,
 )
 from scripts.eval.workbuddy import WORKBUDDY_PINNED_COMMIT
@@ -1039,7 +1040,7 @@ with urllib.request.urlopen(
                     observation_path=observation,
                 )
 
-    def test_legacy_control_metrics_are_accepted_only_without_filter_events(self):
+    def test_historical_control_metrics_preserve_versioned_compatibility(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             transcript = root / "metacodes-transcript.jsonl"
@@ -1063,8 +1064,24 @@ with urllib.request.urlopen(
             )
             trajectory.write_text("{}\n", encoding="utf-8")
             current = load_control_metrics(transcript, observation)
+            project_rule = json.loads(json.dumps(current))
+            project_rule["schema_version"] = PROJECT_RULE_CONTROL_METRICS_SCHEMA
+            for name in ("auto_context_succeeded", "context_observations"):
+                project_rule["tinykg"].pop(name)
+            self.assertEqual(
+                _validate_control_metrics(
+                    project_rule,
+                    trajectory_path=trajectory,
+                    transcript_path=transcript,
+                    observation_path=observation,
+                ),
+                current,
+            )
+
             legacy = json.loads(json.dumps(current))
             legacy["schema_version"] = LEGACY_CONTROL_METRICS_SCHEMA
+            for name in ("auto_context_succeeded", "context_observations"):
+                legacy["tinykg"].pop(name)
             for name in (
                 "rule_filter_events",
                 "active_rule_phases",
