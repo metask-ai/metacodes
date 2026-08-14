@@ -39,7 +39,8 @@ pub fn isValidJson(data: []const u8) bool {
 
 /// 尽力把 raw 修成合法 JSON。返回 owned(调用方 free);已合法则 dupe 原样返回。修不好兜底 `"{}"`。
 /// 修复顺序(每步后重试解析,命中即返回):① 空/None/null → `{}` ② 剥 markdown 代码围栏
-/// ③ 删除一个错位的闭括号（仅当删除后整个 object 立即合法）
+/// ③ 删除数组元素边界重复的 `}`（GLM 会在每个 object 后重复）或单个错位闭括号；
+///    两种都只在删除后整个 object 立即合法时采用
 /// ④ **抽取首个完整 JSON value**(同时吃掉前置**和尾部**噪声——弱模型高频:`{...} 我的理由是…`)
 /// ⑤ 删 trailing comma ⑥ 补缺失闭合括号 ⑦ 补括号后再删 trailing comma(治 `{"a":1,`)⑧ 兜底 `{}`。
 ///
@@ -64,8 +65,15 @@ pub fn repairToolArgs(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     cur = std.mem.trim(u8, cur, " \t\r\n");
     if (isValidJson(cur)) return allocator.dupe(u8, cur);
 
-    // ③ 删除一个错位的闭括号。必须在抽取首个 value 之前做：无类型 depth 计数会
-    // 把错位的 `}` 当作合法闭合并过早截掉其后的完整字段。
+    // ③a GLM 实战样本会在 variants 数组的**每个** object 后多产一个 `}`。
+    // 只删除这个可精确识别的数组元素边界 closer，且整体重新解析合法才采用。
+    if (try removeRepeatedArrayItemExtraClosers(allocator, cur)) |repaired| {
+        defer allocator.free(repaired);
+        if (isValidJson(repaired)) return allocator.dupe(u8, repaired);
+    }
+
+    // ③b 删除一个其它错位的闭括号。必须在抽取首个 value 之前做：无类型 depth
+    // 计数会把错位的 `}` 当作合法闭合并过早截掉其后的完整字段。
     if (try removeSingleMismatchedCloser(allocator, cur)) |repaired| {
         defer allocator.free(repaired);
         if (isValidJson(repaired)) return allocator.dupe(u8, repaired);
@@ -100,6 +108,85 @@ pub fn repairToolArgs(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     // ⑧ 兜底:保证请求不崩(工具执行时缺参会再报错给模型,总比整轮 400 好)。
     log.warn("repair", "tool args 无法 salvage,兜底 {{}}(原文 {d} 字节)", .{raw.len});
     return allocator.dupe(u8, "{}");
+}
+
+/// 删除 GLM 偶发的数组元素重复 closer: `[{...}}, {...}}]` → `[{...}, {...}]`。
+/// 只认可下列唯一形状：当 delimiter stack 正等待 `]`时遇到 `}`，前一个非空白字符
+/// 已是 `}`（元素 object 已合法闭合），且后一个非空白字符是 `,` 或 `]`。其它任何
+/// 不匹配括号都放弃这个候选；caller 还会要求修复后整体通过 JSON parser。
+fn removeRepeatedArrayItemExtraClosers(allocator: std.mem.Allocator, s: []const u8) !?[]u8 {
+    var expected = std.ArrayList(u8).empty;
+    defer expected.deinit(allocator);
+    var remove_indices = std.ArrayList(usize).empty;
+    defer remove_indices.deinit(allocator);
+
+    var in_str = false;
+    var escaped = false;
+    for (s, 0..) |c, i| {
+        if (in_str) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_str = false;
+            }
+            continue;
+        }
+        switch (c) {
+            '"' => in_str = true,
+            '{' => try expected.append(allocator, '}'),
+            '[' => try expected.append(allocator, ']'),
+            '}', ']' => {
+                if (expected.items.len > 0 and expected.items[expected.items.len - 1] == c) {
+                    _ = expected.pop();
+                    continue;
+                }
+                const stack_expects_array_end = expected.items.len > 0 and expected.items[expected.items.len - 1] == ']';
+                const previous = previousNonWhitespace(s, i);
+                const next = nextNonWhitespace(s, i + 1);
+                const is_array_item_extra = c == '}' and stack_expects_array_end and
+                    previous != null and previous.? == '}' and next != null and
+                    (next.? == ',' or next.? == ']');
+                if (!is_array_item_extra) return null;
+                try remove_indices.append(allocator, i);
+                // 忽略这个 closer，不改变 stack；后续数组元素仍按原结构继续校验。
+            },
+            else => {},
+        }
+    }
+    if (remove_indices.items.len == 0) return null;
+
+    const out = try allocator.alloc(u8, s.len - remove_indices.items.len);
+    var source_index: usize = 0;
+    var output_index: usize = 0;
+    var remove_index: usize = 0;
+    while (source_index < s.len) : (source_index += 1) {
+        if (remove_index < remove_indices.items.len and remove_indices.items[remove_index] == source_index) {
+            remove_index += 1;
+            continue;
+        }
+        out[output_index] = s[source_index];
+        output_index += 1;
+    }
+    return out;
+}
+
+fn previousNonWhitespace(s: []const u8, before: usize) ?u8 {
+    var index = before;
+    while (index > 0) {
+        index -= 1;
+        if (!std.ascii.isWhitespace(s[index])) return s[index];
+    }
+    return null;
+}
+
+fn nextNonWhitespace(s: []const u8, from: usize) ?u8 {
+    var index = from;
+    while (index < s.len) : (index += 1) {
+        if (!std.ascii.isWhitespace(s[index])) return s[index];
+    }
+    return null;
 }
 
 /// 删除字符串外恰好一个与 delimiter stack 顶不匹配的闭括号。返回 null 表示没有
@@ -531,6 +618,28 @@ test "repairToolArgs: GLM nested array boundary extra closer preserves complete 
             "{\"kind\":\"synonym\",\"text\":\"convocation\"}," ++
             "{\"kind\":\"synonym\",\"text\":\"degree ceremony\"}]}," ++
             "\"query\":\"commencement\"}",
+        repaired,
+    );
+}
+
+test "repairToolArgs: GLM repeated array item extra closers preserve v3 batch" {
+    const raw =
+        "{\"lexical_plan\": {\"intent\": \"fact_lookup\", \"schema_version\": " ++
+        "\"lexical-query-plan-v3\", \"stage\": \"seed\", \"variants\": [" ++
+        "{\"kind\": \"exact\", \"text\": \"kitchen cleaning tips\"}}, " ++
+        "{\"kind\": \"synonym\", \"text\": \"keeping kitchen clean\"}}, " ++
+        "{\"kind\": \"paraphrase\", \"text\": \"kitchen mess organization\"}]}, " ++
+        "\"query\": \"kitchen cleaning tips\"}";
+    const repaired = try repairToolArgs(testing.allocator, raw);
+    defer testing.allocator.free(repaired);
+    try testing.expect(isValidJson(repaired));
+    try testing.expectEqualStrings(
+        "{\"lexical_plan\": {\"intent\": \"fact_lookup\", \"schema_version\": " ++
+            "\"lexical-query-plan-v3\", \"stage\": \"seed\", \"variants\": [" ++
+            "{\"kind\": \"exact\", \"text\": \"kitchen cleaning tips\"}, " ++
+            "{\"kind\": \"synonym\", \"text\": \"keeping kitchen clean\"}, " ++
+            "{\"kind\": \"paraphrase\", \"text\": \"kitchen mess organization\"}]}, " ++
+            "\"query\": \"kitchen cleaning tips\"}",
         repaired,
     );
 }

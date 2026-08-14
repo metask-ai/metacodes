@@ -253,10 +253,11 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
         seen=(),
         intent="enumeration",
         query="stale compatibility query",
+        input_stage="semantic_expansion",
     ):
         input_plan_sha = _plan_fingerprint(
             intent,
-            "semantic_expansion",
+            input_stage,
             variants,
             None,
             schema_version="lexical-query-plan-v3",
@@ -293,13 +294,17 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
         effective_query = seed["text"].strip(" \t\r\n")
         rewrite = {
             "schema_version": "metacodes-seed-shape-rewrite-v1",
-            "reason": "exact_prefix_in_semantic_expansion",
+            "reason": (
+                "semantic_variants_declared_in_seed"
+                if input_stage == "seed"
+                else "exact_prefix_in_semantic_expansion"
+            ),
             "input_plan_sha256": input_plan_sha,
             "effective_plan_sha256": effective_plan_sha,
             "effective_seed_sha256": hashlib.sha256(
                 effective_query.encode("utf-8")
             ).hexdigest(),
-            "input_stage": "semantic_expansion",
+            "input_stage": input_stage,
             "effective_stage": "seed",
             "declared_variant_count": len(variants),
             "executed_variant_count": 1,
@@ -308,7 +313,7 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
         lexical_plan = {
             "schema_version": "lexical-query-plan-v3",
             "intent": intent,
-            "stage": "semantic_expansion",
+            "stage": input_stage,
             "variants": variants,
         }
         result = {
@@ -317,7 +322,7 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
                 "schema_version": "lexical-query-plan-v3",
                 "plan_sha256": input_plan_sha,
                 "intent": intent,
-                "stage": "semantic_expansion",
+                "stage": input_stage,
                 "variant_count": len(variants),
                 "executed_variant_count": 1,
                 "all_variants_executed": False,
@@ -598,6 +603,40 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
                 trace,
             )
 
+    def test_v3_seed_with_semantic_tail_replays_as_one_effective_seed(self):
+        variants = [
+            {"kind": "exact", "text": "kitchen cleaning tips"},
+            {"kind": "synonym", "text": "keeping kitchen clean"},
+            {"kind": "paraphrase", "text": "kitchen mess organization"},
+        ]
+        recovered = self._seed_shape_rewrite_call(
+            "kg-seed-stage-rewrite",
+            variants=variants,
+            hits=(7,),
+            intent="fact_lookup",
+            query="kitchen cleaning tips",
+            input_stage="seed",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(cassette, [recovered])
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-v3-seed-stage-rewrite",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+            self.assertEqual(trace["status"], "verified")
+            call = trace["calls"][0]
+            self.assertEqual(call["stage"], "seed")
+            self.assertEqual(call["execution"], "host_seed_shape_rewrite")
+            self.assertEqual(call["variant_count"], 1)
+            self.assertEqual(call["probes"][0]["query"], "kitchen cleaning tips")
+            self.assertEqual(
+                summarize_query_plan_traces([trace])["seed_shape_rewrite_count"],
+                1,
+            )
+
             tampered_use, tampered_result = copy.deepcopy(recovered)
             payload = json.loads(tampered_result["content"])
             payload["lexical_query_plan"]["rewrite"]["effective_plan_sha256"] = (
@@ -607,7 +646,7 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             self._write_requests(cassette, [(tampered_use, tampered_result)])
             invalid = build_query_plan_trace(
                 cassette,
-                run_id="run-v3-seed-rewrite-tampered",
+                run_id="run-v3-seed-stage-rewrite-tampered",
                 arm="tinykg_lexical",
                 memory_backend="tinykg_integrated",
             )

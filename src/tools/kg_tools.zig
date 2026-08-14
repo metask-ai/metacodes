@@ -608,8 +608,9 @@ fn appendLexicalPlanReceipt(
     try out.appendSlice(allocator, receipt);
 }
 
-/// Emit a proof-carrying recovery receipt for the one safe malformed v3
-/// shape: semantic_expansion prefixed by an exact seed. The receipt
+/// Emit a proof-carrying recovery receipt for the safe malformed v3 shapes:
+/// semantic_expansion prefixed by an exact seed, or a seed carrying trailing
+/// semantic declarations. The receipt
 /// binds the complete input plan, the effective seed plan, and every omitted
 /// semantic declaration. `all_variants_executed=false` is load-bearing: this
 /// call can establish a seed but can never satisfy enumeration coverage.
@@ -636,11 +637,12 @@ fn appendSeedShapeRewriteReceipt(
 
     try out.print(
         allocator,
-        ",\"lexical_query_plan\":{{\"schema_version\":\"{s}\",\"plan_sha256\":\"{s}\",\"intent\":\"{s}\",\"stage\":\"semantic_expansion\",\"variant_count\":{d},\"executed_variant_count\":1,\"all_variants_executed\":false,\"seen_node_count\":{d},\"seen_state_verified\":true,\"ledger_scope\":\"{s}\",\"merged_hit_count\":{d},\"merged_new_hit_count\":{d},\"merged_previously_seen_count\":{d},\"probe_new_hit_count\":{d},\"probe_repeated_hit_count\":{d},\"query_anchor_rewritten\":{s},\"query_anchor_input_sha256\":\"{s}\",\"query_anchor_effective_sha256\":\"{s}\",\"variant_receipts\":[{{\"variant_index\":0,\"variant_kind\":\"{s}\",\"node_ids\":[",
+        ",\"lexical_query_plan\":{{\"schema_version\":\"{s}\",\"plan_sha256\":\"{s}\",\"intent\":\"{s}\",\"stage\":\"{s}\",\"variant_count\":{d},\"executed_variant_count\":1,\"all_variants_executed\":false,\"seen_node_count\":{d},\"seen_state_verified\":true,\"ledger_scope\":\"{s}\",\"merged_hit_count\":{d},\"merged_new_hit_count\":{d},\"merged_previously_seen_count\":{d},\"probe_new_hit_count\":{d},\"probe_repeated_hit_count\":{d},\"query_anchor_rewritten\":{s},\"query_anchor_input_sha256\":\"{s}\",\"query_anchor_effective_sha256\":\"{s}\",\"variant_receipts\":[{{\"variant_index\":0,\"variant_kind\":\"{s}\",\"node_ids\":[",
         .{
             plan.schema_version.text(),
             rewrite.input_plan_sha256,
             @tagName(plan.intent),
+            @tagName(rewrite.input_stage),
             rewrite.declared_variant_count,
             seen_node_count,
             ledger_scope,
@@ -661,15 +663,16 @@ fn appendSeedShapeRewriteReceipt(
     }
     try out.print(
         allocator,
-        "],\"new_hit_count\":{d},\"repeated_hit_count\":{d}}}],\"execution\":\"host_seed_shape_rewrite\",\"rewrite\":{{\"schema_version\":\"{s}\",\"reason\":\"{s}\",\"input_plan_sha256\":\"{s}\",\"effective_plan_sha256\":\"{s}\",\"effective_seed_sha256\":\"{s}\",\"input_stage\":\"semantic_expansion\",\"effective_stage\":\"seed\",\"declared_variant_count\":{d},\"executed_variant_count\":1,\"unexecuted_semantic_variant_count\":{d}}}}}",
+        "],\"new_hit_count\":{d},\"repeated_hit_count\":{d}}}],\"execution\":\"host_seed_shape_rewrite\",\"rewrite\":{{\"schema_version\":\"{s}\",\"reason\":\"{s}\",\"input_plan_sha256\":\"{s}\",\"effective_plan_sha256\":\"{s}\",\"effective_seed_sha256\":\"{s}\",\"input_stage\":\"{s}\",\"effective_stage\":\"seed\",\"declared_variant_count\":{d},\"executed_variant_count\":1,\"unexecuted_semantic_variant_count\":{d}}}}}",
         .{
             new_hit_count,
             repeated_hit_count,
             lexical_query_plan.SEED_SHAPE_REWRITE_SCHEMA_VERSION,
-            lexical_query_plan.SEED_SHAPE_REWRITE_REASON,
+            rewrite.reason,
             rewrite.input_plan_sha256,
             plan.fingerprint,
             rewrite.effective_seed_sha256,
+            @tagName(rewrite.input_stage),
             rewrite.declared_variant_count,
             rewrite.unexecuted_semantic_variant_count,
         },

@@ -32,6 +32,7 @@ BOUNDED_RECALL_MAX_RESULT_BYTES = 24 * 1024
 BOUNDED_RECALL_EXCERPT_POLICY = "utf8_head_tail_v1"
 SEED_SHAPE_REWRITE_SCHEMA_VERSION = "metacodes-seed-shape-rewrite-v1"
 SEED_SHAPE_REWRITE_REASON = "exact_prefix_in_semantic_expansion"
+SEED_STAGE_REWRITE_REASON = "semantic_variants_declared_in_seed"
 LEGACY_LEXICAL_PLAN_SCHEMA_VERSION = "lexical-query-plan-v1"
 LEXICAL_PLAN_SCHEMA_VERSIONS = frozenset(
     {
@@ -372,14 +373,14 @@ def _parse_plan(tool_input: Mapping[str, Any], where: str) -> Mapping[str, Any]:
     seed_kinds = {"exact", "alias"}
     seed_shape_rewrite = (
         schema_version == BATCH_LEXICAL_PLAN_SCHEMA_VERSION
-        and stage == "semantic_expansion"
+        and stage in {"seed", "semantic_expansion"}
         and len(variants) >= 2
         and variants[0]["kind"] == "exact"
         and all(variant["kind"] != "exact" for variant in variants[1:])
     )
     if seed_shape_rewrite and type_filter is not None:
         _fail(f"{where}.lexical_plan", "recovered seed must omit type")
-    if stage == "seed" and (
+    if stage == "seed" and not seed_shape_rewrite and (
         len(variants) != 1
         or query_index != 0
         or variants[0]["kind"] not in {"exact", "alias"}
@@ -454,13 +455,17 @@ def _parse_plan(tool_input: Mapping[str, Any], where: str) -> Mapping[str, Any]:
         "seed_shape_rewrite": (
             {
                 "schema_version": SEED_SHAPE_REWRITE_SCHEMA_VERSION,
-                "reason": SEED_SHAPE_REWRITE_REASON,
+                "reason": (
+                    SEED_STAGE_REWRITE_REASON
+                    if stage == "seed"
+                    else SEED_SHAPE_REWRITE_REASON
+                ),
                 "input_plan_sha256": input_plan_sha256,
                 "effective_plan_sha256": effective_plan_sha256,
                 "effective_seed_sha256": hashlib.sha256(
                     effective_variants[0]["text"].encode("utf-8")
                 ).hexdigest(),
-                "input_stage": "semantic_expansion",
+                "input_stage": stage,
                 "effective_stage": "seed",
                 "declared_variant_count": len(variants),
                 "executed_variant_count": 1,
@@ -491,7 +496,7 @@ def _parse_seed_shape_rewrite_receipt(
         "schema_version": BATCH_LEXICAL_PLAN_SCHEMA_VERSION,
         "plan_sha256": expected_rewrite["input_plan_sha256"],
         "intent": parsed_plan["intent"],
-        "stage": "semantic_expansion",
+        "stage": expected_rewrite["input_stage"],
         "variant_count": expected_rewrite["declared_variant_count"],
         "executed_variant_count": 1,
         "all_variants_executed": False,

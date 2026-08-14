@@ -149,11 +149,11 @@ const FINAL_ANTHROPIC_SSE =
     "data: {\"type\":\"message_stop\"}\n\n";
 
 // Exact malformed shape observed from a paid GLM-5.2 KgRecall: all fields are
-// present, but one extra `}` appears before the variants array closes.
+// present, but every variants element has one extra `}` after its valid object closer.
 const GLM_BAD_NESTED_ARGS_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m3\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c3\",\"name\":\"echo_tool\",\"input\":{}}}\n\n" ++
-    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"lexical_plan\\\":{\\\"intent\\\":\\\"fact_lookup\\\",\\\"schema_version\\\":\\\"lexical-query-plan-v2\\\",\\\"stage\\\":\\\"semantic_expansion\\\",\\\"variant_index\\\":0,\\\"variants\\\":[{\\\"kind\\\":\\\"synonym\\\",\\\"text\\\":\\\"commencement\\\"},{\\\"kind\\\":\\\"synonym\\\",\\\"text\\\":\\\"convocation\\\"}}]},\\\"query\\\":\\\"commencement\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"lexical_plan\\\":{\\\"intent\\\":\\\"fact_lookup\\\",\\\"schema_version\\\":\\\"lexical-query-plan-v3\\\",\\\"stage\\\":\\\"seed\\\",\\\"variants\\\":[{\\\"kind\\\":\\\"exact\\\",\\\"text\\\":\\\"kitchen cleaning tips\\\"}},{\\\"kind\\\":\\\"synonym\\\",\\\"text\\\":\\\"keeping kitchen clean\\\"}},{\\\"kind\\\":\\\"paraphrase\\\",\\\"text\\\":\\\"kitchen mess organization\\\"}]},\\\"query\\\":\\\"kitchen cleaning tips\\\"}\"}}\n\n" ++
     "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"input_tokens\":100,\"output_tokens\":10}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
@@ -239,8 +239,9 @@ test "P0.6 e2e: GLM extra nested closer preserves complete tool input" {
         .tool_use => |tu| if (std.mem.eql(u8, tu.id, "c3")) {
             saw_use = true;
             try std.testing.expect(cc.message_repair.isValidJson(tu.input));
-            try std.testing.expect(std.mem.indexOf(u8, tu.input, "commencement") != null);
-            try std.testing.expect(std.mem.indexOf(u8, tu.input, "convocation") != null);
+            try std.testing.expect(std.mem.indexOf(u8, tu.input, "kitchen cleaning tips") != null);
+            try std.testing.expect(std.mem.indexOf(u8, tu.input, "keeping kitchen clean") != null);
+            try std.testing.expect(std.mem.indexOf(u8, tu.input, "kitchen mess organization") != null);
             try std.testing.expect(!std.mem.eql(u8, tu.input, "{}"));
         },
         .tool_result => |tr| if (std.mem.eql(u8, tr.tool_use_id, "c3")) {

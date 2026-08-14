@@ -419,6 +419,18 @@ const KG_ENUMERATION_SEED_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+// Exact paid GLM-5.2 failure shape: every variants object has one extra `}`
+// and the model declared semantic alternatives inside stage=seed. The host
+// must repair only the syntax, then deterministically execute the exact seed
+// while leaving both semantic declarations explicitly unexecuted.
+const KG_MALFORMED_SEED_BATCH_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"malformed-seed\",\"role\":\"assistant\",\"model\":\"glm-5.2\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"malformed-seed-1\",\"name\":\"KgRecall\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"lexical_plan\\\":{\\\"intent\\\":\\\"fact_lookup\\\",\\\"schema_version\\\":\\\"lexical-query-plan-v3\\\",\\\"stage\\\":\\\"seed\\\",\\\"variants\\\":[{\\\"kind\\\":\\\"exact\\\",\\\"text\\\":\\\"kitchen cleaning tips\\\"}},{\\\"kind\\\":\\\"synonym\\\",\\\"text\\\":\\\"keeping kitchen clean\\\"}},{\\\"kind\\\":\\\"paraphrase\\\",\\\"text\\\":\\\"kitchen mess organization\\\"}]},\\\"query\\\":\\\"kitchen cleaning tips\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
 const KG_ENUMERATION_PREMATURE_FINAL_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"early\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
@@ -1037,6 +1049,95 @@ test "L2 KG governance: real agent loop batches enumeration recall and host cont
     const final_message = conv.messages.items[conv.messages.items.len - 1];
     try std.testing.expectEqual(cc.message.Role.assistant, final_message.role);
     try std.testing.expectEqualStrings("3", final_message.blocks[0].text);
+}
+
+test "L2 KG governance: malformed GLM seed batch becomes audited exact-only execution" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const project_dir = pbuf[0..dir_len];
+    const store = try std.fmt.allocPrint(a, "{s}/kg-malformed-seed-recovery.kg", .{project_dir});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-malformed-seed-recovery");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+    _ = try kg.remember(.observation, "kitchen cleaning tips granite countertop utensil holder", "observation", false);
+
+    const responses = [_][]const u8{ KG_MALFORMED_SEED_BATCH_SSE, KG_END_TURN_SSE };
+    var srv = try harness.MockServer.startCassette(&responses, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var api_client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "glm-5.2", url);
+    defer api_client.deinit();
+
+    const enabled = [_][]const u8{"KgRecall"};
+    var defs_arena = std.heap.ArenaAllocator.init(a);
+    defer defs_arena.deinit();
+    var prompt_context = cc.tools.PromptContext{ .enabled_tool_names = &enabled };
+    const defs = try cc.tools.toToolDefinitionsFull(defs_arena.allocator(), null, &prompt_context);
+    const system_prompt = try cc.system_prompt.buildFull(a, "glm-5.2", null, null, &enabled, "", true, project_dir);
+    defer a.free(system_prompt);
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "My kitchen is a mess. Recall the relevant tips.");
+    const permission = cc.permission.createContext(.bypass_permissions, a);
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    const run_result = try cc.agent_loop.run(&conv, api_client.provider(), defs, &permission, .{
+        .max_turns = 3,
+        .system_prompt = system_prompt,
+        .kg = &kg,
+        .project_dir = project_dir,
+        .cwd_abs = project_dir,
+    }, &backend, a);
+
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, run_result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 1), run_result.tool_calls);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+
+    var saw_use = false;
+    var saw_result = false;
+    for (conv.messages.items) |message| for (message.blocks) |block| switch (block) {
+        .tool_use => |tool_use| if (std.mem.eql(u8, tool_use.id, "malformed-seed-1")) {
+            saw_use = true;
+            try std.testing.expect(cc.message_repair.isValidJson(tool_use.input));
+            try std.testing.expect(std.mem.indexOf(u8, tool_use.input, "keeping kitchen clean") != null);
+            try std.testing.expect(std.mem.indexOf(u8, tool_use.input, "kitchen mess organization") != null);
+        },
+        .tool_result => |tool_result| if (std.mem.eql(u8, tool_result.tool_use_id, "malformed-seed-1")) {
+            saw_result = true;
+            try std.testing.expect(!tool_result.is_error);
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, tool_result.content, .{});
+            defer parsed.deinit();
+            const receipt = parsed.value.object.get("lexical_query_plan").?.object;
+            try std.testing.expectEqualStrings("host_seed_shape_rewrite", receipt.get("execution").?.string);
+            try std.testing.expectEqualStrings("seed", receipt.get("stage").?.string);
+            try std.testing.expect(!receipt.get("all_variants_executed").?.bool);
+            const rewrite = receipt.get("rewrite").?.object;
+            try std.testing.expectEqualStrings("semantic_variants_declared_in_seed", rewrite.get("reason").?.string);
+            try std.testing.expectEqualStrings("seed", rewrite.get("input_stage").?.string);
+            try std.testing.expectEqual(@as(i64, 2), rewrite.get("unexecuted_semantic_variant_count").?.integer);
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_use and saw_result);
+
+    const final_request = srv.requestAt(1) orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "host_seed_shape_rewrite") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "semantic_variants_declared_in_seed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "unexecuted_semantic_variant_count\\\":2") != null);
 }
 
 test "L2 KG governance: KgContext emits evidence, freshness, and supersession signals" {
