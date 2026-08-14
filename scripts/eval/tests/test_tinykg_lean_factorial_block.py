@@ -51,6 +51,10 @@ class TinyKgLeanFactorialBlockTest(unittest.TestCase):
             ripgrep_sha256="e" * 64,
             tinykg_binary=root / "tinykg",
             tinykg_sha256="f" * 64,
+            tinykg_contract={
+                "storage_format_version": "2",
+                "schema_version": "3",
+            },
             seed_batch=b"seed\n",
             recall_query=executor.PROCEDURAL_MEMORY_QUERY,
             identity=identity,
@@ -125,6 +129,35 @@ class TinyKgLeanFactorialBlockTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden.encode(), payload)
 
+    def test_preflight_probe_rejects_incompatible_tinykg_format(self) -> None:
+        for version, should_pass in (("2", True), ("3", False)):
+            with self.subTest(version=version), mock.patch.object(
+                executor, "LocalTinyKg"
+            ) as local_type:
+                local = local_type.return_value
+                local.store_root = Path("/tmp/factorial-probe-stores")
+                local.command.side_effect = [
+                    "",
+                    (
+                        "nodes=0\nedges=0\nstorage_format_version="
+                        f"{version}\nschema_version=3\n"
+                    ),
+                ]
+                if should_pass:
+                    observed = executor._probe_block_tinykg_contract(
+                        binary=Path("/tmp/tinykg"),
+                        binary_sha256="a" * 64,
+                    )
+                    self.assertEqual("2", observed["storage_format_version"])
+                else:
+                    with self.assertRaisesRegex(
+                        executor.ValidationError, "vendored storage-format-v2"
+                    ):
+                        executor._probe_block_tinykg_contract(
+                            binary=Path("/tmp/tinykg"),
+                            binary_sha256="a" * 64,
+                        )
+
     def test_dry_run_observes_complete_schedule_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory(prefix="factorial-block-preflight-") as temporary:
             root = Path(temporary)
@@ -146,6 +179,7 @@ class TinyKgLeanFactorialBlockTest(unittest.TestCase):
             self.assertFalse(result["quality_evidence"])
             self.assertTrue(result["quality_eligible_after_paid_execution"])
             self.assertEqual(16, result["planned_rollouts"])
+            self.assertEqual("2", result["tinykg_contract"]["storage_format_version"])
 
     def test_block_checkpoints_each_quality_eligible_rollout(self) -> None:
         with tempfile.TemporaryDirectory(prefix="factorial-block-run-") as temporary:

@@ -18,6 +18,7 @@ from pathlib import Path
 import re
 import stat
 import sys
+import tempfile
 from typing import Any, Mapping, Sequence
 
 from .attribution_protocol import (
@@ -44,6 +45,7 @@ from .memory_budget_journal import (
     usd_to_microusd_ceiling,
 )
 from .memory_replay import PRODUCTION_PROVIDER_ID, _artifact_tree_digest
+from .memory_tinykg_local import LocalTinyKg, _store_info
 from .model import ValidationError, stable_json
 from .project_harness_e3_experiment import (
     E3Error,
@@ -144,6 +146,7 @@ class BlockContext:
     ripgrep_sha256: str
     tinykg_binary: Path
     tinykg_sha256: str
+    tinykg_contract: Mapping[str, str]
     seed_batch: bytes
     recall_query: str
     identity: Mapping[str, Any]
@@ -760,6 +763,32 @@ def _block_seed(*, workspace: Path) -> tuple[bytes, str]:
     return payload, PROCEDURAL_MEMORY_QUERY
 
 
+def _probe_block_tinykg_contract(
+    *, binary: Path, binary_sha256: str
+) -> Mapping[str, str]:
+    """Open a real isolated store before any credential or budget mutation."""
+
+    with tempfile.TemporaryDirectory(prefix="metacodes-factorial-tinykg-probe-") as raw:
+        local = LocalTinyKg(
+            binary,
+            expected_sha256=binary_sha256,
+            run_dir=Path(raw) / "local",
+        )
+        store = local.store_root / "contract.kg"
+        local.command("init", store, ())
+        info = _store_info(local.command("store-info", store, ()))
+    observed = {
+        "storage_format_version": str(info.get("storage_format_version", "")),
+        "schema_version": str(info.get("schema_version", "")),
+    }
+    if observed != {"storage_format_version": "2", "schema_version": "3"}:
+        _fail(
+            "factorial block TinyKG contract",
+            "requires metacodes vendored storage-format-v2/schema-v3",
+        )
+    return observed
+
+
 def _calibration_identity(
     *,
     manifest: Mapping[str, Any],
@@ -791,6 +820,7 @@ def _block_identity(
     case_ids: Sequence[str],
     schedules: Sequence[Mapping[str, Any]],
     tinykg_sha256: str,
+    tinykg_contract: Mapping[str, str],
     ripgrep_sha256: str,
     seed_batch: bytes,
     recall_query: str,
@@ -809,6 +839,7 @@ def _block_identity(
         "case_ids": list(case_ids),
         "schedule": list(schedules),
         "tinykg_binary_sha256": tinykg_sha256,
+        "tinykg_contract": dict(tinykg_contract),
         "ripgrep_binary_sha256": ripgrep_sha256,
         "seed_batch_sha256": hashlib.sha256(seed_batch).hexdigest(),
         "procedural_memory_sha256": hashlib.sha256(
@@ -1346,6 +1377,10 @@ def _prepare_block(
         or base.budget_path.with_name(base.budget_path.name + ".lock").exists()
     ):
         _fail("factorial block budget", "fresh block requires a fresh journal path")
+    tinykg_contract = _probe_block_tinykg_contract(
+        binary=base.tinykg_binary,
+        binary_sha256=base.tinykg_sha256,
+    )
     schedules = tuple(balanced_factorial_schedule(BLOCK_CASE_IDS))
     seed_batch, recall_query = _block_seed(workspace=base.workspace)
     identity = _block_identity(
@@ -1353,6 +1388,7 @@ def _prepare_block(
         case_ids=BLOCK_CASE_IDS,
         schedules=schedules,
         tinykg_sha256=base.tinykg_sha256,
+        tinykg_contract=tinykg_contract,
         ripgrep_sha256=base.ripgrep_sha256,
         seed_batch=seed_batch,
         recall_query=recall_query,
@@ -1372,6 +1408,7 @@ def _prepare_block(
         ripgrep_sha256=base.ripgrep_sha256,
         tinykg_binary=base.tinykg_binary,
         tinykg_sha256=base.tinykg_sha256,
+        tinykg_contract=tinykg_contract,
         seed_batch=seed_batch,
         recall_query=recall_query,
         identity=identity,
@@ -1454,6 +1491,7 @@ def preflight_block(
         "raw_artifacts_local_only": True,
         "remote_tinykg_forbidden": True,
         "procedural_memory_sha256": context.identity["procedural_memory_sha256"],
+        "tinykg_contract": dict(context.tinykg_contract),
         "budget_authority_cost_microusd": context.authority.total_cost_microusd,
         "budget_authority_metered_tokens": context.authority.total_metered_tokens,
     }
