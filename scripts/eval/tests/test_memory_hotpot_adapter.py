@@ -113,6 +113,8 @@ class HotpotMemoryAdapterTest(unittest.TestCase):
                 manifest_case["prompt"], qa_execution_prompt(source_case["question"])
             )
             self.assertTrue(manifest_case["prompt"].endswith(QA_EXECUTION_INSTRUCTIONS))
+            self.assertIn("Return only the shortest final answer", manifest_case["prompt"])
+            self.assertIn("without explanation or supporting details", manifest_case["prompt"])
             self.assertNotIn("answer", source_case)
             self.assertNotIn("expected_evidence_ids", source_case)
             self.assertNotIn(manifest_case["gold_answers"][0], manifest_case["prompt"])

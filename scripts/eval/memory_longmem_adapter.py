@@ -22,7 +22,7 @@ from .model import ValidationError, stable_json
 
 
 ADAPTER_ID = "longmemeval-s-cleaned"
-ADAPTER_REVISION = "official-cleaned-session-v2-bounded-qa"
+ADAPTER_REVISION = "official-cleaned-session-v3-final-answer-contract"
 DATASET_ID = "longmemeval-s-cleaned"
 SOURCE_SLICE_SCHEMA_VERSION = 1
 SELECTION_ALGORITHM = "sha256-seed-null-question-id-v1"

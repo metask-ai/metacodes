@@ -34,8 +34,9 @@ WRITE_MODES = frozenset({"disabled", "online", "read_only"})
 QA_EXECUTION_INSTRUCTIONS = (
     "Answer only from context exposed by the harness. Do not inspect or modify "
     "the workspace, and do not use workspace tools. Dedicated recall tools may "
-    "be used when available. If the evidence is unavailable, answer briefly "
-    "that it is unavailable."
+    "be used when available. Return only the shortest final answer, without "
+    "explanation or supporting details. If the evidence is unavailable, answer "
+    "only that it is unavailable."
 )
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 TOP_LEVEL_KEYS = frozenset(

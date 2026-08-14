@@ -26,7 +26,7 @@ from .model import ValidationError, stable_json
 
 
 ADAPTER_ID = "hotpotqa-distractor"
-ADAPTER_REVISION = "official-json-hash-subset-v3-bounded-qa"
+ADAPTER_REVISION = "official-json-hash-subset-v4-final-answer-contract"
 DATASET_ID = "hotpotqa-distractor-dev-v1"
 SOURCE_SLICE_SCHEMA_VERSION = 1
 SOURCE_POLICY_SCHEMA_VERSION = 1
