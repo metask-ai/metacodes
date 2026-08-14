@@ -787,6 +787,89 @@ test "L2 KG governance: v3 batch executes every variant and exposes each node bo
     }
 }
 
+test "L2 KG governance: large v3 recall stays complete JSON below projection cap" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kg-bounded-batch-v3.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-bounded-batch-v3");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const probes = [_][]const u8{ "alpharecalltoken", "betarecalltoken", "gammarecalltoken", "deltarecalltoken" };
+    // Longer than the old auto-context --max-chars=2400 cap. TinyKG's graph
+    // JSON omits node bodies, so that cap incorrectly removed the root itself
+    // and made a valid long memory fail protocol validation.
+    const filler = [_]u8{'x'} ** 5000;
+    for (probes, 0..) |probe, probe_index| {
+        for (0..8) |row_index| {
+            const text = try std.fmt.allocPrint(
+                a,
+                "{s} HEAD-{d}-{d} authoritative fact {s} TAIL-{d}-{d}-{s}",
+                .{ probe, probe_index, row_index, &filler, probe_index, row_index, probe },
+            );
+            defer a.free(text);
+            _ = try kg.remember(.observation, text, "evidence", false);
+        }
+    }
+
+    var ledger = cc.kg_lexical_query_plan.Ledger{};
+    const ctx = cc.tool_context.ToolContext{ .allocator = a, .kg = &kg, .kg_lexical_ledger = &ledger };
+    const args =
+        \\{"query":"alpharecalltoken","lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"enumeration","stage":"semantic_expansion","variants":[{"kind":"synonym","text":"alpharecalltoken"},{"kind":"paraphrase","text":"betarecalltoken"},{"kind":"mechanism","text":"gammarecalltoken"},{"kind":"relation","text":"deltarecalltoken"}]}}
+    ;
+    const output = try cc.kg_tools.executeRecall(&ctx, args);
+    defer a.free(output);
+    try std.testing.expect(output.len <= cc.kg_tools.MAX_RECALL_RESULT_BYTES);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, output, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqual(@as(usize, 32), root.get("hits").?.array.items.len);
+    const envelope = root.get("recall_envelope").?.object;
+    try std.testing.expectEqualStrings("metacodes-bounded-recall-v1", envelope.get("schema_version").?.string);
+    try std.testing.expect(envelope.get("complete_json").?.bool);
+    try std.testing.expectEqual(@as(i64, @intCast(cc.kg_tools.MAX_RECALL_RESULT_BYTES)), envelope.get("max_result_bytes").?.integer);
+    const first_hit = root.get("hits").?.array.items[0].object;
+    try std.testing.expect(first_hit.get("text_truncated").?.bool);
+    try std.testing.expectEqualStrings("utf8_head_tail_v1", first_hit.get("text_excerpt_policy").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, first_hit.get("text").?.string, "HEAD-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_hit.get("text").?.string, "TAIL-") != null);
+    try std.testing.expect(first_hit.get("text_total_bytes").?.integer > first_hit.get("text_returned_bytes").?.integer);
+    const auto_graph = root.get("auto_context").?.object.get("context").?.object.get("graph") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(auto_graph == .object);
+    try std.testing.expectEqual(first_hit.get("node_id").?.integer, auto_graph.object.get("root").?.object.get("id").?.integer);
+    try std.testing.expect(!auto_graph.object.get("summary").?.object.get("truncated").?.bool);
+
+    // Exercise the real generic preflight projection boundary. A self-bounded
+    // KgRecall result must remain byte-identical JSON, not become a commitment
+    // head/tail wrapper that the query-plan replay cannot parse.
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    const blocks = try a.alloc(cc.core_message.Block, 1);
+    blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "bounded-recall"),
+        .content = try a.dupe(u8, output),
+        .is_error = false,
+    } };
+    try conv.append(.{ .role = .user, .blocks = blocks });
+    const reduced = conv.truncateLargeToolResults(cc.conversation.toolResultContextBytes(200_000));
+    try std.testing.expectEqual(@as(usize, 0), reduced.truncated);
+    const provider_visible = conv.messages.items[0].blocks[0].tool_result.content;
+    try std.testing.expectEqualStrings(output, provider_visible);
+    var reparsed = try std.json.parseFromSlice(std.json.Value, a, provider_visible, .{});
+    defer reparsed.deinit();
+    try std.testing.expect(reparsed.value.object.get("lexical_query_plan").?.object.get("all_variants_executed").?.bool);
+}
+
 test "L2 KG governance: real agent loop batches enumeration recall and host context" {
     const a = std.testing.allocator;
     const bin = findBin(a) orelse return error.SkipZigTest;

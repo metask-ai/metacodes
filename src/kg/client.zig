@@ -76,7 +76,12 @@ pub const RecallHit = struct {
     kind: []u8, // owned
     domain: []u8, // owned
     schema_type: []u8, // owned(记忆类型维度:decision/module/bug/…;list-recent 路径为空)
-    text: []u8, // owned(截断后)
+    text: []u8, // owned(UTF-8 head/tail excerpt)
+    /// Authoritative node-text size before the client-side recall excerpt.
+    /// The tool envelope uses this to distinguish a complete body from a
+    /// bounded preview without asking TinyKG for the same node again.
+    text_total_bytes: usize = 0,
+    text_truncated: bool = false,
     score: f64,
     /// 来源记忆文件(md 派生 document 根带;section/typed 节点为空)。owned。
     source_label: []u8 = &.{},
@@ -1868,7 +1873,8 @@ pub const KgClient = struct {
             errdefer self.allocator.free(d_owned);
             const s_owned = self.allocator.dupe(u8, schema_type) catch return KgError.OutOfMemory;
             errdefer self.allocator.free(s_owned);
-            const t_owned = self.allocator.dupe(u8, truncateBytes(text, 800)) catch return KgError.OutOfMemory;
+            const text_truncated = text.len > 800;
+            const t_owned = boundedTextExcerptAlloc(self.allocator, text, 800) catch return KgError.OutOfMemory;
             errdefer self.allocator.free(t_owned);
             const sl_owned: []u8 = if (src_label.len > 0) (self.allocator.dupe(u8, src_label) catch return KgError.OutOfMemory) else @constCast(&[_]u8{});
             errdefer if (sl_owned.len > 0) self.allocator.free(sl_owned);
@@ -1878,6 +1884,8 @@ pub const KgClient = struct {
                 .domain = d_owned,
                 .schema_type = s_owned,
                 .text = t_owned,
+                .text_total_bytes = text.len,
+                .text_truncated = text_truncated,
                 .score = score,
                 .source_label = sl_owned,
             }) catch return KgError.OutOfMemory;
@@ -2305,7 +2313,8 @@ pub const KgClient = struct {
             errdefer self.allocator.free(s_owned);
             const text_un = unescapeTsv(self.allocator, text_col) catch return KgError.OutOfMemory;
             defer self.allocator.free(text_un);
-            const t_owned = self.allocator.dupe(u8, truncateBytes(text_un, 800)) catch return KgError.OutOfMemory;
+            const text_truncated = text_un.len > 800;
+            const t_owned = boundedTextExcerptAlloc(self.allocator, text_un, 800) catch return KgError.OutOfMemory;
             errdefer self.allocator.free(t_owned);
 
             results.append(self.allocator, .{
@@ -2314,6 +2323,8 @@ pub const KgClient = struct {
                 .domain = d_owned,
                 .schema_type = s_owned,
                 .text = t_owned,
+                .text_total_bytes = text_un.len,
+                .text_truncated = text_truncated,
                 .score = 0,
             }) catch return KgError.OutOfMemory;
         }
@@ -2627,6 +2638,38 @@ fn truncateBytes(text: []const u8, max: usize) []const u8 {
     var end = max;
     while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
     return text[0..end];
+}
+
+pub fn boundedTextExcerptAlloc(allocator: std.mem.Allocator, text: []const u8, max: usize) ![]u8 {
+    if (text.len <= max) return allocator.dupe(u8, text);
+    const separator = "\n...\n";
+    if (max <= separator.len + 1) return allocator.dupe(u8, truncateBytes(text, max));
+
+    const content_budget = max - separator.len;
+    const desired_head = content_budget - content_budget / 4;
+    const head = truncateBytes(text, desired_head);
+    const desired_tail = content_budget - head.len;
+    var tail_start = text.len - @min(desired_tail, text.len);
+    while (tail_start < text.len and (text[tail_start] & 0xC0) == 0x80) tail_start += 1;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, head.len + separator.len + text.len - tail_start);
+    try out.appendSlice(allocator, head);
+    try out.appendSlice(allocator, separator);
+    try out.appendSlice(allocator, text[tail_start..]);
+    return out.toOwnedSlice(allocator);
+}
+
+test "bounded recall excerpt preserves UTF-8 head and tail" {
+    const text = "开头-alpha-中间内容需要省略-omega-结尾";
+    const excerpt = try boundedTextExcerptAlloc(std.testing.allocator, text, 24);
+    defer std.testing.allocator.free(excerpt);
+    try std.testing.expect(excerpt.len <= 24);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(excerpt));
+    try std.testing.expect(std.mem.startsWith(u8, excerpt, "开头"));
+    try std.testing.expect(std.mem.endsWith(u8, excerpt, "结尾"));
+    try std.testing.expect(std.mem.indexOf(u8, excerpt, "\n...\n") != null);
 }
 
 fn trimForLog(s: []const u8) []const u8 {

@@ -255,7 +255,7 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             try out.appendSlice(ctx.allocator, row);
             continue;
         }
-        try appendRecallHitRow(&out, ctx.allocator, h, seen_before, ledger_guard != null);
+        try appendRecallHitRow(&out, ctx.allocator, h, seen_before, ledger_guard != null, SINGLE_RECALL_HIT_TEXT_BYTES);
     }
     // 搭车 facet(PM:可见性,零额外调用):结果里各类型计数,让模型知道有哪些类型 → 可 --type 精化。
     const known_types = [_][]const u8{ "decision", "module", "bug", "user_preference", "observation" };
@@ -282,12 +282,17 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try out.appendSlice(ctx.allocator, facet.items);
     try out.append(ctx.allocator, '}');
     if (plan) |value| try appendLexicalPlanReceipt(&out, ctx.allocator, value, ledger_scope, ledger_seen_count, new_hit_count, repeated_hit_count);
+    try appendRecallEnvelope(&out, ctx.allocator);
     try out.appendSlice(ctx.allocator, ",\"retrieval_mode\":\"lexical_bm25_no_embeddings\",\"knowledge_status\":\"unverified_candidates\",\"lexical_guidance\":");
     try appendJsonString(&out, ctx.allocator, retrieval_protocol.RESULT_GUIDANCE);
     const tail = "}";
     try out.appendSlice(ctx.allocator, tail);
     const owned = try out.toOwnedSlice(ctx.allocator);
     errdefer ctx.allocator.free(owned);
+    if (owned.len > MAX_RECALL_RESULT_BYTES) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall bounded envelope exceeded its {d}-byte contract", .{MAX_RECALL_RESULT_BYTES});
+        return error.RecallEnvelopeTooLarge;
+    }
     if (ledger_guard) |*guard| {
         guard.commit(hit_ids[0..hits.len]) catch |err| {
             common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall lexical_plan host ledger could not commit the observed hits: {s}", .{lexical_query_plan.ledgerDiagnostic(err)});
@@ -314,6 +319,20 @@ const BatchVariantReceipt = struct {
     new_hit_count: usize = 0,
     repeated_hit_count: usize = 0,
 };
+
+/// Keep the complete versioned JSON below the generic tool-result projection
+/// threshold. Raising that threshold would only move the cache/context failure;
+/// KgRecall owns its provider-visible information budget instead.
+pub const MAX_RECALL_RESULT_BYTES: usize = 24 * 1024;
+const SINGLE_RECALL_HIT_TEXT_BYTES: usize = 512;
+const AUTO_CONTEXT_TEXT_BYTES: usize = 2000;
+const AUTO_CONTEXT_EDGES: usize = 6;
+
+fn batchHitTextBytes(index: usize) usize {
+    if (index < 4) return 640;
+    if (index < 8) return 384;
+    return 160;
+}
 
 /// Execute every member of a v3 plan under one host-ledger guard. TinyKG reads
 /// remain ordered and read-only; the model receives one merged result envelope,
@@ -393,7 +412,7 @@ fn executeRecallBatch(
                 if (first_new_evidence_node_id == 0 and std.mem.eql(u8, exposed_type, "evidence")) {
                     first_new_evidence_node_id = hit.node_id;
                 }
-                try appendRecallHitRow(&hit_rows, ctx.allocator, hit, false, true);
+                try appendRecallHitRow(&hit_rows, ctx.allocator, hit, false, true, batchHitTextBytes(merged_count - 1));
             }
             const type_str = if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
             for (known_types, 0..) |type_name, facet_index| {
@@ -439,7 +458,9 @@ fn executeRecallBatch(
             .{ receipt.new_hit_count, receipt.repeated_hit_count },
         );
     }
-    try out.appendSlice(ctx.allocator, "],\"execution\":\"host_batch_all\"},\"retrieval_mode\":\"lexical_bm25_no_embeddings\",\"knowledge_status\":\"unverified_candidates\",\"lexical_guidance\":");
+    try out.appendSlice(ctx.allocator, "],\"execution\":\"host_batch_all\"}");
+    try appendRecallEnvelope(&out, ctx.allocator);
+    try out.appendSlice(ctx.allocator, ",\"retrieval_mode\":\"lexical_bm25_no_embeddings\",\"knowledge_status\":\"unverified_candidates\",\"lexical_guidance\":");
     try appendJsonString(&out, ctx.allocator, retrieval_protocol.RESULT_GUIDANCE);
     // Enumeration needs one real graph re-observation, but spending a whole
     // provider turn merely to ask the model to echo a recalled node_id is pure
@@ -456,7 +477,11 @@ fn executeRecallBatch(
             first_new_node_id
         else
             merged_ids[0];
-        const context_args = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d}}}", .{context_node_id});
+        const context_args = try std.fmt.allocPrint(
+            ctx.allocator,
+            "{{\"node_id\":{d},\"limit\":{d},\"text_limit\":{d}}}",
+            .{ context_node_id, AUTO_CONTEXT_EDGES, AUTO_CONTEXT_TEXT_BYTES },
+        );
         defer ctx.allocator.free(context_args);
         const context_observation = try executeContextObserved(ctx, context_args);
         defer ctx.allocator.free(context_observation.result);
@@ -469,6 +494,10 @@ fn executeRecallBatch(
 
     const owned = try out.toOwnedSlice(ctx.allocator);
     errdefer ctx.allocator.free(owned);
+    if (owned.len > MAX_RECALL_RESULT_BYTES) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall bounded envelope exceeded its {d}-byte contract", .{MAX_RECALL_RESULT_BYTES});
+        return error.RecallEnvelopeTooLarge;
+    }
     // Commit only after every provider-visible byte, including auto_context,
     // has been constructed. Otherwise an OOM/protocol failure after commit
     // would mark node bodies as exposed even though the tool result was lost.
@@ -485,6 +514,7 @@ fn appendRecallHitRow(
     hit: kg_mod.RecallHit,
     seen_before: bool,
     include_seen: bool,
+    max_text_bytes: usize,
 ) !void {
     const type_str = if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
     const row = try std.fmt.allocPrint(allocator, "{{\"node_id\":{d},\"type\":\"{s}\",\"scope\":\"{s}\",\"score\":{d:.2},\"text\":", .{
@@ -492,13 +522,37 @@ fn appendRecallHitRow(
     });
     defer allocator.free(row);
     try out.appendSlice(allocator, row);
-    try appendJsonString(out, allocator, hit.text);
+    // The budget is provider-visible JSON payload bytes, not merely decoded
+    // source bytes. Control characters can expand 6x when escaped; budgeting
+    // before serialization would recreate the oversized-result failure with
+    // perfectly valid TinyKG text.
+    const excerpt = try boundedJsonTextExcerptAlloc(allocator, hit.text, max_text_bytes);
+    defer allocator.free(excerpt);
+    try appendJsonString(out, allocator, excerpt);
+    const text_total_bytes = if (hit.text_total_bytes > 0) hit.text_total_bytes else hit.text.len;
+    const text_truncated = hit.text_truncated or excerpt.len < hit.text.len;
+    try out.print(
+        allocator,
+        ",\"text_returned_bytes\":{d},\"text_total_bytes\":{d},\"text_truncated\":{s},\"text_excerpt_policy\":\"utf8_head_tail_v1\"",
+        .{ excerpt.len, text_total_bytes, if (text_truncated) "true" else "false" },
+    );
     if (hit.source_label.len > 0) {
         try out.appendSlice(allocator, ",\"source\":");
-        try appendJsonString(out, allocator, hit.source_label);
+        const source_excerpt = try boundedJsonTextExcerptAlloc(allocator, hit.source_label, 256);
+        defer allocator.free(source_excerpt);
+        try appendJsonString(out, allocator, source_excerpt);
+        if (source_excerpt.len < hit.source_label.len) try out.appendSlice(allocator, ",\"source_truncated\":true");
     }
     if (include_seen) try out.appendSlice(allocator, if (seen_before) ",\"seen_before\":true" else ",\"seen_before\":false");
     try out.append(allocator, '}');
+}
+
+fn appendRecallEnvelope(out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    try out.print(
+        allocator,
+        ",\"recall_envelope\":{{\"schema_version\":\"metacodes-bounded-recall-v1\",\"complete_json\":true,\"max_result_bytes\":{d},\"text_excerpt_policy\":\"utf8_head_tail_v1\"}}",
+        .{MAX_RECALL_RESULT_BYTES},
+    );
 }
 
 fn appendLexicalPlanReceipt(
@@ -620,6 +674,11 @@ fn executeContextObserved(ctx: *const ToolContext, args: []const u8) anyerror!Co
         return error.InvalidGraphProtocol;
     };
     const text = metadata.text;
+    // TinyKG neighbors JSON intentionally omits node bodies and is already
+    // structurally bounded by `limit` (root + at most N adjacent nodes/edges).
+    // Do not pass a small --max-chars here: TinyKG applies that budget to the
+    // authoritative bodies while selecting nodes, so a long root can be
+    // omitted even though its body is not present in the JSON projection.
     const graph_raw = kg.neighborsJson(node_id, limit) catch |e| return .{ .result = try kgErrorResult(ctx, kg, e, "KgContext") };
     defer kg.allocator.free(graph_raw);
     const graph = std.mem.trim(u8, graph_raw, " \t\r\n");
@@ -647,7 +706,10 @@ fn executeContextObserved(ctx: *const ToolContext, args: []const u8) anyerror!Co
         return error.InvalidGraphProtocol;
     };
 
-    const page = textPage(text, requested_offset, text_limit);
+    // Keep both decoded bytes and their JSON representation within text_limit.
+    // Newline/control-heavy memories otherwise expand after paging and can
+    // break the bounded batch envelope despite a small decoded page.
+    const page = try textPageForJsonBudget(ctx.allocator, text, requested_offset, text_limit);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(ctx.allocator);
     const head = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d},\"text\":", .{node_id});
@@ -818,6 +880,62 @@ fn textPage(text: []const u8, requested_offset: usize, max_bytes: usize) TextPag
     return .{ .start = start, .end = end };
 }
 
+fn textPageForJsonBudget(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    requested_offset: usize,
+    max_bytes: usize,
+) !TextPage {
+    var page = textPage(text, requested_offset, max_bytes);
+    while (page.end > page.start) {
+        var encoded: std.ArrayList(u8) = .empty;
+        defer encoded.deinit(allocator);
+        try util_json.serializeString(text[page.start..page.end], &encoded, allocator);
+        const payload_bytes = encoded.items.len - 2;
+        if (payload_bytes <= max_bytes) return page;
+
+        const current_bytes = page.end - page.start;
+        var next_bytes = current_bytes * max_bytes / payload_bytes;
+        if (next_bytes >= current_bytes) next_bytes = current_bytes - 1;
+        // text_limit's primary contract is forward progress. A single JSON
+        // control character needs six wire bytes, so a caller's legal minimum
+        // limit=4 cannot satisfy both the wire budget and progress. Preserve
+        // one complete code point in that degenerate case; the overage is at
+        // most two bytes and next_text_offset still advances deterministically.
+        if (next_bytes == 0) {
+            const first_len = std.unicode.utf8ByteSequenceLength(text[page.start]) catch 1;
+            page.end = @min(text.len, page.start + first_len);
+            return page;
+        }
+        page = textPage(text, page.start, next_bytes);
+    }
+    return page;
+}
+
+fn boundedJsonTextExcerptAlloc(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    max_json_payload_bytes: usize,
+) ![]u8 {
+    var source_budget = @min(text.len, max_json_payload_bytes);
+    while (true) {
+        const excerpt = try kg_mod.boundedTextExcerptAlloc(allocator, text, source_budget);
+        errdefer allocator.free(excerpt);
+
+        var encoded: std.ArrayList(u8) = .empty;
+        defer encoded.deinit(allocator);
+        try util_json.serializeString(excerpt, &encoded, allocator);
+        const payload_bytes = encoded.items.len - 2;
+        if (payload_bytes <= max_json_payload_bytes) return excerpt;
+
+        allocator.free(excerpt);
+        if (source_budget == 0) return allocator.dupe(u8, "");
+        var next_budget = source_budget * max_json_payload_bytes / payload_bytes;
+        if (next_budget >= source_budget) next_budget = source_budget - 1;
+        source_budget = next_budget;
+    }
+}
+
 fn isUtf8Continuation(byte: u8) bool {
     return (byte & 0xC0) == 0x80;
 }
@@ -936,6 +1054,35 @@ test "textPage preserves UTF-8 boundaries and supports deterministic paging" {
     try testing.expectEqualStrings("中文", text[second.start..second.end]);
     const inside_codepoint = textPage(text, 3, 6);
     try testing.expectEqualStrings("中文", text[inside_codepoint.start..inside_codepoint.end]);
+}
+
+test "bounded recall excerpts budget escaped JSON bytes" {
+    const raw = [_]u8{0x01} ** 512;
+    const excerpt = try boundedJsonTextExcerptAlloc(testing.allocator, &raw, 64);
+    defer testing.allocator.free(excerpt);
+
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(testing.allocator);
+    try util_json.serializeString(excerpt, &encoded, testing.allocator);
+    try testing.expect(encoded.items.len >= 2);
+    try testing.expect(encoded.items.len - 2 <= 64);
+    try testing.expect(excerpt.len < raw.len);
+}
+
+test "KgContext page budgets escaped JSON without breaking UTF-8" {
+    const text = "开头\x01\x01\x01\x01\x01\x01\x01\x01结尾";
+    const page = try textPageForJsonBudget(testing.allocator, text, 0, 16);
+    try testing.expect(page.end > page.start);
+    try testing.expect(std.unicode.utf8ValidateSlice(text[page.start..page.end]));
+
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(testing.allocator);
+    try util_json.serializeString(text[page.start..page.end], &encoded, testing.allocator);
+    try testing.expect(encoded.items.len - 2 <= 16);
+
+    const control_only = [_]u8{0x01} ** 8;
+    const minimum = try textPageForJsonBudget(testing.allocator, &control_only, 0, 4);
+    try testing.expectEqual(@as(usize, 1), minimum.end - minimum.start);
 }
 
 test "validateNeighborGraph binds version, root, and requested limit" {

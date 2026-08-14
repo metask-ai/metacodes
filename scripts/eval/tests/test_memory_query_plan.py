@@ -479,6 +479,64 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             self.assertEqual(tampered_trace["status"], "invalid")
             self.assertRegex(tampered_trace["invalid_reasons"][0], "gain counts")
 
+    def test_v3_bounded_recall_envelope_is_replayed_not_trusted(self):
+        call = self._batch_call(
+            "kg-bounded",
+            variants=[
+                {"kind": "synonym", "text": "alpha evidence"},
+                {"kind": "relation", "text": "beta evidence"},
+            ],
+            variant_hits=[(7, 9), (11,)],
+            auto_context_node_id=7,
+        )
+        use, result_block = copy.deepcopy(call)
+        payload = json.loads(result_block["content"])
+        payload["recall_envelope"] = {
+            "schema_version": "metacodes-bounded-recall-v1",
+            "complete_json": True,
+            "max_result_bytes": 24 * 1024,
+            "text_excerpt_policy": "utf8_head_tail_v1",
+        }
+        for hit in payload["hits"]:
+            if hit["seen_before"]:
+                continue
+            returned = len(hit["text"].encode("utf-8"))
+            hit.update(
+                {
+                    "text_returned_bytes": returned,
+                    "text_total_bytes": returned + 100,
+                    "text_truncated": True,
+                    "text_excerpt_policy": "utf8_head_tail_v1",
+                }
+            )
+        result_block["content"] = stable_json(payload)
+
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(cassette, [(use, result_block)])
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-v3-bounded",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+            self.assertEqual(trace["status"], "verified")
+
+            tampered = copy.deepcopy(payload)
+            tampered["hits"][0]["text_returned_bytes"] += 1
+            result_block["content"] = stable_json(tampered)
+            self._write_requests(cassette, [(use, result_block)])
+            invalid = build_query_plan_trace(
+                cassette,
+                run_id="run-v3-bounded-tampered",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+            self.assertEqual(invalid["status"], "invalid")
+            self.assertTrue(
+                any("bounded text excerpt" in reason for reason in invalid["invalid_reasons"])
+            )
+
     def test_v3_stale_query_anchor_requires_and_accepts_host_audit_receipt(self):
         variants = [
             {"kind": "synonym", "text": "commencement"},

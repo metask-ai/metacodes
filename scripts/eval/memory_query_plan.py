@@ -27,6 +27,9 @@ LEXICAL_PLAN_SCHEMA_VERSION = "lexical-query-plan-v2"
 BATCH_LEXICAL_PLAN_SCHEMA_VERSION = "lexical-query-plan-v3"
 AUTO_CONTEXT_SCHEMA_VERSION = "metacodes-auto-context-v1"
 AUTO_CONTEXT_SELECTION_POLICY = "first_new_evidence_then_new_then_merged_v1"
+BOUNDED_RECALL_SCHEMA_VERSION = "metacodes-bounded-recall-v1"
+BOUNDED_RECALL_MAX_RESULT_BYTES = 24 * 1024
+BOUNDED_RECALL_EXCERPT_POLICY = "utf8_head_tail_v1"
 LEGACY_LEXICAL_PLAN_SCHEMA_VERSION = "lexical-query-plan-v1"
 LEXICAL_PLAN_SCHEMA_VERSIONS = frozenset(
     {
@@ -413,6 +416,7 @@ def _parse_batch_receipt(
     parsed_plan: Mapping[str, Any],
     expected_seen: set[int],
     where: str,
+    raw_result: str,
 ) -> Mapping[str, Any]:
     raw_receipt = result.get("lexical_query_plan")
     if not isinstance(raw_receipt, dict):
@@ -578,6 +582,55 @@ def _parse_batch_receipt(
     if merged_hit_ids != ordered_merged:
         _fail(where, "merged hits do not match first-seen per-variant receipt order")
 
+    raw_envelope = result.get("recall_envelope")
+    if raw_envelope is not None:
+        envelope = _object(
+            raw_envelope,
+            f"{where}.recall_envelope",
+            frozenset(
+                {
+                    "schema_version",
+                    "complete_json",
+                    "max_result_bytes",
+                    "text_excerpt_policy",
+                }
+            ),
+        )
+        expected_envelope = {
+            "schema_version": BOUNDED_RECALL_SCHEMA_VERSION,
+            "complete_json": True,
+            "max_result_bytes": BOUNDED_RECALL_MAX_RESULT_BYTES,
+            "text_excerpt_policy": BOUNDED_RECALL_EXCERPT_POLICY,
+        }
+        for key, expected_value in expected_envelope.items():
+            if envelope[key] != expected_value:
+                _fail(f"{where}.recall_envelope.{key}", "unsupported bounded-recall contract")
+        if len(raw_result.encode("utf-8")) > BOUNDED_RECALL_MAX_RESULT_BYTES:
+            _fail(where, "bounded KgRecall result exceeds its declared byte cap")
+        for index, raw_hit in enumerate(hits):
+            if raw_hit.get("seen_before") is True:
+                continue
+            text = raw_hit.get("text")
+            returned = _integer(
+                raw_hit.get("text_returned_bytes"),
+                f"{where}.hits[{index}].text_returned_bytes",
+            )
+            total = _integer(
+                raw_hit.get("text_total_bytes"),
+                f"{where}.hits[{index}].text_total_bytes",
+            )
+            truncated = raw_hit.get("text_truncated")
+            policy = raw_hit.get("text_excerpt_policy")
+            if (
+                not isinstance(text, str)
+                or returned != len(text.encode("utf-8"))
+                or total < returned
+                or not isinstance(truncated, bool)
+                or truncated != (total > returned)
+                or policy != BOUNDED_RECALL_EXCERPT_POLICY
+            ):
+                _fail(f"{where}.hits[{index}]", "invalid bounded text excerpt receipt")
+
     auto_context_node_id: int | None = None
     raw_auto_context = result.get("auto_context")
     if raw_auto_context is not None:
@@ -669,7 +722,7 @@ def _parse_receipt(
     if not isinstance(result, dict):
         _fail(where, "KgRecall result is not an object")
     if parsed_plan["schema_version"] == BATCH_LEXICAL_PLAN_SCHEMA_VERSION:
-        return _parse_batch_receipt(result, parsed_plan, expected_seen, where)
+        return _parse_batch_receipt(result, parsed_plan, expected_seen, where, raw_result)
     receipt = _object(result.get("lexical_query_plan"), f"{where}.lexical_query_plan", RECEIPT_KEYS)
     expected = {
         "schema_version": parsed_plan["schema_version"],
