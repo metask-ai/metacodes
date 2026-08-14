@@ -562,6 +562,7 @@ test "L2 KG governance: freshness and contradiction contract enters the actual A
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "when the governed run has candidates and KgContext is available") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "rejects premature final answers until the available obligations commit") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "zero-candidate batch does not create an impossible KgContext obligation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "One best-node KgContext call is sufficient") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "necessary, not sufficient") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "mechanism, symptom, desired outcome, or nearby implementation term") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Deduplicate candidates by node_id across every call") != null);
@@ -921,7 +922,7 @@ test "L2 KG governance: KgContext emits evidence, freshness, and supersession si
     try std.testing.expectEqualStrings("tinykg-agent-retrieval-v1", graph.get("schema_version").?.string);
     try std.testing.expectEqualStrings("neighbors", graph.get("mode").?.string);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"rel\":\"derived_from\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Inspect connected evidence nodes with KgContext") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "one best-node KgContext call is sufficient") != null);
     const governance = obj.get("knowledge_governance").?.object;
     try std.testing.expectEqualStrings("metacodes-knowledge-governance-v1", governance.get("schema_version").?.string);
     try std.testing.expect(governance.get("current_generation").?.bool);
