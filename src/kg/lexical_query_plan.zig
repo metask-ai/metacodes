@@ -190,9 +190,31 @@ pub const Ledger = struct {
     run_node_ids: [MAX_RUN_SEEN_NODE_IDS]u64 = [_]u64{0} ** MAX_RUN_SEEN_NODE_IDS,
     run_node_count: usize = 0,
     semantic_expansion_probes: usize = 0,
+    successful_plan_calls: usize = 0,
+    enumeration_plan_calls: usize = 0,
+    enumeration_batch_committed: bool = false,
+
+    pub const CoverageState = struct {
+        successful_plan_calls: usize,
+        enumeration_plan_calls: usize,
+        enumeration_batch_committed: bool,
+    };
 
     fn runNodes(self: *const Ledger) []const u64 {
         return self.run_node_ids[0..self.run_node_count];
+    }
+
+    /// Snapshot the execution facts needed by the agent-loop coverage gate.
+    /// The gate never infers success from model text: only a committed real
+    /// KgRecall call advances these counters.
+    pub fn coverageState(self: *Ledger) CoverageState {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return .{
+            .successful_plan_calls = self.successful_plan_calls,
+            .enumeration_plan_calls = self.enumeration_plan_calls,
+            .enumeration_batch_committed = self.enumeration_batch_committed,
+        };
     }
 
     pub fn lockPlan(self: *Ledger, plan: Plan) LedgerError!Guard {
@@ -216,6 +238,10 @@ pub const Ledger = struct {
                 .entry_index = index,
                 .schema_version = plan.schema_version,
                 .semantic_probe_cost = semantic_probe_cost,
+                .enumeration_intent = plan.intent == .enumeration,
+                .enumeration_batch = plan.intent == .enumeration and
+                    plan.schema_version == .host_batch_v3 and
+                    plan.stage == .semantic_expansion and plan.variants.len >= 2,
             };
         }
 
@@ -235,6 +261,10 @@ pub const Ledger = struct {
             .schema_version = plan.schema_version,
             .created = true,
             .semantic_probe_cost = semantic_probe_cost,
+            .enumeration_intent = plan.intent == .enumeration,
+            .enumeration_batch = plan.intent == .enumeration and
+                plan.schema_version == .host_batch_v3 and
+                plan.stage == .semantic_expansion and plan.variants.len >= 2,
         };
     }
 
@@ -244,6 +274,8 @@ pub const Ledger = struct {
         schema_version: SchemaVersion,
         created: bool = false,
         semantic_probe_cost: usize = 0,
+        enumeration_intent: bool = false,
+        enumeration_batch: bool = false,
         active: bool = true,
 
         /// Abort the in-flight observation. Existing history is untouched; a
@@ -322,6 +354,9 @@ pub const Ledger = struct {
                 std.debug.assert(self.semantic_probe_cost <= MAX_SEMANTIC_EXPANSION_PROBES - self.ledger.semantic_expansion_probes);
                 self.ledger.semantic_expansion_probes += self.semantic_probe_cost;
             }
+            self.ledger.successful_plan_calls += 1;
+            if (self.enumeration_intent) self.ledger.enumeration_plan_calls += 1;
+            if (self.enumeration_batch) self.ledger.enumeration_batch_committed = true;
             self.active = false;
             self.ledger.mutex.unlock();
         }
@@ -729,17 +764,34 @@ test "lexical query plan v3 executes a fixed batch and budgets actual probes" {
     try std.testing.expectEqualStrings("graduation ceremony", plan.queryVariant().text);
 
     var ledger = Ledger{};
+    {
+        var aborted = try ledger.lockPlan(plan);
+        aborted.deinit();
+    }
+    const coverage_after_abort = ledger.coverageState();
+    try std.testing.expectEqual(@as(usize, 0), coverage_after_abort.successful_plan_calls);
+    try std.testing.expectEqual(@as(usize, 0), coverage_after_abort.enumeration_plan_calls);
+    try std.testing.expect(!coverage_after_abort.enumeration_batch_committed);
+
     var first = try ledger.lockPlan(plan);
     defer first.deinit();
     try std.testing.expectEqualStrings("agent_run_batch", first.scope());
     try first.commit(&.{ 41, 43 });
     try std.testing.expectEqual(@as(usize, 2), ledger.semantic_expansion_probes);
+    const coverage_after_first = ledger.coverageState();
+    try std.testing.expectEqual(@as(usize, 1), coverage_after_first.successful_plan_calls);
+    try std.testing.expectEqual(@as(usize, 1), coverage_after_first.enumeration_plan_calls);
+    try std.testing.expect(coverage_after_first.enumeration_batch_committed);
 
     var second = try ledger.lockPlan(plan);
     defer second.deinit();
     try std.testing.expect(second.wasSeen(41));
     try second.commit(&.{ 43, 47 });
     try std.testing.expectEqual(@as(usize, 4), ledger.semantic_expansion_probes);
+    const coverage_after_second = ledger.coverageState();
+    try std.testing.expectEqual(@as(usize, 2), coverage_after_second.successful_plan_calls);
+    try std.testing.expectEqual(@as(usize, 2), coverage_after_second.enumeration_plan_calls);
+    try std.testing.expect(coverage_after_second.enumeration_batch_committed);
     try std.testing.expectError(error.SemanticExpansionBudgetExceeded, ledger.lockPlan(plan));
 
     const indexed =
@@ -755,6 +807,27 @@ test "lexical query plan v3 executes a fixed batch and budgets actual probes" {
     var singleton_parsed = try std.json.parseFromSlice(std.json.Value, a, singleton, .{});
     defer singleton_parsed.deinit();
     try std.testing.expectError(error.InvalidStageShape, parse(a, singleton_parsed.value.object, "graduation ceremony", null));
+}
+
+test "fact lookup batch cannot discharge enumeration coverage" {
+    const a = std.testing.allocator;
+    const raw =
+        \\{"lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"fact_lookup","stage":"semantic_expansion","variants":[{"kind":"synonym","text":"graduation ceremony"},{"kind":"broader","text":"education milestone events"}]}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    var plan = (try parse(a, parsed.value.object, "graduation ceremony", null)) orelse return error.TestUnexpectedResult;
+    defer plan.deinit(a);
+
+    var ledger = Ledger{};
+    var guard = try ledger.lockPlan(plan);
+    defer guard.deinit();
+    try guard.commit(&.{41});
+
+    const coverage = ledger.coverageState();
+    try std.testing.expectEqual(@as(usize, 1), coverage.successful_plan_calls);
+    try std.testing.expectEqual(@as(usize, 0), coverage.enumeration_plan_calls);
+    try std.testing.expect(!coverage.enumeration_batch_committed);
 }
 
 test "lexical query ledger counts focused refinement against the post-seed budget" {

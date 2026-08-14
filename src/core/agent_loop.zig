@@ -549,6 +549,15 @@ pub fn run(
     // were actually returned. It is shared by every turn/tool context in this
     // run and never persisted into the canonical TinyKG store.
     var kg_lexical_ledger = @import("../kg/lexical_query_plan.zig").Ledger{};
+    const kg_retrieval_protocol = @import("../kg/retrieval_protocol.zig");
+    const kg_enumeration_query_hint = kg_retrieval_protocol.queryRequiresEnumerationCoverage(latestUserText(conversation)) or
+        (if (opts.synthetic_user_input) |synthetic|
+            kg_retrieval_protocol.queryRequiresEnumerationCoverage(synthetic)
+        else
+            false);
+    var kg_coverage_reminder_emitted = false;
+    var kg_coverage_repair_attempts: u8 = 0;
+    var kg_coverage_borrowed_turns: u32 = 0;
     // 成本次闸:累计本 run 成本(USD),达 opts.cost_budget_usd → 停(.budget)。
     const cost_rates = @import("../util/pricing.zig").rateFor(provider.model());
     var run_cost_usd: f64 = 0;
@@ -562,7 +571,7 @@ pub fn run(
     // the transcript or across process revisions.
     var compact_summary_reserve_tokens: usize = 0;
 
-    while (turns < opts.max_turns) : (turns += 1) {
+    while (turns < opts.max_turns +| kg_coverage_borrowed_turns) : (turns += 1) {
         // 开头检查 abort
         if (opts.abort) |a| if (a.isAborted()) {
             log.warn("agent", "aborted before turn {d}", .{turns + 1});
@@ -1155,6 +1164,27 @@ pub fn run(
                 try conversation.appendText(.user, "Your previous response was cut off by the token limit. Continue exactly where you left off, without repeating.");
                 continue;
             }
+            if (kgEnumerationCoveragePending(
+                &kg_lexical_ledger,
+                gated_tool_defs,
+                kg_enumeration_query_hint,
+            )) {
+                if (kg_coverage_repair_attempts == 0) {
+                    kg_coverage_repair_attempts = 1;
+                    // One request may be needed to emit the mandatory batch
+                    // and one to produce the final answer. Budget/request gates
+                    // still guard both side-effect boundaries.
+                    kg_coverage_borrowed_turns = 2;
+                    backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                    try conversation.appendText(.user, kg_retrieval_protocol.ENUMERATION_COVERAGE_REPAIR);
+                    continue;
+                }
+                // A second premature final is not accepted as a valid answer.
+                // Preserve the trace for audit and fail closed as a controlled
+                // tool loop rather than laundering an uncovered conclusion.
+                backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
+            }
             // L4 诊断:本轮无 tool_use → turn 结束(span 平衡:每个 turn_begin 都配一个
             // turn_end,无论有无工具)。紧接 run_end(end_turn)收口。
             backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
@@ -1561,6 +1591,15 @@ pub fn run(
             );
             try result_blocks.append(allocator, .{ .text = checkpoint });
         }
+        if (!kg_coverage_reminder_emitted and kgEnumerationCoveragePending(
+            &kg_lexical_ledger,
+            gated_tool_defs,
+            kg_enumeration_query_hint,
+        )) {
+            const reminder = try allocator.dupe(u8, kg_retrieval_protocol.ENUMERATION_COVERAGE_REMINDER);
+            try result_blocks.append(allocator, .{ .text = reminder });
+            kg_coverage_reminder_emitted = true;
+        }
 
         const blocks_owned = try result_blocks.toOwnedSlice(allocator);
         try conversation.append(.{ .role = .user, .blocks = blocks_owned });
@@ -1609,6 +1648,37 @@ pub fn run(
 
     // 循环正常退出 = turns >= max_turns
     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .max_turns, .turns = turns, .tool_calls = total_tool_calls });
+}
+
+fn kgEnumerationCoveragePending(
+    ledger: *@import("../kg/lexical_query_plan.zig").Ledger,
+    tool_defs: []const json_mod.ToolDefinition,
+    query_hint: bool,
+) bool {
+    var kg_recall_visible = false;
+    for (tool_defs) |definition| {
+        if (std.mem.eql(u8, definition.name, "KgRecall")) {
+            kg_recall_visible = true;
+            break;
+        }
+    }
+    if (!kg_recall_visible) return false;
+    const coverage = ledger.coverageState();
+    return coverage.successful_plan_calls > 0 and
+        !coverage.enumeration_batch_committed and
+        (query_hint or coverage.enumeration_plan_calls > 0);
+}
+
+test "enumeration coverage gate ignores query wording before a successful recall" {
+    var ledger = @import("../kg/lexical_query_plan.zig").Ledger{};
+    const tool_defs = [_]json_mod.ToolDefinition{.{
+        .name = "KgRecall",
+        .description = "recall",
+        .input_schema = .{ .prop_specs = &.{}, .required = &.{} },
+    }};
+
+    try std.testing.expect(!kgEnumerationCoveragePending(&ledger, &tool_defs, true));
+    try std.testing.expect(!kgEnumerationCoveragePending(&ledger, &.{}, true));
 }
 
 fn elapsedSinceNs(started_ns: util_time.Nanos) u64 {

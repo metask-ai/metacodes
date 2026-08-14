@@ -4,6 +4,8 @@
 //! 合并候选并验证节点/证据。协议同时接到 system prompt、工具 schema、自动召回提醒
 //! 和工具结果，避免不同 agent 入口退化成单条裸 query 或一个超大关键词袋。
 
+const std = @import("std");
+
 /// system prompt 中的强制协议。“语义邻域”是模型主动推理，不暗示底层计算向量距离。
 pub const SYSTEM_RULES =
     \\Lexical retrieval algorithm (mandatory whenever KgRecall is warranted; follow in order):
@@ -13,7 +15,7 @@ pub const SYSTEM_RULES =
     \\- Step 2B — EXACT/HIGH-PRECISION SEED: if no alias was exposed, first issue one compact, untyped KgRecall using the user's exact wording and discriminating field names. Do not mix speculative semantic variants into this seed.
     \\- Step 2C — RECORD THE PLAN: attach `lexical_plan` with schema_version lexical-query-plan-v3 to every normal KgRecall. A seed has one exact/alias variant. If the seed is insufficient, declare one fixed 2-4 member non-exact semantic batch. The host executes every declared member in order inside this single tool call, merges by node_id, exposes each node body at most once, and returns a stable plan_sha256 plus per-variant receipts. `query` is only the compatibility anchor and must equal variants[0].text. The run-scoped host ledger owns seen state; omit variant_index and seen_node_ids. Query-only and v1/v2 calls remain compatibility paths.
     \\- Step 3 — BOUNDED SEMANTIC NEIGHBORHOOD: only if the seed is insufficient, infer 2-4 separate compact probes for this intent and submit them together once. Never concatenate them into a keyword bag. Choose useful dimensions rather than filling a quota: synonym/paraphrase; Chinese/English alias, abbreviation, old/new name, or code identifier; mechanism, symptom, outcome, or nearby implementation; one plausible broader/narrower concept. The host executes at most four semantic probes per run.
-    \\- Step 3E — ENUMERATION REQUIRES COVERAGE: for count/cardinality, exhaustive-list, all/every, or negative/absence questions set intent=`enumeration`. One positive hit proves existence, never completeness. Unless the seed returns an authoritative aggregate, submit a 2-4 member semantic batch; a successful v3 receipt proves every member ran. Batch execution is necessary, not sufficient: verify that merged hits and graph evidence cover the requested scope before concluding a count, exhaustive list, or absence.
+    \\- Step 3E — ENUMERATION REQUIRES COVERAGE: for count/cardinality, exhaustive-list, all/every, or negative/absence questions set intent=`enumeration`. One positive hit proves existence, never completeness. Unless the seed returns an authoritative aggregate, submit a 2-4 member semantic batch; a successful v3 receipt proves every member ran. Batch execution is necessary, not sufficient: verify that merged hits and graph evidence cover the requested scope before concluding a count, exhaustive list, or absence. After a committed seed on an obvious enumeration query, the host records a coverage obligation and rejects a premature final answer until a v3 semantic batch commits.
     \\- Step 4 — MERGE AND VERIFY: semantically judge hits. Deduplicate candidates by node_id across every call. Memory is a candidate, not a current fact. Prefer exact aliases and authoritative nodes, but never treat score or wording overlap as correctness. Call KgContext on the best seed to read its authoritative node text and bounded graph neighborhood.
     \\- Step 5 — GOVERN EVIDENCE AND FRESHNESS: inspect verified_by or evidences links, provenance, and any deprecated_by, resolved_by, and contradiction signal exposed by KgContext. A current-generation node with connected evidence is still only a candidate: TinyKG has no universal freshness clock. If evidence is missing, the graph is truncated, the node is superseded/conflicted, or the claim is time-sensitive, do not use memory as a current fact; verify it against current code, git, tests, or external state.
     \\- Step 6 — STOP OR REPORT UNCERTAINTY: For non-enumeration lookups, stop as soon as authoritative evidence and any required current-state check are sufficient. For enumeration, the Step 3E coverage condition is part of sufficiency. If the bounded variants and graph inspection remain insufficient, say so; do not infer absence from lexical misses and do not invent a fact.
@@ -51,3 +53,75 @@ pub const AUTO_RECALL_NEXT_ACTION =
 /// 每次 KgRecall 结果都携带：把下一步决策放在使用时点，而非只依赖 system prompt。
 pub const RESULT_GUIDANCE =
     "Semantically judge the merged lexical candidates. content_ref=exposed_elsewhere_in_run points to the same node body already exposed in this run, not missing evidence. A v3 all_variants_executed receipt proves declared probes ran, not that the answer is complete. If a seed is insufficient, submit one 2-4 member semantic batch; do not issue its members separately or combine them into a keyword bag. For enumeration, verify merged graph scope before a count/list/absence conclusion. Use KgContext for authoritative text and governance signals. Never promote a hit to a current fact without evidence/freshness/supersession checks; lexical misses do not prove absence.";
+
+/// Added to the real tool-result message when the host observes a committed
+/// seed for a count/list query but no committed v3 semantic batch. This is an
+/// executable control-loop signal, not another static system-prompt slogan.
+pub const ENUMERATION_COVERAGE_REMINDER =
+    "[lexical-coverage-obligation] The current user query requires enumeration coverage. A governed KgRecall seed committed, but no lexical-query-plan-v3 semantic_expansion batch has committed. Before any final answer or abstention, call KgRecall once with intent=enumeration and 2-4 distinct non-exact variants; the host will execute the whole batch. A seed miss or partial hit cannot justify completeness or unavailability.";
+
+/// One bounded repair is allowed if a model still tries to end the run. The
+/// agent loop rejects that premature final answer and gives the model a chance
+/// to discharge the already-observed obligation.
+pub const ENUMERATION_COVERAGE_REPAIR =
+    "[lexical-coverage-rejected-final] Your proposed final answer was rejected by the host because enumeration coverage is still pending. Do not answer yet. Call KgRecall now with lexical-query-plan-v3, intent=enumeration, stage=semantic_expansion, and one fixed batch of 2-4 distinct non-exact variants. After the batch receipt, answer from the merged evidence.";
+
+/// Deliberately high-precision host hint. The model-declared intent remains a
+/// second signal, but obvious cardinality wording must not be silently
+/// downgraded to fact_lookup as happened in a paid calibration.
+pub fn queryRequiresEnumerationCoverage(query: []const u8) bool {
+    const ascii_phrases = [_][]const u8{
+        "how many",
+        "number of",
+        "count of",
+        "count the",
+        "list all",
+        "list every",
+        "all matching",
+        "every matching",
+    };
+    for (ascii_phrases) |phrase| {
+        if (containsAsciiIgnoreCase(query, phrase)) return true;
+    }
+    const unicode_phrases = [_][]const u8{
+        "多少",
+        "几次",
+        "几个",
+        "几条",
+        "几项",
+        "列出所有",
+        "列出全部",
+        "全部列出",
+    };
+    for (unicode_phrases) |phrase| {
+        if (std.mem.indexOf(u8, query, phrase) != null) return true;
+    }
+    return false;
+}
+
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or haystack.len < needle.len) return false;
+    var offset: usize = 0;
+    while (offset <= haystack.len - needle.len) : (offset += 1) {
+        if (!std.ascii.eqlIgnoreCase(haystack[offset .. offset + needle.len], needle)) continue;
+        const left_is_word = offset > 0 and isAsciiWordByte(haystack[offset - 1]);
+        const right = offset + needle.len;
+        const right_is_word = right < haystack.len and isAsciiWordByte(haystack[right]);
+        if (!left_is_word and !right_is_word) return true;
+    }
+    return false;
+}
+
+fn isAsciiWordByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_';
+}
+
+test "enumeration coverage hint is high precision and multilingual" {
+    try std.testing.expect(queryRequiresEnumerationCoverage("How many graduation ceremonies did I attend?"));
+    try std.testing.expect(queryRequiresEnumerationCoverage("LIST ALL matching releases"));
+    try std.testing.expect(queryRequiresEnumerationCoverage("一共有几次发布失败？"));
+    try std.testing.expect(queryRequiresEnumerationCoverage("列出所有未关闭任务"));
+    try std.testing.expect(!queryRequiresEnumerationCoverage("Install all dependencies"));
+    try std.testing.expect(!queryRequiresEnumerationCoverage("Please discount the price"));
+    try std.testing.expect(!queryRequiresEnumerationCoverage("Fix the counter implementation"));
+}

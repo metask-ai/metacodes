@@ -411,6 +411,38 @@ const KG_END_TURN_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+const KG_ENUMERATION_SEED_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"seed\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"seed1\",\"name\":\"KgRecall\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"graduation ceremony\\\",\\\"lexical_plan\\\":{\\\"schema_version\\\":\\\"lexical-query-plan-v3\\\",\\\"intent\\\":\\\"fact_lookup\\\",\\\"stage\\\":\\\"seed\\\",\\\"variants\\\":[{\\\"kind\\\":\\\"exact\\\",\\\"text\\\":\\\"graduation ceremony\\\"}]}}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const KG_ENUMERATION_PREMATURE_FINAL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"early\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Unavailable\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const KG_ENUMERATION_BATCH_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"batch\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"batch1\",\"name\":\"KgRecall\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"commencement\\\",\\\"lexical_plan\\\":{\\\"schema_version\\\":\\\"lexical-query-plan-v3\\\",\\\"intent\\\":\\\"enumeration\\\",\\\"stage\\\":\\\"semantic_expansion\\\",\\\"variants\\\":[{\\\"kind\\\":\\\"synonym\\\",\\\"text\\\":\\\"commencement\\\"},{\\\"kind\\\":\\\"paraphrase\\\",\\\"text\\\":\\\"degree conferral\\\"},{\\\"kind\\\":\\\"broader\\\",\\\"text\\\":\\\"convocation\\\"}]}}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const KG_ENUMERATION_FINAL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"final\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"3\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
 test "L2 KG: 注入段经 inject_user_context 进请求体(字节断言,DoD)" {
     // 端到端:kg_summary → user_context.build → inject_user_context → buildApiMessages
     // → 序列化请求体。用真 MockServer 捕获 body,断言 KG 记忆锚字节在内。
@@ -519,6 +551,8 @@ test "L2 KG governance: freshness and contradiction contract enters the actual A
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "count/cardinality, exhaustive-list") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "One positive hit proves existence, never completeness") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "successful v3 receipt proves every member ran") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "host records a coverage obligation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "rejects a premature final answer") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "necessary, not sufficient") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "mechanism, symptom, desired outcome, or nearby implementation term") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Deduplicate candidates by node_id across every call") != null);
@@ -738,6 +772,92 @@ test "L2 KG governance: v3 batch executes every variant and exposes each node bo
         }
         try std.testing.expect(found);
     }
+}
+
+test "L2 KG governance: real agent loop rejects enumeration final until v3 batch commits" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const project_dir = pbuf[0..dir_len];
+    const store = try std.fmt.allocPrint(a, "{s}/kg-enumeration-gate.kg", .{project_dir});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-enumeration-gate");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+    _ = try kg.remember(.observation, "attended sister commencement", "observation", false);
+    _ = try kg.remember(.observation, "attended friend degree conferral", "observation", false);
+    _ = try kg.remember(.observation, "attended cousin convocation", "observation", false);
+
+    // Deliberately reproduce the paid c010 failure: after a fact_lookup seed,
+    // the provider tries to finalize as unavailable. The real run path must
+    // reject it, surface a host observation, accept a fixed v3 batch, and only
+    // then allow the final answer. max_turns=2 proves the bounded repair loans
+    // exactly enough turns for batch + final instead of dying at the old cap.
+    const responses = [_][]const u8{
+        KG_ENUMERATION_SEED_SSE,
+        KG_ENUMERATION_PREMATURE_FINAL_SSE,
+        KG_ENUMERATION_BATCH_SSE,
+        KG_ENUMERATION_FINAL_SSE,
+    };
+    var srv = try harness.MockServer.startCassette(&responses, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var api_client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer api_client.deinit();
+
+    const enabled = [_][]const u8{"KgRecall"};
+    var defs_arena = std.heap.ArenaAllocator.init(a);
+    defer defs_arena.deinit();
+    var prompt_context = cc.tools.PromptContext{ .enabled_tool_names = &enabled };
+    const defs = try cc.tools.toToolDefinitionsFull(defs_arena.allocator(), null, &prompt_context);
+    const system_prompt = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &enabled, "", true, project_dir);
+    defer a.free(system_prompt);
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "How many graduation ceremonies did I attend?");
+    const permission = cc.permission.createContext(.bypass_permissions, a);
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    const run_result = try cc.agent_loop.run(&conv, api_client.provider(), defs, &permission, .{
+        .max_turns = 2,
+        .system_prompt = system_prompt,
+        .kg = &kg,
+        .project_dir = project_dir,
+        .cwd_abs = project_dir,
+    }, &backend, a);
+
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, run_result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 4), run_result.turns);
+    try std.testing.expectEqual(@as(u32, 2), run_result.tool_calls);
+    try std.testing.expectEqual(@as(usize, 4), srv.requestCount());
+
+    const after_seed = srv.requestAt(1) orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, after_seed.body(), "lexical-coverage-obligation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_seed.body(), "no lexical-query-plan-v3 semantic_expansion batch has committed") != null);
+
+    const repair_request = srv.requestAt(2) orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, repair_request.body(), "lexical-coverage-rejected-final") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repair_request.body(), "Do not answer yet") != null);
+
+    const final_request = srv.requestAt(3) orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "\\\"all_variants_executed\\\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "\\\"executed_variant_count\\\":3") != null);
+
+    const final_message = conv.messages.items[conv.messages.items.len - 1];
+    try std.testing.expectEqual(cc.message.Role.assistant, final_message.role);
+    try std.testing.expectEqualStrings("3", final_message.blocks[0].text);
 }
 
 test "L2 KG governance: KgContext emits evidence, freshness, and supersession signals" {
