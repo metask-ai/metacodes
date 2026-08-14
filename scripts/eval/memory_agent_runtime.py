@@ -56,6 +56,7 @@ from .memory_query_plan import (
     QUERY_PLAN_INVALID_PREFIX,
     SIDECAR_NAME as QUERY_PLAN_SIDECAR_NAME,
     build_query_plan_trace,
+    quality_scoreable_with_pre_search_rejections,
     project_query_variants,
 )
 from .memory_replay import (
@@ -326,6 +327,30 @@ def _host_recall_covers_missing_explicit_recall(
         and scoped_recall.get("status") in {"injected", "no_hits"}
         and query_plan_trace.get("invalid_reasons")
         == ["TinyKG backend executed no KgRecall"]
+    )
+
+
+def _query_plan_evaluator_invalid_reason(
+    scoped_recall: Mapping[str, Any] | None,
+    query_plan_trace: Mapping[str, Any],
+) -> str | None:
+    """Return a treatment-invalid reason without erasing safe recovery.
+
+    The query-plan trace remains the protocol-health authority.  This function
+    answers the narrower quality-evaluation question: did the run retain a
+    host-verified evidence path after any pre-search rejection?  Keeping this
+    decision in one function makes the production runner and its L2 test share
+    the same boundary.
+    """
+
+    if query_plan_trace["status"] != "invalid":
+        return None
+    if _host_recall_covers_missing_explicit_recall(scoped_recall, query_plan_trace):
+        return None
+    if quality_scoreable_with_pre_search_rejections(query_plan_trace):
+        return None
+    return QUERY_PLAN_INVALID_PREFIX + "; ".join(
+        str(reason) for reason in query_plan_trace["invalid_reasons"]
     )
 
 
@@ -3833,14 +3858,10 @@ def run_memory_agent_schedule(
             provenance_links = store_edges
 
         evaluator_invalid: str | None = None
-        host_only_query_plan_gap = _host_recall_covers_missing_explicit_recall(
+        evaluator_invalid = _query_plan_evaluator_invalid_reason(
             scoped_recall_activation,
             query_plan_trace,
         )
-        if query_plan_trace["status"] == "invalid" and not host_only_query_plan_gap:
-            evaluator_invalid = QUERY_PLAN_INVALID_PREFIX + "; ".join(
-                str(reason) for reason in query_plan_trace["invalid_reasons"]
-            )
         if case["benchmark"] == "procedural_transfer":
             validator_entry = validators.get(case["id"])
             if validator_entry is None:

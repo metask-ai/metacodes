@@ -11,9 +11,11 @@ from scripts.eval.memory_query_plan import (
     build_query_plan_trace,
     load_and_verify_query_plan_sidecar,
     project_query_variants,
+    quality_scoreable_with_pre_search_rejections,
     summarize_query_plan_traces,
     validate_query_plan_trace,
 )
+from scripts.eval.memory_agent_runtime import _query_plan_evaluator_invalid_reason
 from scripts.eval.model import ValidationError, stable_json
 
 
@@ -233,6 +235,119 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
         self.assertEqual(trace["status"], "invalid")
         self.assertIn(MULTIPLE_DISTINCT_SEED_PLANS_REASON, trace["invalid_reasons"])
         self.assertRegex(trace["invalid_reasons"][0], "no successful observable result")
+        self.assertFalse(quality_scoreable_with_pre_search_rejections(trace))
+
+    def test_rejected_expansion_then_verified_recovery_keeps_quality_scoreable(self):
+        seed = self._call(
+            "kg-1",
+            variants=[{"kind": "exact", "text": "cuisines learned"}],
+            hits=(7, 9),
+        )
+        expansion_variants = [
+            {"kind": "alias", "text": "cooking class cuisine"},
+            {"kind": "paraphrase", "text": "tried new dishes"},
+        ]
+        rejected_use, rejected_result = self._call(
+            "kg-2",
+            variants=expansion_variants,
+            seen=(7, 9),
+            stage="semantic_expansion",
+        )
+        rejected_result["is_error"] = True
+        rejected_result["content"] = stable_json(
+            {
+                "error": {
+                    "code": "invalid_args",
+                    "category": "user_error",
+                    "detail": (
+                        "KgRecall lexical_plan host ledger rejected the call: "
+                        "lexical_plan.seen_node_ids does not exactly match the host ledger "
+                        "for this plan"
+                    ),
+                    "recoverable": True,
+                }
+            }
+        )
+        recovered = self._call(
+            "kg-3",
+            variants=expansion_variants,
+            seen=(),
+            hits=(11,),
+            stage="semantic_expansion",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(
+                cassette,
+                [seed, (rejected_use, rejected_result), recovered],
+            )
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-recovered",
+                arm="tinykg_lexical",
+                memory_backend="tinykg",
+            )
+
+        self.assertEqual(trace["status"], "invalid")
+        self.assertEqual(len(trace["calls"]), 2)
+        self.assertTrue(quality_scoreable_with_pre_search_rejections(trace))
+        summary = summarize_query_plan_traces([trace])
+        self.assertEqual(
+            summary["quality_eligibility_counts"][
+                "scoreable_with_pre_search_rejections"
+            ],
+            1,
+        )
+        self.assertEqual(summary["protocol_status_counts"]["invalid"], 1)
+        self.assertEqual(summary["quality_eligibility_counts"]["ineligible"], 0)
+        self.assertEqual(summary["explicit_verified_calls"], 2)
+        self.assertEqual(summary["mean_calls_before_stopping"], 3.0)
+        self.assertIsNone(_query_plan_evaluator_invalid_reason(None, trace))
+
+    def test_arbitrary_recoverable_tool_error_cannot_keep_quality_scoreable(self):
+        seed = self._call(
+            "kg-1",
+            variants=[{"kind": "exact", "text": "needle"}],
+            hits=(7,),
+        )
+        failed_use, failed_result = self._call(
+            "kg-2",
+            variants=[
+                {"kind": "alias", "text": "needle alias"},
+                {"kind": "mechanism", "text": "needle mechanism"},
+            ],
+            stage="semantic_expansion",
+        )
+        failed_result["is_error"] = True
+        failed_result["content"] = stable_json(
+            {
+                "error": {
+                    "code": "invalid_args",
+                    "category": "user_error",
+                    "detail": "some other recoverable failure",
+                    "recoverable": True,
+                }
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(cassette, [seed, (failed_use, failed_result)])
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-arbitrary-error",
+                arm="tinykg_lexical",
+                memory_backend="tinykg",
+            )
+
+        self.assertEqual(trace["status"], "invalid")
+        self.assertFalse(quality_scoreable_with_pre_search_rejections(trace))
+        summary = summarize_query_plan_traces([trace])
+        self.assertEqual(summary["protocol_status_counts"]["invalid"], 1)
+        self.assertEqual(summary["quality_eligibility_counts"]["ineligible"], 1)
+        self.assertRegex(
+            _query_plan_evaluator_invalid_reason(None, trace) or "",
+            "query-plan trace invalid",
+        )
 
     def test_missing_receipt_and_plan_sha_drift_are_invalid(self):
         variants = [{"kind": "exact", "text": "needle"}]
@@ -255,6 +370,7 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
                 )
                 self.assertEqual(trace["status"], "invalid")
                 self.assertRegex(trace["invalid_reasons"][0], expected)
+                self.assertFalse(quality_scoreable_with_pre_search_rejections(trace))
 
     def test_missing_seen_progression_is_invalid(self):
         variants = [
@@ -288,6 +404,7 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             )
             self.assertEqual(trace["status"], "invalid")
             self.assertRegex(trace["invalid_reasons"][0], "prior hits")
+            self.assertFalse(quality_scoreable_with_pre_search_rejections(trace))
 
     def test_sidecar_tamper_and_missing_fail_closed_when_bound(self):
         variants = [{"kind": "exact", "text": "needle"}]
@@ -341,8 +458,10 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
             )
             self.assertEqual(trace["status"], "not_applicable")
             summary = summarize_query_plan_traces([None, trace])
-            self.assertEqual(summary["status_counts"]["legacy_unavailable"], 1)
-            self.assertEqual(summary["status_counts"]["not_applicable"], 1)
+            self.assertEqual(
+                summary["protocol_status_counts"]["legacy_unavailable"], 1
+            )
+            self.assertEqual(summary["protocol_status_counts"]["not_applicable"], 1)
 
     def test_verified_host_recall_only_covers_missing_explicit_call(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -362,10 +481,13 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
                 [trace],
                 host_recall_satisfied=[True],
             )
-            self.assertEqual(summary["status_counts"]["host_recall_satisfied"], 1)
-            self.assertEqual(summary["status_counts"]["invalid"], 0)
             self.assertEqual(
-                summary["rollout_status"][0]["trace_status"],
+                summary["quality_eligibility_counts"]["host_recall_satisfied"], 1
+            )
+            self.assertEqual(summary["protocol_status_counts"]["invalid"], 1)
+            self.assertEqual(summary["quality_eligibility_counts"]["ineligible"], 0)
+            self.assertEqual(
+                summary["rollout_status"][0]["protocol_status"],
                 "invalid",
             )
 
@@ -390,8 +512,11 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
                 [trace],
                 host_recall_satisfied=[True],
             )
-            self.assertEqual(summary["status_counts"]["invalid"], 1)
-            self.assertEqual(summary["status_counts"]["host_recall_satisfied"], 0)
+            self.assertEqual(summary["protocol_status_counts"]["invalid"], 1)
+            self.assertEqual(summary["quality_eligibility_counts"]["ineligible"], 1)
+            self.assertEqual(
+                summary["quality_eligibility_counts"]["host_recall_satisfied"], 0
+            )
 
     def test_host_recall_vector_must_align_with_traces(self):
         with self.assertRaisesRegex(ValidationError, "status length mismatch"):

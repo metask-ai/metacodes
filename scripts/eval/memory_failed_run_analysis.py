@@ -28,6 +28,7 @@ from .memory_query_plan import (
     SIDECAR_NAME,
     build_query_plan_trace,
     project_query_variants,
+    quality_scoreable_with_pre_search_rejections,
     summarize_query_plan_traces,
 )
 from .memory_replay import (
@@ -512,7 +513,11 @@ def repair_observations(
     for sequence, (row, rollout, trace) in enumerate(zip(repaired, rollouts, traces)):
         host_ok = _host_recall_satisfied(rollout, trace)
         host_satisfied.append(host_ok)
-        if trace["status"] != "invalid" or host_ok:
+        if (
+            trace["status"] != "invalid"
+            or host_ok
+            or quality_scoreable_with_pre_search_rejections(trace)
+        ):
             continue
         evaluator = row.get("evaluator")
         retrieval = row.get("retrieval")
@@ -688,7 +693,16 @@ def _markdown_report(report: Mapping[str, Any], memory_summary: Mapping[str, Any
         "## Query-plan status",
         "",
         "```json",
-        json.dumps(report["query_plans"]["status_counts"], indent=2, sort_keys=True),
+        json.dumps(
+            {
+                "protocol": report["query_plans"]["protocol_status_counts"],
+                "quality_eligibility": report["query_plans"][
+                    "quality_eligibility_counts"
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        ),
         "```",
         "",
         "## Offline paired comparisons",

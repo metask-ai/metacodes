@@ -47,6 +47,47 @@ def call(index, plan, query):
 
 
 class FailedMemoryRunAnalysisTest(unittest.TestCase):
+    def test_safe_pre_search_rejection_does_not_reclassify_quality(self):
+        observation = {
+            "evaluator": {
+                "status": "ready",
+                "invalid_reason": None,
+                "deterministic_success": True,
+            },
+            "retrieval": {
+                "query_variants": [{"kind": "exact", "text": "needle"}]
+            },
+        }
+        trace = {
+            "schema_version": TRACE_SCHEMA_VERSION,
+            "run_id": "run-recovered",
+            "arm": "tinykg_lexical",
+            "memory_backend": "tinykg_integrated",
+            "kg_recall_count": 2,
+            "status": "invalid",
+            "invalid_reasons": [
+                "call 1: host rejected lexical plan before search"
+            ],
+            "calls": [call(0, "a" * 64, "needle")],
+        }
+
+        repaired, changes, host_satisfied = repair_observations(
+            [observation],
+            [
+                {
+                    "run_id": "run-recovered",
+                    "case_id": "case-recovered",
+                    "arm": "tinykg_lexical",
+                    "scoped_recall": None,
+                }
+            ],
+            [trace],
+        )
+
+        self.assertEqual(repaired, [observation])
+        self.assertEqual(changes, [])
+        self.assertEqual(host_satisfied, [False])
+
     def test_repair_marks_only_protocol_invalid_row_and_preserves_seed_shape(self):
         observations = [
             {

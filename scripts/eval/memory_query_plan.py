@@ -20,11 +20,14 @@ from .model import ValidationError, stable_json
 
 
 TRACE_SCHEMA_VERSION = "metacodes-memory-query-plan-trace-v1"
-REPORT_SCHEMA_VERSION = "metacodes-memory-query-plan-report-v2"
+REPORT_SCHEMA_VERSION = "metacodes-memory-query-plan-report-v3"
 LEXICAL_PLAN_SCHEMA_VERSION = "lexical-query-plan-v1"
 SIDECAR_NAME = "query-plan.json"
 QUERY_PLAN_INVALID_PREFIX = "query-plan trace invalid: "
 MULTIPLE_DISTINCT_SEED_PLANS_REASON = "multiple distinct seed plans in one run"
+PRE_SEARCH_REJECTION_REASON = re.compile(
+    r"^call (?P<call_index>[0-9]+): host rejected lexical plan before search$"
+)
 MAX_OBSERVATION_QUERY_VARIANTS = 5
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 INTENTS = frozenset(
@@ -320,6 +323,37 @@ def _parse_receipt(raw_result: str, parsed_plan: Mapping[str, Any], where: str) 
     }
 
 
+def _is_pre_search_ledger_rejection(raw_result: str) -> bool:
+    """Recognize only the native fail-closed ledger error envelope.
+
+    The matching Zig path rejects before it invokes TinyKG.  Do not broaden
+    this to arbitrary ``invalid_args`` or recoverable tool failures: those can
+    describe malformed input, permission policy, transport failure, or an
+    unavailable store and must continue to invalidate quality evidence.
+    """
+
+    try:
+        result = json.loads(raw_result)
+    except json.JSONDecodeError:
+        return False
+    error = result.get("error") if isinstance(result, dict) else None
+    if not isinstance(error, dict) or set(error) != {
+        "code",
+        "category",
+        "detail",
+        "recoverable",
+    }:
+        return False
+    detail = error.get("detail")
+    return bool(
+        error.get("code") == "invalid_args"
+        and error.get("category") == "user_error"
+        and error.get("recoverable") is True
+        and isinstance(detail, str)
+        and detail.startswith("KgRecall lexical_plan host ledger rejected the call: ")
+    )
+
+
 def _cassette_tools(root: Path, where: str) -> Sequence[Tuple[str, str, Mapping[str, Any], str, bool]]:
     request_paths = sorted(root.glob("req-*.json"))
     if not request_paths:
@@ -426,9 +460,14 @@ def build_query_plan_trace(
             if parsed_plan["stage"] == "seed":
                 declared_seed_plans.add(plan_sha)
             if is_error:
-                reasons.append(
-                    f"call {call_index}: KgRecall has no successful observable result"
-                )
+                if _is_pre_search_ledger_rejection(raw_result):
+                    reasons.append(
+                        f"call {call_index}: host rejected lexical plan before search"
+                    )
+                else:
+                    reasons.append(
+                        f"call {call_index}: KgRecall has no successful observable result"
+                    )
                 continue
             expected_seen = plan_seen[plan_sha]
             if set(parsed_plan["seen_node_ids"]) != expected_seen:
@@ -507,6 +546,43 @@ def project_query_variants(
         if len(projected) == limit:
             break
     return projected
+
+
+def quality_scoreable_with_pre_search_rejections(trace: Mapping[str, Any]) -> bool:
+    """Keep task quality separate from recoverable tool-protocol mistakes.
+
+    A model-issued KgRecall can be rejected without exposing any memory and a
+    the run can still retain a host-receipted retrieval path.  That rejected
+    attempt is real trajectory evidence: the trace remains ``invalid`` and the
+    native tool-error/time/token counters retain its cost.  It is not,
+    however, an infrastructure failure that should erase an otherwise
+    scoreable answer.
+
+    This exception is intentionally narrow.  At least one successful seed and
+    one individually host-verified call must remain, and every trace-level
+    reason must describe a rejected attempt.  Receipt drift, forged gain
+    counts, successful-call ledger mismatches, multiple seed plans, and a run
+    with no successful recall continue to fail closed.
+    """
+
+    validate_query_plan_trace(trace)
+    if trace["memory_backend"] not in TINYKG_BACKENDS:
+        return False
+    if trace["status"] != "invalid" or not trace["calls"]:
+        return False
+    rejection_indices: List[int] = []
+    for reason in trace["invalid_reasons"]:
+        match = PRE_SEARCH_REJECTION_REASON.fullmatch(reason)
+        if match is None:
+            return False
+        rejection_indices.append(int(match.group("call_index")))
+    if len(rejection_indices) != len(set(rejection_indices)):
+        return False
+    successful_indices = {int(call["call_index"]) for call in trace["calls"]}
+    expected_rejections = set(range(int(trace["kg_recall_count"]))) - successful_indices
+    if set(rejection_indices) != expected_rejections:
+        return False
+    return any(call["stage"] == "seed" for call in trace["calls"])
 
 
 def validate_query_plan_trace(trace: Mapping[str, Any], where: str = "query-plan sidecar") -> None:
@@ -627,12 +703,22 @@ def summarize_query_plan_traces(
         host_recall_satisfied = [False] * len(traces)
     if len(host_recall_satisfied) != len(traces):
         _fail("memory query-plan summary", "host recall status length mismatch")
-    status_counts = {
+    protocol_status_counts = {
+        key: 0
+        for key in (
+            "verified",
+            "invalid",
+            "not_applicable",
+            "legacy_unavailable",
+        )
+    }
+    quality_eligibility_counts = {
         key: 0
         for key in (
             "explicit_plan_verified",
+            "scoreable_with_pre_search_rejections",
             "host_recall_satisfied",
-            "invalid",
+            "ineligible",
             "not_applicable",
             "legacy_unavailable",
         )
@@ -644,8 +730,14 @@ def summarize_query_plan_traces(
         if trace is None:
             if host_satisfied:
                 _fail("memory query-plan summary", "legacy trace cannot claim host recall")
-            status_counts["legacy_unavailable"] += 1
-            rollout_rows.append({"status": "legacy_unavailable"})
+            protocol_status_counts["legacy_unavailable"] += 1
+            quality_eligibility_counts["legacy_unavailable"] += 1
+            rollout_rows.append(
+                {
+                    "protocol_status": "legacy_unavailable",
+                    "quality_eligibility": "legacy_unavailable",
+                }
+            )
             continue
         validate_query_plan_trace(trace)
         trace_status = str(trace["status"])
@@ -654,30 +746,38 @@ def summarize_query_plan_traces(
                 "memory query-plan summary",
                 "non-TinyKG trace cannot claim host recall",
             )
+        protocol_status_counts[trace_status] += 1
         if trace_status == "verified":
-            status = "explicit_plan_verified"
+            quality_eligibility = "explicit_plan_verified"
+        elif quality_scoreable_with_pre_search_rejections(trace):
+            quality_eligibility = "scoreable_with_pre_search_rejections"
         elif (
             trace_status == "invalid"
             and host_satisfied
             and trace["invalid_reasons"] == ["TinyKG backend executed no KgRecall"]
         ):
-            status = "host_recall_satisfied"
+            quality_eligibility = "host_recall_satisfied"
+        elif trace_status == "not_applicable":
+            quality_eligibility = "not_applicable"
         else:
-            status = trace_status
-        status_counts[status] += 1
+            quality_eligibility = "ineligible"
+        quality_eligibility_counts[quality_eligibility] += 1
         rollout_rows.append(
             {
                 "run_id": trace["run_id"],
                 "arm": trace["arm"],
                 "memory_backend": trace["memory_backend"],
-                "status": status,
-                "trace_status": trace_status,
+                "protocol_status": trace_status,
+                "quality_eligibility": quality_eligibility,
                 "host_recall_satisfied": host_satisfied,
                 "kg_recall_count": trace["kg_recall_count"],
                 "invalid_reasons": trace["invalid_reasons"],
             }
         )
-        if status != "explicit_plan_verified":
+        if quality_eligibility not in {
+            "explicit_plan_verified",
+            "scoreable_with_pre_search_rejections",
+        }:
             continue
         for call in trace["calls"]:
             calls.append(call)
@@ -704,13 +804,18 @@ def summarize_query_plan_traces(
     verified_call_counts = [
         int(trace["kg_recall_count"])
         for trace in traces
-        if trace is not None and trace["status"] == "verified"
+        if trace is not None
+        and (
+            trace["status"] == "verified"
+            or quality_scoreable_with_pre_search_rejections(trace)
+        )
     ]
     denominator = new_total + repeated_total
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
         "rollouts": len(traces),
-        "status_counts": status_counts,
+        "protocol_status_counts": protocol_status_counts,
+        "quality_eligibility_counts": quality_eligibility_counts,
         "explicit_verified_calls": len(calls),
         "explicit_verified_plans": len(plans),
         "new_hit_count": new_total,
@@ -751,10 +856,26 @@ def render_query_plan_markdown(summary: Mapping[str, Any], title: str) -> str:
         f"- Unique gain ratio: {number(summary['unique_gain_ratio'])}",
         f"- Mean calls before stopping: {number(summary['mean_calls_before_stopping'])}",
         "",
-        "## Status",
+        "## Protocol status",
         "",
         "```json",
-        json.dumps(summary["status_counts"], ensure_ascii=False, indent=2, sort_keys=True),
+        json.dumps(
+            summary["protocol_status_counts"],
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ),
+        "```",
+        "",
+        "## Quality eligibility",
+        "",
+        "```json",
+        json.dumps(
+            summary["quality_eligibility_counts"],
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ),
         "```",
         "",
         "## Stage and typed-variant diagnostics",
