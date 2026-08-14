@@ -515,13 +515,15 @@ test "KG prompt enforces staged semantic neighborhood only when KG is ready" {
     try testing.expect(std.mem.indexOf(u8, with_kg, "computes no embeddings or vector distance") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "one non-exact probe chosen now or a fixed 2-4 member batch") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "host permits at most four v2 semantic-expansion calls") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "ENUMERATION REQUIRES COVERAGE") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "execute every member") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "ALIAS BRANCH HAS PRIORITY") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "EXACT/HIGH-PRECISION SEED") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "mechanism, symptom, desired outcome, or nearby implementation term") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "one plausible broader or narrower concept") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "Deduplicate candidates by node_id across every call") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "KgContext") != null);
-    try testing.expect(std.mem.indexOf(u8, with_kg, "Stop as soon as authoritative evidence and any required current-state check are sufficient") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "For non-enumeration lookups, stop as soon as authoritative evidence") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "Persistent task control-plane algorithm") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "A title or compact summary alone is insufficient") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "never leave finished work claimed/open") != null);

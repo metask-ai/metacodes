@@ -514,10 +514,15 @@ test "L2 KG governance: freshness and contradiction contract enters the actual A
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "host ledger exclusively owns seen state") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "1-4 separate compact semantic variants") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "host permits at most four v2 semantic-expansion calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "ENUMERATION REQUIRES COVERAGE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "count/cardinality, an exhaustive list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "One positive hit proves existence, never completeness") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "execute every member") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "necessary, not sufficient, for completeness") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "mechanism, symptom, desired outcome, or nearby implementation term") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Deduplicate candidates by node_id across every call") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "KgContext") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Stop as soon as authoritative evidence and any required current-state check are sufficient") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "For non-enumeration lookups, stop as soon as authoritative evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Memory is a candidate, not a current fact") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "verified_by or evidences") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "deprecated_by, resolved_by, and contradiction") != null);

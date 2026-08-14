@@ -82,8 +82,15 @@ test "L2: KgRecall and KgContext schemas carry the staged semantic-neighborhood 
 
     const props = kg_recall.input_schema.prop_specs orelse return error.TestUnexpectedResult;
     var query_description: ?[]const u8 = null;
+    var intent_description: ?[]const u8 = null;
     for (props) |prop| {
         if (std.mem.eql(u8, prop.name, "query")) query_description = prop.description;
+        if (std.mem.eql(u8, prop.name, "lexical_plan")) {
+            const plan_props = prop.object_props orelse continue;
+            for (plan_props) |plan_prop| {
+                if (std.mem.eql(u8, plan_prop.name, "intent")) intent_description = plan_prop.description;
+            }
+        }
     }
     const description = query_description orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, description, "exact/high-precision query") != null);
@@ -94,7 +101,13 @@ test "L2: KgRecall and KgContext schemas carry the staged semantic-neighborhood 
     try std.testing.expect(std.mem.indexOf(u8, description, "mechanism/symptom/outcome/nearby implementation") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "broader or narrower concept") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "never combine probes into one keyword bag") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "intent=enumeration") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "execute every member") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "Extra keywords are safe") == null);
+    const intent_desc = intent_description orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, intent_desc, "count/cardinality") != null);
+    try std.testing.expect(std.mem.indexOf(u8, intent_desc, "one positive hit is not complete coverage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kg_recall.description, "which/every") == null);
 
     var type_description: ?[]const u8 = null;
     for (props) |prop| {

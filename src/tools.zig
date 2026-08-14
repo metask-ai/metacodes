@@ -396,7 +396,7 @@ pub const registry: []const ToolEntry = &.{
                 .description = kg_retrieval.PLAN_DESCRIPTION,
                 .object_props = &.{
                     .{ .name = "schema_version", .type = "string", .enum_values = &.{"lexical-query-plan-v2"} },
-                    .{ .name = "intent", .type = "string", .enum_values = &.{ "fact_lookup", "procedure_reuse", "task_recovery", "enumeration", "temporal", "causal", "entity", "other" } },
+                    .{ .name = "intent", .type = "string", .description = "Use enumeration for count/cardinality, exhaustive-list, all/every-match, or absence questions; one positive hit is not complete coverage.", .enum_values = &.{ "fact_lookup", "procedure_reuse", "task_recovery", "enumeration", "temporal", "causal", "entity", "other" } },
                     .{ .name = "stage", .type = "string", .enum_values = &.{ "seed", "semantic_expansion", "focused_refinement" } },
                     .{
                         .name = "variants",
