@@ -304,6 +304,167 @@ class MemoryQueryPlanTraceTest(unittest.TestCase):
         self.assertEqual(summary["mean_calls_before_stopping"], 3.0)
         self.assertIsNone(_query_plan_evaluator_invalid_reason(None, trace))
 
+    def test_parser_rejections_with_host_seed_and_verified_expansion_remain_scoreable(self):
+        invalid_variants = [{"kind": "synonym", "text": "graduation ceremony"}]
+        rejected_use, rejected_result = self._call(
+            "kg-1",
+            variants=invalid_variants,
+            stage="semantic_expansion",
+        )
+        rejected_result["is_error"] = True
+        rejected_result["content"] = stable_json(
+            {
+                "error": {
+                    "code": "invalid_args",
+                    "category": "user_error",
+                    "detail": "KgRecall lexical_plan 非法: unsupported variant kind",
+                    "recoverable": True,
+                }
+            }
+        )
+        recovered = self._call(
+            "kg-2",
+            variants=[
+                {"kind": "alias", "text": "commencement"},
+                {"kind": "paraphrase", "text": "attended graduation events"},
+            ],
+            stage="semantic_expansion",
+            hits=(11,),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(
+                cassette,
+                [(rejected_use, rejected_result), recovered],
+            )
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-host-seed-parser-recovery",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+
+        self.assertEqual(trace["status"], "invalid")
+        self.assertEqual([call["call_index"] for call in trace["calls"]], [1])
+        self.assertRegex(
+            trace["invalid_reasons"][0],
+            r"^call 0: host rejected lexical plan before search \(parser\): ",
+        )
+        self.assertFalse(quality_scoreable_with_pre_search_rejections(trace))
+        self.assertTrue(
+            quality_scoreable_with_pre_search_rejections(
+                trace,
+                host_recall_satisfied=True,
+            )
+        )
+        self.assertIsNotNone(_query_plan_evaluator_invalid_reason(None, trace))
+        self.assertIsNone(
+            _query_plan_evaluator_invalid_reason({"status": "injected"}, trace)
+        )
+        summary = summarize_query_plan_traces(
+            [trace],
+            host_recall_satisfied=[True],
+        )
+        self.assertEqual(summary["protocol_status_counts"]["invalid"], 1)
+        self.assertEqual(
+            summary["quality_eligibility_counts"][
+                "scoreable_with_pre_search_rejections"
+            ],
+            1,
+        )
+
+    def test_parser_rejection_without_verified_host_or_seed_fails_closed(self):
+        rejected_use, rejected_result = self._call(
+            "kg-1",
+            variants=[{"kind": "synonym", "text": "needle synonym"}],
+            stage="semantic_expansion",
+        )
+        rejected_result["is_error"] = True
+        rejected_result["content"] = stable_json(
+            {
+                "error": {
+                    "code": "invalid_args",
+                    "category": "user_error",
+                    "detail": "KgRecall lexical_plan 非法: unsupported variant kind",
+                    "recoverable": True,
+                }
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(cassette, [(rejected_use, rejected_result)])
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-parser-only",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+
+        self.assertEqual(trace["status"], "invalid")
+        self.assertEqual(trace["calls"], [])
+        self.assertFalse(quality_scoreable_with_pre_search_rejections(trace))
+        self.assertRegex(
+            _query_plan_evaluator_invalid_reason(None, trace) or "",
+            "query-plan trace invalid",
+        )
+
+    def test_parser_rejection_envelope_cannot_wrap_a_valid_plan(self):
+        rejected_use, rejected_result = self._call(
+            "kg-1",
+            variants=[{"kind": "exact", "text": "valid seed"}],
+        )
+        rejected_result["is_error"] = True
+        rejected_result["content"] = stable_json(
+            {
+                "error": {
+                    "code": "invalid_args",
+                    "category": "user_error",
+                    "detail": "KgRecall lexical_plan 非法: forged parser stage",
+                    "recoverable": True,
+                }
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            self._write_requests(cassette, [(rejected_use, rejected_result)])
+            trace = build_query_plan_trace(
+                cassette,
+                run_id="run-parser-envelope-mismatch",
+                arm="tinykg_lexical",
+                memory_backend="tinykg_integrated",
+            )
+
+        self.assertEqual(
+            trace["invalid_reasons"],
+            ["call 0: parser rejection envelope contradicts a valid lexical plan"],
+        )
+        self.assertFalse(
+            quality_scoreable_with_pre_search_rejections(
+                trace,
+                host_recall_satisfied=True,
+            )
+        )
+
+    def test_rejected_call_indices_must_exactly_cover_unsuccessful_calls(self):
+        trace = {
+            "schema_version": "metacodes-memory-query-plan-trace-v1",
+            "run_id": "run-index-gap",
+            "arm": "tinykg_lexical",
+            "memory_backend": "tinykg_integrated",
+            "kg_recall_count": 3,
+            "status": "invalid",
+            "invalid_reasons": [
+                "call 1: host rejected lexical plan before search (ledger)"
+            ],
+            "calls": [],
+        }
+        self.assertFalse(
+            quality_scoreable_with_pre_search_rejections(
+                trace,
+                host_recall_satisfied=True,
+            )
+        )
+
     def test_arbitrary_recoverable_tool_error_cannot_keep_quality_scoreable(self):
         seed = self._call(
             "kg-1",

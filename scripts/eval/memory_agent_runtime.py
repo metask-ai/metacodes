@@ -347,7 +347,14 @@ def _query_plan_evaluator_invalid_reason(
         return None
     if _host_recall_covers_missing_explicit_recall(scoped_recall, query_plan_trace):
         return None
-    if quality_scoreable_with_pre_search_rejections(query_plan_trace):
+    host_recall_satisfied = bool(
+        scoped_recall is not None
+        and scoped_recall.get("status") in {"injected", "no_hits"}
+    )
+    if quality_scoreable_with_pre_search_rejections(
+        query_plan_trace,
+        host_recall_satisfied=host_recall_satisfied,
+    ):
         return None
     return QUERY_PLAN_INVALID_PREFIX + "; ".join(
         str(reason) for reason in query_plan_trace["invalid_reasons"]

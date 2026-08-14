@@ -491,12 +491,11 @@ def _load_failed_candidate(
     }
 
 
-def _host_recall_satisfied(rollout: Mapping[str, Any], trace: Mapping[str, Any]) -> bool:
+def _host_recall_observed(rollout: Mapping[str, Any]) -> bool:
     scoped = rollout.get("scoped_recall")
     return bool(
         isinstance(scoped, dict)
         and scoped.get("status") in {"injected", "no_hits"}
-        and trace.get("invalid_reasons") == ["TinyKG backend executed no KgRecall"]
     )
 
 
@@ -511,12 +510,19 @@ def repair_observations(
     changes: List[Mapping[str, Any]] = []
     host_satisfied: List[bool] = []
     for sequence, (row, rollout, trace) in enumerate(zip(repaired, rollouts, traces)):
-        host_ok = _host_recall_satisfied(rollout, trace)
-        host_satisfied.append(host_ok)
+        host_observed = _host_recall_observed(rollout)
+        host_satisfied.append(host_observed)
+        host_covers_gap = bool(
+            host_observed
+            and trace.get("invalid_reasons") == ["TinyKG backend executed no KgRecall"]
+        )
         if (
             trace["status"] != "invalid"
-            or host_ok
-            or quality_scoreable_with_pre_search_rejections(trace)
+            or host_covers_gap
+            or quality_scoreable_with_pre_search_rejections(
+                trace,
+                host_recall_satisfied=host_observed,
+            )
         ):
             continue
         evaluator = row.get("evaluator")

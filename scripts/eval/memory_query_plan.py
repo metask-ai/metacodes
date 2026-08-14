@@ -26,7 +26,8 @@ SIDECAR_NAME = "query-plan.json"
 QUERY_PLAN_INVALID_PREFIX = "query-plan trace invalid: "
 MULTIPLE_DISTINCT_SEED_PLANS_REASON = "multiple distinct seed plans in one run"
 PRE_SEARCH_REJECTION_REASON = re.compile(
-    r"^call (?P<call_index>[0-9]+): host rejected lexical plan before search$"
+    r"^call (?P<call_index>[0-9]+): host rejected lexical plan before search "
+    r"\((?:parser|ledger)\)(?:: .+)?$"
 )
 MAX_OBSERVATION_QUERY_VARIANTS = 5
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -323,8 +324,8 @@ def _parse_receipt(raw_result: str, parsed_plan: Mapping[str, Any], where: str) 
     }
 
 
-def _is_pre_search_ledger_rejection(raw_result: str) -> bool:
-    """Recognize only the native fail-closed ledger error envelope.
+def _pre_search_rejection_stage(raw_result: str) -> str | None:
+    """Recognize only native fail-closed errors emitted before TinyKG search.
 
     The matching Zig path rejects before it invokes TinyKG.  Do not broaden
     this to arbitrary ``invalid_args`` or recoverable tool failures: those can
@@ -335,7 +336,7 @@ def _is_pre_search_ledger_rejection(raw_result: str) -> bool:
     try:
         result = json.loads(raw_result)
     except json.JSONDecodeError:
-        return False
+        return None
     error = result.get("error") if isinstance(result, dict) else None
     if not isinstance(error, dict) or set(error) != {
         "code",
@@ -343,15 +344,20 @@ def _is_pre_search_ledger_rejection(raw_result: str) -> bool:
         "detail",
         "recoverable",
     }:
-        return False
+        return None
     detail = error.get("detail")
-    return bool(
+    if not (
         error.get("code") == "invalid_args"
         and error.get("category") == "user_error"
         and error.get("recoverable") is True
         and isinstance(detail, str)
-        and detail.startswith("KgRecall lexical_plan host ledger rejected the call: ")
-    )
+    ):
+        return None
+    if detail.startswith("KgRecall lexical_plan 非法: "):
+        return "parser"
+    if detail.startswith("KgRecall lexical_plan host ledger rejected the call: "):
+        return "ledger"
+    return None
 
 
 def _cassette_tools(root: Path, where: str) -> Sequence[Tuple[str, str, Mapping[str, Any], str, bool]]:
@@ -454,15 +460,22 @@ def build_query_plan_trace(
         # caller diagnostics and model-controlled ids so later replay is
         # byte-stable and bounded.
         call_where = f"KgRecall[{call_index}]"
+        rejection_stage = _pre_search_rejection_stage(raw_result) if is_error else None
         try:
             parsed_plan = _parse_plan(tool_input, call_where)
             plan_sha = str(parsed_plan["plan_sha256"])
             if parsed_plan["stage"] == "seed":
                 declared_seed_plans.add(plan_sha)
             if is_error:
-                if _is_pre_search_ledger_rejection(raw_result):
+                if rejection_stage == "ledger":
                     reasons.append(
-                        f"call {call_index}: host rejected lexical plan before search"
+                        f"call {call_index}: host rejected lexical plan before search "
+                        f"({rejection_stage})"
+                    )
+                elif rejection_stage == "parser":
+                    reasons.append(
+                        f"call {call_index}: parser rejection envelope contradicts "
+                        "a valid lexical plan"
                     )
                 else:
                     reasons.append(
@@ -494,7 +507,13 @@ def build_query_plan_trace(
                 }
             )
         except ValidationError as exc:
-            reasons.append(f"call {call_index}: {exc}")
+            if rejection_stage == "parser":
+                reasons.append(
+                    f"call {call_index}: host rejected lexical plan before search "
+                    f"(parser): {exc}"
+                )
+            else:
+                reasons.append(f"call {call_index}: {exc}")
     if len(declared_seed_plans) > 1:
         reasons.append(MULTIPLE_DISTINCT_SEED_PLANS_REASON)
     if not recall_tools:
@@ -548,27 +567,35 @@ def project_query_variants(
     return projected
 
 
-def quality_scoreable_with_pre_search_rejections(trace: Mapping[str, Any]) -> bool:
+def quality_scoreable_with_pre_search_rejections(
+    trace: Mapping[str, Any],
+    *,
+    host_recall_satisfied: bool = False,
+) -> bool:
     """Keep task quality separate from recoverable tool-protocol mistakes.
 
-    A model-issued KgRecall can be rejected without exposing any memory and a
+    A model-issued KgRecall can be rejected without exposing any memory and
     the run can still retain a host-receipted retrieval path.  That rejected
     attempt is real trajectory evidence: the trace remains ``invalid`` and the
     native tool-error/time/token counters retain its cost.  It is not,
     however, an infrastructure failure that should erase an otherwise
     scoreable answer.
 
-    This exception is intentionally narrow.  At least one successful seed and
-    one individually host-verified call must remain, and every trace-level
-    reason must describe a rejected attempt.  Receipt drift, forged gain
-    counts, successful-call ledger mismatches, multiple seed plans, and a run
-    with no successful recall continue to fail closed.
+    This exception is intentionally narrow.  Either a successful explicit seed
+    or an independently verified host-scoped recall must remain, and every
+    trace-level reason must describe a rejected attempt.  Receipt drift, forged
+    gain counts, successful-call ledger mismatches, multiple seed plans, and a
+    run with no verified host or explicit recall continue to fail closed.
     """
 
     validate_query_plan_trace(trace)
+    if not isinstance(host_recall_satisfied, bool):
+        _fail("query-plan quality eligibility", "host recall status must be boolean")
     if trace["memory_backend"] not in TINYKG_BACKENDS:
         return False
-    if trace["status"] != "invalid" or not trace["calls"]:
+    if trace["status"] != "invalid" or (
+        not trace["calls"] and not host_recall_satisfied
+    ):
         return False
     rejection_indices: List[int] = []
     for reason in trace["invalid_reasons"]:
@@ -582,7 +609,9 @@ def quality_scoreable_with_pre_search_rejections(trace: Mapping[str, Any]) -> bo
     expected_rejections = set(range(int(trace["kg_recall_count"]))) - successful_indices
     if set(rejection_indices) != expected_rejections:
         return False
-    return any(call["stage"] == "seed" for call in trace["calls"])
+    return host_recall_satisfied or any(
+        call["stage"] == "seed" for call in trace["calls"]
+    )
 
 
 def validate_query_plan_trace(trace: Mapping[str, Any], where: str = "query-plan sidecar") -> None:
@@ -749,7 +778,10 @@ def summarize_query_plan_traces(
         protocol_status_counts[trace_status] += 1
         if trace_status == "verified":
             quality_eligibility = "explicit_plan_verified"
-        elif quality_scoreable_with_pre_search_rejections(trace):
+        elif quality_scoreable_with_pre_search_rejections(
+            trace,
+            host_recall_satisfied=host_satisfied,
+        ):
             quality_eligibility = "scoreable_with_pre_search_rejections"
         elif (
             trace_status == "invalid"
@@ -801,15 +833,15 @@ def summarize_query_plan_traces(
             }
         return result
 
-    verified_call_counts = [
-        int(trace["kg_recall_count"])
-        for trace in traces
-        if trace is not None
-        and (
-            trace["status"] == "verified"
-            or quality_scoreable_with_pre_search_rejections(trace)
-        )
-    ]
+    verified_call_counts = []
+    for trace, host_satisfied in zip(traces, host_recall_satisfied):
+        if trace is None:
+            continue
+        if trace["status"] == "verified" or quality_scoreable_with_pre_search_rejections(
+            trace,
+            host_recall_satisfied=host_satisfied,
+        ):
+            verified_call_counts.append(int(trace["kg_recall_count"]))
     denominator = new_total + repeated_total
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
