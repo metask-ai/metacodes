@@ -1718,6 +1718,10 @@ test "tool observation: actual Write dispatch emits UI-independent typed effect 
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(!done.is_error);
         },
         else => return error.UnexpectedToolResult,

@@ -19,6 +19,7 @@ const tools_mod = @import("../tools.zig");
 const ToolContext = tools_mod.ToolContext;
 const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
+const file_reference = @import("file_reference.zig");
 
 /// 可流式执行的工具:除 **WebSearch** 外的一切。WebSearch 在其隔离子请求里发子 LLM 请求,
 /// 是重量级付费调用——主 stream 后续还可能取消/改写本轮工具,投机预取的浪费远高于 Read/Grep
@@ -39,6 +40,7 @@ const Entry = struct {
     id: []const u8, // borrowed(指向 tool_uses 里的 id;预取 take 前有效)
     thread: ?std.Thread = null,
     content: ?[]u8 = null, // owned by parent allocator(dispatch 结果 dupe 出 arena)
+    file_refs: ?[]file_reference.FileReference = null, // owned by parent allocator
     is_error: bool = false,
     elapsed_ms: u64 = 0,
     taken: bool = false, // 已被 executeSlots 取走(所有权转移)
@@ -72,6 +74,7 @@ fn runJob(job: *Job) void {
         },
         .done => |d| {
             job.entry.content = d.content;
+            job.entry.file_refs = d.file_refs;
             job.entry.is_error = d.is_error;
             job.entry.elapsed_ms = d.elapsed_ms;
         },
@@ -128,9 +131,14 @@ pub const Prefetch = struct {
         };
     }
 
-    /// 取某 id 的预取结果(join 线程)。有则返回 owned content(转移所有权,调用方 free);
+    /// 取某 id 的预取结果(join 线程)。有则返回 owned content/file_refs(转移所有权,调用方 free);
     /// 无该 id / 已取走 → null(调用方正常执行)。
-    pub fn take(self: *Prefetch, id: []const u8) ?struct { content: ?[]u8, is_error: bool, elapsed_ms: u64 } {
+    pub fn take(self: *Prefetch, id: []const u8) ?struct {
+        content: ?[]u8,
+        file_refs: ?[]file_reference.FileReference,
+        is_error: bool,
+        elapsed_ms: u64,
+    } {
         for (self.entries.items) |e| {
             if (e.taken) continue;
             if (!std.mem.eql(u8, e.id, id)) continue;
@@ -146,7 +154,9 @@ pub const Prefetch = struct {
             e.taken = true;
             const content = e.content;
             e.content = null; // 所有权转移给调用方
-            return .{ .content = content, .is_error = e.is_error, .elapsed_ms = e.elapsed_ms };
+            const refs = e.file_refs;
+            e.file_refs = null;
+            return .{ .content = content, .file_refs = refs, .is_error = e.is_error, .elapsed_ms = e.elapsed_ms };
         }
         return null;
     }
@@ -163,6 +173,11 @@ pub const Prefetch = struct {
             if (!e.taken) {
                 if (e.content) |c| self.allocator.free(c);
                 e.content = null;
+                if (e.file_refs) |refs| {
+                    for (refs) |*ref| ref.deinit(self.allocator);
+                    self.allocator.free(refs);
+                }
+                e.file_refs = null;
             }
         }
     }

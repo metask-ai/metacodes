@@ -1397,6 +1397,7 @@ pub fn run(
             if (s.decision != .run) continue;
             if (prefetch.take(s.id)) |pf| {
                 s.content = pf.content;
+                s.file_refs = pf.file_refs;
                 s.is_error = pf.is_error;
                 s.elapsed_ms = pf.elapsed_ms;
                 s.prefetched = true;
