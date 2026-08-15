@@ -271,7 +271,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
             "  apply) printf 'apply version=1 nodes_created=1 nodes_existing=0 "
             "edges_created=0 edges_existing=0\\n' ;;\n"
             "  rebuild-text) : ;;\n"
-            "  store-info) printf 'nodes=1\\nedges=0\\nstorage_format_version=2\\n"
+            "  store-info) printf 'nodes=1\\nedges=0\\nstorage_format_version=3\\n"
             "schema_version=3\\ntext_current=1\\ntext_stale=0\\n' ;;\n"
             "  *) exit 91 ;;\n"
             "esac\n",
@@ -799,7 +799,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
             with mock.patch.object(
                 memory_pilot,
                 "_probe_tinykg_compatibility",
-                return_value={"commands": [], "storage_format_version": 2, "schema_version": 3},
+                return_value={"commands": [], "storage_format_version": 3, "schema_version": 3},
             ), mock.patch.object(memory_pilot, "_load_api_key") as load_key:
                 with self.assertRaisesRegex(ValidationError, "field set drift"):
                     memory_pilot.main(arguments)

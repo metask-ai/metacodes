@@ -42,7 +42,34 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         path_z.ptr,
         null,
     };
-    const raw = try common.spawnCaptureStdoutAbortable(argv[0..argv.len], allocator, ctx.abort);
+    // rg 退出语义:0=有结果,1=无匹配(合法空),>=2/信号死=真实故障。旧版只收
+    // stdout 忽略退出码,rg 在沙箱内 dyld 加载失败会被静默当成"零文件"——
+    // 假空结果比报错危险(模型会当成"目录为空"下结论)。fail loud。
+    const spawned = try common.spawnCaptureWithStderrTimed(
+        argv[0..argv.len],
+        allocator,
+        ctx.abort,
+        0,
+        ctx.spawn_tick_fn,
+        common.MAX_SPAWN_CAPTURE_BYTES,
+        null,
+    );
+    defer allocator.free(spawned.stderr);
+    // 有输出的 exit 2 = 部分目录不可读的 best-effort 结果,照常返回。
+    // 空输出时只把"工具没跑起来"当故障:信号死(负值,如沙箱内 dyld 加载失败)、
+    // exit>2、或 exit 2 且带 stderr(用法/启动错误)。exit 2 + 空 stderr 是
+    // --no-messages 吞掉的权限噪音,维持旧的空结果语义。
+    const startup_failure = spawned.exit_code < 0 or spawned.exit_code > 2 or
+        (spawned.exit_code == 2 and spawned.stderr.len > 0);
+    if (spawned.stdout.len == 0 and startup_failure) {
+        allocator.free(spawned.stdout);
+        common.setErrorDetail(ctx.error_detail, allocator, "ripgrep failed (exit {d}): {s}", .{
+            spawned.exit_code,
+            spawned.stderr[0..@min(spawned.stderr.len, 300)],
+        });
+        return error.GlobExecFailed;
+    }
+    const raw = spawned.stdout;
     defer allocator.free(raw);
 
     var files = std.ArrayList([]const u8).empty;
