@@ -559,7 +559,7 @@ def _run_one(
             factorial_local.command("store-info", factorial_store, ())
         )
         if (
-            factorial_store_info.get("storage_format_version") != "2"
+            factorial_store_info.get("storage_format_version") != "3"
             or factorial_store_info.get("schema_version") != "3"
             or factorial_store_info.get("text_current") != "1"
             or factorial_store_info.get("text_stale") != "0"

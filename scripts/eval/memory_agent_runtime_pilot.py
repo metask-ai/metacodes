@@ -190,7 +190,7 @@ def _probe_tinykg_compatibility(binary: Path, expected_sha256: str) -> Mapping[s
         required = {
             "nodes": "1",
             "edges": "0",
-            "storage_format_version": "2",
+            "storage_format_version": "3",
             "schema_version": "3",
             "text_current": "1",
             "text_stale": "0",

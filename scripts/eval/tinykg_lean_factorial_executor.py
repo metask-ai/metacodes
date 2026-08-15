@@ -781,10 +781,10 @@ def _probe_block_tinykg_contract(
         "storage_format_version": str(info.get("storage_format_version", "")),
         "schema_version": str(info.get("schema_version", "")),
     }
-    if observed != {"storage_format_version": "2", "schema_version": "3"}:
+    if observed != {"storage_format_version": "3", "schema_version": "3"}:
         _fail(
             "factorial block TinyKG contract",
-            "requires metacodes vendored storage-format-v2/schema-v3",
+            "requires metacodes vendored storage-format-v3/schema-v3",
         )
     return observed
 
