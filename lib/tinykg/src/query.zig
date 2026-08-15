@@ -4,6 +4,7 @@ const graph_mod = @import("graph.zig");
 const index = @import("index.zig");
 const segment_mod = @import("segment.zig");
 const storage = @import("storage.zig");
+const checkpoint_view_mod = @import("query/checkpoint_view.zig");
 const metaknow_deferred_based_on_mod = @import("query/metaknow_deferred_based_on.zig");
 const metaknow_deferred_based_on = metaknow_deferred_based_on_mod.MetaknowDeferredBasedOn(core, index, storage);
 const neighbor_traversal_mod = @import("query/neighbor_traversal.zig");
@@ -26,10 +27,14 @@ pub const NeighborResult = neighbor_traversal.NeighborResult;
 pub const neighborsWithCursor = neighbor_traversal.neighborsWithCursor;
 pub const PathResult = path_traversal.PathResult;
 pub const pathWithCursor = path_traversal.pathWithCursor;
+pub const CheckpointProperty = checkpoint_view_mod.CheckpointProperty;
+pub const CheckpointEdgeOrder = checkpoint_view_mod.CheckpointEdgeOrder;
+pub const CheckpointView = checkpoint_view_mod.CheckpointView;
 
 pub const EdgeCursor = union(enum) {
     memory: struct {
         mem_index: *index.MemoryIndex,
+        checkpoint_view: ?CheckpointView = null,
     },
     store: struct {
         allocator: std.mem.Allocator,

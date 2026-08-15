@@ -1,4 +1,5 @@
 const std = @import("std");
+const version = @import("../version.zig");
 const store_data_plane_mod = @import("store_data_plane.zig");
 const data_plane_support_mod = @import("data_plane_support.zig");
 const edge_segment_id_index_mod = @import("edge_segment_id_index.zig");
@@ -48,13 +49,16 @@ const edge_segment_manifest_format = @import("edge_segment_manifest_format.zig")
 const node_text_format = @import("node_text_format.zig").NodeTextFormat(core, schema.max_node_types);
 const node_text_run_manifest_format = @import("node_text_run_manifest_format.zig").NodeTextRunManifestFormat(node_text_format.NodeTextIndexHeader);
 const property_format = @import("property_format.zig");
+const property_block_codec = @import("property_block_codec.zig");
 const property_payload_transaction_mod = @import("property_payload_transaction.zig");
 const repair_session_mod = @import("repair_session.zig");
 const retention = @import("retention.zig");
 const store_bootstrap_mod = @import("store_bootstrap.zig");
 const store_cache_resources_mod = @import("store_cache_resources.zig");
 const store_opening_mod = @import("store_opening.zig");
+const store_manifest_admission_mod = @import("store_manifest_admission.zig");
 const store_paths_mod = @import("store_paths.zig");
+const store_size_metadata = @import("store_size_metadata.zig");
 
 pub const EdgeIndexOrder = edge_index_format.EdgeIndexOrder;
 pub const EdgeIndexHeader = edge_index_format.EdgeIndexHeader;
@@ -102,6 +106,7 @@ pub const SegmentKind = storage_public_data_contracts.SegmentKind;
 pub const SegmentHeader = storage_public_data_contracts.SegmentHeader;
 pub const Manifest = storage_public_data_contracts.Manifest;
 pub const StoreStats = storage_public_data_contracts.StoreStats;
+pub const StoreSizeSnapshot = store_size_metadata.Snapshot;
 pub const StoredNode = storage_public_data_contracts.StoredNode;
 pub const StoredEdgeRef = storage_public_data_contracts.StoredEdgeRef;
 pub const NodeRewriteResult = storage_public_data_contracts.NodeRewriteResult;
@@ -486,6 +491,8 @@ pub const Store = struct {
     pub const open = store_data_plane.open;
 
     pub const openWithOptions = store_data_plane.openWithOptions;
+    pub const process_default_crash_recovery = &store_data_plane.process_default_crash_recovery;
+    pub const process_default_reader_posture = &store_data_plane.process_default_reader_posture;
 
     const allocateOwned = store_data_plane.allocateOwned;
 
@@ -496,6 +503,7 @@ pub const Store = struct {
     pub const resetEmptyForTests = store_data_plane.resetEmptyForTests;
 
     pub const appendNode = store_data_plane.appendNode;
+    pub const syncDurableAppendSurfaces = store_data_plane.syncDurableAppendSurfaces;
 
     pub const appendNodesBatch = store_data_plane.appendNodesBatch;
 
@@ -634,10 +642,29 @@ pub const Store = struct {
 
     pub const stats = store_data_plane.stats;
 
+    /// Read the fixed-size last-measured footprint. Missing metadata means an
+    /// older or not-yet-refreshed Store; corruption fails closed.
+    pub fn readSizeSnapshot(self: Store) !?StoreSizeSnapshot {
+        return store_size_metadata.read(self.allocator, self.io, self.dir_path);
+    }
+
+    /// Perform the explicit O(number of files) footprint audit and atomically
+    /// publish it together with a canonical current-content audit for
+    /// subsequent O(1) reads.
+    pub fn refreshSizeSnapshot(self: Store) !StoreSizeSnapshot {
+        return store_size_metadata.refreshStore(
+            EdgeIndexRecord,
+            self,
+            self.options.durability == .safe,
+        );
+    }
+
     /// Count canonical node records without materializing ids, edges, or
     /// node text. Returning `max_nodes + 1` is a deliberate saturation signal
     /// so admission paths can reject a large log immediately.
     pub const nodeEventCountUpTo = store_data_plane.nodeEventCountUpTo;
+    pub const AppendedNodeTail = storage_data_plane_support.AppendedNodeTail;
+    pub const collectNodeTailAppendedSince = storage_data_plane_support.collectNodeTailAppendedSince;
 
     const fileExists = store_data_plane.fileExists;
 
@@ -809,6 +836,8 @@ pub const Store = struct {
     const readNodePropertyValueRecordAt = store_data_plane.readNodePropertyValueRecordAt;
 
     const readPropertyPayloadIndexHeaderFromFile = store_data_plane.readPropertyPayloadIndexHeaderFromFile;
+    const readPropertyPayloadValueHeaderFromView = store_data_plane.readPropertyPayloadValueHeaderFromView;
+    const readPropertyPayloadValueRecordAtView = store_data_plane.readPropertyPayloadValueRecordAtView;
 
     const readPropertyPayloadIndexRecordAt = store_data_plane.readPropertyPayloadIndexRecordAt;
 
@@ -890,6 +919,10 @@ pub const Store = struct {
     /// would discard concurrent deltas and violate the Store writer contract.
     /// The two-file base is still committed through the normal redo journal.
     pub const replaceEmptyPropertyPayloadFromSortedStream = store_data_plane.replaceEmptyPropertyPayloadFromSortedStream;
+
+    /// Restartable-stream variant that stages and encodes one file at a time,
+    /// halving peak transient disk use on large property loads.
+    pub const replaceEmptyPropertyPayloadFromRestartableSortedStream = store_data_plane.replaceEmptyPropertyPayloadFromRestartableSortedStream;
 
     /// Replace or insert several property values with one crash-safe delta
     /// publication.  The immutable base pair is only probed by key and is not
@@ -1036,7 +1069,9 @@ pub const Store = struct {
 
     const ensureNodeTextBaseHashFilter = store_data_plane.ensureNodeTextBaseHashFilter;
 
-    const ensureCurrentNodeTextBaseHashFilter = store_data_plane.ensureCurrentNodeTextBaseHashFilter;
+    // Daemon startup warmup publishes the filter before the first write so
+    // no client-visible write pays its O(store) rebuild.
+    pub const ensureCurrentNodeTextBaseHashFilter = store_data_plane.ensureCurrentNodeTextBaseHashFilter;
 
     const readNodeTextRunManifestFile = store_data_plane.readNodeTextRunManifestFile;
 
@@ -1370,6 +1405,54 @@ pub const Store = struct {
     const syncParentDirForPath = store_data_plane.syncParentDirForPath;
 };
 
+const StoreOpeningControl = struct {
+    pub const module = store_opening_mod;
+
+    pub fn admitStoreFormat(store: Store) !bool {
+        const AdmissionOps = struct {
+            pub const StoreType = Store;
+            pub const maximumManifestBytes: usize = 64 * 1024;
+            pub const currentStoreManifestVersion: u64 = 1;
+            pub const currentStorageFormatVersion: u64 = version.storage_format_version;
+            pub const currentSchemaVersion: u64 = version.schema_version;
+
+            pub fn allocator(value: Store) std.mem.Allocator {
+                return value.allocator;
+            }
+
+            pub fn io(value: Store) std.Io {
+                return value.io;
+            }
+
+            pub fn storeDirPath(value: Store) []const u8 {
+                return value.dir_path;
+            }
+        };
+        const admission = store_manifest_admission_mod.StoreManifestAdmission(AdmissionOps);
+        const admitted = try admission.admit(store);
+        if (admitted == .current or admitted == .legacy) return false;
+        if (!store.options.allow_legacy_store_format_read) return error.UnsupportedStorageFormatVersion;
+        try ensureNoPendingRecoveryForLegacyRead(store);
+        return true;
+    }
+
+    fn ensureNoPendingRecoveryForLegacyRead(store: Store) !void {
+        var node_text_journal_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const node_text_journal_path = try store.nodeTextsAppendJournalPath(&node_text_journal_buffer);
+        if (try store.pathExists(node_text_journal_path)) return error.LegacyStoreRecoveryRequired;
+        const node_text_journal_tmp_path = try store.tmpPathFor(node_text_journal_path);
+        defer store.allocator.free(node_text_journal_tmp_path);
+        if (try store.pathExists(node_text_journal_tmp_path)) return error.LegacyStoreRecoveryRequired;
+
+        const property_base_redo_path = try storage_data_plane_support.property_payload_transaction.Testing.baseRedoPath(store);
+        defer store.allocator.free(property_base_redo_path);
+        if (try store.pathExists(property_base_redo_path)) return error.LegacyStoreRecoveryRequired;
+        const property_delta_redo_path = try storage_data_plane_support.property_payload_transaction.Testing.deltaRedoPath(store);
+        defer store.allocator.free(property_delta_redo_path);
+        if (try store.pathExists(property_delta_redo_path)) return error.LegacyStoreRecoveryRequired;
+    }
+};
+
 const StorageDataPlaneSupportOps = struct {
     pub const dep_std = std;
     pub const dep_builtin = builtin;
@@ -1409,7 +1492,7 @@ const StorageDataPlaneSupportOps = struct {
     pub const dep_repair_session_mod = repair_session_mod;
     pub const dep_store_bootstrap_mod = store_bootstrap_mod;
     pub const dep_store_cache_resources_mod = store_cache_resources_mod;
-    pub const dep_store_opening_mod = store_opening_mod;
+    pub const dep_store_opening_control = StoreOpeningControl;
     pub const dep_EdgeIndexOrder = EdgeIndexOrder;
     pub const dep_EdgeIndexHeader = EdgeIndexHeader;
     pub const dep_EdgeIndexRecord = EdgeIndexRecord;
@@ -5777,6 +5860,44 @@ test "property payload delta compaction is idempotent and crash-window replay sa
     try std.testing.expectEqual(@as(?u64, 99), try store.getUintProperty(std.testing.allocator, .{ .node = task_id }, "claim_expires_ns"));
 }
 
+test "property payload pair rejects mismatched derived hash flags" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    const task_id = try store.addNode(.task, "pair admission target");
+    try store.appendPropertiesBatch(std.testing.allocator, &.{.{
+        .owner = .{ .node = task_id },
+        .key = "status",
+        .value = .{ .string = "open" },
+    }});
+
+    var index_file = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_index_path, .{ .mode = .read_write });
+    defer index_file.close(std.testing.io);
+    var container_bytes: [property_block_codec.header_len]u8 = undefined;
+    try std.testing.expectEqual(container_bytes.len, try index_file.readPositionalAll(std.testing.io, &container_bytes, 0));
+    var container = try property_block_codec.Header.decode(&container_bytes);
+    try std.testing.expectEqual(
+        storage_data_plane_support.PropertyPayloadIndexHeader.flag_string_value_hash_derived,
+        std.mem.readInt(u64, container.logical_prefix[32..40], .little),
+    );
+    std.mem.writeInt(u64, container.logical_prefix[32..40], 0, .little);
+    try container.encode(&container_bytes);
+    try index_file.writePositionalAll(std.testing.io, &container_bytes, 0);
+
+    try std.testing.expectError(
+        error.InvalidRecord,
+        store.getNodeStringProperty(std.testing.allocator, task_id, "status"),
+    );
+}
+
 test "property payload compaction cleanup failure remains retryable state" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5871,6 +5992,102 @@ test "property payload delta redo recovers absent committed and partial appends"
     const journal_path = try storage_data_plane_support.property_payload_transaction.Testing.deltaRedoPath(store);
     defer std.testing.allocator.free(journal_path);
     try std.testing.expect(!try store.pathExists(journal_path));
+}
+
+fn writeStoreFormatManifestForTest(store_path: []const u8, storage_version: u32) !void {
+    const metadata_path = try std.fs.path.join(std.testing.allocator, &.{ store_path, ".tinykg" });
+    defer std.testing.allocator.free(metadata_path);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, metadata_path);
+    const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ metadata_path, "store-manifest.json" });
+    defer std.testing.allocator.free(manifest_path);
+    const manifest = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"store_manifest_version\":1,\"storage_format_version\":{},\"schema\":{{\"schema_version\":3}}}}",
+        .{storage_version},
+    );
+    defer std.testing.allocator.free(manifest);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = manifest_path,
+        .data = manifest,
+        .flags = .{ .truncate = true },
+    });
+}
+
+test "store format v2 is migration-only and pending property recovery fails closed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    try store.createEmpty();
+    const task_id = try store.addNode(.task, "legacy read only");
+    try store.setNodeStringProperty(std.testing.allocator, task_id, "status", "open");
+    try writeStoreFormatManifestForTest(store_path, 2);
+    store.deinit();
+
+    try std.testing.expectError(
+        error.UnsupportedStorageFormatVersion,
+        Store.open(std.testing.allocator, std.testing.io, store_path),
+    );
+    var legacy = try Store.openWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .allow_legacy_store_format_read = true,
+    });
+    const status = (try legacy.getNodeStringProperty(std.testing.allocator, task_id, "status")).?;
+    defer std.testing.allocator.free(status);
+    try std.testing.expectEqualStrings("open", status);
+
+    const redo_path = try storage_data_plane_support.property_payload_transaction.Testing.deltaRedoPath(legacy);
+    defer std.testing.allocator.free(redo_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = redo_path,
+        .data = "pending",
+        .flags = .{ .truncate = true },
+    });
+    legacy.deinit();
+
+    try std.testing.expectError(
+        error.LegacyStoreRecoveryRequired,
+        Store.openWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+            .allow_legacy_store_format_read = true,
+        }),
+    );
+    try std.testing.expectEqual(.file, (try std.Io.Dir.cwd().statFile(std.testing.io, redo_path, .{})).kind);
+}
+
+test "current v3 opened by upgrade detection still performs property recovery" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    try store.createEmpty();
+    const task_id = try store.addNode(.task, "current recovery");
+    const frame = try storage_data_plane_support.property_payload_transaction.Testing.encodeDelta(std.testing.allocator, 1, &.{.{
+        .owner = .{ .node = task_id },
+        .key = "status",
+        .value = .{ .string = "claimed" },
+    }});
+    defer std.testing.allocator.free(frame);
+    try storage_data_plane_support.property_payload_transaction.Testing.writeDeltaRedo(store, frame);
+    const redo_path = try storage_data_plane_support.property_payload_transaction.Testing.deltaRedoPath(store);
+    defer std.testing.allocator.free(redo_path);
+    try writeStoreFormatManifestForTest(store_path, version.storage_format_version);
+    store.deinit();
+
+    var reopened = try Store.openWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .allow_legacy_store_format_read = true,
+    });
+    defer reopened.deinit();
+    const status = (try reopened.getNodeStringProperty(std.testing.allocator, task_id, "status")).?;
+    defer std.testing.allocator.free(status);
+    try std.testing.expectEqualStrings("claimed", status);
+    try std.testing.expect(!try reopened.pathExists(redo_path));
 }
 
 test "property payload delta corruption without matching redo fails closed on first property use" {
@@ -6177,14 +6394,18 @@ test "compacted searchable metadata digest streams immutable values with fixed m
     const name_index = try store.propertyPayloadKeyHashLowerBound(index_file, index_header.record_count, storage_data_plane_support.nodePropertyKeyHash("name"));
     index_file.close(std.testing.io);
     var values_file = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_values_path, .{ .mode = .read_write });
-    const values_header = try store.readNodePropertyValueBlockHeaderFromFile(values_file);
-    const value_record = try store.readNodePropertyValueRecordAt(values_file, name_index);
+    var values_view = try property_block_codec.View.init(std.testing.allocator, std.testing.io, values_file);
+    const values_header = try store.readPropertyPayloadValueHeaderFromView(&values_view);
+    const value_record = try store.readPropertyPayloadValueRecordAtView(&values_view, name_index);
     const payload_start = try storage_data_plane_support.nodePropertyValueBlockHeaderAndRecordBytes(values_header.record_count);
     const value_offset = try std.math.add(u64, payload_start, value_record.offset);
+    const block_index: usize = @intCast(value_offset / property_block_codec.block_bytes);
+    const physical_offset = values_view.entries[block_index].physical_offset;
+    values_view.deinit();
     var corrupt_byte: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try values_file.readPositionalAll(std.testing.io, &corrupt_byte, value_offset));
+    try std.testing.expectEqual(@as(usize, 1), try values_file.readPositionalAll(std.testing.io, &corrupt_byte, physical_offset));
     corrupt_byte[0] ^= 0xff;
-    try values_file.writePositionalAll(std.testing.io, &corrupt_byte, value_offset);
+    try values_file.writePositionalAll(std.testing.io, &corrupt_byte, physical_offset);
     values_file.close(std.testing.io);
     try std.testing.expectError(error.InvalidRecord, store.searchableNodeMetadataDigest(std.testing.allocator));
 }
@@ -6414,6 +6635,60 @@ test "property point lookups do not materialize unrelated base blobs" {
     var recorded_hits = try store.lookupNodeIdsByUintProperty(uint_fixed.allocator(), "task_recorded_ns", 42, .task, 10);
     defer recorded_hits.deinit(uint_fixed.allocator());
     try std.testing.expectEqualSlices(core.NodeId, &.{task_id}, recorded_hits.items);
+}
+
+test "property point lookup ignores an unselected corrupt block while full scan fails closed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    const node_id = try store.addNode(.task, "block-local property lookup");
+
+    const keys = [_][]const u8{ "block_key_a", "block_key_b", "block_key_c", "block_key_d" };
+    var ordered_keys = keys;
+    std.mem.sort([]const u8, &ordered_keys, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return propertyKeyHashForLookup(left) < propertyKeyHashForLookup(right);
+        }
+    }.lessThan);
+    const value_len = 48 * 1024;
+    const values = [_][]u8{
+        try std.testing.allocator.alloc(u8, value_len),
+        try std.testing.allocator.alloc(u8, value_len),
+        try std.testing.allocator.alloc(u8, value_len),
+        try std.testing.allocator.alloc(u8, value_len),
+    };
+    defer for (values) |value| std.testing.allocator.free(value);
+    for (values, 0..) |value, index| @memset(value, @intCast('a' + index));
+    try store.appendPropertiesBatch(std.testing.allocator, &.{
+        .{ .owner = .{ .node = node_id }, .key = ordered_keys[0], .value = .{ .string = values[0] } },
+        .{ .owner = .{ .node = node_id }, .key = ordered_keys[1], .value = .{ .string = values[1] } },
+        .{ .owner = .{ .node = node_id }, .key = ordered_keys[2], .value = .{ .string = values[2] } },
+        .{ .owner = .{ .node = node_id }, .key = ordered_keys[3], .value = .{ .string = values[3] } },
+    });
+
+    var values_file = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_values_path, .{ .mode = .read_write });
+    var values_view = try property_block_codec.View.init(std.testing.allocator, std.testing.io, values_file);
+    try std.testing.expectEqual(property_block_codec.StorageFormat.block_deflate, values_view.format);
+    try std.testing.expect(values_view.entries.len >= 3);
+    const corrupt_offset = values_view.entries[values_view.entries.len - 1].physical_offset;
+    values_view.deinit();
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try values_file.readPositionalAll(std.testing.io, &byte, corrupt_offset));
+    byte[0] ^= 0xff;
+    try values_file.writePositionalAll(std.testing.io, &byte, corrupt_offset);
+    values_file.close(std.testing.io);
+
+    const selected = (try store.getNodeStringProperty(std.testing.allocator, node_id, ordered_keys[0])).?;
+    defer std.testing.allocator.free(selected);
+    try std.testing.expectEqualSlices(u8, values[0], selected);
+    try std.testing.expectError(error.InvalidRecord, store.loadPropertySnapshot(std.testing.allocator));
 }
 
 test "store node property index supports governed typed exact lookup and repair rebuild" {

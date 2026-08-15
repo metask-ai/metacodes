@@ -26,6 +26,42 @@ pub fn TaskEventCommand(comptime Ops: type) type {
 
             var context = try Ops.Context.init(allocator, io, db.db_path);
             defer context.deinit();
+
+            try finishEvent(&context, parsed, root_id, task_id, relation, writer, allocator);
+        }
+
+        /// Daemon-resident variant: identical parsing and publication
+        /// protocol, but the mutation runs on a store the caller keeps open
+        /// (no CLI lock, no open/close). The parsed db path must match.
+        pub fn runWithStore(
+            store: anytype,
+            args: []const []const u8,
+            writer: anytype,
+            allocator: std.mem.Allocator,
+            io: std.Io,
+        ) !void {
+            const db = try Ops.parseDbArguments(allocator, io, args, 2, std.math.maxInt(usize));
+            const parsed = try Arguments.parseEvent(db.rest);
+            const root_id = try Ops.parseNodeId(parsed.root_id);
+            const task_id = if (parsed.task_id) |raw| try Ops.parseNodeId(raw) else null;
+            const relation = if (parsed.relation_label) |label| try Ops.parseRelation(label) else null;
+            if (!std.mem.eql(u8, db.db_path, store.dir_path)) return error.StorePathMismatch;
+
+            var context = Ops.Context.initBorrowed(io, store);
+            defer context.deinit();
+
+            try finishEvent(&context, parsed, root_id, task_id, relation, writer, allocator);
+        }
+
+        fn finishEvent(
+            context: anytype,
+            parsed: anytype,
+            root_id: anytype,
+            task_id: anytype,
+            relation: anytype,
+            writer: anytype,
+            allocator: std.mem.Allocator,
+        ) !void {
             try context.validateTargets(allocator, root_id, task_id);
 
             const event_ns = context.eventNowNs();

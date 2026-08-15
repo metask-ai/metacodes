@@ -748,7 +748,8 @@ pub fn StoreCopySnapshotDataPlane(comptime Ops: type) type {
         /// files remain recovery state.  Neither class participates in content
         /// identity, backup payloads, recursive copies, or user-visible store bytes.
         fn isStoreControlEntry(name: []const u8) bool {
-            return std.mem.eql(u8, name, cli_store_lock_suffix) or
+            return std.mem.eql(u8, name, "store_size.meta.tmp") or
+                std.mem.eql(u8, name, cli_store_lock_suffix) or
                 std.mem.eql(u8, name, backup_transaction_marker_file) or
                 std.mem.eql(u8, name, import_transaction_marker_file) or
                 std.mem.eql(u8, name, restore_transaction_marker_file) or

@@ -59,7 +59,7 @@ if [ "$WHICH" = all ] || [ "$WHICH" = tinykg ]; then
   # tinykg 只需 src/(build.zig 直接指 lib/tinykg/src/main.zig)。
   vendor_one tinykg "https://github.com/shuzuan-org/tinykg.git" "${TK_SRC:-}" "$HERE/lib/tinykg" "src"
   # 补 tinykg SOURCE.txt 的格式/schema 版本行(kg 门用)。
-  echo "storage_format_version: 2  # 变更须同步 src/kg/client.zig EXPECTED_STORAGE_FORMAT_VERSION" >> "$HERE/lib/tinykg/SOURCE.txt"
+  echo "storage_format_version: 3  # 变更须同步 src/kg/client.zig EXPECTED_STORAGE_FORMAT_VERSION" >> "$HERE/lib/tinykg/SOURCE.txt"
   echo "schema_version: 3  # 变更须同步 src/kg/client.zig EXPECTED_SCHEMA_VERSION" >> "$HERE/lib/tinykg/SOURCE.txt"
 fi
 

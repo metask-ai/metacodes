@@ -15,6 +15,8 @@ const segment_mod = @import("../segment.zig");
 const segment_bundle = @import("../segment_bundle.zig");
 const segment_node_index = @import("../segment_node_index.zig");
 const storage = @import("../storage.zig");
+const checkpoint = @import("../checkpoint.zig");
+const daemon_ownership_lock_mod = @import("../storage/daemon_ownership_lock.zig");
 const task = @import("../task.zig");
 const process_liveness = @import("../process_liveness.zig");
 const text_search = @import("../text.zig");
@@ -71,9 +73,385 @@ const task_lease_commands_mod = @import("task_lease_commands.zig");
 const task_read_commands_mod = @import("task_read_commands.zig");
 const task_mutation_arguments_mod = @import("task_mutation_arguments.zig");
 const task_hierarchy_mod = @import("task_hierarchy.zig");
-const schema_document_registry_loader_mod = @import("schema_document_registry_loader.zig");
+const schema_document_registry_loader_mod = @import("../schema_document_registry_loader.zig");
+const host_maintenance_lock = @import("../storage/host_maintenance_lock.zig");
+const task_snapshot_data_plane = @import("task_snapshot_data_plane.zig");
+const ontology_snapshot_data_plane = @import("ontology_snapshot_data_plane.zig");
+const memory_migration_data_plane = @import("memory_migration_data_plane.zig");
+
+/// `materialize-checkpoint <compact-db> <classic-out> [--verify]`: the
+/// productized compact→classic migration path (engine-narrative decision
+/// 12105). Reads one compact checkpoint repository and materializes it into
+/// an isolated classic Store via the checkpoint restore bridge; `--verify`
+/// re-opens the output and compares every node byte-for-byte against the
+/// decoded snapshot. The source repository is never written.
+const materialize_checkpoint_command = struct {
+    pub fn run(
+        args: []const []const u8,
+        writer: anytype,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+    ) !void {
+        if (args.len < 4 or args.len > 5) return error.MissingArgument;
+        const source_path = args[2];
+        const target_path = args[3];
+        var verify = false;
+        if (args.len == 5) {
+            if (!std.mem.eql(u8, args[4], "--verify")) return error.UnknownOption;
+            verify = true;
+        }
+        if (std.mem.eql(u8, source_path, target_path)) return error.InvalidArgument;
+
+        var runtime = try checkpoint.Runtime.open(allocator, io, source_path, false);
+        defer runtime.deinit();
+        const snapshot = runtime.loaded.checkpoint.snapshot;
+        try checkpoint.materializeStoreDirectory(allocator, io, target_path, snapshot, .{});
+
+        var verified: u64 = 1;
+        if (verify) {
+            var store = try storage.Store.open(allocator, io, target_path);
+            defer store.deinit();
+            for (snapshot.nodes) |source_node| {
+                var node = (try store.readNodeById(allocator, core.NodeId.fromInt(source_node.id))) orelse return error.InvalidRecord;
+                defer node.deinit(allocator);
+                if (@intFromEnum(node.kind) != source_node.kind) return error.InvalidRecord;
+                if (!std.mem.eql(u8, node.text, source_node.text)) return error.InvalidRecord;
+            }
+        } else {
+            verified = 0;
+        }
+        try writer.print(
+            "materialize_checkpoint source={s} target={s} nodes={d} edges={d} properties={d} verified={d}\n",
+            .{ source_path, target_path, snapshot.nodes.len, snapshot.edges.len, snapshot.properties.len, verified },
+        );
+    }
+};
+
+fn migrationNodeIsCurrentGeneration(store: storage.Store, node_id: core.NodeId) anyerror!bool {
+    return nodeIsCurrentGeneration(store, node_id);
+}
+
+/// memory-migration v1 command family (docs/frommetacodes/memory-migration-v1.md).
+const memory_migration_command = struct {
+    pub fn runCapabilities(
+        args: []const []const u8,
+        writer: anytype,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+    ) !void {
+        // The store argument is accepted for wire symmetry but capabilities
+        // bind only the executing engine build.
+        _ = try parseDbArgs(allocator, io, args, 2, 0, 0, true);
+        const build_id = try engineBuildId(allocator, io);
+        const body = try memory_migration_data_plane.exportCapabilitiesAlloc(allocator, build_id);
+        defer allocator.free(body);
+        try writer.print("{s}\n", .{body});
+    }
+
+    pub fn runSnapshot(
+        args: []const []const u8,
+        writer: anytype,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+    ) !void {
+        const parsed = try parseDbArgs(allocator, io, args, 2, 6, 6, true);
+        var source_id: ?u64 = null;
+        var replacement_id: ?u64 = null;
+        var evidence_id: ?u64 = null;
+        var index: usize = 0;
+        while (index < parsed.rest.len) : (index += 2) {
+            const option = parsed.rest[index];
+            if (index + 1 >= parsed.rest.len) return error.MissingArgument;
+            const value = std.fmt.parseInt(u64, parsed.rest[index + 1], 10) catch return error.InvalidMigrationSource;
+            if (std.mem.eql(u8, option, "--source-id")) {
+                source_id = value;
+            } else if (std.mem.eql(u8, option, "--replacement-id")) {
+                replacement_id = value;
+            } else if (std.mem.eql(u8, option, "--evidence-id")) {
+                evidence_id = value;
+            } else {
+                return error.UnknownOption;
+            }
+        }
+        const cli_lock = try CliStoreLock.acquire(allocator, io, parsed.db_path);
+        defer cli_lock.deinit();
+        var store = try storage.Store.open(allocator, io, parsed.db_path);
+        defer store.deinit();
+        var snapshot = try memory_migration_data_plane.exportSnapshotAlloc(
+            allocator,
+            store,
+            source_id orelse return error.MissingArgument,
+            replacement_id orelse return error.MissingArgument,
+            evidence_id orelse return error.MissingArgument,
+            migrationNodeIsCurrentGeneration,
+        );
+        defer snapshot.deinit(allocator);
+        try writer.print("{s}\n", .{snapshot.canonical_bytes});
+    }
+
+    fn readRequestFileAlloc(allocator: std.mem.Allocator, io: std.Io, rest: []const []const u8, option: []const u8) ![]u8 {
+        var index: usize = 0;
+        while (index < rest.len) : (index += 2) {
+            if (index + 1 >= rest.len) return error.MissingArgument;
+            if (std.mem.eql(u8, rest[index], option)) {
+                const path = rest[index + 1];
+                // '-' (stdin) is deferred until a CLI stdin surface exists.
+                if (std.mem.eql(u8, path, "-")) return error.Unsupported;
+                var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+                defer file.close(io);
+                const stat = try file.stat(io);
+                if (stat.size == 0 or stat.size > 1024 * 1024) return error.InvalidCommitRequest;
+                const bytes = try allocator.alloc(u8, @intCast(stat.size));
+                errdefer allocator.free(bytes);
+                const n = try file.readPositionalAll(io, bytes, 0);
+                if (n != bytes.len) return error.InvalidCommitRequest;
+                return bytes;
+            }
+        }
+        return error.MissingArgument;
+    }
+
+    pub fn runCommit(
+        args: []const []const u8,
+        writer: anytype,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+    ) !void {
+        const mig = memory_migration_data_plane;
+        const parsed = try parseDbArgs(allocator, io, args, 2, 2, 2, true);
+        const request_bytes = try readRequestFileAlloc(allocator, io, parsed.rest, "--request");
+        defer allocator.free(request_bytes);
+
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const request = try mig.parseCommitRequest(arena, request_bytes);
+        const build_id = try engineBuildId(allocator, io);
+        if (!std.mem.eql(u8, request.expected_build_id, build_id)) return error.BuildIdentityMismatch;
+
+        const cli_lock = try CliStoreLock.acquire(allocator, io, parsed.db_path);
+        defer cli_lock.deinit();
+        var store = try storage.Store.open(allocator, io, parsed.db_path);
+        defer store.deinit();
+
+        const receipt_path = try mig.migrationPathAlloc(arena, store, request.request_id, "receipt.json");
+        const request_path = try mig.migrationPathAlloc(arena, store, request.request_id, "request.json");
+        const internal_path = try mig.migrationPathAlloc(arena, store, request.request_id, "internal.json");
+
+        // Idempotency and request-id inspection: same id + same bytes replays
+        // the receipt; same id + different bytes is a typed conflict.
+        if (try mig.readFileIfExistsAlloc(arena, store, request_path)) |stored_request| {
+            if (!std.mem.eql(u8, stored_request, request_bytes)) return error.RequestIdConflict;
+            if (try mig.readFileIfExistsAlloc(arena, store, receipt_path)) |stored_receipt| {
+                try writer.print("{s}\n", .{stored_receipt});
+                return;
+            }
+            // Intent is durable but the receipt is not: the earlier attempt
+            // died mid-commit. Roll the fixed effect forward to completion.
+        }
+
+        // Fresh admission against the current consistent state.
+        var pre = try mig.exportSnapshotAlloc(allocator, store, request.source_id, request.replacement_id, request.evidence_id, migrationNodeIsCurrentGeneration);
+        defer pre.deinit(allocator);
+        const resuming = (try mig.readFileIfExistsAlloc(arena, store, request_path)) != null;
+        if (!resuming) {
+            if (!std.mem.eql(u8, &pre.revision, request.expected_revision)) return error.StaleRevision;
+            var observed_hash: [64]u8 = undefined;
+            mig.sha256Hex(pre.canonical_bytes, &observed_hash);
+            if (!std.mem.eql(u8, &observed_hash, request.snapshot_sha256)) return error.SnapshotDrift;
+            if (pre.deprecated_edge_exists or pre.source.retrieval_excluded) return error.InvalidCommitRequest;
+            // Durable intent before any mutation: every later crash point is
+            // classifiable from this file plus the store facts.
+            try mig.writeFileDurablePublic(store, request_path, request_bytes);
+        }
+
+        // Fixed effect, rolled forward idempotently fact-by-fact.
+        var edge_id: u64 = 0;
+        if (!pre.deprecated_edge_exists) {
+            const id = try dag.addEdgeCheckedWithPersistentStore(allocator, store, core.NodeId.fromInt(request.source_id), .deprecated_by, core.NodeId.fromInt(request.replacement_id), .{});
+            edge_id = id.toInt();
+        } else if (try mig.readFileIfExistsAlloc(arena, store, internal_path)) |internal_bytes| {
+            const internal = std.json.parseFromSliceLeaky(std.json.Value, arena, internal_bytes, .{}) catch return error.InvalidCommitReceipt;
+            edge_id = @intCast(internal.object.get("edge_id").?.integer);
+        }
+        if (!pre.source.retrieval_excluded) {
+            _ = try store.upsertPropertiesBatch(allocator, &.{.{
+                .owner = .{ .node = core.NodeId.fromInt(request.source_id) },
+                .key = "retrieval_excluded",
+                .value = .{ .uint = 1 },
+            }});
+        }
+        try store.syncDurableAppendSurfaces();
+
+        var post = try mig.exportSnapshotAlloc(allocator, store, request.source_id, request.replacement_id, request.evidence_id, migrationNodeIsCurrentGeneration);
+        defer post.deinit(allocator);
+        if (!post.deprecated_edge_exists or !post.source.retrieval_excluded) return error.IndeterminateCommit;
+
+        const token = try mig.rollbackTokenAlloc(arena, request.request_id, &post.revision);
+        const internal_body = try std.fmt.allocPrint(arena, "{{\"request_id\":\"{s}\",\"edge_id\":{d},\"previous_revision\":\"{s}\",\"commit_revision\":\"{s}\"}}", .{ request.request_id, edge_id, request.expected_revision, &post.revision });
+        try mig.writeFileDurablePublic(store, internal_path, internal_body);
+        const token_path = try mig.migrationPathAlloc(arena, store, token, "token");
+        try mig.writeFileDurablePublic(store, token_path, request.request_id);
+
+        const receipt = mig.Receipt{
+            .schema_version = mig.receipt_schema_version,
+            .operation = mig.operation_name,
+            .request_id = request.request_id,
+            .proposal_sha256 = request.proposal_sha256,
+            .checker_verdict_sha256 = request.checker_verdict_sha256,
+            .snapshot_sha256 = request.snapshot_sha256,
+            .previous_revision = request.expected_revision,
+            .revision = &post.revision,
+            .source_id = request.source_id,
+            .replacement_id = request.replacement_id,
+            .evidence_id = request.evidence_id,
+            .effect = mig.effect_name,
+            .rollback = mig.rollback_name,
+            .committed = true,
+            .rollback_token = token,
+            .build_id = build_id,
+        };
+        const receipt_bytes = try mig.stringifyAlloc(arena, receipt);
+        try mig.writeFileDurablePublic(store, receipt_path, receipt_bytes);
+        try writer.print("{s}\n", .{receipt_bytes});
+    }
+
+    pub fn runPostState(
+        args: []const []const u8,
+        writer: anytype,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+    ) !void {
+        const mig = memory_migration_data_plane;
+        const parsed = try parseDbArgs(allocator, io, args, 2, 2, 2, true);
+        if (!std.mem.eql(u8, parsed.rest[0], "--rollback-token")) return error.MissingArgument;
+        const token = parsed.rest[1];
+        if (!mig.isLowerHex64(token)) return error.RollbackTokenInvalid;
+
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const build_id = try engineBuildId(allocator, io);
+
+        const cli_lock = try CliStoreLock.acquire(allocator, io, parsed.db_path);
+        defer cli_lock.deinit();
+        var store = try storage.Store.open(allocator, io, parsed.db_path);
+        defer store.deinit();
+
+        const token_path = try mig.migrationPathAlloc(arena, store, token, "token");
+        const request_id = (try mig.readFileIfExistsAlloc(arena, store, token_path)) orelse return error.RollbackTokenInvalid;
+        const receipt_path = try mig.migrationPathAlloc(arena, store, request_id, "receipt.json");
+        const receipt_bytes = (try mig.readFileIfExistsAlloc(arena, store, receipt_path)) orelse return error.InvalidCommitReceipt;
+        const receipt = std.json.parseFromSliceLeaky(mig.Receipt, arena, receipt_bytes, .{}) catch return error.InvalidCommitReceipt;
+
+        var facts = try mig.exportSnapshotAlloc(allocator, store, receipt.source_id, receipt.replacement_id, receipt.evidence_id, migrationNodeIsCurrentGeneration);
+        defer facts.deinit(allocator);
+
+        const post_state = mig.PostState{
+            .schema_version = mig.post_state_schema_version,
+            .revision = receipt.revision,
+            .source_id = receipt.source_id,
+            .replacement_id = receipt.replacement_id,
+            .evidence_id = receipt.evidence_id,
+            .deprecated_edge_exists = facts.deprecated_edge_exists,
+            .source_retrieval_excluded = facts.source.retrieval_excluded,
+            .replacement_current_generation = facts.replacement.current_generation,
+            .evidence_present = true,
+            .rollback_token = token,
+            .build_id = build_id,
+        };
+        const body = try mig.stringifyAlloc(arena, post_state);
+        try writer.print("{s}\n", .{body});
+    }
+
+    pub fn runRollback(
+        args: []const []const u8,
+        writer: anytype,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+    ) !void {
+        const mig = memory_migration_data_plane;
+        const parsed = try parseDbArgs(allocator, io, args, 2, 2, 2, true);
+        const request_bytes = try readRequestFileAlloc(allocator, io, parsed.rest, "--request");
+        defer allocator.free(request_bytes);
+
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const rollback_request = std.json.parseFromSliceLeaky(mig.RollbackRequest, arena, request_bytes, .{
+            .ignore_unknown_fields = false,
+            .duplicate_field_behavior = .@"error",
+        }) catch return error.InvalidCommitRequest;
+        if (!std.mem.eql(u8, rollback_request.schema_version, mig.rollback_schema_version)) return error.InvalidCommitRequest;
+        if (!mig.isLowerHex64(rollback_request.rollback_token)) return error.RollbackTokenInvalid;
+        if (!mig.isLowerHex64(rollback_request.expected_revision)) return error.InvalidCommitRequest;
+        const build_id = try engineBuildId(allocator, io);
+        if (!std.mem.eql(u8, rollback_request.expected_build_id, build_id)) return error.BuildIdentityMismatch;
+
+        const cli_lock = try CliStoreLock.acquire(allocator, io, parsed.db_path);
+        defer cli_lock.deinit();
+        var store = try storage.Store.open(allocator, io, parsed.db_path);
+        defer store.deinit();
+
+        const token_path = try mig.migrationPathAlloc(arena, store, rollback_request.rollback_token, "token");
+        const request_id = (try mig.readFileIfExistsAlloc(arena, store, token_path)) orelse return error.RollbackTokenInvalid;
+        const receipt_path = try mig.migrationPathAlloc(arena, store, request_id, "receipt.json");
+        const receipt_bytes = (try mig.readFileIfExistsAlloc(arena, store, receipt_path)) orelse return error.InvalidCommitReceipt;
+        const receipt = std.json.parseFromSliceLeaky(mig.Receipt, arena, receipt_bytes, .{}) catch return error.InvalidCommitReceipt;
+        if (!std.mem.eql(u8, rollback_request.expected_revision, receipt.revision)) return error.RollbackConflict;
+
+        // Idempotency: a completed rollback replays byte-stable.
+        const rollback_receipt_path = try mig.migrationPathAlloc(arena, store, request_id, "rollback.json");
+        if (try mig.readFileIfExistsAlloc(arena, store, rollback_receipt_path)) |stored| {
+            try writer.print("{s}\n", .{stored});
+            return;
+        }
+
+        const internal_path = try mig.migrationPathAlloc(arena, store, request_id, "internal.json");
+        const internal_bytes = (try mig.readFileIfExistsAlloc(arena, store, internal_path)) orelse return error.InvalidCommitReceipt;
+        const internal = std.json.parseFromSliceLeaky(std.json.Value, arena, internal_bytes, .{}) catch return error.InvalidCommitReceipt;
+        const edge_id: u64 = @intCast(internal.object.get("edge_id").?.integer);
+
+        // Later legitimate mutations must never be overwritten.
+        var facts = try mig.exportSnapshotAlloc(allocator, store, receipt.source_id, receipt.replacement_id, receipt.evidence_id, migrationNodeIsCurrentGeneration);
+        defer facts.deinit(allocator);
+        if (!std.mem.eql(u8, &facts.revision, receipt.revision)) return error.RollbackConflict;
+        if (!facts.deprecated_edge_exists or !facts.source.retrieval_excluded) return error.RollbackConflict;
+
+        try store.deleteEdge(core.EdgeId.fromInt(edge_id));
+        _ = try store.upsertPropertiesBatch(allocator, &.{.{
+            .owner = .{ .node = core.NodeId.fromInt(receipt.source_id) },
+            .key = "retrieval_excluded",
+            .value = .{ .uint = 0 },
+        }});
+        try store.syncDurableAppendSurfaces();
+
+        var post = try mig.exportSnapshotAlloc(allocator, store, receipt.source_id, receipt.replacement_id, receipt.evidence_id, migrationNodeIsCurrentGeneration);
+        defer post.deinit(allocator);
+        if (post.deprecated_edge_exists or post.source.retrieval_excluded) return error.IndeterminateRollback;
+
+        const rollback_receipt = mig.RollbackReceipt{
+            .schema_version = mig.rollback_receipt_schema_version,
+            .rollback_token = rollback_request.rollback_token,
+            .request_id = request_id,
+            .previous_revision = receipt.revision,
+            .revision = &post.revision,
+            .source_id = receipt.source_id,
+            .replacement_id = receipt.replacement_id,
+            .evidence_id = receipt.evidence_id,
+            .effect = mig.rollback_name,
+            .rolled_back = true,
+            .build_id = build_id,
+        };
+        const body = try mig.stringifyAlloc(arena, rollback_receipt);
+        try mig.writeFileDurablePublic(store, rollback_receipt_path, body);
+        try writer.print("{s}\n", .{body});
+    }
+};
 const governed_node_write_admission_mod = @import("governed_node_write_admission.zig");
+const library_invocation_mod = @import("library_invocation.zig");
 const root_command_dispatch_pipeline_mod = @import("root_command_dispatch_pipeline.zig");
+const runtime_environment = @import("runtime_environment.zig");
 
 const schema_document_registry_loader = schema_document_registry_loader_mod.SchemaDocumentRegistryLoader();
 const rootParseNodeIdArg = parseNodeIdArg;
@@ -94,16 +472,20 @@ const GovernedNodeWriteAdmissionOps = struct {
 };
 const governed_node_write_admission = governed_node_write_admission_mod.GovernedNodeWriteAdmission(GovernedNodeWriteAdmissionOps);
 
-var runtime_env_map: ?*const std.process.Environ.Map = null;
 var export_temp_nonce: std.atomic.Value(u64) = .init(0);
 
+const RuntimeEnvironmentScope = runtime_environment.Scope;
+
+fn enterRuntimeEnvironment(map: ?*const std.process.Environ.Map) RuntimeEnvironmentScope {
+    return runtime_environment.enter(map);
+}
+
 pub fn setRuntimeEnvMap(map: ?*const std.process.Environ.Map) void {
-    runtime_env_map = map;
-    benchmark_execution.setRuntimeEnvMap(map);
+    runtime_environment.set(map);
 }
 
 fn envVar(name: []const u8) ?[]const u8 {
-    if (runtime_env_map) |map| return map.get(name);
+    if (runtime_environment.hasMap()) return runtime_environment.get(name);
     if (!builtin.link_libc) return null;
     if (std.mem.eql(u8, name, "TINYKG_BENCH_TRACE")) {
         if (std.c.getenv("TINYKG_BENCH_TRACE")) |raw| return std.mem.span(raw);
@@ -1129,6 +1511,19 @@ const RebuildTextCommandOps = struct {
         }
 
         pub fn rebuild(self: *Context) !Result {
+            // Host-level maintenance gate (opt-in): co-located stores
+            // serialize O(store) jobs instead of stacking them; blocking
+            // here is the intended behavior for an operator command.
+            var host_gate: ?host_maintenance_lock.HostMaintenanceLock = if (host_maintenance_lock.lockPathFromEnvironment()) |path|
+                try host_maintenance_lock.HostMaintenanceLock.acquire(self.store.io, path)
+            else
+                null;
+            defer if (host_gate) |*gate| gate.deinit();
+            // Maintenance jobs scale their run-chunk memory budget with the
+            // corpus so publication stays a single merge pass; the resident
+            // query service never takes this path.
+            const doc_upper_bound = (try self.store.nextNodeId()).toInt() -| 1;
+            text_search.scaleTextPostingRunChunkRecordsForCorpus(doc_upper_bound);
             const meta = try text_search.rebuildPersistentTextCatalog(self.allocator, self.store);
             return .{
                 .doc_count = meta.doc_count,
@@ -1285,7 +1680,18 @@ const StoreUpgradeCommandOps = struct {
 
             const source_lock = try CliStoreLock.acquire(allocator, io, parsed.source_path);
             errdefer source_lock.deinit();
-            const source_store = try storage.Store.open(allocator, io, parsed.source_path);
+            const source_store = storage.Store.openWithOptions(allocator, io, parsed.source_path, .{
+                .allow_legacy_store_format_read = true,
+            }) catch |err| switch (err) {
+                // Keep the upgrade command's public diagnostics independent of
+                // storage-internal admission names. The lock is already held,
+                // so these classifications still describe the exact source
+                // revision that would have been probed by detect().
+                error.UnsupportedStoreManifestVersion => return error.NewerStoreManifest,
+                error.UnsupportedStorageFormatVersion => return error.NewerStorageFormat,
+                error.UnsupportedSchemaVersion => return error.NewerSchemaVersion,
+                else => |other| return other,
+            };
             return .{
                 .allocator = allocator,
                 .io = io,
@@ -1361,8 +1767,31 @@ const store_upgrade_command =
     store_upgrade_command_mod.StoreUpgradeCommand(StoreUpgradeCommandOps);
 
 const StoreInspectionCommandOps = struct {
+    pub const ParsedStoreInfoArgs = struct {
+        db_path: []const u8,
+        refresh_size: bool,
+    };
+
     pub fn parseDbPath(args: []const []const u8, index: usize) ![]const u8 {
         return parseOptionalDbPath(args, index);
+    }
+
+    pub fn parseStoreInfoArgs(args: []const []const u8, index: usize) !ParsedStoreInfoArgs {
+        var db_path = defaultDbPath();
+        var seen_db = false;
+        var refresh_size = false;
+        for (args[index..]) |arg| {
+            if (std.mem.eql(u8, arg, "--refresh-size")) {
+                if (refresh_size) return error.InvalidArgument;
+                refresh_size = true;
+                continue;
+            }
+            if (std.mem.startsWith(u8, arg, "--")) return error.InvalidArgument;
+            if (seen_db) return error.TooManyArguments;
+            db_path = arg;
+            seen_db = true;
+        }
+        return .{ .db_path = db_path, .refresh_size = refresh_size };
     }
 
     pub const Context = struct {
@@ -1393,8 +1822,14 @@ const StoreInspectionCommandOps = struct {
             return .{ .nodes = value.nodes, .edges = value.edges };
         }
 
-        pub fn storeBytes(self: *Context, allocator: std.mem.Allocator) !u64 {
-            return storeDirBytes(allocator, self.io, self.db_path);
+        pub fn indexStats(self: *Context) !struct { nodes: u64, edges: u64 } {
+            const value = try self.store.readIndexMeta();
+            return .{ .nodes = value.nodes, .edges = value.edges };
+        }
+
+        pub fn sizeSnapshot(self: *Context, refresh: bool) !?storage.StoreSizeSnapshot {
+            if (refresh) return try self.store.refreshSizeSnapshot();
+            return try self.store.readSizeSnapshot();
         }
 
         pub fn textFileSize(
@@ -1547,8 +1982,12 @@ const NodeReadCommandOps = struct {
     }
 
     pub const Context = struct {
-        cli_lock: CliStoreLock,
+        cli_lock: ?CliStoreLock,
         store: storage.Store,
+        /// Borrowed contexts wrap the daemon's resident store handle: no CLI
+        /// lock, the store stays open, and repair (a write) is a no-op so a
+        /// read-only process never mutates files the writer owns.
+        borrowed: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8) !Context {
             const cli_lock = try CliStoreLock.acquire(allocator, io, db_path);
@@ -1557,12 +1996,18 @@ const NodeReadCommandOps = struct {
             return .{ .cli_lock = cli_lock, .store = store };
         }
 
+        pub fn initBorrowed(store: storage.Store) Context {
+            return .{ .cli_lock = null, .store = store, .borrowed = true };
+        }
+
         pub fn deinit(self: *Context) void {
+            if (self.borrowed) return;
             self.store.deinit();
-            self.cli_lock.deinit();
+            if (self.cli_lock) |lock| lock.deinit();
         }
 
         pub fn repair(self: *Context) !void {
+            if (self.borrowed) return;
             try self.store.repairPersistentIndexesFromLog();
         }
 
@@ -2057,6 +2502,352 @@ const QueryCommandOps = struct {
 const query_command = query_command_mod.QueryCommand(QueryCommandOps);
 const parseQueryArgs = query_command.parseArguments;
 
+/// Executes the ordinary TinyQL CLI surface against a daemon-owned Store and
+/// generation-bound retained session. Parsing, schema resolution, planning,
+/// output format, and budgets remain identical to `tinykg query`; only Store
+/// opening and the non-reentrant CLI lock are intentionally bypassed.
+/// Session-scoped cache of the store's embedded catalog. Long-lived daemon
+/// sessions pay the catalog read and parse once per store generation instead
+/// of on every query; the daemon already destroys sessions on every commit,
+/// which bounds staleness exactly.
+pub const QueryCatalogCache = struct {
+    catalog: ?catalog_mod.Catalog = null,
+    loaded: bool = false,
+
+    pub fn deinit(self: *QueryCatalogCache) void {
+        if (self.catalog) |*cat| cat.deinit();
+        self.* = .{};
+    }
+};
+
+pub fn invokePersistentQueryAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store: storage.Store,
+    session: *ql.executor.PersistentStoreQuerySession,
+    args: []const []const u8,
+    explain: bool,
+) ![]u8 {
+    return invokePersistentQueryCachedAlloc(allocator, io, store, session, null, args, explain);
+}
+
+pub fn invokePersistentQueryCachedAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store: storage.Store,
+    session: *ql.executor.PersistentStoreQuerySession,
+    catalog_cache: ?*QueryCatalogCache,
+    args: []const []const u8,
+    explain: bool,
+) ![]u8 {
+    const parsed = try parseQueryArgs(allocator, io, args);
+    defer parsed.deinit(allocator);
+    if (!std.mem.eql(u8, parsed.db_path, store.dir_path)) return error.StorePathMismatch;
+
+    const syntax = try ql.parser.parse(allocator, parsed.query);
+    defer ql.ast.freeQuery(allocator, syntax);
+
+    var loaded_schema: ?schema.Registry = if (parsed.schema_path) |path|
+        try loadSchemaRegistryFile(allocator, io, path)
+    else
+        null;
+    defer if (loaded_schema) |*registry| registry.deinit();
+    var owned_catalog: ?catalog_mod.Catalog = null;
+    defer if (owned_catalog) |*cat| cat.deinit();
+    var embedded_catalog: ?catalog_mod.Catalog = null;
+    if (loaded_schema == null) {
+        if (catalog_cache) |cache| {
+            if (!cache.loaded) {
+                cache.catalog = try store.readCatalog();
+                cache.loaded = true;
+            }
+            embedded_catalog = cache.catalog;
+        } else {
+            owned_catalog = try store.readCatalog();
+            embedded_catalog = owned_catalog;
+        }
+    }
+    const query_registry: ?schema.Registry = if (loaded_schema) |registry|
+        registry
+    else if (embedded_catalog) |cat|
+        if (queryCatalogCoversSchemaReferences(cat.registry, syntax)) cat.registry else null
+    else
+        null;
+
+    var type_env = if (query_registry) |registry|
+        try ql.typecheck.checkWithSchema(allocator, syntax, registry)
+    else
+        try ql.typecheck.check(allocator, syntax);
+    defer type_env.deinit(allocator);
+    var logical = if (query_registry) |registry|
+        try ql.planner.planWithSchema(allocator, syntax, registry)
+    else
+        try ql.planner.plan(allocator, syntax);
+    defer logical.deinit(allocator);
+    var physical = try ql.optimizer.optimize(allocator, logical);
+    defer physical.deinit(allocator);
+
+    return query_context_read_data_plane.renderPersistentQueryOutputSession(
+        allocator,
+        io,
+        store,
+        session,
+        physical,
+        explain,
+        .{
+            .max_text_postings_scanned = parsed.max_postings_scanned,
+            .timeout_ms = parsed.timeout_ms,
+        },
+    );
+}
+
+/// Executes the ordinary TinyQL query surface against a compact checkpoint
+/// Runtime. Parser, schema/type checking, optimizer, budgets and output format
+/// are shared with the persistent Store path; only the physical data source is
+/// generation-resident.
+/// Group-commit batch execution for a run of add-node requests: one shared
+/// schema load, one appendNodesBatch, and one governance property upsert
+/// replace the per-operation validate/journal/meta publication that
+/// dominates concurrent write cost. Per-request outputs and errors keep
+/// arrival order; a batch-level failure fails every request in the group.
+/// Durability stays with the caller's group sync boundary.
+pub fn invokeAddNodeGroupAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store: storage.Store,
+    request_args: []const []const []const u8,
+    outputs: *std.ArrayList(?[]u8),
+    failures: *std.ArrayList(?anyerror),
+) !void {
+    std.debug.assert(outputs.items.len == 0 and failures.items.len == 0);
+    try outputs.ensureTotalCapacityPrecise(allocator, request_args.len);
+    try failures.ensureTotalCapacityPrecise(allocator, request_args.len);
+
+    var prepared_list = std.ArrayList(?NodeMutationCommandOps.PreparedAdd).empty;
+    defer {
+        for (prepared_list.items) |*maybe_prepared| {
+            if (maybe_prepared.*) |*prepared| prepared.deinit(allocator);
+        }
+        prepared_list.deinit(allocator);
+    }
+    try prepared_list.ensureTotalCapacityPrecise(allocator, request_args.len);
+
+    var effective_schema: ?EffectiveSchemaRegistry = null;
+    defer if (effective_schema) |*schema_registry| schema_registry.deinit();
+
+    var kinds = std.ArrayList(core.NodeKind).empty;
+    defer kinds.deinit(allocator);
+    try kinds.ensureTotalCapacityPrecise(allocator, request_args.len);
+
+    for (request_args) |args| {
+        outputs.appendAssumeCapacity(null);
+        failures.appendAssumeCapacity(null);
+        var prepared = NodeMutationCommandOps.prepareAdd(allocator, io, args) catch |err| {
+            failures.items[failures.items.len - 1] = err;
+            prepared_list.appendAssumeCapacity(null);
+            kinds.appendAssumeCapacity(.file);
+            continue;
+        };
+        if (!std.mem.eql(u8, prepared.db_path, store.dir_path)) {
+            prepared.deinit(allocator);
+            failures.items[failures.items.len - 1] = error.StorePathMismatch;
+            prepared_list.appendAssumeCapacity(null);
+            kinds.appendAssumeCapacity(.file);
+            continue;
+        }
+        // per-request schema paths fall back to the single path; the shared
+        // load only serves the overwhelmingly common no-explicit-schema case
+        if (prepared.add_args.schema_path != null) {
+            var single_schema = loadEffectiveSchemaRegistry(allocator, io, store, prepared.add_args.schema_path) catch |err| {
+                prepared.deinit(allocator);
+                failures.items[failures.items.len - 1] = err;
+                prepared_list.appendAssumeCapacity(null);
+                kinds.appendAssumeCapacity(.file);
+                continue;
+            };
+            defer single_schema.deinit();
+            const kind = parseNodeKindWithSchemaPolicy(
+                prepared.add_args.kind_label,
+                single_schema.registry,
+                single_schema.enforce_application_schema,
+            ) catch |err| {
+                prepared.deinit(allocator);
+                failures.items[failures.items.len - 1] = err;
+                prepared_list.appendAssumeCapacity(null);
+                kinds.appendAssumeCapacity(.file);
+                continue;
+            };
+            prepared_list.appendAssumeCapacity(prepared);
+            kinds.appendAssumeCapacity(kind);
+            continue;
+        }
+        if (effective_schema == null) {
+            effective_schema = try loadEffectiveSchemaRegistry(allocator, io, store, null);
+        }
+        const kind = parseNodeKindWithSchemaPolicy(
+            prepared.add_args.kind_label,
+            effective_schema.?.registry,
+            effective_schema.?.enforce_application_schema,
+        ) catch |err| {
+            prepared.deinit(allocator);
+            failures.items[failures.items.len - 1] = err;
+            prepared_list.appendAssumeCapacity(null);
+            kinds.appendAssumeCapacity(.file);
+            continue;
+        };
+        prepared_list.appendAssumeCapacity(prepared);
+        kinds.appendAssumeCapacity(kind);
+    }
+
+    var nodes = std.ArrayList(graph.Node).empty;
+    defer nodes.deinit(allocator);
+    var node_request_index = std.ArrayList(usize).empty;
+    defer node_request_index.deinit(allocator);
+    const base_id = (try store.nextNodeId()).toInt();
+    var assigned: u64 = 0;
+    for (prepared_list.items, 0..) |maybe_prepared, request_index| {
+        const prepared = maybe_prepared orelse continue;
+        try nodes.append(allocator, .{
+            .id = core.NodeId.fromInt(base_id + assigned),
+            .kind = kinds.items[request_index],
+            .text = prepared.node_text,
+        });
+        try node_request_index.append(allocator, request_index);
+        assigned += 1;
+    }
+    if (nodes.items.len == 0) return;
+    try store.appendNodesBatch(nodes.items);
+
+    var property_writes = std.ArrayList(storage.PropertyPayloadWrite).empty;
+    defer property_writes.deinit(allocator);
+    for (nodes.items, node_request_index.items) |node, request_index| {
+        const prepared = &prepared_list.items[request_index].?;
+        try collectNodeGovernanceProperties(&property_writes, allocator, node.id, prepared.governance_args);
+    }
+    if (property_writes.items.len != 0) {
+        _ = try store.upsertPropertiesBatch(allocator, property_writes.items);
+    }
+    for (nodes.items, node_request_index.items) |node, request_index| {
+        if (kinds.items[request_index] == .task) try ensureTaskStatusProperty(allocator, store, node.id);
+        outputs.items[request_index] = try std.fmt.allocPrint(allocator, "node {}\n", .{node.id.toInt()});
+    }
+}
+
+/// Daemon-resident read hot path: point reads against the resident store
+/// handle. Reads never mutate, so this serves both the writer daemon and
+/// read-only reader daemons; the per-request whole-store open/close this
+/// replaces dominated point-read latency at GB scale.
+pub fn invokeStoreReadAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store: storage.Store,
+    command: Command,
+    args: []const []const u8,
+) ![]u8 {
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    switch (command) {
+        .get => try node_read_commands.runGetWithStore(store, args, &output.writer, allocator, io),
+        .get_node => try node_read_commands.runNodeWithStore(store, args, &output.writer, allocator, io),
+        else => return error.UnsupportedStoreRead,
+    }
+    return output.toOwnedSlice();
+}
+
+/// Daemon-resident write hot path: execute a mutation command against a store
+/// the caller already holds open, skipping the per-command CLI lock and
+/// whole-store open/close that dominate concurrent write latency. The caller
+/// owns exclusivity (daemon ownership lock) and post-commit session
+/// invalidation. Only the concurrency-critical write family routes here.
+pub fn invokeStoreMutationAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store: storage.Store,
+    command: Command,
+    args: []const []const u8,
+) ![]u8 {
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    switch (command) {
+        .add_node => {
+            var prepared = try NodeMutationCommandOps.prepareAdd(allocator, io, args);
+            defer prepared.deinit(allocator);
+            if (!std.mem.eql(u8, prepared.db_path, store.dir_path)) return error.StorePathMismatch;
+            var context = NodeMutationCommandOps.Context.initBorrowed(io, store, prepared.db_path);
+            defer context.deinit();
+            const result = try context.add(allocator, &prepared);
+            try output.writer.print("node {}\n", .{result.node_id});
+        },
+        .set_property => try property_commands.runSetStringWithStore(store, args, &output.writer, allocator, io),
+        .set_uint_property => try property_commands.runSetUintWithStore(store, args, &output.writer, allocator, io),
+        .set_node_property => try property_commands.runSetNodeWithStore(store, args, &output.writer, allocator, io),
+        .set_edge_property => try property_commands.runSetEdgeWithStore(store, args, &output.writer, allocator, io),
+        .ensure_node => try idempotent_node_commands.runEnsureNodeWithStore(store, args, &output.writer, allocator, io),
+        .add_edge => try edge_mutation_commands.runAddWithStore(store, args, &output.writer, allocator, io),
+        .task_claim => try task_lease_commands.runClaimWithStore(store, args, &output.writer, allocator, io),
+        .task_release => try task_lease_commands.runReleaseWithStore(store, args, &output.writer, allocator, io),
+        .task_close => try task_close_command.runWithStore(store, args, &output.writer, allocator, io),
+        .task_event => try task_event_command.runWithStore(store, args, &output.writer, allocator, io),
+        else => return error.UnsupportedStoreMutation,
+    }
+    return output.toOwnedSlice();
+}
+
+pub fn invokeCheckpointQueryAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime: *checkpoint.Runtime,
+    args: []const []const u8,
+    explain: bool,
+) ![]u8 {
+    const parsed = try parseQueryArgs(allocator, io, args);
+    defer parsed.deinit(allocator);
+    if (!std.mem.eql(u8, parsed.db_path, runtime.repository.dir_path)) return error.StorePathMismatch;
+
+    const syntax = try ql.parser.parse(allocator, parsed.query);
+    defer ql.ast.freeQuery(allocator, syntax);
+    var loaded_schema: ?schema.Registry = if (parsed.schema_path) |path|
+        try loadSchemaRegistryFile(allocator, io, path)
+    else
+        null;
+    defer if (loaded_schema) |*registry| registry.deinit();
+    var embedded_catalog: ?catalog_mod.Catalog = if (loaded_schema == null and runtime.loaded.checkpoint.snapshot.catalog.len != 0)
+        try catalog_mod.decodeCatalog(allocator, runtime.loaded.checkpoint.snapshot.catalog)
+    else
+        null;
+    defer if (embedded_catalog) |*cat| cat.deinit();
+    const query_registry: ?schema.Registry = if (loaded_schema) |registry|
+        registry
+    else if (embedded_catalog) |cat|
+        if (queryCatalogCoversSchemaReferences(cat.registry, syntax)) cat.registry else null
+    else
+        null;
+
+    var type_env = if (query_registry) |registry|
+        try ql.typecheck.checkWithSchema(allocator, syntax, registry)
+    else
+        try ql.typecheck.check(allocator, syntax);
+    defer type_env.deinit(allocator);
+    var logical = if (query_registry) |registry|
+        try ql.planner.planWithSchema(allocator, syntax, registry)
+    else
+        try ql.planner.plan(allocator, syntax);
+    defer logical.deinit(allocator);
+    var physical = try ql.optimizer.optimize(allocator, logical);
+    defer physical.deinit(allocator);
+    return query_context_read_data_plane.renderCheckpointQueryOutput(
+        allocator,
+        io,
+        runtime,
+        physical,
+        explain,
+        .{
+            .max_text_postings_scanned = parsed.max_postings_scanned,
+            .timeout_ms = parsed.timeout_ms,
+        },
+    );
+}
+
 const IdempotentNodeCommandOps = struct {
     pub const Result = struct {
         node_id: u64,
@@ -2124,9 +2915,12 @@ const IdempotentNodeCommandOps = struct {
     }
 
     pub const Context = struct {
-        cli_lock: CliStoreLock,
+        cli_lock: ?CliStoreLock,
         store: storage.Store,
         io: std.Io,
+        /// Borrowed contexts wrap a store the caller keeps open (the daemon's
+        /// resident handle); they take no CLI lock and never close the store.
+        borrowed: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8) !Context {
             const cli_lock = try CliStoreLock.acquire(allocator, io, db_path);
@@ -2135,9 +2929,14 @@ const IdempotentNodeCommandOps = struct {
             return .{ .cli_lock = cli_lock, .store = store, .io = io };
         }
 
+        pub fn initBorrowed(io: std.Io, store: storage.Store) Context {
+            return .{ .cli_lock = null, .store = store, .io = io, .borrowed = true };
+        }
+
         pub fn deinit(self: *Context) void {
+            if (self.borrowed) return;
             self.store.deinit();
-            self.cli_lock.deinit();
+            if (self.cli_lock) |lock| lock.deinit();
         }
 
         pub fn ensureNode(
@@ -2165,6 +2964,9 @@ const IdempotentNodeCommandOps = struct {
                 candidate_limit,
             ) catch |err| switch (err) {
                 error.FileNotFound, error.InvalidRecord => retry: {
+                    // The daemon's resident store never repairs inline; its
+                    // maintenance debt is worked off between requests.
+                    if (self.borrowed) return err;
                     try self.store.repairPersistentIndexesFromLog();
                     break :retry try self.store.lookupNodesByTextLimited(
                         allocator,
@@ -2410,10 +3212,13 @@ const NodeMutationCommandOps = struct {
     }
 
     pub const Context = struct {
-        cli_lock: CliStoreLock,
+        cli_lock: ?CliStoreLock,
         store: storage.Store,
         db_path: []const u8,
         io: std.Io,
+        /// Borrowed contexts wrap a store the caller keeps open (the daemon's
+        /// resident handle); they take no CLI lock and never close the store.
+        borrowed: bool = false,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -2426,9 +3231,14 @@ const NodeMutationCommandOps = struct {
             return .{ .cli_lock = cli_lock, .store = store, .db_path = db_path, .io = io };
         }
 
+        pub fn initBorrowed(io: std.Io, store: storage.Store, db_path: []const u8) Context {
+            return .{ .cli_lock = null, .store = store, .db_path = db_path, .io = io, .borrowed = true };
+        }
+
         pub fn deinit(self: *Context) void {
+            if (self.borrowed) return;
             self.store.deinit();
-            self.cli_lock.deinit();
+            if (self.cli_lock) |lock| lock.deinit();
         }
 
         pub fn add(
@@ -3077,6 +3887,144 @@ const TaskReadCommandOps = struct {
 
 const task_read_commands = task_read_commands_mod.TaskReadCommands(TaskReadCommandOps);
 
+/// Content-addressed identity of the executing engine binary, computed once
+/// per process. Snapshot consumers re-hash the same binary independently and
+/// reject drift, so this must read the real image, never a constant.
+var cached_build_id: ?[7 + 64]u8 = null;
+
+fn engineBuildId(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
+    if (cached_build_id) |*cached| return cached[0..];
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const exe_path: []const u8 = switch (builtin.os.tag) {
+        .macos, .ios => blk: {
+            var len: u32 = @intCast(path_buffer.len);
+            if (std.c._NSGetExecutablePath(&path_buffer, &len) != 0) return error.Unsupported;
+            break :blk std.mem.sliceTo(&path_buffer, 0);
+        },
+        .linux => blk: {
+            const n = std.Io.Dir.readLinkAbsolute(io, "/proc/self/exe", &path_buffer) catch return error.Unsupported;
+            break :blk path_buffer[0..n];
+        },
+        // Windows engine identity lands with the native-package receipts
+        // work; until then the snapshot fails typed instead of lying.
+        else => return error.Unsupported,
+    };
+    var file = try std.Io.Dir.cwd().openFile(io, exe_path, .{});
+    defer file.close(io);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    const chunk = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(chunk);
+    var offset: u64 = 0;
+    while (true) {
+        const n = try file.readPositional(io, &.{chunk}, offset);
+        if (n == 0) break;
+        hasher.update(chunk[0..n]);
+        offset += n;
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    var out: [7 + 64]u8 = undefined;
+    @memcpy(out[0..7], "sha256:");
+    _ = std.fmt.bufPrint(out[7..], "{x}", .{&digest}) catch unreachable;
+    cached_build_id = out;
+    return cached_build_id.?[0..];
+}
+
+/// `ontology-rule-snapshot`: one consistent read exporting the canonical
+/// tinykg-ontology-rule-snapshot-v1 JSON
+/// (docs/frommetacodes/ontology-rule-snapshot-v1.md).
+const ontology_snapshot_command = struct {
+    pub fn run(
+        args: []const []const u8,
+        writer: anytype,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+    ) !void {
+        const parsed = try parseDbArgs(allocator, io, args, 2, 1, 9, true);
+        const project_node_id = try parseNodeIdArg(parsed.rest[0]);
+        var budgets = ontology_snapshot_data_plane.Budgets{};
+        var project_sha256: ?[]const u8 = null;
+        var project_key: ?[]const u8 = null;
+        var index: usize = 1;
+        while (index < parsed.rest.len) : (index += 2) {
+            const option = parsed.rest[index];
+            if (index + 1 >= parsed.rest.len) return error.MissingArgument;
+            const value = parsed.rest[index + 1];
+            if (std.mem.eql(u8, option, "--project-sha256")) {
+                project_sha256 = value;
+            } else if (std.mem.eql(u8, option, "--project-key")) {
+                project_key = value;
+            } else if (std.mem.eql(u8, option, "--max-items")) {
+                budgets.max_items = std.fmt.parseInt(u64, value, 10) catch return error.InvalidLimit;
+            } else if (std.mem.eql(u8, option, "--max-chars")) {
+                budgets.max_chars = std.fmt.parseInt(u64, value, 10) catch return error.InvalidLimit;
+            } else {
+                return error.UnknownOption;
+            }
+        }
+        const expected_sha = project_sha256 orelse return error.MissingArgument;
+        const expected_key = project_key orelse return error.MissingArgument;
+
+        const build_id = try engineBuildId(allocator, io);
+        const cli_lock = try CliStoreLock.acquire(allocator, io, parsed.db_path);
+        defer cli_lock.deinit();
+        var store = try storage.Store.open(allocator, io, parsed.db_path);
+        defer store.deinit();
+        const snapshot = try ontology_snapshot_data_plane.exportOntologySnapshotAlloc(
+            allocator,
+            store,
+            project_node_id,
+            expected_sha,
+            expected_key,
+            budgets,
+            build_id,
+        );
+        defer allocator.free(snapshot);
+        try writer.print("{s}\n", .{snapshot});
+    }
+};
+
+/// `task-snapshot`: one consistent read exporting the canonical
+/// tinykg-task-snapshot-v1 JSON (docs/frommetacodes/task-snapshot-v1.md).
+/// Success writes exactly the canonical object plus one newline; every
+/// failure is a typed error with no success body.
+const task_snapshot_command = struct {
+    pub fn run(
+        args: []const []const u8,
+        writer: anytype,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+    ) !void {
+        const parsed = try parseDbArgs(allocator, io, args, 2, 1, 7, true);
+        var budgets = task_snapshot_data_plane.Budgets{};
+        const root_id = try parseNodeIdArg(parsed.rest[0]);
+        var index: usize = 1;
+        while (index < parsed.rest.len) : (index += 2) {
+            const option = parsed.rest[index];
+            if (index + 1 >= parsed.rest.len) return error.MissingArgument;
+            const value = std.fmt.parseInt(u64, parsed.rest[index + 1], 10) catch return error.InvalidLimit;
+            if (std.mem.eql(u8, option, "--max-tasks")) {
+                budgets.max_tasks = value;
+            } else if (std.mem.eql(u8, option, "--max-edges")) {
+                budgets.max_edges = value;
+            } else if (std.mem.eql(u8, option, "--max-chars")) {
+                budgets.max_chars = value;
+            } else {
+                return error.UnknownOption;
+            }
+        }
+
+        const cli_lock = try CliStoreLock.acquire(allocator, io, parsed.db_path);
+        defer cli_lock.deinit();
+        var store = try storage.Store.open(allocator, io, parsed.db_path);
+        defer store.deinit();
+        const now_ns = try u128ToU64(persistentNowNs(io));
+        const snapshot = try task_snapshot_data_plane.exportTaskSnapshotAlloc(allocator, store, root_id, budgets, now_ns);
+        defer allocator.free(snapshot);
+        try writer.print("{s}\n", .{snapshot});
+    }
+};
+
 const TaskLeaseCommandOps = struct {
     pub fn parseDbArguments(
         allocator: std.mem.Allocator,
@@ -3134,9 +4082,12 @@ const TaskLeaseCommandOps = struct {
     };
 
     pub const Context = struct {
-        cli_lock: CliStoreLock,
+        cli_lock: ?CliStoreLock,
         store: storage.Store,
         io: std.Io,
+        /// Borrowed contexts wrap a store the caller keeps open (the daemon's
+        /// resident handle); they take no CLI lock and never close the store.
+        borrowed: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8) !Context {
             const cli_lock = try CliStoreLock.acquire(allocator, io, db_path);
@@ -3145,9 +4096,14 @@ const TaskLeaseCommandOps = struct {
             return .{ .cli_lock = cli_lock, .store = store, .io = io };
         }
 
+        pub fn initBorrowed(io: std.Io, store: storage.Store) Context {
+            return .{ .cli_lock = null, .store = store, .io = io, .borrowed = true };
+        }
+
         pub fn deinit(self: *Context) void {
+            if (self.borrowed) return;
             self.store.deinit();
-            self.cli_lock.deinit();
+            if (self.cli_lock) |lock| lock.deinit();
         }
 
         pub fn inspectClaim(
@@ -3289,9 +4245,12 @@ const TaskCloseCommandOps = struct {
     }
 
     pub const Context = struct {
-        cli_lock: CliStoreLock,
+        cli_lock: ?CliStoreLock,
         store: storage.Store,
         io: std.Io,
+        /// Borrowed contexts wrap a store the caller keeps open (the daemon's
+        /// resident handle); they take no CLI lock and never close the store.
+        borrowed: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8) !Context {
             const cli_lock = try CliStoreLock.acquire(allocator, io, db_path);
@@ -3300,9 +4259,14 @@ const TaskCloseCommandOps = struct {
             return .{ .cli_lock = cli_lock, .store = store, .io = io };
         }
 
+        pub fn initBorrowed(io: std.Io, store: storage.Store) Context {
+            return .{ .cli_lock = null, .store = store, .io = io, .borrowed = true };
+        }
+
         pub fn deinit(self: *Context) void {
+            if (self.borrowed) return;
             self.store.deinit();
-            self.cli_lock.deinit();
+            if (self.cli_lock) |lock| lock.deinit();
         }
 
         pub fn validateTransition(
@@ -3429,9 +4393,12 @@ const TaskEventCommandOps = struct {
     }
 
     pub const Context = struct {
-        cli_lock: CliStoreLock,
+        cli_lock: ?CliStoreLock,
         store: storage.Store,
         io: std.Io,
+        /// Borrowed contexts wrap a store the caller keeps open (the daemon's
+        /// resident handle); they take no CLI lock and never close the store.
+        borrowed: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8) !Context {
             const cli_lock = try CliStoreLock.acquire(allocator, io, db_path);
@@ -3440,9 +4407,14 @@ const TaskEventCommandOps = struct {
             return .{ .cli_lock = cli_lock, .store = store, .io = io };
         }
 
+        pub fn initBorrowed(io: std.Io, store: storage.Store) Context {
+            return .{ .cli_lock = null, .store = store, .io = io, .borrowed = true };
+        }
+
         pub fn deinit(self: *Context) void {
+            if (self.borrowed) return;
             self.store.deinit();
-            self.cli_lock.deinit();
+            if (self.cli_lock) |lock| lock.deinit();
         }
 
         pub fn validateTargets(
@@ -3717,9 +4689,12 @@ const PropertyCommandOps = struct {
 
     pub const Context = struct {
         allocator: std.mem.Allocator,
-        cli_lock: CliStoreLock,
+        cli_lock: ?CliStoreLock,
         store: storage.Store,
         effective_schema: EffectiveSchemaRegistry,
+        /// Borrowed contexts wrap the daemon's resident store: no CLI lock,
+        /// and the store handle is never closed here.
+        borrowed: bool = false,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -3740,10 +4715,28 @@ const PropertyCommandOps = struct {
             };
         }
 
+        pub fn initBorrowed(
+            allocator: std.mem.Allocator,
+            io: std.Io,
+            store: storage.Store,
+            schema_path: ?[]const u8,
+        ) !Context {
+            const effective_schema = try loadEffectiveSchemaRegistry(allocator, io, store, schema_path);
+            return .{
+                .allocator = allocator,
+                .cli_lock = null,
+                .store = store,
+                .effective_schema = effective_schema,
+                .borrowed = true,
+            };
+        }
+
         pub fn deinit(self: *Context) void {
             self.effective_schema.deinit();
-            self.store.deinit();
-            self.cli_lock.deinit();
+            if (!self.borrowed) {
+                self.store.deinit();
+                if (self.cli_lock) |lock| lock.deinit();
+            }
             self.* = undefined;
         }
 
@@ -3973,8 +4966,11 @@ const EdgeMutationCommandOps = struct {
     pub const Context = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
-        cli_lock: CliStoreLock,
+        cli_lock: ?CliStoreLock,
         store: storage.Store,
+        /// Borrowed contexts wrap a store the caller keeps open (the daemon's
+        /// resident handle); they take no CLI lock and never close the store.
+        borrowed: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8) !Context {
             const cli_lock = try CliStoreLock.acquire(allocator, io, db_path);
@@ -3988,9 +4984,23 @@ const EdgeMutationCommandOps = struct {
             };
         }
 
+        pub fn initBorrowed(allocator: std.mem.Allocator, io: std.Io, store: storage.Store) Context {
+            return .{
+                .allocator = allocator,
+                .io = io,
+                .cli_lock = null,
+                .store = store,
+                .borrowed = true,
+            };
+        }
+
         pub fn deinit(self: *Context) void {
+            if (self.borrowed) {
+                self.* = undefined;
+                return;
+            }
             self.store.deinit();
-            self.cli_lock.deinit();
+            if (self.cli_lock) |lock| lock.deinit();
             self.* = undefined;
         }
 
@@ -4361,6 +5371,10 @@ const RootCommandDispatchPipelineOps = struct {
     pub const taskLeaseCommandsValue = task_lease_commands;
     pub const taskCloseCommandValue = task_close_command;
     pub const taskEventCommandValue = task_event_command;
+    pub const taskSnapshotCommandValue = task_snapshot_command;
+    pub const ontologySnapshotCommandValue = ontology_snapshot_command;
+    pub const memoryMigrationCommandValue = memory_migration_command;
+    pub const materializeCheckpointCommandValue = materialize_checkpoint_command;
     pub const governanceCommandValue = governance_command;
     pub const segmentCommandsValue = segment_commands;
     pub const versionCliValue = version.cli;
@@ -4404,6 +5418,27 @@ const RootCommandDispatchPipelineOps = struct {
 };
 
 const root_command_dispatch_pipeline = root_command_dispatch_pipeline_mod.RootCommandDispatchPipeline(RootCommandDispatchPipelineOps);
+
+const LibraryInvocationOps = struct {
+    pub fn enterEnvironment(environment: ?*const std.process.Environ.Map) RuntimeEnvironmentScope {
+        return enterRuntimeEnvironment(environment);
+    }
+
+    pub fn dispatch(
+        argv: []const []const u8,
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+    ) !void {
+        return root_command_dispatch_pipeline.run(argv, writer, allocator, io);
+    }
+};
+
+const library_invocation = library_invocation_mod.LibraryInvocation(LibraryInvocationOps);
+
+pub const Invocation = library_invocation.Invocation;
+pub const invoke = library_invocation.invoke;
+pub const invokeAlloc = library_invocation.invokeAlloc;
 
 pub fn run(args: []const []const u8, writer: anytype, allocator: std.mem.Allocator, io: std.Io) !void {
     return root_command_dispatch_pipeline.run(args, writer, allocator, io);
@@ -4925,10 +5960,27 @@ const CliStoreLock = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     lock_path: []u8,
+    daemon_access_guard: ?daemon_ownership_lock_mod.AccessGuard,
 
     pub fn acquire(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8) !CliStoreLock {
+        const daemon_internal = if (runtime_environment.get("TINYKG_DAEMON_INTERNAL")) |value|
+            std.mem.eql(u8, value, "1")
+        else
+            false;
+        var daemon_access_guard: ?daemon_ownership_lock_mod.AccessGuard = null;
+        if (!daemon_internal) {
+            // An active `.tinykg-daemon.lock` makes the daemon the only Store
+            // owner. Keep the shared access guard through the complete CLI
+            // critical section so a daemon cannot start between admission and
+            // Store teardown.
+            daemon_access_guard = daemon_ownership_lock_mod.AccessGuard.acquire(allocator, io, db_path) catch |err| switch (err) {
+                error.DaemonAlreadyOwnsStore => return error.DaemonAlreadyOwnsStore,
+                else => |e| return e,
+            };
+        }
+        errdefer if (daemon_access_guard) |*guard| guard.deinit();
         const lock_path = try cliStoreLockPath(allocator, io, db_path);
-        return acquireOwnedPath(allocator, io, lock_path);
+        return acquireOwnedPath(allocator, io, lock_path, daemon_access_guard);
     }
 
     pub fn acquireAdjacent(allocator: std.mem.Allocator, io: std.Io, path: []const u8, suffix: []const u8) !CliStoreLock {
@@ -4937,10 +5989,15 @@ const CliStoreLock = struct {
         const parent_path = std.fs.path.dirname(canonical_path) orelse ".";
         try std.Io.Dir.cwd().createDirPath(io, parent_path);
         const lock_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ canonical_path, suffix });
-        return acquireOwnedPath(allocator, io, lock_path);
+        return acquireOwnedPath(allocator, io, lock_path, null);
     }
 
-    fn acquireOwnedPath(allocator: std.mem.Allocator, io: std.Io, lock_path: []u8) !CliStoreLock {
+    fn acquireOwnedPath(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        lock_path: []u8,
+        daemon_access_guard: ?daemon_ownership_lock_mod.AccessGuard,
+    ) !CliStoreLock {
         errdefer allocator.free(lock_path);
 
         var waited_ms: u64 = 0;
@@ -4961,13 +6018,22 @@ const CliStoreLock = struct {
             };
             errdefer std.Io.Dir.cwd().deleteTree(io, lock_path) catch {};
             try writeCliStoreLockOwner(allocator, io, lock_path);
-            return .{ .allocator = allocator, .io = io, .lock_path = lock_path };
+            return .{
+                .allocator = allocator,
+                .io = io,
+                .lock_path = lock_path,
+                .daemon_access_guard = daemon_access_guard,
+            };
         }
     }
 
     pub fn deinit(self: CliStoreLock) void {
         std.Io.Dir.cwd().deleteTree(self.io, self.lock_path) catch {};
         self.allocator.free(self.lock_path);
+        if (self.daemon_access_guard) |guard_value| {
+            var guard = guard_value;
+            guard.deinit();
+        }
     }
 
     /// A bootstrap store is locked while it still has its staging name.  Once
@@ -5370,6 +6436,7 @@ const StoreMigrationV2DataPlaneOps = struct {
     };
 
     pub const schema_version_current = current_schema_version;
+    pub const storage_format_version_current = current_storage_format_version;
     pub const transaction_marker_file_name = store_migration_transaction_marker_file;
     pub const transaction_marker_format_name = store_migration_transaction_marker_format;
     pub const transaction_marker_legacy_format_name = store_migration_transaction_marker_legacy_format;
@@ -5547,6 +6614,10 @@ const MigrationPropertyLookup = struct {
         }) orelse return null;
         if (index >= self.snapshot.entries.len) return null;
         return self.snapshot.entries[index];
+    }
+
+    pub fn snapshotView(self: *const MigrationPropertyLookup) storage.PropertySnapshot {
+        return self.snapshot;
     }
 };
 
@@ -6294,6 +7365,7 @@ fn normalizeEdgeUintPropertyKey(key: []const u8) ![]const u8 {
 const parseGovernNodeArgs = governed_node_write_admission.parseGovernNodeArgs;
 const nodeVisibleTextFromGovernanceArgs = governed_node_write_admission.nodeVisibleTextFromGovernanceArgs;
 const applyNodeGovernanceProperties = governed_node_write_admission.applyNodeGovernanceProperties;
+const collectNodeGovernanceProperties = governed_node_write_admission.collectNodeGovernanceProperties;
 const u128ToU64 = governed_node_write_admission.u128ToU64;
 fn writeGovernanceJsonStringField(writer: *QueryOutputWriter, field: []const u8, value: []const u8, first_field: *bool) !void {
     try writeGovernanceJsonFieldPrefix(writer, field, first_field);
@@ -7307,9 +8379,12 @@ fn anyPathExists(io: std.Io, path: []const u8) !bool {
 }
 
 fn existingTinyKgStorePath(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8) !bool {
-    const path = try std.fs.path.join(allocator, &.{ db_path, "events.bin" });
-    defer allocator.free(path);
-    return fileExists(io, path);
+    const legacy_path = try std.fs.path.join(allocator, &.{ db_path, "events.bin" });
+    defer allocator.free(legacy_path);
+    if (try fileExists(io, legacy_path)) return true;
+    const compact_path = try std.fs.path.join(allocator, &.{ db_path, checkpoint.current_leaf });
+    defer allocator.free(compact_path);
+    return fileExists(io, compact_path);
 }
 
 fn fileExists(io: std.Io, path: []const u8) !bool {
@@ -7386,6 +8461,29 @@ fn validateParsedStringProperty(owner: storage.PropertyOwner, key: []const u8, v
                 try validateNodeLlmMetadataGranularity(null, null, value);
             } else if (std.mem.eql(u8, key, "name")) {
                 try validateNodeLlmMetadataGranularity(value, null, null);
+            } else if (std.mem.eql(u8, key, "project_sha256")) {
+                // Persistent project identity for ontology snapshots: exactly
+                // 64 lowercase hex, validated at write so identity mismatch
+                // never originates inside TinyKG.
+                if (value.len != 64) return error.InvalidRecord;
+                for (value) |byte| switch (byte) {
+                    '0'...'9', 'a'...'f' => {},
+                    else => return error.InvalidRecord,
+                };
+            } else if (std.mem.eql(u8, key, "project_key")) {
+                if (value.len == 0 or value.len > 200) return error.InvalidRecord;
+            } else if (std.mem.eql(u8, key, "ontology_authority")) {
+                if (!std.mem.eql(u8, value, "user") and
+                    !std.mem.eql(u8, value, "host_observed") and
+                    !std.mem.eql(u8, value, "external_evidence") and
+                    !std.mem.eql(u8, value, "agent_hypothesis"))
+                {
+                    return error.InvalidRecord;
+                }
+            } else if (std.mem.eql(u8, key, "ontology_falsifier")) {
+                if (value.len == 0 or value.len > 4096) return error.InvalidRecord;
+            } else if (std.mem.eql(u8, key, "ontology_provenance")) {
+                if (value.len == 0 or value.len > 16384) return error.InvalidRecord;
             } else {
                 return error.InvalidRecord;
             }
@@ -10703,7 +11801,7 @@ test "upgrade current store is a read-only no-op and does not publish target" {
     out.buffer.clearRetainingCapacity();
     try run(&.{ "tinykg", "upgrade", source_path, target_path }, &out, std.testing.allocator, std.testing.io);
     try std.testing.expect(std.mem.indexOf(u8, out.buffer.items, "result=current action=noop") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.buffer.items, "detected_manifest=1 detected_storage=2 detected_schema=3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffer.items, "detected_manifest=1 detected_storage=3 detected_schema=3") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.buffer.items, "catalog=present detected_catalog=2") != null);
     try std.testing.expect(!try anyPathExists(std.testing.io, target_path));
     const after = try storeContentIdentity(std.testing.allocator, std.testing.io, source_path);
@@ -10802,7 +11900,7 @@ test "upgrade legacy store preserves ids catalog properties sidecar and source" 
     const manifest = try readStoreManifestSummary(std.testing.allocator, std.testing.io, target_path);
     defer manifest.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("1", manifest.store_manifest_version);
-    try std.testing.expectEqualStrings("2", manifest.storage_format_version);
+    try std.testing.expectEqualStrings("3", manifest.storage_format_version);
     try std.testing.expectEqualStrings("3", manifest.schema_version);
 }
 
@@ -10840,7 +11938,7 @@ test "upgrade schema v2 manifest selects task lifecycle migration" {
     var out = QueryOutputWriter{ .allocator = std.testing.allocator };
     defer out.buffer.deinit(std.testing.allocator);
     try run(&.{ "tinykg", "upgrade", source_path, target_path, "--warm-text" }, &out, std.testing.allocator, std.testing.io);
-    try std.testing.expect(std.mem.indexOf(u8, out.buffer.items, "detected_manifest=1 detected_storage=2 detected_schema=2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffer.items, "detected_manifest=1 detected_storage=3 detected_schema=2") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.buffer.items, "target_schema=3 verified=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.buffer.items, "text_warmed=1") != null);
 
@@ -10883,17 +11981,17 @@ test "upgrade rejects future malformed and incomplete current stores before targ
     }{
         .{
             .name = "future-manifest-target.kg",
-            .manifest = "{\"store_manifest_version\":2,\"storage_format_version\":2,\"schema\":{\"schema_version\":3}}",
+            .manifest = "{\"store_manifest_version\":2,\"storage_format_version\":3,\"schema\":{\"schema_version\":3}}",
             .expected = error.NewerStoreManifest,
         },
         .{
             .name = "future-storage-target.kg",
-            .manifest = "{\"store_manifest_version\":1,\"storage_format_version\":3,\"schema\":{\"schema_version\":3}}",
+            .manifest = "{\"store_manifest_version\":1,\"storage_format_version\":4,\"schema\":{\"schema_version\":3}}",
             .expected = error.NewerStorageFormat,
         },
         .{
             .name = "future-schema-target.kg",
-            .manifest = "{\"store_manifest_version\":1,\"storage_format_version\":2,\"schema\":{\"schema_version\":4}}",
+            .manifest = "{\"store_manifest_version\":1,\"storage_format_version\":3,\"schema\":{\"schema_version\":4}}",
             .expected = error.NewerSchemaVersion,
         },
         .{
@@ -10903,7 +12001,7 @@ test "upgrade rejects future malformed and incomplete current stores before targ
         },
         .{
             .name = "catalog-schema-mismatch-target.kg",
-            .manifest = "{\"store_manifest_version\":1,\"storage_format_version\":2,\"schema\":{\"schema_version\":3,\"enabled_profiles\":[\"agent-dag\"]}}",
+            .manifest = "{\"store_manifest_version\":1,\"storage_format_version\":3,\"schema\":{\"schema_version\":3,\"enabled_profiles\":[\"agent-dag\"]}}",
             .expected = error.CatalogSchemaMismatch,
         },
     };
@@ -11075,7 +12173,7 @@ test "migrate-store-v2 physically repairs legacy props text into new store" {
     defer std.testing.allocator.free(manifest_path);
     const manifest = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, manifest_path, std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(manifest);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"storage_format_version\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"storage_format_version\": 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"schema_version\": 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"agent-dag\"") != null);
 
@@ -11159,6 +12257,9 @@ test "migrate-store-v2 task status migration preserves ids and only converts hig
     // Lifecycle fields normalized by task-status-v1 have exactly one writer:
     // the generic property copy must not first append stale values and rely
     // on a later duplicate delta record to hide them.
+    // Preserve every effective source property, including compatible history
+    // that is not re-enumerated by the current catalog, while normalized
+    // lifecycle fields still have exactly one writer.
     try std.testing.expect(std.mem.indexOf(u8, out.buffer.items, "node_properties_written=31 ") != null);
 
     var migrated = try storage.Store.open(std.testing.allocator, std.testing.io, new_path);
@@ -14757,7 +15858,7 @@ test "init command publishes empty store and canonical manifest" {
     const manifest = try readStoreManifestSummary(std.testing.allocator, std.testing.io, db_path);
     defer manifest.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("present", manifest.status);
-    try std.testing.expectEqualStrings("2", manifest.storage_format_version);
+    try std.testing.expectEqualStrings("3", manifest.storage_format_version);
     try std.testing.expectEqualStrings("3", manifest.schema_version);
     try std.testing.expectEqualStrings("", manifest.enabled_profiles);
     try std.testing.expectEqualStrings("init", manifest.migration_name);
@@ -14834,4 +15935,147 @@ test "default db path can come from TINYKG_STORE" {
     try std.testing.expectEqualStrings(default_db_path, defaultDbPathFromEnv(null));
     try std.testing.expectEqualStrings(default_db_path, defaultDbPathFromEnv(empty));
     try std.testing.expectEqualStrings(custom, defaultDbPathFromEnv(custom));
+}
+
+test "task-snapshot exports canonical deterministic v1 with typed failures" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const db_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "snap.kg" });
+    defer std.testing.allocator.free(db_path);
+
+    var out = QueryOutputWriter{ .allocator = std.testing.allocator };
+    defer out.buffer.deinit(std.testing.allocator);
+    try run(&.{ "tinykg", "init", db_path }, &out, std.testing.allocator, std.testing.io);
+    try run(&.{ "tinykg", "add-node", db_path, "task", "root goal" }, &out, std.testing.allocator, std.testing.io); // 1
+    try run(&.{ "tinykg", "add-node", db_path, "task", "child a" }, &out, std.testing.allocator, std.testing.io); // 2
+    try run(&.{ "tinykg", "add-node", db_path, "task", "child b" }, &out, std.testing.allocator, std.testing.io); // 3
+    try run(&.{ "tinykg", "add-node", db_path, "observation", "not a task" }, &out, std.testing.allocator, std.testing.io); // 4
+    try run(&.{ "tinykg", "relate", db_path, "1", "contain", "2" }, &out, std.testing.allocator, std.testing.io);
+    try run(&.{ "tinykg", "relate", db_path, "1", "contain", "3" }, &out, std.testing.allocator, std.testing.io);
+    try run(&.{ "tinykg", "relate", db_path, "1", "contain", "4" }, &out, std.testing.allocator, std.testing.io); // non-task child stays out
+    try run(&.{ "tinykg", "task-claim", db_path, "2", "--by", "agent-x" }, &out, std.testing.allocator, std.testing.io);
+    try run(&.{ "tinykg", "task-close", db_path, "3", "completed", "--by", "agent-x", "--evidence-text", "done b" }, &out, std.testing.allocator, std.testing.io);
+    try run(&.{ "tinykg", "relate", db_path, "2", "depends_on", "3" }, &out, std.testing.allocator, std.testing.io);
+
+    // Identical repeated reads must produce identical canonical bytes.
+    var first = QueryOutputWriter{ .allocator = std.testing.allocator };
+    defer first.buffer.deinit(std.testing.allocator);
+    try run(&.{ "tinykg", "task-snapshot", db_path, "1" }, &first, std.testing.allocator, std.testing.io);
+    var second = QueryOutputWriter{ .allocator = std.testing.allocator };
+    defer second.buffer.deinit(std.testing.allocator);
+    try run(&.{ "tinykg", "task-snapshot", db_path, "1" }, &second, std.testing.allocator, std.testing.io);
+    try std.testing.expectEqualStrings(first.buffer.items, second.buffer.items);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, std.mem.trimEnd(u8, first.buffer.items, "\n"), .{});
+    defer parsed.deinit();
+    const body = parsed.value.object;
+    try std.testing.expectEqualStrings("tinykg-task-snapshot-v1", body.get("schema_version").?.string);
+    try std.testing.expectEqual(@as(usize, 64), body.get("revision").?.string.len);
+    const summary = body.get("summary").?.object;
+    try std.testing.expectEqual(@as(i64, 3), summary.get("task_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), summary.get("hierarchy_edge_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), summary.get("dependency_edge_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), summary.get("evidence_count").?.integer);
+    try std.testing.expectEqual(false, summary.get("truncated").?.bool);
+    const tasks = body.get("tasks").?.array.items;
+    try std.testing.expectEqualStrings("open", tasks[0].object.get("status").?.string);
+    try std.testing.expectEqualStrings("claimed", tasks[1].object.get("status").?.string);
+    try std.testing.expectEqualStrings("agent-x", tasks[1].object.get("claimed_by").?.string);
+    try std.testing.expectEqualStrings("completed", tasks[2].object.get("status").?.string);
+    try std.testing.expect(tasks[2].object.get("claimed_by").? == .null);
+    const verified = body.get("verified_by").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), verified.len);
+    try std.testing.expectEqual(@as(i64, 3), verified[0].object.get("src").?.integer);
+
+    // A mutation that changes the semantic body must change the revision.
+    const revision_before = try std.testing.allocator.dupe(u8, body.get("revision").?.string);
+    defer std.testing.allocator.free(revision_before);
+    try run(&.{ "tinykg", "task-release", db_path, "2", "--by", "agent-x" }, &out, std.testing.allocator, std.testing.io);
+    var third = QueryOutputWriter{ .allocator = std.testing.allocator };
+    defer third.buffer.deinit(std.testing.allocator);
+    try run(&.{ "tinykg", "task-snapshot", db_path, "1" }, &third, std.testing.allocator, std.testing.io);
+    const reparsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, std.mem.trimEnd(u8, third.buffer.items, "\n"), .{});
+    defer reparsed.deinit();
+    try std.testing.expect(!std.mem.eql(u8, revision_before, reparsed.value.object.get("revision").?.string));
+
+    // Typed failures produce no success body.
+    var failed = QueryOutputWriter{ .allocator = std.testing.allocator };
+    defer failed.buffer.deinit(std.testing.allocator);
+    try std.testing.expectError(error.InvalidTaskRoot, run(&.{ "tinykg", "task-snapshot", db_path, "4" }, &failed, std.testing.allocator, std.testing.io));
+    try std.testing.expectError(error.TaskSnapshotTooLarge, run(&.{ "tinykg", "task-snapshot", db_path, "1", "--max-tasks", "2" }, &failed, std.testing.allocator, std.testing.io));
+    try std.testing.expectError(error.InvalidLimit, run(&.{ "tinykg", "task-snapshot", db_path, "1", "--max-tasks", "0" }, &failed, std.testing.allocator, std.testing.io));
+    try std.testing.expectEqual(@as(usize, 0), failed.buffer.items.len);
+}
+
+test "ontology-rule-snapshot exports canonical v1 with identity and provenance discipline" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const db_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "onto.kg" });
+    defer std.testing.allocator.free(db_path);
+    const sha = "ab" ** 32;
+    const other_sha = "cd" ** 32;
+
+    var out = QueryOutputWriter{ .allocator = std.testing.allocator };
+    defer out.buffer.deinit(std.testing.allocator);
+    try run(&.{ "tinykg", "init", db_path }, &out, std.testing.allocator, std.testing.io);
+    try run(&.{ "tinykg", "add-node", db_path, "project", "governed project" }, &out, std.testing.allocator, std.testing.io); // 1
+    try run(&.{ "tinykg", "set-property", db_path, "node", "1", "project_sha256", sha }, &out, std.testing.allocator, std.testing.io);
+    try run(&.{ "tinykg", "set-property", db_path, "node", "1", "project_key", "metacodes:demo" }, &out, std.testing.allocator, std.testing.io);
+    try run(&.{ "tinykg", "add-node", db_path, "concept", "claim body", "--schema-type", "proposition" }, &out, std.testing.allocator, std.testing.io); // 2
+    try run(&.{ "tinykg", "add-node", db_path, "observation", "supporting evidence" }, &out, std.testing.allocator, std.testing.io); // 3
+    try run(&.{ "tinykg", "relate", db_path, "1", "contain", "2" }, &out, std.testing.allocator, std.testing.io);
+    try run(&.{ "tinykg", "relate", db_path, "1", "contain", "3" }, &out, std.testing.allocator, std.testing.io);
+    try run(&.{ "tinykg", "set-property", db_path, "node", "2", "ontology_authority", "agent_hypothesis" }, &out, std.testing.allocator, std.testing.io);
+    try run(&.{ "tinykg", "set-property", db_path, "node", "2", "ontology_falsifier", "bounded counterexample" }, &out, std.testing.allocator, std.testing.io);
+    const provenance = "{\"schema_version\":\"tinykg-ontology-provenance-v1\",\"refs\":[{\"kind\":\"host_observation\",\"node_id\":3,\"evidence_sha256\":\"" ++ sha ++ "\"}]}";
+    try run(&.{ "tinykg", "set-property", db_path, "node", "2", "ontology_provenance", provenance }, &out, std.testing.allocator, std.testing.io);
+
+    var first = QueryOutputWriter{ .allocator = std.testing.allocator };
+    defer first.buffer.deinit(std.testing.allocator);
+    try run(&.{ "tinykg", "ontology-rule-snapshot", db_path, "1", "--project-sha256", sha, "--project-key", "metacodes:demo" }, &first, std.testing.allocator, std.testing.io);
+    var second = QueryOutputWriter{ .allocator = std.testing.allocator };
+    defer second.buffer.deinit(std.testing.allocator);
+    try run(&.{ "tinykg", "ontology-rule-snapshot", db_path, "1", "--project-sha256", sha, "--project-key", "metacodes:demo" }, &second, std.testing.allocator, std.testing.io);
+    try std.testing.expectEqualStrings(first.buffer.items, second.buffer.items);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, std.mem.trimEnd(u8, first.buffer.items, "\n"), .{});
+    defer parsed.deinit();
+    const body = parsed.value.object;
+    try std.testing.expectEqualStrings("tinykg-ontology-rule-snapshot-v1", body.get("schema_version").?.string);
+    try std.testing.expect(std.mem.startsWith(u8, body.get("tinykg_build_id").?.string, "sha256:"));
+    try std.testing.expectEqual(@as(usize, 64), body.get("revision").?.string.len);
+    try std.testing.expectEqual(@as(usize, 64), body.get("snapshot_sha256").?.string.len);
+    try std.testing.expectEqual(true, body.get("bounded").?.bool);
+    try std.testing.expectEqual(false, body.get("truncated").?.bool);
+    const items = body.get("ontology").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    const item = items[0].object;
+    try std.testing.expectEqualStrings("proposition", item.get("kind").?.string);
+    try std.testing.expectEqualStrings("agent_hypothesis", item.get("authority").?.string);
+    try std.testing.expectEqualStrings("project:metacodes:demo", item.get("scope").?.string);
+    try std.testing.expectEqual(@as(usize, 1), item.get("provenance").?.array.items.len);
+
+    // Governance flags exclude an item; the revision must change with it.
+    const revision_before = try std.testing.allocator.dupe(u8, body.get("revision").?.string);
+    defer std.testing.allocator.free(revision_before);
+    try run(&.{ "tinykg", "set-uint-property", db_path, "node", "2", "retrieval_excluded", "1" }, &out, std.testing.allocator, std.testing.io);
+    var third = QueryOutputWriter{ .allocator = std.testing.allocator };
+    defer third.buffer.deinit(std.testing.allocator);
+    try run(&.{ "tinykg", "ontology-rule-snapshot", db_path, "1", "--project-sha256", sha, "--project-key", "metacodes:demo" }, &third, std.testing.allocator, std.testing.io);
+    const reparsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, std.mem.trimEnd(u8, third.buffer.items, "\n"), .{});
+    defer reparsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), reparsed.value.object.get("ontology").?.array.items.len);
+    try std.testing.expect(!std.mem.eql(u8, revision_before, reparsed.value.object.get("revision").?.string));
+
+    // Identity drift and malformed provenance fail typed with no body.
+    var failed = QueryOutputWriter{ .allocator = std.testing.allocator };
+    defer failed.buffer.deinit(std.testing.allocator);
+    try std.testing.expectError(error.ProjectIdentityMismatch, run(&.{ "tinykg", "ontology-rule-snapshot", db_path, "1", "--project-sha256", other_sha, "--project-key", "metacodes:demo" }, &failed, std.testing.allocator, std.testing.io));
+    try std.testing.expectError(error.ProjectIdentityMismatch, run(&.{ "tinykg", "ontology-rule-snapshot", db_path, "1", "--project-sha256", sha, "--project-key", "metacodes:other" }, &failed, std.testing.allocator, std.testing.io));
+    try std.testing.expectError(error.InvalidRecord, run(&.{ "tinykg", "set-property", db_path, "node", "2", "ontology_authority", "made_up_authority" }, &failed, std.testing.allocator, std.testing.io));
+    try std.testing.expectEqual(@as(usize, 0), failed.buffer.items.len);
 }

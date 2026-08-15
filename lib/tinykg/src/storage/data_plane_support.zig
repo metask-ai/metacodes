@@ -1,3 +1,5 @@
+const property_block_codec = @import("property_block_codec.zig");
+
 /// Transitional storage support owner for rebuild state, index algorithms,
 /// segment streams and capability adapters. It is deliberately below one
 /// mebibyte and remains scheduled for responsibility-level refinement.
@@ -41,7 +43,7 @@ pub fn StorageDataPlaneSupport(comptime Ops: type) type {
         const repair_session_mod = Ops.dep_repair_session_mod;
         const store_bootstrap_mod = Ops.dep_store_bootstrap_mod;
         const store_cache_resources_mod = Ops.dep_store_cache_resources_mod;
-        const store_opening_mod = Ops.dep_store_opening_mod;
+        const store_opening_control = Ops.dep_store_opening_control;
         const EdgeIndexOrder = Ops.dep_EdgeIndexOrder;
         const EdgeIndexHeader = Ops.dep_EdgeIndexHeader;
         const EdgeIndexRecord = Ops.dep_EdgeIndexRecord;
@@ -116,6 +118,7 @@ pub fn StorageDataPlaneSupport(comptime Ops: type) type {
         pub const PropertyPayloadRedoJournalHeader = property_format.PropertyPayloadRedoJournalHeader;
         pub const PropertyPayloadIndexRecord = property_format.PropertyPayloadIndexRecord;
         pub const PropertyPayloadDeltaHeader = property_format.PropertyPayloadDeltaHeader;
+        pub const PropertyBlockView = property_block_codec.View;
         pub const NodePropertyValueBlockHeader = property_format.NodePropertyValueBlockHeader;
         pub const NodePropertyValueRecord = property_format.NodePropertyValueRecord;
 
@@ -933,10 +936,10 @@ pub fn StorageDataPlaneSupport(comptime Ops: type) type {
 
         pub fn propertyPayloadRecordLessThan(_: void, a: PropertyPayloadIndexRecord, b: PropertyPayloadIndexRecord) bool {
             if (a.key_hash != b.key_hash) return a.key_hash < b.key_hash;
-            if (a.value_type != b.value_type) return a.value_type < b.value_type;
-            if (a.value_hash != b.value_hash) return a.value_hash < b.value_hash;
             if (a.owner_kind != b.owner_kind) return a.owner_kind < b.owner_kind;
-            return a.owner_id < b.owner_id;
+            if (a.owner_id != b.owner_id) return a.owner_id < b.owner_id;
+            if (a.value_type != b.value_type) return a.value_type < b.value_type;
+            return a.value_hash < b.value_hash;
         }
 
         pub fn propertyPayloadEntryLessThan(_: void, a: PropertyPayloadIndexEntry, b: PropertyPayloadIndexEntry) bool {
@@ -1459,6 +1462,137 @@ pub fn StorageDataPlaneSupport(comptime Ops: type) type {
             if (end > source_texts_size) return error.CannotReuseNodeTexts;
             reuse_cursor.* = @max(reuse_cursor.*, end);
             return parsed_offset;
+        }
+
+        pub const AppendedNodeTail = struct {
+            ids: std.ArrayList(u64),
+            /// XOR of the canonical per-node digests of every tail node, so a
+            /// caller can prove catalog_digest ^ tail_digest == current index
+            /// digest before trusting an incremental merge. The structural
+            /// by-text-order digest is deliberately not part of this proof:
+            /// it hashes run-manifest layout, and incremental consumers read
+            /// node texts through live store reads, not through that layout.
+            node_digest_xor: u64 = 0,
+
+            pub fn deinit(self: *AppendedNodeTail, allocator: std.mem.Allocator) void {
+                self.ids.deinit(allocator);
+                self.* = undefined;
+            }
+        };
+
+        /// Node ids appended to the event log after `from_event_bytes` (a
+        /// record-group boundary such as the text catalog watermark), with
+        /// their combined canonical digest. Cost is O(tail); more than
+        /// `max_nodes` tail nodes fails with error.RecordTooLarge so callers
+        /// can fall back to full staleness handling. Whole-store rewrites
+        /// replace the event log, which invalidates any older watermark and
+        /// therefore never reaches this walk.
+        pub fn collectNodeTailAppendedSince(
+            store: Store,
+            allocator: std.mem.Allocator,
+            from_event_bytes: u64,
+            max_nodes: u64,
+        ) !AppendedNodeTail {
+            var tail = AppendedNodeTail{ .ids = std.ArrayList(u64).empty };
+            errdefer tail.deinit(allocator);
+            var texts = try NodeTextsView.open(store);
+            defer texts.deinit();
+            var file = try std.Io.Dir.cwd().openFile(store.io, store.events_bin_path, .{});
+            defer file.close(store.io);
+            const file_size = try store_plane.regularFileSize(store, file);
+            if (from_event_bytes > file_size) return error.InvalidRecord;
+            var offset: u64 = from_event_bytes;
+            var in_batch = false;
+            while (offset < file_size) {
+                const parsed = (try store_plane.readBinaryRecordHeader(store, file, &offset)) orelse return error.InvalidRecord;
+                try ensureBinaryPayloadFits(file_size, offset, parsed.payload_len);
+                const payload_len = std.math.cast(usize, parsed.payload_len) orelse return error.RecordTooLarge;
+                switch (parsed.kind) {
+                    .batch_begin => {
+                        if (in_batch or payload_len != 0) return error.InvalidRecord;
+                        in_batch = true;
+                    },
+                    .batch_commit => {
+                        if (!in_batch or payload_len != 0) return error.InvalidRecord;
+                        in_batch = false;
+                    },
+                    .node, .node_batch => {
+                        const payload = try allocator.alloc(u8, payload_len);
+                        defer allocator.free(payload);
+                        const read_len = try file.readPositionalAll(store.io, payload, offset);
+                        if (read_len != payload.len) return error.InvalidRecord;
+                        if (parsed.payload_checksum) |checksum| {
+                            if (binaryPayloadChecksum(payload) != checksum) return error.InvalidRecord;
+                        }
+                        if (parsed.kind == .node) {
+                            const node = try validateBinaryNodePayload(payload);
+                            try appendTailNode(&tail, allocator, &texts, node, max_nodes);
+                        } else {
+                            if (!in_batch) return error.InvalidRecord;
+                            const batch = try validateBinaryNodeBatchHeader(payload);
+                            // Derived-offset compact batches carry only text
+                            // lengths per row; per-node offsets accumulate
+                            // from the batch's base text offset, so the walk
+                            // keeps the running cursor the stateless
+                            // validator cannot.
+                            var derived_text_cursor: u64 = batch.base_text_offset;
+                            var index: u32 = 0;
+                            while (index < batch.count) : (index += 1) {
+                                const node = if (batch.derived_text_offset)
+                                    try derivedBatchTailNode(payload, batch, index, &derived_text_cursor)
+                                else
+                                    try validateBinaryNodeBatchNode(payload, batch, index);
+                                try appendTailNode(&tail, allocator, &texts, node, max_nodes);
+                            }
+                        }
+                    },
+                    .edge, .edge_batch, .edge_delete => {},
+                }
+                offset = std.math.add(u64, offset, parsed.payload_len) catch return error.InvalidRecord;
+            }
+            if (in_batch) return error.InvalidRecord;
+            return tail;
+        }
+
+        fn derivedBatchTailNode(
+            payload: []const u8,
+            batch: anytype,
+            index: u32,
+            derived_text_cursor: *u64,
+        ) !ParsedBinaryNode {
+            const row_offset = std.math.add(
+                usize,
+                batch.header_len,
+                std.math.mul(usize, @intCast(index), batch.row_len) catch return error.InvalidRecord,
+            ) catch return error.InvalidRecord;
+            if (row_offset + batch.row_len > payload.len) return error.InvalidRecord;
+            const row = payload[row_offset..][0..batch.row_len];
+            const text_len: u32 = if (batch.short_text_len)
+                std.mem.readInt(u16, row[0..2], .little)
+            else
+                std.mem.readInt(u32, row[0..4], .little);
+            const text_offset = derived_text_cursor.*;
+            derived_text_cursor.* = std.math.add(u64, text_offset, text_len) catch return error.InvalidRecord;
+            const id = std.math.add(u64, batch.dense_base_id, index) catch return error.InvalidRecord;
+            return .{
+                .id = id,
+                .kind = batch.uniform_kind orelse return error.InvalidRecord,
+                .text_offset = text_offset,
+                .text_len = text_len,
+            };
+        }
+
+        fn appendTailNode(
+            tail: *AppendedNodeTail,
+            allocator: std.mem.Allocator,
+            texts: *const NodeTextsView,
+            node: ParsedBinaryNode,
+            max_nodes: u64,
+        ) !void {
+            if (tail.ids.items.len >= max_nodes) return error.RecordTooLarge;
+            const digests = try texts.hashAndDigestStoredNode(node.id, node.kind, node.text_offset, node.text_len);
+            tail.node_digest_xor ^= digests.node_digest;
+            try tail.ids.append(allocator, node.id);
         }
 
         pub fn repairNodeTextMaterial(
@@ -2244,6 +2378,27 @@ pub fn StorageDataPlaneSupport(comptime Ops: type) type {
                 return std.Io.Dir.cwd().deleteFile(store.io, store.property_payload_delta_path);
             }
 
+            pub const CompactionMergeType = store_plane.PropertyPayloadCompactionMerge;
+
+            pub fn openCompactionMerge(store: Store, merge_allocator: std.mem.Allocator) !CompactionMergeType {
+                return CompactionMergeType.init(store, merge_allocator);
+            }
+
+            pub fn closeCompactionMerge(_: Store, merge: *CompactionMergeType) void {
+                merge.deinit();
+            }
+
+            pub fn compactionMergeExpectedCount(merge: *CompactionMergeType) u64 {
+                return merge.expected_count;
+            }
+
+            pub fn compactionMergeContext(merge: *CompactionMergeType) *anyopaque {
+                return @ptrCast(merge);
+            }
+
+            pub const compactionMergeRestart = CompactionMergeType.restart;
+            pub const compactionMergeNext = CompactionMergeType.next;
+
             pub fn keyNameValid(key: []const u8) bool {
                 return propertyKeyNameValid(key);
             }
@@ -2312,12 +2467,38 @@ pub fn StorageDataPlaneSupport(comptime Ops: type) type {
                 return store.node_texts_path;
             }
 
+            pub fn crashRecoveryAllowed(store: Store) bool {
+                return store.options.crash_recovery;
+            }
+
             pub fn shouldSync(store: Store) bool {
                 return selfOptionsNeedSync(store);
             }
 
             pub fn normalWriteMode(store: Store) bool {
                 return store.options.primary_text_write_mode == .normal;
+            }
+
+            /// Event-log watermark captured into v5 append journals so
+            /// bounded recovery scans only the interrupted suffix (12003).
+            /// Unknown on read failure: classification then falls back to
+            /// the full scan, never to a wrong bound.
+            pub fn journalEventWatermark(store: Store) u64 {
+                // maxInt is the shared "unknown" sentinel: classification
+                // must fall back to the full scan, never a wrong bound.
+                return store_plane.eventBytes(store) catch std.math.maxInt(u64);
+            }
+
+            /// Raw-residue ceiling for bulk loading: once the raw node-texts
+            /// file crosses this window the loader seals it into compressed
+            /// blocks instead of deferring one whole-corpus finalize. Bounds
+            /// the store-dir peak at compressed-so-far + one window.
+            pub fn rawFinalizeWindowBytes() u64 {
+                if (std.c.getenv("TINYKG_TEXT_RAW_FINALIZE_WINDOW_BYTES")) |raw| {
+                    const parsed = std.fmt.parseInt(u64, std.mem.span(raw), 10) catch 0;
+                    if (parsed != 0) return parsed;
+                }
+                return 256 * 1024 * 1024;
             }
 
             pub fn renameReplace(store: Store, tmp_path: []const u8, final_path: []const u8) !void {
@@ -2427,6 +2608,10 @@ pub fn StorageDataPlaneSupport(comptime Ops: type) type {
             pub const Request = StoreOpeningRequest;
             pub const StoreType = Store;
 
+            pub fn crashRecoveryAllowed(request: Request) bool {
+                return request.options.crash_recovery;
+            }
+
             pub fn createDirectory(request: Request) !void {
                 try std.Io.Dir.cwd().createDirPath(request.io, request.dir_path);
             }
@@ -2456,12 +2641,18 @@ pub fn StorageDataPlaneSupport(comptime Ops: type) type {
                 return (try store_plane.recoverNodeTextsAppendJournal(store)) == .committed;
             }
 
+            pub fn admitStoreFormat(store: StoreType) !bool {
+                return store_opening_control.admitStoreFormat(store);
+            }
+
             pub fn repairPersistentIndexesFromLog(store: StoreType) !void {
                 // The append journal only makes the node_texts.dat mutation durable.
                 // It commits before the event record and derived indexes, so a crash
-                // can leave a durable text tail that no event references. Repair on
-                // this crash-only path reconciles the tail against the event log.
-                try store_plane.repairPersistentIndexesFromLog(store);
+                // can leave a durable text tail that no event references. Bounded
+                // recovery classifies that interrupted write from the journal, the
+                // index watermark and the event tail, and only falls back to the
+                // full O(event-log) rebuild for states it cannot prove.
+                try store_plane.reconcileCommittedNodeTextsAppend(store);
             }
 
             pub fn recoverPropertyPayloadRedoJournal(store: StoreType) !void {
@@ -2473,7 +2664,7 @@ pub fn StorageDataPlaneSupport(comptime Ops: type) type {
             }
         };
 
-        pub const store_opening = store_opening_mod.StoreOpening(StoreOpeningOps);
+        pub const store_opening = store_opening_control.module.StoreOpening(StoreOpeningOps);
 
         pub const EdgeSegmentQueryOpeningOps = struct {
             pub const DirectionType = segment_mod.Direction;

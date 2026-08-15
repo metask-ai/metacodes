@@ -613,7 +613,7 @@ fn installTaskSnapshotWrapper(
     errdefer allocator.free(wrapper);
     const script = try std.fmt.allocPrint(
         allocator,
-        "#!/bin/sh\nif [ \"$1\" = \"task-snapshot\" ]; then printf '%s' '{s}'; exit 0; fi\nexec \"{s}\" \"$@\"\n",
+        "#!/bin/sh\nif [ \"$1\" = \"task-snapshot\" ]; then printf '%s\\n' '{s}'; exit 0; fi\nexec \"{s}\" \"$@\"\n",
         .{ snapshot, real_tinykg },
     );
     defer allocator.free(script);
@@ -637,6 +637,15 @@ fn findTinyKg(allocator: std.mem.Allocator) ?[]u8 {
     if (std.c.getenv("METACODES_KG_BIN")) |raw| {
         const path = std.mem.span(raw);
         if (isExecutable(path)) return allocator.dupe(u8, path) catch null;
+    }
+    // 本构建的 vendored 二进制优先:主仓路径可能存着旧格式版本的陈旧二进制,
+    // 命中它会让 L2 因版本门静默 skip。
+    if (cc.util_fs.getCwd(allocator) catch null) |cwd| {
+        defer allocator.free(cwd);
+        if (std.fmt.allocPrint(allocator, "{s}/zig-out/vendor/tinykg/tinykg", .{cwd}) catch null) |local| {
+            if (isExecutable(local)) return local;
+            allocator.free(local);
+        }
     }
     const raw_home = std.c.getenv("HOME") orelse return null;
     const home = std.mem.span(raw_home);

@@ -10,11 +10,21 @@ const cc = @import("cc");
 
 const KgClient = cc.kg_client.KgClient;
 
-/// 定位 tinykg 二进制:env METACODES_KG_BIN > vendor > dev(~/prj/tinykg)。
+/// 定位 tinykg 二进制:env METACODES_KG_BIN > 本构建 zig-out vendor > 主仓 vendor > dev(~/prj/tinykg)。
+/// 本构建的 vendored 二进制优先:worktree/CI 里主仓路径可能存着旧格式版本的陈旧
+/// 二进制,命中它会让整族 KG L2 因版本门静默 skip(覆盖悄悄消失)。
 fn findBin(allocator: std.mem.Allocator) ?[]u8 {
     if (std.c.getenv("METACODES_KG_BIN")) |v| {
         const p = std.mem.span(v);
         if (isX(p)) return allocator.dupe(u8, p) catch null;
+    }
+    if (cc.util_fs.getCwd(allocator) catch null) |cwd| {
+        defer allocator.free(cwd);
+        const local = std.fmt.allocPrint(allocator, "{s}/zig-out/vendor/tinykg/tinykg", .{cwd}) catch null;
+        if (local) |full| {
+            if (isX(full)) return full;
+            allocator.free(full);
+        }
     }
     const home_c = std.c.getenv("HOME") orelse return null;
     const home = std.mem.span(home_c);
@@ -809,10 +819,12 @@ test "L2 KG: schema v2 明确 degraded 并给 copy-on-write task-status-v1 迁�
     }
     const manifest_path = try std.fmt.allocPrint(a, "{s}/.tinykg/store-manifest.json", .{store});
     defer a.free(manifest_path);
+    // storage 保持当前期望版本,只降 schema:让测试打在 schema 门上,
+    // 而不是先被 storage 门拦下走另一条 degraded 消息。
     try overwriteFile(a, manifest_path,
         \\{
         \\  "store_manifest_version": 1,
-        \\  "storage_format_version": 2,
+        \\  "storage_format_version": 3,
         \\  "created_by": "tinykg",
         \\  "schema": {"schema_version": 2, "kernel_version": 1, "enabled_profiles": []},
         \\  "migration": {"name": "legacy-test", "source": "", "recorded_ns": 1}
@@ -2781,4 +2793,53 @@ test "L2 KG: general-purpose child gets read tools and an isolated KgClient" {
     // KgRecall sets abort on the client it executes against. The parent must stay untouched,
     // otherwise a child cancellation pointer leaks into the parent session after return.
     try std.testing.expect(kg.abort == null);
+}
+
+test "L2 /kg plan fresh-process byte stability: writer process A then root-id-only reader B render identical Markdown" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/plan-bytes.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    // Process A(writer): 建 root + 三步,覆盖 open/claimed/completed 三态与
+    // verified_by 证据,然后仅凭 TinyKG 渲染投影字节。
+    var root_id: u64 = 0;
+    var first: []u8 = undefined;
+    {
+        var writer_kg = try makeClient(a, bin, store, "proj-plan-bytes");
+        defer writer_kg.deinit();
+        writer_kg.ensureReady();
+        try std.testing.expect(writer_kg.ready);
+        root_id = try writer_kg.createTask("plan byte-stability root", "plan_root");
+        const done_step = try writer_kg.createChildTask(root_id, "已完成的第一步", "plan_step");
+        const claimed_step = try writer_kg.createChildTask(root_id, "认领中的第二步", "plan_step");
+        _ = try writer_kg.createChildTask(root_id, "未开始的第三步", "plan_step");
+        try writer_kg.closeTask(done_step, "第一步完成证据");
+        try writer_kg.claimTask(claimed_step, "byte-stability-agent");
+        first = try cc.kg_plan_view.render(a, &writer_kg, root_id);
+    }
+    defer a.free(first);
+    try std.testing.expect(std.mem.indexOf(u8, first, "已完成的第一步") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "认领中的第二步") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "未开始的第三步") != null);
+
+    // Process B(reader): 全新 KgClient,只拿 root id,不共享任何进程内状态;
+    // 两次渲染都必须与 A 的字节完全一致(fresh-process 最终门,任务 10829)。
+    {
+        var reader_kg = try makeClient(a, bin, store, "proj-plan-bytes");
+        defer reader_kg.deinit();
+        reader_kg.ensureReady();
+        try std.testing.expect(reader_kg.ready);
+        const second = try cc.kg_plan_view.render(a, &reader_kg, root_id);
+        defer a.free(second);
+        try std.testing.expectEqualStrings(first, second);
+        const third = try cc.kg_plan_view.render(a, &reader_kg, root_id);
+        defer a.free(third);
+        try std.testing.expectEqualStrings(first, third);
+    }
 }

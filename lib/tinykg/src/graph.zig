@@ -30,6 +30,10 @@ pub const Graph = struct {
     edge_ids: std.AutoHashMap(u64, void),
     next_node_id: u64,
     next_edge_id: u64,
+    /// When false, node text is borrowed from a caller-owned source that must
+    /// outlive the graph (for example a decoded checkpoint snapshot), and the
+    /// graph neither copies nor frees it.
+    owns_text: bool,
 
     pub fn init(allocator: std.mem.Allocator) Graph {
         return .{
@@ -40,12 +44,21 @@ pub const Graph = struct {
             .edge_ids = std.AutoHashMap(u64, void).init(allocator),
             .next_node_id = 1,
             .next_edge_id = 1,
+            .owns_text = true,
         };
     }
 
+    pub fn initBorrowedText(allocator: std.mem.Allocator) Graph {
+        var graph = init(allocator);
+        graph.owns_text = false;
+        return graph;
+    }
+
     pub fn deinit(self: *Graph) void {
-        for (self.nodes.items) |node| {
-            self.allocator.free(node.text);
+        if (self.owns_text) {
+            for (self.nodes.items) |node| {
+                self.allocator.free(node.text);
+            }
         }
         self.nodes.deinit(self.allocator);
         self.edges.deinit(self.allocator);
@@ -60,8 +73,8 @@ pub const Graph = struct {
         if (self.node_by_id.contains(id.toInt())) return core.Error.InvalidId;
         try self.nodes.ensureUnusedCapacity(self.allocator, 1);
         try self.node_by_id.ensureUnusedCapacity(1);
-        const owned_text = try self.allocator.dupe(u8, text);
-        errdefer self.allocator.free(owned_text);
+        const owned_text = if (self.owns_text) try self.allocator.dupe(u8, text) else text;
+        errdefer if (self.owns_text) self.allocator.free(owned_text);
         const node_index = self.nodes.items.len;
         self.nodes.appendAssumeCapacity(.{
             .id = id,
@@ -98,8 +111,8 @@ pub const Graph = struct {
         try validateNodeText(text);
         try self.nodes.ensureUnusedCapacity(self.allocator, 1);
         try self.node_by_id.ensureUnusedCapacity(1);
-        const owned_text = try self.allocator.dupe(u8, text);
-        errdefer self.allocator.free(owned_text);
+        const owned_text = if (self.owns_text) try self.allocator.dupe(u8, text) else text;
+        errdefer if (self.owns_text) self.allocator.free(owned_text);
         const node_index = self.nodes.items.len;
         self.nodes.appendAssumeCapacity(.{
             .id = id,
@@ -158,7 +171,7 @@ pub const Graph = struct {
         if (last.id.toInt() != id.toInt()) return false;
         if (self.hasIncidentEdge(id)) return false;
         const removed = self.nodes.pop().?;
-        self.allocator.free(removed.text);
+        if (self.owns_text) self.allocator.free(removed.text);
         _ = self.node_by_id.remove(id.toInt());
         self.next_node_id = self.recomputeNextNodeId();
         return true;

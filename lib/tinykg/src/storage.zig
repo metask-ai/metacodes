@@ -38,6 +38,7 @@ pub const SegmentKind = root.SegmentKind;
 pub const SegmentHeader = root.SegmentHeader;
 pub const Manifest = root.Manifest;
 pub const StoreStats = root.StoreStats;
+pub const StoreSizeSnapshot = root.StoreSizeSnapshot;
 pub const StoredNode = root.StoredNode;
 pub const StoredEdgeRef = root.StoredEdgeRef;
 pub const NodeRewriteResult = root.NodeRewriteResult;

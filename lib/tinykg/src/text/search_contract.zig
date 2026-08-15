@@ -26,6 +26,26 @@ pub fn SearchContract(
             /// Minimum CJK bigram coverage ratio. Zero still requires one matching
             /// bigram when a query contains bigrams; positive values tighten the gate.
             cjk_coverage_ratio: f32 = 0,
+            /// Two-index incremental merge: when set, this index scores with
+            /// the combined corpus statistics (N, average length, per-term
+            /// document frequency including the other index's contribution)
+            /// so scores from both sides rank on one scale, and postings
+            /// whose node id appears in `superseded_node_ids` are skipped
+            /// because the other index carries their newer version.
+            merge: ?*const TextMergeStats = null,
+        };
+
+        pub const TextMergeStats = struct {
+            /// Combined document count across both indexes.
+            doc_count: u64,
+            /// Combined weighted document length across both indexes.
+            total_doc_len: f64,
+            /// Document frequency of `term` in the other index.
+            other_df_context: *anyopaque,
+            otherDf: *const fn (context: *anyopaque, term: []const u8) u64,
+            /// Node ids whose documents in THIS index are superseded by the
+            /// other index and must not score or count.
+            superseded_node_ids: ?*const std.AutoHashMap(u64, void) = null,
         };
 
         pub const TextSearchHit = struct {

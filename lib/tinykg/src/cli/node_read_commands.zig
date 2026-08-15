@@ -137,6 +137,46 @@ pub fn NodeReadCommands(comptime Ops: type) type {
             try writer.writeAll(output);
         }
 
+
+        /// Daemon-resident point reads: identical parsing and rendering, but
+        /// against a store the caller keeps open. No per-request store
+        /// open/close, no CLI lock, and no repair from a borrowed context.
+        pub fn runGetWithStore(
+            store: anytype,
+            args: []const []const u8,
+            writer: anytype,
+            allocator: std.mem.Allocator,
+            io: std.Io,
+        ) !void {
+            const db = try Ops.parseDbArguments(allocator, io, args, 1, 6);
+            const parsed = try parseGetArguments(db.rest);
+            if (!std.mem.eql(u8, db.db_path, store.dir_path)) return error.StorePathMismatch;
+            var context = Ops.Context.initBorrowed(store);
+            defer context.deinit();
+            const node_id = try Ops.parseNodeId(parsed.node_id);
+            const output = try renderGetWithRepair(&context, allocator, node_id, parsed);
+            defer allocator.free(output);
+            try writer.writeAll(output);
+        }
+
+        pub fn runNodeWithStore(
+            store: anytype,
+            args: []const []const u8,
+            writer: anytype,
+            allocator: std.mem.Allocator,
+            io: std.Io,
+        ) !void {
+            const db = try Ops.parseDbArguments(allocator, io, args, 1, 6);
+            const parsed = try parseGetArguments(db.rest);
+            const node_id = try Ops.parseNodeId(parsed.node_id);
+            if (!std.mem.eql(u8, db.db_path, store.dir_path)) return error.StorePathMismatch;
+            var context = Ops.Context.initBorrowed(store);
+            defer context.deinit();
+            const output = try renderGetWithRepair(&context, allocator, node_id, parsed);
+            defer allocator.free(output);
+            try writer.writeAll(output);
+        }
+
         pub fn runVersions(
             args: []const []const u8,
             writer: anytype,

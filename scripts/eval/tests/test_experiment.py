@@ -249,7 +249,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 mock.Mock(returncode=0, stdout="ready\n", stderr=""),
                 mock.Mock(
                     returncode=0,
-                    stdout="storage_format_version=2\nschema_version=3\n",
+                    stdout="storage_format_version=3\nschema_version=3\n",
                     stderr="",
                 ),
             ]

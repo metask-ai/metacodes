@@ -864,7 +864,7 @@ test "formal source detail truncation preserves UTF-8 boundaries" {
 }
 
 const audit_fixture =
-    \\{"schema_version":"tinykg-task-snapshot-v1","root_id":1,"revision":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"task_count":2,"hierarchy_edge_count":1,"dependency_edge_count":0,"evidence_count":1,"verified_by_edge_count":1,"used_text_bytes":10,"truncated":false,"truncate_reason":null,"max_tasks":256,"max_edges":1024,"max_chars":200000},"tasks":[{"id":1,"status":"open","claimed_by":null,"text":"root"},{"id":2,"status":"completed","claimed_by":null,"text":"done"}],"hierarchy":[{"src":1,"rel":"contain","dst":2}],"dependencies":[],"evidence":[{"id":9,"kind":"verification","text":"ok"}],"verified_by":[{"src":2,"rel":"verified_by","dst":9}]}
+    \\{"schema_version":"tinykg-task-snapshot-v1","root_id":1,"revision":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"task_count":2,"hierarchy_edge_count":1,"dependency_edge_count":0,"evidence_count":1,"verified_by_edge_count":1,"used_text_bytes":10,"truncated":false,"truncate_reason":null,"max_tasks":256,"max_edges":1024,"max_chars":200000},"tasks":[{"id":1,"status":"open","claimed_by":null,"text":"root"},{"id":2,"status":"completed","claimed_by":null,"text":"done"}],"hierarchy":[{"src":1,"dst":2}],"dependencies":[],"evidence":[{"id":9,"kind":"verification","text":"ok"}],"verified_by":[{"src":2,"rel":"verified_by","dst":9}]}
 ;
 
 const audit_blocked_fixture =

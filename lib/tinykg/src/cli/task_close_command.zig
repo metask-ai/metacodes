@@ -28,6 +28,43 @@ pub fn TaskCloseCommand(comptime Ops: type) type {
 
             var context = try Ops.Context.init(allocator, io, db.db_path);
             defer context.deinit();
+
+            try finishClose(&context, parsed, task_id, explicit_evidence_id, writer, allocator);
+        }
+
+        /// Daemon-resident variant: identical parsing and transition protocol,
+        /// but the mutation runs on a store the caller keeps open (no CLI
+        /// lock, no open/close). The parsed db path must match the store.
+        pub fn runWithStore(
+            store: anytype,
+            args: []const []const u8,
+            writer: anytype,
+            allocator: std.mem.Allocator,
+            io: std.Io,
+        ) !void {
+            const db = try Ops.parseDbArguments(allocator, io, args, 2, 8);
+            const parsed = try Arguments.parseClose(db.rest);
+            const task_id = try Ops.parseTaskId(parsed.task_id);
+            const explicit_evidence_id = if (parsed.evidence_id) |raw|
+                try Ops.parseTaskId(raw)
+            else
+                null;
+            if (!std.mem.eql(u8, db.db_path, store.dir_path)) return error.StorePathMismatch;
+
+            var context = Ops.Context.initBorrowed(io, store);
+            defer context.deinit();
+
+            try finishClose(&context, parsed, task_id, explicit_evidence_id, writer, allocator);
+        }
+
+        fn finishClose(
+            context: anytype,
+            parsed: anytype,
+            task_id: anytype,
+            explicit_evidence_id: anytype,
+            writer: anytype,
+            allocator: std.mem.Allocator,
+        ) !void {
             const transition = try context.validateTransition(
                 allocator,
                 task_id,

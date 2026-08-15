@@ -185,7 +185,15 @@ pub fn GovernedNodeWriteAdmission(comptime Ops: type) type {
                 !std.mem.eql(u8, normalized, "content_hash") and
                 !std.mem.eql(u8, normalized, "source_label") and
                 !std.mem.eql(u8, normalized, "task_event_type") and
-                !std.mem.eql(u8, normalized, "dependency_relation"))
+                !std.mem.eql(u8, normalized, "dependency_relation") and
+                // Ontology governance contract (tinykg-ontology-rule-snapshot-v1
+                // and memory-migration-v1): project identity on project roots,
+                // rule-candidate governance fields on ontology items.
+                !std.mem.eql(u8, normalized, "project_sha256") and
+                !std.mem.eql(u8, normalized, "project_key") and
+                !std.mem.eql(u8, normalized, "ontology_authority") and
+                !std.mem.eql(u8, normalized, "ontology_falsifier") and
+                !std.mem.eql(u8, normalized, "ontology_provenance"))
             {
                 return error.InvalidRecord;
             }
@@ -218,7 +226,11 @@ pub fn GovernedNodeWriteAdmission(comptime Ops: type) type {
                 !std.mem.eql(u8, normalized, "byte_start") and
                 !std.mem.eql(u8, normalized, "byte_end") and
                 !std.mem.eql(u8, normalized, "line_start") and
-                !std.mem.eql(u8, normalized, "line_end"))
+                !std.mem.eql(u8, normalized, "line_end") and
+                // Ontology governance flags (0/1) from the metacodes
+                // rule-candidate contract.
+                !std.mem.eql(u8, normalized, "ontology_contradicted") and
+                !std.mem.eql(u8, normalized, "retrieval_excluded"))
             {
                 return error.InvalidRecord;
             }
@@ -235,6 +247,20 @@ pub fn GovernedNodeWriteAdmission(comptime Ops: type) type {
             return parsed.text;
         }
 
+        /// Shared write-set builder so the single-op apply path and the
+        /// group-commit batch path publish byte-identical governance
+        /// properties. Appends this node's writes onto the caller's list.
+        pub fn collectNodeGovernanceProperties(
+            writes_list: *std.ArrayList(storage.PropertyPayloadWrite),
+            allocator: std.mem.Allocator,
+            node_id: core.NodeId,
+            parsed: ParsedNodeTextGovernanceArgs,
+        ) !void {
+            var writes: [12]storage.PropertyPayloadWrite = undefined;
+            const write_count = try buildNodeGovernancePropertyWrites(&writes, node_id, parsed, false);
+            try writes_list.appendSlice(allocator, writes[0..write_count]);
+        }
+
         pub fn applyNodeGovernanceProperties(
             allocator: std.mem.Allocator,
             store: storage.Store,
@@ -242,10 +268,21 @@ pub fn GovernedNodeWriteAdmission(comptime Ops: type) type {
             parsed: ParsedNodeTextGovernanceArgs,
             parent_id: ?[]const u8,
         ) !void {
-            const owner: storage.PropertyOwner = .{ .node = node_id };
-            const schema_type = if (parsed.task_event_metadata != null) "task_event" else parsed.schema_type orelse parsed.kind_label;
             const parent_node_id = if (parent_id) |pid| try Ops.parseNodeIdArg(pid) else null;
             var writes: [12]storage.PropertyPayloadWrite = undefined;
+            const write_count = try buildNodeGovernancePropertyWrites(&writes, node_id, parsed, parent_node_id != null);
+            if (write_count != 0) _ = try store.upsertPropertiesBatch(allocator, writes[0..write_count]);
+            if (parent_node_id) |parent| try Ops.linkNodeToProjectParent(allocator, store, node_id, parent);
+        }
+
+        fn buildNodeGovernancePropertyWrites(
+            writes: *[12]storage.PropertyPayloadWrite,
+            node_id: core.NodeId,
+            parsed: ParsedNodeTextGovernanceArgs,
+            has_parent: bool,
+        ) !usize {
+            const owner: storage.PropertyOwner = .{ .node = node_id };
+            const schema_type = if (parsed.task_event_metadata != null) "task_event" else parsed.schema_type orelse parsed.kind_label;
             var write_count: usize = 0;
             if (parsed.name) |name| {
                 writes[write_count] = .{ .owner = owner, .key = "name", .value = .{ .string = name } };
@@ -259,7 +296,7 @@ pub fn GovernedNodeWriteAdmission(comptime Ops: type) type {
                 writes[write_count] = .{ .owner = owner, .key = "retrieval_hints", .value = .{ .string = retrieval_hints } };
                 write_count += 1;
             }
-            if (parent_node_id != null or parsed.schema_type != null or parsed.task_event_metadata != null) {
+            if (has_parent or parsed.schema_type != null or parsed.task_event_metadata != null) {
                 writes[write_count] = .{ .owner = owner, .key = "schema_type", .value = .{ .string = schema_type } };
                 write_count += 1;
             }
@@ -294,8 +331,7 @@ pub fn GovernedNodeWriteAdmission(comptime Ops: type) type {
                     }
                 }
             }
-            if (write_count != 0) _ = try store.upsertPropertiesBatch(allocator, writes[0..write_count]);
-            if (parent_node_id) |parent| try Ops.linkNodeToProjectParent(allocator, store, node_id, parent);
+            return write_count;
         }
 
         pub fn validateNodeTextGranularity(text: []const u8) !void {

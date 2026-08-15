@@ -53,6 +53,7 @@ pub fn StoreDataPlane(comptime Ops: type) type {
         const PropertyPayloadIndexHeader = Ops.dep_support.PropertyPayloadIndexHeader;
         const PropertyPayloadIndexRecord = Ops.dep_support.PropertyPayloadIndexRecord;
         const PropertyPayloadDeltaHeader = Ops.dep_support.PropertyPayloadDeltaHeader;
+        const PropertyBlockView = Ops.dep_support.PropertyBlockView;
         const NodePropertyValueBlockHeader = Ops.dep_support.NodePropertyValueBlockHeader;
         const NodePropertyValueRecord = Ops.dep_support.NodePropertyValueRecord;
         const property_payload_delta_header_len = Ops.dep_support.property_payload_delta_header_len;
@@ -170,6 +171,9 @@ pub fn StoreDataPlane(comptime Ops: type) type {
         const PropertyOwner = Ops.dep_PropertyOwner;
         const PropertyPayloadWrite = Ops.dep_PropertyPayloadWrite;
         const SortedPropertyPayloadNext = Ops.dep_SortedPropertyPayloadNext;
+        // Derived from the stream-callback signature so the governed Ops port
+        // does not need one more member for the entry type itself.
+        const SortedPropertyPayloadEntry = @typeInfo(@typeInfo(@typeInfo(@typeInfo(SortedPropertyPayloadNext).pointer.child).@"fn".return_type.?).error_union.payload).optional.child;
         const PropertyPayloadUpsertResult = Ops.dep_PropertyPayloadUpsertResult;
         const PropertyPayloadCompactionResult = Ops.dep_PropertyPayloadCompactionResult;
         const PropertySnapshotValueKind = Ops.dep_PropertySnapshotValueKind;
@@ -457,8 +461,31 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             return initWithOptionsCreate(allocator, io, dir_path, options, true);
         }
 
+        /// Read-only daemon processes flip this once at startup so every
+        /// plain open in the process — including CLI command re-entry for
+        /// stats/get/search — inherits no-recovery semantics. Recovery writes
+        /// belong to the single writer process only.
+        pub var process_default_crash_recovery: bool = true;
+
+        /// Reader posture for every plain open in the process. Read replicas
+        /// flip this once at startup: any Store handle opened through CLI
+        /// re-entry (stats/search/…) then refuses inline repair and stale
+        /// whole-store scans and serves text search from the last published
+        /// snapshot — the same isolation the replica's resident handle uses.
+        /// Without it, a reader-side CLI surface can silently become a second
+        /// writer through the repair path.
+        pub var process_default_reader_posture: bool = false;
+
         pub fn open(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8) !Store {
-            return openWithOptions(allocator, io, dir_path, .{});
+            if (process_default_reader_posture) {
+                return openWithOptions(allocator, io, dir_path, .{
+                    .crash_recovery = false,
+                    .allow_stale_full_scan = false,
+                    .allow_inline_repair = false,
+                    .serve_stale_snapshot = true,
+                });
+            }
+            return openWithOptions(allocator, io, dir_path, .{ .crash_recovery = process_default_crash_recovery });
         }
 
         pub fn openWithOptions(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8, options: StorageOptions) !Store {
@@ -662,6 +689,7 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             try reconcileNodeTextsBeforeAppend(self);
             appendNodesBatchOnce(self, nodes) catch |err| switch (err) {
                 error.FileNotFound, error.InvalidRecord => {
+                    if (!self.options.allow_inline_repair) return err;
                     const repair_start = if (self.node_batch_append_timings != null) storageMonotonicNs(self.io) else 0;
                     try repairPersistentIndexesFromLog(self);
                     if (self.node_batch_append_timings) |timings| {
@@ -760,8 +788,9 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             // batch append retain the committed journal through derived-index
             // publication, so if this best-effort repair fails the durable anchor
             // remains for reopen or the next append instead of stranding an
-            // unreachable text suffix.
-            repairPersistentIndexesFromLog(self) catch {};
+            // unreachable text suffix. Daemons defer that repair to the
+            // maintenance scheduler instead of stalling the write queue.
+            if (self.options.allow_inline_repair) repairPersistentIndexesFromLog(self) catch {};
         }
 
         pub fn appendNodeRecord(self: Store, node: graph_mod.Node, text_span: TextSpan) !void {
@@ -779,7 +808,7 @@ pub fn StoreDataPlane(comptime Ops: type) type {
                 const next_id_start = if (self.node_append_timings != null) storageMonotonicNs(self.io) else 0;
                 const id = nextNodeId(self) catch |err| switch (err) {
                     error.FileNotFound, error.InvalidRecord => {
-                        if (repaired) return err;
+                        if (repaired or !self.options.allow_inline_repair) return err;
                         repaired = true;
                         try repairPersistentIndexesFromLog(self);
                         continue;
@@ -1348,6 +1377,147 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             return primary_node_text.recoverAppendJournal(self);
         }
 
+        /// Bounded crash recovery for a committed node-text append journal.
+        /// The classifier costs one sequential node-catalog pass plus the
+        /// event tail — never a whole-store rebuild — and resolves the three
+        /// provable crash windows: journal-only (finished write), orphan text
+        /// tail (write never reached the event log), and a torn event tail
+        /// (write died mid-append). Every other state falls back to the full
+        /// O(event-log) repair, which stays the correctness anchor.
+        pub fn reconcileCommittedNodeTextsAppend(self: Store) !void {
+            reconcileCommittedNodeTextsAppendBounded(self) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => try repairPersistentIndexesFromLog(self),
+            };
+        }
+
+        fn reconcileCommittedNodeTextsAppendBounded(self: Store) !void {
+            const original_logical = (try primary_node_text.committedAppendJournalOriginalLogicalSize(self)) orelse return;
+            const meta = try readIndexMeta(self);
+            const events_size = try eventBytes(self);
+            if (events_size < meta.event_bytes) return error.InvalidRecord;
+
+            // v5 journals carry the event watermark from when the append
+            // began. If the event log never grew past it AND the indexed
+            // watermark equals it, the interrupted write reached neither the
+            // event log nor the indexes — index publication follows the
+            // event append — so the text tail is provably unreferenced and
+            // rolls back without the whole-catalog pass below (12003).
+            if (try primary_node_text.committedAppendJournalEventWatermark(self)) |journal_watermark| {
+                if (events_size < journal_watermark) return error.InvalidRecord;
+                if (events_size == journal_watermark and meta.event_bytes == journal_watermark) {
+                    try primary_node_text.restoreCommittedAppendJournalOriginal(self);
+                    return;
+                }
+            }
+
+            var events_truncated = false;
+            if (events_size > meta.event_bytes) {
+                const classification = try classifyEventTail(self, meta.event_bytes, events_size);
+                switch (classification.state) {
+                    .torn => {
+                        // Cut exactly at the torn point (outside any open
+                        // batch): complete records beyond the watermark may
+                        // be acknowledged group commits and must survive.
+                        var file = try std.Io.Dir.cwd().openFile(self.io, self.events_bin_path, .{ .mode = .read_write, .allow_directory = false });
+                        defer file.close(self.io);
+                        try file.setLength(self.io, classification.keep_until);
+                        if (selfOptionsNeedSync(self)) try file.sync(self.io);
+                        events_truncated = true;
+                        // Retained complete records still sit beyond the
+                        // indexed watermark; the full repair below rolls
+                        // them forward.
+                        if (classification.keep_until > meta.event_bytes) return error.InvalidRecord;
+                    },
+                    // Complete tail events with unpublished indexes: rolling
+                    // the write forward is future work; keep the full-repair
+                    // anchor for this state.
+                    .complete => return error.InvalidRecord,
+                }
+            }
+
+            // One sequential catalog pass: does any indexed node reference
+            // text beyond the journal's pre-append logical size?
+            var references_appended_tail = false;
+            var max_span_end: u64 = 0;
+            var indexed_nodes: u64 = 0;
+            var current_logical: u64 = 0;
+            {
+                var nodes_iterator = try nodeRecordsIterator(self, null);
+                defer nodes_iterator.deinit();
+                current_logical = nodes_iterator.view.texts.size;
+                while (try nodes_iterator.nextRef()) |node| {
+                    indexed_nodes += 1;
+                    const span_end = std.math.add(u64, node.text_offset, node.text_len) catch return error.InvalidRecord;
+                    if (span_end > max_span_end) max_span_end = span_end;
+                    if (span_end > original_logical) references_appended_tail = true;
+                }
+            }
+            if (indexed_nodes != meta.nodes) return error.InvalidRecord;
+
+            if (references_appended_tail) {
+                // Only a fully published write may reference the appended
+                // tail; it must account for every appended byte and its event
+                // records must already sit below the indexed watermark.
+                if (events_truncated) return error.InvalidRecord;
+                if (max_span_end != current_logical) return error.InvalidRecord;
+                cleanupCommittedNodeTextsAppendJournal(self);
+                return;
+            }
+            // Neither the event log nor any index saw the append: the
+            // committed text tail is orphan; restore the pre-append state.
+            try primary_node_text.restoreCommittedAppendJournalOriginal(self);
+        }
+
+        const EventTailState = enum { torn, complete };
+
+        const EventTailClassification = struct {
+            state: EventTailState,
+            /// Last safe truncation boundary: the end of the final complete
+            /// record that is not inside an uncommitted batch. Acknowledged
+            /// group-commit writes can sit beyond the indexed watermark when
+            /// incremental index refresh has stopped advancing it, so a torn
+            /// tail must be cut at the torn point — never back at the
+            /// watermark, which would discard durable acknowledged records.
+            keep_until: u64,
+        };
+
+        fn classifyEventTail(self: Store, from: u64, until: u64) !EventTailClassification {
+            var file = try std.Io.Dir.cwd().openFile(self.io, self.events_bin_path, .{ .allow_directory = false });
+            defer file.close(self.io);
+            var offset = from;
+            var keep_until = from;
+            var batch_start: ?u64 = null;
+            while (offset < until) {
+                const record_start = offset;
+                const maybe_header = readBinaryRecordHeader(self, file, &offset) catch return .{ .state = .torn, .keep_until = batch_start orelse keep_until };
+                const header = maybe_header orelse return .{ .state = .torn, .keep_until = batch_start orelse keep_until };
+                const payload_len = std.math.cast(usize, header.payload_len) orelse return .{ .state = .torn, .keep_until = batch_start orelse keep_until };
+                const payload = self.allocator.alloc(u8, payload_len) catch |err| return err;
+                defer self.allocator.free(payload);
+                const read_len = file.readPositionalAll(self.io, payload, offset) catch return .{ .state = .torn, .keep_until = batch_start orelse keep_until };
+                if (read_len != payload.len) return .{ .state = .torn, .keep_until = batch_start orelse keep_until };
+                if (header.payload_checksum) |checksum| {
+                    if (binaryPayloadChecksum(payload) != checksum) return .{ .state = .torn, .keep_until = batch_start orelse keep_until };
+                }
+                advanceBinaryOffset(&offset, payload.len) catch return .{ .state = .torn, .keep_until = batch_start orelse keep_until };
+                switch (header.kind) {
+                    .batch_begin => {
+                        if (batch_start == null) batch_start = record_start;
+                    },
+                    .batch_commit => {
+                        batch_start = null;
+                        keep_until = offset;
+                    },
+                    else => {
+                        if (batch_start == null) keep_until = offset;
+                    },
+                }
+            }
+            if (offset == until and batch_start == null) return .{ .state = .complete, .keep_until = until };
+            return .{ .state = .torn, .keep_until = batch_start orelse keep_until };
+        }
+
         pub fn mutateCompressedNodeTextSlicesInPlace(self: Store, texts: *const NodeTextsView, slices: []const []const u8, append_bytes: u64) !void {
             return primary_node_text.mutateCompressedSlicesInPlace(self, texts, slices, append_bytes);
         }
@@ -1576,6 +1746,11 @@ pub fn StoreDataPlane(comptime Ops: type) type {
 
         pub fn repairPersistentIndexesFromLogWithTimings(self: Store, timings: *PersistentRepairTimings) !void {
             try repair_session.repair(self, timings);
+            // A completed full rebuild derives every index from the event log
+            // and the current texts, so any append journal is obsolete by
+            // construction. A stale committed journal that outlived its write
+            // must never trigger a rollback at some later open.
+            cleanupCommittedNodeTextsAppendJournal(self);
         }
 
         pub fn validatePersistentIndexes(self: Store) !void {
@@ -1601,6 +1776,7 @@ pub fn StoreDataPlane(comptime Ops: type) type {
                 // derived-index repair failure here would invite unsafe retries.
                 // Report whether repair completed so node append can retain its
                 // committed text journal when the indexes are still unusable.
+                if (!self.options.allow_inline_repair) return false;
                 repairPersistentIndexesFromLog(self) catch return false;
             };
             return true;
@@ -2632,70 +2808,75 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             const meta = try readCurrentIndexMeta(self);
             var count: u64 = 0;
             var digest: u64 = 0;
-            var opened = try openPublishedEdgeSegmentsForQuery(self, allocator);
-            defer if (opened) |*segments| segments.deinit();
-            if (opened) |*segments| {
+            var manifest = readEdgeSegmentManifest(self, allocator) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => |e| return e,
+            };
+            defer if (manifest) |*value| value.deinit(allocator);
+            const coverage = if (manifest) |*value|
+                try edge_segment_query_opening.coverageFromManifest(self, value)
+            else
+                null;
+            if (coverage) |admitted_coverage| {
                 const tombstone_header = try readEdgeTombstoneIndexHeader(self);
                 var tombstones: ?EdgeTombstoneIndexView = null;
                 defer if (tombstones) |*view| view.deinit();
-                if (tombstone_header.count != 0 and segments.coverage != .visible_full) {
+                if (tombstone_header.count != 0 and admitted_coverage != .visible_full) {
                     tombstones = try EdgeTombstoneIndexView.open(self);
                 }
 
-                if (segments.coverage == .delta) {
-                    var base = try openEdgeIndexRecordReader(self, self.edge_by_src_path, .src, meta);
+                if (admitted_coverage == .delta) {
+                    var base = try visibleEdgeIndexRecordsIterator(self, .src);
                     defer base.deinit();
-                    var stream = BaseAndSegmentMergeStream.initWithVirtualFiltered(
-                        allocator,
-                        &base,
-                        &segments.segments.segments,
-                        segments.segments.virtual_edges.items,
-                        .forward,
-                        if (tombstones) |*view| view else null,
-                    );
-                    defer stream.deinit();
-                    try stream.reset();
-                    while (try stream.next()) |edge| {
-                        const record = EdgeIndexRecord{
-                            .src = edge.src.toInt(),
-                            .dst = edge.dst.toInt(),
-                            .edge_id = edge.edge_id.toInt(),
-                            .rel = @intFromEnum(edge.rel),
-                        };
-                        try visit(context, record);
-                        count = std.math.add(u64, count, 1) catch return error.RecordTooLarge;
-                        digest ^= edgeRecordDigest(record);
-                    }
-                } else {
-                    var stream = if (tombstones) |*view|
-                        EdgeSegmentMergeStream.initWithVirtualFiltered(
-                            allocator,
-                            &segments.segments.segments,
-                            segments.segments.virtual_edges.items,
-                            .forward,
-                            view,
-                        )
-                    else
-                        EdgeSegmentMergeStream.initWithVirtual(
-                            allocator,
-                            &segments.segments.segments,
-                            segments.segments.virtual_edges.items,
-                            .forward,
-                        );
-                    defer stream.deinit();
-                    try stream.reset();
-                    while (try stream.next()) |edge| {
-                        const record = EdgeIndexRecord{
-                            .src = edge.src.toInt(),
-                            .dst = edge.dst.toInt(),
-                            .edge_id = edge.edge_id.toInt(),
-                            .rel = @intFromEnum(edge.rel),
-                        };
+                    while (try base.next()) |record| {
                         try visit(context, record);
                         count = std.math.add(u64, count, 1) catch return error.RecordTooLarge;
                         digest ^= edgeRecordDigest(record);
                     }
                 }
+
+                // Scan integrity is count/digest based and intentionally does
+                // not promise visitor order. Opening one manifest entry at a
+                // time keeps governance, export, migration, and benchmarks
+                // portable under low process descriptor limits.
+                const SegmentScanContext = struct {
+                    visitor_context: *anyopaque,
+                    visitor: EdgeIndexRecordVisitor,
+                    tombstone_view: ?*EdgeTombstoneIndexView,
+                    count: *u64,
+                    digest: *u64,
+
+                    fn scan(scan_context: *@This(), edge: segment_mod.EdgeRecord) !void {
+                        if (scan_context.tombstone_view) |view| {
+                            if (try view.contains(edge.edge_id.toInt())) return;
+                        }
+                        const record = EdgeIndexRecord{
+                            .src = edge.src.toInt(),
+                            .dst = edge.dst.toInt(),
+                            .edge_id = edge.edge_id.toInt(),
+                            .rel = @intFromEnum(edge.rel),
+                        };
+                        try scan_context.visitor(scan_context.visitor_context, record);
+                        scan_context.count.* = std.math.add(u64, scan_context.count.*, 1) catch return error.RecordTooLarge;
+                        scan_context.digest.* ^= edgeRecordDigest(record);
+                    }
+                };
+                var segment_scan_context = SegmentScanContext{
+                    .visitor_context = context,
+                    .visitor = visit,
+                    .tombstone_view = if (tombstones) |*view| view else null,
+                    .count = &count,
+                    .digest = &digest,
+                };
+                var segments = PublishedEdgeSegments.init(allocator);
+                defer segments.deinit();
+                try segments.scanTrustedEntriesBounded(
+                    self.io,
+                    manifest.?.entries.items,
+                    .forward,
+                    &segment_scan_context,
+                    SegmentScanContext.scan,
+                );
             } else {
                 var records = try visibleEdgeIndexRecordsIterator(self, .src);
                 defer records.deinit();
@@ -3900,26 +4081,42 @@ pub fn StoreDataPlane(comptime Ops: type) type {
         }
 
         pub fn readPropertyPayloadIndexHeaderFromFile(self: Store, file: std.Io.File) !PropertyPayloadIndexHeader {
+            var view = try PropertyBlockView.init(self.allocator, self.io, file);
+            defer view.deinit();
+            return readPropertyPayloadIndexHeaderFromView(self, &view);
+        }
+
+        pub fn readPropertyPayloadIndexHeaderFromView(_: Store, view: *PropertyBlockView) !PropertyPayloadIndexHeader {
             var bytes: [PropertyPayloadIndexHeader.encoded_len]u8 = undefined;
-            const n = try file.readPositionalAll(self.io, &bytes, 0);
-            if (n != bytes.len) return error.InvalidRecord;
+            try view.readAt(0, &bytes);
             return PropertyPayloadIndexHeader.decode(&bytes);
         }
 
         pub fn readPropertyPayloadIndexRecordAt(self: Store, file: std.Io.File, index: u64) !PropertyPayloadIndexRecord {
+            var view = try PropertyBlockView.init(self.allocator, self.io, file);
+            defer view.deinit();
+            return readPropertyPayloadIndexRecordAtView(self, &view, index);
+        }
+
+        pub fn readPropertyPayloadIndexRecordAtView(_: Store, view: *PropertyBlockView, index: u64) !PropertyPayloadIndexRecord {
             var bytes: [PropertyPayloadIndexRecord.encoded_len]u8 = undefined;
             const offset = try propertyPayloadIndexRecordOffset(index);
-            const n = try file.readPositionalAll(self.io, &bytes, offset);
-            if (n != bytes.len) return error.InvalidRecord;
+            try view.readAt(offset, &bytes);
             return PropertyPayloadIndexRecord.decode(&bytes);
         }
 
         pub fn propertyPayloadKeyHashLowerBound(self: Store, file: std.Io.File, record_count: u64, key_hash: u64) !u64 {
+            var view = try PropertyBlockView.init(self.allocator, self.io, file);
+            defer view.deinit();
+            return propertyPayloadKeyHashLowerBoundView(self, &view, record_count, key_hash);
+        }
+
+        pub fn propertyPayloadKeyHashLowerBoundView(self: Store, view: *PropertyBlockView, record_count: u64, key_hash: u64) !u64 {
             var lo: u64 = 0;
             var hi = record_count;
             while (lo < hi) {
                 const mid = lo + (hi - lo) / 2;
-                const record = try readPropertyPayloadIndexRecordAt(self, file, mid);
+                const record = try readPropertyPayloadIndexRecordAtView(self, view, mid);
                 if (record.key_hash < key_hash) {
                     lo = mid + 1;
                 } else {
@@ -3929,8 +4126,50 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             return lo;
         }
 
+        fn propertyPayloadOwnerKeyLessThan(record: PropertyPayloadIndexRecord, key_hash: u64, owner_kind: u8, owner_id: u64) bool {
+            if (record.key_hash != key_hash) return record.key_hash < key_hash;
+            if (record.owner_kind != owner_kind) return record.owner_kind < owner_kind;
+            return record.owner_id < owner_id;
+        }
+
+        fn legacyPropertyPayloadRecordLessThan(a: PropertyPayloadIndexRecord, b: PropertyPayloadIndexRecord) bool {
+            if (a.key_hash != b.key_hash) return a.key_hash < b.key_hash;
+            if (a.value_type != b.value_type) return a.value_type < b.value_type;
+            if (a.value_hash != b.value_hash) return a.value_hash < b.value_hash;
+            if (a.owner_kind != b.owner_kind) return a.owner_kind < b.owner_kind;
+            return a.owner_id < b.owner_id;
+        }
+
+        fn propertyPayloadRecordLessThanForView(view: *const PropertyBlockView, a: PropertyPayloadIndexRecord, b: PropertyPayloadIndexRecord) bool {
+            return if (view.hasPropertyIndexAnchors())
+                propertyPayloadRecordLessThan({}, a, b)
+            else
+                legacyPropertyPayloadRecordLessThan(a, b);
+        }
+
+        pub fn propertyPayloadOwnerKeyLowerBoundView(
+            self: Store,
+            view: *PropertyBlockView,
+            record_count: u64,
+            key_hash: u64,
+            owner_kind: u8,
+            owner_id: u64,
+        ) !u64 {
+            const range = try view.propertyIndexRecordRange(key_hash, owner_kind, owner_id, record_count);
+            var lo = range.start;
+            var hi = range.end;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const record = try readPropertyPayloadIndexRecordAtView(self, view, mid);
+                if (propertyPayloadOwnerKeyLessThan(record, key_hash, owner_kind, owner_id)) lo = mid + 1 else hi = mid;
+            }
+            return lo;
+        }
+
         pub fn validatePropertyPayloadIndexOrderIfStrict(self: Store, file: std.Io.File, header: PropertyPayloadIndexHeader) !void {
-            return validatePropertyPayloadIndexOrderIfStrictDeadline(self, file, header, .none);
+            var view = try PropertyBlockView.init(self.allocator, self.io, file);
+            defer view.deinit();
+            return validatePropertyPayloadIndexOrderIfStrictDeadlineView(self, &view, header, .none);
         }
 
         pub fn validatePropertyPayloadIndexOrderIfStrictDeadline(
@@ -3939,21 +4178,52 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             header: PropertyPayloadIndexHeader,
             deadline: core.QueryDeadline,
         ) !void {
+            var view = try PropertyBlockView.init(self.allocator, self.io, file);
+            defer view.deinit();
+            return validatePropertyPayloadIndexOrderIfStrictDeadlineView(self, &view, header, deadline);
+        }
+
+        pub fn validatePropertyPayloadIndexOrderIfStrictDeadlineView(
+            self: Store,
+            view: *PropertyBlockView,
+            header: PropertyPayloadIndexHeader,
+            deadline: core.QueryDeadline,
+        ) !void {
             if (!self.options.validate_indexes_on_read) return;
             var previous: ?PropertyPayloadIndexRecord = null;
             var index: u64 = 0;
             while (index < header.record_count) : (index += 1) {
                 if (deadline.expired()) return core.Error.BudgetExceeded;
-                const record = try readPropertyPayloadIndexRecordAt(self, file, index);
+                const record = try readPropertyPayloadIndexRecordAtView(self, view, index);
                 if (previous) |prev| {
-                    if (!propertyPayloadRecordLessThan({}, prev, record)) return error.InvalidRecord;
+                    if (!propertyPayloadRecordLessThanForView(view, prev, record)) return error.InvalidRecord;
                 }
                 previous = record;
             }
         }
 
         pub fn readPropertyPayloadValuePayloadAt(self: Store, allocator: std.mem.Allocator, file: std.Io.File, header: NodePropertyValueBlockHeader, index: u64, record: PropertyPayloadIndexRecord) !?[]u8 {
-            const value_record = try readNodePropertyValueRecordAt(self, file, index);
+            var view = try PropertyBlockView.init(self.allocator, self.io, file);
+            defer view.deinit();
+            var effective_record = record;
+            return readPropertyPayloadValuePayloadAtView(self, allocator, &view, header, index, &effective_record);
+        }
+
+        pub fn readPropertyPayloadValueHeaderFromView(_: Store, view: *PropertyBlockView) !NodePropertyValueBlockHeader {
+            var bytes: [NodePropertyValueBlockHeader.encoded_len]u8 = undefined;
+            try view.readAt(0, &bytes);
+            return NodePropertyValueBlockHeader.decode(&bytes);
+        }
+
+        pub fn readPropertyPayloadValueRecordAtView(_: Store, view: *PropertyBlockView, index: u64) !NodePropertyValueRecord {
+            var bytes: [NodePropertyValueRecord.encoded_len]u8 = undefined;
+            const offset = try nodePropertyValueRecordOffset(index);
+            try view.readAt(offset, &bytes);
+            return NodePropertyValueRecord.decode(&bytes);
+        }
+
+        pub fn readPropertyPayloadValuePayloadAtView(self: Store, allocator: std.mem.Allocator, view: *PropertyBlockView, header: NodePropertyValueBlockHeader, index: u64, record: *PropertyPayloadIndexRecord) !?[]u8 {
+            const value_record = try readPropertyPayloadValueRecordAtView(self, view, index);
             if (record.value_type == PropertyPayloadIndexRecord.value_type_uint) {
                 if (value_record.offset != 0 or value_record.len != 0) return error.InvalidRecord;
                 return null;
@@ -3966,9 +4236,14 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             const file_offset = std.math.add(u64, payload_start, value_record.offset) catch return error.InvalidRecord;
             const value = try allocator.alloc(u8, value_record.len);
             errdefer allocator.free(value);
-            const n = try file.readPositionalAll(self.io, value, file_offset);
-            if (n != value.len) return error.InvalidRecord;
-            if (nodePropertyValueHash(value) != record.value_hash) return error.InvalidRecord;
+            try view.readAt(file_offset, value);
+            const value_hash = nodePropertyValueHash(value);
+            if (header.hasDerivedStringValueHashes()) {
+                if (record.value_hash != 0) return error.InvalidRecord;
+                record.value_hash = value_hash;
+            } else if (value_hash != record.value_hash) {
+                return error.InvalidRecord;
+            }
             return value;
         }
 
@@ -4426,9 +4701,11 @@ pub fn StoreDataPlane(comptime Ops: type) type {
         pub fn readPropertyPayloadEntriesFromFiles(self: Store, allocator: std.mem.Allocator, index_path: []const u8, values_path: []const u8) !std.ArrayList(PropertyPayloadIndexEntry) {
             var file = try std.Io.Dir.cwd().openFile(self.io, index_path, .{ .allow_directory = false });
             defer file.close(self.io);
-            const header = try readPropertyPayloadIndexHeaderFromFile(self, file);
+            var index_view = try PropertyBlockView.init(self.allocator, self.io, file);
+            defer index_view.deinit();
+            const header = try readPropertyPayloadIndexHeaderFromView(self, &index_view);
             if (header.owner_count != 0 or header.owner_digest != 0) return error.InvalidRecord;
-            if (try regularFileSize(self, file) != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
+            if (index_view.logical_size != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
             var entries = std.ArrayList(PropertyPayloadIndexEntry).empty;
             errdefer {
                 deinitPropertyPayloadIndexEntries(entries.items, allocator);
@@ -4437,17 +4714,20 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             try entries.ensureTotalCapacity(allocator, std.math.cast(usize, header.record_count) orelse return error.RecordTooLarge);
             var values_file = try std.Io.Dir.cwd().openFile(self.io, values_path, .{ .allow_directory = false });
             defer values_file.close(self.io);
-            const values_header = try readNodePropertyValueBlockHeaderFromFile(self, values_file);
-            if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
-            if (try regularFileSize(self, values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
+            var values_view = try PropertyBlockView.init(self.allocator, self.io, values_file);
+            defer values_view.deinit();
+            const values_header = try readPropertyPayloadValueHeaderFromView(self, &values_view);
+            if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0 or
+                values_header.hasDerivedStringValueHashes() != header.hasDerivedStringValueHashes()) return error.InvalidRecord;
+            if (values_view.logical_size != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
             var previous: ?PropertyPayloadIndexRecord = null;
             var index: u64 = 0;
             while (index < header.record_count) : (index += 1) {
-                const record = try readPropertyPayloadIndexRecordAt(self, file, index);
+                var record = try readPropertyPayloadIndexRecordAtView(self, &index_view, index);
                 if (previous) |prev| {
-                    if (!propertyPayloadRecordLessThan({}, prev, record)) return error.InvalidRecord;
+                    if (!propertyPayloadRecordLessThanForView(&index_view, prev, record)) return error.InvalidRecord;
                 }
-                const value = try readPropertyPayloadValuePayloadAt(self, allocator, values_file, values_header, index, record);
+                const value = try readPropertyPayloadValuePayloadAtView(self, allocator, &values_view, values_header, index, &record);
                 entries.appendAssumeCapacity(.{ .record = record, .value = value });
                 previous = record;
             }
@@ -4498,7 +4778,8 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             var values_file = try std.Io.Dir.cwd().openFile(self.io, values_path, .{ .allow_directory = false });
             defer values_file.close(self.io);
             const values_header = try readNodePropertyValueBlockHeaderFromFile(self, values_file);
-            if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
+            if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0 or
+                values_header.hasDerivedStringValueHashes()) return error.InvalidRecord;
             if (try regularFileSize(self, values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
 
             var entries = std.ArrayList(NodePropertyIndexEntry).empty;
@@ -4596,20 +4877,25 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             if (has_index) {
                 var index_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_index_path, .{ .allow_directory = false });
                 defer index_file.close(self.io);
-                const header = try readPropertyPayloadIndexHeaderFromFile(self, index_file);
+                var index_view = try PropertyBlockView.init(self.allocator, self.io, index_file);
+                defer index_view.deinit();
+                const header = try readPropertyPayloadIndexHeaderFromView(self, &index_view);
                 if (header.owner_count != 0 or header.owner_digest != 0) return error.InvalidRecord;
-                if (try regularFileSize(self, index_file) != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
-                try validatePropertyPayloadIndexOrderIfStrict(self, index_file, header);
+                if (index_view.logical_size != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
+                try validatePropertyPayloadIndexOrderIfStrictDeadlineView(self, &index_view, header, .none);
 
                 var values_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_values_path, .{ .allow_directory = false });
                 defer values_file.close(self.io);
-                const values_header = try readNodePropertyValueBlockHeaderFromFile(self, values_file);
-                if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
-                if (try regularFileSize(self, values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
+                var values_view = try PropertyBlockView.init(self.allocator, self.io, values_file);
+                defer values_view.deinit();
+                const values_header = try readPropertyPayloadValueHeaderFromView(self, &values_view);
+                if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0 or
+                    values_header.hasDerivedStringValueHashes() != header.hasDerivedStringValueHashes()) return error.InvalidRecord;
+                if (values_view.logical_size != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
 
-                var index = try propertyPayloadKeyHashLowerBound(self, index_file, header.record_count, key_hash);
+                var index = try propertyPayloadKeyHashLowerBoundView(self, &index_view, header.record_count, key_hash);
                 while (index < header.record_count) : (index += 1) {
-                    const record = try readPropertyPayloadIndexRecordAt(self, index_file, index);
+                    var record = try readPropertyPayloadIndexRecordAtView(self, &index_view, index);
                     if (record.key_hash != key_hash) break;
                     if (owner_filter) |filter| {
                         if (!filter.matches(record.owner_kind, record.owner_id)) continue;
@@ -4621,7 +4907,7 @@ pub fn StoreDataPlane(comptime Ops: type) type {
                     };
                     const position = try positions.getOrPut(owner_key);
                     if (position.found_existing) return error.InvalidRecord;
-                    const value = try readPropertyPayloadValuePayloadAt(self, allocator, values_file, values_header, index, record);
+                    const value = try readPropertyPayloadValuePayloadAtView(self, allocator, &values_view, values_header, index, &record);
                     errdefer if (value) |owned| allocator.free(owned);
                     try entries.append(allocator, .{ .record = record, .value = value });
                     position.value_ptr.* = entries.items.len - 1;
@@ -4670,16 +4956,21 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             if (has_index) {
                 var index_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_index_path, .{ .allow_directory = false });
                 defer index_file.close(self.io);
-                const header = try readPropertyPayloadIndexHeaderFromFile(self, index_file);
+                var index_view = try PropertyBlockView.init(self.allocator, self.io, index_file);
+                defer index_view.deinit();
+                const header = try readPropertyPayloadIndexHeaderFromView(self, &index_view);
                 if (header.owner_count != 0 or header.owner_digest != 0) return error.InvalidRecord;
-                if (try regularFileSize(self, index_file) != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
-                try validatePropertyPayloadIndexOrderIfStrictDeadline(self, index_file, header, deadline);
+                if (index_view.logical_size != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
+                try validatePropertyPayloadIndexOrderIfStrictDeadlineView(self, &index_view, header, deadline);
 
                 var values_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_values_path, .{ .allow_directory = false });
                 defer values_file.close(self.io);
-                const values_header = try readNodePropertyValueBlockHeaderFromFile(self, values_file);
-                if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
-                if (try regularFileSize(self, values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
+                var values_view = try PropertyBlockView.init(self.allocator, self.io, values_file);
+                defer values_view.deinit();
+                const values_header = try readPropertyPayloadValueHeaderFromView(self, &values_view);
+                if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0 or
+                    values_header.hasDerivedStringValueHashes() != header.hasDerivedStringValueHashes()) return error.InvalidRecord;
+                if (values_view.logical_size != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
 
                 // The immutable index is ordered by key hash.  Stale-text checks
                 // need only `name` and `summary`; walking every unrelated
@@ -4695,15 +4986,15 @@ pub fn StoreDataPlane(comptime Ops: type) type {
                 if (searchable_hashes[0] == searchable_hashes[1]) return error.InvalidRecord;
                 for (searchable_hashes) |key_hash| {
                     var previous: ?PropertyPayloadIndexRecord = null;
-                    var index = try propertyPayloadKeyHashLowerBound(self, index_file, header.record_count, key_hash);
+                    var index = try propertyPayloadKeyHashLowerBoundView(self, &index_view, header.record_count, key_hash);
                     while (index < header.record_count) : (index += 1) {
                         if (deadline.expired()) return core.Error.BudgetExceeded;
-                        const record = try readPropertyPayloadIndexRecordAt(self, index_file, index);
+                        var record = try readPropertyPayloadIndexRecordAtView(self, &index_view, index);
                         if (record.key_hash != key_hash) break;
                         if (previous) |prev| {
-                            if (!propertyPayloadRecordLessThan({}, prev, record)) return error.InvalidRecord;
+                            if (!propertyPayloadRecordLessThanForView(&index_view, prev, record)) return error.InvalidRecord;
                         }
-                        const value_record = try readNodePropertyValueRecordAt(self, values_file, index);
+                        const value_record = try readPropertyPayloadValueRecordAtView(self, &values_view, index);
                         if (record.value_type == PropertyPayloadIndexRecord.value_type_uint) {
                             if (value_record.offset != 0 or value_record.len != 0) return error.InvalidRecord;
                         } else if (record.value_type == PropertyPayloadIndexRecord.value_type_string) {
@@ -4715,7 +5006,7 @@ pub fn StoreDataPlane(comptime Ops: type) type {
                                     try budget.afterReplace(0, @intCast(value_record.len))
                                 else
                                     0;
-                                const value = (try readPropertyPayloadValuePayloadAt(self, allocator, values_file, values_header, index, record)) orelse return error.InvalidRecord;
+                                const value = (try readPropertyPayloadValuePayloadAtView(self, allocator, &values_view, values_header, index, &record)) orelse return error.InvalidRecord;
                                 errdefer allocator.free(value);
                                 const position = if (has_delta) try positions.getOrPut(.{
                                     .owner_kind = record.owner_kind,
@@ -4813,6 +5104,60 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             digest.* ^= entry_hasher.final();
         }
 
+        pub fn addSearchableNodeMetadataDigestFromValueView(
+            digest: *u64,
+            seed: u64,
+            owner_id: u64,
+            key_hash: u64,
+            value_hash: u64,
+            value_hash_derived: bool,
+            view: *PropertyBlockView,
+            logical_offset: u64,
+            value_len: u32,
+            deadline: core.QueryDeadline,
+        ) !void {
+            var effective_value_hash = value_hash;
+            if (value_hash_derived) {
+                if (value_hash != 0) return error.InvalidRecord;
+                var value_hasher = std.hash.Wyhash.init(0x544B_5056);
+                var hash_scratch: [16 * 1024]u8 = undefined;
+                var hashed: u64 = 0;
+                while (hashed < value_len) {
+                    if (deadline.expired()) return core.Error.BudgetExceeded;
+                    const take: usize = @intCast(@min(@as(u64, value_len) - hashed, hash_scratch.len));
+                    const offset = std.math.add(u64, logical_offset, hashed) catch return error.InvalidRecord;
+                    try view.readAt(offset, hash_scratch[0..take]);
+                    value_hasher.update(hash_scratch[0..take]);
+                    hashed += take;
+                }
+                effective_value_hash = value_hasher.final();
+            }
+            var entry_hasher = std.hash.Wyhash.init(seed);
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, owner_id, .little);
+            entry_hasher.update(&bytes);
+            std.mem.writeInt(u64, &bytes, key_hash, .little);
+            entry_hasher.update(&bytes);
+            std.mem.writeInt(u64, &bytes, effective_value_hash, .little);
+            entry_hasher.update(&bytes);
+
+            var value_hasher = std.hash.Wyhash.init(0x544B_5056);
+            var scratch: [16 * 1024]u8 = undefined;
+            var consumed: u64 = 0;
+            while (consumed < value_len) {
+                if (deadline.expired()) return core.Error.BudgetExceeded;
+                const remaining = @as(u64, value_len) - consumed;
+                const take: usize = @intCast(@min(remaining, scratch.len));
+                const offset = std.math.add(u64, logical_offset, consumed) catch return error.InvalidRecord;
+                try view.readAt(offset, scratch[0..take]);
+                value_hasher.update(scratch[0..take]);
+                entry_hasher.update(scratch[0..take]);
+                consumed += take;
+            }
+            if (value_hasher.final() != effective_value_hash) return error.InvalidRecord;
+            digest.* ^= entry_hasher.final();
+        }
+
         pub fn searchableNodeCanonicalBaseMetadataDigest(
             self: Store,
             overridden: ?*const std.AutoHashMap(PropertyPayloadOwnerKey, usize),
@@ -4826,16 +5171,21 @@ pub fn StoreDataPlane(comptime Ops: type) type {
 
             var index_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_index_path, .{ .allow_directory = false });
             defer index_file.close(self.io);
-            const header = try readPropertyPayloadIndexHeaderFromFile(self, index_file);
+            var index_view = try PropertyBlockView.init(self.allocator, self.io, index_file);
+            defer index_view.deinit();
+            const header = try readPropertyPayloadIndexHeaderFromView(self, &index_view);
             if (header.owner_count != 0 or header.owner_digest != 0) return error.InvalidRecord;
-            if (try regularFileSize(self, index_file) != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
-            try validatePropertyPayloadIndexOrderIfStrictDeadline(self, index_file, header, deadline);
+            if (index_view.logical_size != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
+            try validatePropertyPayloadIndexOrderIfStrictDeadlineView(self, &index_view, header, deadline);
 
             var values_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_values_path, .{ .allow_directory = false });
             defer values_file.close(self.io);
-            const values_header = try readNodePropertyValueBlockHeaderFromFile(self, values_file);
-            if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
-            if (try regularFileSize(self, values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
+            var values_view = try PropertyBlockView.init(self.allocator, self.io, values_file);
+            defer values_view.deinit();
+            const values_header = try readPropertyPayloadValueHeaderFromView(self, &values_view);
+            if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0 or
+                values_header.hasDerivedStringValueHashes() != header.hasDerivedStringValueHashes()) return error.InvalidRecord;
+            if (values_view.logical_size != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
             const payload_start = try nodePropertyValueBlockHeaderAndRecordBytes(values_header.record_count);
 
             const searchable_hashes = [_]u64{
@@ -4846,15 +5196,15 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             var digest: u64 = 0;
             for (searchable_hashes) |key_hash| {
                 var previous: ?PropertyPayloadIndexRecord = null;
-                var index = try propertyPayloadKeyHashLowerBound(self, index_file, header.record_count, key_hash);
+                var index = try propertyPayloadKeyHashLowerBoundView(self, &index_view, header.record_count, key_hash);
                 while (index < header.record_count) : (index += 1) {
                     if (deadline.expired()) return core.Error.BudgetExceeded;
-                    const record = try readPropertyPayloadIndexRecordAt(self, index_file, index);
+                    const record = try readPropertyPayloadIndexRecordAtView(self, &index_view, index);
                     if (record.key_hash != key_hash) break;
                     if (previous) |prev| {
-                        if (!propertyPayloadRecordLessThan({}, prev, record)) return error.InvalidRecord;
+                        if (!propertyPayloadRecordLessThanForView(&index_view, prev, record)) return error.InvalidRecord;
                     }
-                    const value_record = try readNodePropertyValueRecordAt(self, values_file, index);
+                    const value_record = try readPropertyPayloadValueRecordAtView(self, &values_view, index);
                     if (record.value_type == PropertyPayloadIndexRecord.value_type_uint) {
                         if (value_record.offset != 0 or value_record.len != 0) return error.InvalidRecord;
                     } else if (record.value_type == PropertyPayloadIndexRecord.value_type_string) {
@@ -4872,14 +5222,14 @@ pub fn StoreDataPlane(comptime Ops: type) type {
                                 })) &ignored_digest else &digest
                             else
                                 &digest;
-                            try addSearchableNodeMetadataDigestFromValueFile(
-                                self,
+                            try addSearchableNodeMetadataDigestFromValueView(
                                 digest_target,
                                 0x544B_534D,
                                 record.owner_id,
                                 record.key_hash,
                                 record.value_hash,
-                                values_file,
+                                values_header.hasDerivedStringValueHashes(),
+                                &values_view,
                                 file_offset,
                                 value_record.len,
                                 deadline,
@@ -4910,7 +5260,8 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             var values_file = try std.Io.Dir.cwd().openFile(self.io, self.node_props_overlay_values_path, .{ .allow_directory = false });
             defer values_file.close(self.io);
             const values_header = try readNodePropertyValueBlockHeaderFromFile(self, values_file);
-            if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
+            if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0 or
+                values_header.hasDerivedStringValueHashes()) return error.InvalidRecord;
             if (try regularFileSize(self, values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
             const payload_start = try nodePropertyValueBlockHeaderAndRecordBytes(values_header.record_count);
 
@@ -5059,7 +5410,8 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             var values_file = try std.Io.Dir.cwd().openFile(self.io, self.node_props_overlay_values_path, .{ .allow_directory = false });
             defer values_file.close(self.io);
             const values_header = try readNodePropertyValueBlockHeaderFromFile(self, values_file);
-            if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
+            if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0 or
+                values_header.hasDerivedStringValueHashes()) return error.InvalidRecord;
             if (try regularFileSize(self, values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
 
             const searchable_hashes = [_]u64{
@@ -5414,7 +5766,8 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             var values_file = try std.Io.Dir.cwd().openFile(self.io, values_path, .{ .allow_directory = false });
             defer values_file.close(self.io);
             const values_header = try readNodePropertyValueBlockHeaderFromFile(self, values_file);
-            if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
+            if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0 or
+                values_header.hasDerivedStringValueHashes()) return error.InvalidRecord;
             if (try regularFileSize(self, values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
 
             var previous: ?NodePropertyIndexRecord = null;
@@ -5456,24 +5809,29 @@ pub fn StoreDataPlane(comptime Ops: type) type {
 
             var index_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_index_path, .{ .allow_directory = false });
             defer index_file.close(self.io);
-            const header = try readPropertyPayloadIndexHeaderFromFile(self, index_file);
+            var index_view = try PropertyBlockView.init(self.allocator, self.io, index_file);
+            defer index_view.deinit();
+            const header = try readPropertyPayloadIndexHeaderFromView(self, &index_view);
             if (header.owner_count != 0 or header.owner_digest != 0) return error.InvalidRecord;
-            if (try regularFileSize(self, index_file) != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
+            if (index_view.logical_size != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
 
             var values_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_values_path, .{ .allow_directory = false });
             defer values_file.close(self.io);
-            const values_header = try readNodePropertyValueBlockHeaderFromFile(self, values_file);
-            if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
-            if (try regularFileSize(self, values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
+            var values_view = try PropertyBlockView.init(self.allocator, self.io, values_file);
+            defer values_view.deinit();
+            const values_header = try readPropertyPayloadValueHeaderFromView(self, &values_view);
+            if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0 or
+                values_header.hasDerivedStringValueHashes() != header.hasDerivedStringValueHashes()) return error.InvalidRecord;
+            if (values_view.logical_size != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
 
             var previous: ?PropertyPayloadIndexRecord = null;
             var index: u64 = 0;
             while (index < header.record_count) : (index += 1) {
-                const record = try readPropertyPayloadIndexRecordAt(self, index_file, index);
+                var record = try readPropertyPayloadIndexRecordAtView(self, &index_view, index);
                 if (previous) |prev| {
-                    if (!propertyPayloadRecordLessThan({}, prev, record)) return error.InvalidRecord;
+                    if (!propertyPayloadRecordLessThanForView(&index_view, prev, record)) return error.InvalidRecord;
                 }
-                const value = try readPropertyPayloadValuePayloadAt(self, allocator, values_file, values_header, index, record);
+                const value = try readPropertyPayloadValuePayloadAtView(self, allocator, &values_view, values_header, index, &record);
                 defer if (value) |owned| allocator.free(owned);
                 const value_kind: PropertySnapshotValueKind = switch (record.value_type) {
                     PropertyPayloadIndexRecord.value_type_string => .string,
@@ -5658,15 +6016,19 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             if (has_index) {
                 var index_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_index_path, .{ .allow_directory = false });
                 defer index_file.close(self.io);
-                const header = try readPropertyPayloadIndexHeaderFromFile(self, index_file);
+                var index_view = try PropertyBlockView.init(self.allocator, self.io, index_file);
+                defer index_view.deinit();
+                const header = try readPropertyPayloadIndexHeaderFromView(self, &index_view);
                 if (header.record_count != 0 or header.owner_count != 0 or header.owner_digest != 0) return error.InvalidRecord;
-                if (try regularFileSize(self, index_file) != try propertyPayloadIndexFileSize(0)) return error.InvalidRecord;
+                if (index_view.logical_size != try propertyPayloadIndexFileSize(0)) return error.InvalidRecord;
                 var values_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_values_path, .{ .allow_directory = false });
                 defer values_file.close(self.io);
-                const values_header = try readNodePropertyValueBlockHeaderFromFile(self, values_file);
+                var values_view = try PropertyBlockView.init(self.allocator, self.io, values_file);
+                defer values_view.deinit();
+                const values_header = try readPropertyPayloadValueHeaderFromView(self, &values_view);
                 if (values_header.record_count != 0 or values_header.node_count != 0 or values_header.node_digest != 0 or
                     values_header.payload_bytes != 0 or values_header.payload_digest != 0) return error.InvalidRecord;
-                if (try regularFileSize(self, values_file) != try nodePropertyValueBlockFileSize(0, 0)) return error.InvalidRecord;
+                if (values_view.logical_size != try nodePropertyValueBlockFileSize(0, 0)) return error.InvalidRecord;
             }
             const delta_scan = try scanPropertyPayloadDelta(self, self.allocator, .none, false);
             if (delta_scan.valid_bytes != 0 or delta_scan.last_sequence != 0) return error.InvalidRecord;
@@ -5687,6 +6049,21 @@ pub fn StoreDataPlane(comptime Ops: type) type {
         ) !void {
             try ensureEmptyPropertyPayloadReplacementTarget(self);
             try property_payload_transaction.replaceEmptyBaseFromSortedStream(self, expected_count, context, next);
+        }
+
+        /// Same publication as `replaceEmptyPropertyPayloadFromSortedStream`,
+        /// but for streams that can replay from the beginning. The stages are
+        /// written and encoded one at a time, halving peak transient disk use
+        /// on large property loads; stream drift between passes fails closed.
+        pub fn replaceEmptyPropertyPayloadFromRestartableSortedStream(
+            self: Store,
+            expected_count: u64,
+            context: *anyopaque,
+            restart: *const fn (context: *anyopaque) anyerror!void,
+            next: SortedPropertyPayloadNext,
+        ) !void {
+            try ensureEmptyPropertyPayloadReplacementTarget(self);
+            try property_payload_transaction.replaceEmptyBaseFromRestartableSortedStream(self, expected_count, context, restart, next);
         }
 
         pub fn validatePropertyPayloadWrite(self: Store, allocator: std.mem.Allocator, write: PropertyPayloadWrite) !void {
@@ -5717,31 +6094,61 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             defer found.deinit();
             try found.ensureTotalCapacity(@intCast(wanted.count()));
 
+            const wanted_keys = try allocator.alloc(PropertyPayloadOwnerKey, wanted.count());
+            defer allocator.free(wanted_keys);
+            var wanted_it = wanted.keyIterator();
+            var wanted_index: usize = 0;
+            while (wanted_it.next()) |wanted_key| : (wanted_index += 1) wanted_keys[wanted_index] = wanted_key.*;
+            const PropertyPayloadOwnerKeyOrder = struct {
+                fn lessThan(_: void, a: PropertyPayloadOwnerKey, b: PropertyPayloadOwnerKey) bool {
+                    if (a.key_hash != b.key_hash) return a.key_hash < b.key_hash;
+                    if (a.owner_kind != b.owner_kind) return a.owner_kind < b.owner_kind;
+                    return a.owner_id < b.owner_id;
+                }
+            };
+            std.mem.sort(PropertyPayloadOwnerKey, wanted_keys, {}, PropertyPayloadOwnerKeyOrder.lessThan);
+
             const has_index = try fileExists(self, self.property_payload_index_path);
             const has_values = try fileExists(self, self.property_payload_values_path);
             if (has_index != has_values) return error.InvalidRecord;
             if (has_index) {
                 var index_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_index_path, .{ .allow_directory = false });
                 defer index_file.close(self.io);
-                const header = try readPropertyPayloadIndexHeaderFromFile(self, index_file);
+                var index_view = try PropertyBlockView.init(self.allocator, self.io, index_file);
+                defer index_view.deinit();
+                const header = try readPropertyPayloadIndexHeaderFromView(self, &index_view);
                 if (header.owner_count != 0 or header.owner_digest != 0) return error.InvalidRecord;
-                if (try regularFileSize(self, index_file) != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
-                try validatePropertyPayloadIndexOrderIfStrict(self, index_file, header);
+                if (index_view.logical_size != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
+                try validatePropertyPayloadIndexOrderIfStrictDeadlineView(self, &index_view, header, .none);
 
                 var values_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_values_path, .{ .allow_directory = false });
                 defer values_file.close(self.io);
-                const values_header = try readNodePropertyValueBlockHeaderFromFile(self, values_file);
-                if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
-                if (try regularFileSize(self, values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
+                var values_view = try PropertyBlockView.init(self.allocator, self.io, values_file);
+                defer values_view.deinit();
+                const values_header = try readPropertyPayloadValueHeaderFromView(self, &values_view);
+                if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0 or
+                    values_header.hasDerivedStringValueHashes() != header.hasDerivedStringValueHashes()) return error.InvalidRecord;
+                if (values_view.logical_size != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
 
-                var wanted_it = wanted.keyIterator();
-                while (wanted_it.next()) |wanted_key| {
-                    var index = try propertyPayloadKeyHashLowerBound(self, index_file, header.record_count, wanted_key.key_hash);
+                for (wanted_keys) |wanted_key| {
+                    var index = if (index_view.hasPropertyIndexAnchors())
+                        try propertyPayloadOwnerKeyLowerBoundView(
+                            self,
+                            &index_view,
+                            header.record_count,
+                            wanted_key.key_hash,
+                            wanted_key.owner_kind,
+                            wanted_key.owner_id,
+                        )
+                    else
+                        try propertyPayloadKeyHashLowerBoundView(self, &index_view, header.record_count, wanted_key.key_hash);
                     while (index < header.record_count) : (index += 1) {
-                        const record = try readPropertyPayloadIndexRecordAt(self, index_file, index);
+                        const record = try readPropertyPayloadIndexRecordAtView(self, &index_view, index);
                         if (record.key_hash != wanted_key.key_hash) break;
+                        if (index_view.hasPropertyIndexAnchors() and
+                            (record.owner_kind != wanted_key.owner_kind or record.owner_id != wanted_key.owner_id)) break;
                         if (record.owner_kind == wanted_key.owner_kind and record.owner_id == wanted_key.owner_id) {
-                            try found.put(wanted_key.*, {});
+                            try found.put(wanted_key, {});
                             break;
                         }
                     }
@@ -5783,6 +6190,190 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             return property_payload_transaction.compactDelta(self, allocator);
         }
 
+        /// Bounded-memory merge cursor over the sorted immutable base pair and
+        /// the deduplicated delta upserts. Base records are read one at a time
+        /// from the block views and delta entries (already last-write-wins by
+        /// owner key) are interleaved in the exact staging order; equal owner
+        /// keys take the delta value. Only the delta and one in-flight string
+        /// value are resident. The transaction owner drives this cursor
+        /// through its compaction Ops so commit ordering stays in one place.
+        pub const PropertyPayloadCompactionMerge = struct {
+            store: Store,
+            allocator: std.mem.Allocator,
+            index_file: ?std.Io.File = null,
+            values_file: ?std.Io.File = null,
+            index_view: PropertyBlockView = undefined,
+            values_view: PropertyBlockView = undefined,
+            values_header: NodePropertyValueBlockHeader = undefined,
+            has_base: bool = false,
+            base_count: u64 = 0,
+            base_index: u64 = 0,
+            delta_entries: std.ArrayList(PropertyPayloadIndexEntry) = .empty,
+            delta_index: usize = 0,
+            expected_count: u64 = 0,
+            pending_value: ?[]u8 = null,
+
+            pub fn init(store: Store, allocator: std.mem.Allocator) !PropertyPayloadCompactionMerge {
+                var self = PropertyPayloadCompactionMerge{ .store = store, .allocator = allocator };
+                errdefer self.deinit();
+
+                const has_index = try fileExists(store, store.property_payload_index_path);
+                const has_values = try fileExists(store, store.property_payload_values_path);
+                if (has_index != has_values) return error.InvalidRecord;
+                if (has_index) {
+                    self.index_file = try std.Io.Dir.cwd().openFile(store.io, store.property_payload_index_path, .{ .allow_directory = false });
+                    self.index_view = try PropertyBlockView.init(store.allocator, store.io, self.index_file.?);
+                    const header = try readPropertyPayloadIndexHeaderFromView(store, &self.index_view);
+                    if (header.owner_count != 0 or header.owner_digest != 0) return error.InvalidRecord;
+                    if (self.index_view.logical_size != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
+                    try validatePropertyPayloadIndexOrderIfStrictDeadlineView(store, &self.index_view, header, .none);
+
+                    self.values_file = try std.Io.Dir.cwd().openFile(store.io, store.property_payload_values_path, .{ .allow_directory = false });
+                    self.values_view = try PropertyBlockView.init(store.allocator, store.io, self.values_file.?);
+                    self.values_header = try readPropertyPayloadValueHeaderFromView(store, &self.values_view);
+                    if (self.values_header.record_count != header.record_count or self.values_header.node_count != 0 or
+                        self.values_header.node_digest != 0 or
+                        self.values_header.hasDerivedStringValueHashes() != header.hasDerivedStringValueHashes()) return error.InvalidRecord;
+                    if (self.values_view.logical_size != try nodePropertyValueBlockFileSize(self.values_header.record_count, self.values_header.payload_bytes)) return error.InvalidRecord;
+                    self.has_base = true;
+                    self.base_count = header.record_count;
+                }
+
+                var positions = std.AutoHashMap(PropertyPayloadOwnerKey, usize).init(allocator);
+                defer positions.deinit();
+                _ = try scanPropertyPayloadDelta(store, allocator, .{ .all = .{
+                    .entries = &self.delta_entries,
+                    .positions = &positions,
+                } }, false);
+                std.mem.sort(PropertyPayloadIndexEntry, self.delta_entries.items, {}, propertyPayloadEntryLessThan);
+
+                var new_delta_entries: u64 = 0;
+                for (self.delta_entries.items) |entry| {
+                    const replaces_base = if (self.has_base) blk: {
+                        const position = try propertyPayloadOwnerKeyLowerBoundView(
+                            store,
+                            &self.index_view,
+                            self.base_count,
+                            entry.record.key_hash,
+                            entry.record.owner_kind,
+                            entry.record.owner_id,
+                        );
+                        if (position >= self.base_count) break :blk false;
+                        const record = try readPropertyPayloadIndexRecordAtView(store, &self.index_view, position);
+                        break :blk record.key_hash == entry.record.key_hash and
+                            record.owner_kind == entry.record.owner_kind and
+                            record.owner_id == entry.record.owner_id;
+                    } else false;
+                    if (!replaces_base) new_delta_entries += 1;
+                }
+                self.expected_count = std.math.add(u64, self.base_count, new_delta_entries) catch return error.RecordTooLarge;
+                return self;
+            }
+
+            pub fn deinit(self: *PropertyPayloadCompactionMerge) void {
+                if (self.pending_value) |value| self.allocator.free(value);
+                self.pending_value = null;
+                deinitPropertyPayloadIndexEntries(self.delta_entries.items, self.allocator);
+                self.delta_entries.deinit(self.allocator);
+                if (self.has_base) {
+                    self.values_view.deinit();
+                    self.index_view.deinit();
+                }
+                if (self.values_file) |*file| file.close(self.store.io);
+                if (self.index_file) |*file| file.close(self.store.io);
+                self.* = undefined;
+            }
+
+            pub fn restart(context: *anyopaque) anyerror!void {
+                const self: *PropertyPayloadCompactionMerge = @ptrCast(@alignCast(context));
+                self.base_index = 0;
+                self.delta_index = 0;
+                if (self.pending_value) |value| self.allocator.free(value);
+                self.pending_value = null;
+            }
+
+            fn ownerKeyLessThan(a: PropertyPayloadIndexRecord, b: PropertyPayloadIndexRecord) bool {
+                if (a.key_hash != b.key_hash) return a.key_hash < b.key_hash;
+                if (a.owner_kind != b.owner_kind) return a.owner_kind < b.owner_kind;
+                return a.owner_id < b.owner_id;
+            }
+
+            fn ownerKeyEqual(a: PropertyPayloadIndexRecord, b: PropertyPayloadIndexRecord) bool {
+                return a.key_hash == b.key_hash and a.owner_kind == b.owner_kind and a.owner_id == b.owner_id;
+            }
+
+            fn entryOwner(record: PropertyPayloadIndexRecord) !SortedPropertyPayloadEntry {
+                return switch (record.owner_kind) {
+                    PropertyPayloadIndexRecord.owner_kind_node => .{
+                        .owner = .{ .node = core.NodeId.fromInt(record.owner_id) },
+                        .key_hash = record.key_hash,
+                        .value = .{ .uint = 0 },
+                    },
+                    PropertyPayloadIndexRecord.owner_kind_edge => .{
+                        .owner = .{ .edge = core.EdgeId.fromInt(record.owner_id) },
+                        .key_hash = record.key_hash,
+                        .value = .{ .uint = 0 },
+                    },
+                    else => error.InvalidRecord,
+                };
+            }
+
+            fn emitDelta(self: *PropertyPayloadCompactionMerge) !?SortedPropertyPayloadEntry {
+                const entry = self.delta_entries.items[self.delta_index];
+                self.delta_index += 1;
+                var out = try entryOwner(entry.record);
+                if (entry.record.value_type == PropertyPayloadIndexRecord.value_type_string) {
+                    out.value = .{ .string = entry.value orelse return error.InvalidRecord };
+                } else {
+                    out.value = .{ .uint = entry.record.value_hash };
+                }
+                return out;
+            }
+
+            fn emitBase(self: *PropertyPayloadCompactionMerge, record: PropertyPayloadIndexRecord) !?SortedPropertyPayloadEntry {
+                var mutable_record = record;
+                var out = try entryOwner(record);
+                if (record.value_type == PropertyPayloadIndexRecord.value_type_string) {
+                    const value = (try readPropertyPayloadValuePayloadAtView(
+                        self.store,
+                        self.allocator,
+                        &self.values_view,
+                        self.values_header,
+                        self.base_index,
+                        &mutable_record,
+                    )) orelse return error.InvalidRecord;
+                    if (self.pending_value) |previous| self.allocator.free(previous);
+                    self.pending_value = value;
+                    out.value = .{ .string = value };
+                } else {
+                    out.value = .{ .uint = record.value_hash };
+                }
+                self.base_index += 1;
+                return out;
+            }
+
+            pub fn next(context: *anyopaque) anyerror!?SortedPropertyPayloadEntry {
+                const self: *PropertyPayloadCompactionMerge = @ptrCast(@alignCast(context));
+                while (true) {
+                    const base_available = self.has_base and self.base_index < self.base_count;
+                    const delta_available = self.delta_index < self.delta_entries.items.len;
+                    if (!base_available and !delta_available) return null;
+                    if (!base_available) return self.emitDelta();
+                    const base_record = try readPropertyPayloadIndexRecordAtView(self.store, &self.index_view, self.base_index);
+                    if (!delta_available) return self.emitBase(base_record);
+                    const delta_record = self.delta_entries.items[self.delta_index].record;
+                    if (ownerKeyEqual(base_record, delta_record)) {
+                        // The delta rewrote this owner/key: the base record is
+                        // superseded and must not be emitted.
+                        self.base_index += 1;
+                        return self.emitDelta();
+                    }
+                    if (ownerKeyLessThan(base_record, delta_record)) return self.emitBase(base_record);
+                    return self.emitDelta();
+                }
+            }
+        };
+
         pub fn readPropertyPayloadEntryForKey(
             self: Store,
             allocator: std.mem.Allocator,
@@ -5801,24 +6392,37 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             if (has_index) {
                 var index_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_index_path, .{ .allow_directory = false });
                 defer index_file.close(self.io);
-                const header = try readPropertyPayloadIndexHeaderFromFile(self, index_file);
+                var index_view = try PropertyBlockView.init(self.allocator, self.io, index_file);
+                defer index_view.deinit();
+                const header = try readPropertyPayloadIndexHeaderFromView(self, &index_view);
                 if (header.owner_count != 0 or header.owner_digest != 0) return error.InvalidRecord;
-                if (try regularFileSize(self, index_file) != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
-                try validatePropertyPayloadIndexOrderIfStrict(self, index_file, header);
+                if (index_view.logical_size != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
+                try validatePropertyPayloadIndexOrderIfStrictDeadlineView(self, &index_view, header, .none);
 
                 var values_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_values_path, .{ .allow_directory = false });
                 defer values_file.close(self.io);
-                const values_header = try readNodePropertyValueBlockHeaderFromFile(self, values_file);
-                if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
-                if (try regularFileSize(self, values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
+                var values_view = try PropertyBlockView.init(self.allocator, self.io, values_file);
+                defer values_view.deinit();
+                const values_header = try readPropertyPayloadValueHeaderFromView(self, &values_view);
+                if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0 or
+                    values_header.hasDerivedStringValueHashes() != header.hasDerivedStringValueHashes()) return error.InvalidRecord;
+                if (values_view.logical_size != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
 
-                var index = try propertyPayloadKeyHashLowerBound(self, index_file, header.record_count, lookup.owner_key.key_hash);
+                var index = try propertyPayloadOwnerKeyLowerBoundView(
+                    self,
+                    &index_view,
+                    header.record_count,
+                    lookup.owner_key.key_hash,
+                    lookup.owner_key.owner_kind,
+                    lookup.owner_key.owner_id,
+                );
                 while (index < header.record_count) : (index += 1) {
-                    const record = try readPropertyPayloadIndexRecordAt(self, index_file, index);
-                    if (record.key_hash != lookup.owner_key.key_hash) break;
-                    if (record.owner_kind != lookup.owner_key.owner_kind or record.owner_id != lookup.owner_key.owner_id) continue;
+                    var record = try readPropertyPayloadIndexRecordAtView(self, &index_view, index);
+                    if (record.key_hash != lookup.owner_key.key_hash or
+                        record.owner_kind != lookup.owner_key.owner_kind or
+                        record.owner_id != lookup.owner_key.owner_id) break;
                     if (lookup.value != null) return error.InvalidRecord;
-                    const value = try readPropertyPayloadValuePayloadAt(self, allocator, values_file, values_header, index, record);
+                    const value = try readPropertyPayloadValuePayloadAtView(self, allocator, &values_view, values_header, index, &record);
                     lookup.value = .{ .record = record, .value = value };
                 }
             }
@@ -9334,8 +9938,8 @@ pub fn StoreDataPlane(comptime Ops: type) type {
             if (physical_edges == null and !visible_full) return false;
             const segment_open_start = if (timings != null) storageMonotonicNs(self.io) else 0;
             var segments = PublishedEdgeSegments.init(self.allocator);
-            try segments.openTrustedEntriesForQuery(self.io, manifest.entries.items);
             defer segments.deinit();
+            try segments.validateTrustedEntriesBounded(self.io, manifest.entries.items);
             if (timings) |t| t.edge_segment_open_ns = storageElapsedNs(self.io, segment_open_start);
             const segment_digest_start = if (timings != null) storageMonotonicNs(self.io) else 0;
             const segment_digest = edgeSegmentManifestOwnedEdgeDigest(manifest.entries.items);
@@ -13106,6 +13710,61 @@ pub fn StoreDataPlane(comptime Ops: type) type {
                 try std.Io.Dir.cwd().openFile(self.io, dir_path, .{ .allow_directory = true });
             defer dir_file.close(self.io);
             try dir_file.sync(self.io);
+        }
+
+        /// Group-commit durability boundary: sync every file surface an
+        /// append-family write can touch, plus the store directory for any
+        /// renamed metadata. A batch of writes executed with `.fast`
+        /// durability followed by this call is durable-equivalent to
+        /// executing each write with `.safe`, at one sync cost per group
+        /// instead of per operation. Missing files are fine (that surface
+        /// was simply not written yet).
+        pub fn syncDurableAppendSurfaces(self: Store) !void {
+            const paths = [_][]const u8{
+                self.events_bin_path,
+                self.node_texts_path,
+                self.index_meta_path,
+                self.node_by_id_path,
+                self.node_by_text_path,
+                self.node_by_text_delta_path,
+                self.node_by_text_base_filter_path,
+                self.external_key_index_path,
+                self.property_payload_index_path,
+                self.property_payload_values_path,
+                self.property_payload_delta_path,
+                self.edge_external_key_index_path,
+                self.edge_by_id_path,
+                self.edge_by_src_path,
+                self.edge_by_dst_path,
+                self.edge_order_path,
+                self.edge_tombstones_path,
+            };
+            for (paths) |path| {
+                var file = std.Io.Dir.cwd().openFile(self.io, path, .{}) catch |err| switch (err) {
+                    error.FileNotFound => continue,
+                    else => |other| return other,
+                };
+                defer file.close(self.io);
+                try file.sync(self.io);
+            }
+            var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const journal_path = try nodeTextsAppendJournalPath(self, &journal_path_buffer);
+            if (std.Io.Dir.cwd().openFile(self.io, journal_path, .{})) |journal_file| {
+                var file = journal_file;
+                defer file.close(self.io);
+                try file.sync(self.io);
+            } else |err| switch (err) {
+                error.FileNotFound => {},
+                else => |other| return other,
+            }
+            if (builtin.os.tag != .windows) {
+                var dir_file = if (std.fs.path.isAbsolute(self.dir_path))
+                    try std.Io.Dir.openFileAbsolute(self.io, self.dir_path, .{ .allow_directory = true })
+                else
+                    try std.Io.Dir.cwd().openFile(self.io, self.dir_path, .{ .allow_directory = true });
+                defer dir_file.close(self.io);
+                try dir_file.sync(self.io);
+            }
         }
 
         test "store data plane rejects binary offset overflow" {

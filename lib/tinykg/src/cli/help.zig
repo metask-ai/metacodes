@@ -74,6 +74,13 @@ const usage_text =
     \\  gc-node-text-runs <db>
     \\  task-ready [db] <task-id>
     \\  task-packet [db] <task-id> [--limit <n>] [--format text|json] [--meta] [--max-nodes <n>] [--max-edges <n>] [--max-chars <n>]
+    \\  task-snapshot [db] <root-task-id> [--max-tasks <n>] [--max-edges <n>] [--max-chars <n>]   (tinykg-task-snapshot-v1 canonical JSON,一致读导出 contain 子树+依赖+evidence)
+    \\  ontology-rule-snapshot [db] <project-node-id> --project-sha256 <hex> --project-key <key> [--max-items <n>] [--max-chars <n>]   (tinykg-ontology-rule-snapshot-v1,项目本体只读快照)
+    \\  memory-migration-capabilities [db]   (memory-migration-v1 capability 文档+engine build id)
+    \\  memory-migration-snapshot [db] --source-id <id> --replacement-id <id> --evidence-id <id>   (三节点+固定边事实的一致快照)
+    \\  memory-migration-commit [db] --request <json-file>   (revision-CAS 原子 supersede;同 id 同 bytes 幂等回执)
+    \\  memory-migration-post-state [db] --rollback-token <token>   (按回执 token 重观测 post-state)
+    \\  memory-migration-rollback [db] --request <json-file>   (幂等回滚该 commit 的固定 effect)
     \\  task-frontier [db] <root-id> [--limit <n>] [--mine <agent>] [--unclaimed]
     \\  task-claim [db] <task-id> --by <agent> [--ttl-s <n>] [--steal]
     \\  task-release [db] <task-id> [--by <agent>] [--force]
@@ -81,7 +88,7 @@ const usage_text =
     \\  task-ancestry [db] <task-id> [--depth <n>] [--limit <n>]
     \\  task-metrics [db] <root-id> [--limit <n>]
     \\  task-event [db] <root-id> <write_attempt|write_error|dependency_edge_created|dependency_edge_deleted|prompt_adherence_ok|prompt_adherence_miss> [--task <id>] [--relation <rel>] [--note <text>]
-    \\  store-info [db]
+    \\  store-info [db] [--refresh-size]
     \\  stats [db]
     \\  version
     \\  aliases: remember=add-node, relate=add-edge, revise=update-node, tag-node=govern-node, forget=delete-node, recall=search, inspect=get, health=governance

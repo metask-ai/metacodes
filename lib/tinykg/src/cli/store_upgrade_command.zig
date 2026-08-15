@@ -127,7 +127,7 @@ fn planUpgrade(
     }
     switch (detected) {
         .legacy => {
-            if (current_storage_format_version != 2 or current_schema_version != 3) {
+            if (current_storage_format_version != 3 or current_schema_version != 3) {
                 return error.UpgradePathUnavailable;
             }
             return .migrate_store_v2_task_status_v1;
@@ -144,14 +144,16 @@ fn planUpgrade(
             if (value.schema_version > current_schema_version) {
                 return error.NewerSchemaVersion;
             }
+            if (value.catalog_format_version != null and !value.catalog_compatible) {
+                return error.CatalogSchemaMismatch;
+            }
             if (value.storage_format_version == current_storage_format_version and
                 value.schema_version == current_schema_version)
             {
                 if (value.catalog_format_version == null) return error.MissingStoreCatalog;
-                if (!value.catalog_compatible) return error.CatalogSchemaMismatch;
                 return .current;
             }
-            if (current_storage_format_version != 2 or current_schema_version != 3) {
+            if (current_storage_format_version != 3 or current_schema_version != 3) {
                 return error.UpgradePathUnavailable;
             }
             return .migrate_store_v2_task_status_v1;
@@ -265,7 +267,7 @@ const FailingWriter = struct {
 
 const TestOps = struct {
     pub const currentStoreManifestVersionValue: u32 = 1;
-    pub const currentStorageFormatVersionValue: u32 = 2;
+    pub const currentStorageFormatVersionValue: u32 = 3;
     pub const currentSchemaVersionValue: u32 = 3;
 
     const Step = enum { init, detect, migrate, write, deinit };
@@ -363,25 +365,25 @@ test "store upgrade arguments reject missing duplicate unknown and ambiguous val
 }
 
 test "store upgrade plan accepts current legacy and older supported stores" {
-    try std.testing.expectEqual(UpgradePlan.migrate_store_v2_task_status_v1, try planUpgrade(.{ .legacy = .{} }, 1, 2, 3));
+    try std.testing.expectEqual(UpgradePlan.migrate_store_v2_task_status_v1, try planUpgrade(.{ .legacy = .{} }, 1, 3, 3));
     try std.testing.expectEqual(UpgradePlan.migrate_store_v2_task_status_v1, try planUpgrade(.{ .manifest = .{
         .store_manifest_version = 1,
         .storage_format_version = 1,
         .schema_version = 2,
         .catalog_format_version = null,
-    } }, 1, 2, 3));
+    } }, 1, 3, 3));
     try std.testing.expectEqual(UpgradePlan.migrate_store_v2_task_status_v1, try planUpgrade(.{ .manifest = .{
         .store_manifest_version = 1,
         .storage_format_version = 2,
         .schema_version = 2,
         .catalog_format_version = 1,
-    } }, 1, 2, 3));
+    } }, 1, 3, 3));
     try std.testing.expectEqual(UpgradePlan.current, try planUpgrade(.{ .manifest = .{
         .store_manifest_version = 1,
-        .storage_format_version = 2,
+        .storage_format_version = 3,
         .schema_version = 3,
         .catalog_format_version = 2,
-    } }, 1, 2, 3));
+    } }, 1, 3, 3));
 }
 
 test "store upgrade plan rejects malformed newer catalog mismatch and unavailable routes" {
@@ -393,6 +395,7 @@ test "store upgrade plan rejects malformed newer catalog mismatch and unavailabl
     try std.testing.expectError(error.NewerSchemaVersion, planUpgrade(.{ .manifest = .{ .store_manifest_version = 1, .storage_format_version = 2, .schema_version = 4, .catalog_format_version = 2 } }, 1, 2, 3));
     try std.testing.expectError(error.MissingStoreCatalog, planUpgrade(.{ .manifest = .{ .store_manifest_version = 1, .storage_format_version = 2, .schema_version = 3, .catalog_format_version = null } }, 1, 2, 3));
     try std.testing.expectError(error.CatalogSchemaMismatch, planUpgrade(.{ .manifest = .{ .store_manifest_version = 1, .storage_format_version = 2, .schema_version = 3, .catalog_format_version = 2, .catalog_compatible = false } }, 1, 2, 3));
+    try std.testing.expectError(error.CatalogSchemaMismatch, planUpgrade(.{ .manifest = .{ .store_manifest_version = 1, .storage_format_version = 2, .schema_version = 2, .catalog_format_version = 1, .catalog_compatible = false } }, 1, 2, 3));
     try std.testing.expectError(error.UpgradePathUnavailable, planUpgrade(.{ .legacy = .{} }, 1, 3, 4));
     try std.testing.expectError(error.UpgradePathUnavailable, planUpgrade(.{ .legacy = .{} }, 1, 0, 3));
 }
@@ -401,7 +404,7 @@ test "store upgrade current store is a no-op without a target" {
     TestOps.reset();
     TestOps.detected = .{ .manifest = .{
         .store_manifest_version = 1,
-        .storage_format_version = 2,
+        .storage_format_version = 3,
         .schema_version = 3,
         .catalog_format_version = 2,
     } };
@@ -411,7 +414,7 @@ test "store upgrade current store is a no-op without a target" {
     try store_upgrade_command.run(&.{ "tinykg", "upgrade", "source.kg" }, &writer, std.testing.allocator, std.testing.io);
     try TestOps.expectSteps(&.{ .init, .detect, .write, .deinit });
     try std.testing.expectEqualStrings(
-        "upgrade result=current action=noop source=source.kg manifest=present detected_manifest=1 detected_storage=2 detected_schema=3 catalog=present detected_catalog=2 catalog_compatible=1 target_storage=2 target_schema=3 verified=1\n",
+        "upgrade result=current action=noop source=source.kg manifest=present detected_manifest=1 detected_storage=3 detected_schema=3 catalog=present detected_catalog=2 catalog_compatible=1 target_storage=3 target_schema=3 verified=1\n",
         writer.buffer.items,
     );
 }
@@ -440,7 +443,7 @@ test "store upgrade forces strict verified task-status migration" {
     }, &writer, std.testing.allocator, std.testing.io);
     try TestOps.expectSteps(&.{ .init, .detect, .migrate, .write, .deinit });
     try std.testing.expectEqualStrings(
-        "upgrade result=dry-run action=migrate-store-v2+task-status-v1 source=source.kg target=target.kg manifest=legacy detected_manifest=0 detected_storage=0 detected_schema=0 catalog=absent detected_catalog=0 catalog_compatible=1 target_storage=2 target_schema=3 verified=1 nodes_scanned=13 nodes_written=11 edges_scanned=17 edges_written=15 backup=backup.kg text_warmed=1 marker_cleanup_pending=0\n",
+        "upgrade result=dry-run action=migrate-store-v2+task-status-v1 source=source.kg target=target.kg manifest=legacy detected_manifest=0 detected_storage=0 detected_schema=0 catalog=absent detected_catalog=0 catalog_compatible=1 target_storage=3 target_schema=3 verified=1 nodes_scanned=13 nodes_written=11 edges_scanned=17 edges_written=15 backup=backup.kg text_warmed=1 marker_cleanup_pending=0\n",
         writer.buffer.items,
     );
 }
@@ -460,7 +463,7 @@ test "store upgrade closes probe state after migration or output failure" {
     TestOps.reset();
     TestOps.detected = .{ .manifest = .{
         .store_manifest_version = 1,
-        .storage_format_version = 2,
+        .storage_format_version = 3,
         .schema_version = 3,
         .catalog_format_version = 2,
     } };

@@ -42,6 +42,52 @@ pub fn PublishedEdgeSegmentResources(comptime Ops: type) type {
                 }
             }
 
+            /// Validate every physical entry while keeping at most one segment
+            /// open. Full-store validation needs header/count admission, not a
+            /// query container retaining every immutable reader until teardown.
+            pub fn validateTrustedEntriesBounded(self: *PublishedEdgeSegments, io: std.Io, entries: []const support.OwnedEdgeSegmentManifestEntry) !void {
+                for (entries) |entry| {
+                    if (support.edgeSegmentManifestEntryIsVirtual(entry)) {
+                        try support.edgeSegmentManifestValidateVirtualEntry(entry);
+                        continue;
+                    }
+                    var segment = try segment_mod.ImmutableAdjacencySegment.openTrustedForQuery(self.allocator, io, entry.path, entry.edge_count);
+                    segment.deinit();
+                }
+            }
+
+            /// Stream every manifest edge while retaining at most one physical
+            /// segment reader. Full-store scans do not need a query container
+            /// whose lifetime spans the complete manifest.
+            pub fn scanTrustedEntriesBounded(
+                self: *PublishedEdgeSegments,
+                io: std.Io,
+                entries: []const support.OwnedEdgeSegmentManifestEntry,
+                direction: segment_mod.Direction,
+                context: anytype,
+                comptime callback: fn (@TypeOf(context), segment_mod.EdgeRecord) anyerror!void,
+            ) !void {
+                for (entries) |entry| {
+                    if (support.edgeSegmentManifestEntryIsVirtual(entry)) {
+                        var index: u64 = 0;
+                        while (index < entry.edge_count) : (index += 1) {
+                            try callback(context, try support.edgeSegmentManifestVirtualRunEdgeAt(entry, index));
+                        }
+                        continue;
+                    }
+                    var segment = try segment_mod.ImmutableAdjacencySegment.openTrustedDirectionForQuery(
+                        self.allocator,
+                        io,
+                        entry.path,
+                        direction,
+                        entry.edge_count,
+                    );
+                    defer segment.deinit();
+                    var iterator = try segment.edgeIterator(direction);
+                    while (try iterator.next()) |edge| try callback(context, edge);
+                }
+            }
+
             pub fn openEntry(self: *PublishedEdgeSegments, io: std.Io, entry: support.OwnedEdgeSegmentManifestEntry) !void {
                 if (support.edgeSegmentManifestEntryIsVirtual(entry)) {
                     try support.appendEdgeSegmentManifestVirtualEdges(self.allocator, &self.virtual_edges, entry);
@@ -176,6 +222,8 @@ const TestId = struct {
 const TestRel = enum(u16) { related = 1 };
 
 var test_open_cleanup_count: usize = 0;
+var test_open_active_count: usize = 0;
+var test_open_peak_count: usize = 0;
 
 const TestSegment = struct {
     pub const Direction = enum { forward, reverse };
@@ -189,24 +237,53 @@ const TestSegment = struct {
         cleanup_count: *usize,
         count: u64 = 0,
         digest: u64 = 0,
+        tracks_open: bool = false,
 
         pub fn open(_: std.mem.Allocator, _: std.Io, _: []const u8) !@This() {
             return .{ .cleanup_count = &test_open_cleanup_count };
         }
         pub fn openTrustedForQuery(_: std.mem.Allocator, _: std.Io, _: []const u8, count: u64) !@This() {
-            return .{ .cleanup_count = &test_open_cleanup_count, .count = count };
+            test_open_active_count += 1;
+            test_open_peak_count = @max(test_open_peak_count, test_open_active_count);
+            return .{ .cleanup_count = &test_open_cleanup_count, .count = count, .tracks_open = true };
         }
         pub fn openTrustedDirectionForQuery(_: std.mem.Allocator, _: std.Io, _: []const u8, _: Direction, count: u64) !@This() {
-            return .{ .cleanup_count = &test_open_cleanup_count, .count = count };
+            test_open_active_count += 1;
+            test_open_peak_count = @max(test_open_peak_count, test_open_active_count);
+            return .{ .cleanup_count = &test_open_cleanup_count, .count = count, .tracks_open = true };
         }
         pub fn deinit(self: *@This()) void {
             self.cleanup_count.* += 1;
+            if (self.tracks_open) {
+                test_open_active_count -= 1;
+                self.tracks_open = false;
+            }
         }
         pub fn edgeCount(self: @This()) !u64 {
             return self.count;
         }
         pub fn edgeDigest(self: @This()) !u64 {
             return self.digest;
+        }
+
+        pub const EdgeIterator = struct {
+            remaining: u64,
+
+            pub fn next(self: *@This()) !?EdgeRecord {
+                if (self.remaining == 0) return null;
+                const value = self.remaining;
+                self.remaining -= 1;
+                return .{
+                    .src = .{ .value = 1 },
+                    .dst = .{ .value = value + 1 },
+                    .edge_id = .{ .value = value },
+                    .rel = .related,
+                };
+            }
+        };
+
+        pub fn edgeIterator(self: *@This(), _: Direction) !EdgeIterator {
+            return .{ .remaining = self.count };
         }
     };
 };
@@ -239,6 +316,13 @@ const TestSupport = struct {
         entry: OwnedEdgeSegmentManifestEntry,
     ) !void {
         try edges.append(allocator, entry.edge);
+    }
+    pub fn edgeSegmentManifestVirtualRunEdgeAt(entry: OwnedEdgeSegmentManifestEntry, index: u64) !TestSegment.EdgeRecord {
+        if (index >= entry.edge_count) return error.InvalidRecord;
+        return entry.edge;
+    }
+    pub fn edgeSegmentManifestValidateVirtualEntry(entry: OwnedEdgeSegmentManifestEntry) !void {
+        if (!entry.virtual) return error.InvalidRecord;
     }
     pub fn edgeRecordDigest(record: anytype) u64 {
         return record.src ^ record.dst ^ record.edge_id ^ record.rel;
@@ -297,6 +381,51 @@ test "published edge segments deinitialize physical and virtual resources" {
     try segments.virtual_edges.append(std.testing.allocator, (TestSupport.OwnedEdgeSegmentManifestEntry{}).edge);
     segments.deinit();
     try std.testing.expectEqual(@as(usize, 1), cleanup_count);
+}
+
+test "published edge segment validation releases each physical entry immediately" {
+    test_open_cleanup_count = 0;
+    test_open_active_count = 0;
+    test_open_peak_count = 0;
+    var segments = TestResources.PublishedEdgeSegments.init(std.testing.allocator);
+    defer segments.deinit();
+    const entries = [_]TestSupport.OwnedEdgeSegmentManifestEntry{
+        .{ .path = "one", .edge_count = 1, .virtual = false },
+        .{ .path = "two", .edge_count = 2, .virtual = false },
+        .{ .path = "three", .edge_count = 3, .virtual = false },
+    };
+    try segments.validateTrustedEntriesBounded(std.testing.io, &entries);
+    try std.testing.expectEqual(@as(usize, 3), test_open_cleanup_count);
+    try std.testing.expectEqual(@as(usize, 0), test_open_active_count);
+    try std.testing.expectEqual(@as(usize, 1), test_open_peak_count);
+    try std.testing.expectEqual(@as(usize, 0), segments.segments.items.len);
+}
+
+test "published edge segment full scan releases each physical entry immediately" {
+    test_open_cleanup_count = 0;
+    test_open_active_count = 0;
+    test_open_peak_count = 0;
+    var segments = TestResources.PublishedEdgeSegments.init(std.testing.allocator);
+    defer segments.deinit();
+    const entries = [_]TestSupport.OwnedEdgeSegmentManifestEntry{
+        .{ .path = "one", .edge_count = 1, .virtual = false },
+        .{ .path = "two", .edge_count = 2, .virtual = false },
+        .{ .path = "three", .edge_count = 3, .virtual = false },
+    };
+    const ScanContext = struct {
+        count: usize = 0,
+
+        fn visit(context: *@This(), _: TestSegment.EdgeRecord) !void {
+            context.count += 1;
+        }
+    };
+    var context = ScanContext{};
+    try segments.scanTrustedEntriesBounded(std.testing.io, &entries, .forward, &context, ScanContext.visit);
+    try std.testing.expectEqual(@as(usize, 6), context.count);
+    try std.testing.expectEqual(@as(usize, 3), test_open_cleanup_count);
+    try std.testing.expectEqual(@as(usize, 0), test_open_active_count);
+    try std.testing.expectEqual(@as(usize, 1), test_open_peak_count);
+    try std.testing.expectEqual(@as(usize, 0), segments.segments.items.len);
 }
 
 test "published edge segment query teardown releases retention after segments" {

@@ -342,6 +342,38 @@ pub fn contextPacketWithCursor(
     );
 }
 
+pub fn contextPacketWithCursorMeasured(
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    graph: *const graph_mod.Graph,
+    mem_index: *index.MemoryIndex,
+    edge_cursor: query.EdgeCursor,
+    focus: core.NodeId,
+    max_facts: usize,
+    budget: core.QueryBudget,
+    stats: *index.QueryStats,
+) !ContextPacket {
+    if (isReservedNodeId(focus)) return core.Error.InvalidId;
+    if (mem_index.getNode(graph, focus) == null) return core.Error.NotFound;
+    return context_packet.assemble(
+        allocator,
+        edge_cursor,
+        .{ .memory = .{ .graph = graph, .mem_index = mem_index } },
+        focus,
+        max_facts,
+        .{
+            .budget = budget,
+            .stats = stats,
+            .budget_start_nodes = stats.nodes_visited,
+            .budget_start_edges = stats.edges_visited,
+            .deadline = if (io) |value|
+                core.QueryDeadline.fromIo(value, budget.timeout_ms)
+            else
+                core.QueryDeadline.immediateOrNone(budget.timeout_ms),
+        },
+    );
+}
+
 pub fn contextPacketWithPersistentStore(
     allocator: std.mem.Allocator,
     store: storage.Store,

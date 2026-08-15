@@ -18,6 +18,15 @@ fn findBin(a: std.mem.Allocator) ?[]u8 {
         const p = std.mem.span(v);
         if (isX(p)) return a.dupe(u8, p) catch null;
     }
+    // 本构建的 vendored 二进制优先:主仓路径可能存着旧格式版本的陈旧二进制,
+    // 命中它会让 L2 因版本门静默 skip。
+    if (cc.util_fs.getCwd(a) catch null) |cwd| {
+        defer a.free(cwd);
+        if (std.fmt.allocPrint(a, "{s}/zig-out/vendor/tinykg/tinykg", .{cwd}) catch null) |local| {
+            if (isX(local)) return local;
+            a.free(local);
+        }
+    }
     const home_c = std.c.getenv("HOME") orelse return null;
     const home = std.mem.span(home_c);
     const cands = [_][]const u8{ "prj/cc-t2z/metacodes/zig-out/vendor/tinykg/tinykg", "prj/tinykg/zig-out/bin/tinykg", "bin/tinykg" };

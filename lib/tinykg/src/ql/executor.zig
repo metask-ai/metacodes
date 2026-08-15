@@ -92,14 +92,21 @@ const NodeUintPropertySortContext = struct {
     allocator: std.mem.Allocator,
     graph: *const graph_mod.Graph,
     mem_index: *index.MemoryIndex,
+    checkpoint_view: ?query_mod.CheckpointView,
     key: []const u8,
 };
 
 fn nodeUintPropertyLessThan(ctx: NodeUintPropertySortContext, lhs: core.NodeId, rhs: core.NodeId) bool {
     const lhs_node = ctx.mem_index.getNode(ctx.graph, lhs);
     const rhs_node = ctx.mem_index.getNode(ctx.graph, rhs);
-    const lhs_value = if (lhs_node) |node| nodeUintPropertyValue(ctx.allocator, node.text, ctx.key) else null;
-    const rhs_value = if (rhs_node) |node| nodeUintPropertyValue(ctx.allocator, node.text, ctx.key) else null;
+    const lhs_value = if (lhs_node) |node| if (ctx.checkpoint_view) |view|
+        checkpointNodeUintProperty(view, node.id, ctx.key)
+    else
+        nodeUintPropertyValue(ctx.allocator, node.text, ctx.key) else null;
+    const rhs_value = if (rhs_node) |node| if (ctx.checkpoint_view) |view|
+        checkpointNodeUintProperty(view, node.id, ctx.key)
+    else
+        nodeUintPropertyValue(ctx.allocator, node.text, ctx.key) else null;
     if (lhs_value == null and rhs_value == null) return nodeIdLessThan({}, lhs, rhs);
     if (lhs_value == null) return false;
     if (rhs_value == null) return true;
@@ -107,11 +114,12 @@ fn nodeUintPropertyLessThan(ctx: NodeUintPropertySortContext, lhs: core.NodeId, 
     return nodeIdLessThan({}, lhs, rhs);
 }
 
-fn sortNodeIdsByUintProperty(allocator: std.mem.Allocator, graph: *const graph_mod.Graph, mem_index: *index.MemoryIndex, ids: []core.NodeId, key: []const u8) void {
+fn sortNodeIdsByUintProperty(allocator: std.mem.Allocator, graph: *const graph_mod.Graph, mem_index: *index.MemoryIndex, checkpoint_view: ?query_mod.CheckpointView, ids: []core.NodeId, key: []const u8) void {
     std.mem.sort(core.NodeId, ids, NodeUintPropertySortContext{
         .allocator = allocator,
         .graph = graph,
         .mem_index = mem_index,
+        .checkpoint_view = checkpoint_view,
         .key = key,
     }, nodeUintPropertyLessThan);
 }
@@ -220,21 +228,85 @@ fn memoryNodeMatchesEffectiveStatus(kind: core.NodeKind, property_eq: planner.Pr
     return expected == .open;
 }
 
+fn checkpointNodeUintProperty(view: query_mod.CheckpointView, node_id: core.NodeId, key: []const u8) ?u64 {
+    const property = view.nodeProperty(node_id.toInt(), key) orelse return null;
+    return if (property.value_kind == .uint) property.uint_value else null;
+}
+
+fn checkpointLifecycleFields(view: query_mod.CheckpointView, node_id: core.NodeId) task_mod.StatusSnapshot.LifecycleFields {
+    var fields: task_mod.StatusSnapshot.LifecycleFields = .{};
+    if (view.nodeProperty(node_id.toInt(), task_mod.status_property)) |property| {
+        if (property.value_kind == .string) fields.stored_status_raw = property.string_value else fields.invalid_value_type = true;
+    }
+    if (view.nodeProperty(node_id.toInt(), task_mod.claimed_by_property)) |property| {
+        if (property.value_kind == .string) fields.claimed_by = property.string_value else fields.invalid_value_type = true;
+    }
+    if (view.nodeProperty(node_id.toInt(), task_mod.claim_expires_ns_property)) |property| {
+        if (property.value_kind == .uint) fields.claim_expires_ns = property.uint_value else fields.invalid_value_type = true;
+    }
+    if (view.nodeProperty(node_id.toInt(), "task_recorded_ns")) |property| {
+        if (property.value_kind == .uint) fields.task_recorded_ns = property.uint_value else fields.invalid_value_type = true;
+    }
+    if (view.nodeProperty(node_id.toInt(), "task_created_ns")) |property| {
+        if (property.value_kind == .uint) fields.task_created_ns = property.uint_value else fields.invalid_value_type = true;
+    }
+    if (view.nodeProperty(node_id.toInt(), "task_completed_ns")) |property| {
+        if (property.value_kind == .uint) fields.task_completed_ns = property.uint_value else fields.invalid_value_type = true;
+    }
+    return fields;
+}
+
+fn checkpointNodeMatchesProperty(
+    view: query_mod.CheckpointView,
+    node_id: core.NodeId,
+    node_kind: core.NodeKind,
+    property_eq: planner.PropertyPredicate,
+    now_ns: u64,
+) !bool {
+    if (nodeUintPropertySupported(property_eq.key)) {
+        const concrete = checkpointNodeUintProperty(view, node_id, property_eq.key) orelse return false;
+        if (property_eq.uint_range) |planner_range| {
+            const range = uintPropertyRangeForPlannerRange(planner_range) orelse return false;
+            return uintPropertyRangeContains(range, concrete);
+        }
+        const expected = std.fmt.parseInt(u64, property_eq.value, 10) catch return false;
+        return predicateMatchesUint(property_eq.op, concrete, expected);
+    }
+    if (property_eq.op != .eq) return false;
+    if (node_kind == .task and std.mem.eql(u8, property_eq.key, task_mod.status_property)) {
+        const expected = task_mod.Status.parse(property_eq.value) orelse return false;
+        return try task_mod.effectiveStatusForLifecycleFields(checkpointLifecycleFields(view, node_id), now_ns, .strict) == expected;
+    }
+    const property = view.nodeProperty(node_id.toInt(), property_eq.key) orelse return nodeStringPropertyMissingMatchesEmpty(property_eq);
+    if (property.value_kind != .string) return false;
+    return std.mem.eql(u8, property.string_value, property_eq.value);
+}
+
 fn edgeCursorMatchesStringProperty(edge_cursor: query_mod.EdgeCursor, allocator: std.mem.Allocator, edge_id: core.EdgeId, property_eq: planner.PropertyPredicate) !bool {
     if (property_eq.op != .eq) return false;
-    const value = switch (edge_cursor) {
-        .memory => return false,
-        .store => |cursor| cursor.store.getStringProperty(allocator, .{ .edge = edge_id }, property_eq.key) catch |err| switch (err) {
-            core.Error.InvalidId, core.Error.NotFound => return false,
-            else => |e| return e,
+    return switch (edge_cursor) {
+        .memory => |cursor| blk: {
+            const view = cursor.checkpoint_view orelse return false;
+            const property = view.edgeProperty(edge_id.toInt(), property_eq.key) orelse return false;
+            break :blk property.value_kind == .string and std.mem.eql(u8, property.string_value, property_eq.value);
         },
-        .persistent_store => |cursor| cursor.store.getStringProperty(allocator, .{ .edge = edge_id }, property_eq.key) catch |err| switch (err) {
-            core.Error.InvalidId, core.Error.NotFound => return false,
-            else => |e| return e,
+        .store => |cursor| blk: {
+            const value = cursor.store.getStringProperty(allocator, .{ .edge = edge_id }, property_eq.key) catch |err| switch (err) {
+                core.Error.InvalidId, core.Error.NotFound => return false,
+                else => |e| return e,
+            };
+            defer if (value) |owned| allocator.free(owned);
+            break :blk if (value) |owned| std.mem.eql(u8, owned, property_eq.value) else false;
+        },
+        .persistent_store => |cursor| blk: {
+            const value = cursor.store.getStringProperty(allocator, .{ .edge = edge_id }, property_eq.key) catch |err| switch (err) {
+                core.Error.InvalidId, core.Error.NotFound => return false,
+                else => |e| return e,
+            };
+            defer if (value) |owned| allocator.free(owned);
+            break :blk if (value) |owned| std.mem.eql(u8, owned, property_eq.value) else false;
         },
     };
-    defer if (value) |owned| allocator.free(owned);
-    return if (value) |owned| std.mem.eql(u8, owned, property_eq.value) else false;
 }
 
 fn edgeIdSliceContains(sorted_ids: []const core.EdgeId, edge_id: core.EdgeId) bool {
@@ -256,7 +328,17 @@ fn edgeIdSliceContains(sorted_ids: []const core.EdgeId, edge_id: core.EdgeId) bo
 fn lookupEdgeIdsByProperty(edge_cursor: query_mod.EdgeCursor, allocator: std.mem.Allocator, property_eq: planner.PropertyPredicate) !std.ArrayList(core.EdgeId) {
     if (property_eq.op != .eq) return std.ArrayList(core.EdgeId).empty;
     return switch (edge_cursor) {
-        .memory => return std.ArrayList(core.EdgeId).empty,
+        .memory => |cursor| blk: {
+            var out = std.ArrayList(core.EdgeId).empty;
+            errdefer out.deinit(allocator);
+            const view = cursor.checkpoint_view orelse break :blk out;
+            for (view.propertyRange(property_eq.key)) |property| {
+                if (property.owner_type != 2 or property.value_kind != .string) continue;
+                if (!std.mem.eql(u8, property.string_value, property_eq.value)) continue;
+                try out.append(allocator, .fromInt(property.owner_id));
+            }
+            break :blk out;
+        },
         .store => |cursor| try cursor.store.lookupEdgeIdsByStringProperty(allocator, property_eq.key, property_eq.value, std.math.maxInt(usize)),
         .persistent_store => |cursor| try cursor.store.lookupEdgeIdsByStringProperty(allocator, property_eq.key, property_eq.value, std.math.maxInt(usize)),
     };
@@ -573,6 +655,9 @@ const NodeCursor = union(enum) {
     memory: struct {
         graph: *const graph_mod.Graph,
         mem_index: *index.MemoryIndex,
+        text_index: ?*const text_mod.TextIndex = null,
+        checkpoint_view: ?query_mod.CheckpointView = null,
+        read_timestamp_ns: ?u64 = null,
     },
     store: struct {
         allocator: std.mem.Allocator,
@@ -720,7 +805,9 @@ const NodeCursor = union(enum) {
                     if (node.status != .active) continue;
                     if (!nodeCursorMemoryNodeIsCurrentGeneration(cursor.graph, node.id)) continue;
                     if (!type_filter.matches(node.kind)) continue;
-                    const matches = if (node.kind == .task and std.mem.eql(u8, property_eq.key, task_mod.status_property))
+                    const matches = if (cursor.checkpoint_view) |view|
+                        try checkpointNodeMatchesProperty(view, node.id, node.kind, property_eq, cursor.read_timestamp_ns orelse 0)
+                    else if (node.kind == .task and std.mem.eql(u8, property_eq.key, task_mod.status_property))
                         memoryNodeMatchesEffectiveStatus(node.kind, property_eq)
                     else
                         try nodeMatchesProperty(allocator, node.text, property_eq);
@@ -728,7 +815,7 @@ const NodeCursor = union(enum) {
                     try out.append(allocator, node.id);
                 }
                 if (needs_uint_order) {
-                    sortNodeIdsByUintProperty(allocator, cursor.graph, cursor.mem_index, out.items, property_eq.key);
+                    sortNodeIdsByUintProperty(allocator, cursor.graph, cursor.mem_index, cursor.checkpoint_view, out.items, property_eq.key);
                     if (out.items.len > max_ids) out.shrinkRetainingCapacity(max_ids);
                 }
             },
@@ -778,7 +865,10 @@ const NodeCursor = union(enum) {
         defer node.deinit(allocator);
         if (nodeUintPropertySupported(property_eq.key)) {
             return switch (self) {
-                .memory => try nodeMatchesProperty(allocator, node.text, property_eq),
+                .memory => |cursor| if (cursor.checkpoint_view) |view|
+                    try checkpointNodeMatchesProperty(view, node.id, node.kind, property_eq, cursor.read_timestamp_ns orelse 0)
+                else
+                    try nodeMatchesProperty(allocator, node.text, property_eq),
                 .store => |cursor| blk: {
                     const concrete = try cursor.store.getUintProperty(allocator, .{ .node = id }, property_eq.key) orelse break :blk false;
                     if (property_eq.uint_range) |planner_range| {
@@ -792,7 +882,9 @@ const NodeCursor = union(enum) {
         }
         if (property_eq.op != .eq) return false;
         return switch (self) {
-            .memory => if (node.kind == .task and std.mem.eql(u8, property_eq.key, task_mod.status_property))
+            .memory => |cursor| if (cursor.checkpoint_view) |view|
+                try checkpointNodeMatchesProperty(view, node.id, node.kind, property_eq, cursor.read_timestamp_ns orelse 0)
+            else if (node.kind == .task and std.mem.eql(u8, property_eq.key, task_mod.status_property))
                 memoryNodeMatchesEffectiveStatus(node.kind, property_eq)
             else
                 try nodeMatchesStringProperty(allocator, node.text, property_eq),
@@ -818,7 +910,8 @@ const NodeCursor = union(enum) {
     fn uintProperty(self: NodeCursor, allocator: std.mem.Allocator, id: core.NodeId, key: []const u8) !?u64 {
         if (!nodeUintPropertySupported(key)) return null;
         return switch (self) {
-            .memory => blk: {
+            .memory => |cursor| blk: {
+                if (cursor.checkpoint_view) |view| break :blk checkpointNodeUintProperty(view, id, key);
                 var node = (try self.get(allocator, id)) orelse return null;
                 defer node.deinit(allocator);
                 break :blk nodeUintPropertyValue(allocator, node.text, key);
@@ -906,6 +999,15 @@ const NodeCursor = union(enum) {
         };
         return switch (self) {
             .memory => |cursor| blk: {
+                if (cursor.text_index) |text_index| {
+                    break :blk try text_index.search(query, .{
+                        .kind_filter = kind_filter,
+                        .kind_set_filter = kind_set_filter,
+                        .limit = max_ids,
+                        .max_postings_scanned = max_postings_scanned,
+                        .deadline = deadline,
+                    });
+                }
                 var text_index = try text_mod.TextIndex.buildFromGraphDeadline(allocator, cursor.graph, deadline);
                 defer text_index.deinit();
                 break :blk try text_index.search(query, .{
@@ -937,7 +1039,17 @@ fn textSearchCandidateLimitForLatest(max_ids: usize) usize {
     if (max_ids == 0) return 0;
     const max_candidate_limit: usize = 4096;
     const expanded = std.math.add(usize, std.math.mul(usize, max_ids, 4) catch max_candidate_limit, 32) catch max_candidate_limit;
-    return @max(max_ids, @min(max_candidate_limit, expanded));
+    const limit = @max(max_ids, @min(max_candidate_limit, expanded));
+    // Keep the +1 truncation probe within the persistent top-hit candidate
+    // budget whenever the caller's own limit fits: over-fetching one past the
+    // cache capacity forces common-term queries onto the unbounded posting
+    // scan, which turns product-sized LIMITs into BudgetExceeded on large
+    // stores. Callers asking for more than the budget keep the exact scan.
+    const probe_budget = text_mod.persistent_term_top_hit_candidate_budget;
+    if (probe_budget > 1 and max_ids < probe_budget and limit >= probe_budget) {
+        return probe_budget - 1;
+    }
+    return limit;
 }
 
 fn retainCurrentGenerationTextHits(store: storage.Store, edge_retention_registry: ?*storage.EdgeSegmentRetentionRegistry, hits: *std.ArrayList(text_mod.TextSearchHit), candidate_limit: usize, max_ids: usize) !void {
@@ -1103,7 +1215,10 @@ pub const PersistentStoreQuerySession = struct {
                 null,
             ) catch |err| switch (err) {
                 error.FileNotFound, error.InvalidRecord => {
-                    if (repaired) return err;
+                    // Repair writes durable files and belongs to the single
+                    // writer; a read replica must surface the transient
+                    // instead of mutating the store it does not own.
+                    if (repaired or !self.store.options.allow_inline_repair) return err;
                     repaired = true;
                     self.node_state.deinit();
                     self.resetNodeState();
@@ -1165,6 +1280,88 @@ pub fn executeWithIndexAndIo(
     budget: @import("../core.zig").QueryBudget,
 ) !ResultTable {
     return executeWithIndexDeadline(allocator, graph, mem_index, plan, budget, core.QueryDeadline.fromIo(io, budget.timeout_ms));
+}
+
+/// Compact-checkpoint daemon hot path. The graph, adjacency and BM25 indexes
+/// are generation-owned and reused across requests; execution semantics and
+/// budgets are otherwise identical to the ordinary in-memory executor.
+pub fn executeWithResidentIndexesAndIo(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    graph: *const graph_mod.Graph,
+    mem_index: *index.MemoryIndex,
+    text_index: *const text_mod.TextIndex,
+    checkpoint_view: query_mod.CheckpointView,
+    plan: optimizer.PhysicalPlan,
+    budget: @import("../core.zig").QueryBudget,
+) !ResultTable {
+    return executeWithResidentIndexesAndIoMaybeExplain(
+        allocator,
+        io,
+        graph,
+        mem_index,
+        text_index,
+        checkpoint_view,
+        plan,
+        budget,
+        null,
+    );
+}
+
+pub fn executeWithResidentIndexesAndIoExplain(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    graph: *const graph_mod.Graph,
+    mem_index: *index.MemoryIndex,
+    text_index: *const text_mod.TextIndex,
+    checkpoint_view: query_mod.CheckpointView,
+    plan: optimizer.PhysicalPlan,
+    budget: @import("../core.zig").QueryBudget,
+    timings: *OperatorTimingRecorder,
+) !ResultTable {
+    return executeWithResidentIndexesAndIoMaybeExplain(
+        allocator,
+        io,
+        graph,
+        mem_index,
+        text_index,
+        checkpoint_view,
+        plan,
+        budget,
+        timings,
+    );
+}
+
+fn executeWithResidentIndexesAndIoMaybeExplain(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    graph: *const graph_mod.Graph,
+    mem_index: *index.MemoryIndex,
+    text_index: *const text_mod.TextIndex,
+    checkpoint_view: query_mod.CheckpointView,
+    plan: optimizer.PhysicalPlan,
+    budget: @import("../core.zig").QueryBudget,
+    timings: ?*OperatorTimingRecorder,
+) !ResultTable {
+    if (timings) |recorder| {
+        recorder.clearRetainingCapacity();
+        try recorder.ensureCapacityForPlan(plan);
+    }
+    return executeWithCursorDeadline(
+        allocator,
+        .{ .memory = .{
+            .graph = graph,
+            .mem_index = mem_index,
+            .text_index = text_index,
+            .checkpoint_view = checkpoint_view,
+            .read_timestamp_ns = currentIoTimestampNs(io),
+        } },
+        .{ .memory = .{ .mem_index = mem_index, .checkpoint_view = checkpoint_view } },
+        plan,
+        budget,
+        core.QueryDeadline.fromIo(io, budget.timeout_ms),
+        timings,
+    );
 }
 
 pub fn executeWithStoreAndIo(
@@ -1288,7 +1485,8 @@ fn executeWithPersistentStoreAndIoMaybeRetainedIndexesTimed(
             timings,
         ) catch |err| switch (err) {
             error.FileNotFound, error.InvalidRecord => {
-                if (repaired) return err;
+                // Same single-writer discipline as the session path above.
+                if (repaired or !store.options.allow_inline_repair) return err;
                 repaired = true;
                 try store.repairPersistentIndexesFromLog();
                 continue;
@@ -1328,7 +1526,7 @@ fn executeWithCursorDeadline(
 ) !ResultTable {
     var table = ResultTable.init();
     table.read_timestamp_ns = switch (node_cursor) {
-        .memory => null,
+        .memory => |cursor| cursor.read_timestamp_ns,
         .store => |cursor| if (cursor.state) |state| state.read_timestamp_ns else currentStoreReadTimestampNs(cursor.store),
     };
     errdefer table.deinit(allocator);
@@ -1554,6 +1752,11 @@ fn executeWithCursorDeadline(
         }
     }
     return table;
+}
+
+fn currentIoTimestampNs(io: std.Io) u64 {
+    const timestamp = std.Io.Clock.real.now(io).nanoseconds;
+    return if (timestamp < 0) 0 else @intCast(timestamp);
 }
 
 fn nodeBudgetExhausted(table: *ResultTable, budget: core.QueryBudget) bool {
@@ -3395,6 +3598,145 @@ test "executor undirected self loop returns one binding" {
     defer table.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), table.rows.items.len);
     try std.testing.expectEqual(concept.toInt(), table.rows.items[0].get("b").?.toInt());
+}
+
+test "checkpoint resident executor preserves persistent property and edge query semantics" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try temporary.dir.realPath(std.testing.io, &path_buffer);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buffer[0..root_len], "legacy.kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNodesBatch(&.{
+        .{ .id = .fromInt(1), .kind = .task, .text = "resident task alpha" },
+        .{ .id = .fromInt(2), .kind = .document, .text = "resident document beta" },
+    });
+    try store.appendEdge(.{ .id = .fromInt(5), .src = .fromInt(1), .rel = .references, .dst = .fromInt(2) });
+    try store.appendPropertiesBatch(std.testing.allocator, &.{
+        .{ .owner = .{ .node = .fromInt(1) }, .key = task_mod.status_property, .value = .{ .string = "claimed" } },
+        .{ .owner = .{ .node = .fromInt(1) }, .key = task_mod.claimed_by_property, .value = .{ .string = "agent" } },
+        .{ .owner = .{ .node = .fromInt(1) }, .key = task_mod.claim_expires_ns_property, .value = .{ .uint = std.math.maxInt(u64) } },
+        .{ .owner = .{ .node = .fromInt(1) }, .key = "task_event_ns", .value = .{ .uint = 55 } },
+        .{ .owner = .{ .node = .fromInt(2) }, .key = "summary", .value = .{ .string = "checkpoint summary" } },
+        .{ .owner = .{ .edge = .fromInt(5) }, .key = "created_by", .value = .{ .string = "agent" } },
+    });
+
+    var graph = graph_mod.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.addNodeWithId(.fromInt(1), .task, "resident task alpha");
+    try graph.addNodeWithId(.fromInt(2), .document, "resident document beta");
+    try graph.addEdgeWithIdUnchecked(.fromInt(5), .fromInt(1), .references, .fromInt(2));
+    var graph_index = try index.MemoryIndex.init(std.testing.allocator, &graph);
+    defer graph_index.deinit();
+    var text_index = try text_mod.TextIndex.buildFromGraph(std.testing.allocator, &graph);
+    defer text_index.deinit();
+
+    var property_snapshot = try store.loadPropertySnapshot(std.testing.allocator);
+    defer property_snapshot.deinit(std.testing.allocator);
+    const properties = try std.testing.allocator.alloc(query_mod.CheckpointProperty, property_snapshot.entries.len);
+    defer std.testing.allocator.free(properties);
+    for (property_snapshot.entries, properties) |source, *target| target.* = .{
+        .owner_type = switch (source.owner) {
+            .node => 1,
+            .edge => 2,
+        },
+        .owner_id = switch (source.owner) {
+            .node => |id| id.toInt(),
+            .edge => |id| id.toInt(),
+        },
+        .key_hash = source.key_hash,
+        .value_kind = switch (source.value_kind) {
+            .string => .string,
+            .uint => .uint,
+        },
+        .string_value = source.string_value,
+        .uint_value = source.uint_value,
+    };
+    const checkpoint_view = try query_mod.CheckpointView.init(properties, &.{});
+
+    const Test = struct {
+        fn expectPlanEquivalent(
+            legacy: storage.Store,
+            resident_graph: *const graph_mod.Graph,
+            resident_graph_index: *index.MemoryIndex,
+            resident_text_index: *const text_mod.TextIndex,
+            view: query_mod.CheckpointView,
+            operations: []const optimizer.PhysicalOp,
+        ) !void {
+            var legacy_ops = std.ArrayList(optimizer.PhysicalOp).empty;
+            legacy_ops.items = @constCast(operations);
+            legacy_ops.capacity = operations.len;
+            var resident_ops = std.ArrayList(optimizer.PhysicalOp).empty;
+            resident_ops.items = @constCast(operations);
+            resident_ops.capacity = operations.len;
+            var persistent = try executeWithPersistentStoreAndIo(std.testing.allocator, std.testing.io, legacy, .{ .ops = legacy_ops }, .{});
+            defer persistent.deinit(std.testing.allocator);
+            var resident = try executeWithResidentIndexesAndIo(
+                std.testing.allocator,
+                std.testing.io,
+                resident_graph,
+                resident_graph_index,
+                resident_text_index,
+                view,
+                .{ .ops = resident_ops },
+                .{},
+            );
+            defer resident.deinit(std.testing.allocator);
+            try std.testing.expectEqual(persistent.rows.items.len, resident.rows.items.len);
+            try std.testing.expectEqual(persistent.stats.nodes_visited, resident.stats.nodes_visited);
+            try std.testing.expectEqual(persistent.stats.edges_visited, resident.stats.edges_visited);
+            for (persistent.rows.items, resident.rows.items) |left, right| {
+                try std.testing.expectEqual(left.bindings.items.len, right.bindings.items.len);
+                try std.testing.expectEqual(left.edge_bindings.items.len, right.edge_bindings.items.len);
+                for (left.bindings.items, right.bindings.items) |left_binding, right_binding| {
+                    try std.testing.expectEqualStrings(left_binding.name, right_binding.name);
+                    try std.testing.expectEqual(left_binding.node_id, right_binding.node_id);
+                }
+                for (left.edge_bindings.items, right.edge_bindings.items) |left_binding, right_binding| {
+                    try std.testing.expectEqualStrings(left_binding.name, right_binding.name);
+                    try std.testing.expectEqual(left_binding.edge_id, right_binding.edge_id);
+                }
+            }
+        }
+    };
+
+    const status_ops = [_]optimizer.PhysicalOp{.{ .node_lookup_by_property = .{
+        .var_name = "t",
+        .kind = .task,
+        .property_eq = .{ .key = task_mod.status_property, .value = "claimed" },
+    } }};
+    try Test.expectPlanEquivalent(store, &graph, &graph_index, &text_index, checkpoint_view, &status_ops);
+
+    const numeric_ops = [_]optimizer.PhysicalOp{.{ .node_lookup_by_property = .{
+        .var_name = "t",
+        .kind = .task,
+        .property_eq = .{ .key = "task_event_ns", .op = .gte, .value = "50", .uint_range = .{ .min_value = "50" } },
+    } }};
+    try Test.expectPlanEquivalent(store, &graph, &graph_index, &text_index, checkpoint_view, &numeric_ops);
+
+    const edge_ops = [_]optimizer.PhysicalOp{
+        .{ .node_lookup_by_text = .{ .var_name = "t", .kind = .task, .text = "resident task alpha" } },
+        .{ .expand = .{
+            .left_var = "t",
+            .edge_var = "e",
+            .edge_property_eq = .{ .key = "created_by", .value = "agent" },
+            .rel = .references,
+            .right_var = "d",
+            .right_kind = .document,
+        } },
+    };
+    try Test.expectPlanEquivalent(store, &graph, &graph_index, &text_index, checkpoint_view, &edge_ops);
+
+    const text_ops = [_]optimizer.PhysicalOp{.{ .text_search = .{
+        .var_name = "d",
+        .query = "document beta",
+        .kind = .document,
+    } }};
+    try Test.expectPlanEquivalent(store, &graph, &graph_index, &text_index, checkpoint_view, &text_ops);
 }
 
 fn executorScanAllocationFailure(allocator: std.mem.Allocator) !void {

@@ -5,13 +5,15 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
     const allocator = std.heap.smp_allocator;
-    tinykg.cli.setRuntimeEnvMap(init.environ_map);
 
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
 
-    tinykg.cli.run(args, stdout, allocator, init.io) catch |err| {
+    tinykg.cli.invoke(.{
+        .argv = args,
+        .environment = init.environ_map,
+    }, stdout, allocator, init.io) catch |err| {
         // A command that fails after buffering output must not have that
         // partial result published by the error path.  In particular,
         // schema-reconcile flushes its success receipt inside the guarded

@@ -107,7 +107,7 @@ class Handler(BaseHTTPRequestHandler):
                 ACTOR.markdown_uploads.append(body)
                 response = self.response(body, True, 0, "import_md_doc document=42 nodes_imported=1\n", "", "committed")
             else:
-                response = self.response(body, True, 0, "nodes=1\nstorage_format_version=2\nschema_version=3\n", "", "none")
+                response = self.response(body, True, 0, "nodes=1\nstorage_format_version=3\nschema_version=3\n", "", "none")
                 if command == "schema-drift":
                     response["schemaDigest"] = "d" * 64
             ACTOR.receipts[request_id] = (raw, response)

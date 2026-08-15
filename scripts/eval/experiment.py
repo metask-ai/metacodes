@@ -217,9 +217,9 @@ def tinykg_binary_identity(binary: Path) -> Dict[str, str]:
         for line in store_info.splitlines()
         if "=" in line
     )
-    if fields.get("storage_format_version") != "2" or fields.get("schema_version") != "3":
+    if fields.get("storage_format_version") != "3" or fields.get("schema_version") != "3":
         raise ValidationError(
-            "TinyKG readiness requires storage_format_version=2 and schema_version=3; "
+            "TinyKG readiness requires storage_format_version=3 and schema_version=3; "
             f"observed storage={fields.get('storage_format_version')!r} "
             f"schema={fields.get('schema_version')!r}"
         )

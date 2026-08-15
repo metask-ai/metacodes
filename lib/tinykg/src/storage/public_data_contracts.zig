@@ -32,6 +32,37 @@ pub fn StoragePublicDataContracts(comptime Ops: type) type {
         pub const StorageOptions = struct {
             durability: DurabilityMode = .safe,
             primary_text_write_mode: PrimaryTextWriteMode = .normal,
+            /// Migration-only compatibility admission. Public Store opens keep
+            /// this false; the COW upgrade reader may admit an older manifest
+            /// only after it proves there is no pending recovery state.
+            allow_legacy_store_format_read: bool = false,
+            /// Crash recovery mutates durable bytes and therefore belongs to
+            /// the single writer. Concurrent read-only opens (reader daemons)
+            /// set this false: they skip every open-time recovery write and
+            /// tolerate transient inconsistency by retrying at a later
+            /// snapshot instead of repairing files the writer owns.
+            crash_recovery: bool = true,
+            /// Whole-store stale-text scans are a last-resort read fallback
+            /// whose sequential IO is O(store). Reader daemons beside an
+            /// active writer disable it: a stale catalog then fails fast
+            /// (maintenance required) instead of saturating the disk the
+            /// writer's group commits depend on.
+            allow_stale_full_scan: bool = true,
+            /// Read replicas serve text search from the last published
+            /// catalog watermark when the appended tail cannot be merged,
+            /// instead of failing fast. Results are exact as of that
+            /// watermark; appends the writer has not published yet stay
+            /// invisible until maintenance catches up. Reads then never
+            /// block on (or fail because of) writer-side maintenance debt.
+            serve_stale_snapshot: bool = false,
+            /// A full index repair is O(store) and stalls every queued write
+            /// for minutes at GB scale. Daemons disable inline repair on the
+            /// write path: failures surface to the caller unacknowledged, the
+            /// committed text journal stays as the durable recovery anchor,
+            /// and the repair itself runs from the maintenance scheduler.
+            /// Single-shot CLI invocations keep the historical repair-and-
+            /// retry behavior.
+            allow_inline_repair: bool = true,
             max_node_by_id_index_bytes: u64 = 2 * 1024 * 1024 * 1024,
             validate_indexes_on_read: bool = false,
             auto_compact_edge_segment_entries: u32 = 128,

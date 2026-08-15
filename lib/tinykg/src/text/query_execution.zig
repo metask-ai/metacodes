@@ -51,9 +51,28 @@ pub fn QueryExecution(
             if (query_tokens.items.items.len == 0) return std.ArrayList(TextSearchHit).empty;
 
             const stale = try Ops.persistentCatalogQuickStaleDeadline(allocator, store, options.deadline);
-            if (stale) return Internal.searchStoreScan(allocator, store, query, options);
+            if (stale) {
+                if (try Ops.searchPersistentWithAppendedTail(allocator, store, query, query_tokens.items.items, options)) |hits| return hits;
+                // Read replicas answer from the last published watermark
+                // rather than fail: exact-as-of-snapshot beats an error while
+                // the writer is mid-append. A half-published catalog still
+                // fails fast so the client's retry semantics stay intact.
+                if (store.options.serve_stale_snapshot) {
+                    return Ops.searchPersistentTokens(allocator, store, query_tokens.items.items, options) catch |err| switch (err) {
+                        error.FileNotFound, error.InvalidRecord => error.TextIndexMaintenanceRequired,
+                        else => |other| return other,
+                    };
+                }
+                // reader daemons disable the O(store) fallback scan so their
+                // misses fail fast instead of stealing the writer's IO
+                if (!store.options.allow_stale_full_scan) return error.TextIndexMaintenanceRequired;
+                return Internal.searchStoreScan(allocator, store, query, options);
+            }
             return Ops.searchPersistentTokens(allocator, store, query_tokens.items.items, options) catch |err| switch (err) {
-                error.FileNotFound, error.InvalidRecord => Internal.searchStoreScan(allocator, store, query, options),
+                error.FileNotFound, error.InvalidRecord => if (store.options.allow_stale_full_scan)
+                    Internal.searchStoreScan(allocator, store, query, options)
+                else
+                    error.TextIndexMaintenanceRequired,
                 else => |other| return other,
             };
         }
@@ -203,6 +222,7 @@ const TestSchema = struct {
 
 const TestTrace = struct {
     quick_stale_calls: usize = 0,
+    tail_merge_calls: usize = 0,
     persistent_search_calls: usize = 0,
     store_scan_search_calls: usize = 0,
     persistent_plan_calls: usize = 0,
@@ -213,9 +233,15 @@ const TestTrace = struct {
 
 const TestPersistentFailure = enum { none, missing, invalid, denied };
 
+const TestStoreOptions = struct {
+    allow_stale_full_scan: bool = true,
+    serve_stale_snapshot: bool = false,
+};
+
 const TestStorage = struct {
     pub const Store = struct {
         trace: *TestTrace,
+        options: TestStoreOptions = .{},
         stale: bool = false,
         persistent_failure: TestPersistentFailure = .none,
         node_count: u64 = 1,
@@ -268,6 +294,17 @@ const TestOps = struct {
         var hits = std.ArrayList(test_search_contract.TextSearchHit).empty;
         try hits.append(allocator, .{ .node_id = .fromInt(11), .kind = .task, .score = 2 });
         return hits;
+    }
+
+    pub fn searchPersistentWithAppendedTail(
+        _: std.mem.Allocator,
+        store: TestStorage.Store,
+        _: []const u8,
+        _: []const []u8,
+        _: test_search_contract.TextSearchOptions,
+    ) anyerror!?std.ArrayList(test_search_contract.TextSearchHit) {
+        store.trace.tail_merge_calls += 1;
+        return null;
     }
 
     pub fn searchStoreScan(
@@ -390,6 +427,42 @@ test "query execution rejects unbounded stale scans before data plane" {
         .node_count = test_query.stale_store_scan_max_nodes + 1,
     }, "alpha", .{}));
     try std.testing.expectEqual(@as(usize, 0), trace.store_scan_search_calls);
+}
+
+test "query execution serves stale snapshot readers from the published catalog" {
+    // Snapshot readers answer from the published watermark when the tail
+    // merge declines, without touching the O(store) scan path.
+    var trace = TestTrace{};
+    var hits = try test_query.searchText(std.testing.allocator, .{
+        .trace = &trace,
+        .stale = true,
+        .options = .{ .allow_stale_full_scan = false, .serve_stale_snapshot = true },
+    }, "alpha", .{});
+    defer hits.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), trace.tail_merge_calls);
+    try std.testing.expectEqual(@as(usize, 1), trace.persistent_search_calls);
+    try std.testing.expectEqual(@as(usize, 0), trace.store_scan_search_calls);
+    try std.testing.expectEqual(@as(u64, 11), hits.items[0].node_id.toInt());
+
+    // A half-published catalog keeps failing fast so clients retry.
+    var invalid_trace = TestTrace{};
+    try std.testing.expectError(error.TextIndexMaintenanceRequired, test_query.searchText(std.testing.allocator, .{
+        .trace = &invalid_trace,
+        .stale = true,
+        .persistent_failure = .invalid,
+        .options = .{ .allow_stale_full_scan = false, .serve_stale_snapshot = true },
+    }, "alpha", .{}));
+    try std.testing.expectEqual(@as(usize, 0), invalid_trace.store_scan_search_calls);
+
+    // Without snapshot service the reader posture still fails fast.
+    var reader_trace = TestTrace{};
+    try std.testing.expectError(error.TextIndexMaintenanceRequired, test_query.searchText(std.testing.allocator, .{
+        .trace = &reader_trace,
+        .stale = true,
+        .options = .{ .allow_stale_full_scan = false },
+    }, "alpha", .{}));
+    try std.testing.expectEqual(@as(usize, 0), reader_trace.persistent_search_calls);
+    try std.testing.expectEqual(@as(usize, 0), reader_trace.store_scan_search_calls);
 }
 
 test "query execution preserves deadline empty and tokenizer admission gates" {

@@ -26,6 +26,13 @@ pub fn CatalogFormat(comptime core: type) type {
             term_bytes: u64 = 0,
             posting_count: u64 = 0,
             tokenizer: u16 = tokenizer_version,
+            /// Event-log watermark (index.meta.event_bytes) captured when this
+            /// catalog was published. Zero means unknown (catalogs written
+            /// before this field existed): the delta set cannot be derived, so
+            /// staleness keeps its historical fail-closed behavior. Stored as
+            /// 48 bits in the former zero padding, which caps the watermark at
+            /// 256TB of event bytes without a format break.
+            indexed_event_bytes: u64 = 0,
 
             const magic = [_]u8{ 'T', 'K', 'G', 'T' };
             pub const encoded_len: usize = 88;
@@ -44,6 +51,8 @@ pub fn CatalogFormat(comptime core: type) type {
                 std.mem.writeInt(u64, out[64..72], self.posting_count, .little);
                 std.mem.writeInt(u16, out[72..74], self.tokenizer, .little);
                 @memset(out[74..88], 0);
+                std.debug.assert(self.indexed_event_bytes < (@as(u64, 1) << 48));
+                std.mem.writeInt(u48, out[74..80], @intCast(self.indexed_event_bytes), .little);
                 std.mem.writeInt(u32, out[80..84], persistentTextMetaChecksum(out), .little);
             }
 
@@ -51,7 +60,7 @@ pub fn CatalogFormat(comptime core: type) type {
                 if (!std.mem.eql(u8, bytes[0..4], &magic)) return error.InvalidRecord;
                 if (std.mem.readInt(u16, bytes[4..6], .little) != persistent_text_index_version) return error.InvalidRecord;
                 if (std.mem.readInt(u16, bytes[6..8], .little) != encoded_len) return error.InvalidRecord;
-                if (!allZero(bytes[74..80]) or !allZero(bytes[84..88])) return error.InvalidRecord;
+                if (!allZero(bytes[84..88])) return error.InvalidRecord;
                 const expected_checksum = std.mem.readInt(u32, bytes[80..84], .little);
                 var checksum_bytes = bytes.*;
                 @memset(checksum_bytes[80..84], 0);
@@ -68,6 +77,7 @@ pub fn CatalogFormat(comptime core: type) type {
                     .term_bytes = std.mem.readInt(u64, bytes[56..64], .little),
                     .posting_count = std.mem.readInt(u64, bytes[64..72], .little),
                     .tokenizer = tokenizer,
+                    .indexed_event_bytes = std.mem.readInt(u48, bytes[74..80], .little),
                 };
             }
         };

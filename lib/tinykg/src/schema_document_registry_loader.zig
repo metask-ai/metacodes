@@ -1,5 +1,5 @@
 const std = @import("std");
-const schema = @import("../schema.zig");
+const schema = @import("schema.zig");
 
 /// Owns the bounded, strict external schema document format and its complete
 /// conversion into an owned Registry. Command orchestration, Store catalog

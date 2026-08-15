@@ -1,6 +1,7 @@
 pub const version = @import("version.zig");
 pub const core = @import("core.zig");
 pub const storage = @import("storage.zig");
+pub const checkpoint = @import("checkpoint.zig");
 pub const schema = @import("schema.zig");
 pub const catalog = @import("catalog.zig");
 pub const segment = @import("segment.zig");
@@ -30,6 +31,7 @@ test {
     _ = version;
     _ = core;
     _ = storage;
+    _ = checkpoint;
     _ = schema;
     _ = catalog;
     _ = segment;

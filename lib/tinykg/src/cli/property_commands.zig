@@ -160,6 +160,93 @@ pub fn PropertyCommands(comptime Ops: type) type {
             );
         }
 
+
+        /// Daemon-resident variants: identical parsing and validation, but the
+        /// mutation runs on a store the caller keeps open (no CLI lock, no
+        /// open/close). The parsed db path must match the borrowed store.
+        pub fn runSetStringWithStore(
+            store: anytype,
+            args: []const []const u8,
+            writer: anytype,
+            allocator: std.mem.Allocator,
+            io: std.Io,
+        ) !void {
+            const db = try Ops.parseDbArguments(allocator, io, args, 4, 6);
+            const selection = try Ops.parseOptionalSchema(db.rest, 4, 4);
+            const parsed = try parseStringMutation(selection.positionals);
+            try Ops.validateString(parsed.owner, parsed.key, parsed.value);
+            if (!std.mem.eql(u8, db.db_path, store.dir_path)) return error.StorePathMismatch;
+            var context = try Ops.Context.initBorrowed(allocator, io, store, selection.schema_path);
+            defer context.deinit();
+            try context.setString(parsed.owner, parsed.key, parsed.value);
+            try writer.print(
+                "string_property owner={s} id={} key={s} bytes={}\n",
+                .{ parsed.owner_label, Ops.ownerId(parsed.owner), parsed.key, parsed.value.len },
+            );
+        }
+
+        pub fn runSetUintWithStore(
+            store: anytype,
+            args: []const []const u8,
+            writer: anytype,
+            allocator: std.mem.Allocator,
+            io: std.Io,
+        ) !void {
+            const db = try Ops.parseDbArguments(allocator, io, args, 4, 6);
+            const selection = try Ops.parseOptionalSchema(db.rest, 4, 4);
+            const parsed = try parseUintMutation(selection.positionals);
+            if (!std.mem.eql(u8, db.db_path, store.dir_path)) return error.StorePathMismatch;
+            var context = try Ops.Context.initBorrowed(allocator, io, store, selection.schema_path);
+            defer context.deinit();
+            try context.setUint(parsed.owner, parsed.key, parsed.value);
+            try writer.print(
+                "uint_property owner={s} id={} key={s} value={}\n",
+                .{ parsed.owner_label, Ops.ownerId(parsed.owner), parsed.key, parsed.value },
+            );
+        }
+
+        pub fn runSetNodeWithStore(
+            store: anytype,
+            args: []const []const u8,
+            writer: anytype,
+            allocator: std.mem.Allocator,
+            io: std.Io,
+        ) !void {
+            const db = try Ops.parseDbArguments(allocator, io, args, 3, 5);
+            const selection = try Ops.parseOptionalSchema(db.rest, 3, 3);
+            const parsed = try parseNodeStringMutation(selection.positionals);
+            try Ops.validateString(parsed.owner, parsed.key, parsed.value);
+            if (!std.mem.eql(u8, db.db_path, store.dir_path)) return error.StorePathMismatch;
+            var context = try Ops.Context.initBorrowed(allocator, io, store, selection.schema_path);
+            defer context.deinit();
+            try context.setString(parsed.owner, parsed.key, parsed.value);
+            try writer.print(
+                "node_property node={} key={s} bytes={}\n",
+                .{ Ops.ownerId(parsed.owner), parsed.key, parsed.value.len },
+            );
+        }
+
+        pub fn runSetEdgeWithStore(
+            store: anytype,
+            args: []const []const u8,
+            writer: anytype,
+            allocator: std.mem.Allocator,
+            io: std.Io,
+        ) !void {
+            const db = try Ops.parseDbArguments(allocator, io, args, 3, 5);
+            const selection = try Ops.parseOptionalSchema(db.rest, 3, 3);
+            const parsed = try parseEdgeStringMutation(selection.positionals);
+            try Ops.validateString(parsed.owner, parsed.key, parsed.value);
+            if (!std.mem.eql(u8, db.db_path, store.dir_path)) return error.StorePathMismatch;
+            var context = try Ops.Context.initBorrowed(allocator, io, store, selection.schema_path);
+            defer context.deinit();
+            try context.setString(parsed.owner, parsed.key, parsed.value);
+            try writer.print(
+                "edge_property edge={} key={s} bytes={}\n",
+                .{ Ops.ownerId(parsed.owner), parsed.key, parsed.value.len },
+            );
+        }
+
         pub fn runSetEdge(
             args: []const []const u8,
             writer: anytype,

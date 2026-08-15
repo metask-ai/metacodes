@@ -125,18 +125,24 @@ const SourceRecord = struct {
 };
 
 fn sourceSnapshot(allocator: std.mem.Allocator) ![]u8 {
+    return sourceSnapshotWithProvenance(allocator, &.{.{
+        .kind = .user_correction,
+        .node_id = 17,
+        .evidence_sha256 = PROVENANCE_EVIDENCE[0..],
+    }});
+}
+
+fn sourceSnapshotWithProvenance(
+    allocator: std.mem.Allocator,
+    provenance_refs: []const adapter.ProvenanceRef,
+) ![]u8 {
     const summary = "A governed ontology is context, not promotion authority.";
     const falsifier = "A held-out replay observes context self-authorizing a rule.";
     const summary_sha = observation.sha256Hex(summary);
     const falsifier_sha = observation.sha256Hex(falsifier);
-    const provenance_refs = [1]adapter.ProvenanceRef{.{
-        .kind = .user_correction,
-        .node_id = 17,
-        .evidence_sha256 = PROVENANCE_EVIDENCE[0..],
-    }};
     const provenance_json = try std.json.Stringify.valueAlloc(allocator, .{
         .schema_version = "tinykg-ontology-provenance-v1",
-        .refs = provenance_refs[0..],
+        .refs = provenance_refs,
     }, .{});
     defer allocator.free(provenance_json);
     const provenance_sha = observation.sha256Hex(provenance_json);
@@ -147,7 +153,7 @@ fn sourceSnapshot(allocator: std.mem.Allocator) ![]u8 {
         .authority = .agent_hypothesis,
         .summary = summary,
         .summary_sha256 = summary_sha[0..],
-        .provenance = &provenance_refs,
+        .provenance = provenance_refs,
         .provenance_sha256 = provenance_sha[0..],
         .falsifier = falsifier,
         .falsifier_sha256 = falsifier_sha[0..],
@@ -302,10 +308,14 @@ fn localFixture(
 }
 
 fn request(value: *LocalFixture) adapter.Request {
+    return requestFor(value, 7);
+}
+
+fn requestFor(value: *LocalFixture, project_node_id: u64) adapter.Request {
     value.held[0].member_sha256 = &value.held_members;
     value.held[0].commitment_sha256 = value.held_commitment[0..];
     return .{
-        .project_node_id = 7,
+        .project_node_id = project_node_id,
         .project_sha256 = PROJECT,
         .project_key = PROJECT_KEY,
         .active_rules = .{ .bundle_revision = 0, .bundle_sha256 = ZERO },
@@ -596,23 +606,86 @@ test "L2 source artifact tamper invalidates projection receipt" {
     );
 }
 
-test "L2 current vendored TinyKG lacks ontology snapshot capability and fails before artifacts" {
+fn runTinyKg(a: std.mem.Allocator, bin: []const u8, args: []const []const u8) !void {
+    var argv: std.ArrayList(?[*:0]const u8) = .empty;
+    defer {
+        for (argv.items) |it| if (it) |s| a.free(std.mem.span(s));
+        argv.deinit(a);
+    }
+    try argv.append(a, (try a.dupeZ(u8, bin)).ptr);
+    for (args) |arg| try argv.append(a, (try a.dupeZ(u8, arg)).ptr);
+    try argv.append(a, null);
+    const common = cc.tools_common;
+    const out = try common.spawnCaptureWithStderrTimed(
+        argv.items,
+        a,
+        null,
+        30_000,
+        null,
+        common.MAX_SPAWN_CAPTURE_BYTES,
+        null,
+    );
+    defer a.free(out.stdout);
+    defer a.free(out.stderr);
+    if (out.exit_code != 0) return error.TinyKgSeedFailed;
+}
+
+test "L2 real TinyKG scratch store snapshot binds through prepare persist and rule-author v2" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     const bin = findVendoredTinyKg(a) orelse return error.SkipZigTest;
     defer a.free(bin);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
-    const root = root_buffer[0..root_len];
     var local = try localFixture(a, &tmp, &root_buffer);
     defer local.deinit(a);
-    const store = try std.fmt.allocPrint(a, "{s}/unsupported.kg", .{root});
+    var store_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &store_buf);
+    const root = store_buf[0..root_len];
+    const store = try std.fmt.allocPrint(a, "{s}/scratch.kg", .{root});
     defer a.free(store);
+
+    // Seed one governed project scope through the real CLI write surface:
+    // project identity, one current proposition, two provenance evidence
+    // nodes, and the authority/falsifier/provenance properties the exporter
+    // documents as its storage contract. Provenance refs deliberately span
+    // two kinds in canonical declaration order
+    // (user_correction < host_observation).
+    try runTinyKg(a, bin, &.{ "init", store });
+    try runTinyKg(a, bin, &.{ "add-node", store, "project", "governed scratch project" }); // 1
+    try runTinyKg(a, bin, &.{ "set-property", store, "node", "1", "project_sha256", PROJECT[0..] });
+    try runTinyKg(a, bin, &.{ "set-property", store, "node", "1", "project_key", PROJECT_KEY });
+    try runTinyKg(a, bin, &.{
+        "add-node",
+        store,
+        "concept",
+        "Edit, not Write, is required for existing files.",
+        "--schema-type",
+        "proposition",
+    }); // 2
+    try runTinyKg(a, bin, &.{ "add-node", store, "observation", "user correction evidence" }); // 3
+    try runTinyKg(a, bin, &.{ "add-node", store, "observation", "host observation evidence" }); // 4
+    try runTinyKg(a, bin, &.{ "relate", store, "1", "contain", "2" });
+    try runTinyKg(a, bin, &.{ "relate", store, "1", "contain", "3" });
+    try runTinyKg(a, bin, &.{ "relate", store, "1", "contain", "4" });
+    try runTinyKg(a, bin, &.{ "set-property", store, "node", "2", "ontology_authority", "user" });
+    try runTinyKg(a, bin, &.{
+        "set-property",
+        store,
+        "node",
+        "2",
+        "ontology_falsifier",
+        "A replay observes Write dispatched onto an existing file.",
+    });
+    const provenance = "{\"schema_version\":\"tinykg-ontology-provenance-v1\",\"refs\":[" ++
+        "{\"kind\":\"user_correction\",\"node_id\":3,\"evidence_sha256\":\"" ++ PROVENANCE_EVIDENCE ++ "\"}," ++
+        "{\"kind\":\"host_observation\",\"node_id\":4,\"evidence_sha256\":\"" ++ PROVENANCE_EVIDENCE ++ "\"}]}";
+    try runTinyKg(a, bin, &.{ "set-property", store, "node", "2", "ontology_provenance", provenance });
 
     var client = try cc.kg_client.KgClient.init(a, .{
         .home = root,
-        .domain = "ontology-capability-l2",
+        .domain = "ontology-scratch-l2",
         .config_bin = bin,
         .config_store = store,
         .env_bin = "",
@@ -620,13 +693,20 @@ test "L2 current vendored TinyKG lacks ontology snapshot capability and fails be
     });
     defer client.deinit();
     client.ensureReady();
-    if (!client.ready) return error.SkipZigTest;
+    try std.testing.expect(client.ready);
     var transport = adapter.KgClientTransport{ .client = &client };
+
+    // Identity negatives first, while the session dir is still artifact-free:
+    // a non-project node and an absent node both fail typed before any
+    // persistence side effect.
     try std.testing.expectError(
         cc.kg_client.KgError.Data,
-        adapter.prepare(a, transport.transport(), request(&local)),
+        adapter.prepare(a, transport.transport(), requestFor(&local, 2)),
     );
-    try std.testing.expect(std.mem.indexOf(u8, client.detail(), "UnknownCommand") != null);
+    try std.testing.expectError(
+        cc.kg_client.KgError.Data,
+        adapter.prepare(a, transport.transport(), requestFor(&local, 999)),
+    );
     var artifacts = try std.Io.Dir.openDirAbsolute(std.testing.io, local.session_dir, .{ .iterate = true });
     defer artifacts.close(std.testing.io);
     var iterator = artifacts.iterate();
@@ -635,9 +715,67 @@ test "L2 current vendored TinyKG lacks ontology snapshot capability and fails be
         try std.testing.expect(!std.mem.startsWith(u8, entry.name, projection.SOURCE_FILE_PREFIX));
         try std.testing.expect(!std.mem.startsWith(u8, entry.name, projection.RECEIPT_FILE_PREFIX));
     }
+
+    // Real positive vertical slice: one atomic CLI snapshot -> strict parse ->
+    // re-observation -> content-addressed receipt -> rule-author v2 binding.
+    var prepared = try adapter.prepare(a, transport.transport(), requestFor(&local, 1));
+    defer prepared.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, prepared.projected.packet, CORRECTION) != null);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.projected.packet, "ontology_context_is_authority\":false") != null);
+    const result = try adapter.persist(a, local.session_dir, &prepared);
+    try std.testing.expect(result.created);
+    const expected_build = try client.binarySha256();
+    try std.testing.expectEqualSlices(u8, &expected_build, &result.tinykg_build_sha256);
+    var loaded = try projection.loadBound(a, local.session_dir, result.receipt_id);
+    defer loaded.deinit();
+    try std.testing.expectEqualSlices(u8, &result.source_semantic_snapshot_sha256, &loaded.projection.source_semantic_snapshot_sha256);
+    try std.testing.expectEqualSlices(u8, &result.source_artifact_sha256, &loaded.projection.source_artifact_sha256);
+
+    const run = try completedFailureRun(local.session_dir);
+    var authored = try rule_author.prepare(a, .{
+        .session_dir = local.session_dir,
+        .project_sha256 = PROJECT,
+        .author_sha256 = .{'2'} ** 64,
+        .provider_sha256 = .{'3'} ** 64,
+        .budget_authorization_sha256 = .{'4'} ** 64,
+        .model = "ontology-scratch-l2-control-provider",
+        .observation = run,
+        .trigger = .repeated_typed_failure,
+        .evidence = &.{},
+        .caps = .{
+            .max_cost_microusd = 1_000_000,
+            .max_input_tokens = 100_000,
+            .max_output_tokens = 256,
+        },
+        .pricing = .{
+            .provenance_sha256 = .{'5'} ** 64,
+            .input_microusd_per_mtok = 3_000_000,
+            .output_microusd_per_mtok = 15_000_000,
+            .cache_read_microusd_per_mtok = 300_000,
+            .cache_write_microusd_per_mtok = 3_750_000,
+        },
+        .ontology_projection = .{
+            .receipt_id = result.receipt_id,
+            .ontology_revision = result.ontology_revision,
+            .ontology_snapshot_sha256 = result.ontology_snapshot_sha256,
+            .active_bundle_revision = 0,
+            .active_bundle_sha256 = ZERO,
+        },
+    });
+    defer authored.deinit();
+    const binding = switch (authored.protocol) {
+        .v1 => return error.ExpectedRuleAuthorV2,
+        .v2 => |value| value,
+    };
+    try std.testing.expectEqualSlices(u8, &result.receipt_id, &binding.receipt_id);
+    try std.testing.expectEqualSlices(u8, &result.packet_sha256, &binding.packet_sha256);
+    try std.testing.expect(std.mem.indexOf(u8, authored.packet, result.source_artifact_sha256[0..]) != null);
+    // Raw provenance evidence hashes stay in the source artifact only; the
+    // provider packet must not leak them into the actor-facing context.
+    try std.testing.expect(std.mem.indexOf(u8, authored.packet, PROVENANCE_EVIDENCE[0..]) == null);
 }
 
-test "L2 KgClient rejects noncanonical TinyKG source suffix without normalization" {
+test "L2 KgClient requires exactly one LF of CLI framing and rejects any other suffix" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     const real_bin = findVendoredTinyKg(a) orelse return error.SkipZigTest;
@@ -648,33 +786,113 @@ test "L2 KgClient rejects noncanonical TinyKG source suffix without normalizatio
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
     const root = root_buffer[0..root_len];
-    const store = try std.fmt.allocPrint(a, "{s}/preserve-wire.kg", .{root});
-    defer a.free(store);
-    const wrapper = try std.fmt.allocPrint(a, "{s}/tinykg-wire-wrapper", .{root});
-    defer a.free(wrapper);
     const canonical = try sourceSnapshot(a);
     defer a.free(canonical);
-    const script = try std.fmt.allocPrint(
-        a,
-        "#!/bin/sh\nif [ \"$1\" = \"ontology-rule-snapshot\" ]; then printf '%s\\n' '{s}'; exit 0; fi\nexec '{s}' \"$@\"\n",
-        .{ canonical, real_bin },
-    );
-    defer a.free(script);
-    try writeExecutable(a, wrapper, script);
-    var client = try cc.kg_client.KgClient.init(a, .{
-        .home = root,
-        .domain = "ontology-wire-l2",
-        .config_bin = wrapper,
-        .config_store = store,
-        .env_bin = "",
-        .env_store = "",
+
+    const Case = struct {
+        name: []const u8,
+        suffix: []const u8,
+        accept: bool,
+        detail: []const u8,
+    };
+    const cases = [_]Case{
+        // TinyKG's mandatory CLI line framing: canonical artifact + one LF.
+        .{ .name = "one-lf", .suffix = "\\n", .accept = true, .detail = "" },
+        // A missing frame means the upstream is not this CLI contract.
+        .{ .name = "no-lf", .suffix = "", .accept = false, .detail = "缺少 CLI LF 框架" },
+        // Anything else is preserved and rejected, never normalized away.
+        .{ .name = "two-lf", .suffix = "\\n\\n", .accept = false, .detail = "非 JSON object" },
+        .{ .name = "space-lf", .suffix = " \\n", .accept = false, .detail = "非 JSON object" },
+    };
+    for (cases) |case| {
+        const store = try std.fmt.allocPrint(a, "{s}/wire-{s}.kg", .{ root, case.name });
+        defer a.free(store);
+        const wrapper = try std.fmt.allocPrint(a, "{s}/tinykg-wire-{s}", .{ root, case.name });
+        defer a.free(wrapper);
+        // Both snapshot transports share the same framing contract; the
+        // wrapper serves the same suffixed payload to each.
+        const script = try std.fmt.allocPrint(
+            a,
+            "#!/bin/sh\ncase \"$1\" in ontology-rule-snapshot|task-snapshot) printf '%s{s}' '{s}'; exit 0;; esac\nexec '{s}' \"$@\"\n",
+            .{ case.suffix, canonical, real_bin },
+        );
+        defer a.free(script);
+        try writeExecutable(a, wrapper, script);
+        var client = try cc.kg_client.KgClient.init(a, .{
+            .home = root,
+            .domain = "ontology-wire-l2",
+            .config_bin = wrapper,
+            .config_store = store,
+            .env_bin = "",
+            .env_store = "",
+        });
+        defer client.deinit();
+        client.ensureReady();
+        if (!client.ready) return error.SkipZigTest;
+        if (case.accept) {
+            const artifact = try client.ontologyRuleSnapshot(7, PROJECT, PROJECT_KEY);
+            defer client.allocator.free(artifact);
+            try std.testing.expectEqualStrings(canonical, artifact);
+            const task_artifact = try client.taskSnapshot(7);
+            defer client.allocator.free(task_artifact);
+            try std.testing.expectEqualStrings(canonical, task_artifact);
+        } else {
+            try std.testing.expectError(
+                cc.kg_client.KgError.Data,
+                client.ontologyRuleSnapshot(7, PROJECT, PROJECT_KEY),
+            );
+            try std.testing.expect(std.mem.indexOf(u8, client.detail(), case.detail) != null);
+            try std.testing.expectError(
+                cc.kg_client.KgError.Data,
+                client.taskSnapshot(7),
+            );
+            try std.testing.expect(std.mem.indexOf(u8, client.detail(), case.detail) != null);
+        }
+    }
+}
+
+test "L2 ontology provenance kind order follows declaration order not tag spelling" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var local = try localFixture(a, &tmp, &root_buffer);
+    defer local.deinit(a);
+
+    // Declaration order (user_correction < host_observation < derived_claim)
+    // is canonical; node_id ordering restarts inside each kind.
+    const ordered = try sourceSnapshotWithProvenance(a, &.{
+        .{ .kind = .user_correction, .node_id = 17, .evidence_sha256 = PROVENANCE_EVIDENCE[0..] },
+        .{ .kind = .host_observation, .node_id = 3, .evidence_sha256 = PROVENANCE_EVIDENCE[0..] },
+        .{ .kind = .derived_claim, .node_id = 5, .evidence_sha256 = PROVENANCE_EVIDENCE[0..] },
     });
-    defer client.deinit();
-    client.ensureReady();
-    if (!client.ready) return error.SkipZigTest;
+    var ordered_fake = Fake{ .allocator = a, .snapshot_bytes = ordered };
+    defer ordered_fake.deinit();
+    var prepared = try adapter.prepare(a, ordered_fake.transport(), request(&local));
+    prepared.deinit();
+
+    // Ascending tag spelling that violates declaration order must fail
+    // (the wire contract is not lexicographic).
+    const lex = try sourceSnapshotWithProvenance(a, &.{
+        .{ .kind = .derived_claim, .node_id = 17, .evidence_sha256 = PROVENANCE_EVIDENCE[0..] },
+        .{ .kind = .user_correction, .node_id = 18, .evidence_sha256 = PROVENANCE_EVIDENCE[0..] },
+    });
+    var lex_fake = Fake{ .allocator = a, .snapshot_bytes = lex };
+    defer lex_fake.deinit();
     try std.testing.expectError(
-        cc.kg_client.KgError.Data,
-        client.ontologyRuleSnapshot(7, PROJECT, PROJECT_KEY),
+        error.InvalidOntologyProvenance,
+        adapter.prepare(a, lex_fake.transport(), request(&local)),
     );
-    try std.testing.expect(std.mem.indexOf(u8, client.detail(), "非 JSON object") != null);
+
+    // Duplicate (kind, node_id) must fail.
+    const dup = try sourceSnapshotWithProvenance(a, &.{
+        .{ .kind = .host_observation, .node_id = 9, .evidence_sha256 = PROVENANCE_EVIDENCE[0..] },
+        .{ .kind = .host_observation, .node_id = 9, .evidence_sha256 = PROVENANCE_EVIDENCE[0..] },
+    });
+    var dup_fake = Fake{ .allocator = a, .snapshot_bytes = dup };
+    defer dup_fake.deinit();
+    try std.testing.expectError(
+        error.InvalidOntologyProvenance,
+        adapter.prepare(a, dup_fake.transport(), request(&local)),
+    );
 }

@@ -380,25 +380,78 @@ const RawEdge = struct {
     dst: u64,
 };
 
+// TinyKG's task-snapshot wire spells its three edge arrays differently:
+// hierarchy edges carry no relation field (every edge is `contain`),
+// dependency edges spell the relation `relation`, and verified_by edges
+// spell it `rel`. The metacodes canonical envelope (Markdown machine fence,
+// formal task-audit checker input) keeps the uniform `rel` spelling. Both
+// shapes are parsed strictly — no unknown fields, no optional overlap.
+const WireHierarchyEdge = struct {
+    src: u64,
+    dst: u64,
+};
+
+const WireDependencyEdge = struct {
+    src: u64,
+    relation: []const u8,
+    dst: u64,
+};
+
 const RawEvidence = struct {
     id: u64,
     kind: []const u8,
     text: []const u8,
 };
 
-const RawSnapshot = struct {
-    schema_version: []const u8,
-    root_id: u64,
-    revision: []const u8,
-    summary: RawSummary,
-    tasks: []RawTask,
-    hierarchy: []RawEdge,
-    dependencies: []RawEdge,
-    evidence: []RawEvidence,
-    verified_by: []RawEdge,
-};
+fn RawSnapshotOf(comptime HierarchyEdgeT: type, comptime DependencyEdgeT: type) type {
+    return struct {
+        schema_version: []const u8,
+        root_id: u64,
+        revision: []const u8,
+        summary: RawSummary,
+        tasks: []RawTask,
+        hierarchy: []HierarchyEdgeT,
+        dependencies: []DependencyEdgeT,
+        evidence: []RawEvidence,
+        verified_by: []RawEdge,
+    };
+}
 
+const WireSnapshot = RawSnapshotOf(WireHierarchyEdge, WireDependencyEdge);
+const CanonicalSnapshot = RawSnapshotOf(RawEdge, RawEdge);
+
+inline fn hierarchyRelOk(edge: anytype) bool {
+    return if (comptime @hasField(@TypeOf(edge), "rel"))
+        std.mem.eql(u8, edge.rel, "contain")
+    else
+        true;
+}
+
+inline fn dependencyRelText(edge: anytype) []const u8 {
+    return if (comptime @hasField(@TypeOf(edge), "relation")) edge.relation else edge.rel;
+}
+
+/// Parse the TinyKG `task-snapshot` CLI wire artifact.
 pub fn parseSnapshot(
+    allocator: std.mem.Allocator,
+    expected_root: TaskId,
+    encoded: []const u8,
+) Error!Projection {
+    return parseShaped(WireSnapshot, allocator, expected_root, encoded);
+}
+
+/// Parse the metacodes canonical envelope — the exact bytes `canonicalJson`
+/// renders, embedded in Markdown and handed to the formal task-audit checker.
+pub fn parseCanonical(
+    allocator: std.mem.Allocator,
+    expected_root: TaskId,
+    encoded: []const u8,
+) Error!Projection {
+    return parseShaped(CanonicalSnapshot, allocator, expected_root, encoded);
+}
+
+fn parseShaped(
+    comptime RawSnapshot: type,
     allocator: std.mem.Allocator,
     expected_root: TaskId,
     encoded: []const u8,
@@ -446,7 +499,7 @@ pub fn parseSnapshot(
 
     const hierarchy = arena_allocator.alloc(HierarchyEdge, raw.hierarchy.len) catch return error.OutOfMemory;
     for (raw.hierarchy, 0..) |edge, index| {
-        if (!std.mem.eql(u8, edge.rel, "contain")) return error.ReferentialIntegrity;
+        if (!hierarchyRelOk(edge)) return error.ReferentialIntegrity;
         if (edge.src == 0 or edge.dst == 0 or edge.src == edge.dst or
             !task_index.contains(edge.src) or !task_index.contains(edge.dst))
             return error.ReferentialIntegrity;
@@ -462,7 +515,7 @@ pub fn parseSnapshot(
 
     const dependencies = arena_allocator.alloc(DependencyEdge, raw.dependencies.len) catch return error.OutOfMemory;
     for (raw.dependencies, 0..) |edge, index| {
-        const rel = parseDependencyRel(edge.rel) orelse return error.ReferentialIntegrity;
+        const rel = parseDependencyRel(dependencyRelText(edge)) orelse return error.ReferentialIntegrity;
         if (edge.src == 0 or edge.dst == 0 or edge.src == edge.dst) return error.ReferentialIntegrity;
         const src_local = task_index.contains(edge.src);
         const dst_local = task_index.contains(edge.dst);
@@ -472,7 +525,7 @@ pub fn parseSnapshot(
         }
         if (index > 0) {
             const previous = raw.dependencies[index - 1];
-            const previous_rel = parseDependencyRel(previous.rel) orelse return error.ReferentialIntegrity;
+            const previous_rel = parseDependencyRel(dependencyRelText(previous)) orelse return error.ReferentialIntegrity;
             const order = dependencyOrder(previous.src, previous_rel, previous.dst, edge.src, rel, edge.dst);
             if (order == .eq) return error.DuplicateEdge;
             if (order == .gt) return error.NonCanonicalOrder;
@@ -564,7 +617,7 @@ pub fn parseMarkdown(
     if (payload.len == 0 or std.mem.indexOfScalar(u8, payload, '\n') != null)
         return error.NonCanonicalMarkdown;
 
-    var result = try parseSnapshot(allocator, expected_root, payload);
+    var result = try parseCanonical(allocator, expected_root, payload);
     errdefer result.deinit();
     if (expected_revision) |expected| {
         if (expected.len != result.revision.len or !std.mem.eql(u8, expected, result.revision[0..]))
@@ -585,7 +638,7 @@ fn findAtLineStart(haystack: []const u8, needle: []const u8) ?usize {
     return null;
 }
 
-fn validateSummary(raw: RawSnapshot) Error!void {
+fn validateSummary(raw: anytype) Error!void {
     const summary = raw.summary;
     if (summary.task_count != raw.tasks.len or
         summary.hierarchy_edge_count != raw.hierarchy.len or

@@ -361,13 +361,13 @@ fn parseSource(
                 return error.InvalidOntologyProvenance;
             if (ref.node_id == 0 or isZero(evidence)) return error.InvalidOntologyProvenance;
             if (prior_ref) |prior_value| {
-                const kind_order = std.mem.order(
-                    u8,
-                    @tagName(prior_value.kind),
-                    @tagName(ref.kind),
-                );
-                if (kind_order == .gt or
-                    (kind_order == .eq and ref.node_id <= prior_value.node_id))
+                // Canonical ref order is the kind enum's declaration order
+                // (user_correction < host_observation < external_evidence <
+                // derived_claim — the wire spec's authority-first listing,
+                // matched by TinyKG's exporter), then strictly ascending
+                // node_id inside one kind. Not lexicographic tag spelling.
+                if (@intFromEnum(ref.kind) < @intFromEnum(prior_value.kind) or
+                    (ref.kind == prior_value.kind and ref.node_id <= prior_value.node_id))
                     return error.InvalidOntologyProvenance;
             }
             prior_ref = .{ .kind = ref.kind, .node_id = ref.node_id };

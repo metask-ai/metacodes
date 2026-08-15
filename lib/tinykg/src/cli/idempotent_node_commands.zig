@@ -32,6 +32,26 @@ pub fn IdempotentNodeCommands(comptime Ops: type) type {
             try publishResult(writer, result);
         }
 
+        /// Daemon-resident variant: identical parsing and identity lookup, but
+        /// the mutation runs on a store the caller keeps open (no CLI lock, no
+        /// open/close). The parsed db path must match the borrowed store.
+        pub fn runEnsureNodeWithStore(
+            store: anytype,
+            args: []const []const u8,
+            writer: anytype,
+            allocator: std.mem.Allocator,
+            io: std.Io,
+        ) !void {
+            var prepared = try Ops.prepareEnsureNode(allocator, io, args);
+            defer prepared.deinit(allocator);
+            if (!std.mem.eql(u8, prepared.db_path, store.dir_path)) return error.StorePathMismatch;
+            var context = Ops.Context.initBorrowed(io, store);
+            defer context.deinit();
+
+            const result = try context.ensureNode(allocator, &prepared);
+            try publishResult(writer, result);
+        }
+
         pub fn runEnsureAnchor(
             args: []const []const u8,
             writer: anytype,

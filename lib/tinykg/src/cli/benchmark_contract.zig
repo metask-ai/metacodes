@@ -15,6 +15,7 @@ pub const BenchmarkContract = struct {
         realistic_agent_diverse_text,
         metaknow_replay,
         metaknow_replay_shaped,
+        kunshan_shaped_corpus,
 
         pub fn label(self: Workload) []const u8 {
             return switch (self) {
@@ -23,6 +24,7 @@ pub const BenchmarkContract = struct {
                 .realistic_agent_diverse_text => "realistic-agent-diverse-text",
                 .metaknow_replay => "metaknow-replay",
                 .metaknow_replay_shaped => "metaknow-replay-shaped",
+                .kunshan_shaped_corpus => "kunshan-shaped-corpus",
             };
         }
 
@@ -33,6 +35,7 @@ pub const BenchmarkContract = struct {
                 .realistic_agent_diverse_text => "realistic-agent-diverse-text",
                 .metaknow_replay => "metaknow-replay",
                 .metaknow_replay_shaped => "metaknow-replay-shaped",
+                .kunshan_shaped_corpus => "kunshan-shaped-corpus",
             };
         }
 
@@ -228,6 +231,7 @@ pub const BenchmarkContract = struct {
         if (std.mem.eql(u8, value, "realistic-agent-diverse-text")) return .realistic_agent_diverse_text;
         if (std.mem.eql(u8, value, "metaknow-replay")) return .metaknow_replay;
         if (std.mem.eql(u8, value, "metaknow-replay-shaped")) return .metaknow_replay_shaped;
+        if (std.mem.eql(u8, value, "kunshan-shaped-corpus")) return .kunshan_shaped_corpus;
         return error.InvalidLimit;
     }
 
@@ -248,8 +252,9 @@ pub const BenchmarkContract = struct {
         if (request.maintenance_node_text_runs_every_ops != 0 and !request.agent_mixed) return error.Unsupported;
         if (request.maintenance_node_text_runs_max_records != 0 and request.maintenance_node_text_runs_every_ops == 0) return error.Unsupported;
         if (request.no_regression_gates.enabled() and (request.storage_only or request.agent_mixed)) return error.Unsupported;
-        if (request.workload.usesMetaknowReplay() and request.corpus_dir_path == null) return error.MissingArgument;
-        if (!request.workload.usesMetaknowReplay() and request.corpus_dir_path != null) return error.Unsupported;
+        const needs_corpus_dir = request.workload.usesMetaknowReplay() or request.workload == .kunshan_shaped_corpus;
+        if (needs_corpus_dir and request.corpus_dir_path == null) return error.MissingArgument;
+        if (!needs_corpus_dir and request.corpus_dir_path != null) return error.Unsupported;
         if (request.workload.usesMetaknowReplay() and request.agent_mixed) return error.Unsupported;
         if (request.workload.usesMetaknowReplay() and request.edge_tombstone_probe) return error.Unsupported;
     }
@@ -362,4 +367,21 @@ test "benchmark contract keeps replay corpus gates and execution modes compatibl
     try std.testing.expectError(error.Unsupported, contract.parseArguments(&.{ "tinykg", "bench", "kg", "10", "20", "--corpus-dir", "docs/bench-fixtures/metaknow-export" }));
     try std.testing.expectError(error.Unsupported, contract.parseArguments(&.{ "tinykg", "bench", "kg", "10", "20", "--workload", "metaknow-replay", "--corpus-dir", "docs/bench-fixtures/metaknow-export", "--agent-mixed" }));
     try std.testing.expectError(error.Unsupported, contract.parseArguments(&.{ "tinykg", "bench", "kg", "10", "20", "--storage-only", "--edge-tombstone-probe", "--workload", "metaknow-replay", "--corpus-dir", "docs/bench-fixtures/metaknow-export" }));
+}
+
+test "benchmark contract accepts kunshan shaped corpus with a shard pool directory" {
+    const shaped = try contract.parseArguments(&.{
+        "tinykg",     "bench",                 "kg",           "10",          "20",
+        "--workload", "kunshan-shaped-corpus", "--corpus-dir", "/tmp/shards",
+    });
+    try std.testing.expectEqual(contract.Workload.kunshan_shaped_corpus, shaped.workload);
+    try std.testing.expect(!shaped.workload.usesMetaknowReplay());
+    try std.testing.expectEqualStrings("kunshan-shaped-corpus", shaped.workload.label());
+    // the shard pool is mandatory, and full query mode stays allowed
+    try std.testing.expectError(error.MissingArgument, contract.parseArguments(&.{ "tinykg", "bench", "kg", "10", "20", "--workload", "kunshan-shaped-corpus" }));
+    const mixed = try contract.parseArguments(&.{
+        "tinykg",        "bench", "kg", "10", "20", "--workload", "kunshan-shaped-corpus", "--corpus-dir", "/tmp/shards",
+        "--agent-mixed",
+    });
+    try std.testing.expect(mixed.agent_mixed);
 }

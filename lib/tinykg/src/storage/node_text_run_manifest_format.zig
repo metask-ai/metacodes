@@ -182,8 +182,12 @@ pub fn NodeTextRunManifestFormat(comptime NodeTextIndexHeader: type) type {
         }
 
         pub fn hashFilterSet(filter: []u8, hash: u64) void {
-            std.debug.assert(hashFilterLenValid(filter.len));
-            std.debug.assert(filter.len != 0);
+            // The probe math requires a power-of-two length at or above the
+            // shared floor; upper byte-budget policy differs between run
+            // filters and the larger node-text base filter and is enforced by
+            // each caller's own length validator at its read/write
+            // boundaries.
+            std.debug.assert(filter.len >= hash_filter_min_bytes and std.math.isPowerOfTwo(filter.len));
             const mask: u64 = @intCast(filter.len * 8 - 1);
             var probe_index: usize = 0;
             while (probe_index < hash_filter_probes) : (probe_index += 1) {
@@ -193,8 +197,8 @@ pub fn NodeTextRunManifestFormat(comptime NodeTextIndexHeader: type) type {
         }
 
         pub fn hashFilterMayContain(filter: []const u8, hash: u64) bool {
-            if (filter.len == 0) return true;
-            if (!hashFilterLenValid(filter.len)) return true;
+            if (filter.len < hash_filter_min_bytes) return true;
+            if (!std.math.isPowerOfTwo(filter.len)) return true;
             const mask: u64 = @intCast(filter.len * 8 - 1);
             var probe_index: usize = 0;
             while (probe_index < hash_filter_probes) : (probe_index += 1) {

@@ -20,10 +20,19 @@ pub fn StoreOpening(comptime Ops: type) type {
                 try Ops.ensureStoreMarkerExists(store);
             }
             if (!create or store_marker_exists) {
+                // Format admission must precede every recovery routine because
+                // recovery is allowed to mutate durable bytes.
+                const read_only_older_format = try Ops.admitStoreFormat(store);
+                if (read_only_older_format) return store;
+                // Recovery writes belong to the single writer; a concurrent
+                // read-only open must never repair files the writer owns.
+                if (!Ops.crashRecoveryAllowed(request)) return store;
                 const committed = try Ops.recoverNodeTextsAppendJournal(store);
                 if (committed) {
                     try Ops.repairPersistentIndexesFromLog(store);
                 }
+            } else if (!Ops.crashRecoveryAllowed(request)) {
+                return store;
             }
 
             // Both create-or-open and strict open must finish interrupted
@@ -41,6 +50,7 @@ const TestPhase = enum {
     allocate_store,
     marker_probe,
     ensure_marker,
+    admit_format,
     recover_node_texts,
     repair_indexes,
     recover_property_redo,
@@ -54,6 +64,7 @@ const TestContext = struct {
     fail_at: ?TestPhase = null,
     marker_exists: bool = false,
     node_text_recovery_committed: bool = false,
+    read_only_older_format: bool = false,
     store_owned: bool = false,
     deinit_count: usize = 0,
 
@@ -75,6 +86,10 @@ const TestStore = struct {
 const TestOps = struct {
     pub const Request = *TestContext;
     pub const StoreType = TestStore;
+
+    pub fn crashRecoveryAllowed(_: Request) bool {
+        return true;
+    }
 
     pub fn createDirectory(context: Request) !void {
         try context.record(.create_directory);
@@ -112,6 +127,11 @@ const TestOps = struct {
     pub fn recoverNodeTextsAppendJournal(store: StoreType) !bool {
         try store.context.record(.recover_node_texts);
         return store.context.node_text_recovery_committed;
+    }
+
+    pub fn admitStoreFormat(store: StoreType) !bool {
+        try store.context.record(.admit_format);
+        return store.context.read_only_older_format;
     }
 
     pub fn repairPersistentIndexesFromLog(store: StoreType) !void {
@@ -156,6 +176,7 @@ test "store opening create repairs only a committed node text recovery" {
         .create_directory,
         .allocate_store,
         .marker_probe,
+        .admit_format,
         .recover_node_texts,
         .repair_indexes,
         .recover_property_redo,
@@ -173,9 +194,28 @@ test "store opening strict open admits marker and preserves recovery order" {
         .allocate_store,
         .marker_probe,
         .ensure_marker,
+        .admit_format,
         .recover_node_texts,
         .recover_property_redo,
         .recover_property_delta,
+    }, context.recorded());
+}
+
+test "store opening skips every mutating recovery only for an admitted older format" {
+    var context = TestContext{
+        .marker_exists = true,
+        .node_text_recovery_committed = true,
+        .read_only_older_format = true,
+    };
+    var store = try test_opening.open(&context, false);
+    defer TestOps.deinitStore(&store);
+
+    try std.testing.expectEqualSlices(TestPhase, &.{
+        .require_directory,
+        .allocate_store,
+        .marker_probe,
+        .ensure_marker,
+        .admit_format,
     }, context.recorded());
 }
 
@@ -199,6 +239,7 @@ test "store opening cleans exactly once at every failure boundary" {
         .allocate_store,
         .marker_probe,
         .ensure_marker,
+        .admit_format,
         .recover_node_texts,
         .repair_indexes,
         .recover_property_redo,

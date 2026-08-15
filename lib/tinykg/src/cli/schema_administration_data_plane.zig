@@ -1935,8 +1935,10 @@ pub fn SchemaAdministrationDataPlane(comptime Ops: type) type {
             defer manifest.deinit(allocator);
             const expected_schema_version = try std.fmt.allocPrint(allocator, "{}", .{expected.transaction.target_schema_version});
             defer allocator.free(expected_schema_version);
+            const manifest_storage_version = std.fmt.parseInt(u32, manifest.storage_format_version, 10) catch
+                return error.MigrationRecoveryConflict;
             if (!std.mem.eql(u8, manifest.status, "present") or
-                !std.mem.eql(u8, manifest.storage_format_version, "2") or
+                manifest_storage_version != version.storage_format_version or
                 !std.mem.eql(u8, manifest.schema_version, expected_schema_version) or
                 !std.mem.eql(u8, manifest.enabled_profiles, expected.transaction.target_profiles) or
                 !std.mem.eql(u8, manifest.migration_name, "schema-migrate") or

@@ -1,4 +1,6 @@
 /// Persistent TinyQL, search, context-packet, node and neighbor read rendering.
+const checkpoint = @import("../checkpoint.zig");
+
 pub fn QueryContextReadDataPlane(comptime Ops: type) type {
     return struct {
         const CliOutputFormat = Ops.CliOutputFormatValue;
@@ -107,7 +109,7 @@ pub fn QueryContextReadDataPlane(comptime Ops: type) type {
             explain: bool,
             budget: core.QueryBudget,
         ) ![]u8 {
-            return renderPersistentQueryOutputMaybeRetained(allocator, io, store, null, null, physical, explain, budget);
+            return renderPersistentQueryOutputMaybeRetained(allocator, io, store, null, null, null, physical, explain, budget);
         }
 
         pub fn renderPersistentQueryOutputRetained(
@@ -121,7 +123,290 @@ pub fn QueryContextReadDataPlane(comptime Ops: type) type {
         ) ![]u8 {
             var node_text_retention_registry = storage.NodeTextRunRetentionRegistry.init(allocator);
             defer node_text_retention_registry.deinit();
-            return renderPersistentQueryOutputMaybeRetained(allocator, io, store, edge_retention_registry, &node_text_retention_registry, physical, explain, budget);
+            return renderPersistentQueryOutputMaybeRetained(allocator, io, store, edge_retention_registry, &node_text_retention_registry, null, physical, explain, budget);
+        }
+
+        /// Daemon hot path. The session owns retained edge/node-text readers
+        /// across requests and is explicitly invalidated when Store generation
+        /// advances. Explain output still uses the instrumented retained path.
+        pub fn renderPersistentQueryOutputSession(
+            allocator: std.mem.Allocator,
+            io: std.Io,
+            store: storage.Store,
+            session: *ql.executor.PersistentStoreQuerySession,
+            physical: ql.optimizer.PhysicalPlan,
+            explain: bool,
+            budget: core.QueryBudget,
+        ) ![]u8 {
+            return renderPersistentQueryOutputMaybeRetained(
+                allocator,
+                io,
+                store,
+                session.edgeRetentionRegistry(),
+                null,
+                session,
+                physical,
+                explain,
+                budget,
+            );
+        }
+
+        /// Compact daemon presentation path. Execution and projection both
+        /// borrow one generation-owned checkpoint Runtime, so no expanded
+        /// legacy Store or persistent derived index is created on disk.
+        pub fn renderCheckpointQueryOutput(
+            allocator: std.mem.Allocator,
+            io: std.Io,
+            runtime: *checkpoint.Runtime,
+            physical: ql.optimizer.PhysicalPlan,
+            explain: bool,
+            budget: core.QueryBudget,
+        ) ![]u8 {
+            var out = QueryOutputWriter{ .allocator = allocator };
+            errdefer out.buffer.deinit(allocator);
+            const explain_start_ns = if (explain) monotonicNs(io) else 0;
+            var operator_timings = ql.executor.OperatorTimingRecorder.init(allocator, io);
+            defer operator_timings.deinit();
+            var table = if (explain)
+                try runtime.executeExplain(io, physical, budget, &operator_timings)
+            else
+                try runtime.execute(io, physical, budget);
+            defer table.deinit(allocator);
+            if (!explain and table.stats.budget_exceeded) return core.Error.BudgetExceeded;
+
+            if (explain) {
+                if (try accumulateCheckpointProjectionExplainStats(
+                    allocator,
+                    io,
+                    runtime,
+                    physical,
+                    table,
+                    budget,
+                    &table.stats,
+                )) table.stats.budget_exceeded = true;
+                const elapsed_ns = elapsedNs(io, explain_start_ns);
+                try out.print(
+                    "rows={} nodes_visited={} edges_visited={} budget_exceeded={} elapsed_ns={} text_warm_start=1 text_warm_end=1 max_results={} max_depth={} max_visited_nodes={} max_visited_edges={} max_text_postings_scanned={} timeout_ms={} plan=",
+                    .{
+                        table.rows.items.len,
+                        table.stats.nodes_visited,
+                        table.stats.edges_visited,
+                        table.stats.budget_exceeded,
+                        elapsed_ns,
+                        budget.max_results,
+                        budget.max_depth,
+                        budget.max_visited_nodes,
+                        budget.max_visited_edges,
+                        budget.max_text_postings_scanned,
+                        budget.timeout_ms,
+                    },
+                );
+                try renderPhysicalPlanSummary(&out, physical);
+                try out.writeAll(" op_timings=");
+                try renderOperatorTimings(&out, operator_timings.entries.items);
+                try out.writeAll("\n");
+                return out.buffer.toOwnedSlice(allocator);
+            }
+
+            const projections = physicalProjections(physical) orelse return error.InvalidPlan;
+            const read_timestamp_ns = table.read_timestamp_ns orelse try u128ToU64(persistentNowNs(io));
+            for (table.rows.items) |row| {
+                for (projections, 0..) |projection, index_pos| {
+                    if (index_pos > 0) try out.writeAll("\t");
+                    try writeProjectionCheckpoint(&out, allocator, io, runtime, read_timestamp_ns, row, projection, budget, null);
+                }
+                try out.writeAll("\n");
+            }
+            return out.buffer.toOwnedSlice(allocator);
+        }
+
+        fn writeProjectionCheckpoint(
+            writer: anytype,
+            allocator: std.mem.Allocator,
+            io: std.Io,
+            runtime: *checkpoint.Runtime,
+            read_timestamp_ns: u64,
+            row: ql.executor.Row,
+            projection: ql.ast.Projection,
+            budget: core.QueryBudget,
+            projection_stats: ?*query_index.QueryStats,
+        ) !void {
+            switch (projection) {
+                .variable => |var_name| {
+                    const id = row.get(var_name) orelse {
+                        try writer.writeAll("null");
+                        return;
+                    };
+                    const node = runtime.graph_index.getNode(&runtime.graph, id) orelse return error.InvalidRecord;
+                    try writer.print("{}:", .{id.toInt()});
+                    try writeNodeKindName(writer, node.kind);
+                    try writer.writeAll(":");
+                    try writeEscapedText(writer, markdownProjectionVisibleText(node.text));
+                },
+                .property => |property_projection| {
+                    const id = row.get(property_projection.var_name) orelse {
+                        try writer.writeAll("null");
+                        return;
+                    };
+                    const node = runtime.graph_index.getNode(&runtime.graph, id) orelse return error.InvalidRecord;
+                    if (std.mem.eql(u8, property_projection.property, "text")) {
+                        try writeEscapedText(writer, node.text);
+                        return;
+                    }
+                    if (node.kind == .task and std.mem.eql(u8, property_projection.property, task.status_property)) {
+                        const lifecycle = try checkpointTaskStatus(runtime.query_view, id, read_timestamp_ns);
+                        try writer.writeAll(@tagName(lifecycle));
+                        return;
+                    }
+                    const value = runtime.query_view.nodeProperty(id.toInt(), property_projection.property) orelse {
+                        if (std.mem.eql(u8, property_projection.property, "name") or std.mem.eql(u8, property_projection.property, "summary")) {
+                            try writer.writeAll("");
+                        } else {
+                            try writer.writeAll("null");
+                        }
+                        return;
+                    };
+                    switch (value.value_kind) {
+                        .string => try writeEscapedText(writer, value.string_value),
+                        .uint => try writer.print("{}", .{value.uint_value}),
+                    }
+                },
+                .path => |path| {
+                    const nodes = row.getPath(path.from_var, path.to_var) orelse {
+                        try writer.writeAll("null");
+                        return;
+                    };
+                    for (nodes, 0..) |node_id, index_pos| {
+                        if (runtime.graph_index.getNode(&runtime.graph, node_id) == null) return error.InvalidRecord;
+                        if (index_pos > 0) try writer.writeAll(" -> ");
+                        try writer.print("{}", .{node_id.toInt()});
+                    }
+                },
+                .reachable => |reachable| {
+                    const from = row.get(reachable.from_var) orelse {
+                        try writer.writeAll("null");
+                        return;
+                    };
+                    const to = row.get(reachable.to_var) orelse {
+                        try writer.writeAll("null");
+                        return;
+                    };
+                    var local_stats: query_index.QueryStats = .{};
+                    const stats = projection_stats orelse &local_stats;
+                    const value = try dag.reachableWithCursorMeasured(
+                        allocator,
+                        &runtime.graph,
+                        &runtime.graph_index,
+                        .{ .memory = .{ .mem_index = &runtime.graph_index, .checkpoint_view = runtime.query_view } },
+                        from,
+                        to,
+                        reachable.rel,
+                        budget,
+                        stats,
+                    );
+                    try writer.writeAll(if (value) "true" else "false");
+                },
+                .context => |context| {
+                    const focus = row.get(context.var_name) orelse {
+                        try writer.writeAll("null");
+                        return;
+                    };
+                    var local_stats: query_index.QueryStats = .{};
+                    const stats = projection_stats orelse &local_stats;
+                    var packet = try agent.contextPacketWithCursorMeasured(
+                        allocator,
+                        io,
+                        &runtime.graph,
+                        &runtime.graph_index,
+                        .{ .memory = .{ .mem_index = &runtime.graph_index, .checkpoint_view = runtime.query_view } },
+                        focus,
+                        8,
+                        budget,
+                        stats,
+                    );
+                    defer packet.deinit(allocator);
+                    for (packet.facts.items, 0..) |fact, index_pos| {
+                        const node = runtime.graph_index.getNode(&runtime.graph, fact.node_id) orelse return error.InvalidRecord;
+                        if (index_pos > 0) try writer.writeAll(",");
+                        try writeRelKindName(writer, fact.rel);
+                        try writer.print(":{s}:{}:", .{ @tagName(fact.direction), fact.node_id.toInt() });
+                        try writeEscapedText(writer, node.text);
+                        try writer.print(":{}", .{fact.score});
+                    }
+                },
+                .score => |score| {
+                    if (row.getScore(score.var_name)) |value| {
+                        try writer.print("{d:.6}", .{value});
+                    } else {
+                        try writer.writeAll("null");
+                    }
+                },
+            }
+        }
+
+        fn accumulateCheckpointProjectionExplainStats(
+            allocator: std.mem.Allocator,
+            io: std.Io,
+            runtime: *checkpoint.Runtime,
+            physical: ql.optimizer.PhysicalPlan,
+            table: ql.executor.ResultTable,
+            budget: core.QueryBudget,
+            stats: *query_index.QueryStats,
+        ) !bool {
+            const projections = physicalProjections(physical) orelse return error.InvalidPlan;
+            var sink = ProjectionExplainSink{};
+            const read_timestamp_ns = table.read_timestamp_ns orelse try u128ToU64(persistentNowNs(io));
+            for (table.rows.items) |row| {
+                for (projections) |projection| {
+                    var projection_stats: query_index.QueryStats = .{};
+                    writeProjectionCheckpoint(
+                        &sink,
+                        allocator,
+                        io,
+                        runtime,
+                        read_timestamp_ns,
+                        row,
+                        projection,
+                        budget,
+                        &projection_stats,
+                    ) catch |err| {
+                        try mergeProjectionStats(stats, projection_stats);
+                        switch (err) {
+                            core.Error.BudgetExceeded => return true,
+                            else => |other| return other,
+                        }
+                    };
+                    try mergeProjectionStats(stats, projection_stats);
+                }
+            }
+            return false;
+        }
+
+        fn checkpointTaskStatus(
+            view: query.CheckpointView,
+            node_id: core.NodeId,
+            now_ns: u64,
+        ) !task.Status {
+            var fields: task.StatusSnapshot.LifecycleFields = .{};
+            if (view.nodeProperty(node_id.toInt(), task.status_property)) |value| {
+                if (value.value_kind == .string) fields.stored_status_raw = value.string_value else fields.invalid_value_type = true;
+            }
+            if (view.nodeProperty(node_id.toInt(), task.claimed_by_property)) |value| {
+                if (value.value_kind == .string) fields.claimed_by = value.string_value else fields.invalid_value_type = true;
+            }
+            if (view.nodeProperty(node_id.toInt(), task.claim_expires_ns_property)) |value| {
+                if (value.value_kind == .uint) fields.claim_expires_ns = value.uint_value else fields.invalid_value_type = true;
+            }
+            if (view.nodeProperty(node_id.toInt(), "task_recorded_ns")) |value| {
+                if (value.value_kind == .uint) fields.task_recorded_ns = value.uint_value else fields.invalid_value_type = true;
+            }
+            if (view.nodeProperty(node_id.toInt(), "task_created_ns")) |value| {
+                if (value.value_kind == .uint) fields.task_created_ns = value.uint_value else fields.invalid_value_type = true;
+            }
+            if (view.nodeProperty(node_id.toInt(), "task_completed_ns")) |value| {
+                if (value.value_kind == .uint) fields.task_completed_ns = value.uint_value else fields.invalid_value_type = true;
+            }
+            return task.effectiveStatusForLifecycleFields(fields, now_ns, .strict);
         }
 
         fn renderPersistentQueryOutputMaybeRetained(
@@ -130,6 +415,7 @@ pub fn QueryContextReadDataPlane(comptime Ops: type) type {
             store: storage.Store,
             edge_retention_registry: ?*storage.EdgeSegmentRetentionRegistry,
             node_text_retention_registry: ?*storage.NodeTextRunRetentionRegistry,
+            persistent_session: ?*ql.executor.PersistentStoreQuerySession,
             physical: ql.optimizer.PhysicalPlan,
             explain: bool,
             budget: core.QueryBudget,
@@ -141,7 +427,9 @@ pub fn QueryContextReadDataPlane(comptime Ops: type) type {
             const text_warm_start = if (explain) try persistentTextCatalogWarm(allocator, io, store, store.dir_path) else false;
             var operator_timings = ql.executor.OperatorTimingRecorder.init(allocator, io);
             defer operator_timings.deinit();
-            var table = if (explain)
+            var table = if (persistent_session != null and !explain)
+                try persistent_session.?.execute(io, physical, budget)
+            else if (explain)
                 try ql.executor.executeWithPersistentStoreAndIoRetainedIndexesExplain(allocator, io, store, edge_retention_registry, node_text_retention_registry, physical, budget, &operator_timings)
             else if (edge_retention_registry) |edge_registry|
                 if (node_text_retention_registry) |node_text_registry|

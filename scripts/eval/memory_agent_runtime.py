@@ -1655,13 +1655,15 @@ def _production_sandbox_profile(
     transient_directories: List[Path] = []
     for raw in transient_write_roots:
         spelled = raw.expanduser().absolute()
-        if spelled.name != ".tinykg-cli.lock":
+        is_cli_lock = spelled.name == ".tinykg-cli.lock"
+        is_daemon_lock = spelled.name.endswith(".tinykg-daemon.lock")
+        if not (is_cli_lock or is_daemon_lock):
             _fail(
                 "production sandbox transient write root",
-                "only the TinyKG CLI lock path is supported",
+                "only the TinyKG CLI and daemon-ownership lock paths are supported",
             )
         try:
-            spelled.lstat()
+            existing_info = spelled.lstat()
         except FileNotFoundError:
             pass
         except OSError as exc:
@@ -1669,7 +1671,14 @@ def _production_sandbox_profile(
                 f"production sandbox transient write root is unavailable: {exc}"
             ) from exc
         else:
-            _fail("production sandbox transient write root", "must not already exist")
+            # The daemon-ownership lock is a persistent zero-byte flock
+            # rendezvous file; the CLI lock directory must never survive.
+            if not (
+                is_daemon_lock
+                and stat.S_ISREG(existing_info.st_mode)
+                and existing_info.st_size == 0
+            ):
+                _fail("production sandbox transient write root", "must not already exist")
         parent = spelled.parent
         try:
             parent_info = parent.lstat()
@@ -1680,11 +1689,25 @@ def _production_sandbox_profile(
         if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
             _fail("production sandbox transient write root", "parent must be a real directory")
         path = parent.resolve(strict=True) / spelled.name
-        if not any(_path_is_within(str(path), root) for root in sealed_directories):
-            _fail(
-                "production sandbox transient write root",
-                "must be inside a sealed read-only root",
-            )
+        if is_cli_lock:
+            if not any(_path_is_within(str(path), root) for root in sealed_directories):
+                _fail(
+                    "production sandbox transient write root",
+                    "must be inside a sealed read-only root",
+                )
+        else:
+            # TinyKG storage v3 flocks a zero-byte rendezvous file that is a
+            # sibling of the store. Accept exactly `<sealed-root>` + suffix so
+            # the carve-out stays a single literal path derived from a sealed
+            # store; everything else in the parent stays deny-write.
+            if not any(
+                path == root.with_name(root.name + ".tinykg-daemon.lock")
+                for root in sealed_directories
+            ):
+                _fail(
+                    "production sandbox transient write root",
+                    "daemon lock must be the sibling of a sealed read-only root",
+                )
         if path not in transient_directories:
             transient_directories.append(path)
     transient_directories.sort(key=str)
@@ -1748,6 +1771,13 @@ def _production_sandbox_profile(
             f"  (subpath {_sbpl_string(str(path))})" for path in transient_directories
         )
         lines.append(")")
+        # Opening an already-existing lock rendezvous file is O_RDWR; grant
+        # read on exactly the same lock paths, nothing else.
+        lines.append("(allow file-read*")
+        lines.extend(
+            f"  (subpath {_sbpl_string(str(path))})" for path in transient_directories
+        )
+        lines.append(")")
     return "\n".join(lines) + "\n"
 
 
@@ -1778,7 +1808,14 @@ def _materialize_production_sandbox(
         sealed_files=(profile_path, evidence_path, ripgrep),
         sealed_roots=read_only_roots,
         transient_write_roots=(
-            (tinykg_read_only_store / ".tinykg-cli.lock",)
+            (
+                tinykg_read_only_store / ".tinykg-cli.lock",
+                # TinyKG storage v3 also takes a shared daemon-ownership flock on
+                # a sibling file of the store; the store contents stay sealed.
+                tinykg_read_only_store.with_name(
+                    tinykg_read_only_store.name + ".tinykg-daemon.lock"
+                ),
+            )
             if tinykg_read_only_store is not None
             else ()
         ),
@@ -1856,7 +1893,7 @@ def _run_production_tinykg_read_probe(
     info_output = run("store-info")
     parsed_info = _store_info(info_output)
     if (
-        parsed_info.get("storage_format_version") != "2"
+        parsed_info.get("storage_format_version") != "3"
         or parsed_info.get("schema_version") != "3"
         or parsed_info.get("text_current") != "1"
         or parsed_info.get("text_stale") != "0"

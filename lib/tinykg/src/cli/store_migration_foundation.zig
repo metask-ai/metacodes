@@ -431,11 +431,11 @@ pub fn StoreMigrationFoundation(comptime Ops: type) type {
                 },
                 .canonical_payload => blk: {
                     if (lhs.key_hash != rhs.key_hash) break :blk lhs.key_hash < rhs.key_hash;
+                    if (lhs.owner_kind != rhs.owner_kind) break :blk lhs.owner_kind < rhs.owner_kind;
+                    if (lhs.owner_id != rhs.owner_id) break :blk lhs.owner_id < rhs.owner_id;
                     if (lhs.value_kind != rhs.value_kind) break :blk @intFromEnum(lhs.value_kind) < @intFromEnum(rhs.value_kind);
                     // Target-spool records store the canonical value_hash in version.
-                    if (lhs.version != rhs.version) break :blk lhs.version < rhs.version;
-                    if (lhs.owner_kind != rhs.owner_kind) break :blk lhs.owner_kind < rhs.owner_kind;
-                    break :blk lhs.owner_id < rhs.owner_id;
+                    break :blk lhs.version < rhs.version;
                 },
             };
         }
@@ -1036,6 +1036,11 @@ pub fn StoreMigrationFoundation(comptime Ops: type) type {
         };
 
         pub const MigrationTargetPropertySpoolBuilder = struct {
+            pub const Suppression = struct {
+                owner: storage.PropertyOwner,
+                key_hash: u64,
+            };
+
             inner: MigrationPropertySpoolBuilder,
             nonce: u64,
             current_owner_kind: u8 = 0,
@@ -1096,6 +1101,104 @@ pub fn StoreMigrationFoundation(comptime Ops: type) type {
                     if (!migrationPropertyKeyValid(write.key)) return error.InvalidRecord;
                     try self.appendValue(write.owner, key_hash, write.value);
                 }
+            }
+
+            pub fn appendSnapshot(self: *MigrationTargetPropertySpoolBuilder, snapshot: storage.PropertySnapshot) !void {
+                for (snapshot.entries) |entry| {
+                    const value: storage.PropertyPayloadValue = switch (entry.value_kind) {
+                        .string => .{ .string = entry.string_value },
+                        .uint => .{ .uint = entry.uint_value },
+                    };
+                    try self.appendValue(entry.owner, entry.key_hash, value);
+                }
+            }
+
+            const OwnerKey = struct {
+                owner_kind: u8,
+                owner_id: u64,
+                key_hash: u64,
+            };
+
+            fn ownerParts(owner: storage.PropertyOwner) struct { kind: u8, id: u64 } {
+                return switch (owner) {
+                    .node => |id| .{ .kind = 1, .id = id.toInt() },
+                    .edge => |id| .{ .kind = 2, .id = id.toInt() },
+                };
+            }
+
+            pub fn appendSnapshotMerged(
+                self: *MigrationTargetPropertySpoolBuilder,
+                snapshot: storage.PropertySnapshot,
+                writes: []const storage.PropertyPayloadWrite,
+                suppressions: []const Suppression,
+            ) !u64 {
+                var overrides = std.AutoHashMap(OwnerKey, void).init(self.inner.allocator);
+                defer overrides.deinit();
+                const override_count = std.math.add(usize, writes.len, suppressions.len) catch return error.RecordTooLarge;
+                try overrides.ensureTotalCapacity(std.math.cast(u32, override_count) orelse return error.RecordTooLarge);
+                for (writes) |write| {
+                    const owner = ownerParts(write.owner);
+                    const entry = try overrides.getOrPut(.{
+                        .owner_kind = owner.kind,
+                        .owner_id = owner.id,
+                        .key_hash = storage.propertyKeyHashForLookup(write.key),
+                    });
+                    if (entry.found_existing) return error.InvalidRecord;
+                }
+                for (suppressions) |suppression| {
+                    const owner = ownerParts(suppression.owner);
+                    _ = try overrides.getOrPut(.{
+                        .owner_kind = owner.kind,
+                        .owner_id = owner.id,
+                        .key_hash = suppression.key_hash,
+                    });
+                }
+
+                var source_index: usize = 0;
+                var write_index: usize = 0;
+                var appended: u64 = 0;
+                while (source_index < snapshot.entries.len or write_index < writes.len) {
+                    const source_owner = if (source_index < snapshot.entries.len) ownerParts(snapshot.entries[source_index].owner) else null;
+                    const write_owner = if (write_index < writes.len) ownerParts(writes[write_index].owner) else null;
+                    const next = if (source_owner == null)
+                        write_owner.?
+                    else if (write_owner == null)
+                        source_owner.?
+                    else if (source_owner.?.kind < write_owner.?.kind or
+                        (source_owner.?.kind == write_owner.?.kind and source_owner.?.id <= write_owner.?.id))
+                        source_owner.?
+                    else
+                        write_owner.?;
+
+                    while (source_index < snapshot.entries.len) {
+                        const entry = snapshot.entries[source_index];
+                        const owner = ownerParts(entry.owner);
+                        if (owner.kind != next.kind or owner.id != next.id) break;
+                        const replaced = overrides.contains(.{
+                            .owner_kind = owner.kind,
+                            .owner_id = owner.id,
+                            .key_hash = entry.key_hash,
+                        });
+                        if (!replaced) {
+                            const value: storage.PropertyPayloadValue = switch (entry.value_kind) {
+                                .string => .{ .string = entry.string_value },
+                                .uint => .{ .uint = entry.uint_value },
+                            };
+                            try self.appendValue(entry.owner, entry.key_hash, value);
+                            appended = std.math.add(u64, appended, 1) catch return error.RecordTooLarge;
+                        }
+                        source_index += 1;
+                    }
+                    while (write_index < writes.len) {
+                        const write = writes[write_index];
+                        const owner = ownerParts(write.owner);
+                        if (owner.kind != next.kind or owner.id != next.id) break;
+                        try self.appendValue(write.owner, storage.propertyKeyHashForLookup(write.key), write.value);
+                        appended = std.math.add(u64, appended, 1) catch return error.RecordTooLarge;
+                        write_index += 1;
+                    }
+                }
+                return appended;
             }
 
             fn appendValue(
@@ -2494,8 +2597,10 @@ pub fn StoreMigrationFoundation(comptime Ops: type) type {
             if (stats_out.nodes != result.nodes_imported or stats_out.edges != result.edges_imported) return error.InvalidRecord;
             const manifest = try readStoreManifestSummary(allocator, io, target_path);
             defer manifest.deinit(allocator);
+            const manifest_storage_version = std.fmt.parseInt(u32, manifest.storage_format_version, 10) catch
+                return error.ImportRecoveryConflict;
             if (!std.mem.eql(u8, manifest.status, "present") or
-                !std.mem.eql(u8, manifest.storage_format_version, "2") or
+                manifest_storage_version != current_storage_format_version or
                 !std.mem.eql(u8, manifest.schema_version, "3") or
                 manifest.enabled_profiles.len != 0 or
                 !std.mem.eql(u8, manifest.migration_name, try importManifestName(expected.format)) or

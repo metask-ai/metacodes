@@ -1,5 +1,8 @@
 vendored from: https://github.com/shuzuan-org/tinykg.git
-commit: 5505b06b8eab8eb0612abf80d2044141dd66ba44
+commit: b8bcadb1fb1a9322760fa831f4858850b7787ac7 (+ uncommitted working tree, 2026-08-16)
+content_sha256: e73add3d722362711d261d1baf82996716d47b2a034e5aca46a8fa451a0885a1  # sha256 over sorted per-file sha256 of src/
 note: 源码快照(非 submodule)。更新用 scripts/vendor-deps.sh。
-storage_format_version: 2  # 变更须同步 src/kg/client.zig EXPECTED_STORAGE_FORMAT_VERSION
+note: 本次快照含上游未提交的 ontology-rule-snapshot/task-snapshot/memory-migration
+      data plane(与已部署 remote runtime 0.2.0 同源);上游提交后应 re-vendor 恢复干净 provenance。
+storage_format_version: 3  # 变更须同步 src/kg/client.zig EXPECTED_STORAGE_FORMAT_VERSION
 schema_version: 3  # 变更须同步 src/kg/client.zig EXPECTED_SCHEMA_VERSION

@@ -1,5 +1,6 @@
 const std = @import("std");
 const property_format = @import("property_format.zig");
+const property_block_codec = @import("property_block_codec.zig");
 
 const PropertyPayloadIndexHeader = property_format.PropertyPayloadIndexHeader;
 const PropertyPayloadRedoJournalHeader = property_format.PropertyPayloadRedoJournalHeader;
@@ -88,10 +89,10 @@ fn propertyPayloadValueFileSize(record_count: u64, payload_bytes: u64) !u64 {
 
 fn recordLessThan(a: PropertyPayloadIndexRecord, b: PropertyPayloadIndexRecord) bool {
     if (a.key_hash != b.key_hash) return a.key_hash < b.key_hash;
-    if (a.value_type != b.value_type) return a.value_type < b.value_type;
-    if (a.value_hash != b.value_hash) return a.value_hash < b.value_hash;
     if (a.owner_kind != b.owner_kind) return a.owner_kind < b.owner_kind;
-    return a.owner_id < b.owner_id;
+    if (a.owner_id != b.owner_id) return a.owner_id < b.owner_id;
+    if (a.value_type != b.value_type) return a.value_type < b.value_type;
+    return a.value_hash < b.value_hash;
 }
 
 /// Owns the complete durable mutation boundary for canonical property payloads:
@@ -524,6 +525,7 @@ pub fn PropertyPayloadTransaction(comptime Ops: type) type {
                 .record_count = @intCast(entries.len),
                 .owner_count = 0,
                 .owner_digest = 0,
+                .flags = PropertyPayloadIndexHeader.flag_string_value_hash_derived,
             };
             var header_bytes: [PropertyPayloadIndexHeader.encoded_len]u8 = undefined;
             header.encode(&header_bytes);
@@ -535,7 +537,9 @@ pub fn PropertyPayloadTransaction(comptime Ops: type) type {
                     if (!recordLessThan(prior, record)) return error.InvalidRecord;
                 }
                 var record_bytes: [PropertyPayloadIndexRecord.encoded_len]u8 = undefined;
-                try record.encode(&record_bytes);
+                var stored_record = record;
+                if (stored_record.value_type == PropertyPayloadIndexRecord.value_type_string) stored_record.value_hash = 0;
+                try stored_record.encode(&record_bytes);
                 try writer.append(&record_bytes);
                 previous = record;
             }
@@ -582,6 +586,7 @@ pub fn PropertyPayloadTransaction(comptime Ops: type) type {
                 .node_digest = 0,
                 .payload_bytes = payload_bytes,
                 .payload_digest = payload_digest,
+                .flags = NodePropertyValueBlockHeader.flag_string_value_hash_derived,
             };
             var header_bytes: [NodePropertyValueBlockHeader.encoded_len]u8 = undefined;
             header.encode(&header_bytes);
@@ -599,6 +604,53 @@ pub fn PropertyPayloadTransaction(comptime Ops: type) type {
             try writer.flush();
             if (try regularFileSize(io, file) != file_size) return error.InvalidRecord;
             if (Ops.shouldSync(store)) try file.sync(io);
+        }
+
+        fn encodeStageWithBlockCodec(store: StoreType, raw_path: []const u8, encoded_path: []const u8, options: property_block_codec.EncodeOptions) !void {
+            const allocator = Ops.allocator(store);
+            const io = Ops.io(store);
+            var raw_file = try std.Io.Dir.cwd().openFile(io, raw_path, .{ .allow_directory = false });
+            defer raw_file.close(io);
+            const logical_size = try regularFileSize(io, raw_file);
+            var encoded_file = try std.Io.Dir.cwd().createFile(io, encoded_path, .{ .read = true, .truncate = true });
+            defer encoded_file.close(io);
+            _ = try property_block_codec.encodeFileWithOptions(allocator, io, raw_file, logical_size, encoded_file, options);
+            if (Ops.shouldSync(store)) try encoded_file.sync(io);
+        }
+
+        const index_stage_encode_options = property_block_codec.EncodeOptions{ .property_index = .{
+            .header_len = PropertyPayloadIndexHeader.encoded_len,
+            .record_len = PropertyPayloadIndexRecord.encoded_len,
+            .key_hash_offset = 0,
+            .owner_id_offset = 16,
+            .owner_kind_offset = 24,
+        }, .record_shuffle = true, .record_delta = true };
+        const values_stage_encode_options = property_block_codec.EncodeOptions{
+            .record_shuffle = true,
+            .record_delta = true,
+        };
+
+        /// Replace a raw staged file with its block-encoded form and delete
+        /// the raw bytes immediately, so at most one raw stage exists at a
+        /// time. On real GB-scale stores the raw stages are the dominant
+        /// transient disk cost of a base publication (roughly the logical
+        /// property bytes each), so their lifetime bounds the store's peak
+        /// on-disk footprint during compaction.
+        fn encodeStageInPlace(store: StoreType, stage_path: []const u8, options: property_block_codec.EncodeOptions) !void {
+            const allocator = Ops.allocator(store);
+            const io = Ops.io(store);
+            const raw_path = try std.fmt.allocPrint(allocator, "{s}.raw", .{stage_path});
+            defer allocator.free(raw_path);
+            errdefer std.Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+            try Ops.renameReplace(store, stage_path, raw_path);
+            errdefer Ops.renameReplace(store, raw_path, stage_path) catch {};
+            try encodeStageWithBlockCodec(store, raw_path, stage_path, options);
+            try std.Io.Dir.cwd().deleteFile(io, raw_path);
+        }
+
+        fn encodeBasePairStages(store: StoreType, index_stage_path: []const u8, values_stage_path: []const u8) !void {
+            try encodeStageInPlace(store, index_stage_path, index_stage_encode_options);
+            try encodeStageInPlace(store, values_stage_path, values_stage_encode_options);
         }
 
         fn publishPreparedBaseUsing(
@@ -627,8 +679,13 @@ pub fn PropertyPayloadTransaction(comptime Ops: type) type {
             const values_stage_path = try Ops.tmpPath(store, Ops.valuesPath(store));
             defer allocator.free(values_stage_path);
             errdefer std.Io.Dir.cwd().deleteFile(io, values_stage_path) catch {};
+            // Write and encode one stage at a time: the raw index and raw
+            // value stages are each roughly logical-size, and letting them
+            // coexist would double the peak on-disk footprint of compaction.
             try writeIndexStage(store, index_stage_path, entries);
+            try encodeStageInPlace(store, index_stage_path, index_stage_encode_options);
             try writeValueStage(store, values_stage_path, entries);
+            try encodeStageInPlace(store, values_stage_path, values_stage_encode_options);
             try publishPreparedBase(store, index_stage_path, values_stage_path);
         }
 
@@ -713,7 +770,9 @@ pub fn PropertyPayloadTransaction(comptime Ops: type) type {
                         if (!recordLessThan(prior, record)) return error.InvalidRecord;
                     }
                     var record_bytes: [PropertyPayloadIndexRecord.encoded_len]u8 = undefined;
-                    try record.encode(&record_bytes);
+                    var stored_record = record;
+                    if (stored_record.value_type == PropertyPayloadIndexRecord.value_type_string) stored_record.value_hash = 0;
+                    try stored_record.encode(&record_bytes);
                     try index_writer.append(&record_bytes);
 
                     var value_record: NodePropertyValueRecord = .{ .offset = 0, .len = 0 };
@@ -749,6 +808,7 @@ pub fn PropertyPayloadTransaction(comptime Ops: type) type {
                     .record_count = record_count,
                     .owner_count = 0,
                     .owner_digest = 0,
+                    .flags = PropertyPayloadIndexHeader.flag_string_value_hash_derived,
                 }).encode(&index_header_bytes);
                 try index_file.writePositionalAll(io, &index_header_bytes, 0);
                 var values_header_bytes: [NodePropertyValueBlockHeader.encoded_len]u8 = undefined;
@@ -758,6 +818,7 @@ pub fn PropertyPayloadTransaction(comptime Ops: type) type {
                     .node_digest = 0,
                     .payload_bytes = payload_bytes,
                     .payload_digest = payload_digest,
+                    .flags = NodePropertyValueBlockHeader.flag_string_value_hash_derived,
                 }).encode(&values_header_bytes);
                 try values_file.writePositionalAll(io, &values_header_bytes, 0);
 
@@ -768,7 +829,201 @@ pub fn PropertyPayloadTransaction(comptime Ops: type) type {
                     try values_file.sync(io);
                 }
             }
+            try encodeBasePairStages(store, index_stage_path, values_stage_path);
             try publishPreparedBase(store, index_stage_path, values_stage_path);
+        }
+
+        const StreamPassSummary = struct {
+            record_count: u64 = 0,
+            payload_bytes: u64 = 0,
+            digest: u64 = 0,
+
+            fn addRecord(self: *@This(), record: PropertyPayloadIndexRecord, value: ?[]const u8) !void {
+                var record_identity: [33]u8 = undefined;
+                std.mem.writeInt(u64, record_identity[0..8], record.key_hash, .little);
+                std.mem.writeInt(u64, record_identity[8..16], record.value_hash, .little);
+                std.mem.writeInt(u64, record_identity[16..24], record.owner_id, .little);
+                std.mem.writeInt(u64, record_identity[24..32], self.record_count, .little);
+                record_identity[32] = record.value_type;
+                self.digest ^= std.hash.Wyhash.hash(record.owner_kind, &record_identity);
+                if (value) |bytes| {
+                    self.digest ^= std.hash.Wyhash.hash(value_digest_seed, bytes);
+                    self.payload_bytes = std.math.add(u64, self.payload_bytes, bytes.len) catch return error.RecordTooLarge;
+                }
+                self.record_count = std.math.add(u64, self.record_count, 1) catch return error.RecordTooLarge;
+            }
+
+            fn matches(self: @This(), other: @This()) bool {
+                return self.record_count == other.record_count and
+                    self.payload_bytes == other.payload_bytes and
+                    self.digest == other.digest;
+            }
+        };
+
+        /// Two-pass variant of `replaceEmptyBaseFromSortedStream` for streams
+        /// that can be restarted from the beginning. Each raw stage is
+        /// written, block-encoded, and deleted before the next stage is
+        /// produced, so peak on-disk staging is one raw stage instead of two;
+        /// on GB-scale property loads that halves the store's transient disk
+        /// peak. The second pass must replay the identical stream: record
+        /// count, payload bytes and a per-record content digest are compared
+        /// and any drift fails closed before publication.
+        pub fn replaceEmptyBaseFromRestartableSortedStream(
+            store: StoreType,
+            expected_count: u64,
+            context: *anyopaque,
+            restart: *const fn (context: *anyopaque) anyerror!void,
+            next: Ops.SortedNextType,
+        ) !void {
+            const allocator = Ops.allocator(store);
+            const io = Ops.io(store);
+            const index_stage_path = try Ops.tmpPath(store, Ops.indexPath(store));
+            defer allocator.free(index_stage_path);
+            errdefer std.Io.Dir.cwd().deleteFile(io, index_stage_path) catch {};
+            const values_stage_path = try Ops.tmpPath(store, Ops.valuesPath(store));
+            defer allocator.free(values_stage_path);
+            errdefer std.Io.Dir.cwd().deleteFile(io, values_stage_path) catch {};
+
+            var index_pass = StreamPassSummary{};
+            {
+                var index_file = try std.Io.Dir.cwd().createFile(io, index_stage_path, .{ .read = true, .truncate = true });
+                defer index_file.close(io);
+                var index_writer = try BufferedWriter.initAtOffset(
+                    allocator,
+                    io,
+                    index_file,
+                    write_buffer_bytes,
+                    PropertyPayloadIndexHeader.encoded_len,
+                );
+                defer index_writer.deinit();
+                var previous: ?PropertyPayloadIndexRecord = null;
+                while (try next(context)) |entry| {
+                    if (index_pass.record_count >= expected_count) return error.InvalidRecord;
+                    const record = try sortedStreamIndexRecord(entry);
+                    if (previous) |prior| {
+                        if (!recordLessThan(prior, record)) return error.InvalidRecord;
+                    }
+                    var record_bytes: [PropertyPayloadIndexRecord.encoded_len]u8 = undefined;
+                    var stored_record = record;
+                    if (stored_record.value_type == PropertyPayloadIndexRecord.value_type_string) stored_record.value_hash = 0;
+                    try stored_record.encode(&record_bytes);
+                    try index_writer.append(&record_bytes);
+                    try index_pass.addRecord(record, switch (entry.value) {
+                        .string => |value| value,
+                        .uint => null,
+                    });
+                    previous = record;
+                }
+                if (index_pass.record_count != expected_count) return error.InvalidRecord;
+                try index_writer.flush();
+                var index_header_bytes: [PropertyPayloadIndexHeader.encoded_len]u8 = undefined;
+                (PropertyPayloadIndexHeader{
+                    .record_count = index_pass.record_count,
+                    .owner_count = 0,
+                    .owner_digest = 0,
+                    .flags = PropertyPayloadIndexHeader.flag_string_value_hash_derived,
+                }).encode(&index_header_bytes);
+                try index_file.writePositionalAll(io, &index_header_bytes, 0);
+                if (try regularFileSize(io, index_file) != try propertyPayloadIndexFileSize(index_pass.record_count)) return error.InvalidRecord;
+                if (Ops.shouldSync(store)) try index_file.sync(io);
+            }
+            try encodeStageInPlace(store, index_stage_path, index_stage_encode_options);
+
+            try restart(context);
+            var values_pass = StreamPassSummary{};
+            var payload_digest: u64 = 0;
+            {
+                var values_file = try std.Io.Dir.cwd().createFile(io, values_stage_path, .{ .read = true, .truncate = true });
+                defer values_file.close(io);
+                var value_record_writer = try BufferedWriter.initAtOffset(
+                    allocator,
+                    io,
+                    values_file,
+                    write_buffer_bytes,
+                    NodePropertyValueBlockHeader.encoded_len,
+                );
+                defer value_record_writer.deinit();
+                const payload_offset = std.math.add(
+                    u64,
+                    NodePropertyValueBlockHeader.encoded_len,
+                    std.math.mul(u64, expected_count, NodePropertyValueRecord.encoded_len) catch return error.RecordTooLarge,
+                ) catch return error.RecordTooLarge;
+                var value_writer = try BufferedWriter.initAtOffset(
+                    allocator,
+                    io,
+                    values_file,
+                    write_buffer_bytes,
+                    payload_offset,
+                );
+                defer value_writer.deinit();
+
+                var digest_bytes: [8]u8 = undefined;
+                while (try next(context)) |entry| {
+                    if (values_pass.record_count >= expected_count) return error.InvalidRecord;
+                    const record = try sortedStreamIndexRecord(entry);
+                    var value_record: NodePropertyValueRecord = .{ .offset = 0, .len = 0 };
+                    switch (entry.value) {
+                        .string => |value| {
+                            value_record = .{
+                                .offset = values_pass.payload_bytes,
+                                .len = std.math.cast(u32, value.len) orelse return error.RecordTooLarge,
+                            };
+                            std.mem.writeInt(u64, &digest_bytes, entry.key_hash, .little);
+                            payload_digest ^= std.hash.Wyhash.hash(value_digest_seed, &digest_bytes);
+                            std.mem.writeInt(u64, &digest_bytes, record.value_hash, .little);
+                            payload_digest ^= std.hash.Wyhash.hash(value_digest_seed, &digest_bytes);
+                            payload_digest ^= std.hash.Wyhash.hash(value_digest_seed, value);
+                            try value_writer.append(value);
+                        },
+                        .uint => {},
+                    }
+                    var value_record_bytes: [NodePropertyValueRecord.encoded_len]u8 = undefined;
+                    value_record.encode(&value_record_bytes);
+                    try value_record_writer.append(&value_record_bytes);
+                    try values_pass.addRecord(record, switch (entry.value) {
+                        .string => |value| value,
+                        .uint => null,
+                    });
+                }
+                if (!index_pass.matches(values_pass)) return error.InvalidRecord;
+                try value_record_writer.flush();
+                try value_writer.flush();
+                var values_header_bytes: [NodePropertyValueBlockHeader.encoded_len]u8 = undefined;
+                (NodePropertyValueBlockHeader{
+                    .record_count = values_pass.record_count,
+                    .node_count = 0,
+                    .node_digest = 0,
+                    .payload_bytes = values_pass.payload_bytes,
+                    .payload_digest = payload_digest,
+                    .flags = NodePropertyValueBlockHeader.flag_string_value_hash_derived,
+                }).encode(&values_header_bytes);
+                try values_file.writePositionalAll(io, &values_header_bytes, 0);
+                if (try regularFileSize(io, values_file) != try propertyPayloadValueFileSize(values_pass.record_count, values_pass.payload_bytes)) return error.InvalidRecord;
+                if (Ops.shouldSync(store)) try values_file.sync(io);
+            }
+            try encodeStageInPlace(store, values_stage_path, values_stage_encode_options);
+            try publishPreparedBase(store, index_stage_path, values_stage_path);
+        }
+
+        fn sortedStreamIndexRecord(entry: anytype) !PropertyPayloadIndexRecord {
+            const value_type: u8 = switch (entry.value) {
+                .string => PropertyPayloadIndexRecord.value_type_string,
+                .uint => PropertyPayloadIndexRecord.value_type_uint,
+            };
+            const value_hash: u64 = switch (entry.value) {
+                .string => |value| blk: {
+                    if (value.len == 0) return error.InvalidRecord;
+                    break :blk Ops.valueHash(value);
+                },
+                .uint => |value| value,
+            };
+            return .{
+                .key_hash = entry.key_hash,
+                .value_hash = value_hash,
+                .owner_id = Ops.ownerId(entry.owner),
+                .owner_kind = Ops.ownerKind(entry.owner),
+                .value_type = value_type,
+            };
         }
 
         fn cleanupDeltaAfterCompaction(store: StoreType) bool {
@@ -781,16 +1036,27 @@ pub fn PropertyPayloadTransaction(comptime Ops: type) type {
             _ = try recoverDeltaJournal(store);
             const scan = try Ops.scanDelta(store, allocator, false);
             if (scan.valid_bytes == 0) return .{};
-            var entries = try Ops.readEntriesOrEmpty(store, allocator);
-            defer Ops.deinitEntries(allocator, &entries);
-            try publishBase(store, entries.items);
+            // Stream the merged base+delta state through the restartable
+            // two-pass publication instead of materializing every live entry:
+            // compaction memory stays O(delta + one record) and peak staging
+            // stays one raw file, while commit ordering is unchanged.
+            var merge = try Ops.openCompactionMerge(store, allocator);
+            defer Ops.closeCompactionMerge(store, &merge);
+            const live_entries = Ops.compactionMergeExpectedCount(&merge);
+            try replaceEmptyBaseFromRestartableSortedStream(
+                store,
+                live_entries,
+                Ops.compactionMergeContext(&merge),
+                Ops.compactionMergeRestart,
+                Ops.compactionMergeNext,
+            );
             const cleanup_pending = !cleanupDeltaAfterCompaction(store);
             return .{
                 .compacted = true,
                 .cleanup_pending = cleanup_pending,
                 .delta_bytes = scan.valid_bytes,
                 .delta_frames = scan.last_sequence,
-                .live_entries = @intCast(entries.items.len),
+                .live_entries = live_entries,
             };
         }
 
@@ -865,6 +1131,34 @@ const TestSortedNext = *const fn (context: *anyopaque) anyerror!?TestSortedEntry
 const TestEntry = struct {
     record: PropertyPayloadIndexRecord,
     value: ?[]u8 = null,
+};
+
+const TestCompactionMerge = struct {
+    entries: std.ArrayList(TestEntry),
+    entries_allocator: std.mem.Allocator,
+    index: usize = 0,
+
+    fn restart(context: *anyopaque) anyerror!void {
+        const self: *TestCompactionMerge = @ptrCast(@alignCast(context));
+        self.index = 0;
+    }
+
+    fn next(context: *anyopaque) anyerror!?TestSortedEntry {
+        const self: *TestCompactionMerge = @ptrCast(@alignCast(context));
+        if (self.index >= self.entries.items.len) return null;
+        const entry = self.entries.items[self.index];
+        self.index += 1;
+        const owner: TestOwner = switch (entry.record.owner_kind) {
+            1 => .{ .node = entry.record.owner_id },
+            2 => .{ .edge = entry.record.owner_id },
+            else => return error.InvalidRecord,
+        };
+        const value: TestValue = if (entry.record.value_type == PropertyPayloadIndexRecord.value_type_string)
+            .{ .string = entry.value orelse return error.InvalidRecord }
+        else
+            .{ .uint = entry.record.value_hash };
+        return .{ .owner = owner, .key_hash = entry.record.key_hash, .value = value };
+    }
 };
 
 const TestDeltaScan = struct {
@@ -1074,6 +1368,31 @@ const TestOps = struct {
     pub fn deinitEntries(allocator_arg: std.mem.Allocator, entries: *std.ArrayList(TestEntry)) void {
         entries.deinit(allocator_arg);
     }
+
+    pub const CompactionMergeType = TestCompactionMerge;
+
+    pub fn openCompactionMerge(store: TestStore, allocator_arg: std.mem.Allocator) !TestCompactionMerge {
+        return .{
+            .entries = try readEntriesOrEmpty(store, allocator_arg),
+            .entries_allocator = allocator_arg,
+        };
+    }
+
+    pub fn closeCompactionMerge(_: TestStore, merge: *TestCompactionMerge) void {
+        merge.entries.deinit(merge.entries_allocator);
+        merge.* = undefined;
+    }
+
+    pub fn compactionMergeExpectedCount(merge: *TestCompactionMerge) u64 {
+        return @intCast(merge.entries.items.len);
+    }
+
+    pub fn compactionMergeContext(merge: *TestCompactionMerge) *anyopaque {
+        return @ptrCast(merge);
+    }
+
+    pub const compactionMergeRestart = TestCompactionMerge.restart;
+    pub const compactionMergeNext = TestCompactionMerge.next;
 };
 
 const test_transaction = PropertyPayloadTransaction(TestOps);
@@ -1432,8 +1751,106 @@ test "property payload transaction streams canonical base through one redo commi
     }, state.recorded());
     var index_file = try std.Io.Dir.cwd().openFile(std.testing.io, layout.index_path, .{});
     defer index_file.close(std.testing.io);
+    var index_view = try property_block_codec.View.init(std.testing.allocator, std.testing.io, index_file);
+    defer index_view.deinit();
     var header_bytes: [PropertyPayloadIndexHeader.encoded_len]u8 = undefined;
-    const n = try index_file.readPositionalAll(std.testing.io, &header_bytes, 0);
-    try std.testing.expectEqual(header_bytes.len, n);
+    try index_view.readAt(0, &header_bytes);
     try std.testing.expectEqual(@as(u64, 2), (try PropertyPayloadIndexHeader.decode(&header_bytes)).record_count);
+}
+
+const RestartableTestStream = struct {
+    entries: []const TestSortedEntry,
+    drift_entries: ?[]const TestSortedEntry = null,
+    index: usize = 0,
+    passes: usize = 0,
+
+    fn restart(context: *anyopaque) anyerror!void {
+        const self: *RestartableTestStream = @ptrCast(@alignCast(context));
+        self.index = 0;
+        self.passes += 1;
+        if (self.drift_entries) |drift| self.entries = drift;
+    }
+
+    fn next(context: *anyopaque) anyerror!?TestSortedEntry {
+        const self: *RestartableTestStream = @ptrCast(@alignCast(context));
+        if (self.index >= self.entries.len) return null;
+        defer self.index += 1;
+        return self.entries[self.index];
+    }
+};
+
+test "property payload transaction restartable stream publishes one stage at a time" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var state = TestState{};
+    const initialized = try initTestLayout(&tmp, &buffer, &state);
+    var layout = initialized[0];
+    defer layout.deinit();
+    var stream = RestartableTestStream{ .entries = &.{
+        .{ .owner = .{ .node = 1 }, .key_hash = 1, .value = .{ .string = "alpha" } },
+        .{ .owner = .{ .node = 2 }, .key_hash = 2, .value = .{ .uint = 9 } },
+        .{ .owner = .{ .node = 3 }, .key_hash = 3, .value = .{ .string = "gamma" } },
+    } };
+
+    try test_transaction.replaceEmptyBaseFromRestartableSortedStream(
+        initialized[1],
+        3,
+        &stream,
+        RestartableTestStream.restart,
+        RestartableTestStream.next,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), stream.passes);
+    try std.testing.expectEqualSlices(TestPhase, &.{
+        .base_redo_publish,
+        .values_publish,
+        .index_publish,
+        .base_cleanup,
+    }, state.recorded());
+    var index_file = try std.Io.Dir.cwd().openFile(std.testing.io, layout.index_path, .{});
+    defer index_file.close(std.testing.io);
+    var index_view = try property_block_codec.View.init(std.testing.allocator, std.testing.io, index_file);
+    defer index_view.deinit();
+    var header_bytes: [PropertyPayloadIndexHeader.encoded_len]u8 = undefined;
+    try index_view.readAt(0, &header_bytes);
+    try std.testing.expectEqual(@as(u64, 3), (try PropertyPayloadIndexHeader.decode(&header_bytes)).record_count);
+    var values_file = try std.Io.Dir.cwd().openFile(std.testing.io, layout.values_path, .{});
+    defer values_file.close(std.testing.io);
+    var values_view = try property_block_codec.View.init(std.testing.allocator, std.testing.io, values_file);
+    defer values_view.deinit();
+    var values_header_bytes: [NodePropertyValueBlockHeader.encoded_len]u8 = undefined;
+    try values_view.readAt(0, &values_header_bytes);
+    const values_header = try NodePropertyValueBlockHeader.decode(&values_header_bytes);
+    try std.testing.expectEqual(@as(u64, 3), values_header.record_count);
+    try std.testing.expectEqual(@as(u64, "alpha".len + "gamma".len), values_header.payload_bytes);
+}
+
+test "property payload transaction restartable stream rejects second-pass drift" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var state = TestState{};
+    const initialized = try initTestLayout(&tmp, &buffer, &state);
+    var layout = initialized[0];
+    defer layout.deinit();
+    var stream = RestartableTestStream{
+        .entries = &.{
+            .{ .owner = .{ .node = 1 }, .key_hash = 1, .value = .{ .string = "alpha" } },
+            .{ .owner = .{ .node = 2 }, .key_hash = 2, .value = .{ .uint = 9 } },
+        },
+        .drift_entries = &.{
+            .{ .owner = .{ .node = 1 }, .key_hash = 1, .value = .{ .string = "alpha" } },
+            .{ .owner = .{ .node = 2 }, .key_hash = 2, .value = .{ .uint = 10 } },
+        },
+    };
+
+    try std.testing.expectError(error.InvalidRecord, test_transaction.replaceEmptyBaseFromRestartableSortedStream(
+        initialized[1],
+        2,
+        &stream,
+        RestartableTestStream.restart,
+        RestartableTestStream.next,
+    ));
+    try std.testing.expectEqualSlices(TestPhase, &.{}, state.recorded());
 }

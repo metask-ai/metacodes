@@ -183,6 +183,14 @@ pub fn PersistentQueryExecutionHotPath(
         const textSearchHitLessThan = search_contract.Internal.hitLessThan;
         const bm25WeightedTermScore = scoring_mod.bm25WeightedTermScore;
 
+        fn textSearchFilterAdmitsEntireCatalog(options: TextSearchOptions, docs_view: *const TextDocsFileView) bool {
+            if (options.member_filter != null) return false;
+            if (!textSearchHasNodeFilter(options)) return true;
+            if (!docs_view.header.hasUniformKind()) return false;
+            const uniform_kind: core.NodeKind = @enumFromInt(docs_view.header.uniform_kind);
+            return textSearchMatchesNodeKind(options, uniform_kind);
+        }
+
         pub fn searchPersistentTokens(
             allocator: std.mem.Allocator,
             store: storage_mod.Store,
@@ -343,8 +351,11 @@ pub fn PersistentQueryExecutionHotPath(
         ) !?std.ArrayList(TextSearchHit) {
             if (query_term_plans.len == 0 or query_term_plans.len > persistent_query_term_freq_cache_max_terms) return null;
             // Global top-hit candidates are truncated before node/member
-            // filtering, so filtered queries must use the exact scan path.
-            if (textSearchHasNodeFilter(options) or options.member_filter != null) return null;
+            // filtering. They are exact only when no filter exists or the
+            // persisted docs header proves that every document has one kind
+            // admitted by the filter. Mixed catalogs and membership filters
+            // continue to fail closed into the exact scan path.
+            if (!textSearchFilterAdmitsEntireCatalog(options, docs_view)) return null;
             if (textBenchTraceEnabled()) {
                 std.debug.print(
                     "text_trace=multi_top_hit_start terms={} max_postings={} limit={} mode={s}\n",
@@ -623,7 +634,7 @@ pub fn PersistentQueryExecutionHotPath(
             else
                 0;
             const validate_canonical_freqs = entry.postings_count <= persistent_search_canonical_freq_validate_posting_limit;
-            if (canUsePersistentTermTopHitCache(options, entry)) {
+            if (textSearchFilterAdmitsEntireCatalog(options, docs_view) and canUsePersistentTermTopHitCache(options, entry)) {
                 if (try readPersistentTermTopHitCache(allocator, store, docs_view, term, lookup.index, entry, meta, avg_doc_len, cjk_bigram_query_term, required_cjk_bigram_count, options)) |cached_hits| {
                     return cached_hits;
                 }

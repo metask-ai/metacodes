@@ -56,6 +56,30 @@ pub fn EdgeMutationCommands(comptime Ops: type) type {
             try writer.print("edge {}\n", .{Ops.edgeIdValue(edge_id)});
         }
 
+        /// Daemon-resident variant: identical parsing and validation, but the
+        /// mutation runs on a store the caller keeps open (no CLI lock, no
+        /// open/close). The parsed db path must match the borrowed store.
+        pub fn runAddWithStore(
+            store: anytype,
+            args: []const []const u8,
+            writer: anytype,
+            allocator: std.mem.Allocator,
+            io: std.Io,
+        ) !void {
+            const request = try prepareAdd(allocator, io, args);
+            if (!std.mem.eql(u8, request.db_path, store.dir_path)) return error.StorePathMismatch;
+            var context = Ops.Context.initBorrowed(allocator, io, store);
+            defer context.deinit();
+
+            const edge_id = try context.add(
+                request.src,
+                request.rel_label,
+                request.dst,
+                request.schema_path,
+            );
+            try writer.print("edge {}\n", .{Ops.edgeIdValue(edge_id)});
+        }
+
         pub fn runDelete(
             args: []const []const u8,
             writer: anytype,

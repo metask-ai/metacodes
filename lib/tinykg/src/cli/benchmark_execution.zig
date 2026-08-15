@@ -16,15 +16,14 @@ const task = @import("../task.zig");
 const text_search = @import("../text.zig");
 const benchmark_contract_mod = @import("benchmark_contract.zig");
 const metaknow_replay_workload_mod = @import("metaknow_replay_workload.zig");
+const runtime_environment = @import("runtime_environment.zig");
 
 const benchmark_contract = benchmark_contract_mod.BenchmarkContract;
 const metaknow_replay_workload = metaknow_replay_workload_mod.MetaknowReplayWorkload;
 const default_bench_edge_compact_threshold_entries = benchmark_contract.default_edge_compact_threshold_entries;
 
-var runtime_env_map: ?*const std.process.Environ.Map = null;
-
 fn envVar(name: []const u8) ?[]const u8 {
-    if (runtime_env_map) |map| return map.get(name);
+    if (runtime_environment.hasMap()) return runtime_environment.get(name);
     if (!builtin.link_libc) return null;
     if (std.mem.eql(u8, name, "TINYKG_BENCH_TRACE")) {
         if (std.c.getenv("TINYKG_BENCH_TRACE")) |raw| return std.mem.span(raw);
@@ -81,6 +80,7 @@ const BenchCorpus = struct {
 const BenchTextSource = struct {
     workload: BenchWorkload,
     corpus: ?*const BenchCorpus = null,
+    shards: ?*const BenchShardPool = null,
 
     fn corpusRecordCount(self: BenchTextSource) usize {
         return if (self.corpus) |corpus| corpus.records.len else 0;
@@ -760,7 +760,17 @@ fn renderBenchOutput(
     var node_texts_pre_edge_compress_ns: u128 = 0;
     const corpus = if (corpus_file_path) |path| try loadBenchCorpusFile(allocator, io, path) else BenchCorpus{};
     defer corpus.deinit(allocator);
-    const text_source = BenchTextSource{ .workload = workload, .corpus = if (corpus_file_path == null) null else &corpus };
+    var shard_pool: BenchShardPool = undefined;
+    const shard_pool_loaded = workload == .kunshan_shaped_corpus;
+    if (shard_pool_loaded) {
+        shard_pool = try loadBenchShardPool(allocator, io, corpus_dir_path orelse return error.MissingArgument);
+    }
+    defer if (shard_pool_loaded) shard_pool.deinit(allocator);
+    const text_source = BenchTextSource{
+        .workload = workload,
+        .corpus = if (corpus_file_path == null) null else &corpus,
+        .shards = if (shard_pool_loaded) &shard_pool else null,
+    };
     const replay = if (benchWorkloadUsesMetaknowReplay(workload)) try loadBenchMetaknowReplay(allocator, io, corpus_dir_path orelse return error.MissingArgument) else BenchMetaknowReplay{};
     defer replay.deinit(allocator);
 
@@ -1245,6 +1255,19 @@ fn renderBenchOutput(
     const search_hits = hits.items.len;
     hits.deinit(allocator);
     if (search_hits == 0) return error.InvalidRecord;
+
+    // The warm text probes gate the product read path: a published catalog
+    // (plus any appended tail) serves queries, and the catalog-less bounded
+    // scan above stays measured by text_build_search. Publish before probing
+    // when the large-bench path has not already done so; the destructive
+    // repair probes later corrupt and republish their own state.
+    if (!text_build_search_prebuilt) {
+        const probe_runs_base_path = try benchTextPostingRunsBasePath(allocator, db_path);
+        defer allocator.free(probe_runs_base_path);
+        var probe_rebuild_phase_rss = BenchTextRebuildPhaseRss{};
+        _ = rebuildPersistentTextCatalogForBenchWithPhaseRss(allocator, store, probe_runs_base_path, &probe_rebuild_phase_rss) catch |err|
+            return benchBudgetPhase(err, error.BenchTextRebuildBudgetExceeded);
+    }
 
     const path_query = try benchPathSearchQuery(allocator, node_count);
     defer allocator.free(path_query);
@@ -2071,6 +2094,153 @@ const bench_agent_mixed_query_every: usize = bench_agent_mixed_plan.query_every;
 
 const bench_agent_mixed_query_ops: usize = bench_agent_mixed_append_ops / bench_agent_mixed_query_every;
 
+const bench_agent_property_shape_digest = "properties-v1-n8-k40-s4-u4-compaction-reopen";
+const bench_agent_properties_per_node: usize = 8;
+const bench_agent_property_group_count: usize = 5;
+const bench_agent_property_keys = [_][]const u8{
+    "agent_project",        "agent_workspace",    "agent_role",          "agent_state",
+    "agent_revision",       "agent_priority",     "agent_generation",    "agent_budget",
+    "memory_profile",       "memory_namespace",   "memory_source",       "memory_lifecycle",
+    "memory_epoch",         "memory_rank",        "memory_window",       "memory_score",
+    "task_owner",           "task_queue",         "task_phase",          "task_result",
+    "task_attempt",         "task_depth",         "task_sequence",       "task_weight",
+    "evidence_origin",      "evidence_kind",      "evidence_quality",    "evidence_state",
+    "evidence_revision",    "evidence_count",     "evidence_generation", "evidence_score",
+    "retrieval_domain",     "retrieval_strategy", "retrieval_language",  "retrieval_state",
+    "retrieval_generation", "retrieval_limit",    "retrieval_window",    "retrieval_score",
+};
+
+comptime {
+    std.debug.assert(bench_agent_property_keys.len == bench_agent_properties_per_node * bench_agent_property_group_count);
+}
+
+const BenchAgentPropertyKey = struct {
+    name: []const u8,
+    natural_index: usize,
+    hash: u64,
+};
+
+const BenchAgentPropertyStream = struct {
+    node_count: u64,
+    keys: [bench_agent_property_keys.len]BenchAgentPropertyKey,
+    key_position: usize = 0,
+    next_node_id: u64 = 0,
+    value_buffer: [128]u8 = undefined,
+
+    fn init(node_count: usize) !BenchAgentPropertyStream {
+        var stream = BenchAgentPropertyStream{
+            .node_count = std.math.cast(u64, node_count) orelse return error.RecordTooLarge,
+            .keys = undefined,
+        };
+        for (bench_agent_property_keys, 0..) |name, natural_index| stream.keys[natural_index] = .{
+            .name = name,
+            .natural_index = natural_index,
+            .hash = storage.propertyKeyHashForLookup(name),
+        };
+        std.mem.sort(BenchAgentPropertyKey, &stream.keys, {}, struct {
+            fn lessThan(_: void, a: BenchAgentPropertyKey, b: BenchAgentPropertyKey) bool {
+                return a.hash < b.hash;
+            }
+        }.lessThan);
+        for (stream.keys[1..], stream.keys[0 .. stream.keys.len - 1]) |current, previous| {
+            if (current.hash == previous.hash) return error.InvalidRecord;
+        }
+        return stream;
+    }
+
+    fn restart(raw_context: *anyopaque) anyerror!void {
+        const self: *BenchAgentPropertyStream = @ptrCast(@alignCast(raw_context));
+        self.key_position = 0;
+        self.next_node_id = 0;
+    }
+
+    fn next(raw_context: *anyopaque) anyerror!?storage.SortedPropertyPayloadEntry {
+        const self: *BenchAgentPropertyStream = @ptrCast(@alignCast(raw_context));
+        while (self.key_position < self.keys.len) {
+            const key = self.keys[self.key_position];
+            const group = key.natural_index / bench_agent_properties_per_node;
+            if (self.next_node_id == 0) self.next_node_id = group + 1;
+            if (self.next_node_id <= self.node_count) {
+                const node_id = self.next_node_id;
+                self.next_node_id += bench_agent_property_group_count;
+                return .{
+                    .owner = .{ .node = .fromInt(node_id) },
+                    .key_hash = key.hash,
+                    .value = try benchAgentPropertyValue(&self.value_buffer, key.natural_index, node_id),
+                };
+            }
+            self.key_position += 1;
+            self.next_node_id = 0;
+        }
+        return null;
+    }
+};
+
+fn benchAgentPropertyKeyIndex(node_id: u64, slot: usize) usize {
+    std.debug.assert(node_id != 0 and slot < bench_agent_properties_per_node);
+    const group: usize = @intCast((node_id - 1) % bench_agent_property_group_count);
+    return group * bench_agent_properties_per_node + slot;
+}
+
+fn benchAgentPropertyValue(buffer: *[128]u8, key_index: usize, node_id: u64) !storage.PropertyPayloadValue {
+    return if (key_index % 2 == 0)
+        .{ .string = try std.fmt.bufPrint(buffer, "agent-memory:workspace-{d}:state-{d}:owner-class-{d}", .{
+            node_id % 64,
+            node_id % 7,
+            (node_id + key_index) % 13,
+        }) }
+    else
+        .{ .uint = (node_id % 4096) * 64 + key_index };
+}
+
+fn writeBenchAgentPropertiesForNodes(
+    allocator: std.mem.Allocator,
+    store: storage.Store,
+    first_node_id: u64,
+    node_count: usize,
+) !void {
+    var writes: [bench_agent_properties_per_node * bench_agent_mixed_node_batch_size]storage.PropertyPayloadWrite = undefined;
+    var value_buffers: [bench_agent_properties_per_node * bench_agent_mixed_node_batch_size][128]u8 = undefined;
+    if (node_count > bench_agent_mixed_node_batch_size) return error.InvalidRecord;
+    var write_count: usize = 0;
+    for (0..node_count) |node_offset| {
+        const node_id = first_node_id + node_offset;
+        for (0..bench_agent_properties_per_node) |slot| {
+            const key_index = benchAgentPropertyKeyIndex(node_id, slot);
+            writes[write_count] = .{
+                .owner = .{ .node = .fromInt(node_id) },
+                .key = bench_agent_property_keys[key_index],
+                .value = try benchAgentPropertyValue(&value_buffers[write_count], key_index, node_id),
+            };
+            write_count += 1;
+        }
+    }
+    const result = try store.upsertPropertiesBatch(allocator, writes[0..write_count]);
+    if (result.writes_applied != write_count or result.payload_publish_count != 1) return error.InvalidRecord;
+}
+
+fn probeBenchAgentProperty(
+    allocator: std.mem.Allocator,
+    store: storage.Store,
+    node_id: u64,
+    slot: usize,
+) !void {
+    const key_index = benchAgentPropertyKeyIndex(node_id, slot);
+    const key = bench_agent_property_keys[key_index];
+    var expected_buffer: [128]u8 = undefined;
+    const expected = try benchAgentPropertyValue(&expected_buffer, key_index, node_id);
+    switch (expected) {
+        .string => |expected_value| {
+            const actual = (try store.getNodeStringProperty(allocator, .fromInt(node_id), key)) orelse return error.InvalidRecord;
+            defer allocator.free(actual);
+            if (!std.mem.eql(u8, actual, expected_value)) return error.InvalidRecord;
+        },
+        .uint => |expected_value| {
+            if ((try store.getUintProperty(allocator, .{ .node = .fromInt(node_id) }, key)) != expected_value) return error.InvalidRecord;
+        },
+    }
+}
+
 const bench_tinyql_suite_samples: usize = 32;
 
 const bench_tinyql_suite_warmups: usize = 1;
@@ -2095,6 +2265,8 @@ fn benchGeneratedNodeTextIsLong(node_id: usize, text_source: BenchTextSource) bo
         .realistic_agent_diverse_text => node_id % 97 == 0,
         .metaknow_replay => false,
         .metaknow_replay_shaped => false,
+        // long docs come from the audited length percentile curve instead
+        .kunshan_shaped_corpus => false,
     };
 }
 
@@ -2936,9 +3108,23 @@ fn renderBenchAgentMixedOutput(
     var node_append_timings = storage.NodeAppendTimings{};
     store.node_append_timings = &node_append_timings;
 
+    const initial_property_count = std.math.mul(usize, initial_node_count, bench_agent_properties_per_node) catch return error.RecordTooLarge;
+    var initial_property_stream = try BenchAgentPropertyStream.init(initial_node_count);
+    const initial_property_write_start = monotonicNs(io);
+    try store.replaceEmptyPropertyPayloadFromRestartableSortedStream(
+        initial_property_count,
+        &initial_property_stream,
+        BenchAgentPropertyStream.restart,
+        BenchAgentPropertyStream.next,
+    );
+    const initial_property_write_ns = elapsedNs(io, initial_property_write_start);
+
     var append_node_samples: [bench_agent_mixed_append_ops]u128 = undefined;
     var append_edge_samples: [bench_agent_mixed_append_ops]u128 = undefined;
+    var append_property_samples: [bench_agent_mixed_append_ops]u128 = undefined;
     var append_node_batch_samples: [bench_agent_mixed_node_batch_ops]u128 = undefined;
+    var append_property_batch_samples: [bench_agent_mixed_node_batch_ops]u128 = undefined;
+    var property_lookup_samples: [bench_agent_mixed_query_ops]u128 = undefined;
     var neighbors_samples: [bench_agent_mixed_query_ops]u128 = undefined;
     var lookup_samples: [bench_agent_mixed_query_ops]u128 = undefined;
     var lookup_untimed_samples: [bench_agent_mixed_query_ops]u128 = undefined;
@@ -3008,6 +3194,10 @@ fn renderBenchAgentMixedOutput(
         append_node_samples[op] = elapsedNs(io, node_start);
         benchTraceOp("agent_mixed_append_node_done", op);
 
+        const property_start = monotonicNs(io);
+        try writeBenchAgentPropertiesForNodes(allocator, store, node_id.toInt(), 1);
+        append_property_samples[op] = elapsedNs(io, property_start);
+
         const edge_start = monotonicNs(io);
         _ = try dag.addEdgeCheckedWithPersistentStore(allocator, store, .fromInt(1), .mentions, node_id, .{});
         append_edge_samples[op] = elapsedNs(io, edge_start);
@@ -3062,6 +3252,10 @@ fn renderBenchAgentMixedOutput(
             lookup_untimed_samples[query_sample_index] = lookup_untimed_elapsed;
             lookup_timing_probe_overhead_samples[query_sample_index] = lookup_elapsed -| lookup_untimed_elapsed;
             if (lookup_untimed_id == null or lookup_untimed_id.?.toInt() != node_id.toInt()) return error.InvalidRecord;
+
+            const property_lookup_start = monotonicNs(io);
+            try probeBenchAgentProperty(allocator, store, node_id.toInt(), query_sample_index % bench_agent_properties_per_node);
+            property_lookup_samples[query_sample_index] = elapsedNs(io, property_lookup_start);
 
             const neighbors_start = monotonicNs(io);
             var neighbors = try query.neighborsWithPersistentStoreRetained(allocator, store, &edge_retention_registry, .fromInt(1), .mentions, .{
@@ -3125,6 +3319,10 @@ fn renderBenchAgentMixedOutput(
         try store.appendNodesBatch(batch_nodes.items);
         append_node_batch_samples[batch_op] = elapsedNs(io, batch_start);
 
+        const property_batch_start = monotonicNs(io);
+        try writeBenchAgentPropertiesForNodes(allocator, store, first_logical_node_id, bench_agent_mixed_node_batch_size);
+        append_property_batch_samples[batch_op] = elapsedNs(io, property_batch_start);
+
         freeBenchNodeTexts(allocator, batch_nodes.items);
         texts_owned = false;
     }
@@ -3132,7 +3330,10 @@ fn renderBenchAgentMixedOutput(
 
     const append_node_stats = latencyStats(append_node_samples[0..]);
     const append_edge_stats = latencyStats(append_edge_samples[0..]);
+    const append_property_stats = latencyStats(append_property_samples[0..]);
     const append_node_batch_stats = latencyStats(append_node_batch_samples[0..]);
+    const append_property_batch_stats = latencyStats(append_property_batch_samples[0..]);
+    const property_lookup_stats = latencyStats(property_lookup_samples[0..]);
     const lookup_stats = latencyStats(lookup_samples[0..]);
     const lookup_untimed_stats = latencyStats(lookup_untimed_samples[0..]);
     const lookup_timing_probe_overhead_stats = latencyStats(lookup_timing_probe_overhead_samples[0..]);
@@ -3150,6 +3351,27 @@ fn renderBenchAgentMixedOutput(
     const lookup_body_stats = latencyStats(lookup_body_samples[0..]);
     const lookup_lower_bound_stats = latencyStats(lookup_lower_bound_samples[0..]);
     const neighbors_stats = latencyStats(neighbors_samples[0..]);
+
+    const property_compact_start = monotonicNs(io);
+    const property_compaction = try store.compactPropertyPayloadDelta(allocator);
+    const property_compact_ns = elapsedNs(io, property_compact_start);
+    if (!property_compaction.compacted or property_compaction.cleanup_pending or property_compaction.delta_bytes == 0) return error.InvalidRecord;
+    const property_compact_ns_per_record = if (property_compaction.live_entries == 0)
+        0
+    else
+        property_compact_ns / @as(u128, property_compaction.live_entries);
+
+    const property_reopen_start = monotonicNs(io);
+    var property_reopened = try storage.Store.openWithOptions(allocator, io, db_path, .{
+        .durability = .fast,
+        .validate_indexes_on_read = false,
+    });
+    const property_reopen_ns = elapsedNs(io, property_reopen_start);
+    defer property_reopened.deinit();
+    const property_reopen_probe_node_id: u64 = initial_node_count + bench_agent_mixed_append_ops;
+    const property_reopen_lookup_start = monotonicNs(io);
+    try probeBenchAgentProperty(allocator, property_reopened, property_reopen_probe_node_id, 3);
+    const property_reopen_lookup_ns = elapsedNs(io, property_reopen_lookup_start);
 
     const retained_lookup_node_id = initial_node_count + bench_agent_mixed_append_ops + bench_agent_mixed_node_batch_ops * bench_agent_mixed_node_batch_size;
     const retained_lookup_text = try benchNodeText(allocator, retained_lookup_node_id, text_source);
@@ -3245,6 +3467,35 @@ fn renderBenchAgentMixedOutput(
     const text_rebuild_rss_bytes = text_rebuild_rss.peak_bytes;
     const text_rebuild_current_rss_bytes = text_rebuild_rss.current_bytes;
 
+    // Warm persistent-BM25 product gates. The agent-mixed lane must prove the
+    // text read path at every rung, not only write/point-lookup paths; these
+    // reuse the standard lane's probe names so the shared per-rung latency
+    // thresholds apply unchanged.
+    benchTrace("agent_mixed_text_probe_start");
+    const text_code = benchTextProbe(allocator, store, "parseInvalidRecord") catch |err|
+        return benchBudgetPhase(err, error.BenchTextCodeBudgetExceeded);
+    const text_english = benchTextProbe(allocator, store, "agent latency budget") catch |err|
+        return benchBudgetPhase(err, error.BenchTextEnglishBudgetExceeded);
+    const text_cjk = benchTextProbe(allocator, store, "错误记录") catch |err|
+        return benchBudgetPhase(err, error.BenchTextCjkBudgetExceeded);
+    const text_highfreq = benchTextProbe(allocator, store, "common") catch |err|
+        return benchBudgetPhase(err, error.BenchTextHighfreqBudgetExceeded);
+    benchTrace("agent_mixed_text_probe_done");
+
+    try out.print(
+        "text_code_ns={} text_code_hits={} text_english_ns={} text_english_hits={} text_cjk_ns={} text_cjk_hits={} text_highfreq_ns={} text_highfreq_hits={}\n",
+        .{
+            text_code.ns,
+            text_code.hits,
+            text_english.ns,
+            text_english.hits,
+            text_cjk.ns,
+            text_cjk.hits,
+            text_highfreq.ns,
+            text_highfreq.hits,
+        },
+    );
+
     benchTrace("agent_mixed_stats_start");
     const stats_out = try store.stats();
     benchTrace("agent_mixed_stats_done");
@@ -3302,8 +3553,65 @@ fn renderBenchAgentMixedOutput(
     const node_texts_compression = try benchNodeTextsCompressionEstimate(allocator, io, db_path);
     const posting_compression = try text_search.estimatePersistentPostingCompression(allocator, store);
     const density_breakdown = try benchDensityBreakdown(allocator, io, db_path, store, stats_out);
+    const size_snapshot = try store.refreshSizeSnapshot();
+    const expected_property_count = std.math.mul(u64, stats_out.nodes, bench_agent_properties_per_node) catch return error.RecordTooLarge;
+    if (size_snapshot.property_count != expected_property_count) return error.InvalidRecord;
     benchTrace("agent_mixed_density_done");
+    // Product-order availability gate: one write after the final text
+    // publication, then an immediate search. Measurement order must equal
+    // product usage order — today a single write takes full-text search
+    // offline on stores past the bounded stale-scan size, so this gate stays
+    // red above that size until incremental text indexing (task 11999) lands.
+    benchTrace("agent_mixed_write_then_search_start");
+    var text_after_write_available: u64 = 0;
+    var text_after_write_search_ns: u128 = 0;
+    {
+        const probe_node_id = try store.nextNodeId();
+        try store.appendNode(.{
+            .id = probe_node_id,
+            .kind = .observation,
+            .text = "write then search availability probe: benchwriteprobetoken common agent latency budget entry",
+        });
+        // Available means the written node itself is served back, not that
+        // some older document happens to match; the probe term exists only in
+        // the appended node.
+        const search_start = monotonicNs(io);
+        if (text_search.searchText(allocator, store, "benchwriteprobetoken", .{ .limit = 8 })) |hits_value| {
+            var hits = hits_value;
+            defer hits.deinit(allocator);
+            for (hits.items) |hit| {
+                if (hit.node_id == probe_node_id) {
+                    text_after_write_available = 1;
+                    text_after_write_search_ns = elapsedNs(io, search_start);
+                    break;
+                }
+            }
+        } else |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {},
+        }
+    }
+    benchTrace("agent_mixed_write_then_search_done");
+    try out.print(
+        "text_after_write_available={} text_after_write_search_ns={}\n",
+        .{ text_after_write_available, text_after_write_search_ns },
+    );
+
     try appendBenchDensityMetrics(&out, text_density, total_bytes, text_index_bytes, edge_segments_bytes, node_texts_compression, posting_compression, density_breakdown);
+    try out.print(
+        "property_shape_digest={s}\nproperties_per_node={} property_distinct_keys={} property_count={} logical_property_value_bytes={} property_physical_bytes={} property_physical_over_logical_value_ratio=",
+        .{
+            bench_agent_property_shape_digest,
+            bench_agent_properties_per_node,
+            bench_agent_property_keys.len,
+            size_snapshot.property_count,
+            size_snapshot.logical_property_value_bytes,
+            try density_breakdown.propertyPayloadBytes(),
+        },
+    );
+    try appendRatioValue(&out, try density_breakdown.propertyPayloadBytes(), @max(size_snapshot.logical_property_value_bytes, 1));
+    try out.print("logical_content_bytes={} physical_over_logical_content_ratio=", .{size_snapshot.logical_content_bytes});
+    try appendRatioValue(&out, size_snapshot.physical_bytes, @max(size_snapshot.logical_content_bytes, 1));
     try out.print(
         "text_rebuild_ns={} text_rebuild_rss_bytes={} text_rebuild_current_rss_bytes={} text_rebuild_footprint_bytes={}\n",
         .{ text_rebuild_ns, text_rebuild_rss_bytes, text_rebuild_current_rss_bytes, text_rebuild_rss.footprint_bytes },
@@ -3323,6 +3631,29 @@ fn renderBenchAgentMixedOutput(
             bench_agent_mixed_node_batch_size,
             bench_agent_mixed_query_every,
             bench_agent_mixed_query_ops,
+        },
+    );
+    try out.print(
+        "initial_property_write_ns={} property_compact_ns={} property_compact_records={} property_compact_ns_per_record={} property_reopen_ns={} property_reopen_lookup_ns={}\nappend_property_p50_ns={} append_property_p95_ns={} append_property_p99_ns={} append_property_max_ns={}\nappend_property_batch_p50_ns={} append_property_batch_p95_ns={} append_property_batch_p99_ns={} append_property_batch_max_ns={}\nproperty_lookup_p50_ns={} property_lookup_p95_ns={} property_lookup_p99_ns={} property_lookup_max_ns={}\n",
+        .{
+            initial_property_write_ns,
+            property_compact_ns,
+            property_compaction.live_entries,
+            property_compact_ns_per_record,
+            property_reopen_ns,
+            property_reopen_lookup_ns,
+            append_property_stats.p50_ns,
+            append_property_stats.p95_ns,
+            append_property_stats.p99_ns,
+            append_property_stats.max_ns,
+            append_property_batch_stats.p50_ns,
+            append_property_batch_stats.p95_ns,
+            append_property_batch_stats.p99_ns,
+            append_property_batch_stats.max_ns,
+            property_lookup_stats.p50_ns,
+            property_lookup_stats.p95_ns,
+            property_lookup_stats.p99_ns,
+            property_lookup_stats.max_ns,
         },
     );
     try out.print(
@@ -4049,6 +4380,246 @@ fn benchHasPositiveReachableFixture(node_count: usize, edge_count: usize) bool {
     return node_count >= 3 and edge_count >= 4;
 }
 
+/// Shard pool for the kunshan-shaped-corpus workload: prose shards extracted
+/// offline from real API documentation (scripts/build_kunshan_shape_corpus.py).
+/// Node texts are novel recombinations with word-level mutation, so repeated
+/// byte spans stay bounded by the shard size cap instead of whole templates.
+const BenchShardPool = struct {
+    en_bytes: []u8,
+    en_offsets: []u32,
+    zh_bytes: []u8,
+    zh_offsets: []u32,
+
+    fn deinit(self: *BenchShardPool, allocator: std.mem.Allocator) void {
+        allocator.free(self.en_bytes);
+        allocator.free(self.en_offsets);
+        allocator.free(self.zh_bytes);
+        allocator.free(self.zh_offsets);
+        self.* = undefined;
+    }
+
+    fn shardCount(offsets: []const u32) usize {
+        return offsets.len - 1;
+    }
+
+    fn shard(bytes: []const u8, offsets: []const u32, index: usize) []const u8 {
+        return bytes[offsets[index]..offsets[index + 1]];
+    }
+};
+
+const bench_shard_pool_max_bytes: u64 = 512 * 1024 * 1024;
+
+fn loadBenchShardPoolFile(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8, name: []const u8) ![]u8 {
+    const path = try std.fs.path.join(allocator, &.{ dir_path, name });
+    defer allocator.free(path);
+    const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
+    if (stat.kind != .file or stat.size == 0 or stat.size > bench_shard_pool_max_bytes) return error.InvalidRecord;
+    const bytes = try allocator.alloc(u8, @intCast(stat.size));
+    errdefer allocator.free(bytes);
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    if (try file.readPositionalAll(io, bytes, 0) != bytes.len) return error.InvalidRecord;
+    return bytes;
+}
+
+fn loadBenchShardPoolOffsets(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8, name: []const u8, pool_len: usize) ![]u32 {
+    const raw = try loadBenchShardPoolFile(allocator, io, dir_path, name);
+    defer allocator.free(raw);
+    if (raw.len % 4 != 0 or raw.len < 8) return error.InvalidRecord;
+    const count = raw.len / 4;
+    const offsets = try allocator.alloc(u32, count);
+    errdefer allocator.free(offsets);
+    var previous: u32 = 0;
+    for (offsets, 0..) |*slot, i| {
+        const value = std.mem.readInt(u32, raw[i * 4 ..][0..4], .little);
+        if (value < previous or value > pool_len) return error.InvalidRecord;
+        slot.* = value;
+        previous = value;
+    }
+    if (offsets[0] != 0 or offsets[count - 1] != pool_len) return error.InvalidRecord;
+    return offsets;
+}
+
+fn loadBenchShardPool(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8) !BenchShardPool {
+    const en_bytes = try loadBenchShardPoolFile(allocator, io, dir_path, "shards_en.bin");
+    errdefer allocator.free(en_bytes);
+    const en_offsets = try loadBenchShardPoolOffsets(allocator, io, dir_path, "shards_en.idx", en_bytes.len);
+    errdefer allocator.free(en_offsets);
+    const zh_bytes = try loadBenchShardPoolFile(allocator, io, dir_path, "shards_zh.bin");
+    errdefer allocator.free(zh_bytes);
+    const zh_offsets = try loadBenchShardPoolOffsets(allocator, io, dir_path, "shards_zh.idx", zh_bytes.len);
+    errdefer allocator.free(zh_offsets);
+    if (BenchShardPool.shardCount(en_offsets) == 0 or BenchShardPool.shardCount(zh_offsets) == 0) return error.InvalidRecord;
+    return .{ .en_bytes = en_bytes, .en_offsets = en_offsets, .zh_bytes = zh_bytes, .zh_offsets = zh_offsets };
+}
+
+fn benchKunshanSplitMix(state: *u64) u64 {
+    state.* +%= 0x9E3779B97F4A7C15;
+    var z = state.*;
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+    return z ^ (z >> 31);
+}
+
+/// Kunshan replay node-text length percentiles (docs/bench-ladder.md audit):
+/// p50 606, p90 1523, p99 2971, max 8683 bytes; mean ≈ 759. The points are
+/// pre-deflated (~0.8×) because the composer overshoots its target by up to
+/// one shard plus the fixed header; the same-scale audit pinned the output
+/// percentiles onto the real curve at these settings.
+const bench_kunshan_len_points = [_][2]f64{
+    .{ 0.00, 76 },
+    .{ 0.50, 485 },
+    .{ 0.90, 1360 },
+    .{ 0.99, 2820 },
+    .{ 1.00, 8620 },
+};
+
+fn benchKunshanTargetLen(rng_state: *u64) usize {
+    const unit = @as(f64, @floatFromInt(benchKunshanSplitMix(rng_state) >> 11)) / @as(f64, @floatFromInt(@as(u64, 1) << 53));
+    var i: usize = 1;
+    while (i < bench_kunshan_len_points.len) : (i += 1) {
+        const lo = bench_kunshan_len_points[i - 1];
+        const hi = bench_kunshan_len_points[i];
+        if (unit <= hi[0]) {
+            const t = (unit - lo[0]) / (hi[0] - lo[0]);
+            return @intFromFloat(lo[1] + t * (hi[1] - lo[1]));
+        }
+    }
+    return @intFromFloat(bench_kunshan_len_points[bench_kunshan_len_points.len - 1][1]);
+}
+
+// Short CJK narrative fragments composed per sentence around English shards
+// and identifiers, mirroring agent work-log phrasing. Fragments are word- to
+// phrase-sized, so the CJK layer never repeats long byte spans even though
+// its bigram vocabulary is deliberately bounded like real agent narrative.
+const bench_kunshan_zh_subjects = [_][]const u8{
+    "回归测试", "部署预检", "根因分析", "压测结果", "增量索引", "控制面探针", "快照校验",
+    "迁移脚本", "日志采样", "内存曲线", "延迟分位", "回滚锚点", "验证节点", "任务前沿",
+    "属性负载", "词表构建", "段合并", "守护进程", "检查点导出", "写放大观测", "接口契约",
+    "错误记录", "调用链路", "配置漂移", "租约续期", "证据链",
+};
+const bench_kunshan_zh_verbs = [_][]const u8{
+    "确认", "收敛于", "阻塞在", "回退到", "覆盖了", "暴露出", "稳定在", "超过阈值",
+    "低于预期", "记录为", "归档到", "验证通过", "失败于", "重跑后恢复", "需要复查",
+    "已修复", "待观察", "偏离基线", "对齐到", "触发了",
+};
+const bench_kunshan_zh_tails = [_][]const u8{
+    "后续跟进", "证据已挂接", "另见工单", "与预期一致", "偏差显著", "样本充分",
+    "采样不足", "需扩容", "保持观察", "已达标", "尚未闭环", "结论可复用",
+};
+
+fn benchKunshanAppendZhSentence(out: *std.ArrayList(u8), allocator: std.mem.Allocator, rng_state: *u64, pool: *const BenchShardPool) !void {
+    const subject = bench_kunshan_zh_subjects[benchKunshanSplitMix(rng_state) % bench_kunshan_zh_subjects.len];
+    const verb = bench_kunshan_zh_verbs[benchKunshanSplitMix(rng_state) % bench_kunshan_zh_verbs.len];
+    try out.appendSlice(allocator, subject);
+    try out.appendSlice(allocator, verb);
+    switch (benchKunshanSplitMix(rng_state) % 4) {
+        0 => {
+            // real CJK shard keeps the narrative vocabulary from being purely tabular
+            const index = @as(usize, @intCast(benchKunshanSplitMix(rng_state) % BenchShardPool.shardCount(pool.zh_offsets)));
+            const shard = BenchShardPool.shard(pool.zh_bytes, pool.zh_offsets, index);
+            var take_len = @min(shard.len, 160);
+            if (take_len < shard.len) {
+                // cut before the codepoint that byte take_len falls inside of
+                while (take_len > 0 and (shard[take_len] & 0xC0) == 0x80) take_len -= 1;
+            }
+            try out.appendSlice(allocator, shard[0..take_len]);
+        },
+        1 => {
+            var buf: [24]u8 = undefined;
+            const value = benchKunshanSplitMix(rng_state) % 100_000;
+            try out.appendSlice(allocator, std.fmt.bufPrint(&buf, "{d}ms", .{value}) catch unreachable);
+        },
+        else => {
+            const tail = bench_kunshan_zh_tails[benchKunshanSplitMix(rng_state) % bench_kunshan_zh_tails.len];
+            try out.appendSlice(allocator, tail);
+        },
+    }
+    try out.appendSlice(allocator, "。");
+}
+
+/// Append one English shard with word-level mutation: digit runs re-rolled,
+/// roughly one in twenty-four alphabetic words replaced by a seeded token, so
+/// heavy shard reuse at gb10 scale never repeats the exact byte span.
+fn benchKunshanAppendMutatedEnShard(out: *std.ArrayList(u8), allocator: std.mem.Allocator, rng_state: *u64, pool: *const BenchShardPool) !void {
+    const index = @as(usize, @intCast(benchKunshanSplitMix(rng_state) % BenchShardPool.shardCount(pool.en_offsets)));
+    const shard = BenchShardPool.shard(pool.en_bytes, pool.en_offsets, index);
+    var i: usize = 0;
+    while (i < shard.len) {
+        const byte = shard[i];
+        if (std.ascii.isDigit(byte)) {
+            var end = i;
+            while (end < shard.len and std.ascii.isDigit(shard[end])) end += 1;
+            var digit = i;
+            while (digit < end) : (digit += 1) {
+                try out.append(allocator, '0' + @as(u8, @intCast(benchKunshanSplitMix(rng_state) % 10)));
+            }
+            i = end;
+            continue;
+        }
+        if (std.ascii.isAlphabetic(byte)) {
+            var end = i;
+            while (end < shard.len and std.ascii.isAlphabetic(shard[end])) end += 1;
+            if (end - i >= 4 and benchKunshanSplitMix(rng_state) % 48 == 0) {
+                var buf: [16]u8 = undefined;
+                const token = std.fmt.bufPrint(&buf, "w{x:0>6}", .{benchKunshanSplitMix(rng_state) & 0xFF_FFFF}) catch unreachable;
+                try out.appendSlice(allocator, token);
+            } else {
+                try out.appendSlice(allocator, shard[i..end]);
+            }
+            i = end;
+            continue;
+        }
+        try out.append(allocator, byte);
+        i += 1;
+    }
+}
+
+fn benchKunshanAppendUniqueRef(out: *std.ArrayList(u8), allocator: std.mem.Allocator, rng_state: *u64) !void {
+    var buf: [40]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, " ref=run-{x:0>10}", .{benchKunshanSplitMix(rng_state) & 0xFF_FFFF_FFFF}) catch unreachable;
+    try out.appendSlice(allocator, text);
+}
+
+/// kunshan-shaped-corpus node text: real-doc shard recombination shaped to the
+/// audited Kunshan profile (length percentiles, ~31% CJK byte share, unique
+/// per-node identity). The two per-node marker tokens and the sparse probe
+/// vocabulary seeded by fixed moduli keep every existing bench probe and gate
+/// meaningful without reintroducing template-scale repetition.
+fn appendBenchKunshanShapedNodeText(out: *std.ArrayList(u8), allocator: std.mem.Allocator, node_id: usize, pool: *const BenchShardPool) !void {
+    var rng_state: u64 = 0x544B_4753 ^ (@as(u64, @intCast(node_id)) *% 0x9E3779B97F4A7C15);
+    const start_len = out.items.len;
+    const target_len = benchKunshanTargetLen(&rng_state);
+
+    var header_buf: [64]u8 = undefined;
+    const header = std.fmt.bufPrint(&header_buf, "benchdoc{d} file/{d}.zig ", .{ node_id, node_id }) catch unreachable;
+    try out.appendSlice(allocator, header);
+    if (node_id % 3 != 2) try out.appendSlice(allocator, "common ");
+    if (node_id % 89 == 0) try out.appendSlice(allocator, "parseInvalidRecord InvalidRecord ");
+    if (node_id % 97 == 0) try out.appendSlice(allocator, "错误记录 ");
+    if (node_id % 101 == 0) try out.appendSlice(allocator, "エラー解析 ");
+    if (node_id % 103 == 0) try out.appendSlice(allocator, "오류 ");
+    if (node_id % 107 == 0) try out.appendSlice(allocator, "agent latency budget ");
+
+    while (out.items.len - start_len < target_len) {
+        switch (benchKunshanSplitMix(&rng_state) % 16) {
+            // Byte-share tuning knob: CJK sentences average far fewer bytes
+            // than an English shard, so five double-sentence CJK rounds per
+            // sixteen land the audited ~31% non-ASCII byte share.
+            0, 1, 2, 3, 4 => {
+                try benchKunshanAppendZhSentence(out, allocator, &rng_state, pool);
+                try benchKunshanAppendZhSentence(out, allocator, &rng_state, pool);
+                try benchKunshanAppendZhSentence(out, allocator, &rng_state, pool);
+            },
+            5, 6, 7, 8, 9, 10, 11, 12, 13 => {
+                try benchKunshanAppendMutatedEnShard(out, allocator, &rng_state, pool);
+                try out.append(allocator, ' ');
+            },
+            else => try benchKunshanAppendUniqueRef(out, allocator, &rng_state),
+        }
+    }
+}
+
 fn benchNodeText(allocator: std.mem.Allocator, node_id: usize, text_source: BenchTextSource) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -4062,6 +4633,7 @@ const BenchGeneratedTextSpan = struct {
 };
 
 fn appendBenchNodeTextBytes(allocator: std.mem.Allocator, out: *std.ArrayList(u8), node_id: usize, text_source: BenchTextSource) !void {
+    if (text_source.shards) |pool| return appendBenchKunshanShapedNodeText(out, allocator, node_id, pool);
     if (text_source.corpus) |corpus| {
         if (corpus.records.len != 0) return appendBenchCorpusBackedNodeText(out, allocator, node_id, text_source.workload, corpus);
     }
@@ -4071,6 +4643,8 @@ fn appendBenchNodeTextBytes(allocator: std.mem.Allocator, out: *std.ArrayList(u8
         .realistic_agent_diverse_text => appendBenchRealisticAgentDiverseTextNodeText(out, allocator, node_id),
         .metaknow_replay => core.Error.Unsupported,
         .metaknow_replay_shaped => core.Error.Unsupported,
+        // requires the shard pool; reaching here means it was not loaded
+        .kunshan_shaped_corpus => core.Error.Unsupported,
     };
 }
 
@@ -4901,9 +5475,14 @@ fn appendBenchDensityMetrics(
 }
 
 fn appendRatioMetric(out: *QueryOutputWriter, comptime key: []const u8, numerator: u64, denominator: u64) !void {
+    try out.print("{s}=", .{key});
+    try appendRatioValue(out, numerator, denominator);
+}
+
+fn appendRatioValue(out: *QueryOutputWriter, numerator: u64, denominator: u64) !void {
     const scale: u128 = 1_000_000;
     const scaled = (@as(u128, numerator) * scale) / @as(u128, denominator);
-    try out.print("{s}={d}.{d:0>6}\n", .{ key, scaled / scale, scaled % scale });
+    try out.print("{d}.{d:0>6}\n", .{ scaled / scale, scaled % scale });
 }
 
 fn isStoreControlEntry(name: []const u8) bool {
@@ -5687,10 +6266,6 @@ fn currentRssFromLinuxStatm() !u64 {
 
 /// Full benchmark execution subsystem behind the stable CLI façade.
 pub const BenchmarkExecution = struct {
-    pub fn setRuntimeEnvMap(map: ?*const std.process.Environ.Map) void {
-        runtime_env_map = map;
-    }
-
     pub fn run(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -6959,6 +7534,13 @@ test "benchmark execution runs the agent mixed phase machine end to end" {
     try std.testing.expect(std.mem.indexOf(u8, output, "batch_node_ops=4") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "query_ops=4") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "append_node_p95_ns=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "property_shape_digest=properties-v1-n8-k40-s4-u4-compaction-reopen") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "properties_per_node=8 property_distinct_keys=40 property_count=280") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "append_property_p95_ns=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "property_lookup_p95_ns=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "property_compact_ns=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "property_compact_ns_per_record=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "property_reopen_lookup_ns=") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "lookup_p95_ns=") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "neighbors_p95_ns=") != null);
 }

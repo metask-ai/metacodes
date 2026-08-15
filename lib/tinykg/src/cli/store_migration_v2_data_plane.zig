@@ -25,6 +25,7 @@ pub fn StoreMigrationV2DataPlane(comptime Ops: type) type {
         const RecoveryTargetLock = Ops.RecoveryTargetLock;
 
         const current_schema_version = Ops.schema_version_current;
+        const current_storage_format_version = Ops.storage_format_version_current;
         const store_migration_transaction_marker_file = Ops.transaction_marker_file_name;
         const store_migration_transaction_marker_format = Ops.transaction_marker_format_name;
         const store_migration_transaction_marker_legacy_format = Ops.transaction_marker_legacy_format_name;
@@ -342,6 +343,9 @@ pub fn StoreMigrationV2DataPlane(comptime Ops: type) type {
             try migrated_nodes.ensureTotalCapacityPrecise(allocator, source_nodes.len);
             var property_batch = MigrationPropertyBatch.init(allocator);
             defer property_batch.deinit();
+            var property_suppressions = std.ArrayList(MigrationTargetPropertySpoolBuilder.Suppression).empty;
+            defer property_suppressions.deinit(allocator);
+            const property_result_start = result.node_properties_written;
 
             for (source_nodes) |source_node| {
                 var repaired = try repairLegacyNodeTextForMigration(allocator, source_node.text, parsed.strict, result, true);
@@ -373,6 +377,14 @@ pub fn StoreMigrationV2DataPlane(comptime Ops: type) type {
                 repaired_owned = false;
 
                 if (materialized_status != null) {
+                    inline for (.{
+                        task.status_property,
+                        task.claim_expires_ns_property,
+                        "task_completed_ns",
+                    }) |key| try property_suppressions.append(allocator, .{
+                        .owner = .{ .node = source_node.id },
+                        .key_hash = storage.propertyKeyHashForLookup(key),
+                    });
                     result.task_statuses_written = std.math.add(u64, result.task_statuses_written, 1) catch return error.RecordTooLarge;
                     if (source_node.kind != .task) {
                         result.legacy_closed_tasks_converted = std.math.add(u64, result.legacy_closed_tasks_converted, 1) catch return error.RecordTooLarge;
@@ -431,6 +443,10 @@ pub fn StoreMigrationV2DataPlane(comptime Ops: type) type {
                     }
                 }
                 if (force_task_schema) {
+                    try property_suppressions.append(allocator, .{
+                        .owner = .{ .node = source_node.id },
+                        .key_hash = storage.propertyKeyHashForLookup("schema_type"),
+                    });
                     property_batch.appendString(.{ .node = source_node.id }, "schema_type", "task") catch return error.MigrationPropertyBatchFailed;
                     result.node_properties_written += 1;
                 }
@@ -439,7 +455,8 @@ pub fn StoreMigrationV2DataPlane(comptime Ops: type) type {
             if (target) |store| {
                 store.appendNodesBatch(migrated_nodes.items) catch return error.MigrationAppendNodesFailed;
                 const builder = target_property_builder orelse return error.InvalidRecord;
-                builder.appendBatch(property_batch.writes.items) catch return error.MigrationPropertyBatchFailed;
+                const merged_count = builder.appendSnapshotMerged(source_properties.snapshotView(), property_batch.writes.items, property_suppressions.items) catch return error.MigrationPropertyBatchFailed;
+                result.node_properties_written = std.math.add(u64, property_result_start, merged_count) catch return error.MigrationPropertyBatchFailed;
             } else if (target_property_builder != null or !parsed.dry_run) {
                 return error.InvalidRecord;
             }
@@ -540,6 +557,7 @@ pub fn StoreMigrationV2DataPlane(comptime Ops: type) type {
 
             var property_batch = MigrationPropertyBatch.init(allocator);
             defer property_batch.deinit();
+            const property_result_start = result.edge_properties_written;
             for (edges) |edge| {
                 result.edge_properties_written += collectKnownEdgeProperties(
                     &source_properties,
@@ -550,7 +568,8 @@ pub fn StoreMigrationV2DataPlane(comptime Ops: type) type {
                     &property_batch,
                 ) catch return error.MigrationEdgePropertyFailed;
             }
-            target_property_builder.appendBatch(property_batch.writes.items) catch return error.MigrationPropertyBatchFailed;
+            const merged_count = target_property_builder.appendSnapshotMerged(source_properties.snapshotView(), property_batch.writes.items, &.{}) catch return error.MigrationPropertyBatchFailed;
+            result.edge_properties_written = std.math.add(u64, property_result_start, merged_count) catch return error.MigrationPropertyBatchFailed;
         }
 
         fn migrateStoreV2Edges(
@@ -900,9 +919,11 @@ pub fn StoreMigrationV2DataPlane(comptime Ops: type) type {
             defer manifest.deinit(allocator);
             const expected_schema_version = try std.fmt.allocPrint(allocator, "{}", .{expected.target_schema_version});
             defer allocator.free(expected_schema_version);
+            const expected_storage_version = try std.fmt.allocPrint(allocator, "{}", .{current_storage_format_version});
+            defer allocator.free(expected_storage_version);
             const expected_migration_name = if (expected.task_status_v1) "migrate-store-v2+task-status-v1" else "migrate-store-v2";
             if (!std.mem.eql(u8, manifest.status, "present") or
-                !std.mem.eql(u8, manifest.storage_format_version, "2") or
+                !std.mem.eql(u8, manifest.storage_format_version, expected_storage_version) or
                 !std.mem.eql(u8, manifest.schema_version, expected_schema_version) or
                 !std.mem.eql(u8, manifest.enabled_profiles, expected.target_profiles) or
                 !std.mem.eql(u8, manifest.migration_name, expected_migration_name) or
@@ -937,7 +958,9 @@ pub fn StoreMigrationV2DataPlane(comptime Ops: type) type {
             try validateMigrateStoreV2PathRelationships(allocator, io, parsed);
             if (parsed.dry_run) try validateMigrateStoreV2Destinations(io, parsed);
 
-            var source = try storage.Store.open(allocator, io, parsed.source_path);
+            var source = try storage.Store.openWithOptions(allocator, io, parsed.source_path, .{
+                .allow_legacy_store_format_read = true,
+            });
             defer source.deinit();
             var target_catalog = try migrationCatalog(allocator, source, parsed.profiles, parsed.profiles_explicit, parsed.task_status_v1);
             defer target_catalog.deinit();
@@ -1377,8 +1400,10 @@ pub fn StoreMigrationV2DataPlane(comptime Ops: type) type {
 
             const manifest = try readStoreManifestSummary(allocator, target.io, target.dir_path);
             defer manifest.deinit(allocator);
+            const expected_storage_text = try std.fmt.allocPrint(allocator, "{}", .{current_storage_format_version});
+            defer allocator.free(expected_storage_text);
             if (!std.mem.eql(u8, manifest.status, "present") or
-                !std.mem.eql(u8, manifest.storage_format_version, "2") or
+                !std.mem.eql(u8, manifest.storage_format_version, expected_storage_text) or
                 !std.mem.eql(u8, manifest.enabled_profiles, expected_profiles)) return error.InvalidRecord;
             const expected_schema_text = try std.fmt.allocPrint(allocator, "{}", .{expected_schema_version});
             defer allocator.free(expected_schema_text);

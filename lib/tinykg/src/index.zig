@@ -59,26 +59,134 @@ test "query stats checked increments reject overflow" {
     try std.testing.expectEqual(std.math.maxInt(usize), stats.edges_visited);
 }
 
+pub const KindTextKey = struct {
+    kind: core.NodeKind,
+    text: []const u8,
+};
+
+const KindTextContext = struct {
+    pub fn hash(_: KindTextContext, key: KindTextKey) u64 {
+        var hasher = std.hash.Wyhash.init(0x746b675f6b696e64);
+        const kind_value: u16 = @intFromEnum(key.kind);
+        hasher.update(std.mem.asBytes(&kind_value));
+        hasher.update(key.text);
+        return hasher.final();
+    }
+
+    pub fn eql(_: KindTextContext, lhs: KindTextKey, rhs: KindTextKey) bool {
+        return lhs.kind == rhs.kind and std.mem.eql(u8, lhs.text, rhs.text);
+    }
+};
+
+const KindTextMap = std.HashMap(
+    KindTextKey,
+    std.ArrayList(core.NodeId),
+    KindTextContext,
+    std.hash_map.default_max_load_percentage,
+);
+
+const CompactTextEntry = struct {
+    text: []const u8,
+    ids_off: u32,
+    ids_len: u32,
+};
+
+const CompactKindTextEntry = struct {
+    kind: core.NodeKind,
+    text: []const u8,
+    ids_off: u32,
+    ids_len: u32,
+};
+
+/// Frozen index layout: sorted arrays plus CSR adjacency instead of hash maps
+/// with one ArrayList per node and per distinct text. Text slices alias
+/// caller-owned node text (borrowed-key mode only), so the compact form adds
+/// no copy of any string.
+const CompactForm = struct {
+    node_ids: []u64 = &.{},
+    node_indexes: []u32 = &.{},
+    out_offsets: []u32 = &.{},
+    out_refs: []EdgeRef = &.{},
+    in_offsets: []u32 = &.{},
+    in_refs: []EdgeRef = &.{},
+    text_entries: []CompactTextEntry = &.{},
+    text_ids: []core.NodeId = &.{},
+    kind_text_entries: []CompactKindTextEntry = &.{},
+    kind_text_ids: []core.NodeId = &.{},
+
+    fn deinit(self: *CompactForm, allocator: std.mem.Allocator) void {
+        allocator.free(self.node_ids);
+        allocator.free(self.node_indexes);
+        allocator.free(self.out_offsets);
+        allocator.free(self.out_refs);
+        allocator.free(self.in_offsets);
+        allocator.free(self.in_refs);
+        allocator.free(self.text_entries);
+        allocator.free(self.text_ids);
+        allocator.free(self.kind_text_entries);
+        allocator.free(self.kind_text_ids);
+        self.* = .{};
+    }
+
+    fn nodeSlot(self: *const CompactForm, id: u64) ?usize {
+        var low: usize = 0;
+        var high: usize = self.node_ids.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (self.node_ids[middle] < id) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        if (low == self.node_ids.len or self.node_ids[low] != id) return null;
+        return low;
+    }
+};
+
 pub const MemoryIndex = struct {
     allocator: std.mem.Allocator,
     node_by_id: std.AutoHashMap(u64, usize),
     node_ids_by_text: std.StringHashMap(std.ArrayList(core.NodeId)),
-    node_ids_by_kind_text: std.StringHashMap(std.ArrayList(core.NodeId)),
+    /// Composite (kind, text) lookup. Key text always aliases the exact bytes
+    /// stored by `node_ids_by_text`, so this map never owns another copy of
+    /// node text in either ownership mode.
+    node_ids_by_kind_text: KindTextMap,
     edge_ids: std.AutoHashMap(u64, void),
     out_edges: std.AutoHashMap(u64, std.ArrayList(EdgeRef)),
     in_edges: std.AutoHashMap(u64, std.ArrayList(EdgeRef)),
     owned_keys: std.ArrayList([]u8),
+    /// When false, text keys alias caller-owned node text (for example graph
+    /// nodes backed by a decoded checkpoint snapshot) that must outlive the
+    /// index, and `owned_keys` stays empty.
+    owns_keys: bool,
+    /// Frozen sorted-array/CSR representation. When set, the hash maps above
+    /// are empty, reads are served from `compact`, and mutation fails closed.
+    compacted: bool = false,
+    compact: CompactForm = .{},
 
     pub fn init(allocator: std.mem.Allocator, graph: *const graph_mod.Graph) !MemoryIndex {
+        return initImpl(allocator, graph, true);
+    }
+
+    /// Build an index whose text keys borrow the graph's node text instead of
+    /// copying every string. The graph must strictly outlive the index; use
+    /// this for rebuild-only resident indexes over immutable graphs.
+    pub fn initBorrowingNodeText(allocator: std.mem.Allocator, graph: *const graph_mod.Graph) !MemoryIndex {
+        return initImpl(allocator, graph, false);
+    }
+
+    fn initImpl(allocator: std.mem.Allocator, graph: *const graph_mod.Graph, owns_keys: bool) !MemoryIndex {
         var self = MemoryIndex{
             .allocator = allocator,
             .node_by_id = std.AutoHashMap(u64, usize).init(allocator),
             .node_ids_by_text = std.StringHashMap(std.ArrayList(core.NodeId)).init(allocator),
-            .node_ids_by_kind_text = std.StringHashMap(std.ArrayList(core.NodeId)).init(allocator),
+            .node_ids_by_kind_text = KindTextMap.init(allocator),
             .edge_ids = std.AutoHashMap(u64, void).init(allocator),
             .out_edges = std.AutoHashMap(u64, std.ArrayList(EdgeRef)).init(allocator),
             .in_edges = std.AutoHashMap(u64, std.ArrayList(EdgeRef)).init(allocator),
             .owned_keys = .empty,
+            .owns_keys = owns_keys,
         };
         errdefer self.deinit();
 
@@ -115,6 +223,187 @@ pub const MemoryIndex = struct {
         self.node_ids_by_kind_text.deinit();
         for (self.owned_keys.items) |key| self.allocator.free(key);
         self.owned_keys.deinit(self.allocator);
+        self.compact.deinit(self.allocator);
+    }
+
+    /// Build the frozen sorted-array/CSR layout directly from a complete
+    /// graph: ten exact-size allocations, no intermediate hash maps or
+    /// per-node ArrayLists, and no copy of any node text (all text slices
+    /// alias graph-owned bytes, so the graph must strictly outlive the
+    /// index). Produces exactly the same lookup results and adjacency
+    /// orderings as the incremental path over the same graph.
+    pub fn initCompactFromGraph(allocator: std.mem.Allocator, graph: *const graph_mod.Graph) !MemoryIndex {
+        var form = CompactForm{};
+        errdefer form.deinit(allocator);
+
+        var active_nodes: usize = 0;
+        for (graph.nodes.items) |node| {
+            if (node.status != .active) continue;
+            if (node.id == .none or node.id.toInt() == std.math.maxInt(u64)) return core.Error.InvalidId;
+            active_nodes += 1;
+        }
+        if (active_nodes > std.math.maxInt(u32)) return core.Error.Unsupported;
+
+        // Sorted node table with graph positions alongside.
+        const NodeRow = struct { id: u64, node_index: u32, kind: core.NodeKind, text: []const u8 };
+        const rows = try allocator.alloc(NodeRow, active_nodes);
+        defer allocator.free(rows);
+        {
+            var filled: usize = 0;
+            for (graph.nodes.items, 0..) |node, node_index| {
+                if (node.status != .active) continue;
+                rows[filled] = .{
+                    .id = node.id.toInt(),
+                    .node_index = std.math.cast(u32, node_index) orelse return core.Error.Unsupported,
+                    .kind = node.kind,
+                    .text = node.text,
+                };
+                filled += 1;
+            }
+        }
+        form.node_ids = try allocator.alloc(u64, active_nodes);
+        form.node_indexes = try allocator.alloc(u32, active_nodes);
+        {
+            const byId = struct {
+                fn call(_: void, lhs: NodeRow, rhs: NodeRow) bool {
+                    return lhs.id < rhs.id;
+                }
+            }.call;
+            std.mem.sort(NodeRow, rows, {}, byId);
+            for (rows, 0..) |row, slot| {
+                if (slot > 0 and form.node_ids[slot - 1] == row.id) return core.Error.InvalidId;
+                form.node_ids[slot] = row.id;
+                form.node_indexes[slot] = row.node_index;
+            }
+        }
+
+        // CSR adjacency: count active edges with indexed endpoints, prefix
+        // sums, fill, then order each per-node range exactly like the
+        // incremental path sorted its per-node lists.
+        form.out_offsets = try allocator.alloc(u32, active_nodes + 1);
+        form.in_offsets = try allocator.alloc(u32, active_nodes + 1);
+        @memset(form.out_offsets, 0);
+        @memset(form.in_offsets, 0);
+        var indexed_edges: u32 = 0;
+        for (graph.edges.items) |edge| {
+            if (edge.status != .active) continue;
+            const src_slot = form.nodeSlot(edge.src.toInt()) orelse continue;
+            const dst_slot = form.nodeSlot(edge.dst.toInt()) orelse continue;
+            if (edge.id == .none or edge.id.toInt() == std.math.maxInt(u64)) return core.Error.InvalidId;
+            form.out_offsets[src_slot + 1] = std.math.add(u32, form.out_offsets[src_slot + 1], 1) catch return core.Error.Unsupported;
+            form.in_offsets[dst_slot + 1] = std.math.add(u32, form.in_offsets[dst_slot + 1], 1) catch return core.Error.Unsupported;
+            indexed_edges = std.math.add(u32, indexed_edges, 1) catch return core.Error.Unsupported;
+        }
+        for (1..active_nodes + 1) |slot| {
+            form.out_offsets[slot] += form.out_offsets[slot - 1];
+            form.in_offsets[slot] += form.in_offsets[slot - 1];
+        }
+        form.out_refs = try allocator.alloc(EdgeRef, indexed_edges);
+        form.in_refs = try allocator.alloc(EdgeRef, indexed_edges);
+        {
+            const cursors = try allocator.alloc(u32, active_nodes * 2);
+            defer allocator.free(cursors);
+            const out_cursors = cursors[0..active_nodes];
+            const in_cursors = cursors[active_nodes..];
+            @memcpy(out_cursors, form.out_offsets[0..active_nodes]);
+            @memcpy(in_cursors, form.in_offsets[0..active_nodes]);
+            for (graph.edges.items) |edge| {
+                if (edge.status != .active) continue;
+                const src_slot = form.nodeSlot(edge.src.toInt()) orelse continue;
+                const dst_slot = form.nodeSlot(edge.dst.toInt()) orelse continue;
+                const ref = EdgeRef{ .src = edge.src, .dst = edge.dst, .edge_id = edge.id, .rel = edge.rel };
+                form.out_refs[out_cursors[src_slot]] = ref;
+                out_cursors[src_slot] += 1;
+                form.in_refs[in_cursors[dst_slot]] = ref;
+                in_cursors[dst_slot] += 1;
+            }
+        }
+        for (0..active_nodes) |slot| {
+            std.mem.sort(EdgeRef, form.out_refs[form.out_offsets[slot]..form.out_offsets[slot + 1]], {}, edgeLessThan);
+            std.mem.sort(EdgeRef, form.in_refs[form.in_offsets[slot]..form.in_offsets[slot + 1]], {}, incomingEdgeLessThan);
+        }
+
+        // Text tables: group the node rows by text and by (kind, text), with
+        // ids ascending inside each group.
+        form.text_ids = try allocator.alloc(core.NodeId, active_nodes);
+        form.kind_text_ids = try allocator.alloc(core.NodeId, active_nodes);
+        {
+            const byText = struct {
+                fn call(_: void, lhs: NodeRow, rhs: NodeRow) bool {
+                    return switch (std.mem.order(u8, lhs.text, rhs.text)) {
+                        .lt => true,
+                        .gt => false,
+                        .eq => lhs.id < rhs.id,
+                    };
+                }
+            }.call;
+            std.mem.sort(NodeRow, rows, {}, byText);
+            var distinct: usize = 0;
+            for (rows, 0..) |row, position| {
+                if (position == 0 or !std.mem.eql(u8, rows[position - 1].text, row.text)) distinct += 1;
+            }
+            form.text_entries = try allocator.alloc(CompactTextEntry, distinct);
+            var entry_index: usize = 0;
+            for (rows, 0..) |row, position| {
+                form.text_ids[position] = core.NodeId.fromInt(row.id);
+                if (position == 0 or !std.mem.eql(u8, rows[position - 1].text, row.text)) {
+                    form.text_entries[entry_index] = .{ .text = row.text, .ids_off = @intCast(position), .ids_len = 0 };
+                    entry_index += 1;
+                }
+                form.text_entries[entry_index - 1].ids_len += 1;
+            }
+        }
+        {
+            const byKindText = struct {
+                fn call(_: void, lhs: NodeRow, rhs: NodeRow) bool {
+                    const lhs_kind: u16 = @intFromEnum(lhs.kind);
+                    const rhs_kind: u16 = @intFromEnum(rhs.kind);
+                    if (lhs_kind != rhs_kind) return lhs_kind < rhs_kind;
+                    return switch (std.mem.order(u8, lhs.text, rhs.text)) {
+                        .lt => true,
+                        .gt => false,
+                        .eq => lhs.id < rhs.id,
+                    };
+                }
+            }.call;
+            std.mem.sort(NodeRow, rows, {}, byKindText);
+            var distinct: usize = 0;
+            for (rows, 0..) |row, position| {
+                if (position == 0 or rows[position - 1].kind != row.kind or
+                    !std.mem.eql(u8, rows[position - 1].text, row.text)) distinct += 1;
+            }
+            form.kind_text_entries = try allocator.alloc(CompactKindTextEntry, distinct);
+            var entry_index: usize = 0;
+            for (rows, 0..) |row, position| {
+                form.kind_text_ids[position] = core.NodeId.fromInt(row.id);
+                if (position == 0 or rows[position - 1].kind != row.kind or
+                    !std.mem.eql(u8, rows[position - 1].text, row.text))
+                {
+                    form.kind_text_entries[entry_index] = .{
+                        .kind = row.kind,
+                        .text = row.text,
+                        .ids_off = @intCast(position),
+                        .ids_len = 0,
+                    };
+                    entry_index += 1;
+                }
+                form.kind_text_entries[entry_index - 1].ids_len += 1;
+            }
+        }
+
+        return .{
+            .allocator = allocator,
+            .node_by_id = std.AutoHashMap(u64, usize).init(allocator),
+            .node_ids_by_text = std.StringHashMap(std.ArrayList(core.NodeId)).init(allocator),
+            .node_ids_by_kind_text = KindTextMap.init(allocator),
+            .edge_ids = std.AutoHashMap(u64, void).init(allocator),
+            .out_edges = std.AutoHashMap(u64, std.ArrayList(EdgeRef)).init(allocator),
+            .in_edges = std.AutoHashMap(u64, std.ArrayList(EdgeRef)).init(allocator),
+            .owned_keys = .empty,
+            .owns_keys = false,
+            .compacted = true,
+            .compact = form,
+        };
     }
 
     pub fn findByText(self: *MemoryIndex, kind_filter: ?core.NodeKind, text: []const u8) !?core.NodeId {
@@ -124,17 +413,55 @@ pub const MemoryIndex = struct {
     }
 
     pub fn lookupByText(self: *MemoryIndex, kind_filter: ?core.NodeKind, text: []const u8) ![]const core.NodeId {
+        if (self.compacted) return self.lookupByTextCompact(kind_filter, text);
         if (kind_filter) |kind| {
-            const key = try self.kindTextKey(kind, text);
-            defer self.allocator.free(key);
-            const ids = self.node_ids_by_kind_text.getPtr(key) orelse return &.{};
+            const ids = self.node_ids_by_kind_text.getPtr(.{ .kind = kind, .text = text }) orelse return &.{};
             return ids.items;
         }
         const ids = self.node_ids_by_text.getPtr(text) orelse return &.{};
         return ids.items;
     }
 
+    fn lookupByTextCompact(self: *const MemoryIndex, kind_filter: ?core.NodeKind, text: []const u8) []const core.NodeId {
+        if (kind_filter) |kind| {
+            const kind_value: u16 = @intFromEnum(kind);
+            var low: usize = 0;
+            var high: usize = self.compact.kind_text_entries.len;
+            while (low < high) {
+                const middle = low + (high - low) / 2;
+                const entry = self.compact.kind_text_entries[middle];
+                const entry_kind: u16 = @intFromEnum(entry.kind);
+                const before = entry_kind < kind_value or
+                    (entry_kind == kind_value and std.mem.order(u8, entry.text, text) == .lt);
+                if (before) {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+            if (low == self.compact.kind_text_entries.len) return &.{};
+            const entry = self.compact.kind_text_entries[low];
+            if (entry.kind != kind or !std.mem.eql(u8, entry.text, text)) return &.{};
+            return self.compact.kind_text_ids[entry.ids_off .. entry.ids_off + entry.ids_len];
+        }
+        var low: usize = 0;
+        var high: usize = self.compact.text_entries.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (std.mem.order(u8, self.compact.text_entries[middle].text, text) == .lt) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        if (low == self.compact.text_entries.len) return &.{};
+        const entry = self.compact.text_entries[low];
+        if (!std.mem.eql(u8, entry.text, text)) return &.{};
+        return self.compact.text_ids[entry.ids_off .. entry.ids_off + entry.ids_len];
+    }
+
     pub fn addNode(self: *MemoryIndex, node: graph_mod.Node, node_index: usize) !void {
+        if (self.compacted) return core.Error.Unsupported;
         if (node.status != .active) return;
         if (node.id == .none or node.id.toInt() == std.math.maxInt(u64)) return core.Error.InvalidId;
         if (self.node_by_id.contains(node.id.toInt())) return core.Error.InvalidId;
@@ -151,43 +478,23 @@ pub const MemoryIndex = struct {
         text_ids_created = try self.appendNodeIdTracked(&self.node_ids_by_text, node.text, node.id);
         text_id_appended = true;
 
-        const key = try self.kindTextKey(node.kind, node.text);
-        var key_owned = true;
-        errdefer if (key_owned) self.allocator.free(key);
+        // Reuse the exact key bytes stored by the text map so the composite
+        // (kind, text) index never materializes another copy of node text.
+        const stored_text = self.node_ids_by_text.getKey(node.text) orelse return core.Error.InvalidId;
+        const key = KindTextKey{ .kind = node.kind, .text = stored_text };
         if (self.node_ids_by_kind_text.getPtr(key)) |ids| {
-            self.allocator.free(key);
-            key_owned = false;
             try ids.append(self.allocator, node.id);
             std.mem.sort(core.NodeId, ids.items, {}, nodeIdLessThan);
         } else {
             var ids = std.ArrayList(core.NodeId).empty;
+            errdefer ids.deinit(self.allocator);
             try ids.append(self.allocator, node.id);
-            var ids_in_map = false;
-            errdefer if (!ids_in_map) ids.deinit(self.allocator);
-            var key_in_owned_keys = false;
-            var committed = false;
-            errdefer {
-                if (!committed) {
-                    if (key_in_owned_keys) {
-                        _ = self.owned_keys.pop();
-                        self.allocator.free(key);
-                    }
-                }
-            }
-            try self.owned_keys.append(self.allocator, key);
-            key_in_owned_keys = true;
-            key_owned = false;
             try self.node_ids_by_kind_text.put(key, ids);
-            ids_in_map = true;
-            errdefer {
-                if (self.node_ids_by_kind_text.getPtr(key)) |stored_ids| stored_ids.deinit(self.allocator);
-                _ = self.node_ids_by_kind_text.remove(key);
-            }
-            committed = true;
         }
     }
 
     pub fn addEdgeRecord(self: *MemoryIndex, edge: graph_mod.Edge) !void {
+        if (self.compacted) return core.Error.Unsupported;
         if (edge.status != .active) return;
         if (edge.id == .none or edge.id.toInt() == std.math.maxInt(u64)) return core.Error.InvalidId;
         if (edge.src == .none or edge.dst == .none) return core.Error.InvalidId;
@@ -206,39 +513,46 @@ pub const MemoryIndex = struct {
     }
 
     fn edgeEndpointsIndexed(self: *MemoryIndex, edge: graph_mod.Edge) bool {
+        if (self.compacted) {
+            return self.compact.nodeSlot(edge.src.toInt()) != null and self.compact.nodeSlot(edge.dst.toInt()) != null;
+        }
         return self.node_by_id.contains(edge.src.toInt()) and self.node_by_id.contains(edge.dst.toInt());
     }
 
     pub fn getNode(self: MemoryIndex, graph: *const graph_mod.Graph, id: core.NodeId) ?graph_mod.Node {
-        const node_index = self.node_by_id.get(id.toInt()) orelse return null;
+        const node_index = if (self.compacted) blk: {
+            const slot = self.compact.nodeSlot(id.toInt()) orelse return null;
+            break :blk @as(usize, self.compact.node_indexes[slot]);
+        } else self.node_by_id.get(id.toInt()) orelse return null;
         if (node_index >= graph.nodes.items.len) return null;
         const node = graph.nodes.items[node_index];
         if (node.status != .active or node.id.toInt() != id.toInt()) return null;
         return node;
     }
 
+    fn compactAdjacency(self: *const MemoryIndex, offsets: []const u32, refs: []const EdgeRef, node: core.NodeId) []const EdgeRef {
+        const slot = self.compact.nodeSlot(node.toInt()) orelse return &.{};
+        return refs[offsets[slot]..offsets[slot + 1]];
+    }
+
     pub fn outgoing(self: *MemoryIndex, node: core.NodeId) []const EdgeRef {
+        if (self.compacted) return self.compactAdjacency(self.compact.out_offsets, self.compact.out_refs, node);
         const edges = self.out_edges.getPtr(node.toInt()) orelse return &.{};
         return edges.items;
     }
 
     pub fn outgoingRelation(self: *MemoryIndex, node: core.NodeId, rel: core.RelKind) []const EdgeRef {
-        const edges = self.out_edges.getPtr(node.toInt()) orelse return &.{};
-        return edgeRelationSlice(edges.items, rel);
+        return edgeRelationSlice(self.outgoing(node), rel);
     }
 
     pub fn incoming(self: *MemoryIndex, node: core.NodeId) []const EdgeRef {
+        if (self.compacted) return self.compactAdjacency(self.compact.in_offsets, self.compact.in_refs, node);
         const edges = self.in_edges.getPtr(node.toInt()) orelse return &.{};
         return edges.items;
     }
 
     pub fn incomingRelation(self: *MemoryIndex, node: core.NodeId, rel: core.RelKind) []const EdgeRef {
-        const edges = self.in_edges.getPtr(node.toInt()) orelse return &.{};
-        return edgeRelationSlice(edges.items, rel);
-    }
-
-    fn kindTextKey(self: *MemoryIndex, kind: core.NodeKind, text: []const u8) ![]u8 {
-        return std.fmt.allocPrint(self.allocator, "{d}\x1f{s}", .{ @intFromEnum(kind), text });
+        return edgeRelationSlice(self.incoming(node), rel);
     }
 
     fn appendEdgeRefTracked(self: *MemoryIndex, map: *std.AutoHashMap(u64, std.ArrayList(EdgeRef)), key: u64, ref: EdgeRef, comptime less_than: fn (void, EdgeRef, EdgeRef) bool) !bool {
@@ -280,6 +594,11 @@ pub const MemoryIndex = struct {
         var ids = std.ArrayList(core.NodeId).empty;
         errdefer ids.deinit(self.allocator);
         try ids.append(self.allocator, id);
+
+        if (!self.owns_keys) {
+            try map.put(key, ids);
+            return true;
+        }
 
         const owned_key = try self.allocator.dupe(u8, key);
         var owned_key_owned = true;
@@ -401,6 +720,58 @@ test "incoming edge ordering groups adjacency by destination then relation" {
     try std.testing.expectEqual(@as(u64, 8), edges[1].src.toInt());
     try std.testing.expectEqual(core.RelKind.mentions, edges[2].rel);
 }
+
+test "memory index compact build matches incremental build over the same graph" {
+    var graph = graph_mod.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    const file = try graph.addNode(.file, "src/main.zig");
+    const func = try graph.addNode(.function, "main");
+    const dup = try graph.addNode(.task, "src/main.zig");
+    _ = try graph.addEdgeUnchecked(file, .defines, func);
+    _ = try graph.addEdgeUnchecked(func, .calls, file);
+    _ = try graph.addEdgeUnchecked(file, .mentions, func);
+
+    var incremental = try MemoryIndex.init(std.testing.allocator, &graph);
+    defer incremental.deinit();
+    var compact = try MemoryIndex.initCompactFromGraph(std.testing.allocator, &graph);
+    defer compact.deinit();
+
+    for ([_]core.NodeId{ file, func, dup }) |id| {
+        try index_equivalence_helpers.expectSameRefs(incremental.outgoing(id), compact.outgoing(id));
+        try index_equivalence_helpers.expectSameRefs(incremental.incoming(id), compact.incoming(id));
+        try std.testing.expectEqual(
+            incremental.getNode(&graph, id).?.id.toInt(),
+            compact.getNode(&graph, id).?.id.toInt(),
+        );
+    }
+    try std.testing.expectEqualSlices(
+        core.NodeId,
+        try incremental.lookupByText(null, "src/main.zig"),
+        try compact.lookupByText(null, "src/main.zig"),
+    );
+    try std.testing.expectEqualSlices(
+        core.NodeId,
+        try incremental.lookupByText(.file, "src/main.zig"),
+        try compact.lookupByText(.file, "src/main.zig"),
+    );
+    try std.testing.expectEqual(@as(usize, 0), (try compact.lookupByText(.repo, "src/main.zig")).len);
+    try std.testing.expectEqual(@as(usize, 0), (try compact.lookupByText(null, "absent")).len);
+    try index_equivalence_helpers.expectSameRefs(
+        incremental.outgoingRelation(file, .defines),
+        compact.outgoingRelation(file, .defines),
+    );
+    try std.testing.expectError(core.Error.Unsupported, compact.addNode(graph.nodes.items[0], 0));
+    try std.testing.expectError(core.Error.Unsupported, compact.addEdgeRecord(graph.edges.items[0]));
+}
+
+const index_equivalence_helpers = struct {
+    fn expectSameRefs(expected: []const EdgeRef, actual: []const EdgeRef) !void {
+        try std.testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |lhs, rhs| {
+            try std.testing.expect(edgeRefEqual(lhs, rhs));
+        }
+    }
+};
 
 test "memory index supports text lookup and adjacency" {
     var graph = graph_mod.Graph.init(std.testing.allocator);

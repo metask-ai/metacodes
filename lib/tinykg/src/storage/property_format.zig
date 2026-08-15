@@ -73,10 +73,12 @@ pub const PropertyPayloadIndexHeader = struct {
     record_count: u64,
     owner_count: u64,
     owner_digest: u64,
+    flags: u64 = 0,
 
     const magic = [_]u8{ 'T', 'K', 'P', 'X' };
     const version: u16 = 1;
     pub const encoded_len: usize = 40;
+    pub const flag_string_value_hash_derived: u64 = 1 << 0;
 
     pub fn encode(self: PropertyPayloadIndexHeader, out: *[encoded_len]u8) void {
         @memcpy(out[0..4], &magic);
@@ -85,19 +87,25 @@ pub const PropertyPayloadIndexHeader = struct {
         std.mem.writeInt(u64, out[8..16], self.record_count, .little);
         std.mem.writeInt(u64, out[16..24], self.owner_count, .little);
         std.mem.writeInt(u64, out[24..32], self.owner_digest, .little);
-        std.mem.writeInt(u64, out[32..40], 0, .little);
+        std.mem.writeInt(u64, out[32..40], self.flags, .little);
     }
 
     pub fn decode(bytes: *const [encoded_len]u8) !PropertyPayloadIndexHeader {
         if (!std.mem.eql(u8, bytes[0..4], &magic)) return error.InvalidRecord;
         if (std.mem.readInt(u16, bytes[4..6], .little) != version) return error.InvalidRecord;
         if (std.mem.readInt(u16, bytes[6..8], .little) != encoded_len) return error.InvalidRecord;
-        if (std.mem.readInt(u64, bytes[32..40], .little) != 0) return error.InvalidRecord;
-        return .{
+        const header = PropertyPayloadIndexHeader{
             .record_count = std.mem.readInt(u64, bytes[8..16], .little),
             .owner_count = std.mem.readInt(u64, bytes[16..24], .little),
             .owner_digest = std.mem.readInt(u64, bytes[24..32], .little),
+            .flags = std.mem.readInt(u64, bytes[32..40], .little),
         };
+        if ((header.flags & ~flag_string_value_hash_derived) != 0) return error.InvalidRecord;
+        return header;
+    }
+
+    pub fn hasDerivedStringValueHashes(self: PropertyPayloadIndexHeader) bool {
+        return (self.flags & flag_string_value_hash_derived) != 0;
     }
 };
 
@@ -238,10 +246,12 @@ pub const NodePropertyValueBlockHeader = struct {
     node_digest: u64,
     payload_bytes: u64,
     payload_digest: u64,
+    flags: u64 = 0,
 
     const magic = [_]u8{ 'T', 'K', 'P', 'V' };
     const version: u16 = 1;
     pub const encoded_len: usize = 56;
+    pub const flag_string_value_hash_derived: u64 = 1 << 0;
 
     pub fn encode(self: NodePropertyValueBlockHeader, out: *[encoded_len]u8) void {
         @memcpy(out[0..4], &magic);
@@ -252,21 +262,27 @@ pub const NodePropertyValueBlockHeader = struct {
         std.mem.writeInt(u64, out[24..32], self.node_digest, .little);
         std.mem.writeInt(u64, out[32..40], self.payload_bytes, .little);
         std.mem.writeInt(u64, out[40..48], self.payload_digest, .little);
-        std.mem.writeInt(u64, out[48..56], 0, .little);
+        std.mem.writeInt(u64, out[48..56], self.flags, .little);
     }
 
     pub fn decode(bytes: *const [encoded_len]u8) !NodePropertyValueBlockHeader {
         if (!std.mem.eql(u8, bytes[0..4], &magic)) return error.InvalidRecord;
         if (std.mem.readInt(u16, bytes[4..6], .little) != version) return error.InvalidRecord;
         if (std.mem.readInt(u16, bytes[6..8], .little) != encoded_len) return error.InvalidRecord;
-        if (std.mem.readInt(u64, bytes[48..56], .little) != 0) return error.InvalidRecord;
-        return .{
+        const header = NodePropertyValueBlockHeader{
             .record_count = std.mem.readInt(u64, bytes[8..16], .little),
             .node_count = std.mem.readInt(u64, bytes[16..24], .little),
             .node_digest = std.mem.readInt(u64, bytes[24..32], .little),
             .payload_bytes = std.mem.readInt(u64, bytes[32..40], .little),
             .payload_digest = std.mem.readInt(u64, bytes[40..48], .little),
+            .flags = std.mem.readInt(u64, bytes[48..56], .little),
         };
+        if ((header.flags & ~flag_string_value_hash_derived) != 0) return error.InvalidRecord;
+        return header;
+    }
+
+    pub fn hasDerivedStringValueHashes(self: NodePropertyValueBlockHeader) bool {
+        return (self.flags & flag_string_value_hash_derived) != 0;
     }
 };
 

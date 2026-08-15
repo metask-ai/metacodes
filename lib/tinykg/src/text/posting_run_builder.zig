@@ -23,7 +23,7 @@ pub fn PostingRunBuilder(comptime Ops: type) type {
         const TextPostingRunSummaryWriter = Ops.TextPostingRunSummaryWriter_dep;
         const TextPostingRunTermSummaryRecord = Ops.TextPostingRunTermSummaryRecord_dep;
         const TextRebuildTextFreqCache = Ops.TextRebuildTextFreqCache_dep;
-        const text_posting_run_chunk_records = Ops.text_posting_run_chunk_records_dep;
+        const textPostingRunChunkRecords = Ops.textPostingRunChunkRecords_dep;
         const termSortPrefixKey = Ops.termSortPrefixKey_dep;
         const termSortTailKey = Ops.termSortTailKey_dep;
         const textMonotonicNs = Ops.textMonotonicNs_dep;
@@ -320,6 +320,9 @@ pub fn PostingRunBuilder(comptime Ops: type) type {
             run_paths: std.ArrayList([]u8) = .empty,
             run_summaries: std.ArrayList(TextPostingRunSummaryFile) = .empty,
             chunk: std.ArrayList(TextPostingRunChunkRecord) = .empty,
+            // Captured once at init: the process-wide budget may be rescaled
+            // between jobs, but one builder's chunk boundary must not move.
+            chunk_capacity: usize = 0,
             chunk_term_bytes: std.ArrayList(u8) = .empty,
             chunk_term_cache: [text_posting_run_chunk_term_cache_slots]TextPostingRunChunkTermCacheSlot = [_]TextPostingRunChunkTermCacheSlot{.{}} ** text_posting_run_chunk_term_cache_slots,
             chunk_sort_ns: u128 = 0,
@@ -406,7 +409,8 @@ pub fn PostingRunBuilder(comptime Ops: type) type {
                     .all_docs_candidates = std.StringHashMap(AllDocsRunCandidate).init(allocator),
                 };
                 errdefer builder.deinit();
-                try builder.chunk.ensureTotalCapacityPrecise(allocator, text_posting_run_chunk_records);
+                builder.chunk_capacity = textPostingRunChunkRecords();
+                try builder.chunk.ensureTotalCapacityPrecise(allocator, builder.chunk_capacity);
                 return builder;
             }
 
@@ -988,7 +992,7 @@ pub fn PostingRunBuilder(comptime Ops: type) type {
 
             pub fn appendTermPosting(self: *TextPostingRunBuilder, term: []const u8, posting: TextPostingRecord) !void {
                 self.run_paths_disjoint_term_ranges = false;
-                if (self.chunk.items.len == text_posting_run_chunk_records) try self.flushRun();
+                if (self.chunk.items.len == self.chunk_capacity) try self.flushRun();
                 if (term.len == 0 or term.len > default_max_token_bytes) return error.InvalidRecord;
                 try validateTextPostingFields(posting.doc_id, posting.text_freq, posting.kind_freq);
                 const term_sort_prefix = termSortPrefixKey(term);

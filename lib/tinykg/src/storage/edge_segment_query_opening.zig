@@ -54,6 +54,29 @@ pub fn EdgeSegmentQueryOpening(comptime Ops: type) type {
             filter_direction: ?Ops.DirectionType,
             filter_node_id: ?Ops.NodeIdType,
         ) !?Ops.ResultType {
+            const coverage = (try coverageFromManifest(context, manifest)) orelse return null;
+            const filtered = coverage != .visible_full and
+                filter_direction != null and
+                filter_node_id != null and
+                Ops.manifestRangesTrusted(manifest);
+            return Ops.openSegments(
+                context,
+                allocator,
+                manifest,
+                coverage,
+                filter_direction,
+                filter_node_id,
+                filtered,
+            );
+        }
+
+        /// Classify an admitted manifest without opening its segment readers.
+        /// Full-store streaming and query opening must share this decision so
+        /// resource-lifetime policy cannot drift from coverage semantics.
+        pub fn coverageFromManifest(
+            context: anytype,
+            manifest: *const Ops.ManifestType,
+        ) !?Ops.CoverageType {
             const meta = try Ops.readCurrentMeta(context);
             const manifest_edges = Ops.manifestTotalEdges(manifest);
             const physical_edges = try Ops.visiblePlusTombstoneEdges(context, meta);
@@ -71,20 +94,7 @@ pub fn EdgeSegmentQueryOpening(comptime Ops: type) type {
                 if (!try Ops.baseHeadersMatchMeta(context, meta)) return null;
                 break :coverage .delta;
             };
-
-            const filtered = coverage != .visible_full and
-                filter_direction != null and
-                filter_node_id != null and
-                Ops.manifestRangesTrusted(manifest);
-            return Ops.openSegments(
-                context,
-                allocator,
-                manifest,
-                coverage,
-                filter_direction,
-                filter_node_id,
-                filtered,
-            );
+            return coverage;
         }
     };
 }

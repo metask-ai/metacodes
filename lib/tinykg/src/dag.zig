@@ -27,6 +27,31 @@ pub fn reachableWithCursor(
     rel: core.RelKind,
     budget: core.QueryBudget,
 ) !bool {
+    var stats: index.QueryStats = .{};
+    return reachableWithCursorMeasured(
+        allocator,
+        graph,
+        mem_index,
+        edge_cursor,
+        from,
+        to,
+        rel,
+        budget,
+        &stats,
+    );
+}
+
+pub fn reachableWithCursorMeasured(
+    allocator: std.mem.Allocator,
+    graph: *const graph_mod.Graph,
+    mem_index: *index.MemoryIndex,
+    edge_cursor: query.EdgeCursor,
+    from: core.NodeId,
+    to: core.NodeId,
+    rel: core.RelKind,
+    budget: core.QueryBudget,
+    stats: *index.QueryStats,
+) !bool {
     if (traversal.isReservedNodeId(from) or traversal.isReservedNodeId(to)) return core.Error.InvalidId;
     if (traversal.timedOutImmediately(budget)) return core.Error.BudgetExceeded;
     if (from.toInt() != to.toInt() and traversal.nodeBudgetExhausted(budget)) return core.Error.BudgetExceeded;
@@ -50,6 +75,7 @@ pub fn reachableWithCursor(
         if (try node_state.containsVisited(current.toInt())) continue;
         const current_depth = (try node_state.getDepth(current.toInt())).?;
         try node_state.markVisited(current.toInt());
+        try index.addVisitedNodes(stats, 1);
         var context = ReachableExploreContext{
             .allocator = allocator,
             .graph = graph,
@@ -60,6 +86,7 @@ pub fn reachableWithCursor(
             .current_depth = current_depth,
             .budget = budget,
             .edges_visited = &edges_visited,
+            .stats = stats,
         };
         if (try edge_cursor.forEachOutgoingRelation(current, rel, &context, exploreReachableEdge)) return true;
     }
@@ -76,11 +103,13 @@ const ReachableExploreContext = struct {
     current_depth: u8,
     budget: core.QueryBudget,
     edges_visited: *usize,
+    stats: *index.QueryStats,
 };
 
 fn exploreReachableEdge(ctx: *ReachableExploreContext, edge: index.EdgeRef) !bool {
     if (ctx.edges_visited.* >= ctx.budget.max_visited_edges) return core.Error.BudgetExceeded;
     ctx.edges_visited.* = try traversal.incrementCounter(ctx.edges_visited.*);
+    try index.addVisitedEdges(ctx.stats, 1);
     if (ctx.current_depth >= ctx.budget.max_depth) return core.Error.BudgetExceeded;
     if (edge.dst.toInt() == ctx.to.toInt()) return true;
     if (try ctx.node_state.containsVisited(edge.dst.toInt())) return false;

@@ -18,15 +18,24 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
         const block_deflate_magic = [_]u8{ 'T', 'K', 'N', 'Z' };
         pub const block_deflate_version: u16 = 5;
         pub const block_deflate_header_len: usize = 16;
+        pub const block_deflate_header_len_v2: usize = 24;
+        pub const block_deflate_header_max_len: usize = block_deflate_header_len_v2;
         pub const block_deflate_entry_len: usize = 4;
         pub const block_deflate_block_bytes: u32 = 256 * 1024;
         pub const raw_mmap_max_bytes: u64 = 64 * 1024 * 1024;
         const block_deflate_flag_compressed: u16 = 1 << 0;
         const append_journal_magic = [_]u8{ 'T', 'K', 'N', 'A' };
+        const append_journal_version_v5: u16 = 5;
+        const append_journal_version_v4: u16 = 4;
         const append_journal_version: u16 = 3;
         pub const append_journal_checksummed_version: u16 = 2;
         const append_journal_legacy_version: u16 = 1;
         pub const append_journal_header_len: usize = 64;
+        pub const append_journal_header_len_v4: usize = 72;
+        pub const append_journal_header_len_v5: usize = 88;
+        /// Sentinel for journals older than v5: the pre-append event watermark
+        /// is unknown, so recovery classification falls back to the full scan.
+        pub const append_journal_event_watermark_unknown: u64 = std.math.maxInt(u64);
         const append_journal_hash_seed: u64 = 0x544B_4E41;
         pub const append_journal_header_hash_seed: u64 = 0x544B_4E48;
         pub const deflate_progress_entry_len: usize = 20;
@@ -42,28 +51,55 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
             suffix_offset: u64,
             suffix_len: u64,
             suffix_hash: u64,
-            original_header: [block_deflate_header_len]u8,
+            /// Backup of the node-texts file header being mutated. v4
+            /// journals reserve the segmented (24-byte) form; v3 journals
+            /// carried 16 bytes, decoded here with a zero-filled suffix.
+            original_header: [block_deflate_header_max_len]u8,
             original_format: StorageFormat = .block_deflate,
             committed: bool = false,
+            /// Event-log byte count captured when the append began. Bounded
+            /// crash recovery classifies the interrupted write by scanning
+            /// only the event bytes past this watermark instead of the whole
+            /// log (12003). Unknown (older journal) forces the full scan.
+            pre_append_event_bytes: u64 = append_journal_event_watermark_unknown,
+            /// Reserved upper bound on event bytes this append may emit;
+            /// zero means unbounded. Written as zero today.
+            max_event_span: u64 = 0,
+            /// Encoded length of the journal this header came from; the
+            /// suffix payload starts here. Writers always emit v5.
+            header_len: usize = append_journal_header_len_v5,
 
-            pub fn decode(bytes: *const [append_journal_header_len]u8) !AppendJournalHeader {
+            pub fn decode(bytes: []const u8) !AppendJournalHeader {
+                if (bytes.len < append_journal_header_len) return error.InvalidRecord;
                 if (!std.mem.eql(u8, bytes[0..4], &append_journal_magic)) return error.InvalidRecord;
                 const version = readU16(bytes[4..6]);
-                if (version != append_journal_version and
-                    version != append_journal_checksummed_version and
-                    version != append_journal_legacy_version) return error.InvalidRecord;
-                if (readU16(bytes[6..8]) != append_journal_header_len) return error.InvalidRecord;
-                if (bytes[56] > 1) return error.InvalidRecord;
+                const encoded_len: usize = switch (version) {
+                    append_journal_version_v5 => append_journal_header_len_v5,
+                    append_journal_version_v4 => append_journal_header_len_v4,
+                    append_journal_version, append_journal_checksummed_version, append_journal_legacy_version => append_journal_header_len,
+                    else => return error.InvalidRecord,
+                };
+                if (readU16(bytes[6..8]) != encoded_len) return error.InvalidRecord;
+                if (bytes.len < encoded_len) return error.InvalidRecord;
+                const committed_index = encoded_len - 8;
+                if (bytes[committed_index] > 1) return error.InvalidRecord;
                 if (version == append_journal_legacy_version) {
-                    if (!allZero(bytes[57..64])) return error.InvalidRecord;
+                    if (!allZero(bytes[committed_index + 1 .. encoded_len])) return error.InvalidRecord;
                 } else {
                     var digest_bytes: [8]u8 = undefined;
-                    writeU64(&digest_bytes, std.hash.Wyhash.hash(append_journal_header_hash_seed, bytes[0..57]));
-                    if (!std.mem.eql(u8, bytes[57..64], digest_bytes[0..7])) return error.InvalidRecord;
+                    writeU64(&digest_bytes, std.hash.Wyhash.hash(append_journal_header_hash_seed, bytes[0 .. committed_index + 1]));
+                    if (!std.mem.eql(u8, bytes[committed_index + 1 .. encoded_len], digest_bytes[0..7])) return error.InvalidRecord;
                 }
-                var original_header: [block_deflate_header_len]u8 = undefined;
-                @memcpy(&original_header, bytes[40..56]);
-                const original_format: StorageFormat = if (version == append_journal_version and allZero(&original_header))
+                var original_header: [block_deflate_header_max_len]u8 = @splat(0);
+                const backup_len: usize = if (version >= append_journal_version_v4) block_deflate_header_max_len else block_deflate_header_len;
+                @memcpy(original_header[0..backup_len], bytes[40 .. 40 + backup_len]);
+                var pre_append_event_bytes: u64 = append_journal_event_watermark_unknown;
+                var max_event_span: u64 = 0;
+                if (version == append_journal_version_v5) {
+                    pre_append_event_bytes = readU64(bytes[64..72]);
+                    max_event_span = readU64(bytes[72..80]);
+                }
+                const original_format: StorageFormat = if (version >= append_journal_version and allZero(&original_header))
                     .raw
                 else
                     .block_deflate;
@@ -74,11 +110,14 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
                     .suffix_hash = readU64(bytes[32..40]),
                     .original_header = original_header,
                     .original_format = original_format,
-                    .committed = bytes[56] == 1,
+                    .committed = bytes[committed_index] == 1,
+                    .pre_append_event_bytes = pre_append_event_bytes,
+                    .max_event_span = max_event_span,
+                    .header_len = encoded_len,
                 };
             }
 
-            pub fn encode(self: AppendJournalHeader, out: *[append_journal_header_len]u8) !void {
+            pub fn encode(self: AppendJournalHeader, out: *[append_journal_header_len_v5]u8) !void {
                 if (self.suffix_offset > self.original_size or self.suffix_len != self.original_size - self.suffix_offset) return error.InvalidRecord;
                 switch (self.original_format) {
                     .raw => {
@@ -92,42 +131,81 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
                     },
                 }
                 @memcpy(out[0..4], &append_journal_magic);
-                writeU16(out[4..6], append_journal_version);
-                writeU16(out[6..8], append_journal_header_len);
+                writeU16(out[4..6], append_journal_version_v5);
+                writeU16(out[6..8], append_journal_header_len_v5);
                 writeU64(out[8..16], self.original_size);
                 writeU64(out[16..24], self.suffix_offset);
                 writeU64(out[24..32], self.suffix_len);
                 writeU64(out[32..40], self.suffix_hash);
-                @memcpy(out[40..56], &self.original_header);
-                out[56] = @intFromBool(self.committed);
+                @memcpy(out[40..64], &self.original_header);
+                writeU64(out[64..72], self.pre_append_event_bytes);
+                writeU64(out[72..80], self.max_event_span);
+                out[80] = @intFromBool(self.committed);
                 var digest_bytes: [8]u8 = undefined;
-                writeU64(&digest_bytes, std.hash.Wyhash.hash(append_journal_header_hash_seed, out[0..57]));
-                @memcpy(out[57..64], digest_bytes[0..7]);
+                writeU64(&digest_bytes, std.hash.Wyhash.hash(append_journal_header_hash_seed, out[0..81]));
+                @memcpy(out[81..88], digest_bytes[0..7]);
             }
         };
 
         pub const BlockDeflateHeader = struct {
             logical_size: u64,
+            /// Raw bytes appended after the sealed blocks and their table.
+            /// Zero keeps the on-disk v1 format byte-identical; a non-zero
+            /// tail is written as the v2 24-byte header. The tail serves
+            /// appends without rewriting the whole file; sealing moves full
+            /// 256KiB windows of it into blocks.
+            tail_len: u64 = 0,
+            /// Once a file is v2 its header stays 24 bytes even after the
+            /// tail drains — shrinking would shift the payload. Set by
+            /// decode for v2 files and by writers that seal in place.
+            header_len_override: ?usize = null,
 
-            pub fn decode(bytes: *const [block_deflate_header_len]u8) !BlockDeflateHeader {
+            /// v2 headers self-describe their length via bytes[6..8]; v1
+            /// files keep the 16-byte form.
+            pub fn headerLen(self: BlockDeflateHeader) usize {
+                if (self.header_len_override) |len| return len;
+                return if (self.tail_len == 0) block_deflate_header_len else block_deflate_header_len_v2;
+            }
+
+            pub fn totalLogicalSize(self: BlockDeflateHeader) !u64 {
+                return std.math.add(u64, self.logical_size, self.tail_len) catch error.InvalidRecord;
+            }
+
+            pub fn decode(bytes: []const u8) !BlockDeflateHeader {
+                if (bytes.len < block_deflate_header_len) return error.InvalidRecord;
                 if (!std.mem.eql(u8, bytes[0..4], &block_deflate_magic)) return error.InvalidRecord;
                 if (readU16(bytes[4..6]) != block_deflate_version) return error.InvalidRecord;
-                if (readU16(bytes[6..8]) != block_deflate_header_len) return error.InvalidRecord;
-                const header = BlockDeflateHeader{ .logical_size = readU64(bytes[8..16]) };
+                const encoded_header_len = readU16(bytes[6..8]);
+                var header = BlockDeflateHeader{ .logical_size = readU64(bytes[8..16]) };
+                switch (encoded_header_len) {
+                    block_deflate_header_len => {},
+                    block_deflate_header_len_v2 => {
+                        if (bytes.len < block_deflate_header_len_v2) return error.InvalidRecord;
+                        header.tail_len = readU64(bytes[16..24]);
+                        // A drained tail stays v2 (header_len 24): shrinking
+                        // back to the 16-byte form would shift the payload.
+                        header.header_len_override = block_deflate_header_len_v2;
+                    },
+                    else => return error.InvalidRecord,
+                }
                 try header.validate();
                 return header;
             }
 
-            pub fn encode(self: BlockDeflateHeader, out: *[block_deflate_header_len]u8) !void {
+            pub fn encode(self: BlockDeflateHeader, out: *[block_deflate_header_max_len]u8) ![]const u8 {
                 try self.validate();
                 @memcpy(out[0..4], &block_deflate_magic);
                 writeU16(out[4..6], block_deflate_version);
-                writeU16(out[6..8], block_deflate_header_len);
+                writeU16(out[6..8], @intCast(self.headerLen()));
                 writeU64(out[8..16], self.logical_size);
+                if (self.headerLen() == block_deflate_header_len) return out[0..block_deflate_header_len];
+                writeU64(out[16..24], self.tail_len);
+                return out[0..block_deflate_header_len_v2];
             }
 
             pub fn validate(self: BlockDeflateHeader) !void {
                 if (self.logical_size == 0) return error.InvalidRecord;
+                _ = try self.totalLogicalSize();
                 _ = try self.blockCount();
             }
 
@@ -144,14 +222,22 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
 
             pub fn tableOffset(self: BlockDeflateHeader, physical_size: u64) !u64 {
                 const table_bytes = try self.tableBytes();
-                if (physical_size < block_deflate_header_len or table_bytes > physical_size - block_deflate_header_len) return error.InvalidRecord;
-                const table_offset = physical_size - table_bytes;
-                if (table_offset < block_deflate_header_len) return error.InvalidRecord;
+                const header_len = self.headerLen();
+                const trailing = std.math.add(u64, table_bytes, self.tail_len) catch return error.InvalidRecord;
+                if (physical_size < header_len or trailing > physical_size - header_len) return error.InvalidRecord;
+                const table_offset = physical_size - trailing;
+                if (table_offset < header_len) return error.InvalidRecord;
                 return table_offset;
             }
 
-            pub fn payloadOffset(_: BlockDeflateHeader) u64 {
-                return block_deflate_header_len;
+            /// Physical offset of the raw tail (immediately after the table).
+            pub fn tailOffset(self: BlockDeflateHeader, physical_size: u64) !u64 {
+                const table_offset = try self.tableOffset(physical_size);
+                return std.math.add(u64, table_offset, try self.tableBytes()) catch error.InvalidRecord;
+            }
+
+            pub fn payloadOffset(self: BlockDeflateHeader) u64 {
+                return self.headerLen();
             }
 
             pub fn rawLenForBlock(self: BlockDeflateHeader, block_index: usize) !u32 {
@@ -204,6 +290,208 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
             }
         };
 
+        /// Process-wide content-addressed cache of decompressed deflate
+        /// blocks. Serving one text decompresses up to a whole block, so a
+        /// point read pays ~half a block of flate work; hot blocks skip that
+        /// here. Keys are the hash of the stored compressed bytes plus both
+        /// lengths: a rewritten or truncated file can never produce a stale
+        /// hit, so no invalidation hook exists to forget. Entries live on the
+        /// process allocator, not per-store allocators, mirroring the text
+        /// tail cache's ownership pattern.
+        // Fixed capacity ceiling; the effective slot count is a per-process
+        // budget knob (TINYKG_TEXT_BLOCK_CACHE_SLOTS, clamped to [1, 64]).
+        const process_block_cache_slot_count = 64;
+        const process_block_cache_default_slots = 16;
+        const process_block_cache_allocator = std.heap.smp_allocator;
+        var process_block_cache_effective_slots: usize = 0;
+
+        fn processBlockCacheSlots() usize {
+            if (process_block_cache_effective_slots != 0) return process_block_cache_effective_slots;
+            var slots: usize = process_block_cache_default_slots;
+            if (std.c.getenv("TINYKG_TEXT_BLOCK_CACHE_SLOTS")) |raw| {
+                const parsed = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch 0;
+                if (parsed != 0) slots = @min(parsed, process_block_cache_slot_count);
+            }
+            process_block_cache_effective_slots = @max(slots, 1);
+            return process_block_cache_effective_slots;
+        }
+        const ProcessBlockCacheEntry = struct {
+            content_hash: u64,
+            stored_len: u32,
+            raw_len: u32,
+            last_use: u64,
+            bytes: []u8,
+        };
+        // Critical sections are one slot scan plus at most a block memcpy,
+        // so a spin on the lock-free mutex beats parking a thread.
+        var process_block_cache_mutex: std.atomic.Mutex = .unlocked;
+        var process_block_cache_slots: [process_block_cache_slot_count]?*ProcessBlockCacheEntry = @splat(null);
+        var process_block_cache_tick: u64 = 0;
+
+        fn processBlockCacheLock() void {
+            while (!process_block_cache_mutex.tryLock()) std.atomic.spinLoopHint();
+        }
+
+        fn processBlockCacheRead(content_hash: u64, stored_len: u32, raw_len: u32, out: []u8) bool {
+            std.debug.assert(out.len == raw_len);
+            processBlockCacheLock();
+            defer process_block_cache_mutex.unlock();
+            for (process_block_cache_slots[0..processBlockCacheSlots()]) |*slot| {
+                const entry = slot.* orelse continue;
+                if (entry.content_hash != content_hash or entry.stored_len != stored_len or entry.raw_len != raw_len) continue;
+                process_block_cache_tick += 1;
+                entry.last_use = process_block_cache_tick;
+                @memcpy(out, entry.bytes);
+                return true;
+            }
+            return false;
+        }
+
+        /// Process-wide content-addressed cache of decoded block tables.
+        /// Every view open decodes the whole table — O(#blocks) work that
+        /// grows with the store (tens of thousands of entries at gb10) and
+        /// dominates point-read latency. Keys bind the table bytes' hash,
+        /// the block count, and the payload base offset (entry physical
+        /// offsets are derived from it), so a hit can never describe a
+        /// different payload layout. The decode loop's terminal invariants
+        /// (payload cursor lands on the table, logical sum matches the
+        /// header) are re-checked from cached sums on every hit.
+        // Same knob pattern as the block cache (TINYKG_TEXT_TABLE_CACHE_SLOTS).
+        const process_block_table_slot_count = 16;
+        const process_block_table_default_slots = 4;
+        var process_block_table_effective_slots: usize = 0;
+
+        fn processBlockTableSlots() usize {
+            if (process_block_table_effective_slots != 0) return process_block_table_effective_slots;
+            var slots: usize = process_block_table_default_slots;
+            if (std.c.getenv("TINYKG_TEXT_TABLE_CACHE_SLOTS")) |raw| {
+                const parsed = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch 0;
+                if (parsed != 0) slots = @min(parsed, process_block_table_slot_count);
+            }
+            process_block_table_effective_slots = @max(slots, 1);
+            return process_block_table_effective_slots;
+        }
+        const ProcessBlockTableEntry = struct {
+            table_hash: u64,
+            block_count: u64,
+            payload_offset: u64,
+            // raw lengths are DERIVED from the header's logical size, not
+            // stored in the table bytes; the key must carry it or two files
+            // sharing table bytes but differing in final-block length would
+            // collide.
+            logical_size: u64,
+            stored_sum: u64,
+            raw_sum: u64,
+            last_use: u64,
+            entries: []BlockDeflateEntry,
+        };
+        var process_block_table_mutex: std.atomic.Mutex = .unlocked;
+        var process_block_table_slots: [process_block_table_slot_count]?*ProcessBlockTableEntry = @splat(null);
+        var process_block_table_tick: u64 = 0;
+
+        fn processBlockTableLock() void {
+            while (!process_block_table_mutex.tryLock()) std.atomic.spinLoopHint();
+        }
+
+        fn processBlockTableCacheRead(table_hash: u64, block_count: u64, payload_offset: u64, logical_size: u64, out: []BlockDeflateEntry) ?struct { stored_sum: u64, raw_sum: u64 } {
+            processBlockTableLock();
+            defer process_block_table_mutex.unlock();
+            for (process_block_table_slots[0..processBlockTableSlots()]) |*slot| {
+                const entry = slot.* orelse continue;
+                if (entry.table_hash != table_hash or entry.block_count != block_count or entry.payload_offset != payload_offset or entry.logical_size != logical_size) continue;
+                if (entry.entries.len != out.len) continue;
+                process_block_table_tick += 1;
+                entry.last_use = process_block_table_tick;
+                @memcpy(out, entry.entries);
+                return .{ .stored_sum = entry.stored_sum, .raw_sum = entry.raw_sum };
+            }
+            return null;
+        }
+
+        fn processBlockTableCacheInsert(table_hash: u64, block_count: u64, payload_offset: u64, logical_size: u64, stored_sum: u64, raw_sum: u64, entries: []const BlockDeflateEntry) void {
+            const allocator = process_block_cache_allocator;
+            const copy = allocator.dupe(BlockDeflateEntry, entries) catch return;
+            const entry = allocator.create(ProcessBlockTableEntry) catch {
+                allocator.free(copy);
+                return;
+            };
+            processBlockTableLock();
+            defer process_block_table_mutex.unlock();
+            process_block_table_tick += 1;
+            entry.* = .{
+                .table_hash = table_hash,
+                .block_count = block_count,
+                .payload_offset = payload_offset,
+                .logical_size = logical_size,
+                .stored_sum = stored_sum,
+                .raw_sum = raw_sum,
+                .last_use = process_block_table_tick,
+                .entries = copy,
+            };
+            var victim: usize = 0;
+            var victim_last_use: u64 = std.math.maxInt(u64);
+            for (process_block_table_slots[0..processBlockTableSlots()], 0..) |*slot, index| {
+                const existing = slot.* orelse {
+                    victim = index;
+                    break;
+                };
+                if (existing.table_hash == table_hash and existing.block_count == block_count and existing.payload_offset == payload_offset and existing.logical_size == logical_size) {
+                    victim = index;
+                    break;
+                }
+                if (existing.last_use < victim_last_use) {
+                    victim_last_use = existing.last_use;
+                    victim = index;
+                }
+            }
+            if (process_block_table_slots[victim]) |old| {
+                allocator.free(old.entries);
+                allocator.destroy(old);
+            }
+            process_block_table_slots[victim] = entry;
+        }
+
+        fn processBlockCacheInsert(content_hash: u64, stored_len: u32, raw_len: u32, bytes: []const u8) void {
+            std.debug.assert(bytes.len == raw_len);
+            const allocator = process_block_cache_allocator;
+            const copy = allocator.dupe(u8, bytes) catch return;
+            const entry = allocator.create(ProcessBlockCacheEntry) catch {
+                allocator.free(copy);
+                return;
+            };
+            processBlockCacheLock();
+            defer process_block_cache_mutex.unlock();
+            process_block_cache_tick += 1;
+            entry.* = .{
+                .content_hash = content_hash,
+                .stored_len = stored_len,
+                .raw_len = raw_len,
+                .last_use = process_block_cache_tick,
+                .bytes = copy,
+            };
+            var victim: usize = 0;
+            var victim_last_use: u64 = std.math.maxInt(u64);
+            for (process_block_cache_slots[0..processBlockCacheSlots()], 0..) |*slot, index| {
+                const existing = slot.* orelse {
+                    victim = index;
+                    break;
+                };
+                if (existing.content_hash == content_hash and existing.stored_len == stored_len and existing.raw_len == raw_len) {
+                    victim = index;
+                    break;
+                }
+                if (existing.last_use < victim_last_use) {
+                    victim_last_use = existing.last_use;
+                    victim = index;
+                }
+            }
+            if (process_block_cache_slots[victim]) |old| {
+                allocator.free(old.bytes);
+                allocator.destroy(old);
+            }
+            process_block_cache_slots[victim] = entry;
+        }
+
         pub const View = struct {
             store: StoreType,
             file: std.Io.File,
@@ -212,24 +500,37 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
             format: StorageFormat = .raw,
             blocks: []BlockDeflateEntry = &.{},
             block_cache: ?*BlockCache = null,
+            /// Segmented (v2) block files carry a raw tail after the table:
+            /// logical offsets below `sealed_logical_size` resolve through
+            /// the blocks, the rest reads directly from the tail region.
+            sealed_logical_size: u64 = 0,
+            tail_len: u64 = 0,
+            tail_physical_offset: u64 = 0,
 
             pub fn open(store: StoreType) !View {
-                _ = try Self.recoverAppendJournal(store);
+                // Journal recovery mutates durable bytes and belongs to the
+                // single writer. A reader process opening this view during a
+                // writer's in-flight append must NOT roll the writer back:
+                // the uncommitted text suffix is unreferenced by any index
+                // the reader consults, so reading around it is safe.
+                if (Ops.crashRecoveryAllowed(store)) _ = try Self.recoverAppendJournal(store);
                 const io = Ops.io(store);
                 const allocator = Ops.allocator(store);
                 var file = try std.Io.Dir.cwd().openFile(io, Ops.nodeTextsPath(store), .{});
                 errdefer file.close(io);
                 const physical_size = try regularFileSize(io, file);
                 if (physical_size >= block_deflate_header_len) {
-                    var header_bytes: [block_deflate_header_len]u8 = undefined;
-                    const n = try file.readPositionalAll(io, &header_bytes, 0);
-                    if (n != header_bytes.len) return error.InvalidRecord;
-                    const header_slice = header_bytes[0..];
+                    var header_bytes: [block_deflate_header_max_len]u8 = undefined;
+                    const probe_len = @min(header_bytes.len, std.math.cast(usize, physical_size) orelse header_bytes.len);
+                    const n = try file.readPositionalAll(io, header_bytes[0..probe_len], 0);
+                    if (n != probe_len) return error.InvalidRecord;
+                    const header_slice = header_bytes[0..probe_len];
                     if (std.mem.eql(u8, header_slice[0..4], &block_deflate_magic) and
                         readU16(header_slice[4..6]) == block_deflate_version and
-                        readU16(header_slice[6..8]) == block_deflate_header_len)
+                        (readU16(header_slice[6..8]) == block_deflate_header_len or
+                            readU16(header_slice[6..8]) == block_deflate_header_len_v2))
                     {
-                        const header = try BlockDeflateHeader.decode(header_slice[0..block_deflate_header_len]);
+                        const header = try BlockDeflateHeader.decode(header_slice);
                         const block_count = try header.blockCount();
                         const payload_offset = header.payloadOffset();
                         const table_offset = try header.tableOffset(physical_size);
@@ -244,28 +545,47 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
                         const block_cache = try allocator.create(BlockCache);
                         errdefer allocator.destroy(block_cache);
                         block_cache.* = .{};
-                        var payload_cursor = payload_offset;
-                        var logical_cursor: u64 = 0;
-                        var i: usize = 0;
-                        while (i < blocks.len) : (i += 1) {
-                            const entry_offset = i * block_deflate_entry_len;
-                            const entry_slice = table_bytes[entry_offset..][0..block_deflate_entry_len];
-                            const entry = try BlockDeflateEntry.decode(entry_slice[0..block_deflate_entry_len], payload_cursor, try header.rawLenForBlock(i));
-                            if (entry.physical_offset != payload_cursor) return error.InvalidRecord;
-                            if (entry.physical_offset > table_offset or entry.stored_len > table_offset - entry.physical_offset) return error.InvalidRecord;
-                            blocks[i] = entry;
-                            payload_cursor = std.math.add(u64, payload_cursor, entry.stored_len) catch return error.InvalidRecord;
-                            logical_cursor = std.math.add(u64, logical_cursor, entry.raw_len) catch return error.InvalidRecord;
+                        const table_hash = std.hash.Wyhash.hash(1, table_bytes);
+                        // The cached decode carries the loop's terminal
+                        // invariants; a hit only counts when they hold for
+                        // THIS file, otherwise the slow decode runs and its
+                        // own validation is authoritative.
+                        const cache_satisfied = blk: {
+                            const sums = processBlockTableCacheRead(table_hash, block_count, payload_offset, header.logical_size, blocks) orelse break :blk false;
+                            const payload_end = std.math.add(u64, payload_offset, sums.stored_sum) catch break :blk false;
+                            if (payload_end != table_offset) break :blk false;
+                            if (sums.raw_sum != header.logical_size) break :blk false;
+                            break :blk true;
+                        };
+                        if (!cache_satisfied) {
+                            var payload_cursor = payload_offset;
+                            var logical_cursor: u64 = 0;
+                            var i: usize = 0;
+                            while (i < blocks.len) : (i += 1) {
+                                const entry_offset = i * block_deflate_entry_len;
+                                const entry_slice = table_bytes[entry_offset..][0..block_deflate_entry_len];
+                                const entry = try BlockDeflateEntry.decode(entry_slice[0..block_deflate_entry_len], payload_cursor, try header.rawLenForBlock(i));
+                                if (entry.physical_offset != payload_cursor) return error.InvalidRecord;
+                                if (entry.physical_offset > table_offset or entry.stored_len > table_offset - entry.physical_offset) return error.InvalidRecord;
+                                blocks[i] = entry;
+                                payload_cursor = std.math.add(u64, payload_cursor, entry.stored_len) catch return error.InvalidRecord;
+                                logical_cursor = std.math.add(u64, logical_cursor, entry.raw_len) catch return error.InvalidRecord;
+                            }
+                            if (payload_cursor != table_offset) return error.InvalidRecord;
+                            if (logical_cursor != header.logical_size) return error.InvalidRecord;
+                            const stored_sum = payload_cursor - payload_offset;
+                            processBlockTableCacheInsert(table_hash, block_count, payload_offset, header.logical_size, stored_sum, logical_cursor, blocks);
                         }
-                        if (payload_cursor != table_offset) return error.InvalidRecord;
-                        if (logical_cursor != header.logical_size) return error.InvalidRecord;
                         return .{
                             .store = store,
                             .file = file,
-                            .size = header.logical_size,
+                            .size = try header.totalLogicalSize(),
                             .format = .block_deflate,
                             .blocks = blocks,
                             .block_cache = block_cache,
+                            .sealed_logical_size = header.logical_size,
+                            .tail_len = header.tail_len,
+                            .tail_physical_offset = if (header.tail_len == 0) 0 else try header.tailOffset(physical_size),
                         };
                     }
                 }
@@ -437,7 +757,24 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
                         const n = try self.file.readPositionalAll(Ops.io(self.store), out, offset);
                         if (n != out.len) return error.InvalidRecord;
                     },
-                    .block_deflate => try self.readCompressedInto(offset, out),
+                    .block_deflate => {
+                        if (self.tail_len == 0 or offset + out.len <= self.sealed_logical_size) {
+                            return self.readCompressedInto(offset, out);
+                        }
+                        // Segmented reads split at the sealed/tail boundary;
+                        // tail bytes are stored raw right after the table.
+                        var tail_out = out;
+                        var tail_logical = offset;
+                        if (offset < self.sealed_logical_size) {
+                            const sealed_take: usize = @intCast(self.sealed_logical_size - offset);
+                            try self.readCompressedInto(offset, out[0..sealed_take]);
+                            tail_out = out[sealed_take..];
+                            tail_logical = self.sealed_logical_size;
+                        }
+                        const tail_offset = self.tail_physical_offset + (tail_logical - self.sealed_logical_size);
+                        const n = try self.file.readPositionalAll(Ops.io(self.store), tail_out, tail_offset);
+                        if (n != tail_out.len) return error.InvalidRecord;
+                    },
                 }
             }
 
@@ -506,11 +843,15 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
                     if (stored_len != raw_len) return error.InvalidRecord;
                     @memcpy(out, compressed);
                 } else {
-                    var input_reader: std.Io.Reader = .fixed(compressed);
-                    const flate_buffer = try allocator.alloc(u8, std.compress.flate.max_window_len);
-                    defer allocator.free(flate_buffer);
-                    var decompressor = std.compress.flate.Decompress.init(&input_reader, .raw, flate_buffer);
-                    try decompressor.reader.readSliceAll(out);
+                    const content_hash = std.hash.Wyhash.hash(0, compressed);
+                    if (!processBlockCacheRead(content_hash, entry.stored_len, entry.raw_len, out)) {
+                        var input_reader: std.Io.Reader = .fixed(compressed);
+                        const flate_buffer = try allocator.alloc(u8, std.compress.flate.max_window_len);
+                        defer allocator.free(flate_buffer);
+                        var decompressor = std.compress.flate.Decompress.init(&input_reader, .raw, flate_buffer);
+                        try decompressor.reader.readSliceAll(out);
+                        processBlockCacheInsert(content_hash, entry.stored_len, entry.raw_len, out);
+                    }
                 }
                 allocator.free(cache.bytes);
                 cache.bytes = out;
@@ -824,9 +1165,9 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
                 if (table_write_offset != final_size) return error.InvalidRecord;
                 try output_file.setLength(self.io, final_size);
                 const header = BlockDeflateHeader{ .logical_size = raw_size };
-                var header_bytes: [block_deflate_header_len]u8 = undefined;
-                try header.encode(&header_bytes);
-                try output_file.writePositionalAll(self.io, &header_bytes, 0);
+                var header_bytes: [block_deflate_header_max_len]u8 = undefined;
+                const encoded_header = try header.encode(&header_bytes);
+                try output_file.writePositionalAll(self.io, encoded_header, 0);
                 if (self.need_sync) try output_file.sync(self.io);
                 output_file.close(self.io);
                 output_file_open = false;
@@ -894,7 +1235,7 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
                     append_bytes = std.math.add(u64, append_bytes, text.len) catch return error.RecordTooLarge;
                 }
                 var append_journal_active = false;
-                if (append_bytes != 0 and self.need_sync) {
+                if (append_bytes != 0) {
                     try self.writeRawAppendJournal(texts_start);
                     append_journal_active = true;
                 }
@@ -906,6 +1247,16 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
                 };
                 if (append_journal_active) try self.commitAppendJournalAfterMutation();
                 if (texts_start == 0 and texts_end != 0 and self.normal_write_mode) {
+                    texts_file.close(self.io);
+                    texts_file_open = false;
+                    _ = try self.finalize(.always);
+                } else if (!self.normal_write_mode and texts_end >= Ops.rawFinalizeWindowBytes()) {
+                    // Bulk loading historically deferred compression to one
+                    // terminal finalize, holding the whole corpus raw on
+                    // disk (store peak 117-131% of logical measured at
+                    // gb1/gb3). Sealing every window keeps the raw residue
+                    // bounded by the window; later batches append through
+                    // the incremental compressed path.
                     texts_file.close(self.io);
                     texts_file_open = false;
                     _ = try self.finalize(.always);
@@ -974,7 +1325,7 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
             }
 
             fn writeAppendJournal(self: Owner, texts: *const View, suffix_offset: u64) !void {
-                if (texts.format != .block_deflate or !self.need_sync) return error.InvalidRecord;
+                if (texts.format != .block_deflate) return error.InvalidRecord;
                 const original_size = try regularFileSize(self.io, texts.file);
                 if (suffix_offset < block_deflate_header_len or suffix_offset > original_size) return error.InvalidRecord;
                 const suffix_len_u64 = original_size - suffix_offset;
@@ -983,9 +1334,10 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
                 defer self.allocator.free(suffix);
                 const suffix_n = try texts.file.readPositionalAll(self.io, suffix, suffix_offset);
                 if (suffix_n != suffix.len) return error.InvalidRecord;
-                var original_header: [block_deflate_header_len]u8 = undefined;
-                const header_n = try texts.file.readPositionalAll(self.io, &original_header, 0);
-                if (header_n != original_header.len) return error.InvalidRecord;
+                var original_header: [block_deflate_header_max_len]u8 = @splat(0);
+                const backup_len: usize = @intCast(@min(original_size, block_deflate_header_max_len));
+                const header_n = try texts.file.readPositionalAll(self.io, original_header[0..backup_len], 0);
+                if (header_n != backup_len) return error.InvalidRecord;
                 _ = try BlockDeflateHeader.decode(&original_header);
                 const journal_header = AppendJournalHeader{
                     .original_size = original_size,
@@ -993,8 +1345,9 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
                     .suffix_len = suffix_len_u64,
                     .suffix_hash = std.hash.Wyhash.hash(append_journal_hash_seed, suffix),
                     .original_header = original_header,
+                    .pre_append_event_bytes = Ops.journalEventWatermark(self.store),
                 };
-                var journal_header_bytes: [append_journal_header_len]u8 = undefined;
+                var journal_header_bytes: [append_journal_header_len_v5]u8 = undefined;
                 try journal_header.encode(&journal_header_bytes);
                 var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
                 const journal_path = try self.journalPath(&journal_path_buffer);
@@ -1005,14 +1358,13 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
                     var journal_file = try std.Io.Dir.cwd().createFile(self.io, tmp_path, .{ .read = true, .truncate = true });
                     defer journal_file.close(self.io);
                     try journal_file.writePositionalAll(self.io, &journal_header_bytes, 0);
-                    if (suffix.len != 0) try journal_file.writePositionalAll(self.io, suffix, append_journal_header_len);
+                    if (suffix.len != 0) try journal_file.writePositionalAll(self.io, suffix, append_journal_header_len_v5);
                     if (self.need_sync) try journal_file.sync(self.io);
                 }
                 try Ops.renameReplace(self.store, tmp_path, journal_path);
             }
 
             fn writeRawAppendJournal(self: Owner, original_size: u64) !void {
-                if (!self.need_sync) return error.InvalidRecord;
                 const journal_header = AppendJournalHeader{
                     .original_size = original_size,
                     .suffix_offset = original_size,
@@ -1020,8 +1372,9 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
                     .suffix_hash = std.hash.Wyhash.hash(append_journal_hash_seed, &.{}),
                     .original_header = @splat(0),
                     .original_format = .raw,
+                    .pre_append_event_bytes = Ops.journalEventWatermark(self.store),
                 };
-                var journal_header_bytes: [append_journal_header_len]u8 = undefined;
+                var journal_header_bytes: [append_journal_header_len_v5]u8 = undefined;
                 try journal_header.encode(&journal_header_bytes);
                 var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
                 const journal_path = try self.journalPath(&journal_path_buffer);
@@ -1061,14 +1414,15 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
                 defer self.allocator.free(journal_bytes);
                 const journal_n = try journal_file.readPositionalAll(self.io, journal_bytes, 0);
                 if (journal_n != journal_bytes.len) return error.InvalidRecord;
-                var header_bytes: [append_journal_header_len]u8 = undefined;
-                @memcpy(&header_bytes, journal_bytes[0..append_journal_header_len]);
-                var header = try AppendJournalHeader.decode(&header_bytes);
-                if (journal_size != std.math.add(u64, append_journal_header_len, header.suffix_len) catch return error.InvalidRecord) return error.InvalidRecord;
+                var header = try AppendJournalHeader.decode(journal_bytes);
+                if (journal_size != std.math.add(u64, header.header_len, header.suffix_len) catch return error.InvalidRecord) return error.InvalidRecord;
                 if (header.committed) return;
                 header.committed = true;
+                // Re-emit as v4 regardless of the on-disk version: commit
+                // already rewrites the whole journal through a temp file.
+                var header_bytes: [append_journal_header_len_v5]u8 = undefined;
                 try header.encode(&header_bytes);
-                @memcpy(journal_bytes[0..append_journal_header_len], &header_bytes);
+                const suffix_bytes = journal_bytes[header.header_len..];
                 journal_file.close(self.io);
                 journal_file_open = false;
                 const tmp_path = try self.tmpPathFor(journal_path);
@@ -1077,7 +1431,8 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
                 {
                     var committed_file = try std.Io.Dir.cwd().createFile(self.io, tmp_path, .{ .read = true, .truncate = true });
                     defer committed_file.close(self.io);
-                    try committed_file.writePositionalAll(self.io, journal_bytes, 0);
+                    try committed_file.writePositionalAll(self.io, &header_bytes, 0);
+                    if (suffix_bytes.len != 0) try committed_file.writePositionalAll(self.io, suffix_bytes, append_journal_header_len_v5);
                     if (self.need_sync) try committed_file.sync(self.io);
                 }
                 try Ops.renameReplace(self.store, tmp_path, journal_path);
@@ -1090,20 +1445,22 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
                 };
             }
 
-            fn recoverAppendJournal(self: Owner) !AppendRecovery {
-                var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-                const journal_path = try self.journalPath(&journal_path_buffer);
-                if (!try self.fileExists(journal_path)) return .none;
+            const ParsedJournal = struct {
+                header: AppendJournalHeader,
+                suffix: []u8,
+            };
+
+            fn readJournalState(self: Owner, journal_path: []const u8) !ParsedJournal {
                 var journal_file = try std.Io.Dir.cwd().openFile(self.io, journal_path, .{});
-                var journal_file_open = true;
-                defer if (journal_file_open) journal_file.close(self.io);
+                defer journal_file.close(self.io);
                 const journal_size = try regularFileSize(self.io, journal_file);
                 if (journal_size < append_journal_header_len) return error.InvalidRecord;
-                var header_bytes: [append_journal_header_len]u8 = undefined;
-                const header_n = try journal_file.readPositionalAll(self.io, &header_bytes, 0);
-                if (header_n != header_bytes.len) return error.InvalidRecord;
-                const header = try AppendJournalHeader.decode(&header_bytes);
-                if (journal_size != std.math.add(u64, append_journal_header_len, header.suffix_len) catch return error.InvalidRecord) return error.InvalidRecord;
+                var header_bytes: [append_journal_header_len_v5]u8 = undefined;
+                const probe_len: usize = @intCast(@min(journal_size, header_bytes.len));
+                const header_n = try journal_file.readPositionalAll(self.io, header_bytes[0..probe_len], 0);
+                if (header_n != probe_len) return error.InvalidRecord;
+                const header = try AppendJournalHeader.decode(header_bytes[0..probe_len]);
+                if (journal_size != std.math.add(u64, header.header_len, header.suffix_len) catch return error.InvalidRecord) return error.InvalidRecord;
                 switch (header.original_format) {
                     .raw => {
                         if (!allZero(&header.original_header)) return error.InvalidRecord;
@@ -1119,30 +1476,82 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
                 }
                 const suffix_len = std.math.cast(usize, header.suffix_len) orelse return error.RecordTooLarge;
                 const suffix = try self.allocator.alloc(u8, suffix_len);
-                defer self.allocator.free(suffix);
-                const suffix_n = try journal_file.readPositionalAll(self.io, suffix, append_journal_header_len);
+                errdefer self.allocator.free(suffix);
+                const suffix_n = try journal_file.readPositionalAll(self.io, suffix, header.header_len);
                 if (suffix_n != suffix.len) return error.InvalidRecord;
                 if (std.hash.Wyhash.hash(append_journal_hash_seed, suffix) != header.suffix_hash) return error.InvalidRecord;
-                journal_file.close(self.io);
-                journal_file_open = false;
-                if (header.committed) {
-                    try Ops.syncParentDir(self.store, journal_path);
-                    return .committed;
-                }
+                return .{ .header = header, .suffix = suffix };
+            }
+
+            fn restoreJournalOriginalTexts(self: Owner, journal: ParsedJournal, journal_path: []const u8) !void {
                 var texts_file = try std.Io.Dir.cwd().openFile(self.io, self.node_texts_path, .{ .mode = .read_write, .allow_directory = false });
                 defer texts_file.close(self.io);
-                switch (header.original_format) {
-                    .raw => try texts_file.setLength(self.io, header.original_size),
+                switch (journal.header.original_format) {
+                    .raw => try texts_file.setLength(self.io, journal.header.original_size),
                     .block_deflate => {
-                        try texts_file.setLength(self.io, header.suffix_offset);
-                        if (suffix.len != 0) try texts_file.writePositionalAll(self.io, suffix, header.suffix_offset);
-                        try texts_file.writePositionalAll(self.io, &header.original_header, 0);
-                        try texts_file.setLength(self.io, header.original_size);
+                        try texts_file.setLength(self.io, journal.header.suffix_offset);
+                        if (journal.suffix.len != 0) try texts_file.writePositionalAll(self.io, journal.suffix, journal.header.suffix_offset);
+                        // The backup buffer is padded to the v2 capacity;
+                        // write back only the header bytes that were really
+                        // captured or the pad would clobber payload bytes.
+                        const backup = try BlockDeflateHeader.decode(&journal.header.original_header);
+                        try texts_file.writePositionalAll(self.io, journal.header.original_header[0..backup.headerLen()], 0);
+                        try texts_file.setLength(self.io, journal.header.original_size);
                     },
                 }
                 if (self.need_sync) try texts_file.sync(self.io);
                 self.cleanupJournalAfterRecovery(journal_path);
+            }
+
+            fn recoverAppendJournal(self: Owner) !AppendRecovery {
+                var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                const journal_path = try self.journalPath(&journal_path_buffer);
+                if (!try self.fileExists(journal_path)) return .none;
+                const journal = try self.readJournalState(journal_path);
+                defer self.allocator.free(journal.suffix);
+                if (journal.header.committed) {
+                    try Ops.syncParentDir(self.store, journal_path);
+                    return .committed;
+                }
+                try self.restoreJournalOriginalTexts(journal, journal_path);
                 return .rolled_back;
+            }
+
+            fn committedJournalOriginalLogicalSize(self: Owner) !?u64 {
+                var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                const journal_path = try self.journalPath(&journal_path_buffer);
+                if (!try self.fileExists(journal_path)) return null;
+                const journal = try self.readJournalState(journal_path);
+                defer self.allocator.free(journal.suffix);
+                if (!journal.header.committed) return error.InvalidRecord;
+                return switch (journal.header.original_format) {
+                    .raw => journal.header.original_size,
+                    .block_deflate => (try BlockDeflateHeader.decode(&journal.header.original_header)).logical_size,
+                };
+            }
+
+            /// Event-log watermark captured when the journaled append began,
+            /// or null when the journal predates v5 (or is absent). Bounded
+            /// recovery uses it for the zero-event-growth shortcut.
+            fn committedJournalEventWatermark(self: Owner) !?u64 {
+                var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                const journal_path = try self.journalPath(&journal_path_buffer);
+                if (!try self.fileExists(journal_path)) return null;
+                const journal = try self.readJournalState(journal_path);
+                defer self.allocator.free(journal.suffix);
+                if (!journal.header.committed) return error.InvalidRecord;
+                if (journal.header.pre_append_event_bytes == append_journal_event_watermark_unknown) return null;
+                return journal.header.pre_append_event_bytes;
+            }
+
+            fn restoreCommittedJournalOriginal(self: Owner) !void {
+                var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                const journal_path = try self.journalPath(&journal_path_buffer);
+                if (!try self.fileExists(journal_path)) return;
+                const journal = try self.readJournalState(journal_path);
+                defer self.allocator.free(journal.suffix);
+                if (!journal.header.committed) return error.InvalidRecord;
+                try self.restoreJournalOriginalTexts(journal, journal_path);
             }
 
             fn appendCompressedSlices(self: Owner, texts: *const View, slices: []const []const u8) ![]Ops.SpanType {
@@ -1164,7 +1573,7 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
                 const last_has_room = old_last.raw_len < block_deflate_block_bytes;
                 const truncate_offset = if (last_has_room) old_last.physical_offset else old_payload_end;
                 var append_journal_active = false;
-                if (self.need_sync) {
+                {
                     try self.writeAppendJournal(texts, truncate_offset);
                     append_journal_active = true;
                 }
@@ -1238,9 +1647,9 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
                 try file.writePositionalAll(self.io, block_table, payload_cursor);
                 const final_size = std.math.add(u64, payload_cursor, table_bytes) catch return error.RecordTooLarge;
                 try file.setLength(self.io, final_size);
-                var header_bytes: [block_deflate_header_len]u8 = undefined;
-                try new_header.encode(&header_bytes);
-                try file.writePositionalAll(self.io, &header_bytes, 0);
+                var header_bytes: [block_deflate_header_max_len]u8 = undefined;
+                const encoded_header = try new_header.encode(&header_bytes);
+                try file.writePositionalAll(self.io, encoded_header, 0);
                 if (self.need_sync) try file.sync(self.io);
             }
 
@@ -1327,6 +1736,24 @@ pub fn PrimaryNodeText(comptime Ops: type) type {
 
         pub fn recoverAppendJournal(store: StoreType) !AppendRecovery {
             return Owner.init(store).recoverAppendJournal();
+        }
+
+        /// Logical node-text size recorded by a committed append journal, or
+        /// null when no journal exists. Bounded crash recovery uses this to
+        /// classify how far the interrupted append progressed.
+        pub fn committedAppendJournalOriginalLogicalSize(store: StoreType) !?u64 {
+            return Owner.init(store).committedJournalOriginalLogicalSize();
+        }
+
+        pub fn committedAppendJournalEventWatermark(store: StoreType) !?u64 {
+            return Owner.init(store).committedJournalEventWatermark();
+        }
+
+        /// Restore node texts to the committed journal's pre-append state and
+        /// remove the journal. Only valid when bounded recovery has proven
+        /// that no durable event or index references the appended tail.
+        pub fn restoreCommittedAppendJournalOriginal(store: StoreType) !void {
+            return Owner.init(store).restoreCommittedJournalOriginal();
         }
 
         pub fn mutateCompressedSlicesInPlace(store: StoreType, texts: *const View, slices: []const []const u8, append_bytes: u64) !void {
@@ -1426,6 +1853,22 @@ const TestOps = struct {
         return store.io;
     }
 
+    pub fn crashRecoveryAllowed(_: TestStore) bool {
+        return true;
+    }
+
+    pub var raw_finalize_window_bytes: u64 = 256 * 1024 * 1024;
+
+    pub fn rawFinalizeWindowBytes() u64 {
+        return raw_finalize_window_bytes;
+    }
+
+    pub var journal_event_watermark: u64 = 424242;
+
+    pub fn journalEventWatermark(_: TestStore) u64 {
+        return journal_event_watermark;
+    }
+
     pub fn nodeTextsPath(store: TestStore) []const u8 {
         return store.node_texts_path;
     }
@@ -1520,15 +1963,15 @@ test "primary node text append journal round trips raw and compressed origins" {
         .original_header = @splat(0),
         .original_format = .raw,
     };
-    var raw_bytes: [test_primary.append_journal_header_len]u8 = undefined;
+    var raw_bytes: [test_primary.append_journal_header_len_v5]u8 = undefined;
     try raw.encode(&raw_bytes);
     const decoded_raw = try test_primary.AppendJournalHeader.decode(&raw_bytes);
     try std.testing.expectEqual(test_primary.StorageFormat.raw, decoded_raw.original_format);
     try std.testing.expectEqual(raw.original_size, decoded_raw.original_size);
 
     const block_header = test_primary.BlockDeflateHeader{ .logical_size = 33 };
-    var original_header: [test_primary.block_deflate_header_len]u8 = undefined;
-    try block_header.encode(&original_header);
+    var original_header: [test_primary.block_deflate_header_max_len]u8 = @splat(0);
+    _ = try block_header.encode(&original_header);
     const compressed = test_primary.AppendJournalHeader{
         .original_size = 32,
         .suffix_offset = 23,
@@ -1536,11 +1979,34 @@ test "primary node text append journal round trips raw and compressed origins" {
         .suffix_hash = std.hash.Wyhash.hash(0x544B_4E41, "undo-tail"),
         .original_header = original_header,
     };
-    var compressed_bytes: [test_primary.append_journal_header_len]u8 = undefined;
+    var compressed_bytes: [test_primary.append_journal_header_len_v5]u8 = undefined;
     try compressed.encode(&compressed_bytes);
     const decoded_compressed = try test_primary.AppendJournalHeader.decode(&compressed_bytes);
     try std.testing.expectEqual(test_primary.StorageFormat.block_deflate, decoded_compressed.original_format);
     try std.testing.expectEqualSlices(u8, &original_header, &decoded_compressed.original_header);
+
+    // v5 carries the pre-append event watermark for bounded recovery.
+    var watermarked = compressed;
+    watermarked.pre_append_event_bytes = 123456789;
+    var v5_bytes: [test_primary.append_journal_header_len_v5]u8 = undefined;
+    try watermarked.encode(&v5_bytes);
+    const decoded_v5 = try test_primary.AppendJournalHeader.decode(&v5_bytes);
+    try std.testing.expectEqual(@as(u64, 123456789), decoded_v5.pre_append_event_bytes);
+    try std.testing.expectEqual(@as(u64, 0), decoded_v5.max_event_span);
+
+    // A v4 journal (no watermark field) decodes to the unknown sentinel so
+    // recovery classification falls back to the full scan.
+    var v4_bytes: [test_primary.append_journal_header_len_v4]u8 = undefined;
+    @memcpy(v4_bytes[0..40], v5_bytes[0..40]);
+    std.mem.writeInt(u16, v4_bytes[4..6], 4, .little);
+    std.mem.writeInt(u16, v4_bytes[6..8], test_primary.append_journal_header_len_v4, .little);
+    @memcpy(v4_bytes[40..64], v5_bytes[40..64]);
+    v4_bytes[64] = 0;
+    var digest_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &digest_bytes, std.hash.Wyhash.hash(test_primary.append_journal_header_hash_seed, v4_bytes[0..65]), .little);
+    @memcpy(v4_bytes[65..72], digest_bytes[0..7]);
+    const decoded_v4 = try test_primary.AppendJournalHeader.decode(&v4_bytes);
+    try std.testing.expectEqual(test_primary.append_journal_event_watermark_unknown, decoded_v4.pre_append_event_bytes);
 }
 
 test "primary node text append journal rejects checksum and shape corruption" {
@@ -1552,9 +2018,9 @@ test "primary node text append journal rejects checksum and shape corruption" {
         .original_header = @splat(0),
         .original_format = .raw,
     };
-    var bytes: [test_primary.append_journal_header_len]u8 = undefined;
+    var bytes: [test_primary.append_journal_header_len_v5]u8 = undefined;
     try header.encode(&bytes);
-    bytes[63] ^= 0x80;
+    bytes[87] ^= 0x80;
     try std.testing.expectError(error.InvalidRecord, test_primary.AppendJournalHeader.decode(&bytes));
 
     var invalid = header;
@@ -1724,4 +2190,163 @@ test "primary node text block view decodes compressed and stored blocks" {
     defer std.testing.allocator.free(actual);
     try view.readInto(0, actual);
     try std.testing.expectEqualSlices(u8, raw, actual);
+    // A fresh view repeats the read through the process block cache and must
+    // serve byte-identical content.
+    var reread_view = try test_primary.View.open(store);
+    defer reread_view.deinit();
+    const reread = try std.testing.allocator.alloc(u8, raw.len);
+    defer std.testing.allocator.free(reread);
+    try reread_view.readInto(0, reread);
+    try std.testing.expectEqualSlices(u8, raw, reread);
+}
+
+test "bulk raw appends seal into blocks at the finalize window" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var layout = try TestLayout.init(&tmp, &path_buffer);
+    defer layout.deinit();
+    var repairs: usize = 0;
+    const store = layout.store(&repairs);
+
+    const saved_window = TestOps.raw_finalize_window_bytes;
+    defer TestOps.raw_finalize_window_bytes = saved_window;
+    TestOps.raw_finalize_window_bytes = 96;
+    try writeTestFile(layout.path, "");
+
+    // Two small bulk batches stay raw below the window.
+    const first = [_]struct { text: []const u8 }{ .{ .text = "bulk-one " ** 4 }, .{ .text = "bulk-two " ** 4 } };
+    const first_spans = try test_primary.appendBatch(store, &first);
+    std.testing.allocator.free(first_spans);
+    {
+        var view = try test_primary.View.open(store);
+        defer view.deinit();
+        try std.testing.expectEqual(test_primary.StorageFormat.raw, view.format);
+    }
+
+    // Crossing the window seals the raw file into compressed blocks.
+    const second = [_]struct { text: []const u8 }{.{ .text = "bulk-three " ** 8 }};
+    const second_spans = try test_primary.appendBatch(store, &second);
+    std.testing.allocator.free(second_spans);
+    var view = try test_primary.View.open(store);
+    defer view.deinit();
+    try std.testing.expectEqual(test_primary.StorageFormat.block_deflate, view.format);
+
+    // Every byte written before and after sealing reads back exactly.
+    const expected = ("bulk-one " ** 4) ++ ("bulk-two " ** 4) ++ ("bulk-three " ** 8);
+    try std.testing.expectEqual(@as(u64, expected.len), view.size);
+    const actual = try std.testing.allocator.alloc(u8, expected.len);
+    defer std.testing.allocator.free(actual);
+    try view.readInto(0, actual);
+    try std.testing.expectEqualSlices(u8, expected, actual);
+
+    // Later bulk batches append through the compressed path in place.
+    const third = [_]struct { text: []const u8 }{.{ .text = "bulk-four after seal" }};
+    const third_spans = try test_primary.appendBatch(store, &third);
+    defer std.testing.allocator.free(third_spans);
+    var resealed = try test_primary.View.open(store);
+    defer resealed.deinit();
+    try std.testing.expectEqual(test_primary.StorageFormat.block_deflate, resealed.format);
+    var tail_read: [20]u8 = undefined;
+    try resealed.readInto(expected.len, &tail_read);
+    try std.testing.expectEqualSlices(u8, "bulk-four after seal", &tail_read);
+}
+
+test "segmented v2 block view reads sealed blocks and raw tail" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var layout = try TestLayout.init(&tmp, &path_buffer);
+    defer layout.deinit();
+    var repairs: usize = 0;
+    const store = layout.store(&repairs);
+    const block_bytes: usize = test_primary.block_deflate_block_bytes;
+
+    // Build a sealed v1 block file first.
+    const sealed = try std.testing.allocator.alloc(u8, block_bytes + 512);
+    defer std.testing.allocator.free(sealed);
+    @memset(sealed[0..block_bytes], 'a');
+    var random = std.Random.DefaultPrng.init(0x5345_474D);
+    random.fill(sealed[block_bytes..]);
+    try writeTestFile(layout.path, sealed);
+    _ = try test_primary.finalize(store);
+
+    // Rebuild the file as v2: the 24-byte header shifts the payload, so a
+    // v1 file cannot be upgraded in place — the whole body moves.
+    const tail = "segmented raw tail payload, uncompressed";
+    {
+        const v1_bytes = try readTestFileAlloc(layout.path);
+        defer std.testing.allocator.free(v1_bytes);
+        const body = v1_bytes[test_primary.block_deflate_header_len..];
+        const header = test_primary.BlockDeflateHeader{ .logical_size = sealed.len, .tail_len = tail.len };
+        var header_bytes: [test_primary.block_deflate_header_max_len]u8 = undefined;
+        const encoded = try header.encode(&header_bytes);
+        try std.testing.expectEqual(@as(usize, test_primary.block_deflate_header_len_v2), encoded.len);
+        var rebuilt = std.ArrayList(u8).empty;
+        defer rebuilt.deinit(std.testing.allocator);
+        try rebuilt.appendSlice(std.testing.allocator, encoded);
+        try rebuilt.appendSlice(std.testing.allocator, body);
+        try rebuilt.appendSlice(std.testing.allocator, tail);
+        try writeTestFile(layout.path, rebuilt.items);
+    }
+
+    var view = try test_primary.View.open(store);
+    defer view.deinit();
+    try std.testing.expectEqual(test_primary.StorageFormat.block_deflate, view.format);
+    try std.testing.expectEqual(@as(u64, sealed.len), view.sealed_logical_size);
+    try std.testing.expectEqual(@as(u64, tail.len), view.tail_len);
+    try std.testing.expectEqual(@as(u64, sealed.len + tail.len), view.size);
+
+    // Whole-file read crosses the sealed/tail boundary.
+    const whole = try std.testing.allocator.alloc(u8, sealed.len + tail.len);
+    defer std.testing.allocator.free(whole);
+    try view.readInto(0, whole);
+    try std.testing.expectEqualSlices(u8, sealed, whole[0..sealed.len]);
+    try std.testing.expectEqualSlices(u8, tail, whole[sealed.len..]);
+
+    // Tail-only and boundary-straddling reads.
+    var tail_only: [8]u8 = undefined;
+    try view.readInto(sealed.len + 4, &tail_only);
+    try std.testing.expectEqualSlices(u8, tail[4..12], &tail_only);
+    var straddle: [32]u8 = undefined;
+    try view.readInto(sealed.len - 16, &straddle);
+    try std.testing.expectEqualSlices(u8, sealed[sealed.len - 16 ..], straddle[0..16]);
+    try std.testing.expectEqualSlices(u8, tail[0..16], straddle[16..]);
+
+    // A zero tail must keep encoding as byte-identical v1.
+    const v1_header = test_primary.BlockDeflateHeader{ .logical_size = 64 };
+    var v1_bytes: [test_primary.block_deflate_header_max_len]u8 = undefined;
+    const v1_encoded = try v1_header.encode(&v1_bytes);
+    try std.testing.expectEqual(@as(usize, test_primary.block_deflate_header_len), v1_encoded.len);
+}
+
+test "process block cache round trips, replaces same keys, and evicts by recency" {
+    const cache = test_primary;
+    const slot_count = cache.process_block_cache_slot_count;
+    var out: [8]u8 = undefined;
+
+    // Distinct high keys cannot collide with blocks cached by other tests.
+    const base: u64 = 0xF00D_0000_0000_0000;
+    try std.testing.expect(!cache.processBlockCacheRead(base, 4, 8, &out));
+
+    cache.processBlockCacheInsert(base, 4, 8, "block-01");
+    try std.testing.expect(cache.processBlockCacheRead(base, 4, 8, &out));
+    try std.testing.expectEqualSlices(u8, "block-01", &out);
+    // Same key, different lengths: a different logical block, no false hit.
+    try std.testing.expect(!cache.processBlockCacheRead(base, 4, 7, out[0..7]));
+
+    // Reinserting the same key replaces in place instead of burning a slot.
+    cache.processBlockCacheInsert(base, 4, 8, "block-02");
+    try std.testing.expect(cache.processBlockCacheRead(base, 4, 8, &out));
+    try std.testing.expectEqualSlices(u8, "block-02", &out);
+
+    // Filling every slot with fresh keys evicts the least recently used
+    // entries; the newest keys must all survive.
+    var index: u64 = 1;
+    while (index <= slot_count) : (index += 1) {
+        cache.processBlockCacheInsert(base + index, 4, 8, "fill-blk");
+    }
+    try std.testing.expect(!cache.processBlockCacheRead(base, 4, 8, &out));
+    try std.testing.expect(cache.processBlockCacheRead(base + slot_count, 4, 8, &out));
+    try std.testing.expectEqualSlices(u8, "fill-blk", &out);
 }

@@ -28,7 +28,7 @@ const execution_knowledge = @import("execution_knowledge.zig");
 const file_lock = @import("../swarm/file_lock.zig");
 const transport_mod = @import("transport.zig");
 
-pub const EXPECTED_STORAGE_FORMAT_VERSION = "2";
+pub const EXPECTED_STORAGE_FORMAT_VERSION = "3";
 pub const EXPECTED_SCHEMA_VERSION = "3";
 /// > tinykg 目录锁 30s 超时(cli.zig:1733-1857)。
 pub const SPAWN_TIMEOUT_MS: u64 = 35_000;
@@ -722,7 +722,7 @@ pub const KgClient = struct {
         }
         // storage_format 不符:仅 legacy 自动 migrate,其它版本直接 degraded
         if (!std.mem.eql(u8, ver, "legacy")) {
-            self.setDegraded("store 格式版本不符:期望 {s} 实际 {s}(bin={s} store={s});非 legacy 无法自动 migrate,见 lib/tinykg/SOURCE.txt", .{ EXPECTED_STORAGE_FORMAT_VERSION, ver, bin, self.store_path });
+            self.setDegraded("store 格式版本不符:期望 {s} 实际 {s}(bin={s} store={s});手动跑 `tinykg upgrade {s} <new-store>` 核验后替换,见 lib/tinykg/SOURCE.txt", .{ EXPECTED_STORAGE_FORMAT_VERSION, ver, bin, self.store_path, self.store_path });
             return false;
         }
         // legacy → v2 自动 migrate(本机 KG 是基础特性,不应让用户手动跑 tinykg 命令)
@@ -1498,6 +1498,19 @@ pub const KgClient = struct {
         return self.allocator.dupe(u8, out.stdout) catch KgError.OutOfMemory;
     }
 
+    /// TinyKG snapshot commands frame their canonical JSON artifact on stdout
+    /// as exactly `<artifact>` + one LF (documented CLI line framing; the
+    /// artifact itself has no trailing newline). The framing byte is
+    /// REQUIRED: stdout without it is not this CLI contract and returns null
+    /// so the caller fails typed. Exactly one byte is stripped; any other
+    /// suffix stays in the returned bytes so the downstream canonical-bytes
+    /// check rejects it instead of this transport silently normalizing a
+    /// corrupted wire.
+    fn stripCliLineFraming(stdout: []const u8) ?[]const u8 {
+        if (stdout.len < 1 or stdout[stdout.len - 1] != '\n') return null;
+        return stdout[0 .. stdout.len - 1];
+    }
+
     /// Fetch one bounded, deterministic task-subgraph snapshot under TinyKG's
     /// store lock. The JSON is intentionally left opaque here; the independent
     /// task_projection module owns schema and referential-integrity validation.
@@ -1510,7 +1523,8 @@ pub const KgClient = struct {
             "1024",          "--max-chars",   "200000",
         });
         defer self.freeOut(out);
-        const snapshot = std.mem.trim(u8, out.stdout, " \r\n\t");
+        const snapshot = stripCliLineFraming(out.stdout) orelse
+            return self.dataError("task-snapshot {d} 缺少 CLI LF 框架: {s}", .{ root_id, trimForLog(out.stdout) });
         if (snapshot.len < 2 or snapshot[0] != '{' or snapshot[snapshot.len - 1] != '}')
             return self.dataError("task-snapshot {d} 非 JSON object: {s}", .{ root_id, trimForLog(snapshot) });
         return self.allocator.dupe(u8, snapshot) catch KgError.OutOfMemory;
@@ -1537,10 +1551,15 @@ pub const KgClient = struct {
             "--max-chars",            "200000",
         });
         defer self.freeOut(out);
-        // This command's stdout is a canonical wire artifact. Preserve the
-        // exact bytes so the adapter rejects, rather than silently normalizes,
-        // a CLI-added newline or any other suffix before hashing it.
-        const snapshot = out.stdout;
+        // This command's stdout is a canonical wire artifact plus the CLI's
+        // mandatory single-LF line framing. Strip exactly that one framing
+        // byte; a missing frame or any other suffix fails typed rather than
+        // this transport silently normalizing bytes it will later hash.
+        const snapshot = stripCliLineFraming(out.stdout) orelse
+            return self.dataError(
+                "ontology-rule-snapshot project={d} 缺少 CLI LF 框架: {s}",
+                .{ project_id, trimForLog(out.stdout) },
+            );
         if (snapshot.len < 2 or snapshot[0] != '{' or snapshot[snapshot.len - 1] != '}')
             return self.dataError(
                 "ontology-rule-snapshot project={d} 非 JSON object: {s}",

@@ -23,6 +23,37 @@ pub fn TaskLeaseCommands(comptime Ops: type) type {
             var context = try Ops.Context.init(allocator, io, db.db_path);
             defer context.deinit();
 
+            try finishClaim(&context, parsed, task_id, writer, allocator);
+        }
+
+        /// Daemon-resident variant: identical parsing and lease policy, but
+        /// the mutation runs on a store the caller keeps open (no CLI lock, no
+        /// open/close). The parsed db path must match the borrowed store.
+        pub fn runClaimWithStore(
+            store: anytype,
+            args: []const []const u8,
+            writer: anytype,
+            allocator: std.mem.Allocator,
+            io: std.Io,
+        ) !void {
+            const db = try Ops.parseDbArguments(allocator, io, args, 3, 6);
+            const parsed = try Arguments.parseClaim(db.rest, Ops.defaultClaimTtlSeconds());
+            const task_id = try Ops.parseTaskId(parsed.task_id);
+            if (!std.mem.eql(u8, db.db_path, store.dir_path)) return error.StorePathMismatch;
+
+            var context = Ops.Context.initBorrowed(io, store);
+            defer context.deinit();
+
+            try finishClaim(&context, parsed, task_id, writer, allocator);
+        }
+
+        fn finishClaim(
+            context: anytype,
+            parsed: anytype,
+            task_id: anytype,
+            writer: anytype,
+            allocator: std.mem.Allocator,
+        ) !void {
             // Preserve the command contract: claim identity is validated only
             // after the target store has been opened under the CLI lock.
             const agent_name = try Ops.validateTaskLeaseAgentIdentity(parsed.by orelse return error.MissingArgument);
@@ -62,6 +93,40 @@ pub fn TaskLeaseCommands(comptime Ops: type) type {
 
             var context = try Ops.Context.init(allocator, io, db.db_path);
             defer context.deinit();
+
+            try finishRelease(&context, parsed, release_by, task_id, writer, allocator);
+        }
+
+        /// Daemon-resident variant of `runRelease`; see `runClaimWithStore`.
+        pub fn runReleaseWithStore(
+            store: anytype,
+            args: []const []const u8,
+            writer: anytype,
+            allocator: std.mem.Allocator,
+            io: std.Io,
+        ) !void {
+            const db = try Ops.parseDbArguments(allocator, io, args, 1, 4);
+            const parsed = try Arguments.parseRelease(db.rest);
+            // Release historically validates authority before parsing the id
+            // or opening the store; keep that observable error ordering.
+            const release_by = if (parsed.by) |identity| try Ops.validateTaskLeaseAgentIdentity(identity) else null;
+            const task_id = try Ops.parseTaskId(parsed.task_id);
+            if (!std.mem.eql(u8, db.db_path, store.dir_path)) return error.StorePathMismatch;
+
+            var context = Ops.Context.initBorrowed(io, store);
+            defer context.deinit();
+
+            try finishRelease(&context, parsed, release_by, task_id, writer, allocator);
+        }
+
+        fn finishRelease(
+            context: anytype,
+            parsed: anytype,
+            release_by: ?[]const u8,
+            task_id: anytype,
+            writer: anytype,
+            allocator: std.mem.Allocator,
+        ) !void {
             var inspection = try context.inspectRelease(allocator, task_id);
             defer inspection.deinit(allocator);
 

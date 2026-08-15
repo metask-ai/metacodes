@@ -39,9 +39,20 @@ pub fn InMemoryIndex(
         };
 
         const Posting = struct {
-            doc_index: usize,
+            doc_index: u32,
             weighted_tf: f32,
             raw_tf: u32,
+        };
+
+        /// One term of the compacted immutable index: its bytes live in
+        /// `compact_terms_blob` and its postings in `compact_postings`, so a
+        /// finished index holds three exact-size allocations instead of one
+        /// separately allocated term string and posting list per term.
+        const CompactTermEntry = struct {
+            term_off: u32,
+            term_len: u32,
+            postings_off: u32,
+            postings_len: u32,
         };
 
         const PendingPostingTerm = struct {
@@ -63,6 +74,10 @@ pub fn InMemoryIndex(
             total_doc_len: f32 = 0,
             field_weights: TextFieldWeights = .{},
             tokenizer_options: tokenizer.TokenizerOptions = .{},
+            compacted: bool = false,
+            compact_terms_blob: []u8 = &.{},
+            compact_entries: []CompactTermEntry = &.{},
+            compact_postings: []Posting = &.{},
 
             pub fn init(allocator: std.mem.Allocator) TextIndex {
                 return .{
@@ -82,6 +97,204 @@ pub fn InMemoryIndex(
                 for (self.owned_terms.items) |term| self.allocator.free(term);
                 self.owned_terms.deinit(self.allocator);
                 self.docs.deinit(self.allocator);
+                self.allocator.free(self.compact_terms_blob);
+                self.allocator.free(self.compact_entries);
+                self.allocator.free(self.compact_postings);
+            }
+
+            fn compactTermBytes(self: *const TextIndex, entry: CompactTermEntry) []const u8 {
+                return self.compact_terms_blob[entry.term_off .. entry.term_off + entry.term_len];
+            }
+
+            /// Postings for one term regardless of representation. The
+            /// compacted form binary-searches the sorted term table; the
+            /// mutable form consults the hash map.
+            fn lookupPostings(self: *const TextIndex, term: []const u8) ?[]const Posting {
+                if (!self.compacted) {
+                    const postings = self.postings_by_term.getPtr(term) orelse return null;
+                    return postings.items;
+                }
+                var low: usize = 0;
+                var high: usize = self.compact_entries.len;
+                while (low < high) {
+                    const middle = low + (high - low) / 2;
+                    const entry = self.compact_entries[middle];
+                    if (std.mem.order(u8, self.compactTermBytes(entry), term) == .lt) {
+                        low = middle + 1;
+                    } else {
+                        high = middle;
+                    }
+                }
+                if (low == self.compact_entries.len) return null;
+                const entry = self.compact_entries[low];
+                if (!std.mem.eql(u8, self.compactTermBytes(entry), term)) return null;
+                return self.compact_postings[entry.postings_off .. entry.postings_off + entry.postings_len];
+            }
+
+            /// Build a frozen index directly from a complete graph with one
+            /// tokenizer pass and exact-size final allocations: one term
+            /// blob, one sorted term table, one flat postings array and one
+            /// document array. Tokens and per-document scratch live in a
+            /// bounded reused arena; per-term occurrences go to one flat log
+            /// that is counting-sorted into the postings array. Document
+            /// order, per-term posting order and every BM25 scoring input
+            /// match the incremental addDocument path bit for bit; the
+            /// result is immutable and addDocument fails closed.
+            pub fn buildCompactFromGraph(
+                allocator: std.mem.Allocator,
+                source_graph: *const Graph,
+            ) !TextIndex {
+                const default_config = TextIndex.init(allocator);
+                const field_weights = default_config.field_weights;
+                const tokenizer_options = default_config.tokenizer_options;
+                try tokenizer.validateTokenizerOptions(tokenizer_options);
+
+                var scratch_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer scratch_state.deinit();
+                const scratch = scratch_state.allocator();
+                var doc_scratch_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer doc_scratch_state.deinit();
+
+                const LogEntry = struct {
+                    slot: u32,
+                    doc_index: u32,
+                    weighted_tf: f32,
+                    raw_tf: u32,
+                };
+                var log = std.ArrayList(LogEntry).empty;
+                defer log.deinit(allocator);
+                var term_slots = std.StringHashMap(u32).init(scratch);
+                var terms_by_slot = std.ArrayList([]const u8).empty;
+                var postings_per_slot = std.ArrayList(u32).empty;
+                var total_term_bytes: usize = 0;
+                var docs = std.ArrayList(IndexedDocument).empty;
+                errdefer docs.deinit(allocator);
+                var total_doc_len: f32 = 0;
+                // Reused across documents; keys are only valid within one
+                // document and the table is cleared, not freed.
+                var doc_terms = std.StringHashMap(WeightedTermFreq).init(scratch);
+
+                for (source_graph.nodes.items) |node| {
+                    if (node.status != .active) continue;
+                    if (searchable_document.Internal.isDeletedNodeTombstoneNode(node.kind, node.text)) continue;
+                    if (node.id == .none or node.id.toInt() == std.math.maxInt(u64)) return core.Error.InvalidId;
+                    if (docs.items.len >= std.math.maxInt(u32)) return error.RecordTooLarge;
+                    const doc_index: u32 = @intCast(docs.items.len);
+
+                    _ = doc_scratch_state.reset(.retain_capacity);
+                    doc_terms.clearRetainingCapacity();
+                    var doc_len: f32 = 0;
+                    var tokens = try tokenizer.tokenize(doc_scratch_state.allocator(), node.text, tokenizer_options);
+                    defer tokens.deinit();
+                    for (tokens.items.items) |term| {
+                        const next_doc_len = doc_len + field_weights.text;
+                        if (!std.math.isFinite(next_doc_len)) return core.Error.Unsupported;
+                        doc_len = next_doc_len;
+                        const entry = try doc_terms.getOrPut(term);
+                        if (entry.found_existing) {
+                            const next_weight = entry.value_ptr.weighted + field_weights.text;
+                            if (!std.math.isFinite(next_weight)) return core.Error.Unsupported;
+                            entry.value_ptr.weighted = next_weight;
+                            entry.value_ptr.raw = std.math.add(u32, entry.value_ptr.raw, 1) catch return error.RecordTooLarge;
+                        } else {
+                            entry.value_ptr.* = .{ .weighted = field_weights.text, .raw = 1 };
+                        }
+                    }
+                    if (doc_len <= 0) return core.Error.Unsupported;
+                    const next_total_doc_len = total_doc_len + doc_len;
+                    if (!std.math.isFinite(next_total_doc_len)) return core.Error.Unsupported;
+
+                    var doc_term_it = doc_terms.iterator();
+                    while (doc_term_it.next()) |entry| {
+                        const slot_entry = try term_slots.getOrPut(entry.key_ptr.*);
+                        if (!slot_entry.found_existing) {
+                            if (terms_by_slot.items.len >= std.math.maxInt(u32)) return core.Error.Unsupported;
+                            const owned_term = try scratch.dupe(u8, entry.key_ptr.*);
+                            slot_entry.key_ptr.* = owned_term;
+                            slot_entry.value_ptr.* = @intCast(terms_by_slot.items.len);
+                            try terms_by_slot.append(scratch, owned_term);
+                            try postings_per_slot.append(scratch, 0);
+                            total_term_bytes += owned_term.len;
+                        }
+                        const slot = slot_entry.value_ptr.*;
+                        postings_per_slot.items[slot] = std.math.add(u32, postings_per_slot.items[slot], 1) catch return core.Error.Unsupported;
+                        try log.append(allocator, .{
+                            .slot = slot,
+                            .doc_index = doc_index,
+                            .weighted_tf = entry.value_ptr.weighted,
+                            .raw_tf = entry.value_ptr.raw,
+                        });
+                    }
+
+                    try docs.append(allocator, .{ .node_id = node.id, .kind = node.kind, .len = doc_len });
+                    total_doc_len = next_total_doc_len;
+                }
+                if (log.items.len > std.math.maxInt(u32) or total_term_bytes > std.math.maxInt(u32)) {
+                    return core.Error.Unsupported;
+                }
+
+                // Sort terms, then counting-sort the log into exact postings.
+                const term_count = terms_by_slot.items.len;
+                const order = try scratch.alloc(u32, term_count);
+                for (order, 0..) |*slot, position| slot.* = @intCast(position);
+                const OrderContext = struct {
+                    terms: []const []const u8,
+                    fn lessThan(context: @This(), lhs: u32, rhs: u32) bool {
+                        return std.mem.order(u8, context.terms[lhs], context.terms[rhs]) == .lt;
+                    }
+                };
+                std.mem.sort(u32, order, OrderContext{ .terms = terms_by_slot.items }, OrderContext.lessThan);
+
+                const terms_blob = try allocator.alloc(u8, total_term_bytes);
+                errdefer allocator.free(terms_blob);
+                const entries = try allocator.alloc(CompactTermEntry, term_count);
+                errdefer allocator.free(entries);
+                const postings = try allocator.alloc(Posting, log.items.len);
+                errdefer allocator.free(postings);
+
+                const position_of_slot = try scratch.alloc(u32, term_count);
+                const cursors = try scratch.alloc(u32, term_count);
+                var term_off: u32 = 0;
+                var postings_off: u32 = 0;
+                for (order, 0..) |slot, position| {
+                    const term = terms_by_slot.items[slot];
+                    @memcpy(terms_blob[term_off .. term_off + term.len], term);
+                    entries[position] = .{
+                        .term_off = term_off,
+                        .term_len = @intCast(term.len),
+                        .postings_off = postings_off,
+                        .postings_len = postings_per_slot.items[slot],
+                    };
+                    position_of_slot[slot] = @intCast(position);
+                    cursors[position] = postings_off;
+                    term_off += @intCast(term.len);
+                    postings_off += postings_per_slot.items[slot];
+                }
+                for (log.items) |entry| {
+                    const position = position_of_slot[entry.slot];
+                    postings[cursors[position]] = .{
+                        .doc_index = entry.doc_index,
+                        .weighted_tf = entry.weighted_tf,
+                        .raw_tf = entry.raw_tf,
+                    };
+                    cursors[position] += 1;
+                }
+
+                const docs_exact = try docs.toOwnedSlice(allocator);
+                return .{
+                    .allocator = allocator,
+                    .postings_by_term = std.StringHashMap(std.ArrayList(Posting)).init(allocator),
+                    .doc_ids = std.AutoHashMap(u64, void).init(allocator),
+                    .owned_terms = .empty,
+                    .docs = std.ArrayList(IndexedDocument).fromOwnedSlice(docs_exact),
+                    .total_doc_len = total_doc_len,
+                    .field_weights = field_weights,
+                    .tokenizer_options = tokenizer_options,
+                    .compacted = true,
+                    .compact_terms_blob = terms_blob,
+                    .compact_entries = entries,
+                    .compact_postings = postings,
+                };
             }
 
             pub fn buildFromGraph(allocator: std.mem.Allocator, source_graph: *const Graph) !TextIndex {
@@ -219,19 +432,21 @@ pub fn InMemoryIndex(
                     if (entry.found_existing) continue;
                     entry.value_ptr.* = {};
                     stats.unique_query_terms += 1;
-                    if (self.postings_by_term.get(term)) |postings| {
+                    if (self.lookupPostings(term)) |postings| {
                         stats.matched_terms += 1;
-                        stats.postings_count_total = std.math.add(u64, stats.postings_count_total, postings.items.len) catch return error.RecordTooLarge;
-                        stats.max_postings_count = @max(stats.max_postings_count, postings.items.len);
+                        stats.postings_count_total = std.math.add(u64, stats.postings_count_total, postings.len) catch return error.RecordTooLarge;
+                        stats.max_postings_count = @max(stats.max_postings_count, postings.len);
                     }
                 }
                 return stats;
             }
 
             pub fn addDocument(self: *TextIndex, doc: TextDocument) !void {
+                if (self.compacted) return core.Error.Unsupported;
                 try tokenizer.validateTokenizerOptions(self.tokenizer_options);
                 if (doc.node_id == .none or doc.node_id.toInt() == std.math.maxInt(u64) or self.doc_ids.contains(doc.node_id.toInt())) return core.Error.InvalidId;
-                const doc_index = self.docs.items.len;
+                if (self.docs.items.len >= std.math.maxInt(u32)) return error.RecordTooLarge;
+                const doc_index: u32 = @intCast(self.docs.items.len);
                 var term_weights = std.StringHashMap(WeightedTermFreq).init(self.allocator);
                 defer term_weights.deinit();
                 var owned_term_weights = std.ArrayList([]u8).empty;
@@ -331,9 +546,9 @@ pub fn InMemoryIndex(
 
                 var unique_query_terms = std.StringHashMap(void).init(self.allocator);
                 defer unique_query_terms.deinit();
-                var scores = std.AutoHashMap(usize, f32).init(self.allocator);
+                var scores = std.AutoHashMap(u32, f32).init(self.allocator);
                 defer scores.deinit();
-                var cjk_bigram_match_counts = std.AutoHashMap(usize, u32).init(self.allocator);
+                var cjk_bigram_match_counts = std.AutoHashMap(u32, u32).init(self.allocator);
                 defer cjk_bigram_match_counts.deinit();
                 const prealloc = search_contract.Internal.preallocCapacity(options);
                 try unique_query_terms.ensureTotalCapacity(@intCast(@min(query_tokens.items.items.len, prealloc)));
@@ -358,15 +573,30 @@ pub fn InMemoryIndex(
                     else
                         0;
 
-                    const postings = self.postings_by_term.get(term) orelse continue;
-                    const doc_freq: u64 = @intCast(postings.items.len);
-                    for (postings.items) |posting| {
+                    const postings = self.lookupPostings(term) orelse continue;
+                    // Incremental merge: rank both indexes on one scale by
+                    // scoring with the combined corpus statistics.
+                    const merged_doc_count: u64 = if (options.merge) |merge| merge.doc_count else @intCast(self.docs.items.len);
+                    const merged_avg_doc_len: f32 = if (options.merge) |merge| blk: {
+                        if (merge.doc_count == 0) break :blk 0;
+                        break :blk @floatCast(merge.total_doc_len / @as(f64, @floatFromInt(merge.doc_count)));
+                    } else self.avgDocLen();
+                    var doc_freq: u64 = @intCast(postings.len);
+                    if (options.merge) |merge| {
+                        doc_freq = std.math.add(u64, doc_freq, merge.otherDf(merge.other_df_context, term)) catch return error.RecordTooLarge;
+                    }
+                    for (postings) |posting| {
                         if (options.deadline.expired()) return core.Error.BudgetExceeded;
                         try search_contract.Internal.chargePostingScan(&postings_scanned, options);
                         const doc = self.docs.items[posting.doc_index];
                         if (!search_contract.Internal.matchesNodeKind(options, doc.kind)) continue;
                         if (options.member_filter) |members| {
                             if (!members.contains(doc.node_id.toInt())) continue;
+                        }
+                        if (options.merge) |merge| {
+                            if (merge.superseded_node_ids) |superseded| {
+                                if (superseded.contains(doc.node_id.toInt())) continue;
+                            }
                         }
                         if (cjk_bigram_query_term and posting.raw_tf >= required_cjk_bigram_count) {
                             const entry = try cjk_bigram_match_counts.getOrPut(posting.doc_index);
@@ -376,8 +606,8 @@ pub fn InMemoryIndex(
                         const score = scoring.bm25WeightedTermScore(
                             posting.weighted_tf,
                             doc.len,
-                            self.avgDocLen(),
-                            @intCast(self.docs.items.len),
+                            merged_avg_doc_len,
+                            merged_doc_count,
                             doc_freq,
                             options.params,
                         );
@@ -679,6 +909,53 @@ test "in-memory index preserves CJK coverage and tokenizer agreement" {
     try std.testing.expectError(TestCore.Error.Unsupported, index.search("错误", .{
         .tokenizer = .{ .max_token_bytes = tokenizer_mod.default_max_token_bytes - 1 },
     }));
+}
+
+test "in-memory index compact graph build matches incremental build bit for bit" {
+    var source = TestGraphModule.Graph.init(std.testing.allocator);
+    defer source.deinit();
+    try source.add(.{ .id = .fromInt(3), .kind = .task, .text = "alpha beta alpha 错误记录 gamma" });
+    try source.add(.{ .id = .fromInt(1), .kind = .observation, .text = "alpha shared body" });
+    try source.add(.{ .id = .fromInt(7), .kind = .edit, .text = "alpha shared body" });
+    try source.add(.{ .id = .fromInt(9), .kind = .task, .text = "错误 beta gamma delta" });
+
+    var incremental = try TestTextIndex.buildFromGraph(std.testing.allocator, &source);
+    defer incremental.deinit();
+    var compact = try TestTextIndex.buildCompactFromGraph(std.testing.allocator, &source);
+    defer compact.deinit();
+
+    try std.testing.expect(compact.compacted);
+    try std.testing.expectEqual(incremental.docs.items.len, compact.docs.items.len);
+    try std.testing.expectEqual(incremental.total_doc_len, compact.total_doc_len);
+    for (incremental.docs.items, compact.docs.items) |expected, actual| {
+        try std.testing.expectEqual(expected.node_id, actual.node_id);
+        try std.testing.expectEqual(expected.kind, actual.kind);
+        try std.testing.expectEqual(expected.len, actual.len);
+    }
+
+    for ([_][]const u8{ "alpha", "alpha beta", "错误记录", "shared body", "gamma delta", "absent" }) |query| {
+        var expected_hits = try incremental.search(query, .{ .limit = 8 });
+        defer expected_hits.deinit(std.testing.allocator);
+        var actual_hits = try compact.search(query, .{ .limit = 8 });
+        defer actual_hits.deinit(std.testing.allocator);
+        try std.testing.expectEqual(expected_hits.items.len, actual_hits.items.len);
+        for (expected_hits.items, actual_hits.items) |expected, actual| {
+            try std.testing.expectEqual(expected.node_id, actual.node_id);
+            try std.testing.expectEqual(expected.kind, actual.kind);
+            try std.testing.expectEqual(expected.score, actual.score);
+            try std.testing.expectEqual(expected.match_count, actual.match_count);
+        }
+        const expected_stats = try incremental.queryPlanStats(query, .{});
+        const actual_stats = try compact.queryPlanStats(query, .{});
+        try std.testing.expectEqual(expected_stats.matched_terms, actual_stats.matched_terms);
+        try std.testing.expectEqual(expected_stats.postings_count_total, actual_stats.postings_count_total);
+        try std.testing.expectEqual(expected_stats.max_postings_count, actual_stats.max_postings_count);
+    }
+
+    try std.testing.expectError(
+        TestCore.Error.Unsupported,
+        compact.addDocument(.{ .node_id = .fromInt(11), .kind = .task, .text = "rejected" }),
+    );
 }
 
 test "in-memory index graph builder excludes inactive and tombstone nodes" {

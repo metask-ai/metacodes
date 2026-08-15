@@ -6,6 +6,7 @@ const schema = @import("schema.zig");
 const storage_mod = @import("storage.zig");
 const read_only_memory_map = @import("read_only_memory_map.zig");
 const tokenizer_mod = @import("text/tokenizer.zig");
+const bench_trace_environment = @import("text/bench_trace_environment.zig");
 const catalog_format_mod = @import("text/catalog_format.zig");
 const scoring_mod = @import("text/scoring.zig");
 const search_contract_mod = @import("text/search_contract.zig");
@@ -286,7 +287,317 @@ const QueryExecutionOps = struct {
         defer index.deinit();
         stats.* = try index.queryPlanStats(query, options);
     }
+
+    pub fn searchPersistentWithAppendedTail(
+        allocator: std.mem.Allocator,
+        store: storage_mod.Store,
+        query: []const u8,
+        query_terms: []const []u8,
+        options: TextSearchOptions,
+    ) !?std.ArrayList(TextSearchHit) {
+        return searchPersistentWithAppendedTailImpl(allocator, store, query, query_terms, options);
+    }
 };
+
+/// Upper bound on appended-tail nodes served from a RAM merge before queries
+/// fall back to full staleness handling and the maintenance policy owes a
+/// catalog republication. Bounds the transient tail index memory.
+const incremental_text_tail_max_nodes: u64 = 20_000;
+
+fn incrementalTailOtherDf(context: *anyopaque, term: []const u8) u64 {
+    const map: *const std.StringHashMap(u64) = @ptrCast(@alignCast(context));
+    return map.get(term) orelse 0;
+}
+
+/// Process-wide cache of the incremental tail context so a long-lived reader
+/// (the daemon) pays the O(tail) walk and index build once per store state
+/// instead of once per query. The key pins the exact snapshot the tail was
+/// proven against — store identity, publication watermark, live event bytes,
+/// node digest, and searchable metadata digest — so a hit is byte-equivalent
+/// to rebuilding, and any write moves event bytes and misses. Single-threaded
+/// by the same execution model as the rest of the engine; a future threaded
+/// read path must revisit this along with every other shared structure.
+const CachedTailContext = struct {
+    dir_hash: u64,
+    indexed_event_bytes: u64,
+    event_bytes: u64,
+    node_digest: u64,
+    searchable_metadata_digest: u64,
+    tick: u64,
+    index: TextIndex,
+    node_ids: std.AutoHashMap(u64, void),
+
+    fn deinitAndFree(self: *CachedTailContext) void {
+        self.index.deinit();
+        self.node_ids.deinit();
+        tail_cache_allocator.destroy(self);
+    }
+};
+
+const tail_cache_allocator = std.heap.smp_allocator;
+var tail_cache_slots: [2]?*CachedTailContext = .{ null, null };
+var tail_cache_tick: u64 = 0;
+
+const TailExtension = enum {
+    /// delta verified and folded in; the entry now matches the live store
+    extended,
+    /// nothing was mutated (walk failed or digest chain broke); the entry is
+    /// still a valid snapshot of its recorded frontier
+    intact,
+    /// mutation started and then failed; the entry must be discarded
+    poisoned,
+};
+
+/// Extend a cached tail context across an append-only delta, walking only
+/// the events past the cached frontier. The digest chain is proven before
+/// any mutation: cached digest XOR delta digest must equal the live index
+/// digest, the same proof shape the full walk gives from the publication
+/// watermark.
+fn extendCachedTailContext(
+    entry: *CachedTailContext,
+    store: storage_mod.Store,
+    index_meta: storage_mod.IndexMeta,
+) !TailExtension {
+    const allocator = tail_cache_allocator;
+    if (entry.node_ids.count() >= incremental_text_tail_max_nodes) return .intact;
+    var delta = store.collectNodeTailAppendedSince(
+        allocator,
+        entry.event_bytes,
+        incremental_text_tail_max_nodes - entry.node_ids.count(),
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .intact,
+    };
+    defer delta.deinit(allocator);
+    if ((entry.node_digest ^ delta.node_digest_xor) != index_meta.node_digest) return .intact;
+
+    entry.node_ids.ensureUnusedCapacity(@intCast(delta.ids.items.len)) catch return error.OutOfMemory;
+    for (delta.ids.items) |id| {
+        entry.node_ids.putAssumeCapacity(id, {});
+        var node = (store.readNodeById(allocator, core.NodeId.fromInt(id)) catch {
+            return .poisoned;
+        }) orelse continue;
+        defer node.deinit(allocator);
+        if (isDeletedNodeTombstoneNode(node.kind, node.text)) continue;
+        entry.index.addDocument(.{ .node_id = node.id, .kind = node.kind, .text = node.text }) catch {
+            return .poisoned;
+        };
+    }
+    entry.event_bytes = index_meta.event_bytes;
+    entry.node_digest = index_meta.node_digest;
+    return .extended;
+}
+
+fn obtainCachedTailContext(
+    store: storage_mod.Store,
+    text_meta: PersistentTextMeta,
+    index_meta: storage_mod.IndexMeta,
+    searchable_metadata_digest: u64,
+) !?*CachedTailContext {
+    const dir_hash = std.hash.Wyhash.hash(0x544B_5443, store.dir_path);
+    tail_cache_tick += 1;
+    for (tail_cache_slots) |maybe_entry| {
+        const entry = maybe_entry orelse continue;
+        if (entry.dir_hash != dir_hash) continue;
+        if (entry.indexed_event_bytes != text_meta.indexed_event_bytes) continue;
+        if (entry.searchable_metadata_digest != searchable_metadata_digest) continue;
+        if (entry.event_bytes == index_meta.event_bytes and entry.node_digest == index_meta.node_digest) {
+            entry.tick = tail_cache_tick;
+            return entry;
+        }
+        if (entry.event_bytes < index_meta.event_bytes) {
+            const extension = extendCachedTailContext(entry, store, index_meta) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                unreachable;
+            };
+            switch (extension) {
+                .extended => {
+                    entry.tick = tail_cache_tick;
+                    return entry;
+                },
+                .intact => {},
+                .poisoned => {
+                    for (&tail_cache_slots) |*slot| {
+                        if (slot.* == entry) {
+                            entry.deinitAndFree();
+                            slot.* = null;
+                            break;
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    const allocator = tail_cache_allocator;
+    var tail = store.collectNodeTailAppendedSince(
+        allocator,
+        text_meta.indexed_event_bytes,
+        incremental_text_tail_max_nodes,
+    ) catch |err| switch (err) {
+        error.FileNotFound, error.InvalidRecord, error.RecordTooLarge => return null,
+        else => |other| return other,
+    };
+    defer tail.deinit(allocator);
+    if ((text_meta.node_digest ^ tail.node_digest_xor) != index_meta.node_digest) return null;
+
+    // Tail docs provably carry no searchable name/summary metadata: setting
+    // one would have changed the searchable metadata digest checked above.
+    var tail_index = TextIndex.init(allocator);
+    errdefer tail_index.deinit();
+    var tail_node_ids = std.AutoHashMap(u64, void).init(allocator);
+    errdefer tail_node_ids.deinit();
+    try tail_node_ids.ensureTotalCapacity(@intCast(tail.ids.items.len));
+    for (tail.ids.items) |id| {
+        tail_node_ids.putAssumeCapacity(id, {});
+        var node = (store.readNodeById(allocator, core.NodeId.fromInt(id)) catch |err| switch (err) {
+            error.FileNotFound, error.InvalidRecord => {
+                tail_index.deinit();
+                tail_node_ids.deinit();
+                return null;
+            },
+            else => |other| return other,
+        }) orelse continue;
+        defer node.deinit(allocator);
+        if (isDeletedNodeTombstoneNode(node.kind, node.text)) continue;
+        try tail_index.addDocument(.{ .node_id = node.id, .kind = node.kind, .text = node.text });
+    }
+
+    const entry = try allocator.create(CachedTailContext);
+    errdefer allocator.destroy(entry);
+    entry.* = .{
+        .dir_hash = dir_hash,
+        .indexed_event_bytes = text_meta.indexed_event_bytes,
+        .event_bytes = index_meta.event_bytes,
+        .node_digest = index_meta.node_digest,
+        .searchable_metadata_digest = searchable_metadata_digest,
+        .tick = tail_cache_tick,
+        .index = tail_index,
+        .node_ids = tail_node_ids,
+    };
+
+    var victim_slot: usize = 0;
+    var victim_tick: u64 = std.math.maxInt(u64);
+    for (&tail_cache_slots, 0..) |*slot, slot_index| {
+        if (slot.* == null) {
+            victim_slot = slot_index;
+            victim_tick = 0;
+            break;
+        }
+        if (slot.*.?.tick < victim_tick) {
+            victim_tick = slot.*.?.tick;
+            victim_slot = slot_index;
+        }
+    }
+    if (tail_cache_slots[victim_slot]) |old| old.deinitAndFree();
+    tail_cache_slots[victim_slot] = entry;
+    return entry;
+}
+
+/// Serve a query on a stale-but-append-only catalog by merging the published
+/// index with a RAM index over the appended tail. Returns null whenever any
+/// eligibility proof fails, so callers keep the exact full staleness
+/// semantics as fallback. Eligibility is proof-based, not heuristic: the
+/// searchable metadata digest must be unchanged since publication and the
+/// published node digest XORed with the walked tail's digests must reproduce
+/// the live index node digest exactly.
+fn searchPersistentWithAppendedTailImpl(
+    allocator: std.mem.Allocator,
+    store: storage_mod.Store,
+    query: []const u8,
+    query_terms: []const []u8,
+    options: TextSearchOptions,
+) !?std.ArrayList(TextSearchHit) {
+    const text_meta = readPersistentTextMeta(allocator, store) catch |err| switch (err) {
+        error.FileNotFound, error.InvalidRecord => return null,
+        else => |other| return other,
+    };
+    if (text_meta.indexed_event_bytes == 0) return null;
+    const index_meta = currentPersistentTextMetaAnchor(store) catch |err| switch (err) {
+        error.FileNotFound, error.InvalidRecord => return null,
+        else => |other| return other,
+    };
+    const searchable_metadata_digest = store.searchableNodeMetadataDigestLimitedDeadline(
+        allocator,
+        stale_store_scan_max_property_delta_bytes,
+        options.deadline,
+    ) catch |err| switch (err) {
+        // An oversized property delta must surface through the fallback's
+        // canonical TextIndexMaintenanceRequired, not leak the budget error.
+        error.SearchableMetadataBudgetExceeded => return null,
+        error.FileNotFound, error.InvalidRecord => return null,
+        else => |other| return other,
+    };
+    if (searchable_metadata_digest != text_meta.searchable_metadata_digest) return null;
+
+    const cached_tail = (try obtainCachedTailContext(store, text_meta, index_meta, searchable_metadata_digest)) orelse return null;
+    const tail_index = &cached_tail.index;
+    const tail_node_ids = &cached_tail.node_ids;
+
+    // Per-term document frequencies each side contributes to the other.
+    var catalog_df = std.StringHashMap(u64).init(allocator);
+    defer catalog_df.deinit();
+    var tail_df = std.StringHashMap(u64).init(allocator);
+    defer tail_df.deinit();
+    {
+        var catalog = PersistentPostingCatalog.open(allocator, store, text_meta.doc_count) catch |err| switch (err) {
+            error.FileNotFound, error.InvalidRecord => return null,
+            else => |other| return other,
+        };
+        defer catalog.deinit();
+        for (query_terms) |term| {
+            const catalog_entry = try catalog_df.getOrPut(term);
+            if (catalog_entry.found_existing) continue;
+            catalog_entry.value_ptr.* = if (try catalog.findTermEntry(term)) |lookup| lookup.entry.postings_count else 0;
+            const tail_postings: u64 = if (tail_index.postings_by_term.get(term)) |postings| @intCast(postings.items.len) else 0;
+            try tail_df.put(term, tail_postings);
+        }
+    }
+
+    const tail_doc_count: u64 = @intCast(tail_index.docs.items.len);
+    const field_weights = TextFieldWeights{};
+    const merged_total_doc_len: f64 =
+        @as(f64, @floatFromInt(text_meta.total_text_tokens)) * field_weights.text +
+        @as(f64, tail_index.total_doc_len);
+    const catalog_merge = search_contract.TextMergeStats{
+        .doc_count = text_meta.doc_count + tail_doc_count,
+        .total_doc_len = merged_total_doc_len,
+        .other_df_context = @ptrCast(&tail_df),
+        .otherDf = incrementalTailOtherDf,
+    };
+    const tail_merge = search_contract.TextMergeStats{
+        .doc_count = text_meta.doc_count + tail_doc_count,
+        .total_doc_len = merged_total_doc_len,
+        .other_df_context = @ptrCast(&catalog_df),
+        .otherDf = incrementalTailOtherDf,
+    };
+
+    var catalog_options = options;
+    catalog_options.merge = &catalog_merge;
+    // BudgetExceeded declines the merge instead of failing the query: the
+    // fallback path owns the product semantics for unserveable scans.
+    var catalog_hits = QueryExecutionOps.searchPersistentTokens(allocator, store, query_terms, catalog_options) catch |err| switch (err) {
+        error.FileNotFound, error.InvalidRecord, core.Error.BudgetExceeded => return null,
+        else => |other| return other,
+    };
+    defer catalog_hits.deinit(allocator);
+    var tail_options = options;
+    tail_options.merge = &tail_merge;
+    var tail_hits = try tail_index.search(query, tail_options);
+    // the cached tail index allocates its results with its own allocator
+    defer tail_hits.deinit(tail_cache_allocator);
+
+    var combined = std.ArrayList(TextSearchHit).empty;
+    errdefer combined.deinit(allocator);
+    for (catalog_hits.items) |hit| {
+        if (tail_node_ids.contains(hit.node_id.toInt())) continue;
+        try combined.append(allocator, hit);
+    }
+    try combined.appendSlice(allocator, tail_hits.items);
+    std.mem.sort(TextSearchHit, combined.items, {}, textSearchHitLessThan);
+    if (combined.items.len > options.limit) combined.shrinkRetainingCapacity(options.limit);
+    return combined;
+}
 
 /// Private persisted-reader backend for the cohesive token execution owner.
 /// It exposes no runtime entrypoint: callers reach the implementation only
@@ -648,10 +959,24 @@ const persistent_posting_block_ordinal_len = search_acceleration_format.Internal
 const persistent_block_score_f16_max = search_acceleration_format.Internal.persistent_block_score_f16_max;
 const persistent_term_top_hit_capacity: u64 = 64;
 const persistent_term_top_hit_capacity_usize: usize = @intCast(persistent_term_top_hit_capacity);
+/// Public bound for callers that over-fetch candidates (for example the
+/// TinyQL latest-generation retention probe): a candidate request kept at or
+/// below this value can be served from the persistent top-hit caches, while
+/// one candidate more forces common terms onto the unbounded posting scan.
+pub const persistent_term_top_hit_candidate_budget: usize = @intCast(persistent_term_top_hit_capacity);
 const persistent_term_top_hit_regular_probe_capacity: usize = 8;
 // Medium-frequency terms can still blow the aggregate multi-term scan budget
 // at GB3+ even when each term is far below the default per-query cap.
-const persistent_term_top_hit_production_min_postings: u64 = 137_000;
+// Tied to the default posting-scan budget: any term too large to scan within
+// `core.default_max_text_postings_scanned` must have a persisted top-hit
+// cache, otherwise queries touching it can only fail with BudgetExceeded. A
+// gap between these two constants is an unserveable posting-count band.
+// Medium-frequency terms (tens of thousands of postings) dominate read P95:
+// they stay under the scan budget, so without a published top-hit list every
+// query walks their whole posting range (~5ms on a gb1 store). Publishing
+// top hits from two posting blocks up keeps those queries on the ~1ms cached
+// path; the scan budget itself stays at default_max_text_postings_scanned.
+const persistent_term_top_hit_production_min_postings: u64 = 8_192;
 const persistent_term_top_hit_test_min_postings: u64 = persistent_posting_block_size;
 const persistent_term_top_hit_min_postings: u64 = if (builtin.is_test)
     persistent_term_top_hit_test_min_postings
@@ -678,7 +1003,42 @@ const persistent_dense_all_docs_freq_mode_bitpacked: u8 = 2;
 const text_posting_run_direct_merge_fan_in: usize = 128;
 // Keep chunks large enough that real-shaped GB10 does not pay excessive
 // run/summary rewrites while still respecting the fd-safe merge fan-in.
-const text_posting_run_chunk_records: usize = 3 * 1024 * 1024;
+const text_posting_run_chunk_records_default: usize = 3 * 1024 * 1024;
+
+/// Chunk capacity is a maintenance-job memory budget, not a service-runtime
+/// one: the resident query daemons never build runs. A fixed chunk makes run
+/// count grow linearly with the corpus, and once it passes the merge fan-in
+/// the publication pays a whole extra rewrite pass of every posting (measured
+/// 12.7x per-posting cost at gb10 against gb1). Maintenance therefore scales
+/// the chunk with the corpus so the expected run count stays inside one merge
+/// pass, and only the resident service keeps the flat default.
+var text_posting_run_chunk_records_runtime: usize = text_posting_run_chunk_records_default;
+
+fn textPostingRunChunkRecords() usize {
+    return text_posting_run_chunk_records_runtime;
+}
+
+/// Scale the run-chunk budget for a maintenance rebuild over `doc_count`
+/// documents. Postings-per-document is corpus-shaped and stable across the
+/// audited corpora (~200); the chunk is sized so expected runs fit one merge
+/// pass, clamped to [default, 64Mi records] (a ~1.5GiB ceiling at 24 bytes
+/// per record). `TINYKG_TEXT_REBUILD_CHUNK_RECORDS` overrides the result for
+/// deliberate experiments and constrained hosts.
+pub fn scaleTextPostingRunChunkRecordsForCorpus(doc_count: u64) void {
+    const max_chunk_records: u64 = 64 * 1024 * 1024;
+    if (std.c.getenv("TINYKG_TEXT_REBUILD_CHUNK_RECORDS")) |raw| {
+        const parsed = std.fmt.parseInt(u64, std.mem.span(raw), 10) catch 0;
+        if (parsed != 0) {
+            text_posting_run_chunk_records_runtime = std.math.cast(usize, @min(parsed, max_chunk_records)) orelse text_posting_run_chunk_records_default;
+            return;
+        }
+    }
+    const postings_per_doc: u64 = 202;
+    const expected_postings = std.math.mul(u64, doc_count, postings_per_doc) catch max_chunk_records * text_posting_run_direct_merge_fan_in;
+    const single_pass_chunk = std.math.divCeil(u64, expected_postings, text_posting_run_direct_merge_fan_in) catch max_chunk_records;
+    const clamped = @min(max_chunk_records, @max(@as(u64, text_posting_run_chunk_records_default), single_pass_chunk));
+    text_posting_run_chunk_records_runtime = std.math.cast(usize, clamped) orelse text_posting_run_chunk_records_default;
+}
 const text_posting_run_merge_fan_in: usize = 128;
 const text_posting_run_front_coded_legacy_magic = "TKGRUN3\n".*;
 const text_posting_run_front_coded_magic = "TKGRUN4\n".*;
@@ -1684,14 +2044,35 @@ const TextPostingScanGuard = union(enum) {
     search: TextPostingSearchGuard,
 };
 
+/// Reading the clock costs more than decoding a posting, so checking the
+/// deadline on every posting spends the scan's time in `clock_gettime`
+/// (measured ~35% of a common-term query). One clock read per stride keeps
+/// expiry precision in the tens of microseconds and the clock out of the hot
+/// loop. `.immediate` deadlines still fire on the first posting, and the
+/// posting budget stays exact — only the wall-clock probe is strided.
+const deadline_check_stride = 256;
+var deadline_check_tick: usize = 0;
+
+fn deadlineExpiredStrided(deadline: core.QueryDeadline) bool {
+    switch (deadline) {
+        .none => return false,
+        .immediate => return true,
+        .at => {
+            deadline_check_tick +%= 1;
+            if (deadline_check_tick % deadline_check_stride != 0) return false;
+            return deadline.expired();
+        },
+    }
+}
+
 fn guardBeforeTextPosting(guard: TextPostingScanGuard) !void {
     switch (guard) {
         .none => {},
         .deadline => |deadline| {
-            if (deadline.expired()) return core.Error.BudgetExceeded;
+            if (deadlineExpiredStrided(deadline)) return core.Error.BudgetExceeded;
         },
         .search => |search_guard| {
-            if (search_guard.options.deadline.expired()) return core.Error.BudgetExceeded;
+            if (deadlineExpiredStrided(search_guard.options.deadline)) return core.Error.BudgetExceeded;
             try chargeTextPostingScan(search_guard.postings_scanned, search_guard.options);
         },
     }
@@ -2233,8 +2614,7 @@ pub const PersistentPostingCompressionEstimate = struct {
 pub const PersistentTextRebuildBenchResult = rebuild_runtime.PersistentTextRebuildBenchResult;
 
 fn textBenchTraceEnabled() bool {
-    if (!builtin.link_libc) return false;
-    return std.c.getenv("TINYKG_BENCH_TRACE") != null;
+    return bench_trace_environment.enabled();
 }
 
 fn textBenchTrace(comptime label: []const u8) void {
@@ -2316,6 +2696,10 @@ fn persistentTextMetaFromIndexMeta(index_meta: storage_mod.IndexMeta) Persistent
     return .{
         .node_digest = index_meta.node_digest,
         .node_by_text_order_digest = index_meta.node_by_text_order_digest,
+        // The anchor is verified against the live event log before rebuild, so
+        // this is the exact watermark the published catalog covers; the
+        // incremental tail is everything the event log appends after it.
+        .indexed_event_bytes = index_meta.event_bytes,
     };
 }
 
@@ -2430,6 +2814,18 @@ fn collectTextPosting(context: *CollectTextPostingsContext, posting: TextPosting
     try context.out.append(context.allocator, posting);
 }
 
+/// Drop and re-create a catalog file view's mapping mid-scan so a long
+/// sequential pass does not keep every touched clean page in the process
+/// peak RSS. A failed re-map leaves the view on its positional-read path.
+fn remapCatalogViewForScan(view: anytype) void {
+    if (view.map) |*map| {
+        map.destroy(view.io);
+        view.map = null;
+        const len = std.math.cast(usize, view.size) orelse return;
+        view.map = read_only_memory_map.create(view.io, view.file, len) catch null;
+    }
+}
+
 pub fn estimatePersistentPostingCompression(allocator: std.mem.Allocator, store: storage_mod.Store) !PersistentPostingCompressionEstimate {
     const doc_count = try readPersistentTextDocCount(allocator, store);
     var catalog = try PersistentPostingCatalog.open(allocator, store, doc_count);
@@ -2438,7 +2834,21 @@ pub fn estimatePersistentPostingCompression(allocator: std.mem.Allocator, store:
     var estimate = PersistentPostingCompressionEstimate{};
     var expected_postings_offset: u64 = 0;
     var term_index: u64 = 0;
+    // The scan touches every catalog page exactly once; without dropping the
+    // mappings periodically the whole postings, terms, blocks, and impacts
+    // files end up resident and dominate the process peak RSS on real-entropy
+    // vocabularies. Darwin ignores madvise on file-backed maps, so remapping
+    // is the portable release.
+    var released_postings: u64 = 0;
+    const release_stride: u64 = 64 * 1024 * 1024;
     while (term_index < catalog.terms_header.term_count) : (term_index += 1) {
+        if (expected_postings_offset >= released_postings + release_stride) {
+            remapCatalogViewForScan(&catalog.postings_view);
+            remapCatalogViewForScan(&catalog.terms_view);
+            remapCatalogViewForScan(&catalog.blocks_view);
+            remapCatalogViewForScan(&catalog.impacts_view);
+            released_postings = expected_postings_offset;
+        }
         const entry = try catalog.terms_view.readEntryAt(catalog.terms_header, term_index);
         var context = PostingCompressionEstimateContext{ .estimate = &estimate };
         if (termEntryHasInlinePosting(entry)) {
@@ -3692,7 +4102,7 @@ const PersistentSearchMediumTopCandidateContext = struct {
 };
 
 fn collectPersistentSearchMediumTopCandidatePosting(ctx: *PersistentSearchMediumTopCandidateContext, posting: TextPostingRecord, _: u64) !void {
-    if (ctx.options.deadline.expired()) return core.Error.BudgetExceeded;
+    if (deadlineExpiredStrided(ctx.options.deadline)) return core.Error.BudgetExceeded;
     if (posting.doc_id == 0 or posting.doc_id > ctx.doc_count) return error.InvalidRecord;
     const doc = try ctx.docs_view.readTopHitDocStatsAt(posting.doc_id - 1);
     if (doc.doc_id != posting.doc_id) return error.InvalidRecord;
@@ -3714,7 +4124,7 @@ fn collectPersistentSearchMediumTopCandidatePosting(ctx: *PersistentSearchMedium
 }
 
 fn collectPersistentSearchCandidatePosting(ctx: *PersistentSearchCandidateContext, posting: TextPostingRecord, _: u64) !void {
-    if (ctx.options.deadline.expired()) return core.Error.BudgetExceeded;
+    if (deadlineExpiredStrided(ctx.options.deadline)) return core.Error.BudgetExceeded;
     _ = ctx.allocator;
     _ = ctx.store;
     _ = ctx.node_view;
@@ -3850,7 +4260,7 @@ fn fillPostingCandidateTextFreqs(
     var target_index: usize = 0;
     var local_block_index: u64 = 0;
     while (target_index < sorted_doc_ids.len and local_block_index < block_count) {
-        if (deadline.expired()) return core.Error.BudgetExceeded;
+        if (deadlineExpiredStrided(deadline)) return core.Error.BudgetExceeded;
         const target_doc_id = sorted_doc_ids[target_index];
         var block = try catalog.blocks_view.readBlockRecordAt(catalog.blocks_header.term_count, term_block_offset + local_block_index);
         while (block.last_doc_id < target_doc_id) {
@@ -4100,8 +4510,6 @@ fn denseAllDocsFreqAtFromFile(
 }
 
 fn canUsePersistentTermTopHitCache(options: TextSearchOptions, entry: TextTermEntry) bool {
-    if (textSearchHasNodeFilter(options)) return false;
-    if (options.member_filter != null) return false; // top-hit 缓存是全库序,过滤前截断会漏
     if (options.limit == 0 or options.limit > persistent_term_top_hit_capacity) return false;
     if (entry.postings_count < persistent_term_top_hit_min_postings) return false;
     const default_params = Bm25Params{};
@@ -4149,11 +4557,14 @@ fn readPersistentTermTopHitCache(
         else => |e| return e,
     };
     if (file_size != expected_size) return error.InvalidRecord;
-    const term_hits = (try readTextTermTopHitTermAt(store, file, header, term_index)) orelse return error.InvalidRecord;
+    // A missing term entry is not corruption: the file may have been
+    // published under an older, higher min-postings threshold. Fall back to
+    // the scan path, which is always correct, until the next publication.
+    const term_hits = (try readTextTermTopHitTermAt(store, file, header, term_index)) orelse return null;
     if (term_hits.hit_count > header.capacity) return error.InvalidRecord;
     if (term_hits.hit_offset > header.hit_count or term_hits.hit_count > header.hit_count - term_hits.hit_offset) return error.InvalidRecord;
     const expected_count = @min(entry.postings_count, header.capacity);
-    if (term_hits.hit_count != expected_count) return error.InvalidRecord;
+    if (term_hits.hit_count != expected_count) return null;
 
     var hits = std.ArrayList(TextSearchHit).empty;
     errdefer hits.deinit(allocator);
@@ -4162,7 +4573,7 @@ fn readPersistentTermTopHitCache(
     var previous_score: ?f32 = null;
     var pos: u64 = 0;
     while (pos < term_hits.hit_count) : (pos += 1) {
-        if (options.deadline.expired()) return core.Error.BudgetExceeded;
+        if (deadlineExpiredStrided(options.deadline)) return core.Error.BudgetExceeded;
         const record = try readTextTermTopHitRecordAt(store, file, term_hits.hit_offset + pos);
         const doc = try docs_view.readDocAt(record.doc_id - 1);
         if (doc.doc_id != record.doc_id) return error.InvalidRecord;
@@ -4211,7 +4622,7 @@ const SingleTermSearchContext = struct {
 };
 
 fn appendSingleTermSearchPosting(ctx: *SingleTermSearchContext, posting: TextPostingRecord, _: u64) !void {
-    if (ctx.options.deadline.expired()) return core.Error.BudgetExceeded;
+    if (deadlineExpiredStrided(ctx.options.deadline)) return core.Error.BudgetExceeded;
     const doc = if (ctx.validate_canonical_freqs)
         (try getCachedTextDocFromView(ctx.allocator, ctx.store, ctx.docs_view, ctx.node_view, ctx.docs, posting.doc_id)).doc
     else
@@ -4266,7 +4677,7 @@ const PersistentSearchTermContext = struct {
 };
 
 fn scorePersistentSearchPosting(ctx: *PersistentSearchTermContext, posting: TextPostingRecord, doc_freq: u64) !void {
-    if (ctx.options.deadline.expired()) return core.Error.BudgetExceeded;
+    if (deadlineExpiredStrided(ctx.options.deadline)) return core.Error.BudgetExceeded;
     const doc = if (ctx.validate_canonical_freqs)
         (try getCachedTextDocFromView(ctx.allocator, ctx.store, ctx.docs_view, ctx.node_view, ctx.docs, posting.doc_id)).doc
     else
@@ -4294,12 +4705,24 @@ fn scorePersistentSearchPosting(ctx: *PersistentSearchTermContext, posting: Text
             entry.value_ptr.* = std.math.add(u32, entry.value_ptr.*, 1) catch return error.RecordTooLarge;
         }
     }
+    // Incremental merge: exact scan paths score with combined corpus
+    // statistics so catalog and tail hits rank on one scale. Cached top-hit
+    // paths keep their published scores; that approximation is bounded by
+    // tail/N and recorded in the incremental design decision.
+    var effective_doc_freq = doc_freq;
+    var effective_avg_doc_len = ctx.avg_doc_len;
+    var effective_doc_count = ctx.doc_count;
+    if (ctx.options.merge) |merge| {
+        effective_doc_freq = std.math.add(u64, doc_freq, merge.otherDf(merge.other_df_context, ctx.term)) catch return error.RecordTooLarge;
+        effective_doc_count = merge.doc_count;
+        effective_avg_doc_len = if (merge.doc_count == 0) 0 else @floatCast(merge.total_doc_len / @as(f64, @floatFromInt(merge.doc_count)));
+    }
     const score = bm25WeightedTermScore(
         persistentWeightedTf(posting),
         persistentDocLen(doc),
-        ctx.avg_doc_len,
-        ctx.doc_count,
-        doc_freq,
+        effective_avg_doc_len,
+        effective_doc_count,
+        effective_doc_freq,
         ctx.options.params,
     );
     const entry = try ctx.scores.getOrPut(posting.doc_id);
@@ -5160,7 +5583,7 @@ const PostingRunBuilderOps = struct {
     pub const TextPostingRunSummaryWriter_dep = TextPostingRunSummaryWriter;
     pub const TextPostingRunTermSummaryRecord_dep = TextPostingRunTermSummaryRecord;
     pub const TextRebuildTextFreqCache_dep = TextRebuildTextFreqCache;
-    pub const text_posting_run_chunk_records_dep = text_posting_run_chunk_records;
+    pub const textPostingRunChunkRecords_dep = textPostingRunChunkRecords;
     pub const termSortPrefixKey_dep = termSortPrefixKey;
     pub const termSortTailKey_dep = termSortTailKey;
     pub const textMonotonicNs_dep = textMonotonicNs;
@@ -6647,7 +7070,7 @@ test "text posting run builder scratch allocation is exact compact chunk" {
     try std.testing.expectEqual(@as(usize, 48), @sizeOf(AllDocsCandidateCacheSlot));
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(TextPostingRunChunkRecord));
 
-    const chunk_bytes = std.math.mul(usize, text_posting_run_chunk_records, @sizeOf(TextPostingRunChunkRecord)) catch return error.RecordTooLarge;
+    const chunk_bytes = std.math.mul(usize, textPostingRunChunkRecords(), @sizeOf(TextPostingRunChunkRecord)) catch return error.RecordTooLarge;
     const buffer = try std.testing.allocator.alloc(u8, chunk_bytes + 1024);
     defer std.testing.allocator.free(buffer);
 
@@ -6655,7 +7078,7 @@ test "text posting run builder scratch allocation is exact compact chunk" {
     var builder = try TextPostingRunBuilder.init(fixed.allocator(), std.testing.io, "unused");
     defer builder.deinit();
 
-    try std.testing.expectEqual(@as(usize, text_posting_run_chunk_records), builder.chunk.capacity);
+    try std.testing.expectEqual(textPostingRunChunkRecords(), builder.chunk.capacity);
     try std.testing.expectEqual(@as(usize, 0), builder.chunk_term_bytes.capacity);
 }
 
@@ -11496,6 +11919,91 @@ test "searchText rebuilds from persistent store" {
     try std.testing.expectEqual(core.NodeId.fromInt(2), hits.items[0].node_id);
 }
 
+test "searchText serves batch-appended tail through published catalog merge" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage_mod.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .file, .text = "shared corpus token alpha" });
+    _ = try rebuildPersistentTextCatalog(std.testing.allocator, store);
+
+    // the daemon group-commit path appends tails as node batches
+    try store.appendNodesBatch(&.{
+        .{ .id = .fromInt(2), .kind = .observation, .text = "batchtailmarker shared corpus beta" },
+        .{ .id = .fromInt(3), .kind = .observation, .text = "batchtailmarker shared corpus gamma" },
+    });
+
+    var query_tokens = try tokenizer_mod.tokenize(std.testing.allocator, "batchtailmarker", .{});
+    defer query_tokens.deinit();
+    var merged = (try QueryExecutionOps.searchPersistentWithAppendedTail(
+        std.testing.allocator,
+        store,
+        "batchtailmarker",
+        query_tokens.items.items,
+        .{ .limit = 5 },
+    )) orelse return error.TestUnexpectedResult;
+    defer merged.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), merged.items.len);
+}
+
+test "searchText serves appended tail through published catalog merge" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage_mod.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .file, .text = "shared corpus token alpha" });
+    try store.appendNode(.{ .id = .fromInt(2), .kind = .function, .text = "shared corpus token beta" });
+    _ = try rebuildPersistentTextCatalog(std.testing.allocator, store);
+
+    try store.appendNode(.{ .id = .fromInt(3), .kind = .observation, .text = "tailmarker shared corpus gamma" });
+
+    // The catalog is stale for the appended node, and the incremental merge
+    // itself (not the store-scan fallback) must serve it.
+    var query_tokens = try tokenizer_mod.tokenize(std.testing.allocator, "tailmarker shared", .{});
+    defer query_tokens.deinit();
+    var merged = (try QueryExecutionOps.searchPersistentWithAppendedTail(
+        std.testing.allocator,
+        store,
+        "tailmarker shared",
+        query_tokens.items.items,
+        .{ .limit = 5 },
+    )) orelse return error.TestUnexpectedResult;
+    defer merged.deinit(std.testing.allocator);
+    try std.testing.expect(merged.items.len >= 3);
+    try std.testing.expectEqual(core.NodeId.fromInt(3), merged.items[0].node_id);
+
+    var hits = try searchText(std.testing.allocator, store, "tailmarker", .{ .limit = 5 });
+    defer hits.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), hits.items.len);
+    try std.testing.expectEqual(core.NodeId.fromInt(3), hits.items[0].node_id);
+
+    // Changing searchable metadata invalidates the tail-merge eligibility
+    // proof; the path must decline rather than serve wrong metadata scores.
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(1), "name", "renamed alpha");
+    const declined = try QueryExecutionOps.searchPersistentWithAppendedTail(
+        std.testing.allocator,
+        store,
+        "tailmarker shared",
+        query_tokens.items.items,
+        .{ .limit = 5 },
+    );
+    try std.testing.expect(declined == null);
+}
+
 test "persistent text search indexes node name and summary metadata" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -12077,6 +12585,35 @@ test "persistent multi term kind filter fails closed before global top-hit trunc
     defer hits.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), hits.items.len);
     try std.testing.expectEqual(core.NodeId.fromInt(task_id), hits.items[0].node_id);
+}
+
+test "persistent uniform kind filter safely reuses global multi term top hits" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage_mod.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    var node_id: u64 = 1;
+    while (node_id <= persistent_term_top_hit_min_postings) : (node_id += 1) {
+        try store.appendNode(.{ .id = .fromInt(node_id), .kind = .file, .text = "common shared" });
+    }
+    _ = try rebuildPersistentTextCatalog(std.testing.allocator, store);
+
+    var hits = try searchText(std.testing.allocator, store, "common shared", .{
+        .kind_filter = .file,
+        .limit = 8,
+        .max_postings_scanned = 1,
+    });
+    defer hits.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 8), hits.items.len);
+    for (hits.items) |hit| try std.testing.expectEqual(core.NodeKind.file, hit.kind);
 }
 
 test "searchText persistent single term skips low impact posting blocks" {
