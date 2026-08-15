@@ -364,6 +364,13 @@ fn finalizeCommittedWrite(
     try out.writer.writeAll(structured);
     try out.writer.writeAll(",\"gitDiff\":");
     try std.json.Stringify.encodeJsonString(git_diff, .{}, &out.writer);
+    // EOF 事实:尾换行数是模型最常算错的字节级事实——old_string 不带原文件尾
+    // \n、new_string 又自带 \n 会留下双尾换行,事后 Read 回读时末尾空行还容易
+    // 被误判成"恰好一个换行"。直接把终态事实放进结果,不让模型做换行算术。
+    var final_newlines: usize = 0;
+    while (final_newlines < content.len and content[content.len - 1 - final_newlines] == '\n')
+        final_newlines += 1;
+    try out.writer.print(",\"final_newlines\":{d}", .{final_newlines});
     // 改后诊断:Y2 砍 tree-sitter 后,原 tree-sitter 语法检查(syntaxWarning)由 LSP 被动诊断取代
     // ——更准(真类型/未声明/语法错)。**取舍登记**:未开 `--lsp` 时编辑不再有免费语法警告
     // (tree-sitter 时代无条件提供);开 `--lsp` 则得 server 级诊断,更强。option A 已知代价。
@@ -853,4 +860,21 @@ test "EditTool smart-quote fallback replaces curly with straight" {
     const n = pfs.read(vfd, &rbuf);
     _ = pfs.close(vfd);
     try std.testing.expect(std.mem.indexOf(u8, rbuf[0..@intCast(n)], "world") != null);
+}
+
+test "Edit result reports final_newlines fact" {
+    const a = std.testing.allocator;
+    const ctx = ToolContext.simple(a);
+    var buf: [512]u8 = undefined;
+    const path = tt.path(&buf, "cc-zig-edit-final-newlines.txt");
+    defer _ = std.c.unlink(path.ptr);
+    const write = @import("write.zig");
+    var b1: [640]u8 = undefined;
+    a.free(try write.execute(&ctx, try std.fmt.bufPrint(&b1, "{{\"path\":\"{s}\",\"content\":\"gen-old\\n\"}}", .{path})));
+
+    // old_string 不带原尾换行、new_string 自带 \n → 终态双尾换行,工具必须如实上报 2。
+    var b2: [640]u8 = undefined;
+    const result = try execute(&ctx, try std.fmt.bufPrint(&b2, "{{\"file_path\":\"{s}\",\"old_string\":\"gen-old\",\"new_string\":\"gen-new\\n\"}}", .{path}));
+    defer a.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"final_newlines\":2") != null);
 }

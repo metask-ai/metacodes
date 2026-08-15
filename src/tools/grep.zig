@@ -32,7 +32,6 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     const rg_path = try toolchain.ripgrepPath();
 
-
     // output_mode: content (默认，带行号) / files_with_matches / count
     const output_mode = common.extractJsonArg(args, "output_mode") orelse "files_with_matches";
 

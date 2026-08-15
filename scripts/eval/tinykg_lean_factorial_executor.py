@@ -97,7 +97,12 @@ PROCEDURAL_MEMORY_TEXT = (
     "Verified historical procedural lesson for exact existing-file replacement: "
     "inspect and Read the existing file before modifying it; preserve the requested "
     "canonical bytes and final newline; use Edit with the observed source as a "
-    "source-CAS precondition instead of Write; create no unrelated files; then Read "
+    "source-CAS precondition instead of Write; when a project rule denies a write, "
+    "do not improvise an alternative — follow the recovery protocol in the denial "
+    "verbatim, because it carries the byte-exact obligation. When editing directly, "
+    "include the original trailing newline in old_string so the replacement cannot "
+    "leave a doubled final newline, and trust the tool-reported final_newlines fact "
+    "over your own reading of blank lines. Create no unrelated files; then Read "
     "again and verify the complete result byte-for-byte. This is general workflow "
     "guidance, not a task answer, and current instructions remain authoritative."
 )
