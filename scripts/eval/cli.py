@@ -246,10 +246,16 @@ def cmd_report_memory_query_plans(args: argparse.Namespace) -> int:
         _write_json(args.json, summary)
     print(
         "memory query plans: "
-        f"explicit_verified={summary['status_counts']['explicit_plan_verified']} "
-        f"host_recall_satisfied={summary['status_counts']['host_recall_satisfied']} "
-        f"invalid={summary['status_counts']['invalid']} "
-        f"legacy_unavailable={summary['status_counts']['legacy_unavailable']}"
+        f"explicit_verified="
+        f"{summary['quality_eligibility_counts']['explicit_plan_verified']} "
+        f"scoreable_with_pre_search_rejections="
+        f"{summary['quality_eligibility_counts']['scoreable_with_pre_search_rejections']} "
+        f"host_recall_satisfied="
+        f"{summary['quality_eligibility_counts']['host_recall_satisfied']} "
+        f"protocol_invalid={summary['protocol_status_counts']['invalid']} "
+        f"quality_ineligible={summary['quality_eligibility_counts']['ineligible']} "
+        f"legacy_unavailable="
+        f"{summary['protocol_status_counts']['legacy_unavailable']}"
     )
     return 0
 

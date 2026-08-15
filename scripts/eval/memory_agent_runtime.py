@@ -39,10 +39,11 @@ from .e2e_adapter import (
     _native_trace_metrics,
     finalize_evaluation_fd,
 )
-from .memory_benchmark import PROTOCOL_ID, file_sha256
+from .memory_benchmark import PROTOCOL_ID, file_sha256, is_online_memory_case
 from .memory_budget_journal import (
     BudgetJournal,
     BudgetTransaction,
+    MAX_USER_AUTHORITY_USD,
     validate_checkpoint_payload,
     usd_to_microusd,
     usd_to_microusd_ceiling,
@@ -55,6 +56,7 @@ from .memory_query_plan import (
     QUERY_PLAN_INVALID_PREFIX,
     SIDECAR_NAME as QUERY_PLAN_SIDECAR_NAME,
     build_query_plan_trace,
+    quality_scoreable_with_pre_search_rejections,
     project_query_variants,
 )
 from .memory_replay import (
@@ -199,8 +201,11 @@ class ProductionRuntimeConfig:
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 _fail(f"production memory runtime.{name}", "expected an integer > 0")
-        if self.max_total_cost_usd > 1000.0:
-            _fail("production memory runtime.max_total_cost_usd", "must not exceed $1000")
+        if self.max_total_cost_usd > MAX_USER_AUTHORITY_USD:
+            _fail(
+                "production memory runtime.max_total_cost_usd",
+                f"must not exceed ${MAX_USER_AUTHORITY_USD}",
+            )
         if self.max_rollout_cost_usd > self.max_total_cost_usd:
             _fail("production memory runtime", "rollout cost cap exceeds total cost cap")
         if self.max_rollout_metered_tokens > self.max_total_metered_tokens:
@@ -322,6 +327,37 @@ def _host_recall_covers_missing_explicit_recall(
         and scoped_recall.get("status") in {"injected", "no_hits"}
         and query_plan_trace.get("invalid_reasons")
         == ["TinyKG backend executed no KgRecall"]
+    )
+
+
+def _query_plan_evaluator_invalid_reason(
+    scoped_recall: Mapping[str, Any] | None,
+    query_plan_trace: Mapping[str, Any],
+) -> str | None:
+    """Return a treatment-invalid reason without erasing safe recovery.
+
+    The query-plan trace remains the protocol-health authority.  This function
+    answers the narrower quality-evaluation question: did the run retain a
+    host-verified evidence path after any pre-search rejection?  Keeping this
+    decision in one function makes the production runner and its L2 test share
+    the same boundary.
+    """
+
+    if query_plan_trace["status"] != "invalid":
+        return None
+    if _host_recall_covers_missing_explicit_recall(scoped_recall, query_plan_trace):
+        return None
+    host_recall_satisfied = bool(
+        scoped_recall is not None
+        and scoped_recall.get("status") in {"injected", "no_hits"}
+    )
+    if quality_scoreable_with_pre_search_rejections(
+        query_plan_trace,
+        host_recall_satisfied=host_recall_satisfied,
+    ):
+        return None
+    return QUERY_PLAN_INVALID_PREFIX + "; ".join(
+        str(reason) for reason in query_plan_trace["invalid_reasons"]
     )
 
 
@@ -571,6 +607,58 @@ def _read_regular_file(path: Path, where: str) -> bytes:
         raise ValidationError(f"{where}: cannot read regular file: {exc}") from exc
     finally:
         os.close(fd)
+
+
+def _assert_tinykg_read_transients_clean(store: Path, where: str) -> None:
+    """Reject leaked or attacker-shaped TinyKG read coordination state."""
+
+    spelled_store = store.expanduser().absolute()
+    store_info = spelled_store.lstat()
+    if stat.S_ISLNK(store_info.st_mode) or not stat.S_ISDIR(store_info.st_mode):
+        _fail(where, "store must be a real directory")
+    resolved_store = spelled_store.resolve(strict=True)
+    lock_path = resolved_store / ".tinykg-cli.lock"
+    try:
+        lock_path.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise ValidationError(f"{where}: cannot inspect TinyKG CLI lock: {exc}") from exc
+    else:
+        _fail(where, "TinyKG CLI lock was not released")
+    lease_dir = resolved_store / ".tinykg_leases"
+    try:
+        lease_info = lease_dir.lstat()
+    except OSError as exc:
+        raise ValidationError(f"{where}: TinyKG lease directory is unavailable: {exc}") from exc
+    if stat.S_ISLNK(lease_info.st_mode) or not stat.S_ISDIR(lease_info.st_mode):
+        _fail(where, "TinyKG lease path must be a real directory")
+    try:
+        leaked = sorted(entry.name for entry in lease_dir.iterdir())
+    except OSError as exc:
+        raise ValidationError(f"{where}: cannot inspect TinyKG leases: {exc}") from exc
+    if leaked:
+        _fail(where, f"TinyKG read lease was not released: {leaked[:3]}")
+
+
+def _prepare_tinykg_read_transients(store: Path) -> None:
+    """Materialize stable empty read coordination state before store hashing."""
+
+    spelled_store = store.expanduser().absolute()
+    store_info = spelled_store.lstat()
+    if stat.S_ISLNK(store_info.st_mode) or not stat.S_ISDIR(store_info.st_mode):
+        _fail("TinyKG read transients", "store must be a real directory")
+    resolved_store = spelled_store.resolve(strict=True)
+    lease_dir = resolved_store / ".tinykg_leases"
+    try:
+        lease_dir.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise ValidationError(
+            f"TinyKG read transients: cannot create lease directory: {exc}"
+        ) from exc
+    _assert_tinykg_read_transients_clean(resolved_store, "TinyKG read transients")
 
 
 def _secret_encodings(secret: str) -> Tuple[bytes, ...]:
@@ -1057,12 +1145,10 @@ class _ScriptedPlanner:
                         {
                             "query": query,
                             "lexical_plan": {
-                                "schema_version": "lexical-query-plan-v1",
+                                "schema_version": "lexical-query-plan-v3",
                                 "intent": intent,
                                 "stage": "seed",
                                 "variants": [{"kind": "exact", "text": query}],
-                                "variant_index": 0,
-                                "seen_node_ids": [],
                             },
                         },
                     )
@@ -1399,6 +1485,39 @@ def _cassette_tool_data(
                         logical = logical_ids.get(node_id) if isinstance(node_id, int) else None
                         if logical is not None and logical not in retrieved:
                             retrieved.append(logical)
+                auto_context = parsed.get("auto_context") if isinstance(parsed, dict) else None
+                if isinstance(auto_context, dict):
+                    context = auto_context.get("context")
+                    if (
+                        auto_context.get("schema_version") == "metacodes-auto-context-v1"
+                        and auto_context.get("selection_policy")
+                        == "first_new_evidence_then_new_then_merged_v1"
+                        and isinstance(context, dict)
+                        and isinstance(context.get("graph"), dict)
+                        and isinstance(context.get("knowledge_governance"), dict)
+                    ):
+                        node_id = context.get("node_id")
+                        graph_query = context["graph"].get("query")
+                        governance = context["knowledge_governance"]
+                        if (
+                            isinstance(node_id, int)
+                            and not isinstance(node_id, bool)
+                            and isinstance(graph_query, dict)
+                            and graph_query.get("root_id") == node_id
+                            and governance.get("schema_version")
+                            == "metacodes-knowledge-governance-v1"
+                        ):
+                            logical = logical_ids.get(node_id)
+                            if logical is not None and logical not in verified:
+                                verified.append(logical)
+                            graph_summary = context["graph"].get("summary")
+                            graph_truncated = graph_truncated or bool(
+                                governance.get("graph_truncated")
+                                or (
+                                    isinstance(graph_summary, dict)
+                                    and graph_summary.get("truncated")
+                                )
+                            )
             elif name == "KgContext":
                 node_id = tool_input.get("node_id")
                 logical = logical_ids.get(node_id) if isinstance(node_id, int) else None
@@ -1499,6 +1618,11 @@ def _sanitized_environment(base: Mapping[str, str]) -> Dict[str, str]:
         "METACODES_KG_DOMAIN",
         "METACODES_KG_STORE",
         "METACODES_KG_TRANSPORT",
+        "METACODES_KG_CONFIG",
+        "METACODES_KG_URL",
+        "METACODES_KG_API_KEY",
+        "METACODES_KG_EXPECTED_BUILD_ID",
+        "METACODES_KG_EXPECTED_SCHEMA_DIGEST",
         "METACODES_LONG_HORIZON_ARM",
         "METACODES_BASE_URL",
         "METACODES_RECORD_DIR",
@@ -1656,29 +1780,58 @@ def _production_sandbox_profile(
     for raw in transient_write_roots:
         spelled = raw.expanduser().absolute()
         is_cli_lock = spelled.name == ".tinykg-cli.lock"
+        is_lease_dir = spelled.name == ".tinykg_leases"
         is_daemon_lock = spelled.name.endswith(".tinykg-daemon.lock")
-        if not (is_cli_lock or is_daemon_lock):
+        if not (is_cli_lock or is_lease_dir or is_daemon_lock):
             _fail(
                 "production sandbox transient write root",
-                "only the TinyKG CLI and daemon-ownership lock paths are supported",
+                "only the TinyKG CLI lock, daemon-ownership lock and process-lease paths are supported",
             )
         try:
             existing_info = spelled.lstat()
         except FileNotFoundError:
-            pass
+            # The CLI lock is created/removed in-run and the daemon flock file
+            # appears lazily; only the process-lease directory must pre-exist.
+            if is_lease_dir:
+                _fail(
+                    "production sandbox transient write root",
+                    "TinyKG process-lease directory must be pre-created",
+                )
         except OSError as exc:
             raise ValidationError(
                 f"production sandbox transient write root is unavailable: {exc}"
             ) from exc
         else:
-            # The daemon-ownership lock is a persistent zero-byte flock
-            # rendezvous file; the CLI lock directory must never survive.
-            if not (
-                is_daemon_lock
-                and stat.S_ISREG(existing_info.st_mode)
-                and existing_info.st_size == 0
-            ):
-                _fail("production sandbox transient write root", "must not already exist")
+            if is_cli_lock:
+                _fail("production sandbox transient write root", "CLI lock must not already exist")
+            elif is_daemon_lock:
+                # Persistent zero-byte flock rendezvous file.
+                if not (
+                    stat.S_ISREG(existing_info.st_mode)
+                    and existing_info.st_size == 0
+                ):
+                    _fail(
+                        "production sandbox transient write root",
+                        "daemon lock must be a zero-byte regular file",
+                    )
+            else:
+                if stat.S_ISLNK(existing_info.st_mode) or not stat.S_ISDIR(
+                    existing_info.st_mode
+                ):
+                    _fail(
+                        "production sandbox transient write root",
+                        "TinyKG process-lease path must be a real directory",
+                    )
+                try:
+                    if any(spelled.iterdir()):
+                        _fail(
+                            "production sandbox transient write root",
+                            "TinyKG process-lease directory must be empty",
+                        )
+                except OSError as exc:
+                    raise ValidationError(
+                        f"production sandbox transient write root is unavailable: {exc}"
+                    ) from exc
         parent = spelled.parent
         try:
             parent_info = parent.lstat()
@@ -1689,13 +1842,7 @@ def _production_sandbox_profile(
         if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
             _fail("production sandbox transient write root", "parent must be a real directory")
         path = parent.resolve(strict=True) / spelled.name
-        if is_cli_lock:
-            if not any(_path_is_within(str(path), root) for root in sealed_directories):
-                _fail(
-                    "production sandbox transient write root",
-                    "must be inside a sealed read-only root",
-                )
-        else:
+        if is_daemon_lock:
             # TinyKG storage v3 flocks a zero-byte rendezvous file that is a
             # sibling of the store. Accept exactly `<sealed-root>` + suffix so
             # the carve-out stays a single literal path derived from a sealed
@@ -1707,6 +1854,12 @@ def _production_sandbox_profile(
                 _fail(
                     "production sandbox transient write root",
                     "daemon lock must be the sibling of a sealed read-only root",
+                )
+        else:
+            if not any(_path_is_within(str(path), root) for root in sealed_directories):
+                _fail(
+                    "production sandbox transient write root",
+                    "must be inside a sealed read-only root",
                 )
         if path not in transient_directories:
             transient_directories.append(path)
@@ -1810,6 +1963,7 @@ def _materialize_production_sandbox(
         transient_write_roots=(
             (
                 tinykg_read_only_store / ".tinykg-cli.lock",
+                tinykg_read_only_store / ".tinykg_leases",
                 # TinyKG storage v3 also takes a shared daemon-ownership flock on
                 # a sibling file of the store; the store contents stay sealed.
                 tinykg_read_only_store.with_name(
@@ -1843,15 +1997,7 @@ def _run_production_tinykg_read_probe(
     compact_query = " ".join(query.split())
     if not compact_query or len(compact_query.encode("utf-8")) > 400:
         _fail("production TinyKG read probe", "query must contain 1-400 UTF-8 bytes")
-    lock_path = resolved_store / ".tinykg-cli.lock"
-    try:
-        lock_path.lstat()
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        raise ValidationError(f"production TinyKG CLI lock path is unavailable: {exc}") from exc
-    else:
-        _fail("production TinyKG read probe", "CLI lock path already exists")
+    _assert_tinykg_read_transients_clean(resolved_store, "production TinyKG read probe")
     normalized_before = _tree_digest(resolved_store, normalize_store_manifest=True)
     raw_before = _tree_digest(resolved_store)
 
@@ -1878,20 +2024,14 @@ def _run_production_tinykg_read_probe(
                 f"production TinyKG read probe {action}",
                 f"exited {completed.returncode}: {diagnostic}",
             )
-        try:
-            lock_path.lstat()
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            raise ValidationError(
-                f"production TinyKG read probe {action} cannot inspect CLI lock: {exc}"
-            ) from exc
-        else:
-            _fail(f"production TinyKG read probe {action}", "CLI lock was not released")
+        _assert_tinykg_read_transients_clean(
+            resolved_store, f"production TinyKG read probe {action}"
+        )
         return completed.stdout
 
     info_output = run("store-info")
     parsed_info = _store_info(info_output)
+    _assert_tinykg_read_transients_clean(resolved_store, "production TinyKG read probe")
     if (
         parsed_info.get("storage_format_version") != "3"
         or parsed_info.get("schema_version") != "3"
@@ -2822,7 +2962,8 @@ def run_memory_agent_schedule(
             baseline = _materialize_workspace(public_case, workspace)
 
         split = str(case["split"])
-        online_memory = case["benchmark"] == "procedural_transfer" and split == "online"
+        online_memory = is_online_memory_case(case)
+        read_only_memory = not online_memory
         memory_backend = {
             "codex_style": "none",
             "claude_style": "markdown",
@@ -2868,6 +3009,11 @@ def run_memory_agent_schedule(
                     memory_dir,
                     public_case,
                 )
+            elif read_only_memory and not memory_index.exists():
+                # Integrated TinyKG still exposes the product's Markdown
+                # channel. Give the read-only sandbox a stable empty index to
+                # seal and probe; do not let the child create governance state.
+                _write_new(memory_index, b"")
             markdown_revision_before = _artifact_tree_digest(
                 memory_dir,
                 "markdown memory before rollout",
@@ -2925,6 +3071,14 @@ def run_memory_agent_schedule(
                     )
                 _write_new(batch_path, batch)
                 local.command("apply", store, (str(batch_path),))
+                # Text search is a derived TinyKG catalog.  A freshly applied
+                # store is intentionally stale until the host publishes that
+                # catalog, so make publication part of store preparation --
+                # before the first digest, read-only sandbox probe, budget
+                # authorization, or provider request.  Reused procedural
+                # stores are published by the online consolidation boundary
+                # and must never be repaired implicitly by an offline reader.
+                local.command("rebuild-text", store, ())
                 abstraction_nodes = counts["abstraction_nodes"]
                 if case["benchmark"] == "procedural_transfer":
                     procedural_stores[family_key] = {
@@ -2932,6 +3086,7 @@ def run_memory_agent_schedule(
                         "logical_ids": logical_ids,
                         "abstraction_nodes": abstraction_nodes,
                     }
+            _prepare_tinykg_read_transients(store)
             graph_revision_before = _tree_digest(store, normalize_store_manifest=True)
             raw_store_digest_before = _tree_digest(store)
             info = _store_info(local.command("store-info", store, ()))
@@ -2970,7 +3125,7 @@ def run_memory_agent_schedule(
                 f"forbidden-sibling:{_hash_text(component)}\n".encode("utf-8"),
             )
             offline_read_only_probes: List[Tuple[Path, Path]] = []
-            if split == "offline":
+            if read_only_memory:
                 if memory_dir is not None and memory_index is not None:
                     offline_read_only_probes.append((memory_dir, memory_index))
                 if store is not None:
@@ -2988,7 +3143,7 @@ def run_memory_agent_schedule(
                 ripgrep=pinned_ripgrep,
                 read_only_roots=tuple(root for root, _file in offline_read_only_probes),
                 tinykg_read_only_store=(
-                    store if split == "offline" and store is not None else None
+                    store if read_only_memory and store is not None else None
                 ),
             )
             tinykg_probe_query_bytes = (
@@ -3013,7 +3168,7 @@ def run_memory_agent_schedule(
                 read_only_probes=tuple(offline_read_only_probes),
                 tinykg_read_probe=(
                     (tinykg, store, tinykg_probe_query)
-                    if split == "offline" and store is not None
+                    if read_only_memory and store is not None
                     else None
                 ),
             )
@@ -3677,9 +3832,15 @@ def run_memory_agent_schedule(
             markdown_files_after = sum(1 for path in memory_dir.rglob("*") if path.is_file())
         if tinykg_enabled:
             assert store is not None
+            _assert_tinykg_read_transients_clean(
+                store, f"native memory rollout {run_id}"
+            )
             graph_revision_after = _tree_digest(store, normalize_store_manifest=True)
             raw_store_digest_after = _tree_digest(store)
             info_after = _store_info(local.command("store-info", store, ()))
+            _assert_tinykg_read_transients_clean(
+                store, f"native memory rollout {run_id} post-observation"
+            )
             store_nodes, store_edges = int(info_after["nodes"]), int(info_after["edges"])
             if info_after.get("text_stale") not in {"0", "1"}:
                 _fail(f"native memory rollout {case['id']}", "invalid TinyKG text_stale state")
@@ -3777,19 +3938,15 @@ def run_memory_agent_schedule(
             provenance_links = store_edges
 
         evaluator_invalid: str | None = None
-        host_only_query_plan_gap = _host_recall_covers_missing_explicit_recall(
+        evaluator_invalid = _query_plan_evaluator_invalid_reason(
             scoped_recall_activation,
             query_plan_trace,
         )
-        if query_plan_trace["status"] == "invalid" and not host_only_query_plan_gap:
-            evaluator_invalid = QUERY_PLAN_INVALID_PREFIX + "; ".join(
-                str(reason) for reason in query_plan_trace["invalid_reasons"]
-            )
         if case["benchmark"] == "procedural_transfer":
             validator_entry = validators.get(case["id"])
             if validator_entry is None:
                 evaluator_invalid = evaluator_invalid or "validator bundle missing case"
-        if production_mode and split == "offline" and memory_backend == "markdown":
+        if production_mode and read_only_memory and memory_backend == "markdown":
             if int(exposure["auto_injected_bytes"]) <= 0 and int(
                 exposure["tool_result_bytes"]
             ) <= 0:
@@ -3797,7 +3954,7 @@ def run_memory_agent_schedule(
                     evaluator_invalid
                     or "Markdown backend exposed no durable memory"
                 )
-        if production_mode and split == "offline" and tinykg_enabled:
+        if production_mode and read_only_memory and tinykg_enabled:
             explicit_recall = bool(
                 memory_reads > 0 and query_variants and int(exposure["tool_result_bytes"]) > 0
             )
@@ -3858,7 +4015,9 @@ def run_memory_agent_schedule(
                 "contradictory_rejected": 0,
                 "retrieval_excluded_returned": 0,
                 "provenance_missing_returned": 0,
-                "offline_write_events": memory_writes if split == "offline" else 0,
+                # Historical field name; semantically covers every read-only
+                # lifecycle, including QA's frozen ``test`` split.
+                "offline_write_events": memory_writes if read_only_memory else 0,
             },
             "cost": {
                 "cost_usd": metric_cost if production_mode else 0.0,

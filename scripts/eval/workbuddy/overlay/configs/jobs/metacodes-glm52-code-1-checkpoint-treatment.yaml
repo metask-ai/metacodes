@@ -1,0 +1,25 @@
+model: metacodes-glm52
+harness: metacodes/0.1.0
+dataset: datasets/wb-bench-code-v1.0/tasks
+harness_backend: local
+model_connection: local_proxy
+jobs_dir: results/metacodes-glm52-code-1-checkpoint-treatment
+n_attempts: 1
+record_full_io: true
+agent_user: dev
+verifier_user: dev
+extra_allowed_hosts:
+  - host.docker.internal
+harness_params_override:
+  METACODES_VERIFICATION_CHECKPOINT: true
+  METACODES_PROJECT_CONTROL_MODE: disabled
+  METACODES_PROJECT_RULES_RELATIVE: share/metacodes/workbuddy-w05/project-rules
+  METACODES_PROJECT_KERNEL_RELATIVE: libexec/metacodes-project-kernel
+task_selection:
+  mode: name
+  names:
+    - bug_fix-easy-invalid_filterwarnings_regex_error
+orchestrator_override:
+  n_concurrent_trials: 1
+context_window: 200000
+context_compact_pct: 92

@@ -22,6 +22,8 @@ from scripts.eval.memory_agent_runtime import (
     _copy_memory_tree,
     _estimated_costs_match,
     _host_recall_covers_missing_explicit_recall,
+    _assert_tinykg_read_transients_clean,
+    _prepare_tinykg_read_transients,
     _project_domain,
     _production_environment,
     _materialize_production_sandbox,
@@ -468,6 +470,74 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 }
             ],
         )
+
+    def test_host_auto_context_counts_as_verified_memory_without_extra_tool_call(self):
+        recall_result = {
+            "hits": [
+                {
+                    "node_id": 7,
+                    "type": "evidence",
+                    "scope": "project",
+                    "text": "attended commencement",
+                    "seen_before": False,
+                }
+            ],
+            "auto_context": {
+                "schema_version": "metacodes-auto-context-v1",
+                "selection_policy": "first_new_evidence_then_new_then_merged_v1",
+                "context": {
+                    "node_id": 7,
+                    "graph": {
+                        "query": {"root_id": 7},
+                        "summary": {"truncated": False},
+                    },
+                    "knowledge_governance": {
+                        "schema_version": "metacodes-knowledge-governance-v1",
+                        "graph_truncated": False,
+                    },
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            (cassette / "req-001.json").write_text(
+                stable_json(
+                    {
+                        "messages": [
+                            {
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "id": "recall-1",
+                                        "name": "KgRecall",
+                                        "input": {"query": "graduation attended"},
+                                    }
+                                ]
+                            },
+                            {
+                                "content": [
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": "recall-1",
+                                        "content": stable_json(recall_result),
+                                    }
+                                ]
+                            },
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            observed = _cassette_tool_data(
+                cassette,
+                {7: "longmem:session:7"},
+                "graduation attended",
+            )
+
+        self.assertEqual(observed["retrieved"], ["longmem:session:7"])
+        self.assertEqual(observed["verified"], ["longmem:session:7"])
+        self.assertFalse(observed["graph_truncated"])
 
     def test_failed_recall_deduplicates_equivalent_query_variants(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2430,8 +2500,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             unauthorized.validate(9)
 
         over_limit = copy.copy(valid)
-        object.__setattr__(over_limit, "max_total_cost_usd", 1000.01)
-        with self.assertRaisesRegex(ValidationError, "must not exceed \\$1000"):
+        object.__setattr__(over_limit, "max_total_cost_usd", 2000.01)
+        with self.assertRaisesRegex(ValidationError, "must not exceed \\$2000"):
             over_limit.validate(9)
 
         no_headroom = copy.copy(valid)
@@ -2549,7 +2619,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 "case \"$1\" in\n"
                 "  init) mkdir \"$2\" ;;\n"
                 "  apply) printf 'apply version=1 nodes_created=1 nodes_existing=0 edges_created=0 edges_existing=0\\n' ;;\n"
-                "  store-info) printf 'nodes=1\\nedges=0\\nstorage_format_version=2\\nschema_version=3\\n' ;;\n"
+                "  rebuild-text) : ;;\n"
+                "  store-info) printf 'nodes=1\\nedges=0\\nstorage_format_version=2\\nschema_version=3\\ntext_current=1\\ntext_stale=0\\n' ;;\n"
                 "  *) exit 91 ;;\n"
                 "esac\n",
                 encoding="utf-8",
@@ -2651,7 +2722,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 "case \"$1\" in\n"
                 "  init) mkdir \"$2\" ;;\n"
                 "  apply) printf 'apply version=1 nodes_created=1 nodes_existing=0 edges_created=0 edges_existing=0\\n' ;;\n"
-                "  store-info) printf 'nodes=1\\nedges=0\\nstorage_format_version=2\\nschema_version=3\\n' ;;\n"
+                "  rebuild-text) : ;;\n"
+                "  store-info) printf 'nodes=1\\nedges=0\\nstorage_format_version=2\\nschema_version=3\\ntext_current=1\\ntext_stale=0\\n' ;;\n"
                 "  *) exit 91 ;;\n"
                 "esac\n",
                 encoding="utf-8",
@@ -2685,8 +2757,9 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             self.assertFalse(plan["credential_loaded"])
             self.assertEqual(
                 plan["tinykg_preflight"]["commands"],
-                ["init", "apply", "store-info"],
+                ["init", "apply", "rebuild-text", "store-info"],
             )
+            self.assertTrue(plan["tinykg_preflight"]["text_current"])
             self.assertFalse(missing_auth.exists())
             self.assertFalse(budget_journal.exists())
 
@@ -2795,6 +2868,38 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 os.environ.pop("METASK_API_KEY", None)
                 self.assertEqual(_load_api_key(auth), "private-file-key")
 
+    def test_tinykg_read_transients_fail_closed_on_unsafe_or_leaked_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = root / "store.kg"
+            store.mkdir()
+            _prepare_tinykg_read_transients(store)
+            _assert_tinykg_read_transients_clean(store, "test TinyKG transients")
+
+            leaked = store / ".tinykg_leases" / "reader.lease"
+            leaked.write_text("unreleased\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValidationError, "read lease was not released"):
+                _assert_tinykg_read_transients_clean(store, "test TinyKG transients")
+            leaked.unlink()
+
+            lock = store / ".tinykg-cli.lock"
+            lock.write_text("unreleased\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValidationError, "CLI lock was not released"):
+                _assert_tinykg_read_transients_clean(store, "test TinyKG transients")
+            lock.unlink()
+
+            (store / ".tinykg_leases").rmdir()
+            target = root / "attacker-leases"
+            target.mkdir()
+            (store / ".tinykg_leases").symlink_to(target, target_is_directory=True)
+            with self.assertRaisesRegex(ValidationError, "must be a real directory"):
+                _assert_tinykg_read_transients_clean(store, "test TinyKG transients")
+
+            linked_store = root / "linked-store.kg"
+            linked_store.symlink_to(store, target_is_directory=True)
+            with self.assertRaisesRegex(ValidationError, "store must be a real directory"):
+                _prepare_tinykg_read_transients(linked_store)
+
     @unittest.skipUnless(platform.system() == "Darwin", "requires macOS Seatbelt")
     def test_production_seatbelt_denies_host_sibling_and_process_info(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2823,6 +2928,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             store_manifest = store / ".tinykg" / "store-manifest.json"
             store_manifest.parent.mkdir()
             store_manifest.write_text('{"revision":1}\n', encoding="utf-8")
+            (store / ".tinykg_leases").mkdir(mode=0o700)
             store_before = hashlib.sha256(store_manifest.read_bytes()).hexdigest()
 
             sandbox = _materialize_production_sandbox(
@@ -2941,6 +3047,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             tinykg("init", store)
             tinykg("apply", store, batch)
             tinykg("rebuild-text", store)
+            _prepare_tinykg_read_transients(store)
             store_manifest = store / ".tinykg" / "store-manifest.json"
             store_digest_before = _artifact_tree_digest(store)
             host = root / "host-sentinel.txt"
@@ -2980,6 +3087,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             self.assertRegex(evidence["tinykg_store_info_sha256"], r"^[0-9a-f]{64}$")
             self.assertRegex(evidence["tinykg_recall_sha256"], r"^[0-9a-f]{64}$")
             self.assertFalse((store / ".tinykg-cli.lock").exists())
+            self.assertTrue((store / ".tinykg_leases").is_dir())
+            self.assertEqual(list((store / ".tinykg_leases").iterdir()), [])
             self.assertEqual(_artifact_tree_digest(store), store_digest_before)
             _assert_production_sandbox_identity(sandbox, evidence_path)
 
@@ -4210,10 +4319,10 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 "read_only_roots_enforced": True,
                 "read_only_root_count": (
                     2
-                    if rollout["memory_phase"] == "offline"
+                    if rollout["memory_phase"] != "online"
                     and rollout["memory_backend"] == "tinykg_integrated"
                     else 1
-                    if rollout["memory_phase"] == "offline"
+                    if rollout["memory_phase"] != "online"
                     and rollout["memory_backend"] == "markdown"
                     else 0
                 ),
@@ -4221,30 +4330,30 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                     f"sandbox-read-only-roots:{sequence}"
                 ),
                 "tinykg_read_probe_performed": (
-                    rollout["memory_phase"] == "offline"
+                    rollout["memory_phase"] != "online"
                     and rollout["memory_backend"] == "tinykg_integrated"
                 ),
                 "tinykg_store_info_sha256": (
                     digest(f"tinykg-store-info:{sequence}")
-                    if rollout["memory_phase"] == "offline"
+                    if rollout["memory_phase"] != "online"
                     and rollout["memory_backend"] == "tinykg_integrated"
                     else None
                 ),
                 "tinykg_recall_sha256": (
                     digest(f"tinykg-recall:{sequence}")
-                    if rollout["memory_phase"] == "offline"
+                    if rollout["memory_phase"] != "online"
                     and rollout["memory_backend"] == "tinykg_integrated"
                     else None
                 ),
                 "tinykg_lock_path_clean": (
                     True
-                    if rollout["memory_phase"] == "offline"
+                    if rollout["memory_phase"] != "online"
                     and rollout["memory_backend"] == "tinykg_integrated"
                     else None
                 ),
                 "tinykg_store_unchanged": (
                     True
-                    if rollout["memory_phase"] == "offline"
+                    if rollout["memory_phase"] != "online"
                     and rollout["memory_backend"] == "tinykg_integrated"
                     else None
                 ),

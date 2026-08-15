@@ -21,6 +21,25 @@ const TEXT_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+// GLM-compatible endpoints emit an all-zero usage placeholder at message_start
+// and a complete snapshot at message_delta. The placeholder is not a second
+// response and must not reset the cache baseline.
+const CACHE_WARM_CONTINUATION_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"part\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"input_tokens\":1000,\"output_tokens\":10,\"cache_read_input_tokens\":5000}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const CACHE_WARM_FINAL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m2\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" done\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":1100,\"output_tokens\":8,\"cache_read_input_tokens\":6000}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
 const DENIED_WRITE_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu-denied\",\"name\":\"Write\",\"input\":{}}}\n\n" ++
@@ -110,6 +129,32 @@ test "L4: DiagnosticsBackend 经 TeeBackend 收集真 agent_loop 的 trace" {
     try std.testing.expect(std.mem.indexOf(u8, jsonl, "turn_begin") != null);
     try std.testing.expect(std.mem.indexOf(u8, jsonl, "run_end") != null);
     try std.testing.expect(std.mem.indexOf(u8, jsonl, "end_turn") != null);
+}
+
+test "L2 cache detector consumes one aggregate per real provider response" {
+    const a = std.testing.allocator;
+    const bodies = [_][]const u8{ CACHE_WARM_CONTINUATION_SSE, CACHE_WARM_FINAL_SSE };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "model-a", url);
+    defer client.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "continue once");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+
+    var diag = diagnostics_backend.DiagnosticsBackend.init(a);
+    defer diag.deinit();
+    const diag_be = diag.backend();
+    const result = try agent_loop.run(&conv, client.provider(), &.{}, &perm, .{ .max_turns = 3 }, &diag_be, a);
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 0), diag.countKind(.cache_break));
+    try std.testing.expectEqual(@as(u32, 1), diag.countKind(.continuation));
 }
 
 test "L2: EvaluationBackend projects a real agent_loop into stable events" {

@@ -5,7 +5,13 @@ harness:
   params:
     # Keep the first pilot single-agent.  This limits attribution ambiguity;
     # later cohorts may explicitly enable swarm as a separate treatment.
-    METACODES_DISALLOWED_TOOLS: "Agent,Task,TaskBatch,TeamCreate,TeamDelete,SendMessage"
+    # The installed-agent path is also non-interactive and already runs with
+    # bypassPermissions authority.  Plan approval therefore cannot involve a
+    # user; exposing Enter/Exit only adds a late approval round-trip and may
+    # materialize a task DAG after implementation has already started.  Keep
+    # TinyKG recall/task tools available, but do not advertise the interactive
+    # plan-mode workflow in this frozen runner policy.
+    METACODES_DISALLOWED_TOOLS: "Agent,Task,TaskBatch,TeamCreate,TeamDelete,SendMessage,EnterPlanMode,ExitPlanMode"
   mount:
     name: metacodes
     path: /opt/metacodes

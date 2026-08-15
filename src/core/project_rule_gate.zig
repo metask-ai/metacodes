@@ -1,5 +1,6 @@
 //! Runtime adapter from a verified active bundle to the fixed Lean kernel.
-//! No Zig decision function is used for authorization.
+//! Zig may erase target-tool mismatches using one fixed-kernel equivalence
+//! theorem, but it never reimplements an applicable rule's authorization.
 
 const std = @import("std");
 const bundle_mod = @import("project_rule_bundle.zig");
@@ -229,15 +230,23 @@ pub const RuntimeGate = struct {
             .file_target_state = signal.file_target_state,
             .exact_recovery_material_ready = signal.exact_edit_material.writeNeedsEdit(),
         };
+        const matching = self.matchingRuleCount(signal.tool);
+        if (matching == 0) {
+            if (!self.recordRuleFilter(signal.dispatch_id, .pre, .ordinary, 0))
+                return .{ .result = .fault };
+            return .{ .result = .admit };
+        }
         const signal_json = try std.json.Stringify.valueAlloc(self.allocator, formal_signal, .{});
         defer self.allocator.free(signal_json);
-        const requests = try self.allocator.alloc(kernel.Request, self.active.rules.len);
+        const requests = try self.allocator.alloc(kernel.Request, matching);
         defer self.allocator.free(requests);
-        const bindings = try self.allocator.alloc(kernel.Bindings, self.active.rules.len);
+        const bindings = try self.allocator.alloc(kernel.Bindings, matching);
         defer self.allocator.free(bindings);
-        const request_ids = try self.allocator.alloc([64]u8, self.active.rules.len);
+        const request_ids = try self.allocator.alloc([64]u8, matching);
         defer self.allocator.free(request_ids);
-        for (self.active.rules, 0..) |entry, index| {
+        var index: usize = 0;
+        for (self.active.rules) |entry| {
+            if (!std.mem.eql(u8, entry.rule_spec.target_tool, signal.tool)) continue;
             const candidate_id = parseHex(entry.candidate_id) orelse return error.InvalidCandidateId;
             request_ids[index] = kernel.requestId(
                 .pre_decision,
@@ -266,7 +275,9 @@ pub const RuntimeGate = struct {
                 .bundle_sha256 = self.active.bundle_sha256,
                 .bundle_revision = self.active.revision,
             };
+            index += 1;
         }
+        std.debug.assert(index == matching);
         var batch = try kernel.invokeBatch(
             self.allocator,
             self.config,
@@ -280,6 +291,7 @@ pub const RuntimeGate = struct {
             .pre,
             signal.file_target_state,
             &batch,
+            .ordinary,
         );
     }
 
@@ -299,15 +311,23 @@ pub const RuntimeGate = struct {
             .has_file_mutation_v1 = hasFileMutation(signal.effect),
             .post_reobserved = postReobserved(signal.effect),
         };
+        const matching = self.matchingRuleCount(signal.pre.tool);
+        if (matching == 0) {
+            if (!self.recordRuleFilter(signal.pre.dispatch_id, .post, .ordinary, 0))
+                return .{ .result = .fault };
+            return .{ .result = .admit };
+        }
         const signal_json = try std.json.Stringify.valueAlloc(self.allocator, formal_signal, .{});
         defer self.allocator.free(signal_json);
-        const requests = try self.allocator.alloc(kernel.Request, self.active.rules.len);
+        const requests = try self.allocator.alloc(kernel.Request, matching);
         defer self.allocator.free(requests);
-        const bindings = try self.allocator.alloc(kernel.Bindings, self.active.rules.len);
+        const bindings = try self.allocator.alloc(kernel.Bindings, matching);
         defer self.allocator.free(bindings);
-        const request_ids = try self.allocator.alloc([64]u8, self.active.rules.len);
+        const request_ids = try self.allocator.alloc([64]u8, matching);
         defer self.allocator.free(request_ids);
-        for (self.active.rules, 0..) |entry, index| {
+        var index: usize = 0;
+        for (self.active.rules) |entry| {
+            if (!std.mem.eql(u8, entry.rule_spec.target_tool, signal.pre.tool)) continue;
             const candidate_id = parseHex(entry.candidate_id) orelse return error.InvalidCandidateId;
             request_ids[index] = kernel.requestId(
                 .post_decision,
@@ -336,7 +356,9 @@ pub const RuntimeGate = struct {
                 .bundle_sha256 = self.active.bundle_sha256,
                 .bundle_revision = self.active.revision,
             };
+            index += 1;
         }
+        std.debug.assert(index == matching);
         var batch = try kernel.invokeBatch(
             self.allocator,
             self.config,
@@ -350,6 +372,7 @@ pub const RuntimeGate = struct {
             .post,
             signal.pre.file_target_state,
             &batch,
+            .ordinary,
         );
     }
 
@@ -384,9 +407,10 @@ pub const RuntimeGate = struct {
         } };
     }
 
-    /// Evaluate the recovery transition and every unrelated active rule in
-    /// one physical checker call. The obligation's source rule changes
-    /// operation; other candidates still see the ordinary Edit signal.
+    /// Evaluate the recovery transition and every Edit-targeted active rule in
+    /// one physical checker call. The obligation's source Write rule changes
+    /// operation and is retained explicitly; target-mismatched ordinary rules
+    /// are erased by the same theorem-backed relevance pass as normal tools.
     fn decideExactRecoveryPre(
         self: *RuntimeGate,
         signal: protocol.PreSignal,
@@ -490,47 +514,66 @@ pub const RuntimeGate = struct {
         recovery_signal_json: []const u8,
     ) !BatchDecision {
         if (rule_index >= self.active.rules.len) return error.InvalidRecoveryRule;
-        const requests = try self.allocator.alloc(kernel.Request, self.active.rules.len);
-        defer self.allocator.free(requests);
-        const bindings = try self.allocator.alloc(kernel.Bindings, self.active.rules.len);
-        defer self.allocator.free(bindings);
-        const request_ids = try self.allocator.alloc([64]u8, self.active.rules.len);
-        defer self.allocator.free(request_ids);
+        var checker_rule_count: usize = 1;
         for (self.active.rules, 0..) |entry, index| {
-            const candidate_id = parseHex(entry.candidate_id) orelse
-                return error.InvalidCandidateId;
-            const is_recovery = index == rule_index;
-            const operation = if (is_recovery) recovery_operation else ordinary_operation;
-            const payload = if (is_recovery) recovery_payload else ordinary_payload;
-            const signal_json = if (is_recovery) recovery_signal_json else ordinary_signal_json;
-            request_ids[index] = kernel.requestId(
-                operation,
-                candidate_id,
-                self.active.bundle_sha256,
-                self.active.revision,
-                signal_json,
-            );
-            requests[index] = .{
-                .request_id = request_ids[index][0..],
-                .operation = operation,
-                .kernel_sha256 = self.active.kernel_sha256[0..],
-                .candidate_id = entry.candidate_id,
-                .project_sha256 = self.active.project_sha256[0..],
-                .bundle_sha256 = self.active.bundle_sha256[0..],
-                .bundle_revision = self.active.revision,
-                .rule_spec = entry.rule_spec,
-                .payload = payload,
-            };
-            bindings[index] = .{
-                .request_id = request_ids[index],
-                .operation = operation,
-                .kernel_sha256 = self.active.kernel_sha256,
-                .candidate_id = candidate_id,
-                .project_sha256 = self.active.project_sha256,
-                .bundle_sha256 = self.active.bundle_sha256,
-                .bundle_revision = self.active.revision,
-            };
+            if (index != rule_index and
+                std.mem.eql(u8, entry.rule_spec.target_tool, ordinaryTool(ordinary_payload)))
+                checker_rule_count += 1;
         }
+        const requests = try self.allocator.alloc(kernel.Request, checker_rule_count);
+        defer self.allocator.free(requests);
+        const bindings = try self.allocator.alloc(kernel.Bindings, checker_rule_count);
+        defer self.allocator.free(bindings);
+        const request_ids = try self.allocator.alloc([64]u8, checker_rule_count);
+        defer self.allocator.free(request_ids);
+        var request_index: usize = 0;
+        // The source-bound recovery obligation is the prerequisite for this
+        // host-synthesized transition, so it must be the first recorded
+        // verdict even when an older Edit rule precedes it in bundle order.
+        // The remaining applicable rules preserve their relative order.
+        for (0..2) |pass| {
+            for (self.active.rules, 0..) |entry, index| {
+                const is_recovery = index == rule_index;
+                if ((pass == 0) != is_recovery) continue;
+                if (!is_recovery and
+                    !std.mem.eql(u8, entry.rule_spec.target_tool, ordinaryTool(ordinary_payload)))
+                    continue;
+                const candidate_id = parseHex(entry.candidate_id) orelse
+                    return error.InvalidCandidateId;
+                const operation = if (is_recovery) recovery_operation else ordinary_operation;
+                const payload = if (is_recovery) recovery_payload else ordinary_payload;
+                const signal_json = if (is_recovery) recovery_signal_json else ordinary_signal_json;
+                request_ids[request_index] = kernel.requestId(
+                    operation,
+                    candidate_id,
+                    self.active.bundle_sha256,
+                    self.active.revision,
+                    signal_json,
+                );
+                requests[request_index] = .{
+                    .request_id = request_ids[request_index][0..],
+                    .operation = operation,
+                    .kernel_sha256 = self.active.kernel_sha256[0..],
+                    .candidate_id = entry.candidate_id,
+                    .project_sha256 = self.active.project_sha256[0..],
+                    .bundle_sha256 = self.active.bundle_sha256[0..],
+                    .bundle_revision = self.active.revision,
+                    .rule_spec = entry.rule_spec,
+                    .payload = payload,
+                };
+                bindings[request_index] = .{
+                    .request_id = request_ids[request_index],
+                    .operation = operation,
+                    .kernel_sha256 = self.active.kernel_sha256,
+                    .candidate_id = candidate_id,
+                    .project_sha256 = self.active.project_sha256,
+                    .bundle_sha256 = self.active.bundle_sha256,
+                    .bundle_revision = self.active.revision,
+                };
+                request_index += 1;
+            }
+        }
+        std.debug.assert(request_index == checker_rule_count);
         var batch = try kernel.invokeBatch(
             self.allocator,
             self.config,
@@ -539,7 +582,13 @@ pub const RuntimeGate = struct {
             self.abort,
         );
         defer batch.deinit(self.allocator);
-        return self.recordBatch(dispatch_id, phase, file_target_state, &batch);
+        return self.recordBatch(
+            dispatch_id,
+            phase,
+            file_target_state,
+            &batch,
+            .exact_edit_recovery,
+        );
     }
 
     fn recordBatch(
@@ -548,11 +597,18 @@ pub const RuntimeGate = struct {
         phase: observation.FormalPhase,
         file_target_state: observation.FileTargetState,
         batch: *const kernel.BatchInvocation,
+        filter_operation: observation.RuleFilterOperation,
     ) BatchDecision {
         // A production gate must publish both the payload and its journal
         // binding.  Test-only direct gates may deliberately configure neither.
         if ((self.evidence_dir != null) != (self.observation_sink != null))
             return .{ .result = .fault };
+        if (!self.recordRuleFilter(
+            dispatch_id,
+            phase,
+            filter_operation,
+            batch.invocations.len,
+        )) return .{ .result = .fault };
         var decision_count: usize = 0;
         var result = protocol.Result.admit;
         var recovery_action = protocol.RecoveryAction.none;
@@ -627,6 +683,11 @@ pub const RuntimeGate = struct {
             };
         }
         const first = &batch.invocations[0];
+        const checker_call_sha256 = physicalCheckerCallIdentity(
+            first.checker_call_sha256 orelse return .{ .result = .fault },
+            dispatch_id,
+            phase,
+        );
         if (!sink.emit(.{ .formal_decision_batch = .{
             .dispatch_id = dispatch_id,
             .phase = phase,
@@ -636,7 +697,7 @@ pub const RuntimeGate = struct {
             .bundle_sha256 = self.active.bundle_sha256,
             .bundle_revision = self.active.revision,
             .kernel_sha256 = self.active.kernel_sha256,
-            .checker_call_sha256 = first.checker_call_sha256 orelse return .{ .result = .fault },
+            .checker_call_sha256 = checker_call_sha256,
             .checker_verdict_sha256 = batch.verdict_sha256,
             .checker_batch_size = first.checker_batch_size,
             .checker_elapsed_ns = first.checker_elapsed_ns,
@@ -657,6 +718,42 @@ pub const RuntimeGate = struct {
             if (std.mem.eql(u8, &parsed, &candidate_id)) return index;
         }
         return null;
+    }
+
+    fn matchingRuleCount(self: *const RuntimeGate, tool: []const u8) usize {
+        var count: usize = 0;
+        for (self.active.rules) |entry| {
+            if (std.mem.eql(u8, entry.rule_spec.target_tool, tool)) count += 1;
+        }
+        return count;
+    }
+
+    fn recordRuleFilter(
+        self: *const RuntimeGate,
+        dispatch_id: []const u8,
+        phase: observation.FormalPhase,
+        operation: observation.RuleFilterOperation,
+        checker_rule_count: usize,
+    ) bool {
+        if ((self.evidence_dir != null) != (self.observation_sink != null)) return false;
+        const sink = self.observation_sink orelse return true;
+        if (self.active.rules.len > std.math.maxInt(u32) or
+            checker_rule_count > self.active.rules.len)
+            return false;
+        const active: u32 = @intCast(self.active.rules.len);
+        const checker: u32 = @intCast(checker_rule_count);
+        return sink.emit(.{ .rule_filter = .{
+            .dispatch_id = dispatch_id,
+            .phase = phase,
+            .operation = operation,
+            .project_sha256 = self.active.project_sha256,
+            .bundle_sha256 = self.active.bundle_sha256,
+            .bundle_revision = self.active.revision,
+            .kernel_sha256 = self.active.kernel_sha256,
+            .active_rule_count = active,
+            .checker_rule_count = checker,
+            .statically_pruned_rule_count = active - checker,
+        } });
     }
 
     fn findExactEditObligation(
@@ -721,10 +818,41 @@ pub const RuntimeGate = struct {
     }
 };
 
+/// A checker request digest identifies bytes, not a physical execution. Two
+/// legitimate tool calls can carry byte-identical signals (for example two
+/// reads with the same input size), so publishing the request digest as the
+/// call identity collapses distinct subprocess executions in the durable
+/// journal. Bind the content digest to the host-observed dispatch and phase;
+/// `request_sha256` remains available separately for content equality.
+fn physicalCheckerCallIdentity(
+    request_batch_sha256: [64]u8,
+    dispatch_id: []const u8,
+    phase: observation.FormalPhase,
+) [64]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("metacodes-project-checker-call-v1\x00");
+    hasher.update(&request_batch_sha256);
+    hasher.update("\x00");
+    hasher.update(@tagName(phase));
+    hasher.update("\x00");
+    hasher.update(dispatch_id);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
 fn isRecoveryOperation(operation: kernel.Operation) bool {
     return switch (operation) {
         .recovery_pre_decision, .recovery_post_decision => true,
         .promote, .pre_decision, .post_decision => false,
+    };
+}
+
+fn ordinaryTool(payload: kernel.Payload) []const u8 {
+    return switch (payload) {
+        .pre => |signal| signal.tool,
+        .post => |signal| signal.pre.tool,
+        .promotion, .recovery_pre, .recovery_post => unreachable,
     };
 }
 

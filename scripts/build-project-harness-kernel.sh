@@ -32,6 +32,7 @@ expected_axioms="'MetaCodesControl.ProjectHarness.safePromotion_sound' depends o
 'MetaCodesControl.ProjectHarness.rule_author_promotion_requires_receipt' depends on axioms: [propext]
 'MetaCodesControl.ProjectHarness.denied_all_predecision_blocks' depends on axioms: [propext]
 'MetaCodesControl.ProjectHarness.denied_existing_file_predecision_blocks' depends on axioms: [propext]
+'MetaCodesControl.ProjectRule.target_tool_mismatch_admits_both' depends on axioms: [propext]
 'MetaCodesControl.ProjectRule.denied_observed_overwrite_selects_exact_edit_recovery' depends on axioms: [propext]
 'MetaCodesControl.ProjectRule.nonregular_target_has_no_exact_edit_recovery' depends on axioms: [propext]
 'MetaCodesControl.ProjectRule.exact_edit_recovery_pre_sound' depends on axioms: [propext]

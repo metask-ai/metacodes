@@ -442,6 +442,34 @@ pub fn build(b: *std.Build) void {
     );
     rule_author_trial_step.dependOn(&install_rule_author_trial.step);
 
+    // Host-native, zero-paid vertical slice. The Python parent supplies only
+    // loopback services; the Zig child starts at the production KgClient
+    // daemon-config boundary and completes ontology snapshot -> rule author ->
+    // source re-observation -> candidate binding verification.
+    const project_rule_mac_pilot_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/eval/project_rule_evolution_mac_pilot.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    project_rule_mac_pilot_mod.addImport("metacodes-core", core_mod);
+    addPlatform(b, project_rule_mac_pilot_mod);
+    const project_rule_mac_pilot_exe = b.addExecutable(.{
+        .name = "metacodes-project-rule-evolution-mac-pilot",
+        .root_module = project_rule_mac_pilot_mod,
+    });
+    const project_rule_mac_pilot_run = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/eval/run_project_rule_evolution_mac_pilot.py",
+        "--probe",
+    });
+    project_rule_mac_pilot_run.addArtifactArg(project_rule_mac_pilot_exe);
+    const project_rule_mac_pilot_step = b.step(
+        "eval:project-rule-mac-pilot",
+        "Run the zero-paid Mac TinyKG-daemon to governed-rule host chain",
+    );
+    project_rule_mac_pilot_step.dependOn(&project_rule_mac_pilot_run.step);
+
     const agentcore_types_mod = b.createModule(.{
         .root_source_file = b.path("sdk/zig/types.zig"),
         .target = target,

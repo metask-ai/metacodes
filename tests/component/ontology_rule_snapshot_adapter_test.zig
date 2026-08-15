@@ -11,7 +11,10 @@ const cc = @import("cc");
 const adapter = cc.kg_ontology_rule_snapshot_adapter;
 const projection = cc.ontology_rule_projection;
 const rule_author = cc.rule_author;
+const evolution = cc.project_rule_evolution;
+const bundle = cc.project_rule_bundle;
 const observation = cc.tools.tool_observation;
+const harness = @import("harness");
 
 const PROJECT = [_]u8{'a'} ** 64;
 const REVISION = [_]u8{'b'} ** 64;
@@ -324,12 +327,13 @@ fn requestFor(value: *LocalFixture, project_node_id: u64) adapter.Request {
     };
 }
 
-fn completedFailureRun(session_dir: []const u8) !cc.tool_observation_journal.RunBinding {
+fn completedFailureRunCount(session_dir: []const u8, count: usize) !cc.tool_observation_journal.RunBinding {
     const sid = cc.session_id.SessionId.fromSlice("0123456789abcdef01234567").?;
     var journal = try cc.tool_observation_journal.Journal.init(session_dir, sid);
     errdefer journal.deinit();
     const ids = [_][]const u8{ "ontology-failure-0", "ontology-failure-1", "ontology-failure-2" };
-    for (ids) |id| {
+    if (count > ids.len) return error.InvalidFailureCount;
+    for (ids[0..count]) |id| {
         try std.testing.expect(journal.sink().emit(.{ .dispatch_started = .{
             .id = id,
             .requested_name = "Write",
@@ -359,6 +363,10 @@ fn completedFailureRun(session_dir: []const u8) !cc.tool_observation_journal.Run
     const binding = try journal.runBinding();
     journal.deinit();
     return binding;
+}
+
+fn completedFailureRun(session_dir: []const u8) !cc.tool_observation_journal.RunBinding {
+    return completedFailureRunCount(session_dir, 3);
 }
 
 fn findVendoredTinyKg(allocator: std.mem.Allocator) ?[]u8 {
@@ -894,5 +902,525 @@ test "L2 ontology provenance kind order follows declaration order not tag spelli
     try std.testing.expectError(
         error.InvalidOntologyProvenance,
         adapter.prepare(a, dup_fake.transport(), request(&local)),
+    );
+}
+
+const EvolutionSource = struct {
+    project: [64]u8,
+    project_key: []const u8,
+    /// Borrowed from the test body; the source never owns or frees it.
+    snapshot_bytes: []const u8,
+    snapshot_calls: usize = 0,
+    drift_on_call: ?usize = null,
+    project_calls: usize = 0,
+    project_drift_on_call: ?usize = null,
+
+    fn source(self: *EvolutionSource) evolution.ProjectOntologySource {
+        return .{
+            .ptr = self,
+            .project_node_id_fn = projectNode,
+            .project_key_fn = projectKey,
+            .read_transport_fn = readTransport,
+        };
+    }
+
+    fn cast(ptr: *anyopaque) *EvolutionSource {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn projectNode(ptr: *anyopaque) !?u64 {
+        const self = cast(ptr);
+        self.project_calls += 1;
+        return if (self.project_drift_on_call == self.project_calls) 8 else 7;
+    }
+
+    fn projectKey(ptr: *anyopaque) []const u8 {
+        return cast(ptr).project_key;
+    }
+
+    fn readTransport(ptr: *anyopaque) adapter.ReadTransport {
+        return .{
+            .ptr = ptr,
+            .build_sha256_fn = buildSha256,
+            .snapshot_fn = snapshot,
+        };
+    }
+
+    fn buildSha256(_: *anyopaque) ![64]u8 {
+        return BUILD;
+    }
+
+    fn snapshot(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        project_node_id: u64,
+        project_sha256: [64]u8,
+        project_key: []const u8,
+    ) ![]u8 {
+        const self = cast(ptr);
+        if (project_node_id != 7 or !std.mem.eql(u8, &project_sha256, &self.project) or
+            !std.mem.eql(u8, project_key, self.project_key))
+            return error.RequestBindingLost;
+        self.snapshot_calls += 1;
+        if (self.drift_on_call) |call| {
+            if (self.snapshot_calls == call) {
+                return std.mem.replaceOwned(
+                    u8,
+                    allocator,
+                    self.snapshot_bytes,
+                    "A governed ontology is context, not promotion authority.",
+                    "A drifted ontology is not the prepared source.",
+                );
+            }
+        }
+        return allocator.dupe(u8, self.snapshot_bytes);
+    }
+};
+
+const EvolutionFixture = struct {
+    session_dir: []u8,
+    project_root: []u8,
+    project_rules_dir: []u8,
+    project: [64]u8,
+    project_key: []const u8,
+    evidence: projection.DerivedGenerationEvidence,
+    held: [1]projection.HeldOutCommitment,
+    held_members: [1][]const u8,
+    held_commitment: [64]u8,
+
+    fn deinit(self: *EvolutionFixture, allocator: std.mem.Allocator) void {
+        self.evidence.deinit();
+        allocator.free(self.session_dir);
+        allocator.free(self.project_root);
+        allocator.free(self.project_rules_dir);
+        allocator.free(self.project_key);
+        self.* = undefined;
+    }
+};
+
+fn evolutionFixture(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, root_buffer: []u8) !EvolutionFixture {
+    const root_len = try tmp.dir.realPath(std.testing.io, root_buffer);
+    const root = root_buffer[0..root_len];
+    const project_root = try std.fmt.allocPrint(allocator, "{s}/project", .{root});
+    errdefer allocator.free(project_root);
+    const project_rules_dir = try std.fmt.allocPrint(allocator, "{s}/rules", .{project_root});
+    errdefer allocator.free(project_rules_dir);
+    const session_dir = try std.fmt.allocPrint(allocator, "{s}/0123456789abcdef01234567", .{root});
+    errdefer allocator.free(session_dir);
+    try std.Io.Dir.createDirAbsolute(std.testing.io, project_root, .default_dir);
+    try std.Io.Dir.createDirAbsolute(std.testing.io, project_rules_dir, .default_dir);
+    try std.Io.Dir.createDirAbsolute(std.testing.io, session_dir, .default_dir);
+    const project = bundle.projectIdentity(project_root);
+    const project_key = try std.fmt.allocPrint(allocator, "metacodes:{s}", .{project_root});
+    errdefer allocator.free(project_key);
+    const sid = cc.session_id.SessionId.fromSlice("0123456789abcdef01234567").?;
+    const transcript_path = try std.fmt.allocPrint(allocator, "{s}/transcript.jsonl", .{session_dir});
+    defer allocator.free(transcript_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = transcript_path,
+        .data = "{\"role\":\"user\",\"blocks\":[{\"type\":\"text\",\"text\":\"governed correction\"}]}\n",
+    });
+    const receipt = try cc.rule_source_receipt.persistUserCorrection(session_dir, .{
+        .project_sha256 = project,
+        .issuer_sha256 = .{'2'} ** 64,
+        .session_id = sid,
+        .transcript_line_index = 0,
+        .correction = "governed correction",
+    });
+    var evidence = try projection.deriveGenerationEvidence(
+        allocator,
+        session_dir,
+        project,
+        receipt.receipt_id,
+        .user_correction,
+        GENERATION_MEMBER,
+    );
+    errdefer evidence.deinit();
+    const held_members = [1][]const u8{HELD_OUT_MEMBER[0..]};
+    const held_commitment = try projection.heldOutCommitmentSha256(allocator, HELD_OUT_SUITE, &held_members);
+    return .{
+        .session_dir = session_dir,
+        .project_root = project_root,
+        .project_rules_dir = project_rules_dir,
+        .project = project,
+        .project_key = project_key,
+        .evidence = evidence,
+        .held = .{.{
+            // Rebound after the fixture reaches its final address. These
+            // slices must never point into this returning stack frame.
+            .commitment_sha256 = undefined,
+            .suite_sha256 = HELD_OUT_SUITE[0..],
+            .case_count = 1,
+            .member_sha256 = undefined,
+            .sealed = true,
+        }},
+        .held_members = held_members,
+        .held_commitment = held_commitment,
+    };
+}
+
+fn evolutionPrepareInput(fixture: *EvolutionFixture, source: evolution.ProjectOntologySource) evolution.PrepareInput {
+    fixture.held[0].member_sha256 = &fixture.held_members;
+    fixture.held[0].commitment_sha256 = fixture.held_commitment[0..];
+    return .{
+        .session_dir = fixture.session_dir,
+        .project_root = fixture.project_root,
+        .project_rules_dir = fixture.project_rules_dir,
+        .ontology_source = source,
+        .kernel_config = null,
+        .author_sha256 = .{'2'} ** 64,
+        .actor_provider_sha256 = .{'1'} ** 64,
+        .provider_sha256 = .{'3'} ** 64,
+        .budget_authorization_sha256 = .{'4'} ** 64,
+        .model = "ontology-evolution-l2-control-provider",
+        .observation = undefined,
+        .trigger = .repeated_typed_failure,
+        .evidence = &.{},
+        .caps = .{
+            .max_cost_microusd = 1_000_000,
+            .max_input_tokens = 100_000,
+            .max_output_tokens = 256,
+        },
+        .pricing = .{
+            .provenance_sha256 = .{'5'} ** 64,
+            .input_microusd_per_mtok = 3_000_000,
+            .output_microusd_per_mtok = 15_000_000,
+            .cache_read_microusd_per_mtok = 300_000,
+            .cache_write_microusd_per_mtok = 3_750_000,
+        },
+        .generation_evidence = &.{fixture.evidence.value},
+        .held_out_commitments = &fixture.held,
+    };
+}
+
+fn evolutionProposalJson(allocator: std.mem.Allocator) ![]u8 {
+    const spec = cc.project_rule_spec.Spec{
+        .target_tool = "Write",
+        .target_scope = .existing_file,
+        .deny_target = true,
+        .max_input_bytes = 8192,
+        .max_agent_depth = 4,
+        .authoritative_only = true,
+        .effect_requirement = .none,
+    };
+    const lean = try rule_author.renderCanonicalLean(allocator, spec);
+    defer allocator.free(lean);
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .schema_version = rule_author.RESPONSE_SCHEMA_VERSION,
+        .decision = rule_author.Decision.propose,
+        .reason = "A narrow rule candidate is useful for this controlled failure.",
+        .invariant = "An authoritative Write must not replace an existing regular file.",
+        .falsifier = "Replay admits an authoritative Write whose host signal is regular_existing.",
+        .rule_spec = cc.project_rule_spec.toWire(spec),
+        .lean_source = lean,
+    }, .{});
+}
+
+fn evolutionTextSse(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const quoted = try std.json.Stringify.valueAlloc(allocator, text, .{});
+    defer allocator.free(quoted);
+    return std.fmt.allocPrint(
+        allocator,
+        "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_evolution\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":0}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{s}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":80}}}}\n\n" ++
+            "data: {{\"type\":\"message_stop\"}}\n\n",
+        .{quoted},
+    );
+}
+
+const EvolutionArtifacts = struct {
+    receipts: usize = 0,
+    candidates: usize = 0,
+};
+
+fn evolutionArtifacts(session_dir: []const u8) !EvolutionArtifacts {
+    var result = EvolutionArtifacts{};
+    var entries = try std.Io.Dir.openDirAbsolute(std.testing.io, session_dir, .{ .iterate = true });
+    defer entries.close(std.testing.io);
+    var it = entries.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        if (std.mem.startsWith(u8, entry.name, rule_author.RECEIPT_FILE_PREFIX))
+            result.receipts += 1;
+        if (std.mem.startsWith(u8, entry.name, cc.rule_candidate.FILE_PREFIX))
+            result.candidates += 1;
+    }
+    return result;
+}
+
+test "L2 project rule evolution persists one source-bound candidate without actor context or tools" {
+    const a = std.heap.page_allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var fixture = try evolutionFixture(a, &tmp, &root_buffer);
+    defer fixture.deinit(a);
+    const fixed_source = try sourceSnapshot(a);
+    defer a.free(fixed_source);
+    const project_rebound = try replacedAndRebound(a, fixed_source, PROJECT[0..], &fixture.project);
+    defer a.free(project_rebound);
+    const source_rebound = try replacedAndRebound(a, project_rebound, PROJECT_KEY, fixture.project_key);
+    defer a.free(source_rebound);
+    var fake = EvolutionSource{
+        .project = fixture.project,
+        .project_key = fixture.project_key,
+        .snapshot_bytes = source_rebound,
+    };
+    const run = try completedFailureRun(fixture.session_dir);
+    var input = evolutionPrepareInput(&fixture, fake.source());
+    input.observation = run;
+    var prepared = try evolution.prepare(a, input);
+    defer prepared.deinit();
+    const permit = try prepared.authorize(.{
+        .enabled = true,
+        .now_ns = 1_000_000,
+        .cooldown_ns = 0,
+        .remaining_requests = 1,
+        .remaining_cost_microusd = 1_000_000,
+        .remaining_input_tokens = 100_000,
+        .remaining_output_tokens = 256,
+    });
+    const response_json = try evolutionProposalJson(a);
+    defer a.free(response_json);
+    const sse = try evolutionTextSse(a, response_json);
+    defer a.free(sse);
+    var server = try harness.MockServer.start(sse, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "evolution-success-key", input.model, url);
+    defer client.deinit();
+    client.setMaxTokensOverride(256);
+
+    const outcome = try evolution.authorOnce(
+        &prepared,
+        .{ .provider = client.provider(), .provider_sha256 = .{'3'} ** 64 },
+        permit,
+        null,
+    );
+    try std.testing.expectEqual(rule_author.Decision.propose, outcome.decision);
+    try std.testing.expect(outcome.candidate_id != null);
+    try std.testing.expect(outcome.candidate_created);
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    try std.testing.expectEqual(@as(usize, 6), fake.snapshot_calls);
+    const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, rule_author.PACKET_SCHEMA_VERSION_V2) != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "ontology_context_is_authority\\\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "ACTOR_SECRET_CACHE_PREFIX") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") == null);
+    try std.testing.expect(try rule_author.verifyCandidateBinding(
+        a,
+        fixture.session_dir,
+        outcome.author_receipt_id,
+        outcome.candidate_id.?,
+    ));
+    const artifacts = try evolutionArtifacts(fixture.session_dir);
+    try std.testing.expectEqual(@as(usize, 1), artifacts.receipts);
+    try std.testing.expectEqual(@as(usize, 1), artifacts.candidates);
+}
+
+test "L2 project rule evolution ordinary run stops before TinyKG snapshot and provider" {
+    const a = std.heap.page_allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var fixture = try evolutionFixture(a, &tmp, &root_buffer);
+    defer fixture.deinit(a);
+    const fixed_source = try sourceSnapshot(a);
+    defer a.free(fixed_source);
+    var fake = EvolutionSource{
+        .project = fixture.project,
+        .project_key = fixture.project_key,
+        .snapshot_bytes = fixed_source,
+    };
+    const run = try completedFailureRunCount(fixture.session_dir, 1);
+    var input = evolutionPrepareInput(&fixture, fake.source());
+    input.observation = run;
+    try std.testing.expectError(error.TriggerNotSatisfied, evolution.prepare(a, input));
+    try std.testing.expectEqual(@as(usize, 0), fake.project_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.snapshot_calls);
+    const artifacts = try evolutionArtifacts(fixture.session_dir);
+    try std.testing.expectEqual(@as(usize, 0), artifacts.receipts);
+    try std.testing.expectEqual(@as(usize, 0), artifacts.candidates);
+}
+
+test "L2 project rule evolution source drift before provider spends zero requests" {
+    const a = std.heap.page_allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var fixture = try evolutionFixture(a, &tmp, &root_buffer);
+    defer fixture.deinit(a);
+    const fixed_source = try sourceSnapshot(a);
+    defer a.free(fixed_source);
+    const project_rebound = try replacedAndRebound(a, fixed_source, PROJECT[0..], &fixture.project);
+    defer a.free(project_rebound);
+    const source_rebound = try replacedAndRebound(a, project_rebound, PROJECT_KEY, fixture.project_key);
+    defer a.free(source_rebound);
+    var fake = EvolutionSource{
+        .project = fixture.project,
+        .project_key = fixture.project_key,
+        .snapshot_bytes = source_rebound,
+        .drift_on_call = 3,
+    };
+    const run = try completedFailureRun(fixture.session_dir);
+    var input = evolutionPrepareInput(&fixture, fake.source());
+    input.observation = run;
+    var prepared = try evolution.prepare(a, input);
+    defer prepared.deinit();
+    const permit = try prepared.authorize(.{
+        .enabled = true,
+        .now_ns = 1_000_000,
+        .cooldown_ns = 0,
+        .remaining_requests = 1,
+        .remaining_cost_microusd = 1_000_000,
+        .remaining_input_tokens = 100_000,
+        .remaining_output_tokens = 256,
+    });
+    const response_json = try evolutionProposalJson(a);
+    defer a.free(response_json);
+    const sse = try evolutionTextSse(a, response_json);
+    defer a.free(sse);
+    var server = try harness.MockServer.start(sse, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "evolution-pre-drift-key", input.model, url);
+    defer client.deinit();
+    client.setMaxTokensOverride(256);
+    try std.testing.expectError(
+        error.OntologySourceDrift,
+        evolution.authorOnce(&prepared, .{ .provider = client.provider(), .provider_sha256 = .{'3'} ** 64 }, permit, null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+    const artifacts = try evolutionArtifacts(fixture.session_dir);
+    try std.testing.expectEqual(@as(usize, 0), artifacts.receipts);
+    try std.testing.expectEqual(@as(usize, 0), artifacts.candidates);
+}
+
+test "L2 project rule evolution active pointer drift before provider spends zero requests" {
+    const a = std.heap.page_allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var fixture = try evolutionFixture(a, &tmp, &root_buffer);
+    defer fixture.deinit(a);
+    const fixed_source = try sourceSnapshot(a);
+    defer a.free(fixed_source);
+    const project_rebound = try replacedAndRebound(a, fixed_source, PROJECT[0..], &fixture.project);
+    defer a.free(project_rebound);
+    const source_rebound = try replacedAndRebound(a, project_rebound, PROJECT_KEY, fixture.project_key);
+    defer a.free(source_rebound);
+    var fake = EvolutionSource{
+        .project = fixture.project,
+        .project_key = fixture.project_key,
+        .snapshot_bytes = source_rebound,
+    };
+    const run = try completedFailureRun(fixture.session_dir);
+    var input = evolutionPrepareInput(&fixture, fake.source());
+    input.observation = run;
+    var prepared = try evolution.prepare(a, input);
+    defer prepared.deinit();
+    const permit = try prepared.authorize(.{
+        .enabled = true,
+        .now_ns = 1_000_000,
+        .cooldown_ns = 0,
+        .remaining_requests = 1,
+        .remaining_cost_microusd = 1_000_000,
+        .remaining_input_tokens = 100_000,
+        .remaining_output_tokens = 256,
+    });
+    const active_path = try std.fmt.allocPrint(a, "{s}/{s}", .{ fixture.project_rules_dir, bundle.ACTIVE_FILE });
+    defer a.free(active_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = active_path, .data = "{}" });
+    const response_json = try evolutionProposalJson(a);
+    defer a.free(response_json);
+    const sse = try evolutionTextSse(a, response_json);
+    defer a.free(sse);
+    var server = try harness.MockServer.start(sse, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "evolution-active-drift-key", input.model, url);
+    defer client.deinit();
+    client.setMaxTokensOverride(256);
+    try std.testing.expectError(
+        error.ActiveBundleDrift,
+        evolution.authorOnce(&prepared, .{ .provider = client.provider(), .provider_sha256 = .{'3'} ** 64 }, permit, null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+    const artifacts = try evolutionArtifacts(fixture.session_dir);
+    try std.testing.expectEqual(@as(usize, 0), artifacts.receipts);
+    try std.testing.expectEqual(@as(usize, 0), artifacts.candidates);
+}
+
+test "L2 project rule evolution rejects TinyKG source drift after provider before candidate persistence" {
+    const a = std.heap.page_allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var fixture = try evolutionFixture(a, &tmp, &root_buffer);
+    defer fixture.deinit(a);
+    const fixed_source = try sourceSnapshot(a);
+    defer a.free(fixed_source);
+    const project_rebound = try replacedAndRebound(a, fixed_source, PROJECT[0..], &fixture.project);
+    defer a.free(project_rebound);
+    const source_rebound = try replacedAndRebound(a, project_rebound, PROJECT_KEY, fixture.project_key);
+    defer a.free(source_rebound);
+    var fake = EvolutionSource{
+        .project = fixture.project,
+        .project_key = fixture.project_key,
+        .snapshot_bytes = source_rebound,
+        // prepare=2 reads, pre-provider reobserve=2 reads, then the first
+        // post-provider read drifts. The paid call must have happened once,
+        // but its proposal must remain non-authorizing and unpersisted.
+        .drift_on_call = 5,
+    };
+    const run = try completedFailureRun(fixture.session_dir);
+    var input = evolutionPrepareInput(&fixture, fake.source());
+    input.observation = run;
+    var prepared = try evolution.prepare(a, input);
+    defer prepared.deinit();
+    const permit = try prepared.authorize(.{
+        .enabled = true,
+        .now_ns = 1_000_000,
+        .cooldown_ns = 0,
+        .remaining_requests = 1,
+        .remaining_cost_microusd = 1_000_000,
+        .remaining_input_tokens = 100_000,
+        .remaining_output_tokens = 256,
+    });
+    const response_json = try evolutionProposalJson(a);
+    defer a.free(response_json);
+    const sse = try evolutionTextSse(a, response_json);
+    defer a.free(sse);
+    var server = try harness.MockServer.start(sse, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "evolution-l2-key", input.model, url);
+    defer client.deinit();
+    client.setMaxTokensOverride(256);
+    try std.testing.expectError(
+        error.OntologySourceDrift,
+        evolution.authorOnce(&prepared, .{ .provider = client.provider(), .provider_sha256 = .{'3'} ** 64 }, permit, null),
+    );
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    const artifacts = try evolutionArtifacts(fixture.session_dir);
+    try std.testing.expectEqual(@as(usize, 1), artifacts.receipts);
+    try std.testing.expectEqual(@as(usize, 0), artifacts.candidates);
+    try std.testing.expectError(
+        error.AuthorAlreadyAttempted,
+        evolution.authorOnce(&prepared, .{ .provider = client.provider(), .provider_sha256 = .{'3'} ** 64 }, permit, null),
     );
 }

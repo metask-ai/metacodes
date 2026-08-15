@@ -178,6 +178,8 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // run-scoped host ledger before TinyKG is touched; legacy query-only calls
     // intentionally preserve their old behavior.
     var ledger_guard: ?lexical_query_plan.Ledger.Guard = null;
+    var ledger_seen_count: usize = 0;
+    var ledger_scope: []const u8 = "agent_run_plan";
     defer if (ledger_guard) |*guard| guard.deinit();
     if (plan) |value| {
         const ledger = ctx.kg_lexical_ledger orelse {
@@ -188,11 +190,31 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall lexical_plan host ledger rejected the call: {s}", .{lexical_query_plan.ledgerDiagnostic(err)});
             return error.InvalidLexicalPlanState;
         };
+        ledger_seen_count = ledger_guard.?.seenCount();
+        ledger_scope = ledger_guard.?.scope();
     }
     // 采用率埋点(PM:kill-criterion 的 load-bearing 仪器,measure 模型是否用 --type)。
-    log.info("kg", "kg_recall type_filter={s} lexical_plan={s}", .{ type_canon orelse "none", if (plan == null) "legacy" else "v1" });
+    const plan_version = if (plan) |value| value.schema_version.text() else "query-only";
+    log.info("kg", "kg_recall type_filter={s} lexical_plan={s}", .{ type_canon orelse "none", plan_version });
 
-    const hits = kg.recallTyped(query, 8, false, type_canon) catch |e| {
+    if (plan) |value| {
+        if (value.executesAll()) {
+            return executeRecallBatch(
+                ctx,
+                kg,
+                value,
+                type_canon,
+                &ledger_guard.?,
+                ledger_scope,
+                ledger_seen_count,
+            );
+        }
+    }
+
+    // A recovered v3 seed executes the declared exact/alias text, never the
+    // redundant compatibility query. v1/v2 already require the two to match.
+    const effective_query = if (plan) |value| value.selected().text else query;
+    const hits = kg.recallTyped(effective_query, 8, false, type_canon) catch |e| {
         return kgErrorResult(ctx, kg, e, "KgRecall");
     };
     defer {
@@ -214,21 +236,9 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     for (hits, 0..) |h, i| {
         hit_ids[i] = h.node_id;
         if (i > 0) try out.appendSlice(ctx.allocator, ",");
-        const type_str = if (h.schema_type.len > 0) h.schema_type else h.kind;
-        const row = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d},\"type\":\"{s}\",\"scope\":\"{s}\",\"score\":{d:.2},\"text\":", .{
-            h.node_id, type_str, if (std.mem.eql(u8, h.domain, "global")) "global" else "project", h.score,
-        });
-        defer ctx.allocator.free(row);
-        try out.appendSlice(ctx.allocator, row);
-        try appendJsonString(&out, ctx.allocator, h.text);
-        // 溯源(PM P0-2):hit 带 source 的是记忆 markdown 文件——模型该**更新该文件**而非
-        // 另存/KgRemember(否则 "update rather than duplicate" 指令不可执行)。
-        if (h.source_label.len > 0) {
-            try out.appendSlice(ctx.allocator, ",\"source\":");
-            try appendJsonString(&out, ctx.allocator, h.source_label);
-        }
+        var seen_before = false;
         if (ledger_guard) |*guard| {
-            const seen_before = guard.wasSeen(h.node_id);
+            seen_before = guard.wasSeen(h.node_id);
             const duplicate_in_batch = containsNodeId(hit_ids[0..i], h.node_id);
             if (!duplicate_in_batch) {
                 if (seen_before) {
@@ -237,9 +247,18 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
                     new_hit_count += 1;
                 }
             }
-            try out.appendSlice(ctx.allocator, if (seen_before) ",\"seen_before\":true" else ",\"seen_before\":false");
         }
-        try out.appendSlice(ctx.allocator, "}");
+        const compact_repeat = if (plan) |value|
+            (value.schema_version == .host_managed_v2 or value.isSeedShapeRewrite()) and seen_before
+        else
+            false;
+        if (compact_repeat) {
+            const row = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d},\"seen_before\":true,\"content_ref\":\"exposed_elsewhere_in_run\"}}", .{h.node_id});
+            defer ctx.allocator.free(row);
+            try out.appendSlice(ctx.allocator, row);
+            continue;
+        }
+        try appendRecallHitRow(&out, ctx.allocator, h, seen_before, ledger_guard != null, SINGLE_RECALL_HIT_TEXT_BYTES);
     }
     // 搭车 facet(PM:可见性,零额外调用):结果里各类型计数,让模型知道有哪些类型 → 可 --type 精化。
     const known_types = [_][]const u8{ "decision", "module", "bug", "user_preference", "observation" };
@@ -265,13 +284,33 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try out.appendSlice(ctx.allocator, ",\"types_in_results\":{");
     try out.appendSlice(ctx.allocator, facet.items);
     try out.append(ctx.allocator, '}');
-    if (plan) |value| try appendLexicalPlanReceipt(&out, ctx.allocator, value, new_hit_count, repeated_hit_count);
+    if (plan) |value| {
+        if (value.isSeedShapeRewrite()) {
+            try appendSeedShapeRewriteReceipt(
+                &out,
+                ctx.allocator,
+                value,
+                ledger_scope,
+                ledger_seen_count,
+                hit_ids[0..hits.len],
+                new_hit_count,
+                repeated_hit_count,
+            );
+        } else {
+            try appendLexicalPlanReceipt(&out, ctx.allocator, value, ledger_scope, ledger_seen_count, new_hit_count, repeated_hit_count);
+        }
+    }
+    try appendRecallEnvelope(&out, ctx.allocator);
     try out.appendSlice(ctx.allocator, ",\"retrieval_mode\":\"lexical_bm25_no_embeddings\",\"knowledge_status\":\"unverified_candidates\",\"lexical_guidance\":");
     try appendJsonString(&out, ctx.allocator, retrieval_protocol.RESULT_GUIDANCE);
     const tail = "}";
     try out.appendSlice(ctx.allocator, tail);
     const owned = try out.toOwnedSlice(ctx.allocator);
     errdefer ctx.allocator.free(owned);
+    if (owned.len > MAX_RECALL_RESULT_BYTES) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall bounded envelope exceeded its {d}-byte contract", .{MAX_RECALL_RESULT_BYTES});
+        return error.RecallEnvelopeTooLarge;
+    }
     if (ledger_guard) |*guard| {
         guard.commit(hit_ids[0..hits.len]) catch |err| {
             common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall lexical_plan host ledger could not commit the observed hits: {s}", .{lexical_query_plan.ledgerDiagnostic(err)});
@@ -292,32 +331,352 @@ fn containsNodeId(values: []const u64, expected: u64) bool {
     return false;
 }
 
+const BatchVariantReceipt = struct {
+    node_ids: [8]u64 = [_]u64{0} ** 8,
+    node_count: usize = 0,
+    new_hit_count: usize = 0,
+    repeated_hit_count: usize = 0,
+};
+
+/// Keep the complete versioned JSON below the generic tool-result projection
+/// threshold. Raising that threshold would only move the cache/context failure;
+/// KgRecall owns its provider-visible information budget instead.
+pub const MAX_RECALL_RESULT_BYTES: usize = 24 * 1024;
+const SINGLE_RECALL_HIT_TEXT_BYTES: usize = 512;
+const AUTO_CONTEXT_TEXT_BYTES: usize = 2000;
+const AUTO_CONTEXT_EDGES: usize = 6;
+
+fn batchHitTextBytes(index: usize) usize {
+    if (index < 4) return 640;
+    if (index < 8) return 384;
+    return 160;
+}
+
+/// Execute every member of a v3 plan under one host-ledger guard. TinyKG reads
+/// remain ordered and read-only; the model receives one merged result envelope,
+/// each node body at most once, plus replayable per-variant node-id receipts.
+/// This deliberately does not claim a cross-query snapshot: a shared daemon
+/// may accept a writer between probes, so freshness is rechecked via KgContext.
+fn executeRecallBatch(
+    ctx: *const ToolContext,
+    kg: *kg_mod.KgClient,
+    plan: lexical_query_plan.Plan,
+    type_canon: ?[]const u8,
+    guard: *lexical_query_plan.Ledger.Guard,
+    ledger_scope: []const u8,
+    ledger_seen_count: usize,
+) anyerror![]u8 {
+    std.debug.assert(plan.schema_version == .host_batch_v3);
+    std.debug.assert(plan.executesAll());
+
+    var hit_rows: std.ArrayList(u8) = .empty;
+    defer hit_rows.deinit(ctx.allocator);
+    var receipts = [_]BatchVariantReceipt{.{}} ** lexical_query_plan.MAX_VARIANTS;
+    var merged_ids: [lexical_query_plan.MAX_SEEN_NODE_IDS]u64 = [_]u64{0} ** lexical_query_plan.MAX_SEEN_NODE_IDS;
+    var merged_count: usize = 0;
+    var merged_new_count: usize = 0;
+    var merged_previously_seen_count: usize = 0;
+    var probe_new_count: usize = 0;
+    var probe_repeated_count: usize = 0;
+    var first_new_node_id: u64 = 0;
+    var first_new_evidence_node_id: u64 = 0;
+    const known_types = [_][]const u8{ "decision", "module", "bug", "user_preference", "observation" };
+    var facet_counts = [_]usize{0} ** known_types.len;
+
+    for (plan.variants, 0..) |variant, variant_index| {
+        const hits = kg.recallTyped(variant.text, 8, false, type_canon) catch |e| {
+            return kgErrorResult(ctx, kg, e, "KgRecall");
+        };
+        defer {
+            for (hits) |*hit| hit.deinit(kg.allocator);
+            kg.allocator.free(hits);
+        }
+        var receipt = &receipts[variant_index];
+        for (hits) |hit| {
+            if (containsNodeId(receipt.node_ids[0..receipt.node_count], hit.node_id)) continue;
+            if (receipt.node_count == receipt.node_ids.len) {
+                common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall batch variant returned more than eight distinct hits", .{});
+                return error.InvalidLexicalPlanState;
+            }
+            receipt.node_ids[receipt.node_count] = hit.node_id;
+            receipt.node_count += 1;
+
+            const seen_before_run = guard.wasSeen(hit.node_id);
+            const seen_earlier_in_batch = containsNodeId(merged_ids[0..merged_count], hit.node_id);
+            if (seen_before_run or seen_earlier_in_batch) {
+                receipt.repeated_hit_count += 1;
+                probe_repeated_count += 1;
+            } else {
+                receipt.new_hit_count += 1;
+                probe_new_count += 1;
+            }
+            if (seen_earlier_in_batch) continue;
+            if (merged_count == merged_ids.len) {
+                common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall batch exceeded the governed 32-node merged-result bound", .{});
+                return error.InvalidLexicalPlanState;
+            }
+            if (merged_count > 0) try hit_rows.append(ctx.allocator, ',');
+            merged_ids[merged_count] = hit.node_id;
+            merged_count += 1;
+            if (seen_before_run) {
+                merged_previously_seen_count += 1;
+                const row = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d},\"seen_before\":true,\"content_ref\":\"exposed_elsewhere_in_run\"}}", .{hit.node_id});
+                defer ctx.allocator.free(row);
+                try hit_rows.appendSlice(ctx.allocator, row);
+            } else {
+                merged_new_count += 1;
+                if (first_new_node_id == 0) first_new_node_id = hit.node_id;
+                const exposed_type = if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
+                if (first_new_evidence_node_id == 0 and std.mem.eql(u8, exposed_type, "evidence")) {
+                    first_new_evidence_node_id = hit.node_id;
+                }
+                try appendRecallHitRow(&hit_rows, ctx.allocator, hit, false, true, batchHitTextBytes(merged_count - 1));
+            }
+            const type_str = if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
+            for (known_types, 0..) |type_name, facet_index| {
+                if (std.mem.eql(u8, type_str, type_name)) facet_counts[facet_index] += 1;
+            }
+        }
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(ctx.allocator);
+    try out.appendSlice(ctx.allocator, "{\"hits\":[");
+    try out.appendSlice(ctx.allocator, hit_rows.items);
+    try out.appendSlice(ctx.allocator, "],\"count\":");
+    try out.print(ctx.allocator, "{d},\"types_in_results\":{{", .{merged_count});
+    var facet_first = true;
+    for (known_types, facet_counts) |type_name, count| {
+        if (count == 0) continue;
+        if (!facet_first) try out.append(ctx.allocator, ',');
+        facet_first = false;
+        try out.print(ctx.allocator, "\"{s}\":{d}", .{ type_name, count });
+    }
+    try out.appendSlice(ctx.allocator, "},\"lexical_query_plan\":{");
+    try out.print(
+        ctx.allocator,
+        "\"schema_version\":\"{s}\",\"plan_sha256\":\"{s}\",\"intent\":\"{s}\",\"stage\":\"{s}\",\"variant_count\":{d},\"executed_variant_count\":{d},\"all_variants_executed\":true,\"seen_node_count\":{d},\"seen_state_verified\":true,\"ledger_scope\":\"{s}\",\"merged_hit_count\":{d},\"merged_new_hit_count\":{d},\"merged_previously_seen_count\":{d},\"probe_new_hit_count\":{d},\"probe_repeated_hit_count\":{d},\"query_anchor_rewritten\":{s},\"query_anchor_input_sha256\":\"{s}\",\"query_anchor_effective_sha256\":\"{s}\",\"variant_receipts\":[",
+        .{ plan.schema_version.text(), plan.fingerprint, @tagName(plan.intent), @tagName(plan.stage), plan.variants.len, plan.variants.len, ledger_seen_count, ledger_scope, merged_count, merged_new_count, merged_previously_seen_count, probe_new_count, probe_repeated_count, if (plan.query_anchor_rewritten) "true" else "false", plan.query_anchor_input_sha256, plan.query_anchor_effective_sha256 },
+    );
+    for (plan.variants, 0..) |variant, variant_index| {
+        if (variant_index > 0) try out.append(ctx.allocator, ',');
+        const receipt = receipts[variant_index];
+        try out.print(
+            ctx.allocator,
+            "{{\"variant_index\":{d},\"variant_kind\":\"{s}\",\"node_ids\":[",
+            .{ variant_index, @tagName(variant.kind) },
+        );
+        for (receipt.node_ids[0..receipt.node_count], 0..) |node_id, node_index| {
+            if (node_index > 0) try out.append(ctx.allocator, ',');
+            try out.print(ctx.allocator, "{d}", .{node_id});
+        }
+        try out.print(
+            ctx.allocator,
+            "],\"new_hit_count\":{d},\"repeated_hit_count\":{d}}}",
+            .{ receipt.new_hit_count, receipt.repeated_hit_count },
+        );
+    }
+    try out.appendSlice(ctx.allocator, "],\"execution\":\"host_batch_all\"}");
+    try appendRecallEnvelope(&out, ctx.allocator);
+    try out.appendSlice(ctx.allocator, ",\"retrieval_mode\":\"lexical_bm25_no_embeddings\",\"knowledge_status\":\"unverified_candidates\",\"lexical_guidance\":");
+    try appendJsonString(&out, ctx.allocator, retrieval_protocol.RESULT_GUIDANCE);
+    // Enumeration needs one real graph re-observation, but spending a whole
+    // provider turn merely to ask the model to echo a recalled node_id is pure
+    // orchestration tax. Deterministically build the exact KgContext result in
+    // the same tool envelope before committing either observation. Selection
+    // prefers newly exposed evidence, then any new node, then the first merged
+    // node. This does not decide truth; it only removes model-owned parameter
+    // reconstruction from the governance read.
+    var auto_context_node_id: ?u64 = null;
+    if (plan.intent == .enumeration and plan.stage == .semantic_expansion and merged_count > 0) {
+        const context_node_id = if (first_new_evidence_node_id != 0)
+            first_new_evidence_node_id
+        else if (first_new_node_id != 0)
+            first_new_node_id
+        else
+            merged_ids[0];
+        const context_args = try std.fmt.allocPrint(
+            ctx.allocator,
+            "{{\"node_id\":{d},\"limit\":{d},\"text_limit\":{d}}}",
+            .{ context_node_id, AUTO_CONTEXT_EDGES, AUTO_CONTEXT_TEXT_BYTES },
+        );
+        defer ctx.allocator.free(context_args);
+        const context_observation = try executeContextObserved(ctx, context_args);
+        defer ctx.allocator.free(context_observation.result);
+        try out.appendSlice(ctx.allocator, ",\"auto_context\":{\"schema_version\":\"metacodes-auto-context-v1\",\"selection_policy\":\"first_new_evidence_then_new_then_merged_v1\",\"context\":");
+        try out.appendSlice(ctx.allocator, context_observation.result);
+        try out.append(ctx.allocator, '}');
+        auto_context_node_id = context_observation.observed_node_id;
+    }
+    try out.append(ctx.allocator, '}');
+
+    const owned = try out.toOwnedSlice(ctx.allocator);
+    errdefer ctx.allocator.free(owned);
+    if (owned.len > MAX_RECALL_RESULT_BYTES) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall bounded envelope exceeded its {d}-byte contract", .{MAX_RECALL_RESULT_BYTES});
+        return error.RecallEnvelopeTooLarge;
+    }
+    // Commit only after every provider-visible byte, including auto_context,
+    // has been constructed. Otherwise an OOM/protocol failure after commit
+    // would mark node bodies as exposed even though the tool result was lost.
+    guard.commitWithContext(merged_ids[0..merged_count], auto_context_node_id) catch |err| {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall lexical_plan host ledger could not commit the observed batch: {s}", .{lexical_query_plan.ledgerDiagnostic(err)});
+        return error.InvalidLexicalPlanState;
+    };
+    return owned;
+}
+
+fn appendRecallHitRow(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    hit: kg_mod.RecallHit,
+    seen_before: bool,
+    include_seen: bool,
+    max_text_bytes: usize,
+) !void {
+    const type_str = if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
+    const row = try std.fmt.allocPrint(allocator, "{{\"node_id\":{d},\"type\":\"{s}\",\"scope\":\"{s}\",\"score\":{d:.2},\"text\":", .{
+        hit.node_id, type_str, if (std.mem.eql(u8, hit.domain, "global")) "global" else "project", hit.score,
+    });
+    defer allocator.free(row);
+    try out.appendSlice(allocator, row);
+    // The budget is provider-visible JSON payload bytes, not merely decoded
+    // source bytes. Control characters can expand 6x when escaped; budgeting
+    // before serialization would recreate the oversized-result failure with
+    // perfectly valid TinyKG text.
+    const excerpt = try boundedJsonTextExcerptAlloc(allocator, hit.text, max_text_bytes);
+    defer allocator.free(excerpt);
+    try appendJsonString(out, allocator, excerpt);
+    const text_total_bytes = if (hit.text_total_bytes > 0) hit.text_total_bytes else hit.text.len;
+    const text_truncated = hit.text_truncated or excerpt.len < hit.text.len;
+    try out.print(
+        allocator,
+        ",\"text_returned_bytes\":{d},\"text_total_bytes\":{d},\"text_truncated\":{s},\"text_excerpt_policy\":\"utf8_head_tail_v1\"",
+        .{ excerpt.len, text_total_bytes, if (text_truncated) "true" else "false" },
+    );
+    if (hit.source_label.len > 0) {
+        try out.appendSlice(allocator, ",\"source\":");
+        const source_excerpt = try boundedJsonTextExcerptAlloc(allocator, hit.source_label, 256);
+        defer allocator.free(source_excerpt);
+        try appendJsonString(out, allocator, source_excerpt);
+        if (source_excerpt.len < hit.source_label.len) try out.appendSlice(allocator, ",\"source_truncated\":true");
+    }
+    if (include_seen) try out.appendSlice(allocator, if (seen_before) ",\"seen_before\":true" else ",\"seen_before\":false");
+    try out.append(allocator, '}');
+}
+
+fn appendRecallEnvelope(out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    try out.print(
+        allocator,
+        ",\"recall_envelope\":{{\"schema_version\":\"metacodes-bounded-recall-v1\",\"complete_json\":true,\"max_result_bytes\":{d},\"text_excerpt_policy\":\"utf8_head_tail_v1\"}}",
+        .{MAX_RECALL_RESULT_BYTES},
+    );
+}
+
 fn appendLexicalPlanReceipt(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     plan: lexical_query_plan.Plan,
+    ledger_scope: []const u8,
+    seen_node_count: usize,
     new_hit_count: usize,
     repeated_hit_count: usize,
 ) !void {
+    const variant_index = switch (plan.execution) {
+        .single => |index| index,
+        .batch_all, .seed_shape_rewrite => unreachable,
+    };
     const selected = plan.selected();
     const receipt = try std.fmt.allocPrint(
         allocator,
-        ",\"lexical_query_plan\":{{\"schema_version\":\"{s}\",\"plan_sha256\":\"{s}\",\"intent\":\"{s}\",\"stage\":\"{s}\",\"variant_index\":{d},\"variant_count\":{d},\"variant_kind\":\"{s}\",\"seen_node_count\":{d},\"seen_state_verified\":true,\"ledger_scope\":\"agent_run_plan\",\"new_hit_count\":{d},\"repeated_hit_count\":{d}}}",
+        ",\"lexical_query_plan\":{{\"schema_version\":\"{s}\",\"plan_sha256\":\"{s}\",\"intent\":\"{s}\",\"stage\":\"{s}\",\"variant_index\":{d},\"variant_count\":{d},\"variant_kind\":\"{s}\",\"seen_node_count\":{d},\"seen_state_verified\":true,\"ledger_scope\":\"{s}\",\"new_hit_count\":{d},\"repeated_hit_count\":{d}}}",
         .{
-            lexical_query_plan.SCHEMA_VERSION,
+            plan.schema_version.text(),
             plan.fingerprint,
             @tagName(plan.intent),
             @tagName(plan.stage),
-            plan.variant_index,
+            variant_index,
             plan.variants.len,
             @tagName(selected.kind),
-            plan.seen_node_ids.len,
+            seen_node_count,
+            ledger_scope,
             new_hit_count,
             repeated_hit_count,
         },
     );
     defer allocator.free(receipt);
     try out.appendSlice(allocator, receipt);
+}
+
+/// Emit a proof-carrying recovery receipt for the safe malformed v3 shapes:
+/// semantic_expansion prefixed by an exact seed, or a seed carrying trailing
+/// semantic declarations. The receipt
+/// binds the complete input plan, the effective seed plan, and every omitted
+/// semantic declaration. `all_variants_executed=false` is load-bearing: this
+/// call can establish a seed but can never satisfy enumeration coverage.
+fn appendSeedShapeRewriteReceipt(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    plan: lexical_query_plan.Plan,
+    ledger_scope: []const u8,
+    seen_node_count: usize,
+    hit_ids: []const u64,
+    new_hit_count: usize,
+    repeated_hit_count: usize,
+) !void {
+    const rewrite = plan.seed_shape_rewrite orelse unreachable;
+    const seed = plan.selected();
+    var distinct_ids: [8]u64 = [_]u64{0} ** 8;
+    var distinct_count: usize = 0;
+    for (hit_ids) |node_id| {
+        if (containsNodeId(distinct_ids[0..distinct_count], node_id)) continue;
+        std.debug.assert(distinct_count < distinct_ids.len);
+        distinct_ids[distinct_count] = node_id;
+        distinct_count += 1;
+    }
+
+    try out.print(
+        allocator,
+        ",\"lexical_query_plan\":{{\"schema_version\":\"{s}\",\"plan_sha256\":\"{s}\",\"intent\":\"{s}\",\"stage\":\"{s}\",\"variant_count\":{d},\"executed_variant_count\":1,\"all_variants_executed\":false,\"seen_node_count\":{d},\"seen_state_verified\":true,\"ledger_scope\":\"{s}\",\"merged_hit_count\":{d},\"merged_new_hit_count\":{d},\"merged_previously_seen_count\":{d},\"probe_new_hit_count\":{d},\"probe_repeated_hit_count\":{d},\"query_anchor_rewritten\":{s},\"query_anchor_input_sha256\":\"{s}\",\"query_anchor_effective_sha256\":\"{s}\",\"variant_receipts\":[{{\"variant_index\":0,\"variant_kind\":\"{s}\",\"node_ids\":[",
+        .{
+            plan.schema_version.text(),
+            rewrite.input_plan_sha256,
+            @tagName(plan.intent),
+            @tagName(rewrite.input_stage),
+            rewrite.declared_variant_count,
+            seen_node_count,
+            ledger_scope,
+            distinct_count,
+            new_hit_count,
+            repeated_hit_count,
+            new_hit_count,
+            repeated_hit_count,
+            if (plan.query_anchor_rewritten) "true" else "false",
+            plan.query_anchor_input_sha256,
+            plan.query_anchor_effective_sha256,
+            @tagName(seed.kind),
+        },
+    );
+    for (distinct_ids[0..distinct_count], 0..) |node_id, index| {
+        if (index > 0) try out.append(allocator, ',');
+        try out.print(allocator, "{d}", .{node_id});
+    }
+    try out.print(
+        allocator,
+        "],\"new_hit_count\":{d},\"repeated_hit_count\":{d}}}],\"execution\":\"host_seed_shape_rewrite\",\"rewrite\":{{\"schema_version\":\"{s}\",\"reason\":\"{s}\",\"input_plan_sha256\":\"{s}\",\"effective_plan_sha256\":\"{s}\",\"effective_seed_sha256\":\"{s}\",\"input_stage\":\"{s}\",\"effective_stage\":\"seed\",\"declared_variant_count\":{d},\"executed_variant_count\":1,\"unexecuted_semantic_variant_count\":{d}}}}}",
+        .{
+            new_hit_count,
+            repeated_hit_count,
+            lexical_query_plan.SEED_SHAPE_REWRITE_SCHEMA_VERSION,
+            rewrite.reason,
+            rewrite.input_plan_sha256,
+            plan.fingerprint,
+            rewrite.effective_seed_sha256,
+            @tagName(rewrite.input_stage),
+            rewrite.declared_variant_count,
+            rewrite.unexecuted_semantic_variant_count,
+        },
+    );
 }
 
 const DEFAULT_CONTEXT_EDGES: usize = 12;
@@ -329,8 +688,23 @@ const MAX_GRAPH_BYTES: usize = 64 * 1024;
 /// 读取一个候选节点的权威正文页 + 有界本地图邻域。检索与遍历分开：KgRecall 找种子，
 /// KgContext 验证种子和 evidence；不能让模型仅凭 BM25 摘要或边名下结论。
 pub fn executeContext(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
-    const kg = requireKg(ctx) orelse return degradedResult(ctx.allocator, null);
-    if (!kg.ready) return degradedResult(ctx.allocator, kg);
+    const observation = try executeContextObserved(ctx, args);
+    if (observation.observed_node_id) |node_id| {
+        if (ctx.kg_lexical_ledger) |ledger| _ = ledger.commitContext(node_id);
+    }
+    return observation.result;
+}
+
+const ContextObservation = struct {
+    result: []u8,
+    /// Set only after both real TinyKG reads and the complete result body
+    /// succeed. Degraded output is useful to the model but is not evidence.
+    observed_node_id: ?u64 = null,
+};
+
+fn executeContextObserved(ctx: *const ToolContext, args: []const u8) anyerror!ContextObservation {
+    const kg = requireKg(ctx) orelse return .{ .result = try degradedResult(ctx.allocator, null) };
+    if (!kg.ready) return .{ .result = try degradedResult(ctx.allocator, kg) };
     kg.setAbort(ctx.abort);
 
     var parsed_args = std.json.parseFromSlice(std.json.Value, ctx.allocator, args, .{}) catch |err| switch (err) {
@@ -374,7 +748,7 @@ pub fn executeContext(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
     const text_limit = std.math.cast(usize, text_limit_u64) orelse return error.InvalidLimit;
 
-    const metadata_raw = kg.nodeMetadataJson(node_id, true) catch |e| return kgErrorResult(ctx, kg, e, "KgContext");
+    const metadata_raw = kg.nodeMetadataJson(node_id, true) catch |e| return .{ .result = try kgErrorResult(ctx, kg, e, "KgContext") };
     defer kg.allocator.free(metadata_raw);
     var parsed_metadata = std.json.parseFromSlice(std.json.Value, ctx.allocator, metadata_raw, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -389,7 +763,12 @@ pub fn executeContext(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         return error.InvalidGraphProtocol;
     };
     const text = metadata.text;
-    const graph_raw = kg.neighborsJson(node_id, limit) catch |e| return kgErrorResult(ctx, kg, e, "KgContext");
+    // TinyKG neighbors JSON intentionally omits node bodies and is already
+    // structurally bounded by `limit` (root + at most N adjacent nodes/edges).
+    // Do not pass a small --max-chars here: TinyKG applies that budget to the
+    // authoritative bodies while selecting nodes, so a long root can be
+    // omitted even though its body is not present in the JSON projection.
+    const graph_raw = kg.neighborsJson(node_id, limit) catch |e| return .{ .result = try kgErrorResult(ctx, kg, e, "KgContext") };
     defer kg.allocator.free(graph_raw);
     const graph = std.mem.trim(u8, graph_raw, " \t\r\n");
     if (graph.len > MAX_GRAPH_BYTES) {
@@ -416,7 +795,10 @@ pub fn executeContext(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         return error.InvalidGraphProtocol;
     };
 
-    const page = textPage(text, requested_offset, text_limit);
+    // Keep both decoded bytes and their JSON representation within text_limit.
+    // Newline/control-heavy memories otherwise expand after paging and can
+    // break the bounded batch envelope despite a small decoded page.
+    const page = try textPageForJsonBudget(ctx.allocator, text, requested_offset, text_limit);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(ctx.allocator);
     const head = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d},\"text\":", .{node_id});
@@ -435,7 +817,10 @@ pub fn executeContext(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try out.appendSlice(ctx.allocator, ",\"verification_guidance\":");
     try appendJsonString(&out, ctx.allocator, retrieval_protocol.CONTEXT_RESULT_GUIDANCE);
     try out.appendSlice(ctx.allocator, "}");
-    return out.toOwnedSlice(ctx.allocator);
+    return .{
+        .result = try out.toOwnedSlice(ctx.allocator),
+        .observed_node_id = node_id,
+    };
 }
 
 const KnowledgeGovernance = struct {
@@ -584,6 +969,62 @@ fn textPage(text: []const u8, requested_offset: usize, max_bytes: usize) TextPag
     return .{ .start = start, .end = end };
 }
 
+fn textPageForJsonBudget(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    requested_offset: usize,
+    max_bytes: usize,
+) !TextPage {
+    var page = textPage(text, requested_offset, max_bytes);
+    while (page.end > page.start) {
+        var encoded: std.ArrayList(u8) = .empty;
+        defer encoded.deinit(allocator);
+        try util_json.serializeString(text[page.start..page.end], &encoded, allocator);
+        const payload_bytes = encoded.items.len - 2;
+        if (payload_bytes <= max_bytes) return page;
+
+        const current_bytes = page.end - page.start;
+        var next_bytes = current_bytes * max_bytes / payload_bytes;
+        if (next_bytes >= current_bytes) next_bytes = current_bytes - 1;
+        // text_limit's primary contract is forward progress. A single JSON
+        // control character needs six wire bytes, so a caller's legal minimum
+        // limit=4 cannot satisfy both the wire budget and progress. Preserve
+        // one complete code point in that degenerate case; the overage is at
+        // most two bytes and next_text_offset still advances deterministically.
+        if (next_bytes == 0) {
+            const first_len = std.unicode.utf8ByteSequenceLength(text[page.start]) catch 1;
+            page.end = @min(text.len, page.start + first_len);
+            return page;
+        }
+        page = textPage(text, page.start, next_bytes);
+    }
+    return page;
+}
+
+fn boundedJsonTextExcerptAlloc(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    max_json_payload_bytes: usize,
+) ![]u8 {
+    var source_budget = @min(text.len, max_json_payload_bytes);
+    while (true) {
+        const excerpt = try kg_mod.boundedTextExcerptAlloc(allocator, text, source_budget);
+        errdefer allocator.free(excerpt);
+
+        var encoded: std.ArrayList(u8) = .empty;
+        defer encoded.deinit(allocator);
+        try util_json.serializeString(excerpt, &encoded, allocator);
+        const payload_bytes = encoded.items.len - 2;
+        if (payload_bytes <= max_json_payload_bytes) return excerpt;
+
+        allocator.free(excerpt);
+        if (source_budget == 0) return allocator.dupe(u8, "");
+        var next_budget = source_budget * max_json_payload_bytes / payload_bytes;
+        if (next_budget >= source_budget) next_budget = source_budget - 1;
+        source_budget = next_budget;
+    }
+}
+
 fn isUtf8Continuation(byte: u8) bool {
     return (byte & 0xC0) == 0x80;
 }
@@ -702,6 +1143,35 @@ test "textPage preserves UTF-8 boundaries and supports deterministic paging" {
     try testing.expectEqualStrings("中文", text[second.start..second.end]);
     const inside_codepoint = textPage(text, 3, 6);
     try testing.expectEqualStrings("中文", text[inside_codepoint.start..inside_codepoint.end]);
+}
+
+test "bounded recall excerpts budget escaped JSON bytes" {
+    const raw = [_]u8{0x01} ** 512;
+    const excerpt = try boundedJsonTextExcerptAlloc(testing.allocator, &raw, 64);
+    defer testing.allocator.free(excerpt);
+
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(testing.allocator);
+    try util_json.serializeString(excerpt, &encoded, testing.allocator);
+    try testing.expect(encoded.items.len >= 2);
+    try testing.expect(encoded.items.len - 2 <= 64);
+    try testing.expect(excerpt.len < raw.len);
+}
+
+test "KgContext page budgets escaped JSON without breaking UTF-8" {
+    const text = "开头\x01\x01\x01\x01\x01\x01\x01\x01结尾";
+    const page = try textPageForJsonBudget(testing.allocator, text, 0, 16);
+    try testing.expect(page.end > page.start);
+    try testing.expect(std.unicode.utf8ValidateSlice(text[page.start..page.end]));
+
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(testing.allocator);
+    try util_json.serializeString(text[page.start..page.end], &encoded, testing.allocator);
+    try testing.expect(encoded.items.len - 2 <= 16);
+
+    const control_only = [_]u8{0x01} ** 8;
+    const minimum = try textPageForJsonBudget(testing.allocator, &control_only, 0, 4);
+    try testing.expectEqual(@as(usize, 1), minimum.end - minimum.start);
 }
 
 test "validateNeighborGraph binds version, root, and requested limit" {

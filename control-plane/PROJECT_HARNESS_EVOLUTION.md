@@ -144,6 +144,22 @@ independence. An optional independent semantic reviewer may reject underscoped
 or overbroad candidates before replay, but it cannot replace the mechanical
 Lean/Zig gates.
 
+The current orchestration API binds host-attested actor/author identity hashes
+and rejects equality. Those caller-supplied digests catch accidental same-role
+configuration but are not yet cryptographic proof of endpoint or credential
+independence. That stronger claim requires the provider factory to derive the
+fingerprint from the effective endpoint/model/credential capability and pass an
+opaque binding rather than accepting arbitrary digests. Until then experiments
+must report this boundary as host-attested role separation.
+
+TinyKG has two deliberate instances. The Metacodes-owned local `tinykgd` is the
+runtime task/ontology/signal plane and may be shared by multiple local
+Metacodes processes through one StoreActor. The remote TinyKG Skill is the
+cross-device roadmap and refined long-term-memory plane. Runtime code never
+inherits the Skill's `remote.json` or `TINYKG_REMOTE_*` namespace; benchmark
+stores remain fresh and local. Each plane keeps its own store/build/generation
+identity, so remote memory cannot silently become runtime authorization.
+
 Rule-author usage is accounted separately: requests, tokens, cache reads and
 writes, latency, dollars, candidate compile rate, replay FP/FN, shadow
 divergence, human interventions and proposal-to-promotion time. None of its

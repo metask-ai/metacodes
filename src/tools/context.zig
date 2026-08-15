@@ -302,7 +302,8 @@ pub const ToolContext = struct {
     /// null = 未配置(缺二进制)——KG 工具此时不会注册;non-null 但 !ready = degraded。
     kg: ?*@import("../kg/client.zig").KgClient = null,
     /// 本次 agent run 的无向量检索事实账本。lexical_plan 存在时必须非 null：
-    /// 宿主据此校验模型声明的 seen_node_ids，并在同一锁内计算/提交真实命中增益。
+    /// v2 seen state 完全由宿主管理；v1 兼容路径仍校验模型声明，并在同一锁内
+    /// 计算/提交真实命中增益。
     /// legacy query-only 路径不读取它。由 agent_loop.run 创建，绝不进 TinyKG store。
     kg_lexical_ledger: ?*@import("../kg/lexical_query_plan.zig").Ledger = null,
     /// KG per-project 指针目录(`{home}/.metacodes/projects/<git根hash>`)。plan 落图写 kg_root
@@ -405,6 +406,13 @@ pub const ToolContext = struct {
     additional_dirs: []const []const u8 = &.{},
     /// HOME(sandbox profile ~/ 展开)。
     home_dir: []const u8 = "",
+    /// Session-scoped root for content-addressed tool-result artifacts.
+    /// Empty means persistence/recovery is unavailable and projection must
+    /// return an explicit non-recoverable fallback envelope.
+    artifact_root: []const u8 = "",
+    /// Optional UI-independent counters shared by all execution depths in a
+    /// session. Atomic fields make parallel tools/subagents safe observers.
+    tool_result_metrics: ?*@import("../core/tool_result_metrics.zig").Metrics = null,
     /// 当前 session plan 文件全路径(ExitPlanMode 模型未传 plan 时从此读回兜底)。空=无。
     plan_file_path: []const u8 = "",
     /// 末轮助手消息里提取的 `<proposed_plan>` 内容(agent_loop 在 plan 模式末轮填;

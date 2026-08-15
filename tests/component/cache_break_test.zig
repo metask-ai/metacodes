@@ -5,6 +5,22 @@ const cc = @import("cc");
 
 const Detector = cc.cache_break.CacheBreakDetector;
 
+test "L2 usage fragments aggregate once per response" {
+    var usage = cc.cache_break.ResponseUsage{};
+    usage.observe(0, 0, 0, 0); // GLM-compatible message_start placeholder
+    usage.observe(1200, 80, 9000, 0); // complete message_delta snapshot
+    try std.testing.expect(usage.has_metering);
+    try std.testing.expectEqual(@as(u64, 1200), usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 80), usage.output_tokens);
+    try std.testing.expectEqual(@as(u64, 9000), usage.cache_read_tokens);
+    try std.testing.expectEqual(@as(u64, 10200), usage.promptTokens());
+
+    // Official Anthropic may split input/cache and output across fragments.
+    usage.observe(0, 120, 0, 0);
+    try std.testing.expectEqual(@as(u64, 120), usage.output_tokens);
+    try std.testing.expectEqual(@as(u64, 9000), usage.cache_read_tokens);
+}
+
 test "L2 击穿: 首次无基线 → null" {
     var d = Detector{};
     d.recordRequest("sys", "tools", "model");

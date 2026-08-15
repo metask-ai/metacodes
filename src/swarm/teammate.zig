@@ -211,6 +211,8 @@ pub const SpawnTeammateParams = struct {
     // 深拷贝(cwd 已有,复用作 sandbox cwd_abs)。
     sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
     home_dir: []const u8 = "",
+    artifact_root: []const u8 = "",
+    tool_result_metrics: ?*@import("../core/tool_result_metrics.zig").Metrics = null,
     additional_dirs: []const []const u8 = &.{},
     mcp_sessions: []const @import("../core/mcp_session.zig").McpSessionEntry = &.{},
     /// AgentDef.isolation=worktree 所有权；spawnTeammate consume-on-call。
@@ -245,6 +247,8 @@ const TeammateInput = struct {
     sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings,
     cwd_abs: []u8,
     home_dir: []u8,
+    artifact_root: []u8,
+    tool_result_metrics: ?*@import("../core/tool_result_metrics.zig").Metrics,
     additional_dirs: [][]u8,
     memdir_owned: []u8,
     mcp_sessions_owned: []@import("../core/mcp_session.zig").McpSessionEntry,
@@ -262,6 +266,7 @@ const TeammateInput = struct {
         a.free(self.home);
         a.free(self.cwd_abs); // task#12
         a.free(self.home_dir);
+        a.free(self.artifact_root);
         for (self.additional_dirs) |d| a.free(d);
         a.free(self.additional_dirs);
         a.free(self.memdir_owned);
@@ -588,6 +593,8 @@ pub const TeammateRegistry = struct {
         errdefer if (!committed) a.free(cwd_sb_owned);
         const home_sb_owned = try a.dupe(u8, p.home_dir);
         errdefer if (!committed) a.free(home_sb_owned);
+        const artifact_root_owned = try a.dupe(u8, p.artifact_root);
+        errdefer if (!committed) a.free(artifact_root_owned);
         const adirs_sb_owned = try a.alloc([]u8, p.additional_dirs.len);
         errdefer if (!committed) a.free(adirs_sb_owned);
         var nad_sb: usize = 0;
@@ -631,6 +638,8 @@ pub const TeammateRegistry = struct {
             .sandbox = p.sandbox, // task#12:borrow(App-lifetime)
             .cwd_abs = cwd_sb_owned,
             .home_dir = home_sb_owned,
+            .artifact_root = artifact_root_owned,
+            .tool_result_metrics = p.tool_result_metrics,
             .additional_dirs = adirs_sb_owned,
             .memdir_owned = memdir_owned,
             .mcp_sessions_owned = mcp_sessions_owned,
@@ -1085,6 +1094,8 @@ fn teammateThreadMain(input: *TeammateInput) void {
                 .sandbox = input.sandbox,
                 .cwd_abs = input.cwd_abs,
                 .home_dir = input.home_dir,
+                .artifact_root = input.artifact_root,
+                .tool_result_metrics = input.tool_result_metrics,
                 .additional_dirs = input.additional_dirs,
                 .mcp_sessions = &input.mcp_sessions_owned,
             },

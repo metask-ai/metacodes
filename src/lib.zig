@@ -30,6 +30,9 @@ pub const subagent = @import("core/subagent.zig");
 pub const tool_exec = @import("core/tool_exec.zig");
 pub const file_reference = @import("core/file_reference.zig");
 pub const tool_observation_journal = @import("core/tool_observation_journal.zig");
+pub const tool_result_artifact = @import("core/tool_result_artifact.zig");
+pub const result_projection = @import("core/result_projection.zig");
+pub const tool_result_metrics = @import("core/tool_result_metrics.zig");
 pub const rule_impact_stats = @import("core/rule_impact_stats.zig");
 pub const rule_impact_operational_observation = @import("core/rule_impact_operational_observation.zig");
 pub const rule_impact_evidence = @import("core/rule_impact_evidence.zig");
@@ -37,6 +40,7 @@ pub const rule_impact_receipt = @import("core/rule_impact_receipt.zig");
 pub const rule_impact_aggregate_receipt = @import("core/rule_impact_aggregate_receipt.zig");
 pub const ontology_rule_projection = @import("core/ontology_rule_projection.zig");
 pub const rule_author = @import("core/rule_author.zig");
+pub const project_rule_evolution = @import("core/project_rule_evolution.zig");
 pub const project_rule_gate_protocol = @import("tools/project_rule_gate.zig");
 pub const rule_source_receipt = @import("core/rule_source_receipt.zig");
 pub const project_rule_spec = @import("core/project_rule_spec.zig");
@@ -65,6 +69,8 @@ pub const answer_queue = @import("core/answer_queue.zig");
 pub const recorder = @import("core/recorder.zig");
 pub const context_pressure = @import("core/context_pressure.zig");
 pub const kg_task_projection = @import("kg/task_projection.zig"); // pure TinyKG snapshot/Markdown contract
+pub const kg_client = @import("kg/client.zig"); // local daemon/exclusive-store control-plane client
+pub const kg_transport = @import("kg/transport.zig"); // authenticated tinykgd HTTP transport
 pub const kg_experience_packet = @import("kg/experience_packet.zig"); // prior execution feedback at claim boundary
 pub const kg_lexical_query_plan = @import("kg/lexical_query_plan.zig"); // governed vector-free query plans + host ledger
 pub const kg_memory_migration_adapter = @import("kg/memory_migration_adapter.zig"); // Metacodes transaction controller over TinyKG snapshot/CAS/receipt primitives
@@ -99,6 +105,7 @@ pub const config = @import("app/config.zig");
 // ── 工具 ─────────────────────────────────────────────────────────────────
 pub const tools = @import("tools.zig"); // registry + dispatch
 pub const tool_context = @import("tools/context.zig"); // ToolContext
+pub const read_artifact = @import("tools/read_artifact.zig");
 pub const tools_dynamic = @import("tools/dynamic.zig"); // Skill/MCP DynRegistry
 
 // ── 权限 ─────────────────────────────────────────────────────────────────

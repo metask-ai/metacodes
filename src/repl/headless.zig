@@ -15,11 +15,57 @@ const pfs = @import("platform").fs;
 const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
+const permission_mod = @import("../permission.zig");
 const project_activation = @import("../core/project_rule_activation.zig");
 const request_gate_mod = @import("../core/request_gate.zig");
 const tee_backend_mod = @import("../core/tee_backend.zig");
+const tool_context_mod = @import("../tools/context.zig");
 const ui_backend_mod = @import("../core/protocol/ui_backend.zig");
 const writer_backend = @import("../core/writer_backend.zig");
+
+/// Headless callers can make tool availability part of their frozen runtime
+/// contract with `--disallowed-tools`. The ordinary permission settings still
+/// enforce every rule at dispatch; this narrower ceiling additionally removes
+/// exact bare tool names from the provider schema so the model cannot spend a
+/// turn proposing an action the host has already forbidden.
+///
+/// Parameterized permission rules such as `Bash(git push *)` are intentionally
+/// not treated as name bans: hiding all of Bash would be stronger than the
+/// caller requested. They remain enforced by the normal permission pipeline.
+const HeadlessToolPolicy = struct {
+    disallowed_rules: []const u8,
+    parent: ?tool_context_mod.ToolExecutionPolicy = null,
+
+    fn executionPolicy(self: *const HeadlessToolPolicy) tool_context_mod.ToolExecutionPolicy {
+        return .{
+            .ctx = @ptrCast(self),
+            .allowsToolFn = allowsToolAdapter,
+            .allowsInvocationFn = allowsInvocationAdapter,
+        };
+    }
+
+    fn deniesExactName(self: *const HeadlessToolPolicy, name: []const u8) bool {
+        var it = std.mem.tokenizeScalar(u8, self.disallowed_rules, ',');
+        while (it.next()) |raw| {
+            const rule = std.mem.trim(u8, raw, " \t\r\n");
+            if (rule.len == 0 or std.mem.indexOfScalar(u8, rule, '(') != null) continue;
+            if (std.mem.eql(u8, rule, name)) return true;
+        }
+        return false;
+    }
+
+    fn allowsToolAdapter(raw: *const anyopaque, name: []const u8) bool {
+        const self: *const HeadlessToolPolicy = @ptrCast(@alignCast(raw));
+        if (self.deniesExactName(name)) return false;
+        return if (self.parent) |parent| parent.allowsTool(name) else true;
+    }
+
+    fn allowsInvocationAdapter(raw: *const anyopaque, name: []const u8, arguments_json: []const u8) bool {
+        const self: *const HeadlessToolPolicy = @ptrCast(@alignCast(raw));
+        if (self.deniesExactName(name)) return false;
+        return if (self.parent) |parent| parent.allowsInvocation(name, arguments_json) else true;
+    }
+};
 
 /// headless 用 WriterBackend null-sink:吞掉 agent_loop 的流式输出（ANSI + tool 注解），
 /// 只要最终文本。工具卡事件 no-op,text_chunk/颜色括号全丢弃。
@@ -35,6 +81,15 @@ pub fn run(
         std.debug.print("error: empty prompt\n", .{});
         return 1;
     }
+
+    // A headless caller owns stdin and cannot answer an interactive permission
+    // prompt.  This must be set on the session PermissionContext itself (rather
+    // than inferred from isatty) so an .ask decision deterministically denies
+    // without printing a prompt or consuming fd 0.  In particular, protected
+    // paths still override bypassPermissions, but they cannot corrupt --json
+    // stdout while failing closed.
+    const previous_no_interactive = enterNonInteractivePermissionBoundary(&app.permission_ctx);
+    defer restoreInteractivePermissionBoundary(&app.permission_ctx, previous_no_interactive);
 
     try app.conversation.appendText(.user, trimmed);
 
@@ -86,6 +141,11 @@ pub fn run(
         runtime.toolExecutionPolicy()
     else
         null;
+    var headless_tool_policy = HeadlessToolPolicy{
+        .disallowed_rules = app.config.disallowed_tools orelse "",
+        .parent = eval_execution_policy,
+    };
+    const effective_execution_policy = if (headless_tool_policy.disallowed_rules.len > 0 or eval_execution_policy != null) headless_tool_policy.executionPolicy() else null;
     defer if (eval_be) |*evaluation| evaluation.deinit();
     var eval_ui: ui_backend_mod.UiBackend = if (eval_be) |*evaluation| evaluation.backend() else be;
     var eval_tee = tee_backend_mod.TeeBackend{ .primary = &be, .secondary = &eval_ui };
@@ -119,7 +179,7 @@ pub fn run(
             app,
             scoped_recall,
             eval_request_gate,
-            eval_execution_policy,
+            effective_execution_policy,
             eval_be != null,
             if (run_control) |control| control.observer() else null,
             if (run_control) |control| control.formalGate() else null,
@@ -188,7 +248,7 @@ fn buildOptions(
     app: *app_mod.App,
     scoped_recall: ?[]const u8,
     request_gate: ?request_gate_mod.Gate,
-    execution_policy: ?@import("../tools/context.zig").ToolExecutionPolicy,
+    execution_policy: ?tool_context_mod.ToolExecutionPolicy,
     emit_semantic_tool_events: bool,
     tool_observer: ?@import("../tools/context.zig").ToolObservationSink,
     project_rule_gate: ?@import("../tools/context.zig").ProjectRuleGate,
@@ -205,6 +265,7 @@ fn buildOptions(
         .execution_policy = execution_policy,
         .tool_observer = tool_observer,
         .project_rule_gate = project_rule_gate,
+        .verification_checkpoint = app.config.verification_checkpoint,
         // Tool lifecycle events are part of the evaluation protocol even
         // though the null writer renders no cards.  Leaving this false made
         // headless traces contain policy decisions without tool attempts.
@@ -231,6 +292,8 @@ fn buildOptions(
         .cwd_abs = app.cwdAbs(),
         .additional_dirs = app.additionalDirs(),
         .home_dir = app.homeDir(),
+        .artifact_root = app.sessionDir() orelse "",
+        .tool_result_metrics = &app.tool_result_metrics,
         .agents = &app.agents,
         .parent_model = app.activeModel(),
         .skills_set = &app.skills,
@@ -253,6 +316,9 @@ pub fn resumeSuspended(
     response_json: []const u8,
     json_output: bool,
 ) !u8 {
+    const previous_no_interactive = enterNonInteractivePermissionBoundary(&app.permission_ctx);
+    defer restoreInteractivePermissionBoundary(&app.permission_ctx, previous_no_interactive);
+
     const suspend_state = @import("../core/suspend_state.zig");
     const transcript = @import("../core/transcript.zig");
     const dir = app.sessionDir() orelse {
@@ -304,6 +370,14 @@ pub fn resumeSuspended(
         crs[i] = .{ .tool_use_id = src.tool_use_id, .content = src.content, .is_error = src.is_error };
     }
 
+    var headless_tool_policy = HeadlessToolPolicy{
+        .disallowed_rules = app.config.disallowed_tools orelse "",
+    };
+    const execution_policy = if (headless_tool_policy.disallowed_rules.len > 0)
+        headless_tool_policy.executionPolicy()
+    else
+        null;
+
     const result = agent_loop.resumeRun(
         &app.conversation,
         app.provider(),
@@ -312,7 +386,7 @@ pub fn resumeSuspended(
         state.tool_use_id,
         response_json,
         crs,
-        buildOptions(app, null, null, null, false, run_control.observer(), run_control.formalGate()), // resume 不重新召回;fresh eval metadata 已在原进程消费
+        buildOptions(app, null, null, execution_policy, false, run_control.observer(), run_control.formalGate()), // resume 不重新召回;fresh eval metadata 已在原进程消费
         &be,
         allocator,
     ) catch |err| {
@@ -344,6 +418,54 @@ pub fn resumeSuspended(
         if (final_text.len == 0 or final_text[final_text.len - 1] != '\n') writeStdout("\n");
     }
     return exitCodeFor(result.stop_reason);
+}
+
+/// Install the process-input ownership boundary used by both fresh headless
+/// runs and subprocess resume.  The previous value is returned so library
+/// consumers that reuse an App can restore their session exactly.
+fn enterNonInteractivePermissionBoundary(ctx: *permission_mod.PermissionContext) bool {
+    const previous = ctx.no_interactive_prompt;
+    ctx.no_interactive_prompt = true;
+    return previous;
+}
+
+fn restoreInteractivePermissionBoundary(ctx: *permission_mod.PermissionContext, previous: bool) void {
+    ctx.no_interactive_prompt = previous;
+}
+
+test "headless permission boundary restores reusable session state" {
+    var permission = permission_mod.createContext(.default, std.testing.allocator);
+    permission.no_interactive_prompt = true;
+    const previous = enterNonInteractivePermissionBoundary(&permission);
+    restoreInteractivePermissionBoundary(&permission, previous);
+    try std.testing.expect(permission.no_interactive_prompt);
+}
+
+test "headless tool policy intersects exact CLI denies with its parent" {
+    const Parent = struct {
+        var sentinel: u8 = 0;
+        fn allowsTool(_: *const anyopaque, name: []const u8) bool {
+            return !std.mem.eql(u8, name, "Write");
+        }
+        fn allowsInvocation(_: *const anyopaque, name: []const u8, _: []const u8) bool {
+            return !std.mem.eql(u8, name, "Write");
+        }
+    };
+    var policy = HeadlessToolPolicy{
+        .disallowed_rules = " EnterPlanMode, Bash(git push *), Agent ",
+        .parent = .{
+            .ctx = @ptrCast(&Parent.sentinel),
+            .allowsToolFn = Parent.allowsTool,
+            .allowsInvocationFn = Parent.allowsInvocation,
+        },
+    };
+    const execution = policy.executionPolicy();
+    try std.testing.expect(!execution.allowsTool("EnterPlanMode"));
+    try std.testing.expect(!execution.allowsInvocation("Agent", "{}"));
+    try std.testing.expect(!execution.allowsTool("Write"));
+    try std.testing.expect(execution.allowsTool("Bash"));
+    try std.testing.expect(execution.allowsInvocation("Bash", "{\"command\":\"git status\"}"));
+    try std.testing.expect(execution.allowsTool("KgRecall"));
 }
 
 /// 把 conversation 最后一条 assistant message 的所有 text block 拼起来（owned）。

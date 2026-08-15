@@ -9,6 +9,7 @@
 const std = @import("std");
 const sync = @import("platform").sync;
 const msg = @import("message.zig");
+const result_projection = @import("result_projection.zig");
 
 pub const TOOL_RESULT_CLEARED_STUB = "[tool result cleared to save context]";
 pub const TOOL_RESULT_COMMITMENT_PREFIX = "[tool-result-commitment ";
@@ -582,6 +583,10 @@ pub const Conversation = struct {
 
     fn clearToolResultAt(self: *Conversation, m: msg.Message, bi: usize) ?usize {
         const tr = m.blocks[bi].tool_result;
+        // Artifact envelopes are already compact and are the only recovery
+        // capability for the omitted bytes. Microcompact must not erase that
+        // capability merely because the result became old.
+        if (result_projection.hasRecoverableArtifact(tr.content)) return null;
         const new_content = if (toolResultCommitmentLine(tr.content)) |commitment|
             std.fmt.allocPrint(
                 self.allocator,

@@ -82,6 +82,10 @@ pub const core_edit_hl_cache = @import("core/edit_hl_cache.zig");
 pub const tool_exec = @import("core/tool_exec.zig");
 pub const message_repair = @import("core/message_repair.zig");
 pub const tool_result_storage = @import("tools/tool_result_storage.zig");
+pub const tool_result_artifact = @import("core/tool_result_artifact.zig");
+pub const result_projection = @import("core/result_projection.zig");
+pub const tool_result_metrics = @import("core/tool_result_metrics.zig");
+pub const read_artifact = @import("tools/read_artifact.zig");
 pub const cache_break = @import("core/cache_break.zig");
 pub const core_message = @import("core/message.zig");
 pub const transcript = @import("core/transcript.zig");
@@ -145,6 +149,7 @@ pub const rule_impact_receipt = @import("core/rule_impact_receipt.zig");
 pub const rule_impact_aggregate_receipt = @import("core/rule_impact_aggregate_receipt.zig");
 pub const ontology_rule_projection = @import("core/ontology_rule_projection.zig");
 pub const rule_author = @import("core/rule_author.zig");
+pub const project_rule_evolution = @import("core/project_rule_evolution.zig");
 pub const rule_source_receipt = @import("core/rule_source_receipt.zig");
 pub const project_rule_spec = @import("core/project_rule_spec.zig");
 pub const rule_candidate = @import("core/rule_candidate.zig");
@@ -856,6 +861,10 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
                 config.model = allocator.dupe(u8, m) catch m;
                 config.model_explicit = true;
             }
+        } else if (std.mem.eql(u8, arg, "--model-display-name")) {
+            if (args.next()) |name| {
+                config.model_display_name = allocator.dupe(u8, name) catch name;
+            }
         } else if (std.mem.eql(u8, arg, "--reasoning-effort") or std.mem.eql(u8, arg, "--thinking")) {
             if (args.next()) |e| config.reasoning_effort = types.ReasoningEffort.parse(e);
         } else if (std.mem.eql(u8, arg, "--temperature")) {
@@ -884,6 +893,8 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             if (args.next()) |s| config.allowed_tools = allocator.dupe(u8, s) catch s;
         } else if (std.mem.eql(u8, arg, "--disallowedTools") or std.mem.eql(u8, arg, "--disallowed-tools")) {
             if (args.next()) |s| config.disallowed_tools = allocator.dupe(u8, s) catch s;
+        } else if (std.mem.eql(u8, arg, "--verification-checkpoint")) {
+            config.verification_checkpoint = true;
         } else if (std.mem.eql(u8, arg, "--add-dir")) {
             if (args.next()) |s| config.add_dirs = appendNulList(allocator, config.add_dirs, s);
         } else if (std.mem.eql(u8, arg, "--answers-file")) {
@@ -1036,6 +1047,7 @@ fn printHelp() void {
         \\  --web [port]          Serve a web UI (HTTP+SSE) instead of the TUI (default port 7777)
         \\  --resume-response <j> Resume a suspended session with a late tool response (@file to read from a file)
         \\  --model <model>       Model (default: claude-sonnet-4-20250514)
+        \\  --model-display-name <name>  Stable actor-visible model identity
         \\  --reasoning-effort <e> none|minimal|low|medium|high|xhigh
         \\  --temperature <f>    Override sampling temperature (dialect-gated fields)
         \\  --top-p <f>          Override nucleus sampling top_p
@@ -1047,6 +1059,7 @@ fn printHelp() void {
         \\  --settings <path>     Extra settings JSON (CLI layer)
         \\  --allowedTools <list> Comma-separated allow rules, e.g. "Bash(git *),Read"
         \\  --disallowedTools <l> Comma-separated deny rules
+        \\  --verification-checkpoint  Enable the experimental post-test checkpoint
         \\  --add-dir <path>      Extra read/write directory (repeatable)
         \\  --answers-file <path> Preset answers for permission .ask / AskUserQuestion (non-tty)
         \\  --base-url <url>      Override API endpoint (must end with /v1/messages)

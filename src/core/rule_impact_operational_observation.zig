@@ -316,6 +316,12 @@ fn validateRunIdentity(run: *const journal_mod.LoadedRunDispatches, active: Acti
             decision.bundle_revision != active.bundle_revision)
             return error.FormalDecisionBundleMismatch;
     }
+    for (run.rule_filters) |filter| {
+        if (!std.mem.eql(u8, &filter.project_sha256, &active.project_sha256) or
+            !std.mem.eql(u8, &filter.bundle_sha256, &active.bundle_sha256) or
+            filter.bundle_revision != active.bundle_revision)
+            return error.FormalDecisionBundleMismatch;
+    }
 }
 
 fn validateOperationalSnapshot(snapshot: impact.Snapshot, interval: [64]u8) !void {

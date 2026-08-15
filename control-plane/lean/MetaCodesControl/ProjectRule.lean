@@ -192,6 +192,15 @@ theorem existing_file_scope_fails_closed_without_regular_observation
   rcases uncertain with state | state | state <;>
     simp [preDecision, same, scope, state]
 
+/-- The host may erase rules whose target tool differs from the concrete tool
+signal before invoking the sidecar. This is a semantics-preserving fast path,
+not a second authorization policy: both fixed-kernel decisions are
+definitionally `true` for every non-target tool. -/
+theorem target_tool_mismatch_admits_both (spec : RuleSpec) (signal : PostSignal)
+    (different : signal.pre.tool ≠ spec.targetTool) :
+    preDecision spec signal.pre = true ∧ postDecision spec signal = true := by
+  simp [preDecision, postDecision, different]
+
 theorem reobservation_required (spec : RuleSpec) (signal : PostSignal)
     (same : signal.pre.tool = spec.targetTool)
     (pre : preDecision spec signal.pre = true)

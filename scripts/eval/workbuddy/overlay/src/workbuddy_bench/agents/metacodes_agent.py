@@ -27,6 +27,7 @@ from workbuddy_bench.agents._agent_user import ensure_agent_user
 from workbuddy_bench.agents._metacodes_trace import (
     OBSERVATION_FILENAME,
     TraceError,
+    anthropic_messages_endpoint,
     load_control_metrics,
     load_trace_ir,
     project_state_hash,
@@ -37,13 +38,20 @@ _OUTPUT_FILENAME = "metacodes-output.jsonl"
 _TRANSCRIPT_FILENAME = "metacodes-transcript.jsonl"
 _RUNTIME_CONTRACT_FILENAME = "metacodes-runtime-contract.json"
 _DEFAULT_DISABLED_TOOLS = (
-    "Agent,Task,TaskBatch,TeamCreate,TeamDelete,SendMessage"
+    "Agent,Task,TaskBatch,TeamCreate,TeamDelete,SendMessage,"
+    "EnterPlanMode,ExitPlanMode"
 )
+_PROJECT_CONTROL_MODES = {"disabled", "enforced"}
 _REMOTE_TINYKG_ENV = (
     "TINYKG_REMOTE_URL",
     "TINYKG_API_KEY",
     "TINYKG_REMOTE_EXPECTED_BUILD_ID",
     "TINYKG_REMOTE_CONFIG",
+    "METACODES_KG_CONFIG",
+    "METACODES_KG_URL",
+    "METACODES_KG_API_KEY",
+    "METACODES_KG_EXPECTED_BUILD_ID",
+    "METACODES_KG_EXPECTED_SCHEMA_DIGEST",
     "METASK_API_KEY",
 )
 
@@ -67,12 +75,32 @@ class MetacodesAgent(BaseInstalledAgent):
         self._disabled_tools = str(
             kwargs.pop("METACODES_DISALLOWED_TOOLS", _DEFAULT_DISABLED_TOOLS)
         )
+        verification_checkpoint = kwargs.pop(
+            "METACODES_VERIFICATION_CHECKPOINT", False
+        )
+        if not isinstance(verification_checkpoint, bool):
+            raise ValueError(
+                "METACODES_VERIFICATION_CHECKPOINT must be an explicit boolean"
+            )
+        self._verification_checkpoint = verification_checkpoint
         project_rules = kwargs.pop("METACODES_PROJECT_RULES_RELATIVE", None)
         project_kernel = kwargs.pop("METACODES_PROJECT_KERNEL_RELATIVE", None)
+        project_control_mode = kwargs.pop("METACODES_PROJECT_CONTROL_MODE", None)
         if (project_rules is None) != (project_kernel is None):
             raise ValueError(
                 "metacodes project rules and project kernel must be configured together"
             )
+        if project_rules is None:
+            if project_control_mode is not None:
+                raise ValueError(
+                    "metacodes project control mode requires staged rules and kernel"
+                )
+            project_control_mode = "absent"
+        elif project_control_mode not in _PROJECT_CONTROL_MODES:
+            raise ValueError(
+                "metacodes staged project control requires explicit disabled/enforced mode"
+            )
+        self._project_control_mode = str(project_control_mode)
         self._project_rules_relative = (
             _relative_mount_path(project_rules, "project rules")
             if project_rules is not None
@@ -84,6 +112,12 @@ class MetacodesAgent(BaseInstalledAgent):
             else None
         )
         model_params = kwargs.pop("model_params", None) or {}
+        model_display_name = str(kwargs.pop("METACODES_MODEL_DISPLAY_NAME", ""))
+        if not model_display_name:
+            raise ValueError(
+                "metacodes WorkBuddy runs require a stable backend model identity"
+            )
+        self._model_display_name = model_display_name
         max_output = model_params.get("max_output_tokens")
         self._max_output_tokens = int(max_output) if max_output is not None else None
         self._model_params = dict(model_params)
@@ -148,10 +182,17 @@ class MetacodesAgent(BaseInstalledAgent):
         instruction = self.render_instruction(instruction)
         escaped_instruction = shlex.quote(instruction)
         escaped_model = shlex.quote(self.model_name)
-        escaped_proxy = self._proxy_url
-        if "\n" in escaped_proxy or "\r" in escaped_proxy:
-            raise ValueError("proxy_url contains a newline")
-
+        escaped_model_display_name = shlex.quote(self._model_display_name)
+        try:
+            escaped_proxy = anthropic_messages_endpoint(self._proxy_url)
+        except TraceError as exc:
+            raise ValueError(str(exc)) from exc
+        # metacodes treats METACODES_BASE_URL as the complete Anthropic
+        # messages endpoint, not as a server root.  WorkBuddy supplies the host
+        # proxy root, so make the protocol endpoint explicit.  Otherwise the
+        # request arrives at `/`, the proxy classifies it as auxiliary traffic,
+        # and the internal route slug leaks upstream instead of being rewritten
+        # to the configured backend model.
         route = self.model_name
         # The WorkBuddy proxy consumes this prefix for per-trial attribution,
         # then resolves the suffix against its registered route table.
@@ -173,53 +214,98 @@ class MetacodesAgent(BaseInstalledAgent):
         runtime_contract_path = f"/logs/agent/{_RUNTIME_CONTRACT_FILENAME}"
         flags = [
             "--model", escaped_model,
+            "--model-display-name", escaped_model_display_name,
             "--permission", "bypassPermissions",
             "--no-theme",
             "--disallowed-tools", shlex.quote(self._disabled_tools),
         ]
         if self._max_output_tokens is not None:
             flags += ["--max-tokens", str(self._max_output_tokens)]
+        if self._verification_checkpoint:
+            flags.append("--verification-checkpoint")
 
         project_setup = ""
+        project_postcheck = ""
         project_contract = {
+            "staged": False,
+            "mode": "absent",
             "configured": False,
             "project_state_hash": None,
+            "artifacts_verified": False,
+            "runtime_active_bundle_absent": True,
         }
-        if self._project_kernel_relative is not None and self._project_rules_relative is not None:
+        project_staged = (
+            self._project_kernel_relative is not None
+            and self._project_rules_relative is not None
+        )
+        if project_staged:
             project_hash = project_state_hash("/workspace")
             project_contract = {
-                "configured": True,
-                "project_state_hash": project_hash,
+                "staged": True,
+                "mode": self._project_control_mode,
+                "configured": self._project_control_mode == "enforced",
+                "project_state_hash": (
+                    project_hash if self._project_control_mode == "enforced" else None
+                ),
+                "artifacts_verified": True,
+                "runtime_active_bundle_absent": (
+                    self._project_control_mode == "disabled"
+                ),
             }
             project_source = mount + "/" + self._project_rules_relative
             project_kernel = mount + "/" + self._project_kernel_relative
             project_setup = (
-                f'project_state="$HOME/.metacodes/projects/{project_hash}"; '
-                'mkdir -p "$project_state" || exit 77; '
                 f'project_source={shlex.quote(project_source)}; '
+                f'project_kernel={shlex.quote(project_kernel)}; '
                 'test -d "$project_source" || exit 78; '
-                'test -z "$(find "$project_source" -type l -print -quit)" || exit 79; '
-                'test ! -e "$project_state/project-rules" || exit 80; '
-                'cp -R -- "$project_source" "$project_state/project-rules" || exit 81; '
-                'chmod -R u=rwX,go= "$project_state/project-rules" || exit 82; '
-                f'export METACODES_PROJECT_KERNEL_PATH={shlex.quote(project_kernel)}; '
-                'project_kernel_sha="$(sha256sum "$METACODES_PROJECT_KERNEL_PATH" | cut -d" " -f1)"; '
-                'test "${#project_kernel_sha}" -eq 64 || exit 83; '
-                'export METACODES_PROJECT_KERNEL_SHA256="$project_kernel_sha"; '
+                'test -x "$project_kernel" || exit 83; '
             )
+            if self._project_control_mode == "enforced":
+                project_setup += (
+                    f'project_state="$HOME/.metacodes/projects/{project_hash}"; '
+                    'mkdir -p "$project_state" || exit 77; '
+                    'test -z "$(find "$project_source" -type l -print -quit)" || exit 79; '
+                    'test ! -e "$project_state/project-rules" || exit 80; '
+                    'cp -R -- "$project_source" "$project_state/project-rules" || exit 81; '
+                    'chmod -R u=rwX,go= "$project_state/project-rules" || exit 82; '
+                    'export METACODES_PROJECT_KERNEL_PATH="$project_kernel"; '
+                    'project_kernel_sha="$(sha256sum "$METACODES_PROJECT_KERNEL_PATH" | cut -d" " -f1)"; '
+                    'test "${#project_kernel_sha}" -eq 64 || exit 83; '
+                    'export METACODES_PROJECT_KERNEL_SHA256="$project_kernel_sha"; '
+                )
+            else:
+                disabled_bundle_check = (
+                    'test ! -e "$HOME/.metacodes/projects/'
+                    + project_hash
+                    + '/project-rules/active.json" || exit 88; '
+                )
+                project_setup += disabled_bundle_check
+                project_postcheck = disabled_bundle_check
+        else:
+            project_contract = {
+                "staged": False,
+                "mode": "absent",
+                "configured": False,
+                "project_state_hash": None,
+                "artifacts_verified": False,
+                "runtime_active_bundle_absent": True,
+            }
 
         remote_tinykg_env_absent = all(name not in env for name in _REMOTE_TINYKG_ENV)
         if not remote_tinykg_env_absent:
             raise ValueError("metacodes WorkBuddy trial received remote TinyKG authority")
         runtime_contract = json.dumps(
             {
-                "schema_version": "metacodes-workbuddy-runtime-contract-v1",
+                "schema_version": "metacodes-workbuddy-runtime-contract-v2",
                 "quality_evidence": False,
                 "fresh_home": True,
                 "local_tinykg": True,
                 "remote_tinykg_env_absent": remote_tinykg_env_absent,
                 "tinykg_store_absent_before_first_provider_request": True,
                 "credential_delivery": "anonymous-fd-route-token",
+                "transport_model_is_route": True,
+                "actor_model_identity": self._model_display_name,
+                "verification_checkpoint": self._verification_checkpoint,
                 "project_control": project_contract,
             },
             sort_keys=True,
@@ -234,6 +320,7 @@ class MetacodesAgent(BaseInstalledAgent):
             'run_home="/tmp/metacodes-workbuddy-home"; '
             'test ! -e "$run_home" || { echo "fresh HOME already exists" >&2; exit 70; }; '
             'mkdir -p "$run_home" || exit 70; export HOME="$run_home"; '
+            "unset METACODES_PROJECT_KERNEL_PATH METACODES_PROJECT_KERNEL_SHA256; "
             f"{project_setup}"
             "export METACODES_KG_TRANSPORT=cli-exclusive; "
             f'export METACODES_KG_BIN={shlex.quote(mount + "/bin/tinykg")}; '
@@ -243,9 +330,13 @@ class MetacodesAgent(BaseInstalledAgent):
             'test "${#kernel_sha}" -eq 64 || exit 71; '
             'export METACODES_FORMAL_KERNEL_SHA256="$kernel_sha"; '
             "unset TINYKG_REMOTE_URL TINYKG_API_KEY TINYKG_REMOTE_EXPECTED_BUILD_ID "
-            "TINYKG_REMOTE_CONFIG METASK_API_KEY; "
+            "TINYKG_REMOTE_CONFIG METACODES_KG_CONFIG METACODES_KG_URL "
+            "METACODES_KG_API_KEY METACODES_KG_EXPECTED_BUILD_ID "
+            "METACODES_KG_EXPECTED_SCHEMA_DIGEST METASK_API_KEY; "
             'test -z "${TINYKG_REMOTE_URL+x}${TINYKG_API_KEY+x}'
             '${TINYKG_REMOTE_EXPECTED_BUILD_ID+x}${TINYKG_REMOTE_CONFIG+x}'
+            '${METACODES_KG_CONFIG+x}${METACODES_KG_URL+x}${METACODES_KG_API_KEY+x}'
+            '${METACODES_KG_EXPECTED_BUILD_ID+x}${METACODES_KG_EXPECTED_SCHEMA_DIGEST+x}'
             '${METASK_API_KEY+x}" || exit 84; '
             'test ! -e "$METACODES_KG_STORE" || exit 85; '
             f"printf '%s\\n' {shlex.quote(runtime_contract)} > "
@@ -254,8 +345,12 @@ class MetacodesAgent(BaseInstalledAgent):
             'exec 9<<<"$METACODES_ROUTE_TOKEN"; unset METACODES_ROUTE_TOKEN; '
             "export METACODES_API_KEY_FD=9; "
             f"metacodes {' '.join(flags)} -p {escaped_instruction} --json "
-            f"2>&1 </dev/null | tee {shlex.quote(output_path)}; "
+            # NDJSON stdout is a machine protocol.  Keep diagnostics on the
+            # Harbor-owned stderr stream so a permission warning or other host
+            # message can never merge with the exactly-once result event.
+            f"</dev/null | tee {shlex.quote(output_path)}; "
             "agent_status=${PIPESTATUS[0]}; "
+            f"{project_postcheck}"
             'mapfile -t transcripts < <(find "$HOME/.metacodes/projects" '
             "-type f -name transcript.jsonl -print 2>/dev/null); "
             'test "${#transcripts[@]}" -eq 1 || { '

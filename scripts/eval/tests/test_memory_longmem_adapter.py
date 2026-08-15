@@ -16,6 +16,7 @@ from scripts.eval.memory_longmem_adapter import (
     load_longmem_records,
     select_records,
 )
+from scripts.eval.memory_benchmark import QA_EXECUTION_INSTRUCTIONS
 from scripts.eval.memory_replay import validate_manifest
 from scripts.eval.model import ValidationError, stable_json
 
@@ -124,6 +125,11 @@ class LongMemMemoryAdapterTest(unittest.TestCase):
         ][0]
         self.assertEqual(len(non_abstention["expected_evidence_ids"]), 1)
         self.assertIn("Question date: 2024/01/10 (Wed) 12:00", non_abstention["prompt"])
+        self.assertTrue(non_abstention["prompt"].endswith(QA_EXECUTION_INSTRUCTIONS))
+        self.assertIn("Do not inspect or modify the workspace", non_abstention["prompt"])
+        self.assertIn("Return only the shortest final answer", non_abstention["prompt"])
+        self.assertIn("without explanation or supporting details", non_abstention["prompt"])
+        self.assertNotIn(non_abstention["gold_answers"][0], non_abstention["prompt"])
 
     def test_duplicate_non_gold_session_occurrences_get_unique_ids(self):
         record = longmem_record(1)

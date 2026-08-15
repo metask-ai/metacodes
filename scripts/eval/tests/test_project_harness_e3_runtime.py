@@ -12,7 +12,12 @@ import threading
 import time
 import unittest
 
-from scripts.eval.memory_agent_runtime import _text_sse, _tool_results, _tool_sse
+from scripts.eval.memory_agent_runtime import (
+    _project_domain,
+    _text_sse,
+    _tool_results,
+    _tool_sse,
+)
 from scripts.eval.memory_benchmark import file_sha256
 from scripts.eval.memory_budget_journal import (
     BudgetAuthority,
@@ -43,6 +48,12 @@ from scripts.eval.project_harness_e3_pilot import (
     _run_one,
 )
 from scripts.eval.project_harness_e3_templates import build_templates
+from scripts.eval.model import ValidationError, stable_json
+from scripts.eval.tinykg_lean_factorial_executor import (
+    _stable_core_prefix,
+    execute_cell,
+    persist_references,
+)
 
 
 def _assistant_tool_names(requests: list[dict]) -> list[str]:
@@ -230,6 +241,37 @@ class _StallingProvider(_Provider):
 
 
 class ProjectHarnessE3RuntimeTest(unittest.TestCase):
+    def test_factorial_core_prefix_erases_only_tinykg_treatment_sections(self) -> None:
+        base = {
+            "model": "glm-5.2",
+            "system": "# System\nstable\n\n# Memory\nnone\n\n# Environment\nfrozen\n",
+            "tools": [{"name": "Read"}],
+            "cache_control": {"type": "ephemeral"},
+        }
+        tinykg = {
+            **base,
+            "system": (
+                "# System\nstable\n\n"
+                "# Deferred tools\nhelp\n\n"
+                "- FormalAuditTask — bounded graph audit\n\n"
+                "# Memory\nscoped recall\n\n"
+                "# Environment\nfrozen\n\n"
+                "# Knowledge Graph\nlexical graph policy\n"
+            ),
+        }
+        self.assertEqual(_stable_core_prefix(base), _stable_core_prefix(tinykg))
+        changed = {**tinykg, "system": tinykg["system"].replace("frozen", "drifted")}
+        self.assertNotEqual(_stable_core_prefix(base), _stable_core_prefix(changed))
+        unrelated_deferred = {
+            **tinykg,
+            "system": tinykg["system"].replace(
+                "- FormalAuditTask — bounded graph audit",
+                "- OtherTool — unrelated treatment",
+            ),
+        }
+        with self.assertRaisesRegex(ValidationError, "non-TinyKG deferred-tool"):
+            _stable_core_prefix(unrelated_deferred)
+
     def test_rollout_window_pauses_without_reordering_resume_prefix(self) -> None:
         schedule = [{"sequence": index} for index in range(4)]
         self.assertEqual([{"sequence": 1}], _rollout_window(schedule, 1, 1))
@@ -495,6 +537,213 @@ class ProjectHarnessE3RuntimeTest(unittest.TestCase):
             self.assertEqual(1, governance["exact_edit_recovery_post_admits"])
             self.assertTrue(governance["recovery_after_block"])
             self.assertTrue(governance["trustworthy_task_success"])
+
+    def test_real_factorial_cells_share_one_native_executor(self) -> None:
+        binary_raw = os.environ.get("METACODES_TEST_PROJECT_HARNESS_PRODUCTION_BIN")
+        driver_raw = os.environ.get("METACODES_TEST_PROJECT_HARNESS_LIFECYCLE_DRIVER")
+        kernel_raw = os.environ.get("METACODES_TEST_PROJECT_KERNEL_PATH")
+        lake_raw = os.environ.get("METACODES_TEST_PROJECT_LAKE_PATH")
+        tinykg_raw = os.environ.get("METACODES_TEST_TINYKG_BIN")
+        if platform.system() != "Darwin" or not all(
+            (binary_raw, driver_raw, kernel_raw, lake_raw, tinykg_raw)
+        ):
+            self.skipTest("native factorial artifacts are not configured")
+        repo = Path(__file__).resolve().parents[3]
+        binary = Path(str(binary_raw)).resolve(strict=True)
+        driver = Path(str(driver_raw)).resolve(strict=True)
+        kernel = Path(str(kernel_raw)).resolve(strict=True)
+        lake = Path(str(lake_raw)).resolve(strict=True)
+        tinykg = Path(str(tinykg_raw)).resolve(strict=True)
+        ripgrep_raw = os.environ.get("METACODES_TEST_RIPGREP") or shutil.which("rg")
+        if not ripgrep_raw:
+            self.skipTest("native ripgrep is unavailable")
+        ripgrep = Path(ripgrep_raw).resolve(strict=True)
+        case = CASE_BY_ID["canonicalize_deploy_yaml"]
+        with tempfile.TemporaryDirectory(prefix="metacodes-factorial-runtime-") as temporary:
+            root = Path(temporary) / "experiment"
+            templates = build_templates(
+                repo=repo,
+                root=root,
+                driver=driver,
+                kernel=kernel,
+                lake=lake,
+                builder=repo / "scripts/build_project_rule.py",
+                allow_dirty=True,
+            )
+            workspace = Path(templates["project_root"])
+            run_dir = root / "run"
+            run_dir.mkdir()
+            manifest = {
+                "manifest_id": "9" * 64,
+                "analysis_plan": ANALYSIS_PLAN,
+                "cases": [case],
+                "root": str(root),
+                "project_root": str(workspace),
+                "project_sha256": templates["project_sha256"],
+                "repository": {"commit": "8" * 40, "dirty": False},
+                "artifacts": {
+                    "production_binary": {
+                        "path": str(binary),
+                        "sha256": file_sha256(binary),
+                    },
+                    "shadow_binary": {
+                        "path": str(binary),
+                        "sha256": file_sha256(binary),
+                    },
+                    "kernel": {
+                        "path": str(kernel),
+                        "sha256": file_sha256(kernel),
+                        "runtime_dependencies": _kernel_runtime_dependencies(kernel),
+                    },
+                },
+                "execution": {
+                    "provider_identity": PRODUCTION_PROVIDER_ID,
+                    "model_provider": PRODUCTION_MODEL_PROVIDER,
+                    "model_id": PRODUCTION_MODEL_ID,
+                    "model_fingerprint": "7" * 64,
+                    "allowed_tools": list(E3_ALLOWED_TOOLS),
+                    "disallowed_tools": list(E3_DISALLOWED_TOOLS),
+                    "max_output_tokens": 4096,
+                    "rollout_timeout_seconds": E3_ROLLOUT_TIMEOUT_SECONDS,
+                    "max_rollout_cost_usd": 0.9,
+                    "max_rollout_metered_tokens": 300_000,
+                    "max_total_cost_usd": 5.0,
+                    "max_total_metered_tokens": 1_200_001,
+                },
+                "arms": ARM_CONFIG,
+            }
+            authority = BudgetAuthority(
+                manifest_sha256=_canonical_sha256(manifest),
+                model_fingerprint="7" * 64,
+                provider_identity=PRODUCTION_PROVIDER_ID,
+                total_cost_microusd=usd_to_microusd(5.0),
+                total_metered_tokens=1_200_001,
+            )
+            domain = _project_domain(workspace)
+            seed_batch = (
+                "\n".join(
+                    stable_json(item)
+                    for item in (
+                        {"version": 1},
+                        {"op": "node", "id": 1, "kind": "project", "name": domain},
+                        {
+                            "op": "node",
+                            "id": 2,
+                            "kind": "decision",
+                            "name": (
+                                "Historical deploy.yaml correction: inspect the existing file; "
+                                "replace it with the exact managed deployment using replicas 3 "
+                                "and rolling strategy, then verify the final bytes."
+                            ),
+                        },
+                        {"op": "edge", "id": 1, "src": 1, "rel": "contain", "dst": 2},
+                    )
+                )
+                + "\n"
+            ).encode("utf-8")
+            schedules = [
+                {
+                    "sequence": sequence,
+                    "case_id": case["id"],
+                    "position": sequence,
+                    "cell": cell,
+                }
+                for sequence, cell in enumerate(
+                    ("control", "memory_only", "lean_only", "combined")
+                )
+            ]
+            results = []
+            with BudgetJournal(root / "budget.json", authority) as budget:
+                for schedule in schedules:
+                    with _HazardProvider(workspace) as provider:
+                        results.append(
+                            execute_cell(
+                                repo=repo,
+                                manifest=manifest,
+                                templates=templates,
+                                schedule=schedule,
+                                run_dir=run_dir,
+                                ripgrep=ripgrep,
+                                ripgrep_sha256=file_sha256(ripgrep),
+                                api_key="loopback-secret-not-for-production",
+                                budget=budget,
+                                timeout_seconds=30,
+                                tinykg_binary=tinykg,
+                                tinykg_binary_sha256=file_sha256(tinykg),
+                                seed_batch=seed_batch,
+                                recall_query=(
+                                    "deploy.yaml managed deployment replicas rolling strategy"
+                                ),
+                                test_base_url=provider.url,
+                            )
+                        )
+                references_path = persist_references(
+                    receipts=results,
+                    run_dir=run_dir,
+                )
+                budget_snapshot = budget.snapshot()
+            references = json.loads(references_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                "metacodes-tinykg-lean-factorial-references-v1",
+                references["schema_version"],
+            )
+            self.assertEqual(
+                [0, 1, 2, 3],
+                [item["sequence"] for item in references["receipts"]],
+            )
+            projections = [result["projection"] for result in results]
+            by_cell = {row["cell"]: row for row in projections}
+            for result in results:
+                source_receipt = json.loads(
+                    Path(result["source"]["receipt_path"]).read_text(encoding="utf-8")
+                )
+                first_request = json.loads(
+                    Path(source_receipt["artifacts"]["first_request"]).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertNotIn("FormalAuditTask", first_request["system"])
+                self.assertNotIn("# Deferred tools", first_request["system"])
+                self.assertNotIn("\n# Memory\n", first_request["system"])
+            self.assertEqual(
+                1,
+                len({row["identity"]["tool_schema_sha256"] for row in projections}),
+            )
+            self.assertEqual(
+                1,
+                len(
+                    {
+                        row["identity"]["stable_core_prefix_sha256"]
+                        for row in projections
+                    }
+                ),
+            )
+            self.assertEqual(
+                by_cell["control"]["identity"]["first_request_sha256"],
+                by_cell["lean_only"]["identity"]["first_request_sha256"],
+            )
+            self.assertEqual(
+                by_cell["memory_only"]["identity"]["first_request_sha256"],
+                by_cell["combined"]["identity"]["first_request_sha256"],
+            )
+            for cell in ("memory_only", "combined"):
+                self.assertGreater(
+                    by_cell[cell]["treatment"]["tinykg"]["read_count"], 0
+                )
+                self.assertGreater(
+                    by_cell[cell]["usage"]["memory_exposed_tokens"], 0
+                )
+            for cell in ("control", "lean_only"):
+                self.assertEqual(
+                    0, by_cell[cell]["treatment"]["tinykg"]["read_count"]
+                )
+                self.assertEqual(0, by_cell[cell]["usage"]["memory_exposed_tokens"])
+            for cell in ("lean_only", "combined"):
+                self.assertGreater(
+                    by_cell[cell]["treatment"]["lean"]["checker_calls"], 0
+                )
+            self.assertEqual(4, budget_snapshot["transaction_states"]["committed"])
+            self.assertTrue(all(row["quality_evidence"] is False for row in projections))
 
     def test_real_runner_timeout_persists_authorized_failure_without_retry(self) -> None:
         binary_raw = os.environ.get("METACODES_TEST_PROJECT_HARNESS_PRODUCTION_BIN")

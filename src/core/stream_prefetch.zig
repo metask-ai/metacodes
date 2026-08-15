@@ -43,6 +43,8 @@ const Entry = struct {
     file_refs: ?[]file_reference.FileReference = null, // owned by parent allocator
     is_error: bool = false,
     elapsed_ms: u64 = 0,
+    effect: ?@import("../tools/observation.zig").Effect = null,
+    effect_valid: bool = true,
     taken: bool = false, // 已被 executeSlots 取走(所有权转移)
     skip: bool = false, // 预取遇 UiPending(并发安全工具不该发生)→ 丢弃,take 返 null 让 executeSlots 重跑
 };
@@ -77,6 +79,8 @@ fn runJob(job: *Job) void {
             job.entry.file_refs = d.file_refs;
             job.entry.is_error = d.is_error;
             job.entry.elapsed_ms = d.elapsed_ms;
+            job.entry.effect = d.effect;
+            job.entry.effect_valid = d.effect_valid;
         },
         // Host 工具不进流式预取(prefetch_safe=false + isStreamable 白名单),此分支
         // 防御性兜底:标 skip 让 executeSlots 正常路径重跑并走完整 fatal 控制流。
@@ -138,6 +142,8 @@ pub const Prefetch = struct {
         file_refs: ?[]file_reference.FileReference,
         is_error: bool,
         elapsed_ms: u64,
+        effect: ?@import("../tools/observation.zig").Effect,
+        effect_valid: bool,
     } {
         for (self.entries.items) |e| {
             if (e.taken) continue;
@@ -156,7 +162,14 @@ pub const Prefetch = struct {
             e.content = null; // 所有权转移给调用方
             const refs = e.file_refs;
             e.file_refs = null;
-            return .{ .content = content, .file_refs = refs, .is_error = e.is_error, .elapsed_ms = e.elapsed_ms };
+            return .{
+                .content = content,
+                .file_refs = refs,
+                .is_error = e.is_error,
+                .elapsed_ms = e.elapsed_ms,
+                .effect = e.effect,
+                .effect_valid = e.effect_valid,
+            };
         }
         return null;
     }

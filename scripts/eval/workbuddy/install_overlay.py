@@ -31,6 +31,8 @@ _AGENT_PATH = Path("src/workbuddy_bench/agents/metacodes_agent.py")
 _TRACE_PATH = Path("src/workbuddy_bench/agents/_metacodes_trace.py")
 _KEY_FD_PATH = Path("src/workbuddy_bench/proxy/_metacodes_key_fd.py")
 _PROXY_CONFIG_PATH = Path("src/workbuddy_bench/proxy/config.py")
+_PROXY_LOGGER_PATH = Path("src/workbuddy_bench/proxy/interceptors/logger.py")
+_PROXY_PIPELINE_PATH = Path("src/workbuddy_bench/proxy/pipeline.py")
 _ARTIFACT_PREFIX = "configs/harnesses/metacodes/docker/artifacts/"
 
 
@@ -109,6 +111,21 @@ _METACODES_RUNTIME_BUILDER = '''def _build_metacodes_runtime_config(
     })
     project_rules = harness_params.get("METACODES_PROJECT_RULES_RELATIVE")
     project_kernel = harness_params.get("METACODES_PROJECT_KERNEL_RELATIVE")
+    project_mode = harness_params.get("METACODES_PROJECT_CONTROL_MODE")
+    verification_checkpoint = harness_params.get(
+        "METACODES_VERIFICATION_CHECKPOINT", False
+    )
+    if not isinstance(verification_checkpoint, bool):
+        raise ValueError(
+            "METACODES_VERIFICATION_CHECKPOINT must be an explicit boolean"
+        )
+    project_staged = bool(project_rules and project_kernel)
+    if project_staged and project_mode not in ("disabled", "enforced"):
+        raise ValueError(
+            "metacodes staged project control requires explicit disabled/enforced mode"
+        )
+    if not project_staged and project_mode is not None:
+        raise ValueError("metacodes project control mode requires staged artifacts")
     if project_rules or project_kernel:
         env.update({
             "METACODES_PROJECT_RULES_SOURCE": (
@@ -124,13 +141,23 @@ _METACODES_RUNTIME_BUILDER = '''def _build_metacodes_runtime_config(
         "connection_policy": "local-proxy-only",
         "credential_delivery": "anonymous-fd-route-token",
         "disabled_tools": harness_params.get("METACODES_DISALLOWED_TOOLS"),
-        "project_control_configured": bool(project_rules and project_kernel),
+        "project_control_staged": project_staged,
+        "project_control_mode": project_mode if project_staged else "absent",
+        "project_control_configured": project_staged and project_mode == "enforced",
+        "transport_model_is_route": connection_mode == "local_proxy",
+        "actor_model_identity": backend_model_name,
+        "verification_checkpoint": verification_checkpoint,
         "translated_env": {key: value for key, value in env.items() if value},
         "cleared_env": [
             "TINYKG_REMOTE_URL",
             "TINYKG_API_KEY",
             "TINYKG_REMOTE_EXPECTED_BUILD_ID",
             "TINYKG_REMOTE_CONFIG",
+            "METACODES_KG_CONFIG",
+            "METACODES_KG_URL",
+            "METACODES_KG_API_KEY",
+            "METACODES_KG_EXPECTED_BUILD_ID",
+            "METACODES_KG_EXPECTED_SCHEMA_DIGEST",
             "METASK_API_KEY",
         ],
         "context_window_request": context_window,
@@ -149,6 +176,244 @@ _PROXY_IMPORT = (
 )
 _PROXY_KEY_OLD = '        key = _resolve_env(backend_raw.get("key", ""), backend_raw.get("key_env", ""))\n'
 _PROXY_KEY_NEW = '        key = resolve_secret_env(backend_raw.get("key", ""), backend_raw.get("key_env", ""))\n'
+
+
+_PROXY_LOGGER_INIT_OLD = '''        self._seq = 0
+        # Per-stream accumulators keyed by request_id
+        self._stream_bufs: dict[str, _StreamAccumulator] = {}
+'''
+_PROXY_LOGGER_INIT_NEW = '''        self._seq = 0
+        # Sequence numbers are allocated when the request reaches the proxy, not
+        # when its response happens to finish.  Completion order is not request
+        # order when a client closes a stream immediately after message_stop.
+        self._request_seqs: dict[str, int] = {}
+        # Per-stream accumulators keyed by request_id
+        self._stream_bufs: dict[str, _StreamAccumulator] = {}
+'''
+_PROXY_LOGGER_REQUEST_OLD = '''        if ctx.client_body is None:
+            ctx.client_body = _json_safe(ctx.ensure_parsed())
+        if ctx.is_stream:
+            self._stream_bufs[ctx.request_id] = _StreamAccumulator()
+'''
+_PROXY_LOGGER_REQUEST_NEW = '''        if ctx.client_body is None:
+            ctx.client_body = _json_safe(ctx.ensure_parsed())
+        self._seq += 1
+        self._request_seqs[ctx.request_id] = self._seq
+        if ctx.is_stream:
+            self._stream_bufs[ctx.request_id] = _StreamAccumulator()
+'''
+_PROXY_LOGGER_DISCARD_OLD = '''    def discard_stream(self, request_id: str) -> None:
+        """Drop a stream's accumulator without logging.
+
+        Safe to call from a cancellation/finally path (no I/O, no await): ensures
+        the per-request accumulator is freed even when the client disconnects
+        mid-stream and on_stream_end never runs. Idempotent.
+        """
+        self._stream_bufs.pop(request_id, None)
+
+'''
+_PROXY_LOGGER_DISCARD_NEW = '''    def discard_stream(self, request_id: str) -> None:
+        """Drop a stream that provably never reached the provider."""
+        self._stream_bufs.pop(request_id, None)
+        self._request_seqs.pop(request_id, None)
+
+    def finalize_aborted_stream(self, ctx: RequestContext) -> None:
+        """Persist a provider-attempt record even if the client closes early.
+
+        Some clients stop reading immediately after the terminal SSE event.  The
+        async generator is then closed before ``on_stream_end`` resumes, although
+        the provider request and its complete response already happened.  Losing
+        that record corrupts request counts and can make a later request look like
+        the cacheable first request.  This synchronous finally-path is deliberately
+        fail-visible: a stream without a terminal event is recorded as status 499.
+        """
+        buf = self._stream_bufs.pop(ctx.request_id, None)
+        if buf is None:
+            self._request_seqs.pop(ctx.request_id, None)
+            return
+        completed = bool(buf.stop_reason or buf.finish_reason)
+        status = 200 if completed else 499
+        resp = ResponseContext(
+            status_code=status,
+            is_stream=True,
+            duration_ms=(time.time() - ctx.timestamp) * 1000,
+            error=None if completed else "client_disconnected_before_terminal_event",
+        )
+        resp.summary = buf.summarize()
+        resp.summary["status"] = status
+        self._write_record(self._build_record(ctx, resp), _route_instance_id(ctx))
+
+'''
+_PROXY_LOGGER_SEQ_OLD = '''        """Build a JSONL record."""
+        self._seq += 1
+
+        client_request_body = _json_safe(ctx.client_body or ctx.parsed_body or {})
+'''
+_PROXY_LOGGER_SEQ_NEW = '''        """Build a JSONL record."""
+        request_seq = self._request_seqs.pop(ctx.request_id, None)
+        if request_seq is None:
+            # Defensive compatibility for direct test callers that bypassed
+            # on_request; production paths always allocate before provider I/O.
+            self._seq += 1
+            request_seq = self._seq
+
+        client_request_body = _json_safe(ctx.client_body or ctx.parsed_body or {})
+'''
+_PROXY_LOGGER_RECORD_SEQ_OLD = '''            "seq": self._seq,
+'''
+_PROXY_LOGGER_RECORD_SEQ_NEW = '''            "seq": request_seq,
+'''
+_PROXY_PIPELINE_FINALLY_OLD = '''            if not stream_ended:
+                for interceptor in self._interceptors.values():
+                    discard = getattr(interceptor, "discard_stream", None)
+                    if discard:
+                        discard(ctx.request_id)
+'''
+_PROXY_PIPELINE_FINALLY_NEW = '''            if not stream_ended:
+                for interceptor in self._interceptors.values():
+                    finalize = (
+                        getattr(interceptor, "finalize_aborted_stream", None)
+                        if provider_state["started"]
+                        else None
+                    )
+                    if finalize is not None:
+                        finalize(ctx)
+                        continue
+                    discard = getattr(interceptor, "discard_stream", None)
+                    if discard:
+                        discard(ctx.request_id)
+'''
+_PROXY_PIPELINE_STREAM_STATE_OLD = '''        stream_ended = False
+        try:
+'''
+_PROXY_PIPELINE_STREAM_STATE_NEW = '''        stream_ended = False
+        provider_state = {"started": False}
+        try:
+'''
+_PROXY_PIPELINE_STREAM_LOOP_OLD = '''            if substream is not None:
+                async for event in substream:
+                    yield event
+'''
+_PROXY_PIPELINE_STREAM_LOOP_NEW = '''            if substream is not None:
+                async for event in substream:
+                    yield event
+'''
+_PROXY_PIPELINE_SUBSTREAM_CALLS_OLD = '''                    ctx, route, interceptor_names, upstream_url, upstream_body, t0, sink
+                )
+            elif route.mode == ProxyMode.PASSTHROUGH:
+                substream = self._stream_passthrough(
+                    ctx, route, interceptor_names, upstream_url, upstream_body, t0, sink
+'''
+_PROXY_PIPELINE_SUBSTREAM_CALLS_NEW = '''                    ctx, route, interceptor_names, upstream_url, upstream_body, t0, sink,
+                    provider_state,
+                )
+            elif route.mode == ProxyMode.PASSTHROUGH:
+                substream = self._stream_passthrough(
+                    ctx, route, interceptor_names, upstream_url, upstream_body, t0, sink,
+                    provider_state,
+'''
+_PROXY_PIPELINE_A2O_SIGNATURE_OLD = '''        sink: list[ResponseContext],
+    ) -> AsyncIterator[bytes]:
+        """A2O streaming: convert OpenAI chunks to Anthropic SSE. Yields client
+'''
+_PROXY_PIPELINE_A2O_SIGNATURE_NEW = '''        sink: list[ResponseContext],
+        provider_state: dict[str, bool],
+    ) -> AsyncIterator[bytes]:
+        """A2O streaming: convert OpenAI chunks to Anthropic SSE. Yields client
+'''
+_PROXY_PIPELINE_PASSTHROUGH_SIGNATURE_OLD = '''        sink: list[ResponseContext],
+    ) -> AsyncIterator[bytes]:
+        """Same-protocol passthrough: relay upstream bytes verbatim (event names,
+'''
+_PROXY_PIPELINE_PASSTHROUGH_SIGNATURE_NEW = '''        sink: list[ResponseContext],
+        provider_state: dict[str, bool],
+    ) -> AsyncIterator[bytes]:
+        """Same-protocol passthrough: relay upstream bytes verbatim (event names,
+'''
+_PROXY_PIPELINE_A2O_SENDER_OLD = '''        try:
+            async for chunk in self.sender.send_stream(
+'''
+_PROXY_PIPELINE_A2O_SENDER_NEW = '''        try:
+            # A2O emits a synthetic message_start before touching the upstream.
+            # Mark the physical attempt only when execution reaches the sender.
+            provider_state["started"] = True
+            async for chunk in self.sender.send_stream(
+'''
+_PROXY_PIPELINE_PASSTHROUGH_SENDER_OLD = '''        try:
+            async for chunk in self.sender.send_stream_raw(
+'''
+_PROXY_PIPELINE_PASSTHROUGH_SENDER_NEW = '''        try:
+            provider_state["started"] = True
+            async for chunk in self.sender.send_stream_raw(
+'''
+_PROXY_PIPELINE_A2O_START_OLD = '''        start_event = converter.start()
+        yield start_event
+        await self._broadcast_chunk(
+            ctx, names, StreamChunk(client_raw_bytes=start_event, summarize=False)
+        )
+'''
+_PROXY_PIPELINE_A2O_START_NEW = '''        start_event = converter.start()
+        await self._broadcast_chunk(
+            ctx, names, StreamChunk(client_raw_bytes=start_event, summarize=False)
+        )
+        yield start_event
+'''
+_PROXY_PIPELINE_A2O_EVENTS_OLD = '''                for event in events:
+                    yield event
+                await self._broadcast_chunk(
+                    ctx, names,
+                    StreamChunk(client_raw_bytes=b"".join(events), upstream_parsed=chunk),
+                )
+'''
+_PROXY_PIPELINE_A2O_EVENTS_NEW = '''                await self._broadcast_chunk(
+                    ctx, names,
+                    StreamChunk(client_raw_bytes=b"".join(events), upstream_parsed=chunk),
+                )
+                for event in events:
+                    yield event
+'''
+_PROXY_PIPELINE_A2O_FINISH_OLD = '''            finish_events = converter.finish()
+            for event in finish_events:
+                yield event
+            await self._broadcast_chunk(
+                ctx, names,
+                StreamChunk(client_raw_bytes=b"".join(finish_events), summarize=False),
+            )
+'''
+_PROXY_PIPELINE_A2O_FINISH_NEW = '''            finish_events = converter.finish()
+            await self._broadcast_chunk(
+                ctx, names,
+                StreamChunk(client_raw_bytes=b"".join(finish_events), summarize=False),
+            )
+            for event in finish_events:
+                yield event
+'''
+_PROXY_PIPELINE_PASSTHROUGH_OLD = '''                if not rewrite:
+                    yield chunk
+                    await self._broadcast_chunk(ctx, names, StreamChunk(raw_bytes=chunk))
+                    continue
+'''
+_PROXY_PIPELINE_PASSTHROUGH_NEW = '''                if not rewrite:
+                    await self._broadcast_chunk(ctx, names, StreamChunk(raw_bytes=chunk))
+                    yield chunk
+                    continue
+'''
+_PROXY_PIPELINE_REWRITE_OLD = '''                    out = _rewrite_reasoning_sse(head + sep)
+                    yield out
+                    await self._broadcast_chunk(ctx, names, StreamChunk(raw_bytes=out))
+'''
+_PROXY_PIPELINE_REWRITE_NEW = '''                    out = _rewrite_reasoning_sse(head + sep)
+                    await self._broadcast_chunk(ctx, names, StreamChunk(raw_bytes=out))
+                    yield out
+'''
+_PROXY_PIPELINE_REWRITE_TAIL_OLD = '''                out = _rewrite_reasoning_sse(buf)
+                yield out
+                await self._broadcast_chunk(ctx, names, StreamChunk(raw_bytes=out))
+'''
+_PROXY_PIPELINE_REWRITE_TAIL_NEW = '''                out = _rewrite_reasoning_sse(buf)
+                await self._broadcast_chunk(ctx, names, StreamChunk(raw_bytes=out))
+                yield out
+'''
 
 
 _RESOLVER_MOUNT_OLD = '''    dataset_runtime = load_dataset_runtime_contract(dataset, repo_root=_repo_root())
@@ -192,6 +457,22 @@ _PREPARE_MOUNT_NEW = '''    harness_name = harness.get("name", "")
             )
     harness_mount = harness.get("mount")
     if dataset_requires_mount:
+'''
+
+_PREPARE_AGENT_IDENTITY_OLD = '''    kwargs: dict[str, Any] = dict(harness_params)
+    if model_params:
+        kwargs["model_params"] = model_params
+'''
+_PREPARE_AGENT_IDENTITY_NEW = '''    kwargs: dict[str, Any] = dict(harness_params)
+    if harness.get("name") == "metacodes":
+        backend_model_name = str(
+            (manifest or {}).get("backend_model_name") or model.get("name") or ""
+        )
+        if not backend_model_name:
+            raise ValueError("metacodes requires a stable backend model identity")
+        kwargs["METACODES_MODEL_DISPLAY_NAME"] = backend_model_name
+    if model_params:
+        kwargs["model_params"] = model_params
 '''
 
 
@@ -245,6 +526,13 @@ def _patched_upstream(repo: Path) -> Dict[Path, bytes]:
     resolver = resolver.replace(_RESOLVER_MOUNT_OLD, _RESOLVER_MOUNT_NEW, 1)
 
     prepare_job = _head_file(repo, _PREPARE_JOB_PATH).decode("utf-8")
+    if prepare_job.count(_PREPARE_AGENT_IDENTITY_OLD) != 1:
+        raise OverlayError("WorkBuddy prepare_job model-identity anchor drifted")
+    prepare_job = prepare_job.replace(
+        _PREPARE_AGENT_IDENTITY_OLD,
+        _PREPARE_AGENT_IDENTITY_NEW,
+        1,
+    )
     if prepare_job.count(_PREPARE_MOUNT_OLD) != 1:
         raise OverlayError("WorkBuddy prepare_job mount-requirement anchor drifted")
     prepare_job = prepare_job.replace(_PREPARE_MOUNT_OLD, _PREPARE_MOUNT_NEW, 1)
@@ -259,11 +547,52 @@ def _patched_upstream(repo: Path) -> Dict[Path, bytes]:
         _PROXY_IMPORT_ANCHOR + _PROXY_IMPORT,
         1,
     ).replace(_PROXY_KEY_OLD, _PROXY_KEY_NEW, 1)
+    proxy_logger = _head_file(repo, _PROXY_LOGGER_PATH).decode("utf-8")
+    for old, new, label in (
+        (_PROXY_LOGGER_INIT_OLD, _PROXY_LOGGER_INIT_NEW, "logger init"),
+        (_PROXY_LOGGER_REQUEST_OLD, _PROXY_LOGGER_REQUEST_NEW, "request sequence"),
+        (_PROXY_LOGGER_DISCARD_OLD, _PROXY_LOGGER_DISCARD_NEW, "stream finalizer"),
+        (_PROXY_LOGGER_SEQ_OLD, _PROXY_LOGGER_SEQ_NEW, "record sequence"),
+        (_PROXY_LOGGER_RECORD_SEQ_OLD, _PROXY_LOGGER_RECORD_SEQ_NEW, "record field"),
+    ):
+        if proxy_logger.count(old) != 1:
+            raise OverlayError(f"WorkBuddy proxy {label} anchor drifted")
+        proxy_logger = proxy_logger.replace(old, new, 1)
+    proxy_pipeline = _head_file(repo, _PROXY_PIPELINE_PATH).decode("utf-8")
+    for old, new, label in (
+        (_PROXY_PIPELINE_STREAM_STATE_OLD, _PROXY_PIPELINE_STREAM_STATE_NEW, "stream state"),
+        (_PROXY_PIPELINE_STREAM_LOOP_OLD, _PROXY_PIPELINE_STREAM_LOOP_NEW, "stream loop"),
+        (_PROXY_PIPELINE_SUBSTREAM_CALLS_OLD, _PROXY_PIPELINE_SUBSTREAM_CALLS_NEW, "substream calls"),
+        (_PROXY_PIPELINE_A2O_SIGNATURE_OLD, _PROXY_PIPELINE_A2O_SIGNATURE_NEW, "A2O signature"),
+        (
+            _PROXY_PIPELINE_PASSTHROUGH_SIGNATURE_OLD,
+            _PROXY_PIPELINE_PASSTHROUGH_SIGNATURE_NEW,
+            "passthrough signature",
+        ),
+        (_PROXY_PIPELINE_A2O_SENDER_OLD, _PROXY_PIPELINE_A2O_SENDER_NEW, "A2O sender"),
+        (
+            _PROXY_PIPELINE_PASSTHROUGH_SENDER_OLD,
+            _PROXY_PIPELINE_PASSTHROUGH_SENDER_NEW,
+            "passthrough sender",
+        ),
+        (_PROXY_PIPELINE_A2O_START_OLD, _PROXY_PIPELINE_A2O_START_NEW, "A2O start"),
+        (_PROXY_PIPELINE_A2O_EVENTS_OLD, _PROXY_PIPELINE_A2O_EVENTS_NEW, "A2O events"),
+        (_PROXY_PIPELINE_A2O_FINISH_OLD, _PROXY_PIPELINE_A2O_FINISH_NEW, "A2O finish"),
+        (_PROXY_PIPELINE_PASSTHROUGH_OLD, _PROXY_PIPELINE_PASSTHROUGH_NEW, "passthrough"),
+        (_PROXY_PIPELINE_REWRITE_OLD, _PROXY_PIPELINE_REWRITE_NEW, "rewrite"),
+        (_PROXY_PIPELINE_REWRITE_TAIL_OLD, _PROXY_PIPELINE_REWRITE_TAIL_NEW, "rewrite tail"),
+        (_PROXY_PIPELINE_FINALLY_OLD, _PROXY_PIPELINE_FINALLY_NEW, "stream finally"),
+    ):
+        if proxy_pipeline.count(old) != 1:
+            raise OverlayError(f"WorkBuddy proxy {label} anchor drifted")
+        proxy_pipeline = proxy_pipeline.replace(old, new, 1)
     return {
         _ADAPTER_PATH: adapter.encode("utf-8"),
         _RESOLVER_PATH: resolver.encode("utf-8"),
         _PREPARE_JOB_PATH: prepare_job.encode("utf-8"),
         _PROXY_CONFIG_PATH: proxy_config.encode("utf-8"),
+        _PROXY_LOGGER_PATH: proxy_logger.encode("utf-8"),
+        _PROXY_PIPELINE_PATH: proxy_pipeline.encode("utf-8"),
     }
 
 

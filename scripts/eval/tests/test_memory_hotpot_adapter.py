@@ -16,6 +16,7 @@ from scripts.eval.memory_hotpot_adapter import (
     load_hotpot_records,
     select_records,
 )
+from scripts.eval.memory_benchmark import QA_EXECUTION_INSTRUCTIONS, qa_execution_prompt
 from scripts.eval.memory_replay import validate_manifest
 from scripts.eval.model import ValidationError, stable_json
 
@@ -108,7 +109,12 @@ class HotpotMemoryAdapterTest(unittest.TestCase):
         )
         validate_manifest(manifest)
         for source_case, manifest_case in zip(source_slice["cases"], manifest["cases"]):
-            self.assertEqual(manifest_case["prompt"], source_case["question"])
+            self.assertEqual(
+                manifest_case["prompt"], qa_execution_prompt(source_case["question"])
+            )
+            self.assertTrue(manifest_case["prompt"].endswith(QA_EXECUTION_INSTRUCTIONS))
+            self.assertIn("Return only the shortest final answer", manifest_case["prompt"])
+            self.assertIn("without explanation or supporting details", manifest_case["prompt"])
             self.assertNotIn("answer", source_case)
             self.assertNotIn("expected_evidence_ids", source_case)
             self.assertNotIn(manifest_case["gold_answers"][0], manifest_case["prompt"])

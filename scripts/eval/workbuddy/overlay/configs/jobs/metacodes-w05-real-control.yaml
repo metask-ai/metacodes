@@ -11,6 +11,7 @@ verifier_user: dev
 extra_allowed_hosts:
   - host.docker.internal
 harness_params_override:
+  METACODES_PROJECT_CONTROL_MODE: enforced
   METACODES_PROJECT_RULES_RELATIVE: share/metacodes/workbuddy-w05/project-rules
   METACODES_PROJECT_KERNEL_RELATIVE: libexec/metacodes-project-kernel
 task_selection:

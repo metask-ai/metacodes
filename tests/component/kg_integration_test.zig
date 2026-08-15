@@ -222,9 +222,10 @@ test "L2 KG governance: scoped recall exposes stable node ids and candidate-only
         try std.testing.expect(std.mem.indexOf(u8, inj.?, "exact canonical alias/symbol") != null);
         try std.testing.expect(std.mem.indexOf(u8, inj.?, "exact/high-precision") != null);
         try std.testing.expect(std.mem.indexOf(u8, inj.?, "强制下一步 / MANDATORY NEXT ACTION") != null);
-        try std.testing.expect(std.mem.indexOf(u8, inj.?, "只能包含该精确词和用户已要求的字段名") != null);
-        try std.testing.expect(std.mem.indexOf(u8, inj.?, "2-4 个彼此分开的紧凑语义变体") != null);
-        try std.testing.expect(std.mem.indexOf(u8, inj.?, "机制、症状、期望结果、邻近实现") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "canonical alias/代码符号") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "2-4 个分离的语义变体") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "宿主整批执行") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "按 node_id 合并") != null);
     }
     // 负向:零重合无关请求 → 不注入(相关性门挡答案缺席噪声;PM P0 逼可证伪的两侧测试)。
     {
@@ -420,6 +421,58 @@ const KG_END_TURN_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+const KG_ENUMERATION_SEED_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"seed\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"seed1\",\"name\":\"KgRecall\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"graduation ceremony\\\",\\\"lexical_plan\\\":{\\\"schema_version\\\":\\\"lexical-query-plan-v3\\\",\\\"intent\\\":\\\"fact_lookup\\\",\\\"stage\\\":\\\"seed\\\",\\\"variants\\\":[{\\\"kind\\\":\\\"exact\\\",\\\"text\\\":\\\"graduation ceremony\\\"}]}}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+// Exact paid GLM-5.2 failure shape: every variants object has one extra `}`
+// and the model declared semantic alternatives inside stage=seed. The host
+// must repair only the syntax, then deterministically execute the exact seed
+// while leaving both semantic declarations explicitly unexecuted.
+const KG_MALFORMED_SEED_BATCH_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"malformed-seed\",\"role\":\"assistant\",\"model\":\"glm-5.2\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"malformed-seed-1\",\"name\":\"KgRecall\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"lexical_plan\\\":{\\\"intent\\\":\\\"fact_lookup\\\",\\\"schema_version\\\":\\\"lexical-query-plan-v3\\\",\\\"stage\\\":\\\"seed\\\",\\\"variants\\\":[{\\\"kind\\\":\\\"exact\\\",\\\"text\\\":\\\"kitchen cleaning tips\\\"}},{\\\"kind\\\":\\\"synonym\\\",\\\"text\\\":\\\"keeping kitchen clean\\\"}},{\\\"kind\\\":\\\"paraphrase\\\",\\\"text\\\":\\\"kitchen mess organization\\\"}]},\\\"query\\\":\\\"kitchen cleaning tips\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const KG_ENUMERATION_PREMATURE_FINAL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"early\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Unavailable\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const KG_ENUMERATION_BATCH_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"batch\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"batch1\",\"name\":\"KgRecall\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"graduation ceremony\\\",\\\"lexical_plan\\\":{\\\"schema_version\\\":\\\"lexical-query-plan-v3\\\",\\\"intent\\\":\\\"enumeration\\\",\\\"stage\\\":\\\"semantic_expansion\\\",\\\"variants\\\":[{\\\"kind\\\":\\\"synonym\\\",\\\"text\\\":\\\"commencement\\\"},{\\\"kind\\\":\\\"paraphrase\\\",\\\"text\\\":\\\"degree conferral\\\"},{\\\"kind\\\":\\\"broader\\\",\\\"text\\\":\\\"convocation\\\"}]}}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const KG_ENUMERATION_CONTEXT_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"context\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"context1\",\"name\":\"KgContext\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"node_id\\\":1,\\\"limit\\\":10}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const KG_ENUMERATION_FINAL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"final\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"3\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
 test "L2 KG: 注入段经 inject_user_context 进请求体(字节断言,DoD)" {
     // 端到端:kg_summary → user_context.build → inject_user_context → buildApiMessages
     // → 序列化请求体。用真 MockServer 捕获 body,断言 KG 记忆锚字节在内。
@@ -519,15 +572,27 @@ test "L2 KG governance: freshness and contradiction contract enters the actual A
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "MUST contain only that exact term plus field names") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "EXACT/HIGH-PRECISION SEED") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "RECORD THE PLAN") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "lexical-query-plan-v1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "stable plan_sha256 plus host-measured new/repeated hit counts") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "rejects invented, omitted, cross-plan, or stale ids before search") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "2-4 separate compact semantic variants") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "make at most four semantic-variant calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "lexical-query-plan-v3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "executes every declared member in order") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "run-scoped host ledger owns seen state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "2-4 separate compact probes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "at most four semantic probes per run") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "ENUMERATION REQUIRES COVERAGE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "count/cardinality, exhaustive-list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "One positive hit proves existence, never completeness") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "successful v3 receipt proves every member ran") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "host deterministically runs one real KgContext re-observation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Use a valid host-generated auto_context when present") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "inspect it instead of repeating KgContext") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "rejects premature final answers until the available obligations commit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "zero-candidate batch does not create an impossible KgContext obligation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "attaches it as auto_context in the same tool result") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "preserve the user's relation or action") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "necessary, not sufficient") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "mechanism, symptom, desired outcome, or nearby implementation term") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Deduplicate candidates by node_id across every call") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "KgContext") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Stop as soon as authoritative evidence and any required current-state check are sufficient") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "For non-enumeration lookups, stop as soon as authoritative evidence") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Memory is a candidate, not a current fact") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "verified_by or evidences") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "deprecated_by, resolved_by, and contradiction") != null);
@@ -547,9 +612,11 @@ test "L2 KG governance: freshness and contradiction contract enters the actual A
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"KgRecall\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"lexical_plan\":{\"type\":\"object\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"schema_version\":{\"type\":\"string\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"enum\":[\"lexical-query-plan-v1\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"enum\":[\"lexical-query-plan-v3\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"variants\":{\"type\":\"array\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"seen_node_ids\":{\"type\":\"array\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"synonym\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"seen_node_ids\":{\"type\":\"array\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"variant_index\":{\"type\":\"integer\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"KgContext\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "authoritative node text") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "bounded TinyKG task_packet") != null);
@@ -581,17 +648,17 @@ test "L2 KG governance: lexical query plan binds variants and measures informati
     var ledger = @import("cc").kg_lexical_query_plan.Ledger{};
     const ctx = @import("cc").tool_context.ToolContext{ .allocator = a, .kg = &kg, .kg_lexical_ledger = &ledger };
     const first_args =
-        \\{"query":"panic crash checkpoint","lexical_plan":{"schema_version":"lexical-query-plan-v1","intent":"task_recovery","stage":"semantic_expansion","variants":[{"kind":"paraphrase","text":"panic crash checkpoint"},{"kind":"mechanism","text":"checkpoint recovery"}],"variant_index":0,"seen_node_ids":[]}}
+        \\{"query":"panic crash checkpoint","lexical_plan":{"schema_version":"lexical-query-plan-v2","intent":"task_recovery","stage":"semantic_expansion","variants":[{"kind":"synonym","text":"panic crash checkpoint"},{"kind":"mechanism","text":"checkpoint recovery"}],"variant_index":0}}
     ;
     const first_out = try @import("cc").kg_tools.executeRecall(&ctx, first_args);
     defer a.free(first_out);
     var first_parsed = try std.json.parseFromSlice(std.json.Value, a, first_out, .{});
     defer first_parsed.deinit();
     const first_receipt = first_parsed.value.object.get("lexical_query_plan").?.object;
-    try std.testing.expectEqualStrings("lexical-query-plan-v1", first_receipt.get("schema_version").?.string);
+    try std.testing.expectEqualStrings("lexical-query-plan-v2", first_receipt.get("schema_version").?.string);
     try std.testing.expectEqualStrings("task_recovery", first_receipt.get("intent").?.string);
     try std.testing.expectEqualStrings("semantic_expansion", first_receipt.get("stage").?.string);
-    try std.testing.expectEqualStrings("paraphrase", first_receipt.get("variant_kind").?.string);
+    try std.testing.expectEqualStrings("synonym", first_receipt.get("variant_kind").?.string);
     try std.testing.expectEqual(@as(i64, 0), first_receipt.get("variant_index").?.integer);
     try std.testing.expectEqual(@as(i64, 2), first_receipt.get("variant_count").?.integer);
     try std.testing.expectEqual(@as(i64, 0), first_receipt.get("repeated_hit_count").?.integer);
@@ -602,53 +669,14 @@ test "L2 KG governance: lexical query plan binds variants and measures informati
         if (hit.object.get("node_id").?.integer != @as(i64, @intCast(memory_id))) continue;
         first_found = true;
         try std.testing.expect(!hit.object.get("seen_before").?.bool);
+        try std.testing.expect(hit.object.get("text") != null);
+        try std.testing.expect(hit.object.get("content_ref") == null);
     }
     try std.testing.expect(first_found);
 
-    var seen_ids_json: std.ArrayList(u8) = .empty;
-    defer seen_ids_json.deinit(a);
-    for (first_parsed.value.object.get("hits").?.array.items, 0..) |hit, index| {
-        if (index > 0) try seen_ids_json.append(a, ',');
-        const id_text = try std.fmt.allocPrint(a, "{d}", .{hit.object.get("node_id").?.integer});
-        defer a.free(id_text);
-        try seen_ids_json.appendSlice(a, id_text);
-    }
-
-    // The model cannot omit ids that the host actually returned. This check
-    // happens before the TinyKG search and is the trust boundary for the
-    // information-gain receipt.
-    var state_detail: ?[]const u8 = null;
-    defer if (state_detail) |value| a.free(value);
-    const state_ctx = @import("cc").tool_context.ToolContext{
-        .allocator = a,
-        .kg = &kg,
-        .kg_lexical_ledger = &ledger,
-        .error_detail = &state_detail,
-    };
-    const omitted_args =
-        \\{"query":"checkpoint recovery","lexical_plan":{"schema_version":"lexical-query-plan-v1","intent":"task_recovery","stage":"semantic_expansion","variants":[{"kind":"paraphrase","text":"panic crash checkpoint"},{"kind":"mechanism","text":"checkpoint recovery"}],"variant_index":1,"seen_node_ids":[]}}
+    const second_args =
+        \\{"query":"checkpoint recovery","lexical_plan":{"schema_version":"lexical-query-plan-v2","intent":"task_recovery","stage":"semantic_expansion","variants":[{"kind":"synonym","text":"panic crash checkpoint"},{"kind":"mechanism","text":"checkpoint recovery"}],"variant_index":1}}
     ;
-    // Poison the executable only for this call. Invalid seen state must still
-    // return the ledger error, proving the real executeRecall path rejected it
-    // before attempting a TinyKG subprocess.
-    {
-        const saved_bin = kg.bin_path;
-        const poisoned_bin = try a.dupe(u8, "/definitely/missing/tinykg-ledger-must-reject-first");
-        kg.bin_path = poisoned_bin;
-        defer {
-            kg.bin_path = saved_bin;
-            a.free(poisoned_bin);
-        }
-        try std.testing.expectError(error.InvalidLexicalPlanState, @import("cc").kg_tools.executeRecall(&state_ctx, omitted_args));
-    }
-    try std.testing.expect(state_detail != null);
-    try std.testing.expect(std.mem.indexOf(u8, state_detail.?, "does not exactly match the host ledger") != null);
-
-    const second_template =
-        \\{"query":"checkpoint recovery","lexical_plan":{"schema_version":"lexical-query-plan-v1","intent":"task_recovery","stage":"semantic_expansion","variants":[{"kind":"paraphrase","text":"panic crash checkpoint"},{"kind":"mechanism","text":"checkpoint recovery"}],"variant_index":1,"seen_node_ids":[__SEEN_IDS__]}}
-    ;
-    const second_args = try std.mem.replaceOwned(u8, a, second_template, "__SEEN_IDS__", seen_ids_json.items);
-    defer a.free(second_args);
     const second_out = try @import("cc").kg_tools.executeRecall(&ctx, second_args);
     defer a.free(second_out);
     var second_parsed = try std.json.parseFromSlice(std.json.Value, a, second_out, .{});
@@ -658,19 +686,23 @@ test "L2 KG governance: lexical query plan binds variants and measures informati
     try std.testing.expectEqualStrings("mechanism", second_receipt.get("variant_kind").?.string);
     try std.testing.expectEqual(@as(i64, 1), second_receipt.get("variant_index").?.integer);
     try std.testing.expect(second_receipt.get("seen_state_verified").?.bool);
-    try std.testing.expectEqualStrings("agent_run_plan", second_receipt.get("ledger_scope").?.string);
+    try std.testing.expect(second_receipt.get("seen_node_count").?.integer >= 1);
+    try std.testing.expectEqualStrings("agent_run_explicit", second_receipt.get("ledger_scope").?.string);
     try std.testing.expect(second_receipt.get("repeated_hit_count").?.integer >= 1);
     var repeated_found = false;
     for (second_parsed.value.object.get("hits").?.array.items) |hit| {
         if (hit.object.get("node_id").?.integer != @as(i64, @intCast(memory_id))) continue;
         repeated_found = true;
         try std.testing.expect(hit.object.get("seen_before").?.bool);
+        try std.testing.expect(hit.object.get("text") == null);
+        try std.testing.expectEqualStrings("exposed_elsewhere_in_run", hit.object.get("content_ref").?.string);
     }
     try std.testing.expect(repeated_found);
 
     try std.testing.expect(std.mem.indexOf(u8, first_out, "\"retrieval_mode\":\"lexical_bm25_no_embeddings\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first_out, "Semantically judge these lexical candidates") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first_out, "deduplicate node_id values across calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_out, "Semantically judge the merged lexical candidates") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_out, "do not issue its members separately") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_out, "content_ref=exposed_elsewhere_in_run") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_out, "KgContext") != null);
 
     var detail: ?[]const u8 = null;
@@ -678,10 +710,36 @@ test "L2 KG governance: lexical query plan binds variants and measures informati
     const bad_ctx = @import("cc").tool_context.ToolContext{ .allocator = a, .kg = &kg, .error_detail = &detail };
     try std.testing.expectError(error.InvalidLexicalPlan, @import("cc").kg_tools.executeRecall(
         &bad_ctx,
-        "{\"query\":\"mismatch\",\"lexical_plan\":{\"schema_version\":\"lexical-query-plan-v1\",\"intent\":\"fact_lookup\",\"stage\":\"seed\",\"variants\":[{\"kind\":\"exact\",\"text\":\"needle\"}],\"variant_index\":0,\"seen_node_ids\":[]}}",
+        "{\"query\":\"mismatch\",\"lexical_plan\":{\"schema_version\":\"lexical-query-plan-v2\",\"intent\":\"fact_lookup\",\"stage\":\"seed\",\"variants\":[{\"kind\":\"exact\",\"text\":\"needle\"}],\"variant_index\":0}}",
     ));
     try std.testing.expect(detail != null);
     try std.testing.expect(std.mem.indexOf(u8, detail.?, "must exactly match") != null);
+
+    // Prove the real tool path rejects obsolete model-owned seen state before
+    // any TinyKG subprocess can run, rather than merely unit-testing parse().
+    var caller_seen_detail: ?[]const u8 = null;
+    defer if (caller_seen_detail) |value| a.free(value);
+    const caller_seen_ctx = @import("cc").tool_context.ToolContext{
+        .allocator = a,
+        .kg = &kg,
+        .kg_lexical_ledger = &ledger,
+        .error_detail = &caller_seen_detail,
+    };
+    {
+        const saved_bin = kg.bin_path;
+        const poisoned_bin = try a.dupe(u8, "/definitely/missing/tinykg-v2-parser-must-reject-first");
+        kg.bin_path = poisoned_bin;
+        defer {
+            kg.bin_path = saved_bin;
+            a.free(poisoned_bin);
+        }
+        try std.testing.expectError(error.InvalidLexicalPlan, @import("cc").kg_tools.executeRecall(
+            &caller_seen_ctx,
+            "{\"query\":\"needle\",\"lexical_plan\":{\"schema_version\":\"lexical-query-plan-v2\",\"intent\":\"fact_lookup\",\"stage\":\"seed\",\"variants\":[{\"kind\":\"exact\",\"text\":\"needle\"}],\"variant_index\":0,\"seen_node_ids\":[41]}}",
+        ));
+    }
+    try std.testing.expect(caller_seen_detail != null);
+    try std.testing.expect(std.mem.indexOf(u8, caller_seen_detail.?, "host-manages seen state") != null);
 
     var no_ledger_detail: ?[]const u8 = null;
     defer if (no_ledger_detail) |value| a.free(value);
@@ -695,6 +753,401 @@ test "L2 KG governance: lexical query plan binds variants and measures informati
     const long_args = try std.fmt.allocPrint(a, "{{\"query\":\"{s}\"}}", .{&long_query});
     defer a.free(long_args);
     try std.testing.expectError(error.InvalidQuery, @import("cc").kg_tools.executeRecall(&ctx, long_args));
+}
+
+test "L2 KG governance: v3 batch executes every variant and exposes each node body once" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kg-batch-v3.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-batch-v3");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+    const memory_id = try kg.remember(.decision, "panic crash checkpoint recovery procedure", "decision", false);
+
+    var ledger = @import("cc").kg_lexical_query_plan.Ledger{};
+    const ctx = @import("cc").tool_context.ToolContext{ .allocator = a, .kg = &kg, .kg_lexical_ledger = &ledger };
+    const args =
+        \\{"query":"panic crash checkpoint","type":"decision","lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"enumeration","stage":"semantic_expansion","variants":[{"kind":"synonym","text":"panic crash checkpoint"},{"kind":"mechanism","text":"checkpoint recovery procedure"}]}}
+    ;
+    const output = try @import("cc").kg_tools.executeRecall(&ctx, args);
+    defer a.free(output);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, output, .{});
+    defer parsed.deinit();
+
+    const receipt = parsed.value.object.get("lexical_query_plan").?.object;
+    try std.testing.expectEqualStrings("lexical-query-plan-v3", receipt.get("schema_version").?.string);
+    try std.testing.expectEqualStrings("host_batch_all", receipt.get("execution").?.string);
+    try std.testing.expectEqualStrings("agent_run_batch", receipt.get("ledger_scope").?.string);
+    try std.testing.expect(receipt.get("all_variants_executed").?.bool);
+    try std.testing.expectEqual(@as(i64, 2), receipt.get("executed_variant_count").?.integer);
+    try std.testing.expectEqual(@as(usize, 2), receipt.get("variant_receipts").?.array.items.len);
+    try std.testing.expect(receipt.get("probe_repeated_hit_count").?.integer >= 1);
+
+    var body_count: usize = 0;
+    for (parsed.value.object.get("hits").?.array.items) |hit| {
+        if (hit.object.get("node_id").?.integer != @as(i64, @intCast(memory_id))) continue;
+        body_count += 1;
+        try std.testing.expect(hit.object.get("text") != null);
+        try std.testing.expect(hit.object.get("content_ref") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), body_count);
+    for (receipt.get("variant_receipts").?.array.items) |variant_receipt| {
+        var found = false;
+        for (variant_receipt.object.get("node_ids").?.array.items) |node_id| {
+            if (node_id.integer == @as(i64, @intCast(memory_id))) found = true;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "L2 KG governance: v3 exact-prefixed expansion is audited as seed recovery" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kg-seed-shape-rewrite-v3.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-seed-shape-rewrite-v3");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+    const memory_id = try kg.remember(.observation, "kitchenpreferencesexacttoken favorite cuisine cooking evidence", "evidence", false);
+
+    var ledger = cc.kg_lexical_query_plan.Ledger{};
+    const ctx = cc.tool_context.ToolContext{ .allocator = a, .kg = &kg, .kg_lexical_ledger = &ledger };
+    const malformed_batch =
+        \\{"query":"stale kitchen query","lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"enumeration","stage":"semantic_expansion","variants":[{"kind":"exact","text":"kitchenpreferencesexacttoken"},{"kind":"paraphrase","text":"foods enjoyed while cooking"},{"kind":"relation","text":"favorite cuisine preferences"}]}}
+    ;
+    const recovered_output = try cc.kg_tools.executeRecall(&ctx, malformed_batch);
+    defer a.free(recovered_output);
+    var recovered = try std.json.parseFromSlice(std.json.Value, a, recovered_output, .{});
+    defer recovered.deinit();
+
+    const receipt = recovered.value.object.get("lexical_query_plan").?.object;
+    try std.testing.expectEqualStrings("host_seed_shape_rewrite", receipt.get("execution").?.string);
+    try std.testing.expectEqualStrings("semantic_expansion", receipt.get("stage").?.string);
+    try std.testing.expect(!receipt.get("all_variants_executed").?.bool);
+    try std.testing.expectEqual(@as(i64, 3), receipt.get("variant_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), receipt.get("executed_variant_count").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), receipt.get("variant_receipts").?.array.items.len);
+    const rewrite = receipt.get("rewrite").?.object;
+    try std.testing.expectEqualStrings("metacodes-seed-shape-rewrite-v1", rewrite.get("schema_version").?.string);
+    try std.testing.expectEqualStrings("seed", rewrite.get("effective_stage").?.string);
+    try std.testing.expectEqual(@as(i64, 2), rewrite.get("unexecuted_semantic_variant_count").?.integer);
+    try std.testing.expect(!std.mem.eql(u8, rewrite.get("input_plan_sha256").?.string, rewrite.get("effective_plan_sha256").?.string));
+    try std.testing.expectEqual(@as(i64, @intCast(memory_id)), recovered.value.object.get("hits").?.array.items[0].object.get("node_id").?.integer);
+    try std.testing.expect(recovered.value.object.get("auto_context") == null);
+    const after_rewrite = ledger.coverageState();
+    try std.testing.expectEqual(@as(usize, 1), after_rewrite.enumeration_plan_calls);
+    try std.testing.expect(!after_rewrite.enumeration_batch_committed);
+    try std.testing.expectEqual(@as(usize, 0), ledger.semantic_expansion_probes);
+
+    const corrected_batch =
+        \\{"query":"kitchen cooking preferences","lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"enumeration","stage":"semantic_expansion","variants":[{"kind":"paraphrase","text":"kitchen cooking preferences"},{"kind":"relation","text":"favorite cuisine cooking"}]}}
+    ;
+    const batch_output = try cc.kg_tools.executeRecall(&ctx, corrected_batch);
+    defer a.free(batch_output);
+    var batch = try std.json.parseFromSlice(std.json.Value, a, batch_output, .{});
+    defer batch.deinit();
+    try std.testing.expect(batch.value.object.get("lexical_query_plan").?.object.get("all_variants_executed").?.bool);
+    const after_batch = ledger.coverageState();
+    try std.testing.expect(after_batch.enumeration_batch_committed);
+    try std.testing.expect(after_batch.enumeration_context_committed);
+    try std.testing.expectEqual(@as(usize, 2), ledger.semantic_expansion_probes);
+}
+
+test "L2 KG governance: large v3 recall stays complete JSON below projection cap" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kg-bounded-batch-v3.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-bounded-batch-v3");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const probes = [_][]const u8{ "alpharecalltoken", "betarecalltoken", "gammarecalltoken", "deltarecalltoken" };
+    // Longer than the old auto-context --max-chars=2400 cap. TinyKG's graph
+    // JSON omits node bodies, so that cap incorrectly removed the root itself
+    // and made a valid long memory fail protocol validation.
+    const filler = [_]u8{'x'} ** 5000;
+    for (probes, 0..) |probe, probe_index| {
+        for (0..8) |row_index| {
+            const text = try std.fmt.allocPrint(
+                a,
+                "{s} HEAD-{d}-{d} authoritative fact {s} TAIL-{d}-{d}-{s}",
+                .{ probe, probe_index, row_index, &filler, probe_index, row_index, probe },
+            );
+            defer a.free(text);
+            _ = try kg.remember(.observation, text, "evidence", false);
+        }
+    }
+
+    var ledger = cc.kg_lexical_query_plan.Ledger{};
+    const ctx = cc.tool_context.ToolContext{ .allocator = a, .kg = &kg, .kg_lexical_ledger = &ledger };
+    const args =
+        \\{"query":"alpharecalltoken","lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"enumeration","stage":"semantic_expansion","variants":[{"kind":"synonym","text":"alpharecalltoken"},{"kind":"paraphrase","text":"betarecalltoken"},{"kind":"mechanism","text":"gammarecalltoken"},{"kind":"relation","text":"deltarecalltoken"}]}}
+    ;
+    const output = try cc.kg_tools.executeRecall(&ctx, args);
+    defer a.free(output);
+    try std.testing.expect(output.len <= cc.kg_tools.MAX_RECALL_RESULT_BYTES);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, output, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqual(@as(usize, 32), root.get("hits").?.array.items.len);
+    const envelope = root.get("recall_envelope").?.object;
+    try std.testing.expectEqualStrings("metacodes-bounded-recall-v1", envelope.get("schema_version").?.string);
+    try std.testing.expect(envelope.get("complete_json").?.bool);
+    try std.testing.expectEqual(@as(i64, @intCast(cc.kg_tools.MAX_RECALL_RESULT_BYTES)), envelope.get("max_result_bytes").?.integer);
+    const first_hit = root.get("hits").?.array.items[0].object;
+    try std.testing.expect(first_hit.get("text_truncated").?.bool);
+    try std.testing.expectEqualStrings("utf8_head_tail_v1", first_hit.get("text_excerpt_policy").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, first_hit.get("text").?.string, "HEAD-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_hit.get("text").?.string, "TAIL-") != null);
+    try std.testing.expect(first_hit.get("text_total_bytes").?.integer > first_hit.get("text_returned_bytes").?.integer);
+    const auto_graph = root.get("auto_context").?.object.get("context").?.object.get("graph") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(auto_graph == .object);
+    try std.testing.expectEqual(first_hit.get("node_id").?.integer, auto_graph.object.get("root").?.object.get("id").?.integer);
+    try std.testing.expect(!auto_graph.object.get("summary").?.object.get("truncated").?.bool);
+
+    // Exercise the real generic preflight projection boundary. A self-bounded
+    // KgRecall result must remain byte-identical JSON, not become a commitment
+    // head/tail wrapper that the query-plan replay cannot parse.
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    const blocks = try a.alloc(cc.core_message.Block, 1);
+    blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "bounded-recall"),
+        .content = try a.dupe(u8, output),
+        .is_error = false,
+    } };
+    try conv.append(.{ .role = .user, .blocks = blocks });
+    const reduced = conv.truncateLargeToolResults(cc.conversation.toolResultContextBytes(200_000));
+    try std.testing.expectEqual(@as(usize, 0), reduced.truncated);
+    const provider_visible = conv.messages.items[0].blocks[0].tool_result.content;
+    try std.testing.expectEqualStrings(output, provider_visible);
+    var reparsed = try std.json.parseFromSlice(std.json.Value, a, provider_visible, .{});
+    defer reparsed.deinit();
+    try std.testing.expect(reparsed.value.object.get("lexical_query_plan").?.object.get("all_variants_executed").?.bool);
+}
+
+test "L2 KG governance: real agent loop batches enumeration recall and host context" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const project_dir = pbuf[0..dir_len];
+    const store = try std.fmt.allocPrint(a, "{s}/kg-enumeration-gate.kg", .{project_dir});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-enumeration-gate");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+    const first_memory_id = try kg.remember(.observation, "attended sister commencement", "observation", false);
+    try std.testing.expectEqual(@as(u64, 1), first_memory_id);
+    _ = try kg.remember(.observation, "attended friend degree conferral", "observation", false);
+    _ = try kg.remember(.observation, "attended cousin convocation", "observation", false);
+
+    // Deliberately reproduce the paid c010 failure: after a fact_lookup seed,
+    // the provider tries to finalize as unavailable. The real run path must
+    // reject it, surface a host observation, accept a fixed v3 batch, attach
+    // real host-owned KgContext evidence, and only then allow the final answer.
+    // max_turns=2 proves the repair needs no model-owned context round-trip.
+    const responses = [_][]const u8{
+        KG_ENUMERATION_SEED_SSE,
+        KG_ENUMERATION_PREMATURE_FINAL_SSE,
+        KG_ENUMERATION_BATCH_SSE,
+        KG_ENUMERATION_FINAL_SSE,
+    };
+    var srv = try harness.MockServer.startCassette(&responses, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var api_client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer api_client.deinit();
+
+    const enabled = [_][]const u8{ "KgRecall", "KgContext" };
+    var defs_arena = std.heap.ArenaAllocator.init(a);
+    defer defs_arena.deinit();
+    var prompt_context = cc.tools.PromptContext{ .enabled_tool_names = &enabled };
+    const defs = try cc.tools.toToolDefinitionsFull(defs_arena.allocator(), null, &prompt_context);
+    const system_prompt = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &enabled, "", true, project_dir);
+    defer a.free(system_prompt);
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "How many graduation ceremonies did I attend?");
+    const permission = cc.permission.createContext(.bypass_permissions, a);
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    const run_result = try cc.agent_loop.run(&conv, api_client.provider(), defs, &permission, .{
+        .max_turns = 2,
+        .system_prompt = system_prompt,
+        .kg = &kg,
+        .project_dir = project_dir,
+        .cwd_abs = project_dir,
+    }, &backend, a);
+
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, run_result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 4), run_result.turns);
+    try std.testing.expectEqual(@as(u32, 2), run_result.tool_calls);
+    try std.testing.expectEqual(@as(usize, 4), srv.requestCount());
+
+    const after_seed = srv.requestAt(1) orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, after_seed.body(), "lexical-coverage-obligation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_seed.body(), "no lexical-query-plan-v3 semantic_expansion batch has committed") != null);
+
+    const repair_request = srv.requestAt(2) orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, repair_request.body(), "lexical-coverage-rejected-final") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repair_request.body(), "Do not answer yet") != null);
+
+    const final_request = srv.requestAt(3) orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "\\\"all_variants_executed\\\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "\\\"executed_variant_count\\\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "\\\"query_anchor_rewritten\\\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "query_anchor_input_sha256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "query_anchor_effective_sha256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "metacodes-auto-context-v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "first_new_evidence_then_new_then_merged_v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "lexical-evidence-obligation") == null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "knowledge_governance") != null);
+
+    // Tool definitions legitimately mention KgContext in every request. Prove
+    // the model did not issue it by inspecting the real structured transcript,
+    // rather than substring-matching the request schema.
+    var explicit_context_calls: usize = 0;
+    for (conv.messages.items) |message| {
+        for (message.blocks) |block| switch (block) {
+            .tool_use => |tool_use| if (std.mem.eql(u8, tool_use.name, "KgContext")) {
+                explicit_context_calls += 1;
+            },
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 0), explicit_context_calls);
+
+    const final_message = conv.messages.items[conv.messages.items.len - 1];
+    try std.testing.expectEqual(cc.message.Role.assistant, final_message.role);
+    try std.testing.expectEqualStrings("3", final_message.blocks[0].text);
+}
+
+test "L2 KG governance: malformed GLM seed batch becomes audited exact-only execution" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const project_dir = pbuf[0..dir_len];
+    const store = try std.fmt.allocPrint(a, "{s}/kg-malformed-seed-recovery.kg", .{project_dir});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-malformed-seed-recovery");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+    _ = try kg.remember(.observation, "kitchen cleaning tips granite countertop utensil holder", "observation", false);
+
+    const responses = [_][]const u8{ KG_MALFORMED_SEED_BATCH_SSE, KG_END_TURN_SSE };
+    var srv = try harness.MockServer.startCassette(&responses, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var api_client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "glm-5.2", url);
+    defer api_client.deinit();
+
+    const enabled = [_][]const u8{"KgRecall"};
+    var defs_arena = std.heap.ArenaAllocator.init(a);
+    defer defs_arena.deinit();
+    var prompt_context = cc.tools.PromptContext{ .enabled_tool_names = &enabled };
+    const defs = try cc.tools.toToolDefinitionsFull(defs_arena.allocator(), null, &prompt_context);
+    const system_prompt = try cc.system_prompt.buildFull(a, "glm-5.2", null, null, &enabled, "", true, project_dir);
+    defer a.free(system_prompt);
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "My kitchen is a mess. Recall the relevant tips.");
+    const permission = cc.permission.createContext(.bypass_permissions, a);
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    const run_result = try cc.agent_loop.run(&conv, api_client.provider(), defs, &permission, .{
+        .max_turns = 3,
+        .system_prompt = system_prompt,
+        .kg = &kg,
+        .project_dir = project_dir,
+        .cwd_abs = project_dir,
+    }, &backend, a);
+
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, run_result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 1), run_result.tool_calls);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+
+    var saw_use = false;
+    var saw_result = false;
+    for (conv.messages.items) |message| for (message.blocks) |block| switch (block) {
+        .tool_use => |tool_use| if (std.mem.eql(u8, tool_use.id, "malformed-seed-1")) {
+            saw_use = true;
+            try std.testing.expect(cc.message_repair.isValidJson(tool_use.input));
+            try std.testing.expect(std.mem.indexOf(u8, tool_use.input, "keeping kitchen clean") != null);
+            try std.testing.expect(std.mem.indexOf(u8, tool_use.input, "kitchen mess organization") != null);
+        },
+        .tool_result => |tool_result| if (std.mem.eql(u8, tool_result.tool_use_id, "malformed-seed-1")) {
+            saw_result = true;
+            try std.testing.expect(!tool_result.is_error);
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, tool_result.content, .{});
+            defer parsed.deinit();
+            const receipt = parsed.value.object.get("lexical_query_plan").?.object;
+            try std.testing.expectEqualStrings("host_seed_shape_rewrite", receipt.get("execution").?.string);
+            try std.testing.expectEqualStrings("seed", receipt.get("stage").?.string);
+            try std.testing.expect(!receipt.get("all_variants_executed").?.bool);
+            const rewrite = receipt.get("rewrite").?.object;
+            try std.testing.expectEqualStrings("semantic_variants_declared_in_seed", rewrite.get("reason").?.string);
+            try std.testing.expectEqualStrings("seed", rewrite.get("input_stage").?.string);
+            try std.testing.expectEqual(@as(i64, 2), rewrite.get("unexecuted_semantic_variant_count").?.integer);
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_use and saw_result);
+
+    const final_request = srv.requestAt(1) orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "host_seed_shape_rewrite") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "semantic_variants_declared_in_seed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "unexecuted_semantic_variant_count\\\":2") != null);
 }
 
 test "L2 KG governance: KgContext emits evidence, freshness, and supersession signals" {
@@ -739,7 +1192,7 @@ test "L2 KG governance: KgContext emits evidence, freshness, and supersession si
     try std.testing.expectEqualStrings("tinykg-agent-retrieval-v1", graph.get("schema_version").?.string);
     try std.testing.expectEqualStrings("neighbors", graph.get("mode").?.string);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"rel\":\"derived_from\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Inspect connected evidence nodes with KgContext") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "one best-node KgContext call is sufficient") != null);
     const governance = obj.get("knowledge_governance").?.object;
     try std.testing.expectEqualStrings("metacodes-knowledge-governance-v1", governance.get("schema_version").?.string);
     try std.testing.expect(governance.get("current_generation").?.bool);
@@ -2593,7 +3046,9 @@ test "L2 KG experience feedback: claim exposes verified prior execution before w
     const second_request = srv.requestAt(1) orelse return error.NoRequestCaptured;
     try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "LEXICAL EXPANSION") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "2-4 separate compact semantic variants") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "Deduplicate candidates by node_id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "lexical-query-plan-v3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "host executes the fixed batch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "merges by node_id") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "repair parser checkpoint recovery corruption") == null);
     try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "parser checkpoint replay verified") == null);
     try std.testing.expect(std.mem.indexOf(u8, second_request.body(), "metacodes-experience-packet-v1") != null);

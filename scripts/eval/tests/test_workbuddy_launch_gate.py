@@ -2,6 +2,8 @@ import hashlib
 import http.server
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -24,12 +26,15 @@ from scripts.eval.workbuddy.launch_gate import (
     AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION_V1,
     LaunchError,
     PROVIDER_KEY_ENV,
+    PAIRED_SCHEMA_VERSION,
     SCHEMA_VERSION,
     HOST_CONTROL_PLANE_MODULES,
     _artifact_contract,
+    _expected_project_control,
     _paid_host_guard,
     _official_task_identity,
     _collect_usage,
+    _cacheable_first_request_sha256,
     _aggregate_control_metrics,
     _validate_control_metrics,
     _receipt_quality_evidence,
@@ -37,18 +42,23 @@ from scripts.eval.workbuddy.launch_gate import (
     _reobserve_launch_inputs,
     _runtime_contract,
     _validate_trial_project_control,
+    _validate_launch_manifest,
+    build_launch_manifest,
     execute_launch,
     recover_authorized_failure_receipt,
     validate_authorized_failure_receipt,
     validate_launch_manifest,
 )
 from scripts.eval.workbuddy.trace import (
+    LEGACY_CONTROL_METRICS_SCHEMA,
     OBSERVATION_JOURNAL_SCHEMA,
     OBSERVATION_FILENAME,
+    PROJECT_RULE_CONTROL_METRICS_SCHEMA,
     load_control_metrics,
 )
 from scripts.eval.workbuddy import WORKBUDDY_PINNED_COMMIT
 from scripts.eval.workbuddy.install_overlay import _digest
+from scripts.eval.workbuddy.environment_preflight import prebuild as prebuild_environment
 from scripts.eval.workbuddy.stage_artifacts import stage
 
 
@@ -110,6 +120,28 @@ class _Server:
 
 
 class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
+    def test_cacheable_first_request_hash_ignores_only_transport_route(self):
+        baseline = {
+            "model": "baseline-run--metacodes-glm52",
+            "system": "You are powered by the model glm-5.2.",
+            "messages": [{"role": "user", "content": "task"}],
+            "tools": [{"name": "Read", "description": "read"}],
+            "stream": True,
+        }
+        treatment = dict(baseline)
+        treatment["model"] = "treatment-run--metacodes-glm52"
+        self.assertEqual(
+            _cacheable_first_request_sha256(baseline),
+            _cacheable_first_request_sha256(treatment),
+        )
+
+        drifted = dict(treatment)
+        drifted["system"] = "You are powered by a run-specific route."
+        self.assertNotEqual(
+            _cacheable_first_request_sha256(baseline),
+            _cacheable_first_request_sha256(drifted),
+        )
+
     def test_artifact_contract_recomputes_project_kernel_and_rule_tree(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -189,6 +221,12 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
             "schema_version": SCHEMA_VERSION,
             "quality_evidence": False,
             "quality_evidence_on_commit": quality_evidence_on_commit,
+            "evaluation_treatment": {
+                "project_control": "absent",
+                "actor_prompt_changed": False,
+                "tool_schema_changed": False,
+                "provider_cache_prefix_changed_by_control_plane": False,
+            },
             "run_id": "workbuddy-l2-run-1",
             "workbuddy": {
                 "checkout": str(workbuddy),
@@ -220,6 +258,7 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
                 "config": {"sha256": digest("model-config")},
                 "provider_identity": "workbuddy-l2-mock-provider",
                 "fingerprint": digest("model"),
+                "backend_model_name": "glm-5.2",
             },
             "harness_fingerprint": digest("harness"),
             "host_control_plane": {
@@ -236,7 +275,7 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
                 "max_cost_microusd": 500_000,
                 "max_metered_tokens": 50_000,
                 "prior_exposure_microusd": 0,
-                "user_authority_microusd": 1_000_000_000,
+                "user_authority_microusd": 2_000_000_000,
             },
             "execution": {
                 "n_attempts": 1,
@@ -277,6 +316,21 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
                 "paid_rollouts_authorized": False,
             },
         }
+        covariates = {"fixture": "workbuddy-paid-launch-l2"}
+        manifest["comparison"] = (
+            {
+                "schema_version": (
+                    "metacodes-workbuddy-project-control-comparison-v1"
+                ),
+                "comparison_id": "workbuddy-l2-comparison",
+                "covariates_sha256": hashlib.sha256(
+                    stable_json(covariates).encode("utf-8")
+                ).hexdigest(),
+                "covariates": covariates,
+            }
+            if quality_evidence_on_commit
+            else None
+        )
         manifest["content_sha256"] = hashlib.sha256(
             stable_json(manifest).encode("utf-8")
         ).hexdigest()
@@ -284,6 +338,166 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
         path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
         os.chmod(path, 0o600)
         return path
+
+    def test_manifest_builder_persists_actor_model_identity_for_runtime_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            workbuddy = root / "workbuddy"
+            job_path = workbuddy / "configs/jobs/identity-l2.yaml"
+            model_path = workbuddy / "configs/models/model-l2.yaml"
+            split_manifest = (
+                workbuddy
+                / "configs/harnesses/metacodes/docker/artifacts/share/metacodes/artifact-manifest.json"
+            )
+            preflight = root / "preflight.json"
+            cohort_manifest = root / "cohorts.json"
+            for path in (job_path, model_path, split_manifest, preflight, cohort_manifest):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fixture\n", encoding="utf-8")
+            job_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "model": "model-l2",
+                        "harness": "metacodes/0.1.0",
+                        "dataset": "datasets/wb-bench-code-v1.0/tasks",
+                        "model_connection": "local_proxy",
+                        "record_full_io": True,
+                        "n_attempts": 1,
+                        "harness_params_override": {
+                            "METACODES_VERIFICATION_CHECKPOINT": False
+                        },
+                        "task_selection": {"mode": "name", "names": ["task-a"]},
+                        "orchestrator_override": {"n_concurrent_trials": 1},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            model_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "model": {
+                            "name": "glm-5.2",
+                            "backend_url_env": "TEST_WORKBUDDY_BASE_URL",
+                            "backend_key_env": PROVIDER_KEY_ENV,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cohort = {
+                "subset": "code",
+                "cohort": "dev",
+                "dataset": "datasets/wb-bench-code-v1.0/tasks",
+                "take": 1,
+                "selected_tasks": ["task-a"],
+                "selected_tasks_sha256": digest("task-a"),
+                "manifest": {"path": str(cohort_manifest), "bytes": 8, "sha256": digest("cohort")},
+                "content_sha256": digest("cohort-content"),
+            }
+            artifact = {
+                "manifest": {"path": str(split_manifest), "bytes": 8, "sha256": digest("artifact")},
+                "executables": {},
+                "target_platform": "linux/amd64",
+            }
+            preflight_row = {
+                "content_sha256": digest("preflight-content"),
+                "target_platform": "linux/amd64",
+            }
+            file_identity = lambda path: {
+                "path": str(Path(path).resolve()),
+                "bytes": Path(path).stat().st_size,
+                "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+            }
+            runner_tools = {
+                "bash": {"path": "/fixture/bash", "bytes": 1, "sha256": digest("bash"), "version_first_line": "bash", "version_sha256": digest("bash-version")},
+                "uv": {"path": "/fixture/uv", "bytes": 1, "sha256": digest("uv"), "version_first_line": "uv", "version_sha256": digest("uv-version")},
+            }
+            host = {
+                name: {"path": f"/fixture/{name}.py", "bytes": 1, "sha256": digest(name)}
+                for name in HOST_CONTROL_PLANE_MODULES
+            }
+            overlay = {
+                "overlay_sha256": digest("overlay-content"),
+                "quality_evidence": False,
+            }
+            overlay_path = workbuddy / "configs/harnesses/metacodes/OVERLAY.json"
+            overlay_path.parent.mkdir(parents=True, exist_ok=True)
+            overlay_path.write_text("{}\n", encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {"TEST_WORKBUDDY_BASE_URL": "https://provider.invalid/v1/messages"},
+            ), mock.patch(
+                "scripts.eval.workbuddy.launch_gate._git",
+                side_effect=[WORKBUDDY_PINNED_COMMIT, "https://github.com/Tencent/workbuddy-bench"],
+            ), mock.patch(
+                "scripts.eval.workbuddy.launch_gate.validate_installed_overlay",
+                return_value=overlay,
+            ), mock.patch(
+                "scripts.eval.workbuddy.launch_gate._cohort", return_value=cohort
+            ), mock.patch(
+                "scripts.eval.workbuddy.launch_gate._artifact_contract",
+                return_value=artifact,
+            ), mock.patch(
+                "scripts.eval.workbuddy.launch_gate.validate_environment_preflight",
+                return_value=preflight_row,
+            ), mock.patch(
+                "scripts.eval.workbuddy.launch_gate._runner_tool",
+                side_effect=[runner_tools["bash"], runner_tools["uv"]],
+            ), mock.patch(
+                "scripts.eval.workbuddy.launch_gate._host_control_plane", return_value=host
+            ), mock.patch(
+                "scripts.eval.workbuddy.launch_gate._identity",
+                side_effect=file_identity,
+            ):
+                manifest = build_launch_manifest(
+                    run_id="workbuddy-actor-identity-l2",
+                    workbuddy_checkout=workbuddy,
+                    cohort_manifest=cohort_manifest,
+                    subset="code",
+                    cohort="dev",
+                    take=1,
+                    split_mount_manifest=split_manifest,
+                    environment_preflight_receipt=preflight,
+                    job_config=job_path,
+                    model_config=model_path,
+                    runner_bash=Path("/fixture/bash"),
+                    runner_uv=Path("/fixture/uv"),
+                    provider_identity="provider-l2",
+                    total_cost_microusd=1_000_000,
+                    total_metered_tokens=100_000,
+                    max_cost_microusd=500_000,
+                    max_metered_tokens=50_000,
+                )
+            self.assertEqual("glm-5.2", manifest["model"]["backend_model_name"])
+            self.assertEqual(
+                "glm-5.2",
+                _validate_launch_manifest(dict(manifest))["model"]["backend_model_name"],
+            )
+
+            missing = dict(manifest)
+            missing["model"] = dict(manifest["model"])
+            missing["model"].pop("backend_model_name")
+            missing["content_sha256"] = hashlib.sha256(
+                stable_json({key: value for key, value in missing.items() if key != "content_sha256"}).encode("utf-8")
+            ).hexdigest()
+            with self.assertRaisesRegex(LaunchError, "actor model identity is incomplete"):
+                _validate_launch_manifest(missing)
+
+            previous = dict(missing)
+            previous["schema_version"] = PAIRED_SCHEMA_VERSION
+            previous["content_sha256"] = hashlib.sha256(
+                stable_json(
+                    {
+                        key: value
+                        for key, value in previous.items()
+                        if key != "content_sha256"
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            self.assertNotIn(
+                "backend_model_name",
+                _validate_launch_manifest(previous)["model"],
+            )
 
     @staticmethod
     def _runner_code() -> str:
@@ -319,11 +533,12 @@ trajectory = {
     "total_completion_tokens": 30,
     "total_cached_tokens": 80,
     "total_cost_usd": 0.01,
-    "extra": {"cache_creation_input_tokens": 10, "control_metrics": control_metrics}
+    "extra": {"cache_creation_input_tokens": 10, "control_metrics": control_metrics,
+              "metacodes_turns": 1}
   }
 }
 (agent / "trajectory.json").write_text(json.dumps(trajectory) + "\n")
-record = {"request": {"body": {"model": "volatile-route", "system": "stable", "messages": [{"role": "user", "content": "task"}]}}}
+record = {"seq": 1, "request": {"body": {"model": "volatile-route", "system": "stable", "messages": [{"role": "user", "content": "task"}]}}, "response": {"status": 200}, "error": None}
 (agent / "requests.jsonl").write_text(json.dumps(record) + "\n")
 '''
 
@@ -825,6 +1040,78 @@ with urllib.request.urlopen(
                     observation_path=observation,
                 )
 
+    def test_historical_control_metrics_preserve_versioned_compatibility(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "metacodes-transcript.jsonl"
+            observation = root / OBSERVATION_FILENAME
+            trajectory = root / "trajectory.json"
+            transcript.write_text(
+                json.dumps({"role": "user", "blocks": []}) + "\n",
+                encoding="utf-8",
+            )
+            rows = [
+                {"schema_version": OBSERVATION_JOURNAL_SCHEMA, "sequence": 0,
+                 "session_id": "legacy-session", "run_id": "legacy-run",
+                 "monotonic_elapsed_ns": 0, "event": {"run_started": {}}},
+                {"schema_version": OBSERVATION_JOURNAL_SCHEMA, "sequence": 1,
+                 "session_id": "legacy-session", "run_id": "legacy-run",
+                 "monotonic_elapsed_ns": 1, "event": {"run_finished": {}}},
+            ]
+            observation.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            trajectory.write_text("{}\n", encoding="utf-8")
+            current = load_control_metrics(transcript, observation)
+            project_rule = json.loads(json.dumps(current))
+            project_rule["schema_version"] = PROJECT_RULE_CONTROL_METRICS_SCHEMA
+            for name in ("auto_context_succeeded", "context_observations"):
+                project_rule["tinykg"].pop(name)
+            self.assertEqual(
+                _validate_control_metrics(
+                    project_rule,
+                    trajectory_path=trajectory,
+                    transcript_path=transcript,
+                    observation_path=observation,
+                ),
+                current,
+            )
+
+            legacy = json.loads(json.dumps(current))
+            legacy["schema_version"] = LEGACY_CONTROL_METRICS_SCHEMA
+            for name in ("auto_context_succeeded", "context_observations"):
+                legacy["tinykg"].pop(name)
+            for name in (
+                "rule_filter_events",
+                "active_rule_phases",
+                "checker_rule_phases",
+                "statically_pruned_rule_phases",
+            ):
+                legacy["lean"].pop(name)
+            normalized = _validate_control_metrics(
+                legacy,
+                trajectory_path=trajectory,
+                transcript_path=transcript,
+                observation_path=observation,
+            )
+            self.assertEqual(normalized, current)
+
+            filtered = json.loads(json.dumps(current))
+            filtered["lean"]["rule_filter_events"] = 1
+            filtered["lean"]["active_rule_phases"] = 1
+            with mock.patch(
+                "scripts.eval.workbuddy.launch_gate.load_control_metrics",
+                return_value=filtered,
+            ):
+                with self.assertRaisesRegex(LaunchError, "cannot represent"):
+                    _validate_control_metrics(
+                        legacy,
+                        trajectory_path=trajectory,
+                        transcript_path=transcript,
+                        observation_path=observation,
+                    )
+
     def test_control_metrics_wave_aggregation_sums_counts_but_preserves_maxima(self):
         def row(*, elapsed: int, maximum: int, kernel: str, used: bool):
             return {
@@ -900,6 +1187,155 @@ with urllib.request.urlopen(
                     credential_fd=self._credential_fd(),
                     runner_argv=[sys.executable, "-c", "raise SystemExit(98)"],
                 )
+
+    def test_dataset_staging_drift_on_real_launch_path_precedes_budget_and_runner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest_path = self._manifest(root)
+            workbuddy = root / "workbuddy"
+            harness = workbuddy / "configs/harnesses/metacodes/docker"
+            harness.mkdir(parents=True)
+            (harness / "Dockerfile").write_text(
+                "FROM scratch\n", encoding="utf-8"
+            )
+            for task in ("code-task-a", "code-task-b"):
+                environment = (
+                    workbuddy
+                    / f"datasets/wb-bench-code-v1.0/tasks/{task}/environment"
+                )
+                environment.mkdir(parents=True)
+                (environment / "Dockerfile").write_text(
+                    "FROM scratch\n", encoding="utf-8"
+                )
+                (environment.parent / "task.toml").write_text(
+                    f"[task]\nname = '{task}'\n", encoding="utf-8"
+                )
+            dataset_root = workbuddy / "datasets/wb-bench-code-v1.0"
+            (dataset_root / "dataset.toml").write_text(
+                '[verifier]\nschema = "workbuddy.verifier.v1"\nengine = "composite"\n',
+                encoding="utf-8",
+            )
+            shared = dataset_root / "shared/verifier"
+            shared.mkdir(parents=True)
+            (shared / "plugin.py").write_text("VALUE = 1\n", encoding="utf-8")
+            docker = root / "docker"
+            docker.write_text("fixture\n", encoding="utf-8")
+            docker.chmod(0o755)
+            preflight_path = root / "environment-preflight.json"
+
+            def fake_environment_run(argv, **_kwargs):
+                args = [str(item) for item in argv]
+                if args[0] == "git":
+                    return subprocess.CompletedProcess(
+                        args, 0, WORKBUDDY_PINNED_COMMIT + "\n", ""
+                    )
+                if "buildx" in args and "build" in args:
+                    return subprocess.CompletedProcess(args, 0, "built\n", "")
+                if args[1:3] == ["image", "inspect"]:
+                    row = {
+                        "Id": "sha256:" + "a" * 64,
+                        "Architecture": "amd64",
+                        "Os": "linux",
+                    }
+                    return subprocess.CompletedProcess(
+                        args, 0, json.dumps(row), ""
+                    )
+                if args[1:3] == ["version", "--format"]:
+                    return subprocess.CompletedProcess(
+                        args, 0, '{"Version":"test"}\n', ""
+                    )
+                raise AssertionError(f"unexpected environment command: {args}")
+
+            with mock.patch(
+                "scripts.eval.workbuddy.environment_preflight._run",
+                side_effect=fake_environment_run,
+            ):
+                preflight = prebuild_environment(
+                    workbuddy=workbuddy,
+                    dataset="datasets/wb-bench-code-v1.0/tasks",
+                    selected_tasks=["code-task-a"],
+                    output=preflight_path,
+                    docker=docker,
+                )
+
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["cohort"]["manifest"] = {
+                "path": "/fixture/cohort.json",
+                "bytes": 1,
+                "sha256": digest("cohort"),
+            }
+            manifest["artifacts"]["executables"] = {}
+            manifest["environment_preflight"] = {
+                "receipt": {
+                    "path": str(preflight_path),
+                    "bytes": len(preflight_path.read_bytes()),
+                    "sha256": hashlib.sha256(preflight_path.read_bytes()).hexdigest(),
+                },
+                "content_sha256": preflight["content_sha256"],
+                "target_platform": "linux/amd64",
+            }
+            manifest["model"]["backend_url_env"] = "WORKBUDDY_L2_UNUSED_URL"
+            manifest["model"]["backend_url_sha256"] = hashlib.sha256(b"").hexdigest()
+            manifest.pop("content_sha256")
+            manifest["content_sha256"] = hashlib.sha256(
+                stable_json(manifest).encode("utf-8")
+            ).hexdigest()
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            os.chmod(manifest_path, 0o600)
+
+            # WorkBuddy stages and prepares the complete dataset before task
+            # selection. Drift an unselected task after receipt publication.
+            (workbuddy / "datasets/wb-bench-code-v1.0/tasks/code-task-b/task.toml").write_text(
+                "[task]\nname = 'drifted'\n", encoding="utf-8"
+            )
+            journal = root / "budget.json"
+            receipt = root / "receipt.json"
+            credential_fd = self._credential_fd()
+            try:
+                with mock.patch(
+                    "scripts.eval.workbuddy.launch_gate._reobserve_host_control_plane"
+                ), mock.patch(
+                    "scripts.eval.workbuddy.launch_gate._git",
+                    return_value=WORKBUDDY_PINNED_COMMIT,
+                ), mock.patch(
+                    "scripts.eval.workbuddy.launch_gate._reobserve_identity"
+                ), mock.patch(
+                    "scripts.eval.workbuddy.launch_gate.validate_installed_overlay",
+                    return_value={
+                        "overlay_sha256": manifest["workbuddy"][
+                            "overlay_content_sha256"
+                        ]
+                    },
+                ), mock.patch(
+                    "scripts.eval.workbuddy.launch_gate._paid_host_guard"
+                ), mock.patch(
+                    "scripts.eval.workbuddy.launch_gate._runner_tool",
+                    side_effect=lambda path, *_args, **_kwargs: manifest["execution"][
+                        "runner_tools"
+                    ][Path(path).name],
+                ), mock.patch(
+                    "scripts.eval.workbuddy.environment_preflight._run",
+                    side_effect=fake_environment_run,
+                ), mock.patch(
+                    "scripts.eval.workbuddy.launch_gate.subprocess.run"
+                ) as runner:
+                    with self.assertRaisesRegex(
+                        LaunchError, "dataset staging contract changed"
+                    ):
+                        execute_launch(
+                            manifest_path=manifest_path,
+                            journal_path=journal,
+                            receipt_path=receipt,
+                            credential_fd=credential_fd,
+                        )
+                runner.assert_not_called()
+                self.assertFalse(journal.exists())
+                self.assertFalse(receipt.exists())
+            finally:
+                os.close(credential_fd)
 
     def test_provider_received_then_crash_has_no_forged_failure_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1126,6 +1562,22 @@ with urllib.request.urlopen(
                 validate_launch_manifest(manifest)
             self.assertFalse((root / "budget.json").exists())
 
+    def test_manifest_requires_current_two_thousand_dollar_authority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest = self._manifest(root)
+            value = json.loads(manifest.read_text())
+            value["budget"]["user_authority_microusd"] = 1_000_000_000
+            value["content_sha256"] = hashlib.sha256(
+                stable_json({key: row for key, row in value.items() if key != "content_sha256"}).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            manifest.write_text(json.dumps(value, sort_keys=True) + "\n")
+            with self.assertRaisesRegex(LaunchError, "budget authority is inconsistent"):
+                validate_launch_manifest(manifest)
+
     def test_paid_host_rejects_dotenv_and_uv_docker_shadow(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1261,6 +1713,340 @@ with urllib.request.urlopen(
             with self.assertRaisesRegex(LaunchError, "identity is incomplete"):
                 _official_task_identity(trajectory, manifest, [task], route)
 
+    def _official_usage_fixture(self, root: Path, reward: object) -> dict:
+        workbuddy = root / "workbuddy"
+        run_id = "workbuddy-official-reward-l2"
+        job_slug = "metacodes-official-reward-l2"
+        model_slug = "test-model"
+        model_route = run_id + "--" + model_slug
+        task = "code-task-a"
+        trial = workbuddy / "results" / job_slug / "run" / (task + "__1")
+        agent = trial / "agent"
+        agent.mkdir(parents=True)
+        transcript = agent / "metacodes-transcript.jsonl"
+        observation = agent / OBSERVATION_FILENAME
+        transcript.write_text(
+            json.dumps({"role": "user", "blocks": [{"type": "text", "text": "task"}]})
+            + "\n",
+            encoding="utf-8",
+        )
+        observation.write_text(
+            json.dumps(
+                {
+                    "schema_version": OBSERVATION_JOURNAL_SCHEMA,
+                    "sequence": 0,
+                    "session_id": "session-official-reward-l2",
+                    "run_id": "run-official-reward-l2",
+                    "monotonic_elapsed_ns": 0,
+                    "event": {"run_started": {}},
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "schema_version": OBSERVATION_JOURNAL_SCHEMA,
+                    "sequence": 1,
+                    "session_id": "session-official-reward-l2",
+                    "run_id": "run-official-reward-l2",
+                    "monotonic_elapsed_ns": 1,
+                    "event": {"run_finished": {}},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        control = load_control_metrics(transcript, observation)
+        (agent / "trajectory.json").write_text(
+            json.dumps(
+                {
+                    "final_metrics": {
+                        "total_prompt_tokens": 10,
+                        "total_completion_tokens": 2,
+                        "total_cached_tokens": 3,
+                        "total_cost_usd": 0.001,
+                        "extra": {
+                            "cache_creation_input_tokens": 4,
+                            "control_metrics": control,
+                        },
+                    }
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (agent / "requests.jsonl").write_text(
+            json.dumps(
+                {
+                    "request": {
+                        "body": {
+                            "model": model_route,
+                            "system": "stable",
+                            "messages": [{"role": "user", "content": "task"}],
+                        }
+                    }
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (trial / "config.json").write_text(
+            json.dumps(
+                {
+                    "agent": {
+                        "kwargs": {"METACODES_MODEL_DISPLAY_NAME": "glm-5.2"}
+                    }
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (agent / "metacodes-runtime-contract.json").write_text(
+            json.dumps(
+                {
+                    "project_control": {
+                        "staged": False,
+                        "mode": "absent",
+                        "configured": False,
+                        "project_state_hash": None,
+                        "artifacts_verified": False,
+                        "runtime_active_bundle_absent": True,
+                    },
+                    "transport_model_is_route": True,
+                    "actor_model_identity": "glm-5.2",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        result = {
+            "task_name": f"workbuddy/{task}",
+            "task_id": {
+                "path": str(
+                    Path(".workspace/tmp/staged")
+                    / run_id
+                    / "wb-bench-code-v1.0/tasks"
+                    / task
+                )
+            },
+            "source": "tasks",
+            "trial_uri": trial.resolve().as_uri(),
+            "task_checksum": digest("official-task-checksum"),
+            "exception_info": None,
+            "agent_info": {
+                "name": "metacodes",
+                "model_info": {"name": model_route},
+            },
+            "verifier_result": {"rewards": {"reward": reward}},
+        }
+        (trial / "result.json").write_text(
+            json.dumps(result, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        instance = workbuddy / "scripts/logs/instances" / run_id
+        runtime_jobs = workbuddy / ".workspace/data/generated/jobs"
+        proxy_logs = workbuddy / "scripts/logs/proxy"
+        for path in (instance, runtime_jobs, proxy_logs):
+            path.mkdir(parents=True, exist_ok=True)
+        (instance / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "selected_tasks": [task],
+                    "model_connection": "local_proxy",
+                    "record_full_io": True,
+                    "harness_resolved_slug": "metacodes/0.1.0",
+                    "model_slug": model_slug,
+                    "model_route": model_route,
+                    "backend_model_name": "glm-5.2",
+                    "harness_runtime_config": {
+                        "project_control_staged": False,
+                        "project_control_mode": "absent",
+                        "project_control_configured": False,
+                        "transport_model_is_route": True,
+                        "actor_model_identity": "glm-5.2",
+                        "translated_env": {},
+                    },
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (instance / "proxy.yaml").write_text(
+            "proxy:\n  backend_retries: 0\n  routes: []\n", encoding="utf-8"
+        )
+        (runtime_jobs / f"{job_slug}.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "agents": [
+                        {
+                            "kwargs": {
+                                "METACODES_MODEL_DISPLAY_NAME": "glm-5.2"
+                            }
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {
+            "run_id": run_id,
+            "workbuddy": {"checkout": str(workbuddy)},
+            "cohort": {
+                "dataset": "datasets/wb-bench-code-v1.0/tasks",
+                "selected_tasks": [task],
+            },
+            "job": {"slug": job_slug},
+            "model": {
+                "slug": model_slug,
+                "backend_model_name": "glm-5.2",
+            },
+            "artifacts": {},
+        }
+
+    def test_official_collect_usage_reads_authoritative_reward_and_rejects_bad_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._official_usage_fixture(root, 0.75)
+            usage = _collect_usage(manifest, started_ns=0, official_runner=True)
+            self.assertEqual(0.75, usage["tasks"]["code-task-a"]["verifier_reward"])
+            self.assertEqual(0.75, usage["quality"]["mean_verifier_reward"])
+            self.assertFalse(usage["tasks"]["code-task-a"]["full_pass"])
+
+        for reward in (None, True, float("nan"), -0.1, 1.1):
+            with self.subTest(reward=reward), tempfile.TemporaryDirectory() as directory:
+                manifest = self._official_usage_fixture(Path(directory), reward)
+                with self.assertRaisesRegex(LaunchError, "invalid verifier reward"):
+                    _collect_usage(manifest, started_ns=0, official_runner=True)
+
+    def test_v3_usage_rejects_missing_or_out_of_order_provider_request_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self._official_usage_fixture(Path(directory), 1.0)
+            manifest["schema_version"] = SCHEMA_VERSION
+            workbuddy = Path(manifest["workbuddy"]["checkout"])
+            request_log = next(
+                workbuddy.rglob("agent/requests.jsonl")
+            )
+            trajectory_path = request_log.with_name("trajectory.json")
+            trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+            trajectory["final_metrics"]["extra"]["metacodes_turns"] = 2
+            trajectory_path.write_text(
+                json.dumps(trajectory) + "\n", encoding="utf-8"
+            )
+            row = json.loads(request_log.read_text(encoding="utf-8"))
+            row.update({"seq": 2, "response": {"status": 200}, "error": None})
+            request_log.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                LaunchError, "provider request audit is incomplete or out of order"
+            ):
+                _collect_usage(manifest, started_ns=0, official_runner=True)
+            trajectory["final_metrics"]["extra"]["metacodes_turns"] = 1
+            trajectory_path.write_text(
+                json.dumps(trajectory) + "\n", encoding="utf-8"
+            )
+            row.update({"seq": 1, "response": {"status": 499}})
+            request_log.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                LaunchError, "provider request audit is incomplete or out of order"
+            ):
+                _collect_usage(manifest, started_ns=0, official_runner=True)
+
+    def test_v3_usage_accepts_wave_global_sequences_across_tasks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self._official_usage_fixture(Path(directory), 1.0)
+            manifest["schema_version"] = SCHEMA_VERSION
+            workbuddy = Path(manifest["workbuddy"]["checkout"])
+            first_agent = next(workbuddy.rglob("agent/trajectory.json")).parent
+            first_trajectory = json.loads(
+                (first_agent / "trajectory.json").read_text(encoding="utf-8")
+            )
+            first_trajectory["final_metrics"]["extra"]["metacodes_turns"] = 1
+            (first_agent / "trajectory.json").write_text(
+                json.dumps(first_trajectory) + "\n", encoding="utf-8"
+            )
+            first_request = json.loads(
+                (first_agent / "requests.jsonl").read_text(encoding="utf-8")
+            )
+            first_request.update(
+                {"seq": 1, "response": {"status": 200}, "error": None}
+            )
+            (first_agent / "requests.jsonl").write_text(
+                json.dumps(first_request) + "\n", encoding="utf-8"
+            )
+
+            first_trial = first_agent.parent
+            second_task = "code-task-b"
+            second_trial = first_trial.parent / (second_task + "__2")
+            shutil.copytree(first_trial, second_trial)
+            second_agent = second_trial / "agent"
+            second_request = dict(first_request)
+            second_request["seq"] = 2
+            (second_agent / "requests.jsonl").write_text(
+                json.dumps(second_request) + "\n", encoding="utf-8"
+            )
+            result_path = second_trial / "result.json"
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result["task_name"] = f"workbuddy/{second_task}"
+            result["task_id"]["path"] = result["task_id"]["path"].replace(
+                "code-task-a", second_task
+            )
+            result["trial_uri"] = second_trial.resolve().as_uri()
+            result_path.write_text(
+                json.dumps(result, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            manifest["cohort"]["selected_tasks"].append(second_task)
+            run_manifest = (
+                workbuddy
+                / "scripts/logs/instances"
+                / manifest["run_id"]
+                / "manifest.json"
+            )
+            resolved = json.loads(run_manifest.read_text(encoding="utf-8"))
+            resolved["selected_tasks"].append(second_task)
+            run_manifest.write_text(
+                json.dumps(resolved, sort_keys=True) + "\n", encoding="utf-8"
+            )
+
+            usage = _collect_usage(manifest, started_ns=0, official_runner=True)
+            self.assertEqual(2, usage["provider_requests"])
+            self.assertEqual({"code-task-a", second_task}, set(usage["tasks"]))
+            second_request["seq"] = 3
+            (second_agent / "requests.jsonl").write_text(
+                json.dumps(second_request) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                LaunchError, "provider request audit has a missing or duplicate wave sequence"
+            ):
+                _collect_usage(manifest, started_ns=0, official_runner=True)
+
+    def test_v3_usage_hashes_complete_request_audit_above_default_identity_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self._official_usage_fixture(Path(directory), 1.0)
+            manifest["schema_version"] = SCHEMA_VERSION
+            request_log = next(
+                Path(manifest["workbuddy"]["checkout"]).rglob(
+                    "agent/requests.jsonl"
+                )
+            )
+            trajectory_path = request_log.with_name("trajectory.json")
+            trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+            trajectory["final_metrics"]["extra"]["metacodes_turns"] = 1
+            trajectory_path.write_text(
+                json.dumps(trajectory) + "\n", encoding="utf-8"
+            )
+            row = json.loads(request_log.read_text(encoding="utf-8"))
+            row.update({"seq": 1, "response": {"status": 200}, "error": None})
+            # Keep one valid JSONL record while making it larger than _identity's
+            # generic 16 MiB default and smaller than the request-audit 64 MiB cap.
+            row["request"]["body"]["padding"] = "x" * (17 * 1024 * 1024)
+            request_log.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+            usage = _collect_usage(manifest, started_ns=0, official_runner=True)
+            task = next(iter(usage["tasks"].values()))
+            self.assertEqual(
+                hashlib.sha256(request_log.read_bytes()).hexdigest(),
+                task["requests_sha256"],
+            )
+
     def test_resolved_prepared_and_trial_project_control_are_bound(self):
         """Bind job YAML through resolver, prepare_job and the trial runtime."""
 
@@ -1286,7 +2072,11 @@ with urllib.request.urlopen(
                 "harness_resolved_slug": "metacodes/0.1.0",
                 "model_slug": "test-model",
                 "harness_runtime_config": {
+                    "project_control_staged": True,
+                    "project_control_mode": "enforced",
                     "project_control_configured": True,
+                    "transport_model_is_route": True,
+                    "actor_model_identity": "glm-5.2",
                     "translated_env": {
                         "METACODES_PROJECT_RULES_SOURCE": (
                             "/opt/metacodes/" + rules_relative
@@ -1305,8 +2095,10 @@ with urllib.request.urlopen(
                 encoding="utf-8",
             )
             agent_kwargs = {
+                "METACODES_PROJECT_CONTROL_MODE": "enforced",
                 "METACODES_PROJECT_RULES_RELATIVE": rules_relative,
                 "METACODES_PROJECT_KERNEL_RELATIVE": kernel_relative,
+                "METACODES_MODEL_DISPLAY_NAME": "glm-5.2",
             }
             runtime_job = runtime_jobs / f"{job_slug}.yaml"
             runtime_job.write_text(
@@ -1318,7 +2110,10 @@ with urllib.request.urlopen(
                 "workbuddy": {"checkout": str(workbuddy)},
                 "cohort": {"selected_tasks": ["code-task-a"]},
                 "job": {"slug": job_slug},
-                "model": {"slug": "test-model"},
+                "model": {
+                    "slug": "test-model",
+                    "backend_model_name": "glm-5.2",
+                },
                 "artifacts": {
                     "project_control": {
                         "rules": {
@@ -1351,9 +2146,15 @@ with urllib.request.urlopen(
                 json.dumps(
                     {
                         "project_control": {
+                            "staged": True,
+                            "mode": "enforced",
                             "configured": True,
                             "project_state_hash": "5807156ecf67bb70",
-                        }
+                            "artifacts_verified": True,
+                            "runtime_active_bundle_absent": False,
+                        },
+                        "transport_model_is_route": True,
+                        "actor_model_identity": "glm-5.2",
                     }
                 )
                 + "\n",
@@ -1367,6 +2168,81 @@ with urllib.request.urlopen(
             )
             with self.assertRaisesRegex(LaunchError, "runtime job project control"):
                 _runtime_contract(manifest)
+
+    def test_disabled_project_control_is_staged_but_has_no_runtime_active_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            project_sha = hashlib.sha256(
+                b"metacodes-project-identity-v1\x00/workspace"
+            ).hexdigest()
+            rules_relative = "share/metacodes/workbuddy-w05/project-rules"
+            kernel_relative = "libexec/metacodes-project-kernel"
+            manifest = {
+                "model": {"backend_model_name": "glm-5.2"},
+                "evaluation_treatment": {"project_control": "disabled"},
+                "artifacts": {
+                    "project_control": {
+                        "rules": {
+                            "project_root": "/workspace",
+                            "project_sha256": project_sha,
+                            "relative_path": rules_relative,
+                        },
+                        "kernel": {"relative_path": kernel_relative},
+                    }
+                },
+            }
+            expected = {
+                "staged": True,
+                "mode": "disabled",
+                "configured": False,
+                "project_root": "/workspace",
+                "project_sha256": project_sha,
+                "project_state_hash": None,
+                "rules_relative_path": rules_relative,
+                "kernel_relative_path": kernel_relative,
+                "artifacts_verified": True,
+                "runtime_active_bundle_absent": True,
+            }
+            self.assertEqual(expected, _expected_project_control(manifest))
+            trial = root / "trial"
+            (trial / "agent").mkdir(parents=True)
+            kwargs = {
+                "METACODES_PROJECT_CONTROL_MODE": "disabled",
+                "METACODES_PROJECT_RULES_RELATIVE": rules_relative,
+                "METACODES_PROJECT_KERNEL_RELATIVE": kernel_relative,
+                "METACODES_MODEL_DISPLAY_NAME": "glm-5.2",
+            }
+            (trial / "config.json").write_text(
+                json.dumps({"agent": {"kwargs": kwargs}}) + "\n", encoding="utf-8"
+            )
+            (trial / "agent/metacodes-runtime-contract.json").write_text(
+                json.dumps(
+                    {
+                        "project_control": {
+                            "staged": True,
+                            "mode": "disabled",
+                            "configured": False,
+                            "project_state_hash": None,
+                            "artifacts_verified": True,
+                            "runtime_active_bundle_absent": True,
+                        },
+                        "transport_model_is_route": True,
+                        "actor_model_identity": "glm-5.2",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            _validate_trial_project_control(trial, manifest)
+            forged = json.loads(
+                (trial / "agent/metacodes-runtime-contract.json").read_text()
+            )
+            forged["project_control"]["runtime_active_bundle_absent"] = False
+            (trial / "agent/metacodes-runtime-contract.json").write_text(
+                json.dumps(forged) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(LaunchError, "runtime project control drifted"):
+                _validate_trial_project_control(trial, manifest)
 
 
 if __name__ == "__main__":

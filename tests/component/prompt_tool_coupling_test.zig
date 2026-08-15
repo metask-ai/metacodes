@@ -82,20 +82,33 @@ test "L2: KgRecall and KgContext schemas carry the staged semantic-neighborhood 
 
     const props = kg_recall.input_schema.prop_specs orelse return error.TestUnexpectedResult;
     var query_description: ?[]const u8 = null;
+    var intent_description: ?[]const u8 = null;
     for (props) |prop| {
         if (std.mem.eql(u8, prop.name, "query")) query_description = prop.description;
+        if (std.mem.eql(u8, prop.name, "lexical_plan")) {
+            const plan_props = prop.object_props orelse continue;
+            for (plan_props) |plan_prop| {
+                if (std.mem.eql(u8, plan_prop.name, "intent")) intent_description = plan_prop.description;
+            }
+        }
     }
     const description = query_description orelse return error.TestUnexpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, description, "exact/high-precision query") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "ONE compact semantic variant") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "2-4 separate variants") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "at most four variant calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "one untyped exact/alias variant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "declare 2-4 separate semantic variants in one v3 batch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "host executes all members") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "FIRST inspect automatic recall") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "MUST contain ONLY that exact term") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "query is a legacy compatibility field") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "audits any stale-query normalization") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "mechanism/symptom/outcome/nearby implementation") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "broader or narrower concept") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "Do not combine all variants into one keyword bag") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "broader/narrower concept") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "Never combine variants into a keyword bag") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "intent=enumeration") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "require batch coverage") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "Extra keywords are safe") == null);
+    const intent_desc = intent_description orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, intent_desc, "count/cardinality") != null);
+    try std.testing.expect(std.mem.indexOf(u8, intent_desc, "one positive hit is not complete coverage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kg_recall.description, "which/every") == null);
 
     var type_description: ?[]const u8 = null;
     for (props) |prop| {
@@ -107,7 +120,7 @@ test "L2: KgRecall and KgContext schemas carry the staged semantic-neighborhood 
 
     const kg_context = cc.tools.getTool("KgContext") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, kg_context.description, "authoritative node text") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kg_context.description, "connected evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kg_context.description, "verified_by/evidences provenance") != null);
     const context_props = kg_context.input_schema.prop_specs orelse return error.TestUnexpectedResult;
     var saw_node_id = false;
     var saw_limit = false;
@@ -170,7 +183,10 @@ test "L2: long-horizon arm gates TinyKG tools as one typed treatment" {
     try std.testing.expect(claude.usesAutoMemory(false));
     try std.testing.expect(!claude.usesTinyKg());
     const tinykg = cc.types_mod.LongHorizonArm.tinykg;
-    try std.testing.expect(tinykg.usesAutoMemory(false));
+    // The TinyKG arm links markdown auto-memory only when the native channel
+    // is enabled; an explicit global disable stays authoritative (types.zig).
+    try std.testing.expect(tinykg.usesAutoMemory(true));
+    try std.testing.expect(!tinykg.usesAutoMemory(false));
     try std.testing.expect(tinykg.usesTinyKg());
 
     var without_kg = cc.tools.PromptContext{ .tinykg_enabled = false };
@@ -361,4 +377,57 @@ test "L2 e2e: 请求体 tools 携带动态长描述" {
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "cat -n format") != null); // Read 长描述
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "exact string replacements") != null); // Edit 长描述
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "ALWAYS use Grep") != null); // Grep 长描述
+}
+
+test "L2 e2e: execution policy hides deferred tools from schema and system prompt" {
+    const a = std.heap.page_allocator;
+    var srv = try harness.MockServer.start(MINIMAL_END_TURN_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    const defs = [_]cc.json_mod.ToolDefinition{
+        .{ .name = "Read", .description = "read", .input_schema = .{} },
+        .{ .name = "ToolSearch", .description = "activate deferred tools", .input_schema = .{} },
+        .{ .name = "FormalAuditTask", .description = "formal audit", .input_schema = .{}, .deferred = true },
+    };
+    const enabled_names = [_][]const u8{ "Read", "ToolSearch", "FormalAuditTask" };
+    const system = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &enabled_names, "", true, "/tmp");
+    defer a.free(system);
+    try std.testing.expect(std.mem.indexOf(u8, system, "# Deferred tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, system, "FormalAuditTask") != null);
+
+    // Even if the upper policy mechanically includes ToolSearch, the runtime
+    // must remove it after the only deferred schema has been denied.
+    const policy_defs = [_]cc.json_mod.ToolDefinition{ defs[0], defs[1] };
+    var policy = cc.tool_context.ToolSetExecutionPolicy{ .definitions = &policy_defs };
+    var activated = std.StringHashMap(void).init(a);
+    defer activated.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "read only");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var wb = cc.writer_backend.WriterBackend.initNull();
+    const be = wb.backend();
+
+    _ = cc.agent_loop.run(&conv, client.provider(), &defs, &perm, .{
+        .max_turns = 1,
+        .system_prompt = system,
+        .activated_tools = &activated,
+        .execution_policy = policy.executionPolicy(),
+    }, &be, a) catch return error.SkipZigTest;
+
+    const request = srv.lastRequest() orelse return error.NoRequestCaptured;
+    const tools_field = request.jsonField("tools") orelse return error.ToolsFieldMissing;
+    const request_system = request.jsonField("system") orelse return error.SystemFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"Read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "ToolSearch") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "FormalAuditTask") == null);
+    try std.testing.expect(std.mem.indexOf(u8, request_system, "# Deferred tools") == null);
+    try std.testing.expect(std.mem.indexOf(u8, request_system, "FormalAuditTask") == null);
 }

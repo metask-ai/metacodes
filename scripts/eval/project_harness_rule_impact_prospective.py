@@ -34,6 +34,7 @@ if __package__ in {None, ""}:
     from scripts.eval.memory_budget_journal import (  # type: ignore
         BudgetAuthority,
         BudgetJournal,
+        MAX_USER_AUTHORITY_USD,
         usd_to_microusd,
         usd_to_microusd_ceiling,
     )
@@ -85,6 +86,7 @@ else:
     from .memory_budget_journal import (
         BudgetAuthority,
         BudgetJournal,
+        MAX_USER_AUTHORITY_USD,
         usd_to_microusd,
         usd_to_microusd_ceiling,
     )
@@ -357,7 +359,7 @@ def freeze_manifest(
             Path(str(templates["artifacts"]["kernel"]["path"]))
         ),
     }
-    if max_total_cost_usd > 1000 or max_total_cost_usd <= 0:
+    if max_total_cost_usd > MAX_USER_AUTHORITY_USD or max_total_cost_usd <= 0:
         raise E3Error("prospective RuleImpact cost authority is invalid")
     execution = {
         "provider_identity": PRODUCTION_PROVIDER_ID,

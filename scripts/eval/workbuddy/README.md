@@ -125,8 +125,14 @@ results and memory text remain in isolated local trial artifacts and are not
 copied into the derived metrics. A failed or interrupted authorized run is not
 automatically retried.
 
+For official datasets, preflight also requires and hash-binds the dataset-level
+`dataset.toml`. When it selects the composite verifier, the complete
+`shared/verifier` implementation is bound and re-observed before authorization.
+A checkout containing only selected task directories is not a runnable official
+dataset and fails before credential loading, journal mutation, or provider I/O.
+
 If the runner returns nonzero after authorization, the gate writes a separate
-`metacodes-workbuddy-authorized-failure-v1` receipt before reporting the
+`metacodes-workbuddy-authorized-failure-v2` receipt before reporting the
 failure. It keeps the journal transaction in `request_authorized`, reports
 actual cost/tokens as unknown, marks `quality_evidence=false` and
 `retry_allowed=false`, and binds only bounded status/count/timing summaries
@@ -144,10 +150,63 @@ Receipt evidence classification is also frozen before authorization. Omit
 runs; their committed receipts remain `quality_evidence=false` even though
 they use the official runner. Pass it only for a preregistered real-provider
 wave whose official task outcomes are intended to count as quality evidence.
+Every such wave must also carry an explicit `--comparison-id`; a single arm is
+not sufficient quality evidence for a harness change.
+
+Paired outcome studies use two independently created launch manifests
+with the same comparison id and frozen covariate digest. The baseline job uses
+`METACODES_PROJECT_CONTROL_MODE=disabled`: it mounts and verifies the exact
+same rule tree and compiled kernel, but does not materialize
+`$HOME/.metacodes/projects/<project>/project-rules/active.json`. The treatment
+uses `enforced`. Each arm has a distinct run id, budget journal and budget
+transaction. After both official receipts commit, build the paired report with:
+
+```bash
+python3 -m scripts.eval.workbuddy.paired_analysis \
+  --study project_control \
+  --baseline-manifest /private/baseline-manifest.json \
+  --baseline-receipt /private/baseline-receipt.json \
+  --baseline-budget-journal /private/baseline-budget.json \
+  --treatment-manifest /private/treatment-manifest.json \
+  --treatment-receipt /private/treatment-receipt.json \
+  --treatment-budget-journal /private/treatment-budget.json \
+  --output /private/paired-report.json
+```
+
+The analyzer replays both journal hash chains, binds official Harbor verifier
+rewards, requires identical per-task cacheable first-request hashes and reports
+success, time, cost, token, cache and Lean deltas. Its conclusion is only an
+observed paired difference for that frozen cohort and rule bundle. With one
+model sample per arm it is not a causal effect estimate, and
+`quality_evidence=true` is possible only when both input receipts independently
+carry quality evidence.
+
+The progress-aware verification checkpoint is a separate treatment; never
+infer its effect from a project-control pair. Freeze both arms with project
+control disabled, set `METACODES_VERIFICATION_CHECKPOINT=false` only in the
+baseline and `true` only in the treatment, then run the same analyzer with
+`--study verification_checkpoint`. This profile additionally requires each
+task receipt to carry derived progress evidence bound to the already validated
+transcript/observation hashes, rejects any Lean actuation in either arm, and
+reports calls, mutations and elapsed time after the first host-observed
+post-mutation successful verification. Raw tool arguments/results stay in the
+isolated local trial artifacts. If a treatment task reaches no such
+verification, no checkpoint is expected; the missing milestone remains `null`
+rather than being rewritten as zero improvement.
 
 The overlay also keeps the opaque local-proxy route free of Harbor's ``__``
 eval-group delimiter. Otherwise a completed multi-task job can fail only while
 Harbor formats its final summary, after all provider and scorer work has run.
+
+The production WorkBuddy adapter is deliberately non-interactive and launches
+metacodes with pre-authorized ``bypassPermissions`` authority. Its frozen tool
+policy therefore omits ``EnterPlanMode`` and ``ExitPlanMode``: there is no user
+approval channel to serve, and auto-approving a plan late in a rollout can add
+sampling plus task-DAG bookkeeping without strengthening the decision. This is
+an evaluation-runner policy, not a removal from the normal metacodes TUI. TinyKG
+recall and task tools remain available. The complete disabled-tool string is
+bound into each launch manifest, so changing this policy creates a new
+covariate and requires fresh paired runs rather than reusing prior evidence.
 
 ```bash
 python3 -m scripts.eval.workbuddy.launch_gate create ... \
@@ -155,7 +214,8 @@ python3 -m scripts.eval.workbuddy.launch_gate create ... \
   --runner-bash /absolute/path/to/bash \
   --runner-uv /absolute/path/to/uv \
   --output launch.json
-# Real scored waves add: --quality-evidence-on-commit
+# Real scored waves add both:
+#   --quality-evidence-on-commit --comparison-id <frozen-pair-id>
 python3 -m scripts.eval.workbuddy.launch_gate run \
   --manifest launch.json --budget-journal /private/budget.json \
   --receipt /private/receipts/run.json --credential-fd 9

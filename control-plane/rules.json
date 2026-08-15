@@ -537,7 +537,7 @@
       "target": {
         "metric": "memory_local_store_isolation_obligations_minus_observed",
         "setpoint": 0,
-        "goal": "Every memory benchmark invokes a hash-pinned local TinyKG binary with an explicit fresh run-local store, sealed child environment, raw read-phase digest guard, native remote-sentinel and fault feedback, and provenance-complete zero-remote trace pins for all three adapters."
+        "goal": "Every memory benchmark invokes a hash-pinned local TinyKG binary with an explicit fresh run-local store, sealed child environment with neither TinyKG Skill remote authority nor Metacodes local-daemon authority, raw read-phase digest guard, native remote-sentinel and fault feedback, and provenance-complete zero-remote trace pins for all three adapters."
       },
       "sensor": {
         "adapter": "memory_local_store_isolation",
@@ -562,7 +562,7 @@
       "actuator": {
         "kind": "release_gate",
         "on_violation": "block",
-        "remediation": "Restore direct hash-pinned TinyKG execution, explicit METACODES_KG_TRANSPORT=cli-exclusive routing, sealed HOME/TMP and removal of every TINYKG_* child variable, fresh run-local store/output containment, the unnormalized whole-store digest around read operations, all three adapter tests plus real native remote sentinels and write-fault rejection, and the three-trace zero-remote pin. Never substitute the TinyKG skill harness or a remote canonical store for benchmark storage.",
+        "remediation": "Restore direct hash-pinned TinyKG execution, explicit METACODES_KG_TRANSPORT=cli-exclusive routing, sealed HOME/TMP and removal of every TINYKG_* plus ambient METACODES_KG_* child variable before adding the explicit isolated CLI bindings, fresh run-local store/output containment, the unnormalized whole-store digest around read operations, all three adapter tests plus real native remote sentinels and write-fault rejection, and the three-trace zero-remote pin. Never substitute the TinyKG Skill remote Store or the Metacodes local daemon Store for benchmark storage.",
         "observation": {
           "schema_version": 1,
           "build_file": "control-plane/build.zig",
@@ -693,7 +693,7 @@
       "target": {
         "metric": "tinykg_daemon_transport_obligations_minus_observed",
         "setpoint": 0,
-        "goal": "Every Metacodes process uses the TinyKG Skill's authenticated and build-pinned Web transport to one daemon-owned StoreActor, with session-pinned schema, generation-bound queries, zero transport-level write retries, a process-shared ambiguity fence across cloned agent sessions, content-bound Markdown uploads, and native multi-process feedback; shared raw Store fallback is impossible."
+        "goal": "Every Metacodes process uses a Metacodes-owned local authenticated and build-pinned Web transport to one daemon-owned StoreActor, never inherits the remote TinyKG Skill configuration, and retains session-pinned schema, generation-bound queries, zero transport-level write retries, a process-shared ambiguity fence across cloned agent sessions, content-bound Markdown uploads, and native multi-process feedback; shared raw Store fallback is impossible."
       },
       "sensor": {
         "adapter": "daemon_transport",
@@ -718,7 +718,7 @@
       "actuator": {
         "kind": "release_gate",
         "on_violation": "block",
-        "remediation": "Restore canonical TinyKG Skill remote-config routing, build/session-schema pins, explicit isolated cli-exclusive compatibility, the no-raw-Store boundary, request identity with zero transport-level write retries, the process-shared ambiguity fence across cloned agent sessions, generation-bound sessions, real wall-clock deadlines, bounded backpressure/unavailability, Markdown content upload, and native two-process/one-StoreActor feedback. Comments or manifest claims cannot satisfy this gate.",
+        "remediation": "Restore the Metacodes-owned local daemon config boundary (with zero TinyKG Skill remote-config inheritance), build/session-schema pins, explicit isolated cli-exclusive compatibility, the no-raw-Store boundary, request identity with zero transport-level write retries, the process-shared ambiguity fence across cloned agent sessions, generation-bound sessions, real wall-clock deadlines, bounded backpressure/unavailability, Markdown content upload, and native two-process/one-StoreActor feedback. Comments or manifest claims cannot satisfy this gate.",
         "observation": {
           "schema_version": 1,
           "build_file": "control-plane/build.zig",

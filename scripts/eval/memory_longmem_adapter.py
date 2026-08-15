@@ -16,13 +16,13 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
-from .memory_benchmark import PROTOCOL_ID
+from .memory_benchmark import PROTOCOL_ID, qa_execution_prompt
 from .memory_replay import REPLAY_SCHEMA_VERSION, validate_manifest
 from .model import ValidationError, stable_json
 
 
 ADAPTER_ID = "longmemeval-s-cleaned"
-ADAPTER_REVISION = "official-cleaned-session-v1"
+ADAPTER_REVISION = "official-cleaned-session-v3-final-answer-contract"
 DATASET_ID = "longmemeval-s-cleaned"
 SOURCE_SLICE_SCHEMA_VERSION = 1
 SELECTION_ALGORITHM = "sha256-seed-null-question-id-v1"
@@ -405,7 +405,7 @@ def build_manifest(
                 "id": corpus_case["id"],
                 "benchmark": "episodic_recall",
                 "split": "test",
-                "prompt": (
+                "prompt": qa_execution_prompt(
                     f"Question date: {record['question_date']}\n"
                     f"Question: {record['question']}"
                 ),

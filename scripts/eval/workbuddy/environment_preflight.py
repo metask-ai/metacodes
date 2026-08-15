@@ -26,9 +26,17 @@ from . import WORKBUDDY_PINNED_COMMIT
 from .stage_artifacts import TARGET_PLATFORM
 
 
-SCHEMA_VERSION = "metacodes-workbuddy-environment-preflight-v1"
+SCHEMA_VERSION = "metacodes-workbuddy-environment-preflight-v3"
 TASK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,191}$")
 DEFAULT_HARNESS_IMAGE = "workbuddy-bench/harness/metacodes:0.1.0"
+MAX_DATASET_TASKS = 4096
+MAX_TASK_TOML_BYTES = 1024 * 1024
+MAX_DATASET_TASK_TOML_BYTES = 128 * 1024 * 1024
+MAX_DATASET_CONTRACT_FILES = 256
+MAX_DATASET_CONTRACT_BYTES = 8 * 1024 * 1024
+OFFICIAL_DATASET_PREFIX = "wb-bench-"
+COMPOSITE_VERIFIER_SCHEMA = "workbuddy.verifier.v1"
+COMPOSITE_VERIFIER_ENGINE = "composite"
 
 
 class EnvironmentPreflightError(ValueError):
@@ -43,7 +51,23 @@ def _canonical_sha256(value: object) -> str:
     return _sha256_bytes(stable_json(value).encode("utf-8"))
 
 
-def _read_regular(path: Path, maximum: int = 2 * 1024 * 1024 * 1024) -> bytes:
+def _stable_file_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_uid,
+        info.st_gid,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _read_regular_observed(
+    path: Path, maximum: int = 2 * 1024 * 1024 * 1024
+) -> tuple[bytes, os.stat_result]:
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
         before = os.fstat(descriptor)
@@ -64,12 +88,15 @@ def _read_regular(path: Path, maximum: int = 2 * 1024 * 1024 * 1024) -> bytes:
             if observed > maximum:
                 raise EnvironmentPreflightError(f"environment input is too large: {path}")
         after = os.fstat(descriptor)
-        identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-        if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        if _stable_file_identity(before) != _stable_file_identity(after):
             raise EnvironmentPreflightError(f"environment input changed while hashing: {path}")
-        return b"".join(chunks)
+        return b"".join(chunks), after
     finally:
         os.close(descriptor)
+
+
+def _read_regular(path: Path, maximum: int = 2 * 1024 * 1024 * 1024) -> bytes:
+    return _read_regular_observed(path, maximum)[0]
 
 
 def _tree_identity(root: Path) -> Dict[str, object]:
@@ -222,6 +249,329 @@ def _resolve_dataset(workbuddy: Path, dataset: str) -> Path:
     return path
 
 
+def _dataset_staging_identity(
+    dataset_path: Path, selected_tasks: Sequence[str]
+) -> Dict[str, object]:
+    """Bind every task.toml that WorkBuddy may rewrite before selection.
+
+    ``prepare_tasks.py`` walks the complete dataset, not only the selected
+    cohort.  Copies preserve file modes, so a read-only unselected task can
+    otherwise fail after paid authorization.  This scan deliberately checks
+    owner-write mode bits rather than ``os.access``: effective privileges do
+    not describe whether the staged copy will satisfy that contract.
+    """
+
+    try:
+        before = dataset_path.lstat()
+    except OSError as exc:
+        raise EnvironmentPreflightError(
+            f"cannot inspect WorkBuddy dataset: {dataset_path}"
+        ) from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+        raise EnvironmentPreflightError(
+            f"WorkBuddy dataset is not a regular directory: {dataset_path}"
+        )
+    rows: list[Dict[str, object]] = []
+    names: set[str] = set()
+    total_bytes = 0
+    try:
+        children = sorted(dataset_path.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        raise EnvironmentPreflightError(
+            f"cannot enumerate WorkBuddy dataset: {dataset_path}"
+        ) from exc
+    for child in children:
+        try:
+            child_info = child.lstat()
+        except OSError as exc:
+            raise EnvironmentPreflightError(
+                f"cannot inspect WorkBuddy dataset entry: {child}"
+            ) from exc
+        if stat.S_ISLNK(child_info.st_mode):
+            if child.is_dir() and (child / "task.toml").exists():
+                raise EnvironmentPreflightError(
+                    f"WorkBuddy task directory is a symlink: {child}"
+                )
+            continue
+        if not stat.S_ISDIR(child_info.st_mode):
+            continue
+        task_toml = child / "task.toml"
+        try:
+            task_info = task_toml.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise EnvironmentPreflightError(
+                f"cannot inspect WorkBuddy task.toml: {task_toml}"
+            ) from exc
+        if len(rows) >= MAX_DATASET_TASKS:
+            raise EnvironmentPreflightError(
+                f"WorkBuddy dataset exceeds {MAX_DATASET_TASKS} tasks"
+            )
+        if stat.S_ISLNK(task_info.st_mode):
+            raise EnvironmentPreflightError(
+                f"WorkBuddy task.toml is a symlink: {task_toml}"
+            )
+        try:
+            payload, observed = _read_regular_observed(
+                task_toml, maximum=MAX_TASK_TOML_BYTES
+            )
+        except OSError as exc:
+            raise EnvironmentPreflightError(
+                f"cannot inspect WorkBuddy task.toml: {task_toml}"
+            ) from exc
+        if _stable_file_identity(task_info) != _stable_file_identity(observed):
+            raise EnvironmentPreflightError(
+                f"WorkBuddy task.toml changed before hashing: {task_toml}"
+            )
+        if not TASK_RE.fullmatch(child.name):
+            raise EnvironmentPreflightError(
+                f"WorkBuddy dataset contains an unsafe task name: {child.name}"
+            )
+        mode = stat.S_IMODE(observed.st_mode)
+        if mode & stat.S_IWUSR == 0:
+            raise EnvironmentPreflightError(
+                f"WorkBuddy task.toml is not owner-writable for staging: {task_toml}"
+            )
+        total_bytes += len(payload)
+        if total_bytes > MAX_DATASET_TASK_TOML_BYTES:
+            raise EnvironmentPreflightError(
+                "WorkBuddy dataset task.toml payload exceeds the staging bound"
+            )
+        names.add(child.name)
+        rows.append(
+            {
+                "task": child.name,
+                "task_toml": {
+                    "bytes": len(payload),
+                    "mode": mode,
+                    "owner_writable": True,
+                    "sha256": _sha256_bytes(payload),
+                },
+            }
+        )
+    try:
+        after = dataset_path.lstat()
+    except OSError as exc:
+        raise EnvironmentPreflightError(
+            f"cannot re-observe WorkBuddy dataset: {dataset_path}"
+        ) from exc
+    if _stable_file_identity(before) != _stable_file_identity(after):
+        raise EnvironmentPreflightError(
+            f"WorkBuddy dataset changed while scanning: {dataset_path}"
+        )
+    missing = sorted(set(selected_tasks) - names)
+    if missing:
+        raise EnvironmentPreflightError(
+            "selected WorkBuddy task is absent from the staging dataset: "
+            + ", ".join(missing)
+        )
+    if not rows:
+        raise EnvironmentPreflightError("WorkBuddy dataset has no task.toml files")
+    return {
+        "path": str(dataset_path),
+        "task_count": len(rows),
+        "task_toml_bytes": total_bytes,
+        "owner_writable": True,
+        "content_sha256": _canonical_sha256(rows),
+        "tasks": rows,
+    }
+
+
+def _dataset_execution_identity(dataset_path: Path) -> Dict[str, object]:
+    """Bind dataset-level files that select and implement the real verifier.
+
+    Official WorkBuddy datasets are not self-contained task directories. Their
+    ``dataset.toml`` selects the verifier engine and a composite verifier loads
+    executable policy from ``shared/verifier``. Missing these files makes
+    Harbor fall back to the task-local compatibility stub, so they must be
+    checked before a paid request is authorized.
+    """
+
+    dataset_root = dataset_path.parent if dataset_path.name == "tasks" else dataset_path
+    dataset_toml = dataset_root / "dataset.toml"
+    official = dataset_root.name.startswith(OFFICIAL_DATASET_PREFIX)
+    if not dataset_toml.exists():
+        if official:
+            raise EnvironmentPreflightError(
+                f"official WorkBuddy dataset is missing dataset.toml: {dataset_root}"
+            )
+        return {
+            "dataset_root": str(dataset_root),
+            "contract": "legacy-task-local",
+            "dataset_toml": None,
+            "shared_verifier": None,
+        }
+
+    try:
+        payload = _read_regular(dataset_toml, maximum=MAX_TASK_TOML_BYTES)
+        text = payload.decode("utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise EnvironmentPreflightError(
+            f"invalid WorkBuddy dataset contract: {dataset_toml}"
+        ) from exc
+    verifier: Dict[str, str] = {}
+    identity_keys = {"schema", "engine", "plugin"}
+    section = ""
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        header = re.fullmatch(r"\[([A-Za-z0-9_.-]+)\]", line)
+        if header is not None:
+            section = header.group(1)
+            continue
+        if section != "verifier":
+            continue
+        assignment = re.match(r"([A-Za-z0-9_-]+)\s*=", line)
+        if assignment is None or assignment.group(1) not in identity_keys:
+            # The runner owns the complete TOML parser.  This dependency-free
+            # host gate extracts only the fields that select executable verifier
+            # behavior; unrelated numeric/list settings must not be rejected.
+            continue
+        match = re.fullmatch(
+            r"([A-Za-z0-9_-]+)\s*=\s*([\"'])([^\"']*)\2", line
+        )
+        if match is None or match.group(1) in verifier:
+            raise EnvironmentPreflightError(
+                f"invalid WorkBuddy verifier contract: {dataset_toml}"
+            )
+        verifier[match.group(1)] = match.group(3)
+    if not verifier:
+        raise EnvironmentPreflightError(
+            f"official WorkBuddy dataset has no verifier contract: {dataset_toml}"
+        )
+    schema = verifier.get("schema")
+    engine = verifier.get("engine")
+    if not isinstance(schema, str) or not schema or not isinstance(engine, str) or not engine:
+        raise EnvironmentPreflightError(
+            f"WorkBuddy dataset verifier contract is incomplete: {dataset_toml}"
+        )
+
+    shared_identity: Dict[str, object] | None = None
+    if engine == COMPOSITE_VERIFIER_ENGINE:
+        if schema != COMPOSITE_VERIFIER_SCHEMA:
+            raise EnvironmentPreflightError(
+                f"WorkBuddy composite verifier schema is unsupported: {dataset_toml}"
+            )
+        if verifier.get("plugin"):
+            raise EnvironmentPreflightError(
+                f"official WorkBuddy verifier plugin override is unsupported: {dataset_toml}"
+            )
+        shared_root = dataset_root / "shared/verifier"
+        plugin_path = shared_root / "plugin.py"
+        try:
+            shared_info = shared_root.lstat()
+            plugin_info = plugin_path.lstat()
+        except OSError as exc:
+            raise EnvironmentPreflightError(
+                f"WorkBuddy composite verifier implementation is missing: {shared_root}"
+            ) from exc
+        if (
+            stat.S_ISLNK(shared_info.st_mode)
+            or not stat.S_ISDIR(shared_info.st_mode)
+            or stat.S_ISLNK(plugin_info.st_mode)
+            or not stat.S_ISREG(plugin_info.st_mode)
+            or plugin_info.st_nlink != 1
+        ):
+            raise EnvironmentPreflightError(
+                f"WorkBuddy composite verifier implementation is unsafe: {shared_root}"
+            )
+        rows: list[Dict[str, object]] = []
+        directories_seen: list[tuple[Path, tuple[int, ...]]] = []
+        total_bytes = 0
+        for current, directories, files in os.walk(shared_root, followlinks=False):
+            directories.sort()
+            files.sort()
+            current_path = Path(current)
+            try:
+                current_info = current_path.lstat()
+            except OSError as exc:
+                raise EnvironmentPreflightError(
+                    f"cannot inspect WorkBuddy shared verifier directory: {current_path}"
+                ) from exc
+            if stat.S_ISLNK(current_info.st_mode) or not stat.S_ISDIR(
+                current_info.st_mode
+            ):
+                raise EnvironmentPreflightError(
+                    f"WorkBuddy shared verifier contains an unsafe directory: {current_path}"
+                )
+            directories_seen.append(
+                (current_path, _stable_file_identity(current_info))
+            )
+            for name in directories:
+                directory = current_path / name
+                try:
+                    info = directory.lstat()
+                except OSError as exc:
+                    raise EnvironmentPreflightError(
+                        f"cannot inspect WorkBuddy shared verifier directory: {directory}"
+                    ) from exc
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    raise EnvironmentPreflightError(
+                        f"WorkBuddy shared verifier contains an unsafe directory: {directory}"
+                    )
+            for name in files:
+                path = current_path / name
+                relative = path.relative_to(shared_root).as_posix()
+                try:
+                    file_payload = _read_regular(
+                        path, maximum=MAX_DATASET_CONTRACT_BYTES + 1
+                    )
+                except (OSError, EnvironmentPreflightError) as exc:
+                    raise EnvironmentPreflightError(
+                        f"WorkBuddy shared verifier contains an unsafe file: {path}"
+                    ) from exc
+                total_bytes += len(file_payload)
+                if len(rows) >= MAX_DATASET_CONTRACT_FILES:
+                    raise EnvironmentPreflightError(
+                        "WorkBuddy shared verifier exceeds the file-count bound"
+                    )
+                if total_bytes > MAX_DATASET_CONTRACT_BYTES:
+                    raise EnvironmentPreflightError(
+                        "WorkBuddy shared verifier exceeds the byte bound"
+                    )
+                rows.append(
+                    {
+                        "path": relative,
+                        "bytes": len(file_payload),
+                        "sha256": _sha256_bytes(file_payload),
+                    }
+                )
+        for directory, identity in reversed(directories_seen):
+            try:
+                observed = directory.lstat()
+            except OSError as exc:
+                raise EnvironmentPreflightError(
+                    f"WorkBuddy shared verifier changed while hashing: {directory}"
+                ) from exc
+            if _stable_file_identity(observed) != identity:
+                raise EnvironmentPreflightError(
+                    f"WorkBuddy shared verifier changed while hashing: {directory}"
+                )
+        if not rows:
+            raise EnvironmentPreflightError("WorkBuddy shared verifier is empty")
+        shared_identity = {
+            "path": str(shared_root.resolve(strict=True)),
+            "files": len(rows),
+            "bytes": total_bytes,
+            "content_sha256": _canonical_sha256(rows),
+        }
+
+    return {
+        "dataset_root": str(dataset_root.resolve(strict=True)),
+        "contract": "dataset-verifier",
+        "dataset_toml": {
+            "path": str(dataset_toml.resolve(strict=True)),
+            "bytes": len(payload),
+            "sha256": _sha256_bytes(payload),
+            "schema": schema,
+            "engine": engine,
+        },
+        "shared_verifier": shared_identity,
+    }
+
+
 def prebuild(
     *,
     workbuddy: Path,
@@ -243,6 +593,8 @@ def prebuild(
     if not os.access(docker_path, os.X_OK):
         raise EnvironmentPreflightError("docker executable is not executable")
     dataset_path = _resolve_dataset(checkout, dataset)
+    dataset_staging = _dataset_staging_identity(dataset_path, selected_tasks)
+    dataset_execution = _dataset_execution_identity(dataset_path)
     started = time.monotonic()
     harness_context = checkout / "configs/harnesses/metacodes/docker"
     harness_identity = _tree_identity(harness_context)
@@ -302,6 +654,8 @@ def prebuild(
         "workbuddy_commit": WORKBUDDY_PINNED_COMMIT,
         "workbuddy_checkout": str(checkout),
         "dataset": dataset,
+        "dataset_staging": dataset_staging,
+        "dataset_execution": dataset_execution,
         "selected_tasks": list(selected_tasks),
         "target_platform": TARGET_PLATFORM,
         "docker": {
@@ -367,6 +721,18 @@ def validate_receipt(
     ):
         raise EnvironmentPreflightError("environment preflight receipt contract mismatch")
     dataset_path = _resolve_dataset(checkout, dataset)
+    observed_dataset_staging = _dataset_staging_identity(
+        dataset_path, expected_tasks
+    )
+    if value.get("dataset_staging") != observed_dataset_staging:
+        raise EnvironmentPreflightError(
+            "WorkBuddy dataset staging contract changed after preflight"
+        )
+    observed_dataset_execution = _dataset_execution_identity(dataset_path)
+    if value.get("dataset_execution") != observed_dataset_execution:
+        raise EnvironmentPreflightError(
+            "WorkBuddy dataset execution contract changed after preflight"
+        )
     docker_row = value.get("docker") or {}
     if (
         not isinstance(docker_row, dict)

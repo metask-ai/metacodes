@@ -21,6 +21,7 @@ from typing import Dict, Iterable, List
 
 from .install_overlay import install
 from .stage_artifacts import stage
+from .trace import CONTROL_METRICS_SCHEMA
 
 
 class W0Error(RuntimeError):
@@ -158,7 +159,7 @@ def run_w0(workbuddy: Path, zig: Path, bash: Path, uv: Path) -> Dict[str, object
         or extra.get("cache_creation_input_tokens") != 10
         or extra.get("metacodes_stop_reason") != "end_turn"
         or control.get("schema_version")
-        != "metacodes-workbuddy-control-metrics-v1"
+        != CONTROL_METRICS_SCHEMA
         or (control.get("tool_runtime") or {}).get("dispatch_started") != 1
         or (control.get("tool_runtime") or {}).get("dispatch_finished") != 1
         or (control.get("lean") or {}).get("used") is not False

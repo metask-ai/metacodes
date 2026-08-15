@@ -17,11 +17,12 @@ from scripts.eval.memory_failed_run_analysis import (
     verify_reanalysis_bundle,
 )
 from scripts.eval.memory_query_plan import (
+    LEGACY_TRACE_SCHEMA_VERSION,
     LEXICAL_PLAN_SCHEMA_VERSION,
     MULTIPLE_DISTINCT_SEED_PLANS_REASON,
     QUERY_PLAN_INVALID_PREFIX,
-    TRACE_SCHEMA_VERSION,
 )
+from scripts.eval.memory_agent_runtime import _query_plan_evaluator_invalid_reason
 from scripts.eval.model import ValidationError
 from scripts.eval.model import stable_json
 
@@ -40,13 +41,113 @@ def call(index, plan, query):
         "query": query,
         "seen_node_count": 0,
         "seen_state_verified": True,
-        "ledger_scope": "agent_run_plan",
+        "ledger_scope": "agent_run_explicit",
         "new_hit_count": 0,
         "repeated_hit_count": 0,
     }
 
 
 class FailedMemoryRunAnalysisTest(unittest.TestCase):
+    def test_safe_pre_search_rejection_does_not_reclassify_quality(self):
+        observation = {
+            "evaluator": {
+                "status": "ready",
+                "invalid_reason": None,
+                "deterministic_success": True,
+            },
+            "retrieval": {
+                "query_variants": [{"kind": "exact", "text": "needle"}]
+            },
+        }
+        trace = {
+            "schema_version": LEGACY_TRACE_SCHEMA_VERSION,
+            "run_id": "run-recovered",
+            "arm": "tinykg_lexical",
+            "memory_backend": "tinykg_integrated",
+            "kg_recall_count": 2,
+            "status": "invalid",
+            "invalid_reasons": [
+                "call 1: host rejected lexical plan before search (ledger)"
+            ],
+            "calls": [call(0, "a" * 64, "needle")],
+        }
+
+        repaired, changes, host_satisfied = repair_observations(
+            [observation],
+            [
+                {
+                    "run_id": "run-recovered",
+                    "case_id": "case-recovered",
+                    "arm": "tinykg_lexical",
+                    "scoped_recall": None,
+                }
+            ],
+            [trace],
+        )
+
+        self.assertEqual(repaired, [observation])
+        self.assertEqual(changes, [])
+        self.assertEqual(host_satisfied, [False])
+
+    def test_host_seeded_parser_recovery_matches_live_quality_decision(self):
+        observation = {
+            "evaluator": {
+                "status": "ready",
+                "invalid_reason": None,
+                "deterministic_success": True,
+            },
+            "retrieval": {
+                "query_variants": [
+                    {"kind": "semantic", "text": "graduation commencement"}
+                ]
+            },
+        }
+        scoped_recall = {"status": "injected"}
+        recovered_call = call(4, "a" * 64, "graduation commencement")
+        recovered_call.update(
+            {
+                "stage": "semantic_expansion",
+                "variant_count": 2,
+                "variant_kind": "paraphrase",
+                "new_hit_count": 3,
+            }
+        )
+        trace = {
+            "schema_version": LEGACY_TRACE_SCHEMA_VERSION,
+            "run_id": "run-host-parser-recovery",
+            "arm": "tinykg_lexical",
+            "memory_backend": "tinykg_integrated",
+            "kg_recall_count": 5,
+            "status": "invalid",
+            "invalid_reasons": [
+                "call 0: host rejected lexical plan before search (parser): unsupported kind",
+                "call 1: host rejected lexical plan before search (parser): invalid expansion shape",
+                "call 2: host rejected lexical plan before search (parser): unsupported kind",
+                "call 3: host rejected lexical plan before search (ledger)",
+            ],
+            "calls": [recovered_call],
+        }
+
+        repaired, changes, host_satisfied = repair_observations(
+            [observation],
+            [
+                {
+                    "run_id": "run-host-parser-recovery",
+                    "case_id": "case-host-parser-recovery",
+                    "arm": "tinykg_lexical",
+                    "scoped_recall": scoped_recall,
+                }
+            ],
+            [trace],
+        )
+
+        self.assertIsNone(
+            _query_plan_evaluator_invalid_reason(scoped_recall, trace)
+        )
+        self.assertEqual(repaired, [observation])
+        self.assertEqual(changes, [])
+        self.assertEqual(host_satisfied, [True])
+
     def test_repair_marks_only_protocol_invalid_row_and_preserves_seed_shape(self):
         observations = [
             {
@@ -77,7 +178,7 @@ class FailedMemoryRunAnalysisTest(unittest.TestCase):
         ]
         traces = [
             {
-                "schema_version": TRACE_SCHEMA_VERSION,
+                "schema_version": LEGACY_TRACE_SCHEMA_VERSION,
                 "run_id": "run-bad",
                 "arm": "tinykg_lexical",
                 "memory_backend": "tinykg_integrated",
@@ -90,7 +191,7 @@ class FailedMemoryRunAnalysisTest(unittest.TestCase):
                 ],
             },
             {
-                "schema_version": TRACE_SCHEMA_VERSION,
+                "schema_version": LEGACY_TRACE_SCHEMA_VERSION,
                 "run_id": "run-host",
                 "arm": "tinykg_lexical",
                 "memory_backend": "tinykg_integrated",

@@ -233,10 +233,11 @@ test "L2 并发: unsafe 工具串行单跑(未知工具→错误,不崩)" {
     try std.testing.expect(std.mem.indexOf(u8, content, "Read") != null); // 可用工具清单含 Read
 }
 
-test "L2 并发: per-message 聚合预算(多大结果合计超 200k → 落盘最大的)" {
+test "L2 并发: executeSlots 保留聚合大结果给 hook/UI 后置投影" {
     const a = std.testing.allocator;
     _ = std.c.mkdir("/tmp/cc-budget-home", 0o755);
-    // 3 个 denied slot 各预填 ~80k 内容(decision=.denied 让 executeSlots 不执行,只走聚合预算)
+    // 3 个 denied slot 各预填 ~80k 内容。dispatch 层必须保持原字节；
+    // agent_loop 才是唯一投影提交点。
     const big = try a.alloc(u8, 80_000);
     defer a.free(big);
     @memset(big, 'Z');
@@ -249,16 +250,14 @@ test "L2 并发: per-message 聚合预算(多大结果合计超 200k → 落盘�
     const ctx = cc.tool_context.ToolContext{ .allocator = a, .home_dir = "/tmp/cc-budget-home" };
     try tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
 
-    // 合计 240k > 200k → 至少一个被落盘(preview)
-    var persisted_count: usize = 0;
     var total: usize = 0;
     for (slots) |s| {
         const c = s.content.?;
         total += c.len;
-        if (std.mem.indexOf(u8, c, "\"persisted\":true") != null) persisted_count += 1;
+        try std.testing.expectEqual(@as(usize, 80_000), c.len);
+        try std.testing.expectEqual(@as(u8, 'Z'), c[0]);
     }
-    try std.testing.expect(persisted_count >= 1);
-    try std.testing.expect(total <= 200_000); // 落盘后合计达标
+    try std.testing.expectEqual(@as(usize, 240_000), total);
 }
 
 test "L2 并发: per-input 分类(Bash readonly safe / 写 unsafe)" {
@@ -271,11 +270,11 @@ test "L2 并发: per-input 分类(Bash readonly safe / 写 unsafe)" {
     try std.testing.expect(!tools.isConcurrencySafeInput("Write", "{\"file_path\":\"/x\",\"content\":\"y\"}"));
 }
 
-test "L2 并发: per-message 预算跳过 Read(防 Read→file→Read 环)" {
+test "L2 并发: executeSlots 对 Read/Grep 都不提前投影" {
     const a = std.testing.allocator;
     _ = std.c.mkdir("/tmp/cc-budget-home2", 0o755);
-    // Read 结果(maxResultChars==maxInt)即便很大,也不应被强制落盘。
-    // 配 2 个大 Grep + 1 个大 Read,合计超预算 → 只落 Grep,Read 原样保留。
+    // ReadArtifact 的防环由 result_projection 的 inline-only policy 保证；
+    // dispatch 层不再按工具名做持久化分叉。
     const big = try a.alloc(u8, 90_000);
     defer a.free(big);
     @memset(big, 'R');
@@ -288,12 +287,8 @@ test "L2 并发: per-message 预算跳过 Read(防 Read→file→Read 环)" {
     const ctx = cc.tool_context.ToolContext{ .allocator = a, .home_dir = "/tmp/cc-budget-home2" };
     try tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
 
-    // Read 结果未被落盘(仍是原始 90k 'R')
-    try std.testing.expect(std.mem.indexOf(u8, slots[0].content.?, "\"persisted\":true") == null);
-    try std.testing.expect(slots[0].content.?.len == 90_000);
-    // 至少一个 Grep 被落盘
-    var grep_persisted: usize = 0;
-    if (std.mem.indexOf(u8, slots[1].content.?, "\"persisted\":true") != null) grep_persisted += 1;
-    if (std.mem.indexOf(u8, slots[2].content.?, "\"persisted\":true") != null) grep_persisted += 1;
-    try std.testing.expect(grep_persisted >= 1);
+    for (slots) |slot| {
+        try std.testing.expectEqual(@as(usize, 90_000), slot.content.?.len);
+        try std.testing.expectEqual(@as(u8, 'R'), slot.content.?[0]);
+    }
 }

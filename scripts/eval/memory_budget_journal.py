@@ -31,6 +31,8 @@ JOURNAL_SCHEMA_VERSION = 1
 ZERO_HEAD_SHA256 = "0" * 64
 MAX_JOURNAL_BYTES = 8 * 1024 * 1024
 MICRO_USD_PER_USD = 1_000_000
+MAX_USER_AUTHORITY_USD = 2_000
+MAX_USER_AUTHORITY_MICROUSD = MAX_USER_AUTHORITY_USD * MICRO_USD_PER_USD
 HEX64 = frozenset("0123456789abcdef")
 FaultHook = Callable[[str], None]
 
@@ -125,8 +127,11 @@ class BudgetAuthority:
             "budget authority.total_metered_tokens",
             minimum=1,
         )
-        if self.total_cost_microusd > 1000 * MICRO_USD_PER_USD:
-            _fail("budget authority.total_cost_microusd", "must not exceed $1000")
+        if self.total_cost_microusd > MAX_USER_AUTHORITY_MICROUSD:
+            _fail(
+                "budget authority.total_cost_microusd",
+                f"must not exceed ${MAX_USER_AUTHORITY_USD}",
+            )
 
     def record(self) -> Mapping[str, Any]:
         self.validate()

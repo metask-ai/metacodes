@@ -8,12 +8,15 @@
 //!
 //! ExitPlanMode 审批(对齐 cc):带 `plan` 正文参数 → 经 exit_plan_fn 回调弹审批框 →
 //! 仅用户批准才切回执行模式;拒绝则留在 plan,把"继续打磨"回传模型。无回调(headless/
-//! 子 agent)→ answer_queue 兜底 → 都无则安全默认 reject(绝不静默放行)。
+//! 子 agent)→ answer_queue 兜底 → 都无则安全默认 reject。唯一例外是明确以
+//! `bypassPermissions` 启动、且由 headless 标记为不可交互的 runner：该模式本身已经
+//! 授权执行，plan 只是内部工作流，不应等待不存在的用户；它可自动批准并恢复原模式。
 
 const std = @import("std");
 const pfs = @import("platform").fs;
 const ToolContext = @import("context.zig").ToolContext;
 const PlanApproval = ToolContext.PlanApproval;
+const permission_mode = @import("../permission/mode.zig");
 
 /// Plan 模式工作流指令(对齐 mecode collaboration_mode/plan.md)。**两处共用**:
 ///   ① EnterPlanMode 返回 tool_result(模型进 plan 当轮读到);
@@ -99,6 +102,17 @@ fn approvalFromQueue() ?PlanApproval {
     return .reject;
 }
 
+/// Headless `bypassPermissions` 已经是宿主给出的执行授权。若模型自行进入 plan，
+/// 不存在 UI 的 runner 不能靠 answer_queue 无限拒绝；只在“不可交互 + 原模式明确 bypass
+/// + UI requester 确实 unavailable”这个窄条件下自动批准。default/accept-edits 等模式
+/// 仍 fail-closed，suspendable 的 `.pending` 也绝不被视为 unavailable。
+fn shouldAutoApproveHeadless(ctx: *const ToolContext, previous: ?@import("../types.zig").PermissionMode) bool {
+    const pctx = ctx.permission_ctx orelse return false;
+    if (!pctx.no_interactive_prompt) return false;
+    const mode = previous orelse return false;
+    return permission_mode.canonical(mode) == .bypass_permissions;
+}
+
 pub fn executeExit(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const pctx = ctx.permission_ctx orelse return error.NotAvailable;
     const prev_slot = ctx.plan_prev_mode orelse return error.NotAvailable;
@@ -147,8 +161,13 @@ pub fn executeExit(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         },
         // L3:异步前端挂起 → error.UiPending(agent_loop 挂起,resumeRun 续跑)。
         .pending => return error.UiPending,
-        // 无 UI 回调(headless/子 agent)→ answer_queue 兜底,再无则 reject。
-        .unavailable => choice = approvalFromQueue() orelse .reject,
+        // 无 UI 回调：不可交互边界绝不消费进程级 answer_queue（可能是其它会话遗留
+        // 的输入）。只有显式 bypassPermissions 可恢复原授权，其余 fail closed；普通
+        // 非 TTY e2e/旧调用方仍可按既有协议使用 answer_queue。
+        .unavailable => choice = if (pctx.no_interactive_prompt)
+            if (shouldAutoApproveHeadless(ctx, prev_slot.*)) .approve_default else .reject
+        else
+            approvalFromQueue() orelse .reject,
     }
 
     switch (choice) {
@@ -170,8 +189,7 @@ pub fn executeExit(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         },
         .reject => {
             // 留在 plan 模式;告知模型继续打磨,不要执行。
-            return try ctx.allocator.dupe(u8,
-                "{\"mode\":\"plan\",\"status\":\"rejected\"," ++
+            return try ctx.allocator.dupe(u8, "{\"mode\":\"plan\",\"status\":\"rejected\"," ++
                 "\"note\":\"User wants to keep planning. Continue refining the plan and do not execute. Call ExitPlanMode again when the plan is updated.\"}");
         },
     }
@@ -207,17 +225,13 @@ fn commitPlanToGraph(ctx: *const ToolContext, plan_md: []const u8) !?[]u8 {
     }
 
     if (!result.structured) {
-        return try std.fmt.allocPrint(ctx.allocator,
-            ",\"kg\":{{\"committed\":true,\"root_id\":{d},\"structured\":false," ++
-            "\"note\":\"计划未能结构化,已按整体目标入图。用 TaskList 查看,TaskUpdate completed 闭合。\"}}",
-            .{result.root_id});
+        return try std.fmt.allocPrint(ctx.allocator, ",\"kg\":{{\"committed\":true,\"root_id\":{d},\"structured\":false," ++
+            "\"note\":\"计划未能结构化,已按整体目标入图。用 TaskList 查看,TaskUpdate completed 闭合。\"}}", .{result.root_id});
     }
     const status = if (result.incomplete) "incomplete" else "complete";
     const trunc_note = if (result.truncated) "(注意:计划超 40 步,超出部分未入图)" else "";
-    return try std.fmt.allocPrint(ctx.allocator,
-        ",\"kg\":{{\"committed\":true,\"root_id\":{d},\"steps\":{d}/{d},\"status\":\"{s}\",\"truncated\":{}," ++
-        "\"note\":\"计划已存为持久任务图({d} 步){s}。用 TaskList 领 ready 任务,完成后 TaskUpdate completed(会自动解锁后续步骤)。未来 session 从图恢复进度。\"}}",
-        .{ result.root_id, result.steps_committed, result.total_steps, status, result.truncated, result.total_steps, trunc_note });
+    return try std.fmt.allocPrint(ctx.allocator, ",\"kg\":{{\"committed\":true,\"root_id\":{d},\"steps\":{d}/{d},\"status\":\"{s}\",\"truncated\":{}," ++
+        "\"note\":\"计划已存为持久任务图({d} 步){s}。用 TaskList 领 ready 任务,完成后 TaskUpdate completed(会自动解锁后续步骤)。未来 session 从图恢复进度。\"}}", .{ result.root_id, result.steps_committed, result.total_steps, status, result.truncated, result.total_steps, trunc_note });
 }
 
 test "EnterPlanMode without ctx returns NotAvailable" {
@@ -279,6 +293,16 @@ fn mockUiRequestFn(
         else => out.* = .{ .plan_approval = .reject },
     }
     return .answered;
+}
+
+fn pendingUiRequestFn(
+    _: *anyopaque,
+    _: @import("../core/session_id.zig").SessionId,
+    _: std.mem.Allocator,
+    _: *const @import("../core/protocol/ui_request.zig").UiRequest,
+    _: *@import("../core/protocol/ui_request.zig").UiResponse,
+) anyerror!@import("../core/protocol/ui_request.zig").RequestOutcome {
+    return .pending;
 }
 
 fn setupExitCtx(a: std.mem.Allocator, pctx: *@import("../permission.zig").PermissionContext, prev: *?@import("../types.zig").PermissionMode, dummy_state: *anyopaque) ToolContext {
@@ -367,6 +391,106 @@ test "ExitPlanMode 无回调无队列 → 安全默认 reject(留 plan)" {
     defer a.free(r);
     try std.testing.expect(pctx.modeValue() == .plan); // 绝不静默放行
     try std.testing.expect(std.mem.indexOf(u8, r, "\"status\":\"rejected\"") != null);
+}
+
+test "ExitPlanMode headless previous bypass → unavailable 时自动恢复执行授权" {
+    const a = std.testing.allocator;
+    const permission = @import("../permission.zig");
+    const types = @import("../types.zig");
+    var pctx = permission.PermissionContext{
+        .mode = .init(.plan),
+        .allocator = a,
+        .no_interactive_prompt = true,
+    };
+    var prev: ?types.PermissionMode = .bypass_permissions;
+    const ctx = ToolContext{ .allocator = a, .permission_ctx = &pctx, .plan_prev_mode = &prev };
+
+    const r = try executeExit(&ctx, "{\"plan\":\"do X\"}");
+    defer a.free(r);
+    try std.testing.expectEqual(types.PermissionMode.bypass_permissions, pctx.modeValue());
+    try std.testing.expect(prev == null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "\"status\":\"approved\"") != null);
+}
+
+test "ExitPlanMode headless legacy bypass alias → canonicalize 后自动恢复" {
+    const a = std.testing.allocator;
+    const permission = @import("../permission.zig");
+    const types = @import("../types.zig");
+    var pctx = permission.PermissionContext{
+        .mode = .init(.plan),
+        .allocator = a,
+        .no_interactive_prompt = true,
+    };
+    var prev: ?types.PermissionMode = .bypass;
+    const ctx = ToolContext{ .allocator = a, .permission_ctx = &pctx, .plan_prev_mode = &prev };
+
+    const r = try executeExit(&ctx, "{\"plan\":\"do X\"}");
+    defer a.free(r);
+    try std.testing.expectEqual(types.PermissionMode.bypass, pctx.modeValue());
+    try std.testing.expect(prev == null);
+}
+
+test "ExitPlanMode headless previous default → unavailable 仍 fail closed" {
+    const a = std.testing.allocator;
+    const permission = @import("../permission.zig");
+    const types = @import("../types.zig");
+    var pctx = permission.PermissionContext{
+        .mode = .init(.plan),
+        .allocator = a,
+        .no_interactive_prompt = true,
+    };
+    var prev: ?types.PermissionMode = .default;
+    const ctx = ToolContext{ .allocator = a, .permission_ctx = &pctx, .plan_prev_mode = &prev };
+
+    const r = try executeExit(&ctx, "{\"plan\":\"do X\"}");
+    defer a.free(r);
+    try std.testing.expectEqual(types.PermissionMode.plan, pctx.modeValue());
+    try std.testing.expectEqual(types.PermissionMode.default, prev.?);
+    try std.testing.expect(std.mem.indexOf(u8, r, "\"status\":\"rejected\"") != null);
+}
+
+test "ExitPlanMode headless 不消费进程级 answer queue" {
+    const a = std.testing.allocator;
+    const answer_queue = @import("../core/answer_queue.zig");
+    const permission = @import("../permission.zig");
+    const types = @import("../types.zig");
+    answer_queue.load("approve\n");
+    defer answer_queue.resetForTest();
+    var pctx = permission.PermissionContext{
+        .mode = .init(.plan),
+        .allocator = a,
+        .no_interactive_prompt = true,
+    };
+    var prev: ?types.PermissionMode = .default;
+    const ctx = ToolContext{ .allocator = a, .permission_ctx = &pctx, .plan_prev_mode = &prev };
+
+    const r = try executeExit(&ctx, "{\"plan\":\"do X\"}");
+    defer a.free(r);
+    try std.testing.expectEqual(types.PermissionMode.plan, pctx.modeValue());
+    try std.testing.expectEqualStrings("approve", answer_queue.pop().?);
+}
+
+test "ExitPlanMode headless suspendable pending → 不自动批准" {
+    const a = std.testing.allocator;
+    const permission = @import("../permission.zig");
+    const types = @import("../types.zig");
+    var pctx = permission.PermissionContext{
+        .mode = .init(.plan),
+        .allocator = a,
+        .no_interactive_prompt = true,
+    };
+    var prev: ?types.PermissionMode = .bypass_permissions;
+    var dummy: u8 = 0;
+    const ctx = ToolContext{
+        .allocator = a,
+        .permission_ctx = &pctx,
+        .plan_prev_mode = &prev,
+        .ui_requester = .{ .ctx = &dummy, .requestFn = &pendingUiRequestFn },
+    };
+
+    try std.testing.expectError(error.UiPending, executeExit(&ctx, "{\"plan\":\"do X\"}"));
+    try std.testing.expectEqual(types.PermissionMode.plan, pctx.modeValue());
+    try std.testing.expectEqual(types.PermissionMode.bypass_permissions, prev.?);
 }
 
 test "ExitPlanMode 模型未传 plan → 从 plan 文件读盘兜底(对齐 cc normalizeToolInput)" {

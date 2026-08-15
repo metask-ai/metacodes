@@ -23,6 +23,7 @@ from .e2e_adapter import _native_trace_metrics
 from .memory_agent_runtime import PRODUCTION_MODEL_FINGERPRINT, SAFE_STOP_REASONS, _parse_result
 from .memory_budget_journal import (
     JOURNAL_SCHEMA_VERSION,
+    MAX_USER_AUTHORITY_USD,
     reopen_checkpoint_transaction,
     usd_to_microusd,
     usd_to_microusd_ceiling,
@@ -107,6 +108,9 @@ MAX_KERNEL_RUNTIME_DEPENDENCIES = 64
 E3_MIN_ROLLOUT_COST_USD = 0.90
 E3_MIN_ROLLOUT_METERED_TOKENS = 300_000
 E3_ROLLOUT_TIMEOUT_SECONDS = 300
+CURRENT_FORMAL_BATCH_SCHEMA = "metacodes-project-formal-decision-batch-v5"
+RULE_FILTER_SCHEMA = "metacodes-project-rule-filter-v1"
+RULE_FILTER_PROOF = "MetaCodesControl.ProjectRule.target_tool_mismatch_admits_both"
 COMMITTED_BUDGET_RECEIPT_FIELDS = frozenset(
     {
         "journal_id",
@@ -981,7 +985,7 @@ def _validate_execution_contract(
     if (
         rollout_cost < E3_MIN_ROLLOUT_COST_USD
         or total_cost <= 0
-        or total_cost > 1000
+        or total_cost > MAX_USER_AUTHORITY_USD
         or rollout_cost * schedule_length >= total_cost
         or rollout_tokens < E3_MIN_ROLLOUT_METERED_TOKENS
         or rollout_tokens * schedule_length >= total_tokens
@@ -1123,7 +1127,11 @@ def freeze_manifest(
     templates = verify_templates(templates_path, repo)
     if templates.get("paid_rollout_eligible") is not True:
         raise E3Error("template setup is not eligible for a paid rollout")
-    if max_total_cost_usd > 1000 or max_total_cost_usd <= 0 or max_rollout_cost_usd <= 0:
+    if (
+        max_total_cost_usd > MAX_USER_AUTHORITY_USD
+        or max_total_cost_usd <= 0
+        or max_rollout_cost_usd <= 0
+    ):
         raise E3Error("invalid paid cost authority")
     if max_rollout_metered_tokens <= 0 or max_total_metered_tokens <= 0 or max_output_tokens <= 0:
         raise E3Error("invalid paid token authority")
@@ -1357,6 +1365,47 @@ def _journal_events(path: Path) -> List[Mapping[str, Any]]:
     return records
 
 
+def _journal_rule_filter(
+    payload: Mapping[str, Any], sequence: int
+) -> Mapping[str, Any]:
+    if payload.get("schema_version") != RULE_FILTER_SCHEMA:
+        raise E3Error("project-Harness rule-filter schema drift")
+    dispatch_id = payload.get("dispatch_id")
+    phase = payload.get("phase")
+    operation = payload.get("operation")
+    if not isinstance(dispatch_id, str) or not dispatch_id:
+        raise E3Error("project-Harness rule-filter dispatch identity drift")
+    if phase not in {"pre", "post"} or operation not in {
+        "ordinary",
+        "exact_edit_recovery",
+    }:
+        raise E3Error("project-Harness rule-filter operation drift")
+    if payload.get("proof") != RULE_FILTER_PROOF:
+        raise E3Error("project-Harness rule-filter theorem identity drift")
+    counts: List[int] = []
+    for label in (
+        "active_rule_count",
+        "checker_rule_count",
+        "statically_pruned_rule_count",
+    ):
+        value = payload.get(label)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise E3Error(f"invalid project-Harness rule-filter {label}")
+        counts.append(value)
+    active, checker, pruned = counts
+    if active == 0 or checker > active or pruned != active - checker:
+        raise E3Error("project-Harness rule-filter cardinality drift")
+    if operation == "exact_edit_recovery" and checker == 0:
+        raise E3Error("exact recovery source rule was statically erased")
+    revision = payload.get("bundle_revision")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
+        raise E3Error("project-Harness rule-filter revision drift")
+    for label in ("project_sha256", "bundle_sha256", "kernel_sha256"):
+        if not _is_sha256(payload.get(label)):
+            raise E3Error(f"project-Harness rule-filter {label} drift")
+    return {**payload, "_sequence": sequence}
+
+
 def analyze_journal(
     *,
     path: Path,
@@ -1372,6 +1421,8 @@ def analyze_journal(
     finishes: Dict[str, Mapping[str, Any]] = {}
     formal: List[Mapping[str, Any]] = []
     checker_calls: List[Mapping[str, Any]] = []
+    filters: Dict[tuple[str, str, str], Mapping[str, Any]] = {}
+    checker_backed_filters: set[tuple[str, str, str]] = set()
     saw_recovery_direction_field = False
     saw_operation_field = False
     for record in records:
@@ -1379,6 +1430,17 @@ def analyze_journal(
         payload = event.get("tool_observation") if isinstance(event, Mapping) else None
         if not isinstance(payload, Mapping):
             continue
+        filter_payload = payload.get("rule_filter")
+        if isinstance(filter_payload, Mapping):
+            item = _journal_rule_filter(filter_payload, int(record["sequence"]))
+            key = (
+                str(item["dispatch_id"]),
+                str(item["phase"]),
+                str(item["operation"]),
+            )
+            if key in filters:
+                raise E3Error("duplicate project-Harness rule filter")
+            filters[key] = item
         started = payload.get("dispatch_started")
         if isinstance(started, Mapping):
             dispatch_id = started.get("id")
@@ -1397,6 +1459,7 @@ def analyze_journal(
             if not isinstance(decisions, list) or not decisions:
                 raise E3Error("empty formal decision batch")
             checker_calls.append({**batch, "_sequence": record["sequence"]})
+            normalized_batch: List[Mapping[str, Any]] = []
             for decision in decisions:
                 if not isinstance(decision, Mapping):
                     raise E3Error("invalid formal decision")
@@ -1409,7 +1472,35 @@ def analyze_journal(
                     "operation",
                     "pre_decision" if normalized.get("phase") == "pre" else "post_decision",
                 )
+                normalized_batch.append(normalized)
                 formal.append(normalized)
+            if batch.get("schema_version") == CURRENT_FORMAL_BATCH_SCHEMA:
+                filter_operations = {
+                    "exact_edit_recovery"
+                    if str(item.get("operation", "")).startswith("recovery_")
+                    else "ordinary"
+                    for item in normalized_batch
+                }
+                if len(filter_operations) != 1:
+                    raise E3Error("formal batch mixed rule-filter operations")
+                filter_key = (
+                    str(batch.get("dispatch_id")),
+                    str(batch.get("phase")),
+                    next(iter(filter_operations)),
+                )
+                filter_item = filters.get(filter_key)
+                if (
+                    filter_item is None
+                    or int(filter_item["_sequence"]) >= int(record["sequence"])
+                    or filter_item.get("checker_rule_count") != len(decisions)
+                    or filter_item.get("project_sha256") != batch.get("project_sha256")
+                    or filter_item.get("bundle_sha256") != batch.get("bundle_sha256")
+                    or filter_item.get("bundle_revision") != batch.get("bundle_revision")
+                    or filter_item.get("kernel_sha256") != batch.get("kernel_sha256")
+                    or filter_key in checker_backed_filters
+                ):
+                    raise E3Error("project-Harness rule-filter/formal batch binding drift")
+                checker_backed_filters.add(filter_key)
         single = payload.get("formal_decision")
         if isinstance(single, Mapping):
             checker_calls.append({**single, "_sequence": record["sequence"]})
@@ -1439,11 +1530,22 @@ def analyze_journal(
         "evolved_enforced": "enforced",
     }[arm]
     if expected_actuation is None:
-        if formal or candidate_id is not None:
+        if formal or filters or candidate_id is not None:
             raise E3Error("signal-only arm emitted formal authority")
     else:
-        if not formal or candidate_id is None:
-            raise E3Error("governed arm omitted formal decisions")
+        if (not formal and not filters) or candidate_id is None:
+            raise E3Error("governed arm omitted formal authorization")
+        for item in filters.values():
+            if (
+                item.get("project_sha256") != project_sha256
+                or item.get("kernel_sha256") != kernel_sha256
+            ):
+                raise E3Error("project-Harness rule-filter identity drift")
+        if filters and (
+            len({item.get("bundle_sha256") for item in filters.values()}) != 1
+            or len({item.get("bundle_revision") for item in filters.values()}) != 1
+        ):
+            raise E3Error("project-Harness rule-filter bundle drift")
         for decision in formal:
             recovery_action = decision.get("recovery_action", "none")
             operation = decision.get("operation")
@@ -1478,6 +1580,95 @@ def analyze_journal(
             if not isinstance(dispatch_id, str) or not dispatch_id:
                 raise E3Error("formal decision has no dispatch identity")
             by_dispatch.setdefault(dispatch_id, []).append(decision)
+
+        modern_filter_contract = bool(filters) or any(
+            call.get("schema_version") == CURRENT_FORMAL_BATCH_SCHEMA
+            for call in checker_calls
+        )
+        if modern_filter_contract:
+            if any(
+                call.get("schema_version") != CURRENT_FORMAL_BATCH_SCHEMA
+                for call in checker_calls
+            ):
+                raise E3Error("project-Harness mixed legacy/current formal authority")
+            for key, item in filters.items():
+                checker_count = int(item["checker_rule_count"])
+                if (checker_count > 0) != (key in checker_backed_filters):
+                    raise E3Error("project-Harness rule-filter checker path drift")
+
+            governed_ids = set(starts) | set(by_dispatch)
+            for key in filters:
+                dispatch_id, phase, _operation = key
+                if dispatch_id not in governed_ids:
+                    raise E3Error("project-Harness rule filter references no dispatch")
+                if phase == "post" and dispatch_id not in starts:
+                    raise E3Error("blocked dispatch emitted a post rule filter")
+
+            for dispatch_id, start in starts.items():
+                finish = finishes[dispatch_id]
+                synthesized_exact_edit = (
+                    start.get("requested_name") == "Write"
+                    and start.get("dispatched_name") == "Edit"
+                )
+                required = (
+                    {
+                        (dispatch_id, "pre", "ordinary"),
+                        (dispatch_id, "pre", "exact_edit_recovery"),
+                        (dispatch_id, "post", "exact_edit_recovery"),
+                    }
+                    if synthesized_exact_edit
+                    else {
+                        (dispatch_id, "pre", "ordinary"),
+                        (dispatch_id, "post", "ordinary"),
+                    }
+                )
+                if not required.issubset(filters):
+                    raise E3Error("governed dispatch phase has no rule filter")
+                allowed = required
+                if any(key[0] == dispatch_id and key not in allowed for key in filters):
+                    raise E3Error("governed dispatch emitted an unexpected rule filter")
+                for key in required:
+                    item = filters[key]
+                    sequence = int(item["_sequence"])
+                    if key[1] == "pre" and sequence >= int(start["_sequence"]):
+                        raise E3Error("pre rule filter followed its real dispatch")
+                    if key[1] == "post" and not (
+                        int(start["_sequence"]) < sequence < int(finish["_sequence"])
+                    ):
+                        raise E3Error("post rule filter escaped its dispatch interval")
+                if synthesized_exact_edit and not (
+                    int(filters[(dispatch_id, "pre", "ordinary")]["_sequence"])
+                    < int(filters[(dispatch_id, "pre", "exact_edit_recovery")]["_sequence"])
+                ):
+                    raise E3Error("exact recovery rule-filter direction drift")
+
+            for dispatch_id in set(by_dispatch) - set(starts):
+                required = {
+                    (
+                        dispatch_id,
+                        str(item["phase"]),
+                        "exact_edit_recovery"
+                        if str(item.get("operation", "")).startswith("recovery_")
+                        else "ordinary",
+                    )
+                    for item in by_dispatch[dispatch_id]
+                }
+                if not required or not required.issubset(filters):
+                    raise E3Error("blocked governed dispatch has no pre rule filter")
+                if any(key[0] == dispatch_id and key not in required for key in filters):
+                    raise E3Error("blocked dispatch emitted an unexpected rule filter")
+                if any(key[1] != "pre" for key in required):
+                    raise E3Error("blocked dispatch emitted a post rule filter")
+                ordinary = filters.get((dispatch_id, "pre", "ordinary"))
+                recovery = filters.get(
+                    (dispatch_id, "pre", "exact_edit_recovery")
+                )
+                if recovery is not None and (
+                    ordinary is None
+                    or int(ordinary["_sequence"]) >= int(recovery["_sequence"])
+                ):
+                    raise E3Error("blocked exact recovery rule-filter direction drift")
+
         for dispatch_id, start in starts.items():
             decisions = by_dispatch.get(dispatch_id, [])
             pre = [item for item in decisions if item.get("phase") == "pre"]
@@ -1520,6 +1711,13 @@ def analyze_journal(
                 if direction_sequence is not None
                 and int(item["_sequence"]) > direction_sequence
             ] if synthesized_exact_edit else pre
+
+            if not decisions and modern_filter_contract:
+                # A theorem-backed zero-checker filter is itself the formal
+                # authorization for a statically irrelevant rule.  The filter
+                # contract above has already required both causal phases and
+                # forbidden a hidden checker call.
+                continue
 
             def track(item: Mapping[str, Any]) -> tuple[str, str]:
                 operation = str(item["operation"])

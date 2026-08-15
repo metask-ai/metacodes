@@ -1,6 +1,7 @@
-import json
+import ast
 import hashlib
 import io
+import json
 import os
 import subprocess
 import tarfile
@@ -32,15 +33,18 @@ from scripts.eval.workbuddy.key_fd import (
 )
 from scripts.eval.workbuddy.trace import (
     CONTROL_METRICS_SCHEMA,
+    RULE_FILTER_PROOF,
     OBSERVATION_JOURNAL_SCHEMA,
     TOOL_OBSERVATION_SCHEMA,
     TraceError,
+    anthropic_messages_endpoint,
     final_result,
     load_control_metrics,
     project_state_hash,
     read_json_lines,
     transcript_ir,
 )
+from scripts.eval.workbuddy.progress_analysis import analyze_progress
 
 
 ZERO_COMMIT = "0" * 40
@@ -72,6 +76,28 @@ class WorkBuddyTraceTest(unittest.TestCase):
 
     def test_project_state_hash_matches_zig_xxhash64(self):
         self.assertEqual(project_state_hash("/workspace"), "5807156ecf67bb70")
+
+    def test_proxy_origin_becomes_complete_anthropic_messages_endpoint(self):
+        for source in (
+            "http://host.docker.internal:3456",
+            "http://host.docker.internal:3456/",
+            "http://host.docker.internal:3456/v1/messages",
+            "http://host.docker.internal:3456/v1/messages/",
+        ):
+            self.assertEqual(
+                anthropic_messages_endpoint(source),
+                "http://host.docker.internal:3456/v1/messages",
+            )
+        for invalid in (
+            "",
+            "host.docker.internal:3456",
+            "http://host.docker.internal:3456/other",
+            "http://host.docker.internal:3456/?route=glm",
+            "http://host.docker.internal:3456/#fragment",
+            "http://host.docker.internal:3456\n/v1/messages",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(TraceError):
+                anthropic_messages_endpoint(invalid)
 
     def test_transcript_maps_calls_results_and_cache_metrics_without_dropping_provenance(self):
         result = final_result(
@@ -184,6 +210,283 @@ class WorkBuddyTraceTest(unittest.TestCase):
             },
         )
 
+    def test_progress_analysis_derives_green_checkpoint_without_retaining_payloads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            calls = [
+                ("w", "Write", {"file_path": "/secret/project/a.py", "content": "secret"}, "ok"),
+                (
+                    "t",
+                    "Bash",
+                    json.dumps({"command": "cd /workspace && python -m pytest -q"}),
+                    json.dumps({"stdout": "secret test output", "stderr": "", "exit_code": 0}),
+                ),
+                ("e", "Edit", {"file_path": "/secret/project/a.py"}, "ok"),
+            ]
+            rows = []
+            for call_id, name, arguments, result in calls:
+                rows.extend(
+                    [
+                        {
+                            "role": "assistant",
+                            "blocks": [
+                                {
+                                    "type": "tool_use",
+                                    "id": call_id,
+                                    "name": name,
+                                    "input": arguments,
+                                }
+                            ],
+                        },
+                        {
+                            "role": "user",
+                            "blocks": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": call_id,
+                                    "content": result,
+                                    "is_error": False,
+                                }
+                            ],
+                        },
+                    ]
+                )
+            self._write_jsonl(transcript, rows)
+            effect = {
+                "file_mutation_v2": {
+                    "mutation": {"change": "changed"},
+                    "reobservation": {"state": "matched"},
+                }
+            }
+            events = []
+            for index, (call_id, name, _arguments, _result) in enumerate(calls):
+                events.append(
+                    {
+                        "tool_observation": {
+                            "dispatch_finished": {
+                                "id": call_id,
+                                "requested_name": name,
+                                "dispatched_name": name,
+                                "origin": "authoritative",
+                                "agent_depth": 0,
+                                "outcome": "succeeded",
+                                "effect": effect if name in {"Write", "Edit"} else None,
+                                "effect_valid": True,
+                            }
+                        }
+                    }
+                )
+            journal = self._journal(*events)
+            for index, row in enumerate(journal):
+                row["monotonic_elapsed_ns"] = index * 1_000_000_000
+            self._write_jsonl(observation, journal)
+            metrics = analyze_progress(transcript, observation)
+        self.assertEqual(metrics["progress"]["first_mutation_call"], 1)
+        self.assertEqual(metrics["progress"]["first_successful_verification_call"], 2)
+        self.assertEqual(metrics["progress"]["calls_after_first_successful_verification"], 1)
+        self.assertEqual(metrics["progress"]["mutations_after_first_successful_verification"], 1)
+        encoded = json.dumps(metrics, sort_keys=True)
+        self.assertNotIn("secret", encoded)
+        self.assertFalse(metrics["privacy"]["tool_arguments_retained"])
+
+    def test_progress_analysis_rejects_transcript_observation_identity_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(
+                transcript,
+                [
+                    {"role": "assistant", "blocks": [{
+                        "type": "tool_use", "id": "call", "name": "Bash",
+                        "input": {"command": "pytest -q"},
+                    }]},
+                    {"role": "user", "blocks": [{
+                        "type": "tool_result", "tool_use_id": "call",
+                        "content": "{\"exit_code\":0}", "is_error": False,
+                    }]},
+                ],
+            )
+            self._write_jsonl(observation, self._journal())
+            with self.assertRaises(TraceError):
+                analyze_progress(transcript, observation)
+
+    def test_progress_analysis_same_turn_mutation_and_green_is_not_causal_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(
+                transcript,
+                [
+                    {
+                        "role": "assistant",
+                        "blocks": [
+                            {"type": "tool_use", "id": "w", "name": "Write", "input": {}},
+                            {
+                                "type": "tool_use",
+                                "id": "t",
+                                "name": "Bash",
+                                "input": {"command": "pytest -q"},
+                            },
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "blocks": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "w",
+                                "content": "ok",
+                                "is_error": False,
+                            },
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "t",
+                                "content": json.dumps(
+                                    {"stdout": "1 passed", "stderr": "", "exit_code": 0}
+                                ),
+                                "is_error": False,
+                            },
+                        ],
+                    },
+                ],
+            )
+            effect = {
+                "file_mutation_v2": {
+                    "mutation": {"change": "changed"},
+                    "reobservation": {"state": "matched"},
+                }
+            }
+            self._write_jsonl(
+                observation,
+                self._journal(
+                    {"tool_observation": {"dispatch_finished": {
+                        "id": "w", "requested_name": "Write", "dispatched_name": "Write",
+                        "origin": "authoritative", "agent_depth": 0, "outcome": "succeeded",
+                        "effect": effect, "effect_valid": True,
+                    }}},
+                    {"tool_observation": {"dispatch_finished": {
+                        "id": "t", "requested_name": "Bash", "dispatched_name": "Bash",
+                        "origin": "authoritative", "agent_depth": 0, "outcome": "succeeded",
+                        "effect": None, "effect_valid": True,
+                    }}},
+                ),
+            )
+            metrics = analyze_progress(transcript, observation)
+        self.assertEqual(1, metrics["progress"]["successful_verifications"])
+        self.assertIsNone(metrics["progress"]["first_successful_verification_call"])
+
+    def test_progress_analysis_excludes_same_green_turn_parallel_tail_from_after_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            calls = [
+                ("w1", "Write", {}),
+                ("t", "Bash", {"command": "pytest -q"}),
+                ("w2", "Write", {}),
+            ]
+            self._write_jsonl(
+                transcript,
+                [
+                    {"role": "assistant", "blocks": [{
+                        "type": "tool_use", "id": "w1", "name": "Write", "input": {},
+                    }]},
+                    {"role": "user", "blocks": [{
+                        "type": "tool_result", "tool_use_id": "w1", "content": "ok",
+                        "is_error": False,
+                    }]},
+                    {"role": "assistant", "blocks": [
+                        {"type": "tool_use", "id": call_id, "name": name, "input": args}
+                        for call_id, name, args in calls[1:]
+                    ]},
+                    {"role": "user", "blocks": [
+                        {"type": "tool_result", "tool_use_id": "t", "content": json.dumps({
+                            "stdout": "1 passed", "stderr": "", "exit_code": 0,
+                        }), "is_error": False},
+                        {"type": "tool_result", "tool_use_id": "w2", "content": "ok",
+                         "is_error": False},
+                    ]},
+                ],
+            )
+            effect = {"file_mutation_v2": {
+                "mutation": {"change": "changed"},
+                "reobservation": {"state": "matched"},
+            }}
+            self._write_jsonl(
+                observation,
+                self._journal(*[
+                    {"tool_observation": {"dispatch_finished": {
+                        "id": call_id, "requested_name": name, "dispatched_name": name,
+                        "origin": "authoritative", "agent_depth": 0, "outcome": "succeeded",
+                        "effect": effect if name == "Write" else None, "effect_valid": True,
+                    }}}
+                    for call_id, name, _args in calls
+                ]),
+            )
+            metrics = analyze_progress(transcript, observation)["progress"]
+        self.assertEqual(2, metrics["first_successful_verification_call"])
+        self.assertEqual(0, metrics["calls_after_first_successful_verification"])
+        self.assertEqual(0, metrics["mutations_after_first_successful_verification"])
+
+    def test_progress_analysis_counts_injected_checkpoint_only_in_bound_result_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(
+                transcript,
+                [
+                    {"role": "assistant", "blocks": [{
+                        "type": "tool_use", "id": "w", "name": "Write", "input": {},
+                    }]},
+                    {"role": "user", "blocks": [{
+                        "type": "tool_result", "tool_use_id": "w", "content": "ok",
+                        "is_error": False,
+                    }]},
+                    {"role": "assistant", "blocks": [{
+                        "type": "tool_use", "id": "t", "name": "Bash",
+                        "input": {"command": "pytest -q"},
+                    }]},
+                    {"role": "user", "blocks": [
+                        {"type": "tool_result", "tool_use_id": "t", "content": json.dumps({
+                            "stdout": "1 passed", "stderr": "", "exit_code": 0,
+                        }), "is_error": False},
+                        {"type": "text", "text": "[verification checkpoint]\nfinish"},
+                    ]},
+                ],
+            )
+            effect = {"file_mutation_v2": {
+                "mutation": {"change": "changed"},
+                "reobservation": {"state": "matched"},
+            }}
+            self._write_jsonl(
+                observation,
+                self._journal(
+                    {"tool_observation": {"dispatch_finished": {
+                        "id": "w", "requested_name": "Write", "dispatched_name": "Write",
+                        "origin": "authoritative", "agent_depth": 0, "outcome": "succeeded",
+                        "effect": effect, "effect_valid": True,
+                    }}},
+                    {"tool_observation": {"dispatch_finished": {
+                        "id": "t", "requested_name": "Bash", "dispatched_name": "Bash",
+                        "origin": "authoritative", "agent_depth": 0, "outcome": "succeeded",
+                        "effect": None, "effect_valid": True,
+                    }}},
+                ),
+            )
+            metrics = analyze_progress(transcript, observation)
+        self.assertEqual(1, metrics["progress"]["checkpoint_messages"])
+        self.assertEqual(
+            1,
+            metrics["progress"][
+                "checkpoint_messages_after_successful_verification"
+            ],
+        )
+
     def test_control_metrics_count_formal_batch_dispatch_and_recovery(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -250,6 +553,55 @@ class WorkBuddyTraceTest(unittest.TestCase):
         self.assertEqual(metrics["lean"]["recovery_directions"], 1)
         self.assertEqual(metrics["lean"]["checker_elapsed_ns"], 7000)
 
+    def test_control_metrics_count_zero_checker_rule_filters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(transcript, [{"role": "user", "blocks": []}])
+            identity = {
+                "schema_version": "metacodes-project-rule-filter-v1",
+                "operation": "ordinary",
+                "project_sha256": "1" * 64,
+                "bundle_sha256": "2" * 64,
+                "bundle_revision": 7,
+                "kernel_sha256": "3" * 64,
+                "active_rule_count": 2,
+                "checker_rule_count": 0,
+                "statically_pruned_rule_count": 2,
+                "proof": RULE_FILTER_PROOF,
+            }
+            start = {
+                "schema_version": TOOL_OBSERVATION_SCHEMA,
+                "id": "filtered-read",
+                "requested_name": "Read",
+                "dispatched_name": "Read",
+                "origin": "authoritative",
+                "agent_depth": 0,
+            }
+            self._write_jsonl(
+                observation,
+                self._journal(
+                    {"tool_observation": {"rule_filter": {
+                        **identity, "dispatch_id": "filtered-read", "phase": "pre",
+                    }}},
+                    {"tool_observation": {"dispatch_started": start}},
+                    {"tool_observation": {"rule_filter": {
+                        **identity, "dispatch_id": "filtered-read", "phase": "post",
+                    }}},
+                    {"tool_observation": {"dispatch_finished": {
+                        **start, "outcome": "succeeded",
+                    }}},
+                ),
+            )
+            metrics = load_control_metrics(transcript, observation)
+        self.assertTrue(metrics["lean"]["used"])
+        self.assertEqual(metrics["lean"]["checker_calls"], 0)
+        self.assertEqual(metrics["lean"]["rule_filter_events"], 2)
+        self.assertEqual(metrics["lean"]["active_rule_phases"], 4)
+        self.assertEqual(metrics["lean"]["checker_rule_phases"], 0)
+        self.assertEqual(metrics["lean"]["statically_pruned_rule_phases"], 4)
+
     def test_control_metrics_count_tinykg_routing_trust_and_task_commit(self):
         calls = [
             ("recall-hit", "KgRecall", {
@@ -259,12 +611,28 @@ class WorkBuddyTraceTest(unittest.TestCase):
                     {"node_id": 2, "seen_before": True},
                 ],
                 "lexical_query_plan": {
-                    "schema_version": "lexical-query-plan-v1",
+                    "schema_version": "lexical-query-plan-v3",
                     "plan_sha256": "4" * 64,
+                    "intent": "fact_lookup",
+                    "stage": "seed",
+                    "variant_count": 1,
                     "seen_state_verified": True,
-                    "ledger_scope": "agent_run_plan",
-                    "new_hit_count": 1,
-                    "repeated_hit_count": 1,
+                    "ledger_scope": "agent_run_batch",
+                    "execution": "host_batch_all",
+                    "all_variants_executed": True,
+                    "executed_variant_count": 1,
+                    "merged_hit_count": 2,
+                    "merged_new_hit_count": 1,
+                    "merged_previously_seen_count": 1,
+                    "probe_new_hit_count": 1,
+                    "probe_repeated_hit_count": 1,
+                    "variant_receipts": [{
+                        "variant_index": 0,
+                        "variant_kind": "exact",
+                        "node_ids": [1, 2],
+                        "new_hit_count": 1,
+                        "repeated_hit_count": 1,
+                    }],
                 },
             }),
             ("recall-miss", "KgRecall", {"count": 0, "hits": []}),
@@ -274,6 +642,13 @@ class WorkBuddyTraceTest(unittest.TestCase):
             }}),
             ("remember", "KgRemember", {"remembered": {"node_id": 9}}),
             ("task-create", "TaskCreate", {"task": {"id": "kg-10"}}),
+            ("task-list", "TaskList", [
+                {
+                    "id": "kg-10", "subject": "Persist result", "status": "pending",
+                    "kg_status": "open", "readiness": "ready", "plan_step": True,
+                },
+                {"parallel_hint": "2 ready tasks can run in parallel"},
+            ]),
             ("task-claim", "TaskUpdate", {
                 "claimed": True, "claimed_by": "agent-l2"
             }),
@@ -281,7 +656,26 @@ class WorkBuddyTraceTest(unittest.TestCase):
         ]
         transcript_rows = [
             {"role": "assistant", "blocks": [
-                {"type": "tool_use", "id": call_id, "name": name, "input": {}}
+                {
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": name,
+                    "input": (
+                        {
+                            "query": "control memory",
+                            "lexical_plan": {
+                                "schema_version": "lexical-query-plan-v3",
+                                "intent": "fact_lookup",
+                                "stage": "seed",
+                                "variants": [
+                                    {"kind": "exact", "text": "control memory"}
+                                ],
+                            },
+                        }
+                        if call_id == "recall-hit"
+                        else {}
+                    ),
+                }
                 for call_id, name, _ in calls
             ]},
             {"role": "user", "blocks": [
@@ -303,11 +697,216 @@ class WorkBuddyTraceTest(unittest.TestCase):
         self.assertEqual(tinykg["recall_miss_calls"], 1)
         self.assertEqual(tinykg["recall_new_nodes"], 1)
         self.assertEqual(tinykg["recall_repeated_nodes"], 1)
+        self.assertEqual(tinykg["auto_context_succeeded"], 0)
+        self.assertEqual(tinykg["context_observations"], 1)
         self.assertEqual(tinykg["context_evidence_connected"], 1)
         self.assertEqual(tinykg["remember_succeeded"], 1)
-        self.assertEqual(tinykg["task_dag_calls"], 3)
-        self.assertEqual(tinykg["task_tinykg_status_results"], 3)
+        self.assertEqual(tinykg["task_dag_calls"], 4)
+        self.assertEqual(tinykg["task_list_calls"], 1)
+        self.assertEqual(tinykg["task_tinykg_status_results"], 4)
         self.assertEqual(tinykg["task_terminal_commits"], 1)
+
+    def test_control_metrics_count_bound_auto_context_as_real_observation(self):
+        tool_input = {
+            "query": "commencement attendance",
+            "lexical_plan": {
+                "schema_version": "lexical-query-plan-v3",
+                "intent": "enumeration",
+                "stage": "semantic_expansion",
+                "variants": [
+                    {"kind": "synonym", "text": "commencement attendance"},
+                    {"kind": "relation", "text": "graduation ceremonies attended"},
+                ],
+            },
+        }
+        payload = {
+            "count": 1,
+            "hits": [{
+                "node_id": 7,
+                "type": "evidence",
+                "seen_before": False,
+                "text": "attended commencement",
+            }],
+            "lexical_query_plan": {
+                "schema_version": "lexical-query-plan-v3",
+                "plan_sha256": "4" * 64,
+                "intent": "enumeration",
+                "stage": "semantic_expansion",
+                "variant_count": 2,
+                "executed_variant_count": 2,
+                "all_variants_executed": True,
+                "seen_state_verified": True,
+                "ledger_scope": "agent_run_batch",
+                "execution": "host_batch_all",
+                "merged_hit_count": 1,
+                "merged_new_hit_count": 1,
+                "merged_previously_seen_count": 0,
+                "probe_new_hit_count": 1,
+                "probe_repeated_hit_count": 1,
+                "variant_receipts": [
+                    {
+                        "variant_index": 0,
+                        "variant_kind": "synonym",
+                        "node_ids": [7],
+                        "new_hit_count": 1,
+                        "repeated_hit_count": 0,
+                    },
+                    {
+                        "variant_index": 1,
+                        "variant_kind": "relation",
+                        "node_ids": [7],
+                        "new_hit_count": 0,
+                        "repeated_hit_count": 1,
+                    },
+                ],
+            },
+            "auto_context": {
+                "schema_version": "metacodes-auto-context-v1",
+                "selection_policy": "first_new_evidence_then_new_then_merged_v1",
+                "context": {
+                    "node_id": 7,
+                    "graph": {"query": {"root_id": 7}},
+                    "knowledge_governance": {
+                        "schema_version": "metacodes-knowledge-governance-v1",
+                        "trust_state": "evidence_connected_candidate",
+                    },
+                },
+            },
+        }
+        rows = [
+            {"role": "assistant", "blocks": [{
+                "type": "tool_use", "id": "recall", "name": "KgRecall",
+                "input": tool_input,
+            }]},
+            {"role": "user", "blocks": [{
+                "type": "tool_result", "tool_use_id": "recall",
+                "content": json.dumps(payload), "is_error": False,
+            }]},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(transcript, rows)
+            self._write_jsonl(observation, self._journal())
+            tinykg = load_control_metrics(transcript, observation)["tinykg"]
+        self.assertEqual(tinykg["context_calls"], 0)
+        self.assertEqual(tinykg["context_succeeded"], 0)
+        self.assertEqual(tinykg["auto_context_succeeded"], 1)
+        self.assertEqual(tinykg["context_observations"], 1)
+        self.assertEqual(tinykg["context_evidence_connected"], 1)
+
+    def test_control_metrics_reject_v3_variant_receipt_unbound_to_input_or_hits(self):
+        tool_input = {
+            "query": "control memory",
+            "lexical_plan": {
+                "schema_version": "lexical-query-plan-v3",
+                "intent": "fact_lookup",
+                "stage": "seed",
+                "variants": [{"kind": "exact", "text": "control memory"}],
+            },
+        }
+        payload = {
+            "count": 1,
+            "hits": [{"node_id": 1, "seen_before": False}],
+            "lexical_query_plan": {
+                "schema_version": "lexical-query-plan-v3",
+                "plan_sha256": "4" * 64,
+                "intent": "fact_lookup",
+                "stage": "seed",
+                "variant_count": 1,
+                "executed_variant_count": 1,
+                "all_variants_executed": True,
+                "seen_state_verified": True,
+                "ledger_scope": "agent_run_batch",
+                "execution": "host_batch_all",
+                "merged_hit_count": 1,
+                "merged_new_hit_count": 1,
+                "merged_previously_seen_count": 0,
+                "probe_new_hit_count": 1,
+                "probe_repeated_hit_count": 0,
+                "variant_receipts": [{
+                    "variant_index": 0,
+                    "variant_kind": "exact",
+                    "node_ids": [2],
+                    "new_hit_count": 1,
+                    "repeated_hit_count": 0,
+                }],
+            },
+        }
+        rows = [
+            {"role": "assistant", "blocks": [{
+                "type": "tool_use", "id": "recall", "name": "KgRecall", "input": tool_input,
+            }]},
+            {"role": "user", "blocks": [{
+                "type": "tool_result", "tool_use_id": "recall",
+                "content": json.dumps(payload), "is_error": False,
+            }]},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(transcript, rows)
+            self._write_jsonl(observation, self._journal())
+            with self.assertRaisesRegex(TraceError, "unmerged node"):
+                load_control_metrics(transcript, observation)
+
+    def test_control_metrics_reject_malformed_task_list_array(self):
+        cases = (
+            {"tasks": []},
+            ["not-an-object"],
+            [{"parallel_hint": ""}],
+            [{"id": "kg-1", "subject": "Task", "status": "pending",
+              "kg_status": "unknown"}],
+        )
+        for payload in cases:
+            transcript_rows = [
+                {"role": "assistant", "blocks": [{
+                    "type": "tool_use", "id": "list", "name": "TaskList", "input": {}
+                }]},
+                {"role": "user", "blocks": [{
+                    "type": "tool_result", "tool_use_id": "list",
+                    "content": json.dumps(payload), "is_error": False,
+                }]},
+            ]
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                transcript = root / "transcript.jsonl"
+                observation = root / "tool-observations.jsonl"
+                self._write_jsonl(transcript, transcript_rows)
+                self._write_jsonl(observation, self._journal())
+                with self.assertRaises(TraceError):
+                    load_control_metrics(transcript, observation)
+
+    def test_control_metrics_accept_empty_and_local_task_lists_without_kg_evidence(self):
+        calls = (
+            ("empty", []),
+            ("local", [{
+                "id": "1", "subject": "Session task", "status": "in_progress",
+                "blockedBy": [],
+            }]),
+        )
+        transcript_rows = [
+            {"role": "assistant", "blocks": [
+                {"type": "tool_use", "id": call_id, "name": "TaskList", "input": {}}
+                for call_id, _ in calls
+            ]},
+            {"role": "user", "blocks": [
+                {"type": "tool_result", "tool_use_id": call_id,
+                 "content": json.dumps(payload), "is_error": False}
+                for call_id, payload in calls
+            ]},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(transcript, transcript_rows)
+            self._write_jsonl(observation, self._journal())
+            metrics = load_control_metrics(transcript, observation)
+        self.assertEqual(metrics["tinykg"]["task_list_calls"], 2)
+        self.assertEqual(metrics["tinykg"]["task_tinykg_status_results"], 0)
 
     def test_control_metrics_reject_sequence_identity_pairing_and_recall_drift(self):
         cases = []
@@ -620,6 +1219,9 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
             (harness / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
             environment = workbuddy / "datasets/code/tasks/task-a/environment"
             environment.mkdir(parents=True)
+            (environment.parent / "task.toml").write_text(
+                "[task]\nname = 'task-a'\n", encoding="utf-8"
+            )
             (environment / "Dockerfile").write_text(
                 "FROM scratch\n", encoding="utf-8"
             )
@@ -648,6 +1250,8 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
             self.assertEqual(built, observed)
             self.assertEqual(built["target_platform"], "linux/amd64")
             self.assertEqual(built["tasks"]["task-a"]["architecture"], "amd64")
+            self.assertEqual(built["dataset_staging"]["task_count"], 1)
+            self.assertTrue(built["dataset_staging"]["owner_writable"])
             self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
 
             (environment / "Dockerfile").write_text(
@@ -678,6 +1282,9 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
             (harness / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
             environment = workbuddy / "datasets/code/tasks/task-a/environment"
             environment.mkdir(parents=True)
+            (environment.parent / "task.toml").write_text(
+                "[task]\nname = 'task-a'\n", encoding="utf-8"
+            )
             (environment / "Dockerfile").write_text(
                 "FROM scratch\n", encoding="utf-8"
             )
@@ -699,8 +1306,477 @@ class WorkBuddyEnvironmentPreflightTest(unittest.TestCase):
                         docker=docker,
                     )
 
+    def test_preflight_rejects_unselected_readonly_task_before_docker_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            workbuddy = root / "workbuddy"
+            harness = workbuddy / "configs/harnesses/metacodes/docker"
+            harness.mkdir(parents=True)
+            (harness / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            for task in ("task-a", "task-b"):
+                environment = workbuddy / f"datasets/code/tasks/{task}/environment"
+                environment.mkdir(parents=True)
+                (environment / "Dockerfile").write_text(
+                    "FROM scratch\n", encoding="utf-8"
+                )
+                (environment.parent / "task.toml").write_text(
+                    f"[task]\nname = '{task}'\n", encoding="utf-8"
+                )
+            unselected = workbuddy / "datasets/code/tasks/task-b/task.toml"
+            unselected.chmod(0o444)
+            calls: list[list[str]] = []
+
+            def observe_run(argv, **kwargs):
+                calls.append([str(item) for item in argv])
+                return self._fake_run()(argv, **kwargs)
+
+            docker = root / "docker"
+            docker.write_text("fixture\n", encoding="utf-8")
+            docker.chmod(0o755)
+            with mock.patch(
+                "scripts.eval.workbuddy.environment_preflight._run",
+                side_effect=observe_run,
+            ):
+                with self.assertRaisesRegex(
+                    EnvironmentPreflightError,
+                    r"not owner-writable.*task-b/task\.toml",
+                ):
+                    prebuild(
+                        workbuddy=workbuddy,
+                        dataset="datasets/code/tasks",
+                        selected_tasks=["task-a"],
+                        output=root / "preflight.json",
+                        docker=docker,
+                    )
+            self.assertFalse(
+                any("buildx" in call and "build" in call for call in calls)
+            )
+            self.assertFalse((root / "preflight.json").exists())
+
+    def test_preflight_reobserves_unselected_task_toml_and_rejects_links(self):
+        for mutation in ("content", "symlink", "hardlink"):
+            with self.subTest(
+                mutation=mutation
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                os.chmod(root, 0o700)
+                workbuddy = root / "workbuddy"
+                harness = workbuddy / "configs/harnesses/metacodes/docker"
+                harness.mkdir(parents=True)
+                (harness / "Dockerfile").write_text(
+                    "FROM scratch\n", encoding="utf-8"
+                )
+                for task in ("task-a", "task-b"):
+                    environment = (
+                        workbuddy / f"datasets/code/tasks/{task}/environment"
+                    )
+                    environment.mkdir(parents=True)
+                    (environment / "Dockerfile").write_text(
+                        "FROM scratch\n", encoding="utf-8"
+                    )
+                    (environment.parent / "task.toml").write_text(
+                        f"[task]\nname = '{task}'\n", encoding="utf-8"
+                    )
+                docker = root / "docker"
+                docker.write_text("fixture\n", encoding="utf-8")
+                docker.chmod(0o755)
+                receipt = root / "preflight.json"
+                with mock.patch(
+                    "scripts.eval.workbuddy.environment_preflight._run",
+                    side_effect=self._fake_run(),
+                ):
+                    built = prebuild(
+                        workbuddy=workbuddy,
+                        dataset="datasets/code/tasks",
+                        selected_tasks=["task-a"],
+                        output=receipt,
+                        docker=docker,
+                    )
+                self.assertEqual(built["dataset_staging"]["task_count"], 2)
+                target = workbuddy / "datasets/code/tasks/task-b/task.toml"
+                if mutation == "content":
+                    target.write_text(
+                        "[task]\nname = 'task-b-drifted'\n", encoding="utf-8"
+                    )
+                    expected = "staging contract changed"
+                else:
+                    original = target.read_bytes()
+                    target.unlink()
+                    source = root / f"{mutation}-source.toml"
+                    source.write_bytes(original)
+                    if mutation == "symlink":
+                        target.symlink_to(source)
+                        expected = "task.toml is a symlink"
+                    else:
+                        os.link(source, target)
+                        expected = "single-link regular file"
+                with mock.patch(
+                    "scripts.eval.workbuddy.environment_preflight._run",
+                    side_effect=self._fake_run(),
+                ):
+                    with self.assertRaisesRegex(
+                        EnvironmentPreflightError, expected
+                    ):
+                        validate_receipt(
+                            receipt,
+                            workbuddy=workbuddy,
+                            dataset="datasets/code/tasks",
+                            selected_tasks=["task-a"],
+                            inspect_images=True,
+                        )
+
+    def test_preflight_rejects_missing_selected_task_before_docker_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            workbuddy = root / "workbuddy"
+            harness = workbuddy / "configs/harnesses/metacodes/docker"
+            harness.mkdir(parents=True)
+            (harness / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            task = workbuddy / "datasets/code/tasks/task-a"
+            (task / "environment").mkdir(parents=True)
+            (task / "environment/Dockerfile").write_text(
+                "FROM scratch\n", encoding="utf-8"
+            )
+            (task / "task.toml").write_text(
+                "[task]\nname = 'task-a'\n", encoding="utf-8"
+            )
+            docker = root / "docker"
+            docker.write_text("fixture\n", encoding="utf-8")
+            docker.chmod(0o755)
+            calls: list[list[str]] = []
+
+            def observe_run(argv, **kwargs):
+                calls.append([str(item) for item in argv])
+                return self._fake_run()(argv, **kwargs)
+
+            with mock.patch(
+                "scripts.eval.workbuddy.environment_preflight._run",
+                side_effect=observe_run,
+            ):
+                with self.assertRaisesRegex(
+                    EnvironmentPreflightError,
+                    "selected WorkBuddy task is absent.*task-missing",
+                ):
+                    prebuild(
+                        workbuddy=workbuddy,
+                        dataset="datasets/code/tasks",
+                        selected_tasks=["task-missing"],
+                        output=root / "preflight.json",
+                        docker=docker,
+                    )
+            self.assertFalse(
+                any("buildx" in call and "build" in call for call in calls)
+            )
+
+    def test_preflight_rejects_incomplete_official_composite_dataset_before_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            workbuddy = root / "workbuddy"
+            harness = workbuddy / "configs/harnesses/metacodes/docker"
+            harness.mkdir(parents=True)
+            (harness / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            environment = (
+                workbuddy
+                / "datasets/wb-bench-code-v1.0/tasks/task-a/environment"
+            )
+            environment.mkdir(parents=True)
+            (environment / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            (environment.parent / "task.toml").write_text(
+                "[task]\nname = 'task-a'\n", encoding="utf-8"
+            )
+            docker = root / "docker"
+            docker.write_text("fixture\n", encoding="utf-8")
+            docker.chmod(0o755)
+            calls: list[list[str]] = []
+
+            def observe_run(argv, **kwargs):
+                calls.append([str(item) for item in argv])
+                return self._fake_run()(argv, **kwargs)
+
+            with mock.patch(
+                "scripts.eval.workbuddy.environment_preflight._run",
+                side_effect=observe_run,
+            ):
+                with self.assertRaisesRegex(
+                    EnvironmentPreflightError, "missing dataset.toml"
+                ):
+                    prebuild(
+                        workbuddy=workbuddy,
+                        dataset="datasets/wb-bench-code-v1.0/tasks",
+                        selected_tasks=["task-a"],
+                        output=root / "preflight.json",
+                        docker=docker,
+                    )
+            self.assertFalse(any("buildx" in call for call in calls))
+
+            dataset_root = workbuddy / "datasets/wb-bench-code-v1.0"
+            (dataset_root / "dataset.toml").write_text(
+                '[verifier]\nschema = "workbuddy.verifier.v1"\nengine = "composite"\ntimeout_sec = 600.0\n',
+                encoding="utf-8",
+            )
+            calls.clear()
+            with mock.patch(
+                "scripts.eval.workbuddy.environment_preflight._run",
+                side_effect=observe_run,
+            ):
+                with self.assertRaisesRegex(
+                    EnvironmentPreflightError,
+                    "composite verifier implementation is missing",
+                ):
+                    prebuild(
+                        workbuddy=workbuddy,
+                        dataset="datasets/wb-bench-code-v1.0/tasks",
+                        selected_tasks=["task-a"],
+                        output=root / "preflight.json",
+                        docker=docker,
+                    )
+            self.assertFalse(any("buildx" in call for call in calls))
+
+    def test_preflight_binds_and_reobserves_composite_verifier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            workbuddy = root / "workbuddy"
+            harness = workbuddy / "configs/harnesses/metacodes/docker"
+            harness.mkdir(parents=True)
+            (harness / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            dataset_root = workbuddy / "datasets/wb-bench-code-v1.0"
+            environment = dataset_root / "tasks/task-a/environment"
+            environment.mkdir(parents=True)
+            (environment / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            (environment.parent / "task.toml").write_text(
+                "[task]\nname = 'task-a'\n", encoding="utf-8"
+            )
+            (dataset_root / "dataset.toml").write_text(
+                '[verifier]\nschema = "workbuddy.verifier.v1"\nengine = "composite"\n',
+                encoding="utf-8",
+            )
+            shared = dataset_root / "shared/verifier"
+            shared.mkdir(parents=True)
+            plugin = shared / "plugin.py"
+            plugin.write_text("VALUE = 1\n", encoding="utf-8")
+            docker = root / "docker"
+            docker.write_text("fixture\n", encoding="utf-8")
+            docker.chmod(0o755)
+            receipt = root / "preflight.json"
+            with mock.patch(
+                "scripts.eval.workbuddy.environment_preflight._run",
+                side_effect=self._fake_run(),
+            ):
+                built = prebuild(
+                    workbuddy=workbuddy,
+                    dataset="datasets/wb-bench-code-v1.0/tasks",
+                    selected_tasks=["task-a"],
+                    output=receipt,
+                    docker=docker,
+                )
+            self.assertEqual(
+                built["dataset_execution"]["shared_verifier"]["files"], 1
+            )
+            plugin.write_text("VALUE = 2\n", encoding="utf-8")
+            with mock.patch(
+                "scripts.eval.workbuddy.environment_preflight._run",
+                side_effect=self._fake_run(),
+            ):
+                with self.assertRaisesRegex(
+                    EnvironmentPreflightError, "execution contract changed"
+                ):
+                    validate_receipt(
+                        receipt,
+                        workbuddy=workbuddy,
+                        dataset="datasets/wb-bench-code-v1.0/tasks",
+                        selected_tasks=["task-a"],
+                        inspect_images=True,
+                    )
+
+    def test_preflight_rejects_composite_verifier_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            workbuddy = root / "workbuddy"
+            harness = workbuddy / "configs/harnesses/metacodes/docker"
+            harness.mkdir(parents=True)
+            (harness / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            dataset_root = workbuddy / "datasets/wb-bench-code-v1.0"
+            environment = dataset_root / "tasks/task-a/environment"
+            environment.mkdir(parents=True)
+            (environment / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            (environment.parent / "task.toml").write_text(
+                "[task]\nname = 'task-a'\n", encoding="utf-8"
+            )
+            (dataset_root / "dataset.toml").write_text(
+                '[verifier]\nschema = "workbuddy.verifier.v1"\nengine = "composite"\n',
+                encoding="utf-8",
+            )
+            external = root / "external-verifier"
+            external.mkdir()
+            (external / "plugin.py").write_text("VALUE = 1\n", encoding="utf-8")
+            shared = dataset_root / "shared"
+            shared.mkdir()
+            (shared / "verifier").symlink_to(external, target_is_directory=True)
+            docker = root / "docker"
+            docker.write_text("fixture\n", encoding="utf-8")
+            docker.chmod(0o755)
+            calls: list[list[str]] = []
+
+            def observe_run(argv, **kwargs):
+                calls.append([str(item) for item in argv])
+                return self._fake_run()(argv, **kwargs)
+
+            with mock.patch(
+                "scripts.eval.workbuddy.environment_preflight._run",
+                side_effect=observe_run,
+            ):
+                with self.assertRaisesRegex(
+                    EnvironmentPreflightError,
+                    "composite verifier implementation is unsafe",
+                ):
+                    prebuild(
+                        workbuddy=workbuddy,
+                        dataset="datasets/wb-bench-code-v1.0/tasks",
+                        selected_tasks=["task-a"],
+                        output=root / "preflight.json",
+                        docker=docker,
+                    )
+            self.assertFalse(any("buildx" in call for call in calls))
+
 
 class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
+    def test_workbuddy_headless_policy_hides_interactive_plan_without_disabling_tinykg(self):
+        overlay = Path(__file__).parents[1] / "workbuddy/overlay"
+        defaults = yaml.safe_load(
+            (overlay / "configs/harnesses/metacodes/_defaults.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        configured = set(
+            defaults["harness"]["params"]["METACODES_DISALLOWED_TOOLS"].split(",")
+        )
+
+        adapter_path = overlay / "src/workbuddy_bench/agents/metacodes_agent.py"
+        tree = ast.parse(adapter_path.read_text(encoding="utf-8"))
+        adapter_default = None
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if any(
+                isinstance(target, ast.Name)
+                and target.id == "_DEFAULT_DISABLED_TOOLS"
+                for target in node.targets
+            ):
+                adapter_default = ast.literal_eval(node.value)
+                break
+        self.assertIsInstance(adapter_default, str)
+        self.assertEqual(configured, set(adapter_default.split(",")))
+        self.assertTrue(
+            {
+                "Agent", "Task", "TaskBatch", "TeamCreate", "TeamDelete",
+                "SendMessage", "EnterPlanMode", "ExitPlanMode",
+            }.issubset(configured)
+        )
+        self.assertTrue(
+            {
+                "KgRecall", "KgContext", "KgRemember",
+                "TaskCreate", "TaskList", "TaskUpdate",
+            }
+            .isdisjoint(configured)
+        )
+
+    def test_installed_adapter_post_run_accepts_real_task_list_contract(self):
+        checkout_raw = os.environ.get("METACODES_WORKBUDDY_CHECKOUT")
+        if not checkout_raw:
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        checkout = Path(checkout_raw).resolve()
+        if not checkout.is_dir():
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        overlay_installer.validate_installed_overlay(checkout)
+        program = r'''
+import json, tempfile
+from pathlib import Path
+from harbor.models.agent.context import AgentContext
+from workbuddy_bench.agents._metacodes_trace import (
+    OBSERVATION_JOURNAL_SCHEMA, OBSERVATION_FILENAME,
+)
+from workbuddy_bench.agents.metacodes_agent import MetacodesAgent
+
+def write_jsonl(path, rows):
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+with tempfile.TemporaryDirectory() as directory:
+    logs = Path(directory) / "trial" / "agent"
+    logs.mkdir(parents=True)
+    write_jsonl(logs / "metacodes-output.jsonl", [{
+        "type": "result", "stop_reason": "end_turn", "turns": 1,
+        "tool_calls": 1, "input_tokens": 120, "output_tokens": 30,
+        "cache_read_input_tokens": 80, "cache_creation_input_tokens": 10,
+        "cost_usd": 0.01, "text": "done",
+    }])
+    write_jsonl(logs / "metacodes-transcript.jsonl", [
+        {"role": "assistant", "blocks": [{
+            "type": "tool_use", "id": "list-1", "name": "TaskList", "input": {}
+        }]},
+        {"role": "user", "blocks": [{
+            "type": "tool_result", "tool_use_id": "list-1", "is_error": False,
+            "content": json.dumps([
+                {"id": "kg-1", "subject": "Task", "status": "pending",
+                 "kg_status": "open", "readiness": "ready", "plan_step": True},
+                {"parallel_hint": "2 ready tasks can run in parallel"},
+            ]),
+        }]},
+        {"role": "assistant", "blocks": [{"type": "text", "text": "done"}]},
+    ])
+    write_jsonl(logs / OBSERVATION_FILENAME, [
+        {"schema_version": OBSERVATION_JOURNAL_SCHEMA, "sequence": 0,
+         "monotonic_elapsed_ns": 0, "session_id": "session-l2", "run_id": "run-l2",
+         "event": {"run_started": {}}},
+        {"schema_version": OBSERVATION_JOURNAL_SCHEMA, "sequence": 1,
+         "monotonic_elapsed_ns": 1, "session_id": "session-l2", "run_id": "run-l2",
+         "event": {"run_finished": {}}},
+    ])
+    agent = MetacodesAgent(
+        logs, model_name="route-l2", model_params={},
+        METACODES_MODEL_DISPLAY_NAME="glm-5.2",
+        connection={"mode": "local_proxy", "proxy_url": "http://127.0.0.1:1"},
+    )
+    context = AgentContext()
+    agent.populate_context_post_run(context)
+    trajectory = json.loads((logs / "trajectory.json").read_text(encoding="utf-8"))
+    control = trajectory["final_metrics"]["extra"]["control_metrics"]
+    assert control["tinykg"]["task_list_calls"] == 1
+    assert control["tinykg"]["task_tinykg_status_results"] == 1
+    assert context.n_input_tokens == 120
+    assert context.n_cache_tokens == 80
+    assert context.n_output_tokens == 30
+    assert context.cost_usd == 0.01
+'''
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(checkout / "src")
+        subprocess.run(
+            [str(checkout / ".venv/bin/python"), "-c", program],
+            cwd=checkout,
+            env=env,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def test_adapter_keeps_machine_ndjson_stdout_separate_from_diagnostics(self):
+        source = (
+            Path(__file__).parents[1]
+            / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'f"</dev/null | tee {shlex.quote(output_path)}; "',
+            source,
+        )
+        self.assertNotIn(
+            'f"2>&1 </dev/null | tee {shlex.quote(output_path)}; "',
+            source,
+        )
+
     def test_adapter_remote_environment_assertion_is_one_shell_operand(self):
         source = (
             Path(__file__).parents[1]
@@ -723,6 +1799,8 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         self.assertIn(
             'test -z "${TINYKG_REMOTE_URL+x}${TINYKG_API_KEY+x}'
             '${TINYKG_REMOTE_EXPECTED_BUILD_ID+x}${TINYKG_REMOTE_CONFIG+x}'
+            '${METACODES_KG_CONFIG+x}${METACODES_KG_URL+x}${METACODES_KG_API_KEY+x}'
+            '${METACODES_KG_EXPECTED_BUILD_ID+x}${METACODES_KG_EXPECTED_SCHEMA_DIGEST+x}'
             '${METASK_API_KEY+x}" || exit 84',
             command_fragment,
         )
@@ -731,6 +1809,21 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         self.assertIn(
             'raise ValueError("metacodes WorkBuddy trial received remote TinyKG authority")',
             source,
+        )
+
+    def test_adapter_uses_complete_messages_endpoint_so_proxy_rewrites_model(self):
+        source = (
+            Path(__file__).parents[1]
+            / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "escaped_proxy = anthropic_messages_endpoint(self._proxy_url)",
+            source,
+        )
+        self.assertIn('"METACODES_BASE_URL": escaped_proxy', source)
+        self.assertLess(
+            source.index("escaped_proxy = anthropic_messages_endpoint(self._proxy_url)"),
+            source.index('"METACODES_BASE_URL": escaped_proxy'),
         )
 
     def test_overlay_patches_resolve_and_prepare_with_one_mount_contract(self):
@@ -746,10 +1839,36 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
                     + overlay_installer._RESOLVER_MOUNT_OLD
                 ),
                 overlay_installer._PREPARE_JOB_PATH:
-                    overlay_installer._PREPARE_MOUNT_OLD,
+                    (
+                        overlay_installer._PREPARE_AGENT_IDENTITY_OLD
+                        + overlay_installer._PREPARE_MOUNT_OLD
+                    ),
                 overlay_installer._PROXY_CONFIG_PATH: (
                     overlay_installer._PROXY_IMPORT_ANCHOR
                     + overlay_installer._PROXY_KEY_OLD
+                ),
+                overlay_installer._PROXY_LOGGER_PATH: (
+                    overlay_installer._PROXY_LOGGER_INIT_OLD
+                    + overlay_installer._PROXY_LOGGER_REQUEST_OLD
+                    + overlay_installer._PROXY_LOGGER_DISCARD_OLD
+                    + overlay_installer._PROXY_LOGGER_SEQ_OLD
+                    + overlay_installer._PROXY_LOGGER_RECORD_SEQ_OLD
+                ),
+                overlay_installer._PROXY_PIPELINE_PATH: (
+                    overlay_installer._PROXY_PIPELINE_A2O_SIGNATURE_OLD
+                    + overlay_installer._PROXY_PIPELINE_PASSTHROUGH_SIGNATURE_OLD
+                    + overlay_installer._PROXY_PIPELINE_A2O_SENDER_OLD
+                    + overlay_installer._PROXY_PIPELINE_PASSTHROUGH_SENDER_OLD
+                    + overlay_installer._PROXY_PIPELINE_SUBSTREAM_CALLS_OLD
+                    + overlay_installer._PROXY_PIPELINE_A2O_START_OLD
+                    + overlay_installer._PROXY_PIPELINE_A2O_EVENTS_OLD
+                    + overlay_installer._PROXY_PIPELINE_A2O_FINISH_OLD
+                    + overlay_installer._PROXY_PIPELINE_PASSTHROUGH_OLD
+                    + overlay_installer._PROXY_PIPELINE_REWRITE_OLD
+                    + overlay_installer._PROXY_PIPELINE_REWRITE_TAIL_OLD
+                    + overlay_installer._PROXY_PIPELINE_STREAM_STATE_OLD
+                    + overlay_installer._PROXY_PIPELINE_STREAM_LOOP_OLD
+                    + overlay_installer._PROXY_PIPELINE_FINALLY_OLD
                 ),
             }
             for relative, content in fixtures.items():
@@ -777,9 +1896,226 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
             self.assertIn(overlay_installer._RESOLVER_MOUNT_NEW, resolver)
             self.assertIn(overlay_installer._MODEL_ROUTE_NEW, resolver)
             self.assertIn(overlay_installer._PREPARE_MOUNT_NEW, prepare)
+            self.assertIn(overlay_installer._PREPARE_AGENT_IDENTITY_NEW, prepare)
+            proxy_logger = patched[overlay_installer._PROXY_LOGGER_PATH].decode("utf-8")
+            proxy_pipeline = patched[overlay_installer._PROXY_PIPELINE_PATH].decode("utf-8")
+            self.assertIn(overlay_installer._PROXY_LOGGER_REQUEST_NEW, proxy_logger)
+            self.assertIn(overlay_installer._PROXY_LOGGER_DISCARD_NEW, proxy_logger)
+            self.assertIn(overlay_installer._PROXY_PIPELINE_FINALLY_NEW, proxy_pipeline)
+            self.assertIn(overlay_installer._PROXY_PIPELINE_PASSTHROUGH_NEW, proxy_pipeline)
+            self.assertIn('"actor_model_identity": backend_model_name', resolver)
+            self.assertIn(
+                '"transport_model_is_route": connection_mode == "local_proxy"',
+                resolver,
+            )
             self.assertNotIn(overlay_installer._RESOLVER_MOUNT_OLD, resolver)
             self.assertNotIn(overlay_installer._MODEL_ROUTE_OLD, resolver)
             self.assertNotIn(overlay_installer._PREPARE_MOUNT_OLD, prepare)
+            self.assertNotIn(overlay_installer._PREPARE_AGENT_IDENTITY_OLD, prepare)
+
+    def test_adapter_passes_stable_backend_identity_separately_from_route(self):
+        source = (
+            Path(__file__).parents[1]
+            / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('kwargs.pop("METACODES_MODEL_DISPLAY_NAME", "")', source)
+        self.assertIn('"--model", escaped_model', source)
+        self.assertIn('"--model-display-name", escaped_model_display_name', source)
+        self.assertIn('"transport_model_is_route": True', source)
+        self.assertIn('"actor_model_identity": self._model_display_name', source)
+        self.assertIn(
+            'kwargs["METACODES_MODEL_DISPLAY_NAME"] = backend_model_name',
+            overlay_installer._PREPARE_AGENT_IDENTITY_NEW,
+        )
+
+    def test_installed_prepare_job_preserves_route_and_injects_backend_identity(self):
+        checkout_raw = os.environ.get("METACODES_WORKBUDDY_CHECKOUT")
+        if not checkout_raw:
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        checkout = Path(checkout_raw)
+        if not checkout.is_dir():
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        source = checkout / "src/workbuddy_bench/runner/prepare_job.py"
+        if not source.is_file():
+            self.skipTest("WorkBuddy prepare_job is unavailable")
+        route = "paired-control-run--metacodes-glm52"
+        program = r'''
+import json
+from workbuddy_bench.runner.prepare_job import _build_agent_block
+row = _build_agent_block(
+            harness={
+                "name": "metacodes",
+                "import_path": "workbuddy_bench.agents.metacodes_agent:MetacodesAgent",
+                "params": {},
+            },
+            model_slug="metacodes-glm52",
+            model={"name": "glm-5.2", "params": {}},
+            job={},
+            manifest={
+                "connection": {
+                    "effective": "local_proxy",
+                    "proxy_url": "http://host.docker.internal:1234",
+                },
+                "model_connection": "local_proxy",
+                "model_route": "paired-control-run--metacodes-glm52",
+                "backend_model_name": "glm-5.2",
+                "instance_id": "paired-control-run",
+            },
+        )
+print(json.dumps(row))
+'''
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(checkout / "src")
+        completed = subprocess.run(
+            [str(checkout / ".venv/bin/python"), "-c", program],
+            cwd=checkout,
+            env=env,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        row = json.loads(completed.stdout)
+        self.assertEqual(row["model_name"], route)
+        self.assertEqual(
+            row["kwargs"]["connection"]["model_route"], route
+        )
+        self.assertEqual(
+            row["kwargs"]["METACODES_MODEL_DISPLAY_NAME"], "glm-5.2"
+        )
+
+    def test_installed_proxy_persists_terminal_stream_when_client_closes(self):
+        checkout_raw = os.environ.get("METACODES_WORKBUDDY_CHECKOUT")
+        if not checkout_raw:
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        checkout = Path(checkout_raw).resolve()
+        if not checkout.is_dir():
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        overlay_installer.validate_installed_overlay(checkout)
+        program = r'''
+import asyncio, json, tempfile
+from pathlib import Path
+from workbuddy_bench.proxy.config import BackendConfig, ProxyConfig, ProxyMode, RouteConfig
+from workbuddy_bench.proxy.interceptors import RequestContext
+from workbuddy_bench.proxy.pipeline import Pipeline
+
+TERMINAL = (
+    b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1}}}\n\n'
+    b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n'
+    b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+)
+
+class Sender:
+    async def send_stream_raw(self, *args, **kwargs):
+        yield TERMINAL
+
+async def main():
+    with tempfile.TemporaryDirectory() as directory:
+        config = ProxyConfig(log_dir=directory, log_enabled=True)
+        route = RouteConfig(
+            slug="route", mode=ProxyMode.PASSTHROUGH,
+            backend=BackendConfig(url="http://provider.invalid/v1/messages"),
+            backend_model="glm-5.2", client_protocol="anthropic",
+            backend_protocol="anthropic", interceptors=["log"], instance_id="run-l2",
+        )
+        config.routes[route.slug] = route
+        pipeline = Pipeline(config)
+        pipeline.sender = Sender()
+        body = {
+            "model": "route", "system": "stable",
+            "messages": [{"role": "user", "content": "task"}], "stream": True,
+        }
+        context = RequestContext(
+            path="/v1/messages", raw_body=json.dumps(body).encode(),
+            parsed_body=dict(body), route=route,
+        )
+        stream = pipeline.handle_stream(context)
+        assert await anext(stream) == TERMINAL
+        await stream.aclose()
+        rows = [
+            json.loads(line)
+            for line in (Path(directory) / "run-l2.jsonl").read_text().splitlines()
+        ]
+        assert len(rows) == 1
+        assert rows[0]["seq"] == 1
+        assert rows[0]["response"]["status"] == 200
+        assert rows[0]["response"]["stop_reason"] == "end_turn"
+
+asyncio.run(main())
+'''
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(checkout / "src")
+        subprocess.run(
+            [str(checkout / ".venv/bin/python"), "-c", program],
+            cwd=checkout,
+            env=env,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def test_installed_a2o_disconnect_before_sender_is_not_provider_attempt(self):
+        checkout_raw = os.environ.get("METACODES_WORKBUDDY_CHECKOUT")
+        if not checkout_raw:
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        checkout = Path(checkout_raw).resolve()
+        if not checkout.is_dir():
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        overlay_installer.validate_installed_overlay(checkout)
+        program = r'''
+import asyncio, json, tempfile
+from pathlib import Path
+from workbuddy_bench.proxy.config import BackendConfig, ProxyConfig, ProxyMode, RouteConfig
+from workbuddy_bench.proxy.interceptors import RequestContext
+from workbuddy_bench.proxy.pipeline import Pipeline
+
+class Sender:
+    calls = 0
+    async def send_stream(self, *args, **kwargs):
+        self.calls += 1
+        raise AssertionError("provider sender must not start")
+        yield
+
+async def main():
+    with tempfile.TemporaryDirectory() as directory:
+        config = ProxyConfig(log_dir=directory, log_enabled=True)
+        route = RouteConfig(
+            slug="route", mode=ProxyMode.A2O,
+            backend=BackendConfig(url="http://provider.invalid/v1"),
+            backend_model="glm-5.2", client_protocol="anthropic",
+            backend_protocol="openai", interceptors=["log"], instance_id="run-l2",
+        )
+        config.routes[route.slug] = route
+        pipeline = Pipeline(config)
+        pipeline.sender = Sender()
+        body = {
+            "model": "route", "system": "stable",
+            "messages": [{"role": "user", "content": "task"}], "stream": True,
+        }
+        context = RequestContext(
+            path="/v1/messages", raw_body=json.dumps(body).encode(),
+            parsed_body=dict(body), route=route,
+        )
+        stream = pipeline.handle_stream(context)
+        first = await anext(stream)
+        assert b"message_start" in first
+        await stream.aclose()
+        assert pipeline.sender.calls == 0
+        log_path = Path(directory) / "run-l2.jsonl"
+        assert not log_path.exists() or not log_path.read_text().strip()
+
+asyncio.run(main())
+'''
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(checkout / "src")
+        subprocess.run(
+            [str(checkout / ".venv/bin/python"), "-c", program],
+            cwd=checkout,
+            env=env,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
 
     def test_digest_detects_changes_before_owned_overlay_replacement(self):
         rows = [(Path("a"), b"one"), (Path("b"), b"two")]
@@ -833,6 +2169,8 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         self.assertEqual(
             job["harness_params_override"],
             {
+                "METACODES_VERIFICATION_CHECKPOINT": False,
+                "METACODES_PROJECT_CONTROL_MODE": "enforced",
                 "METACODES_PROJECT_RULES_RELATIVE": (
                     "share/metacodes/workbuddy-w05/project-rules"
                 ),
@@ -849,6 +2187,78 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         )
         self.assertEqual(model["max_concurrent"], 1)
         self.assertEqual(model["context_window"], job["context_window"])
+
+    def test_paid_code_baseline_differs_only_by_control_actuation_and_result_root(self):
+        root = Path(__file__).parents[1] / "workbuddy/overlay/configs/jobs"
+        baseline = yaml.safe_load(
+            (root / "metacodes-glm52-code-3-baseline.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        treatment = yaml.safe_load(
+            (root / "metacodes-glm52-code-3-canary.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        baseline_root = baseline.pop("jobs_dir")
+        treatment_root = treatment.pop("jobs_dir")
+        self.assertNotEqual(baseline_root, treatment_root)
+        baseline_mode = baseline["harness_params_override"].pop(
+            "METACODES_PROJECT_CONTROL_MODE"
+        )
+        treatment_mode = treatment["harness_params_override"].pop(
+            "METACODES_PROJECT_CONTROL_MODE"
+        )
+        self.assertEqual("disabled", baseline_mode)
+        self.assertEqual("enforced", treatment_mode)
+        self.assertEqual(treatment, baseline)
+
+    def test_checkpoint_pair_differs_only_by_explicit_boolean_and_result_root(self):
+        root = Path(__file__).parents[1] / "workbuddy/overlay/configs/jobs"
+        baseline = yaml.safe_load(
+            (root / "metacodes-glm52-code-1-checkpoint-baseline.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        treatment = yaml.safe_load(
+            (root / "metacodes-glm52-code-1-checkpoint-treatment.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertNotEqual(baseline.pop("jobs_dir"), treatment.pop("jobs_dir"))
+        baseline_checkpoint = baseline["harness_params_override"].pop(
+            "METACODES_VERIFICATION_CHECKPOINT"
+        )
+        treatment_checkpoint = treatment["harness_params_override"].pop(
+            "METACODES_VERIFICATION_CHECKPOINT"
+        )
+        self.assertIs(baseline_checkpoint, False)
+        self.assertIs(treatment_checkpoint, True)
+        self.assertEqual(
+            "disabled",
+            baseline["harness_params_override"]["METACODES_PROJECT_CONTROL_MODE"],
+        )
+        self.assertEqual(treatment, baseline)
+
+    def test_adapter_runtime_contract_reobserves_disabled_active_bundle_absence(self):
+        source = (
+            Path(__file__).parents[1]
+            / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('test -d "$project_source" || exit 78', source)
+        self.assertIn('test -x "$project_kernel" || exit 83', source)
+        self.assertIn(
+            '/project-rules/active.json" || exit 88',
+            source,
+        )
+        self.assertIn("project_setup += disabled_bundle_check", source)
+        self.assertIn("project_postcheck = disabled_bundle_check", source)
+        self.assertIn(
+            "unset METACODES_PROJECT_KERNEL_PATH METACODES_PROJECT_KERNEL_SHA256",
+            source,
+        )
+        self.assertIn('"artifacts_verified": True', source)
+        self.assertIn('"runtime_active_bundle_absent": (', source)
 
     def test_paid_code_probe_is_frozen_to_first_code_dev_task(self):
         root = Path(__file__).parents[1] / "workbuddy"
@@ -871,6 +2281,8 @@ class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
         self.assertEqual(
             job["harness_params_override"],
             {
+                "METACODES_VERIFICATION_CHECKPOINT": False,
+                "METACODES_PROJECT_CONTROL_MODE": "enforced",
                 "METACODES_PROJECT_RULES_RELATIVE": (
                     "share/metacodes/workbuddy-w05/project-rules"
                 ),

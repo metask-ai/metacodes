@@ -184,7 +184,7 @@ const PLATFORM: []const u8 = switch (@import("builtin").os.tag) {
 
 /// 拼 # Environment 段，返回 allocator-owned string。
 /// cwd 由调用方提供(CLI 传进程 cwd,Session 传 workspace.root)——库不预设 cwd 来源。
-fn buildEnvSection(allocator: std.mem.Allocator, model: []const u8, cwd: []const u8) ![]u8 {
+fn buildEnvSection(allocator: std.mem.Allocator, model_identity: []const u8, cwd: []const u8) ![]u8 {
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
 
@@ -227,12 +227,12 @@ fn buildEnvSection(allocator: std.mem.Allocator, model: []const u8, cwd: []const
 
     // 模型描述 —— 不从 TS 的 marketingName 表里拉（Zig 端没维护），直接用 model id
     {
-        const s = try std.fmt.allocPrint(allocator, " - You are powered by the model {s}.\n", .{model});
+        const s = try std.fmt.allocPrint(allocator, " - You are powered by the model {s}.\n", .{model_identity});
         defer allocator.free(s);
         try buf.appendSlice(allocator, s);
     }
 
-    if (getKnowledgeCutoff(model)) |cut| {
+    if (getKnowledgeCutoff(model_identity)) |cut| {
         const s = try std.fmt.allocPrint(allocator, " - Assistant knowledge cutoff is {s}.\n", .{cut});
         defer allocator.free(s);
         try buf.appendSlice(allocator, s);
@@ -411,6 +411,84 @@ fn buildDeferredToolsSection(
     return try buf.toOwnedSlice(allocator);
 }
 
+/// Keep the deferred-tool catalog in an already-built system prompt consistent
+/// with the runtime tool pool. `buildFull` runs while App initializes, but a
+/// per-run execution policy or active Skill can narrow that pool later in
+/// `agent_loop`. Without this projection the provider schema can correctly hide
+/// a tool while the prompt still tells the model to activate it.
+///
+/// Returns an owned replacement only when the prompt must change. The common
+/// path returns null so the stable prompt bytes (and provider cache prefix) stay
+/// untouched.
+pub fn projectDeferredToolsForExecution(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    catalog_defs: []const @import("../json.zig").ToolDefinition,
+    visible_defs: []const @import("../json.zig").ToolDefinition,
+) !?[]u8 {
+    const marker = "# Deferred tools\n";
+    const section_start = std.mem.indexOf(u8, prompt, marker) orelse return null;
+    const after_marker = section_start + marker.len;
+    const section_end = if (std.mem.indexOf(u8, prompt[after_marker..], "\n\n# ")) |rel|
+        after_marker + rel
+    else
+        prompt.len;
+
+    const tool_search_visible = hasToolDefinition(visible_defs, "ToolSearch", false);
+    const section = prompt[section_start..section_end];
+    var projected: std.ArrayList(u8) = .empty;
+    defer projected.deinit(allocator);
+    var changed = !tool_search_visible;
+    var kept_tools: usize = 0;
+
+    var lines = std.mem.splitScalar(u8, section, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        const keep = blk: {
+            if (!std.mem.startsWith(u8, line, "- ")) break :blk true;
+            const rest = line[2..];
+            const name_end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+            const name = rest[0..name_end];
+            const allowed = tool_search_visible and hasToolDefinition(catalog_defs, name, true);
+            if (allowed) kept_tools += 1 else changed = true;
+            break :blk allowed;
+        };
+        if (!keep) continue;
+        if (!first) try projected.append(allocator, '\n');
+        try projected.appendSlice(allocator, line);
+        first = false;
+    }
+
+    if (!changed) return null;
+
+    // No activation path remains: remove the whole section and exactly one
+    // surrounding separator. Avoid leaving four blank lines between headings.
+    if (kept_tools == 0) {
+        var replace_start = section_start;
+        var replace_end = section_end;
+        if (section_start >= 2 and std.mem.eql(u8, prompt[section_start - 2 .. section_start], "\n\n")) {
+            replace_start -= 2;
+        } else if (section_end + 2 <= prompt.len and std.mem.eql(u8, prompt[section_end .. section_end + 2], "\n\n")) {
+            replace_end += 2;
+        }
+        return try std.mem.concat(allocator, u8, &.{ prompt[0..replace_start], prompt[replace_end..] });
+    }
+
+    return try std.mem.concat(allocator, u8, &.{ prompt[0..section_start], projected.items, prompt[section_end..] });
+}
+
+fn hasToolDefinition(
+    definitions: []const @import("../json.zig").ToolDefinition,
+    name: []const u8,
+    require_deferred: bool,
+) bool {
+    for (definitions) |definition| {
+        if (!std.mem.eql(u8, definition.name, name)) continue;
+        return !require_deferred or definition.deferred;
+    }
+    return false;
+}
+
 /// 按当前工具集动态拼 # Using your tools 段（对应 cc getUsingYourToolsSection）。
 /// 动态耦合:
 /// - 无 Grep → 去掉 "use Grep instead of grep" 子条
@@ -513,15 +591,17 @@ test "KG prompt enforces staged semantic neighborhood only when KG is ready" {
     const with_kg = try buildFull(testing.allocator, "claude-opus-4-7", null, null, null, "", true, "/tmp");
     defer testing.allocator.free(with_kg);
     try testing.expect(std.mem.indexOf(u8, with_kg, "computes no embeddings or vector distance") != null);
-    try testing.expect(std.mem.indexOf(u8, with_kg, "2-4 separate compact semantic variants") != null);
-    try testing.expect(std.mem.indexOf(u8, with_kg, "make at most four semantic-variant calls") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "one fixed 2-4 member non-exact semantic batch") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "host executes at most four semantic probes per run") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "ENUMERATION REQUIRES COVERAGE") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "successful v3 receipt proves every member ran") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "ALIAS BRANCH HAS PRIORITY") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "EXACT/HIGH-PRECISION SEED") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "mechanism, symptom, desired outcome, or nearby implementation term") != null);
-    try testing.expect(std.mem.indexOf(u8, with_kg, "one plausible broader or narrower concept") != null);
-    try testing.expect(std.mem.indexOf(u8, with_kg, "Deduplicate candidates by node_id across every call") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "one plausible broader/narrower concept") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "merges by node_id") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "KgContext") != null);
-    try testing.expect(std.mem.indexOf(u8, with_kg, "Stop as soon as authoritative evidence and any required current-state check are sufficient") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "For non-enumeration lookups, stop as soon as authoritative evidence") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "Persistent task control-plane algorithm") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "A title or compact summary alone is insufficient") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "never leave finished work claimed/open") != null);
@@ -536,6 +616,48 @@ test "KG prompt enforces staged semantic neighborhood only when KG is ready" {
     try testing.expect(std.mem.indexOf(u8, without_kg, "Persistent task control-plane algorithm") == null);
     try testing.expect(std.mem.indexOf(u8, without_kg, "# Deferred tools") == null);
     try testing.expect(std.mem.indexOf(u8, without_kg, "FormalAuditTask") == null);
+}
+
+test "deferred prompt projection follows runtime catalog without changing stable common path" {
+    const ToolDefinition = @import("../json.zig").ToolDefinition;
+    const prompt =
+        \\# Before
+        \\stable
+        \\
+        \\# Deferred tools
+        \\Activate one.
+        \\- Alpha — first
+        \\- Beta — second
+        \\
+        \\# After
+        \\stable
+    ;
+    const catalog = [_]ToolDefinition{
+        .{ .name = "ToolSearch", .description = "search", .input_schema = .{} },
+        .{ .name = "Alpha", .description = "first", .input_schema = .{}, .deferred = true },
+        .{ .name = "Beta", .description = "second", .input_schema = .{}, .deferred = true },
+    };
+    const unchanged = try projectDeferredToolsForExecution(testing.allocator, prompt, &catalog, &catalog);
+    try testing.expect(unchanged == null);
+
+    const alpha_only = [_]ToolDefinition{
+        catalog[0],
+        catalog[1],
+    };
+    const projected = (try projectDeferredToolsForExecution(testing.allocator, prompt, &alpha_only, &alpha_only)) orelse
+        return error.TestUnexpectedResult;
+    defer testing.allocator.free(projected);
+    try testing.expect(std.mem.indexOf(u8, projected, "- Alpha") != null);
+    try testing.expect(std.mem.indexOf(u8, projected, "- Beta") == null);
+    try testing.expect(std.mem.indexOf(u8, projected, "# Before\nstable\n\n# Deferred tools") != null);
+    try testing.expect(std.mem.indexOf(u8, projected, "\n\n# After\nstable") != null);
+
+    const no_search = [_]ToolDefinition{catalog[1]};
+    const removed = (try projectDeferredToolsForExecution(testing.allocator, prompt, &no_search, &no_search)) orelse
+        return error.TestUnexpectedResult;
+    defer testing.allocator.free(removed);
+    try testing.expect(std.mem.indexOf(u8, removed, "# Deferred tools") == null);
+    try testing.expect(std.mem.indexOf(u8, removed, "# Before\nstable\n\n# After") != null);
 }
 
 test "knowledge cutoff maps opus-4-7" {

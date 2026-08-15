@@ -218,6 +218,9 @@ pub const App = struct {
     transcript_writer: ?transcript.Writer = null,
     /// 本 session 累计用量（跨多 turn）
     usage: UsageTotals = .{},
+    /// Internal-only large-result projection/recovery counters. Evaluation
+    /// and formal observation adapters may snapshot these; no UI owns them.
+    tool_result_metrics: @import("core/tool_result_metrics.zig").Metrics = .{},
     /// 从 config.json 加载的细粒度权限规则；null 时仅靠四模式兜底
     rule_set: ?permission_mod.RuleSet = null,
     /// 5 层 settings 聚合(allow/ask/deny + additionalDirectories + disable flags)。
@@ -557,12 +560,13 @@ pub const App = struct {
             if (app.lsp_service != null) @import("util/log.zig").info("lsp", "LSP passive diagnostics enabled (--lsp)", .{});
         }
 
-        // 构造 system prompt（依赖 config.model）。# Using your tools 段按 enabled_tool_names
+        // 构造 system prompt。显式 display identity 只作用于模型自述/knowledge
+        // cutoff；真实 transport model 仍独立驱动 provider、catalog、pricing 与 context。
         // 动态裁剪（对应 cc getUsingYourToolsSection(enabledTools)）。失败仅 log，保持 null。
         // 环境段 cwd 用进程 cwd(CLI 语义);Session 库消费方用 workspace.root(见 agent_session)。
         const cli_cwd = @import("util/fs.zig").getCwd(allocator) catch "";
         defer if (cli_cwd.len > 0) allocator.free(cli_cwd);
-        app.system_prompt = system_prompt_mod.buildFull(allocator, app.config.model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), cli_cwd) catch |err| blk: {
+        app.system_prompt = system_prompt_mod.buildFull(allocator, app.config.model_display_name orelse app.config.model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), cli_cwd) catch |err| blk: {
             @import("util/log.zig").warn("sysprompt", "build failed: {s} (continuing without system prompt)", .{@errorName(err)});
             break :blk null;
         };
@@ -789,6 +793,9 @@ pub const App = struct {
         const sp_mod = @import("core/system_prompt.zig");
         const sw_cwd = @import("util/fs.zig").getCwd(app.allocator) catch "";
         defer if (sw_cwd.len > 0) app.allocator.free(sw_cwd);
+        // The startup display identity is bound to the startup transport route.
+        // An explicit /model switch selects a new real model and must not keep
+        // advertising the old backend identity.
         const new_system_prompt = sp_mod.buildFull(app.allocator, model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), sw_cwd) catch null;
 
         // U3:先同步全部 model 值镜像(seam,不含 config.model=启动快照/system_prompt=派生重建/

@@ -1,0 +1,6 @@
+[
+  "canonicalize_archive_limits_env_v4",
+  "replace_node_inventory_json_v4",
+  "regenerate_lifecycle_yaml_v4",
+  "rewrite_proxy_conf_v4"
+]

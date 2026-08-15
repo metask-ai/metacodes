@@ -200,7 +200,7 @@ const AutoRecoveryDispatchProbe = struct {
     fn emit(raw: *anyopaque, event: cc.tools.tool_observation.Event) bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
         switch (event) {
-            .formal_decision, .formal_decision_batch => {},
+            .rule_filter, .formal_decision, .formal_decision_batch => {},
             .dispatch_started => |started| {
                 self.starts += 1;
                 self.requested_write = std.mem.eql(u8, started.requested_name, "Write");
@@ -253,7 +253,7 @@ const RejectDispatchStartSink = struct {
     fn emit(raw: *anyopaque, event: cc.tools.tool_observation.Event) bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
         return switch (event) {
-            .formal_decision, .formal_decision_batch => blk: {
+            .rule_filter, .formal_decision, .formal_decision_batch => blk: {
                 self.formal_events += 1;
                 break :blk true;
             },
@@ -639,7 +639,9 @@ test "L2 rejected auto-recovery dispatch start cancels inflight authorization" {
     const after = try readArtifact(allocator, path);
     defer allocator.free(after);
     try std.testing.expectEqualStrings("before\n", after);
-    try std.testing.expectEqual(@as(usize, 2), sink_state.formal_events);
+    // Both the denied Write and its synthesized Edit emit one non-authority
+    // filter event before their authority-bearing Lean batch.
+    try std.testing.expectEqual(@as(usize, 4), sink_state.formal_events);
     try std.testing.expectEqual(@as(usize, 1), sink_state.rejected_starts);
     try std.testing.expectEqual(@as(usize, 0), runtime.exact_edit_obligations_len);
     try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
@@ -1216,7 +1218,7 @@ test "L2 rejected dispatch start cancels exact recovery inflight state" {
     );
     try std.testing.expect(rejected == .host_fatal);
     try std.testing.expectEqual(@as(usize, 1), sink_state.rejected_starts);
-    try std.testing.expectEqual(@as(usize, 1), sink_state.formal_events);
+    try std.testing.expectEqual(@as(usize, 2), sink_state.formal_events);
     try std.testing.expectEqual(@as(usize, 0), runtime.exact_edit_obligations_len);
     try std.testing.expectEqual(@as(usize, 0), runtime.inflight_exact_edits_len);
     const unchanged = try readArtifact(allocator, path);
@@ -1401,7 +1403,11 @@ test "L2 governed executeOne rejects detached Bash and Monitor before process cr
         },
         else => return error.UnexpectedToolResult,
     }
-    try std.testing.expectEqual(@as(usize, 0), jobs.jobs.items.len);
+    // The governed synchronous run still spools through the JobRegistry (the
+    // gate disables only auto-backgrounding), so a completed entry may remain;
+    // what must hold is that nothing keeps running past the tool return.
+    try std.testing.expectEqual(@as(usize, 0), jobs.runningCount());
+    const entries_after_foreground = jobs.jobs.items.len;
 
     const monitor = try cc.tool_exec.executeOne(
         &ctx,
@@ -1423,7 +1429,9 @@ test "L2 governed executeOne rejects detached Bash and Monitor before process cr
         },
         else => return error.UnexpectedToolResult,
     }
-    try std.testing.expectEqual(@as(usize, 0), jobs.jobs.items.len);
+    // Blocked before process creation: no new registry entry and nothing runs.
+    try std.testing.expectEqual(entries_after_foreground, jobs.jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), jobs.runningCount());
     try std.testing.expectEqual(@as(usize, 3), probe.pre_calls);
     try std.testing.expectEqual(@as(usize, 3), probe.post_calls);
     try std.testing.expectEqual(
@@ -2225,7 +2233,9 @@ test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edi
     // The unrelated Edit, exact recovery and new-file Write reached dispatch;
     // the prohibited Write, partial Edit and directory Write did not.
     try std.testing.expectEqual(@as(usize, 3), observed.dispatches.len);
-    try std.testing.expectEqual(@as(usize, 9), observed.formal_decisions.len);
+    // The unrelated Edit now closes through zero-checker filter events. It no
+    // longer fabricates two admissions from a Write-targeted rule.
+    try std.testing.expectEqual(@as(usize, 7), observed.formal_decisions.len);
     var blocked_regular: usize = 0;
     var admitted_missing: usize = 0;
     var blocked_other: usize = 0;
@@ -2244,8 +2254,8 @@ test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edi
 
     var impact = try cc.rule_impact_stats.derive(allocator, &observed, .{});
     defer impact.deinit(allocator);
-    try std.testing.expectEqual(@as(u64, 9), impact.formal_decisions);
-    try std.testing.expectEqual(@as(u64, 9), impact.physical_checker_calls);
+    try std.testing.expectEqual(@as(u64, 7), impact.formal_decisions);
+    try std.testing.expectEqual(@as(u64, 7), impact.physical_checker_calls);
     try std.testing.expectEqual(@as(u64, 1), impact.exact_edit_recovery_directions);
     try std.testing.expectEqual(@as(u64, 1), impact.exact_edit_recovery_pre_admits);
     try std.testing.expectEqual(@as(u64, 1), impact.exact_edit_recovery_pre_blocks);
@@ -2625,8 +2635,10 @@ test "L2 normal RunControl finish publishes a bound operational observer" {
         );
         defer loaded.deinit();
         try std.testing.expectEqualStrings("end_turn", loaded.stop_reason);
-        try std.testing.expectEqual(@as(u64, 2), loaded.snapshot.formal_decisions);
-        try std.testing.expectEqual(@as(u64, 2), loaded.snapshot.physical_checker_calls);
+        // This active rule targets Write; the Read is auditable through two
+        // zero-checker filter events and contributes no formal decisions.
+        try std.testing.expectEqual(@as(u64, 0), loaded.snapshot.formal_decisions);
+        try std.testing.expectEqual(@as(u64, 0), loaded.snapshot.physical_checker_calls);
         try std.testing.expectEqual(@as(u64, 1), loaded.snapshot.authoritative_dispatches);
         try std.testing.expectEqual(@as(u64, 1), loaded.snapshot.authoritative_successes);
         try std.testing.expect(loaded.snapshot.labels.task_success == null);
@@ -2810,6 +2822,15 @@ fn syntheticActive(
     rule_count: usize,
     config: cc.project_harness_runtime.Config,
 ) !cc.project_rule_bundle.LoadedActive {
+    return syntheticActiveForTool(allocator, rule_count, config, "Write");
+}
+
+fn syntheticActiveForTool(
+    allocator: std.mem.Allocator,
+    rule_count: usize,
+    config: cc.project_harness_runtime.Config,
+    target_tool: []const u8,
+) !cc.project_rule_bundle.LoadedActive {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -2820,16 +2841,13 @@ fn syntheticActive(
         const candidate = cc.tools.tool_observation.sha256Hex(name);
         rule.* = .{
             .candidate_id = try a.dupe(u8, &candidate),
-            // The real dispatch below is Read. Every rule must therefore
-            // admit independently in both phases while still producing one
-            // candidate-bound verdict per entry.
             .rule_spec = cc.project_rule_spec.toWire(.{
-                .target_tool = "Write",
+                .target_tool = target_tool,
                 .deny_target = false,
                 .max_input_bytes = 8192,
                 .max_agent_depth = 4,
                 .authoritative_only = true,
-                .effect_requirement = .file_mutation_v1_reobserved,
+                .effect_requirement = .none,
             }),
         };
     }
@@ -2884,6 +2902,69 @@ fn syntheticOrderedRecoveryActive(
     };
     rules[0] = if (recovery_first) recovery else generic;
     rules[1] = if (recovery_first) generic else recovery;
+    return .{
+        .arena = arena,
+        .project_sha256 = .{'a'} ** 64,
+        .bundle_sha256 = .{'b'} ** 64,
+        .revision = 7,
+        .kernel_sha256 = config.expected_sha256,
+        .promotion_receipt_id = .{'c'} ** 64,
+        .promotion_request_sha256 = .{'d'} ** 64,
+        .promotion_verdict_sha256 = .{'e'} ** 64,
+        .active_pointer_sha256 = .{'f'} ** 64,
+        .rules = rules,
+    };
+}
+
+fn syntheticRecoveryWithEditAndBash(
+    allocator: std.mem.Allocator,
+    config: cc.project_harness_runtime.Config,
+) !cc.project_rule_bundle.LoadedActive {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const rules = try a.alloc(cc.project_rule_bundle.RuleEntry, 3);
+    const source_id = cc.tools.tool_observation.sha256Hex("mixed-recovery-source");
+    const edit_id = cc.tools.tool_observation.sha256Hex("mixed-recovery-edit");
+    const bash_id = cc.tools.tool_observation.sha256Hex("mixed-recovery-bash");
+    const source = cc.project_rule_bundle.RuleEntry{
+        .candidate_id = try a.dupe(u8, &source_id),
+        .rule_spec = cc.project_rule_spec.toWire(.{
+            .target_tool = "Write",
+            .target_scope = .existing_file,
+            .deny_target = true,
+            .max_input_bytes = 8192,
+            .max_agent_depth = 4,
+            .authoritative_only = true,
+            .effect_requirement = .none,
+        }),
+    };
+    const edit = cc.project_rule_bundle.RuleEntry{
+        .candidate_id = try a.dupe(u8, &edit_id),
+        .rule_spec = cc.project_rule_spec.toWire(.{
+            .target_tool = "Edit",
+            .deny_target = false,
+            .max_input_bytes = 8192,
+            .max_agent_depth = 4,
+            .authoritative_only = true,
+            .effect_requirement = .file_mutation_v1_reobserved,
+        }),
+    };
+    rules[0] = edit;
+    rules[1] = .{
+        .candidate_id = try a.dupe(u8, &bash_id),
+        .rule_spec = cc.project_rule_spec.toWire(.{
+            .target_tool = "Bash",
+            .deny_target = true,
+            .max_input_bytes = 8192,
+            .max_agent_depth = 4,
+            .authoritative_only = true,
+            .effect_requirement = .none,
+        }),
+    };
+    // Deliberately place the source obligation after the Edit rule. Runtime
+    // recovery ordering must still evaluate and record the source first.
+    rules[2] = source;
     return .{
         .arena = arena,
         .project_sha256 = .{'a'} ** 64,
@@ -3043,7 +3124,7 @@ test "L2 multi-target recovery keeps obligations independent and journals one mi
         if (!std.mem.eql(u8, decision.dispatch_id, "multi-target-a-edit") or
             decision.phase != .pre)
             continue;
-        try std.testing.expectEqual(@as(u32, 2), decision.checker_batch_size);
+        try std.testing.expectEqual(@as(u32, 1), decision.checker_batch_size);
         if (pre_sequence) |sequence|
             try std.testing.expectEqual(sequence, decision.sequence)
         else
@@ -3063,11 +3144,11 @@ test "L2 multi-target recovery keeps obligations independent and journals one mi
         }
     }
     try std.testing.expectEqual(@as(usize, 1), recovery_pre);
-    try std.testing.expectEqual(@as(usize, 1), ordinary_pre);
+    try std.testing.expectEqual(@as(usize, 0), ordinary_pre);
 
     var impact = try cc.rule_impact_stats.derive(allocator, &observed, .{});
     defer impact.deinit(allocator);
-    try std.testing.expectEqual(@as(u64, 10), impact.formal_decisions);
+    try std.testing.expectEqual(@as(u64, 6), impact.formal_decisions);
     try std.testing.expectEqual(@as(u64, 6), impact.physical_checker_calls);
     try std.testing.expectEqual(@as(u64, 2), impact.exact_edit_recovery_directions);
     try std.testing.expectEqual(@as(u64, 2), impact.exact_edit_recovery_pre_admits);
@@ -3221,7 +3302,7 @@ fn runBatchRuntimeFixture(rule_count: usize) !BatchRuntimeStats {
     defer allocator.free(evidence_dir);
     try cc.util_fs.mkdirParents(evidence_dir);
 
-    var active = try syntheticActive(allocator, rule_count, config);
+    var active = try syntheticActiveForTool(allocator, rule_count, config, "Read");
     defer active.deinit();
     var runtime = cc.project_rule_gate.RuntimeGate{
         .allocator = allocator,
@@ -3328,6 +3409,279 @@ test "L2 project rule batch runtime uses two checker calls for 4 rules" {
     _ = try runBatchRuntimeFixture(4);
 }
 
+test "L2 target mismatch skips checker while retaining auditable dispatch filters" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
+    defer allocator.free(evidence_dir);
+    try cc.util_fs.mkdirParents(evidence_dir);
+    const checker_path = try std.fmt.allocPrint(allocator, "{s}/must-not-run", .{root});
+    defer allocator.free(checker_path);
+    const marker_path = try std.fmt.allocPrint(allocator, "{s}/checker-ran", .{root});
+    defer allocator.free(marker_path);
+    const checker_script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\nprintf ran > '{s}'\nexit 91\n",
+        .{marker_path},
+    );
+    defer allocator.free(checker_script);
+    try overwriteArtifact(allocator, checker_path, checker_script);
+    const checker_z = try allocator.dupeZ(u8, checker_path);
+    defer allocator.free(checker_z);
+    if (std.c.chmod(checker_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    const config = cc.project_harness_runtime.Config{
+        .checker_path = checker_path,
+        .expected_sha256 = cc.tools.tool_observation.sha256Hex(checker_script),
+    };
+    var active = try syntheticActive(allocator, 2, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+    };
+    const sid = cc.session_id.SessionId.fromSlice("2123456789abcdef01234567").?;
+    var journal = try cc.tool_observation_journal.Journal.init(evidence_dir, sid);
+    const sink = journal.sink();
+    runtime.evidence_dir = evidence_dir;
+    runtime.observation_sink = sink;
+    var probe = Probe{};
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.tool_dispatcher = probe.dispatcher();
+    ctx.project_rule_gate = runtime.protocolGate();
+    ctx.tool_observer = sink;
+
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Read",
+        "{}",
+        "zero-match-no-checker",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(!done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    const marker_z = try allocator.dupeZ(u8, marker_path);
+    defer allocator.free(marker_z);
+    const marker_fd = pfs.open(marker_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (marker_fd >= 0) {
+        _ = pfs.close(marker_fd);
+        return error.CheckerUnexpectedlyRan;
+    }
+    try journal.finishRun("end_turn");
+    const binding = try journal.runBinding();
+    journal.deinit();
+
+    var observed = try cc.tool_observation_journal.loadRunDispatches(
+        allocator,
+        evidence_dir,
+        binding,
+    );
+    defer observed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), observed.formal_decisions.len);
+    try std.testing.expectEqual(@as(usize, 2), observed.rule_filters.len);
+    for (observed.rule_filters) |filter| {
+        try std.testing.expectEqual(@as(u32, 2), filter.active_rule_count);
+        try std.testing.expectEqual(@as(u32, 0), filter.checker_rule_count);
+        try std.testing.expectEqual(@as(u32, 2), filter.statically_pruned_rule_count);
+    }
+}
+
+test "L2 exact recovery retains source and Edit rules while pruning unrelated tools" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
+    defer allocator.free(evidence_dir);
+    try cc.util_fs.mkdirParents(evidence_dir);
+    const path = try std.fmt.allocPrint(allocator, "{s}/mixed-rules.txt", .{root});
+    defer allocator.free(path);
+    try overwriteArtifact(allocator, path, "before\n");
+
+    var active = try syntheticRecoveryWithEditAndBash(allocator, config);
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+        .auto_exact_edit_recovery = true,
+    };
+    const sid = cc.session_id.SessionId.fromSlice("3123456789abcdef01234567").?;
+    var journal = try cc.tool_observation_journal.Journal.init(evidence_dir, sid);
+    const sink = journal.sink();
+    runtime.evidence_dir = evidence_dir;
+    runtime.observation_sink = sink;
+    var read_state = cc.core_read_state.ReadState.init(allocator);
+    defer read_state.deinit();
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.read_state = &read_state;
+    ctx.project_rule_gate = runtime.protocolGate();
+    ctx.tool_observer = sink;
+    const write_args = try std.json.Stringify.valueAlloc(allocator, .{
+        .file_path = path,
+        .content = "after\n",
+    }, .{});
+    defer allocator.free(write_args);
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        write_args,
+        "mixed-recovery",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            try std.testing.expect(!done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    try journal.finishRun("end_turn");
+    const binding = try journal.runBinding();
+    journal.deinit();
+
+    var observed = try cc.tool_observation_journal.loadRunDispatches(
+        allocator,
+        evidence_dir,
+        binding,
+    );
+    defer observed.deinit();
+    try std.testing.expectEqual(@as(usize, 3), observed.rule_filters.len);
+    try std.testing.expectEqual(
+        cc.tools.tool_observation.RuleFilterOperation.ordinary,
+        observed.rule_filters[0].operation,
+    );
+    try std.testing.expectEqual(@as(u32, 1), observed.rule_filters[0].checker_rule_count);
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        observed.rule_filters[0].statically_pruned_rule_count,
+    );
+    for (observed.rule_filters[1..]) |filter| {
+        try std.testing.expectEqual(
+            cc.tools.tool_observation.RuleFilterOperation.exact_edit_recovery,
+            filter.operation,
+        );
+        try std.testing.expectEqual(@as(u32, 3), filter.active_rule_count);
+        try std.testing.expectEqual(@as(u32, 2), filter.checker_rule_count);
+        try std.testing.expectEqual(@as(u32, 1), filter.statically_pruned_rule_count);
+    }
+    try std.testing.expectEqual(@as(usize, 5), observed.formal_decisions.len);
+    const after = try readArtifact(allocator, path);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings("after\n", after);
+}
+
+test "L2 repeated identical signals retain distinct physical checker calls" {
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
+    defer allocator.free(evidence_dir);
+    try cc.util_fs.mkdirParents(evidence_dir);
+
+    var active = try syntheticActiveForTool(allocator, 1, config, "Read");
+    defer active.deinit();
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+    };
+    const sid = cc.session_id.SessionId.fromSlice("1123456789abcdef01234567").?;
+    var journal = try cc.tool_observation_journal.Journal.init(evidence_dir, sid);
+    const sink = journal.sink();
+    runtime.evidence_dir = evidence_dir;
+    runtime.observation_sink = sink;
+    var probe = Probe{};
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.tool_dispatcher = probe.dispatcher();
+    ctx.project_rule_gate = runtime.protocolGate();
+    ctx.tool_observer = sink;
+
+    for ([_][]const u8{ "same-signal-a", "same-signal-b" }) |dispatch_id| {
+        const result = try cc.tool_exec.executeOne(
+            &ctx,
+            "Read",
+            "{}",
+            dispatch_id,
+            allocator,
+            .{ .bytes = [_]u8{'0'} ** 12 },
+        );
+        switch (result) {
+            .done => |done| {
+                if (done.content) |bytes| allocator.free(bytes);
+                try std.testing.expect(!done.is_error);
+            },
+            else => return error.UnexpectedToolResult,
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    try journal.finishRun("end_turn");
+    const binding = try journal.runBinding();
+    journal.deinit();
+
+    var observed = try cc.tool_observation_journal.loadRunDispatches(
+        allocator,
+        evidence_dir,
+        binding,
+    );
+    defer observed.deinit();
+    try std.testing.expectEqual(@as(usize, 4), observed.formal_decisions.len);
+
+    var calls = std.AutoHashMap([64]u8, void).init(allocator);
+    defer calls.deinit();
+    var pre_request: ?[64]u8 = null;
+    var post_request: ?[64]u8 = null;
+    for (observed.formal_decisions) |formal| {
+        const call = formal.checker_call_sha256 orelse
+            return error.MissingCheckerCallIdentity;
+        const entry = try calls.getOrPut(call);
+        try std.testing.expect(!entry.found_existing);
+        switch (formal.phase) {
+            .pre => {
+                if (pre_request) |expected|
+                    try std.testing.expectEqualSlices(u8, &expected, &formal.request_sha256)
+                else
+                    pre_request = formal.request_sha256;
+            },
+            .post => {
+                if (post_request) |expected|
+                    try std.testing.expectEqualSlices(u8, &expected, &formal.request_sha256)
+                else
+                    post_request = formal.request_sha256;
+            },
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 4), calls.count());
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &(pre_request orelse unreachable),
+        &(post_request orelse unreachable),
+    ));
+}
+
 test "L2 project rule batch runtime uses two checker calls for 16 rules" {
     _ = try runBatchRuntimeFixture(16);
 }
@@ -3363,7 +3717,7 @@ test "L2 malformed Lean batch verdict fails before the real dispatcher" {
         .checker_path = checker_path,
         .expected_sha256 = cc.tools.tool_observation.sha256Hex(checker_script),
     };
-    var active = try syntheticActive(allocator, 4, config);
+    var active = try syntheticActiveForTool(allocator, 4, config, "Read");
     defer active.deinit();
     var runtime = cc.project_rule_gate.RuntimeGate{
         .allocator = allocator,
@@ -3534,7 +3888,7 @@ test "L2 same-cardinality batch binding drift has no durable verdict and no disp
         .checker_path = checker_path,
         .expected_sha256 = cc.tools.tool_observation.sha256Hex(checker_script),
     };
-    var active = try syntheticActive(allocator, 4, config);
+    var active = try syntheticActiveForTool(allocator, 4, config, "Read");
     defer active.deinit();
     var runtime = cc.project_rule_gate.RuntimeGate{
         .allocator = allocator,

@@ -50,6 +50,62 @@ test "L2 Stage7: --base-url 解析进 Config.base_url" {
     a.free(config.model);
 }
 
+test "L2: transport model and actor-visible model identity remain separate" {
+    const a = std.testing.allocator;
+    const route = "workbuddy-baseline-run-specific-route--metacodes-glm52";
+    const argv = [_][*:0]const u8{
+        "metacodes",
+        "--model",
+        route,
+        "--model-display-name",
+        "glm-5.2",
+    };
+    const config = cc.parseArgsForTest(&argv, a);
+    defer a.free(config.model);
+    defer a.free(config.model_display_name.?);
+
+    try std.testing.expectEqualStrings(route, config.model);
+    try std.testing.expectEqualStrings("glm-5.2", config.model_display_name.?);
+
+    const system = try cc.system_prompt.buildFull(
+        a,
+        config.model_display_name.?,
+        null,
+        null,
+        null,
+        "",
+        false,
+        "/tmp",
+    );
+    defer a.free(system);
+    try std.testing.expect(std.mem.indexOf(u8, system, "powered by the model glm-5.2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, system, route) == null);
+
+    var srv = try harness.MockServer.start(MINIMAL_END_TURN_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", config.model, url);
+    defer client.deinit();
+
+    const empty_messages: []const cc.types_mod.ApiMessage = &.{};
+    var resp = client.sendMessageStream(empty_messages, system, null) catch |err| {
+        std.debug.print("model identity request failed: {s}\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    drainStream(&resp) catch {};
+    resp.deinit();
+
+    const captured = srv.lastRequest() orelse return error.NoRequestCaptured;
+    const request_model = captured.jsonField("model") orelse return error.ModelFieldMissing;
+    const request_system = captured.jsonField("system") orelse return error.SystemFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, request_model, route) != null);
+    try std.testing.expect(std.mem.indexOf(u8, request_system, "powered by the model glm-5.2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request_system, route) == null);
+}
+
 // (2) 用 Config.base_url 起 Client(= app.zig:152 的构造)→ 请求打到 mock。
 test "L2 Stage7: Config.base_url → Client 请求打到 mock 端点" {
     const a = std.testing.allocator;

@@ -3,6 +3,11 @@ const std = @import("std");
 /// 通用配置
 pub const Config = struct {
     api_key: ?[]const u8 = null,
+    /// Stable actor-visible identity used only in the system prompt.  The
+    /// transport/request model remains `model`; keeping these separate lets a
+    /// proxy use run-specific route names without leaking them into the
+    /// cacheable prompt prefix.
+    model_display_name: ?[]const u8 = null,
     model: []const u8 = "claude-sonnet-4-20250514",
     model_explicit: bool = false,
     reasoning_effort: ?ReasoningEffort = null,
@@ -81,6 +86,9 @@ pub const Config = struct {
     allowed_tools: ?[]const u8 = null,
     /// `--disallowedTools "..."`:逗号分隔,注入 CLI 层 deny。
     disallowed_tools: ?[]const u8 = null,
+    /// Experimental, opt-in progress checkpoint for coding evaluations. Kept
+    /// out of the default product path until measured on fixed benchmarks.
+    verification_checkpoint: bool = false,
     /// `--add-dir <path>`(可重复):额外可读写目录,注入 additionalDirectories。
     /// 多个用 `\x00` 分隔拼一串(parseArgs 累加)。
     add_dirs: ?[]const u8 = null,
@@ -124,7 +132,12 @@ pub const LongHorizonArm = enum {
         return switch (self) {
             .native => native_enabled,
             .codex_style => false,
-            .claude_style, .tinykg => true,
+            .claude_style => true,
+            // TinyKG links markdown memory when the native channel is enabled,
+            // but an explicit global disable remains authoritative.  This
+            // permits graph-only deployments without silently enabling a
+            // second persistence channel.
+            .tinykg => native_enabled,
         };
     }
 
@@ -135,6 +148,12 @@ pub const LongHorizonArm = enum {
         };
     }
 };
+
+test "TinyKG arm respects an explicit auto-memory disable" {
+    try std.testing.expect(LongHorizonArm.tinykg.usesAutoMemory(true));
+    try std.testing.expect(!LongHorizonArm.tinykg.usesAutoMemory(false));
+    try std.testing.expect(LongHorizonArm.claude_style.usesAutoMemory(false));
+}
 
 /// LLM 后端协议种类(App 组装层据此选具体 Client;core 只见中立 Provider)。
 pub const ProviderKind = enum { anthropic, openai, gemini };
@@ -302,6 +321,10 @@ pub fn parseArgs(init: std.process.Init, allocator: std.mem.Allocator) Config {
             if (args.next()) |model| {
                 config.model = allocator.dupe(u8, model) catch model;
             }
+        } else if (std.mem.eql(u8, arg, "--model-display-name")) {
+            if (args.next()) |name| {
+                config.model_display_name = allocator.dupe(u8, name) catch name;
+            }
         } else if (std.mem.eql(u8, arg, "--no-theme")) {
             config.no_theme = true;
         } else if (std.mem.eql(u8, arg, "--verbose")) {
@@ -336,6 +359,7 @@ fn printHelp() void {
         \\
         \\Options:
         \\  --model <model>       Model to use (default: claude-sonnet-4-20250514)
+        \\  --model-display-name <name>  Stable model identity shown to the actor
         \\  --api-key <key>       Metask API key (or METASK_API_KEY env)
         \\  --permission <mode>   Permission mode: auto, prompt, plan, bypass
         \\  --no-theme            Disable colors
@@ -354,6 +378,7 @@ pub fn printHelpToWriter(stdout: anytype) !void {
         \\
         \\Options:
         \\  --model <model>       Model to use (default: claude-sonnet-4-20250514)
+        \\  --model-display-name <name>  Stable model identity shown to the actor
         \\  --api-key <key>       Metask API key (or METASK_API_KEY env)
         \\  --permission <mode>   Permission mode: auto, prompt, plan, bypass
         \\  --no-theme            Disable colors

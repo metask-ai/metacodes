@@ -23,7 +23,12 @@ from typing import Any, Mapping
 SCHEMA_VERSION = "metacodes-workbuddy-mock-provider-v2"
 MOCK_CREDENTIAL = "metacodes-workbuddy-mock-only"
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
-SCENARIOS = ("final-v1", "control-plane-v1")
+SCENARIOS = (
+    "final-v1",
+    "control-plane-v1",
+    "headless-permission-v1",
+    "guessed-disabled-tool-v1",
+)
 CONTROL_MEMORY = (
     "workbuddy-w05-control-marker: real local TinyKG and project Lean gate "
     "must be observed before quality evaluation"
@@ -268,12 +273,10 @@ def _control_plane_sse(request_number: int, request: Mapping[str, Any]) -> bytes
             {
                 "query": CONTROL_MEMORY,
                 "lexical_plan": {
-                    "schema_version": "lexical-query-plan-v1",
+                    "schema_version": "lexical-query-plan-v3",
                     "intent": "fact_lookup",
                     "stage": "seed",
                     "variants": [{"kind": "exact", "text": CONTROL_MEMORY}],
-                    "variant_index": 0,
-                    "seen_node_ids": [],
                 },
             },
         )
@@ -382,6 +385,35 @@ def _scenario_sse(scenario: str, request_number: int, request: Mapping[str, Any]
         )
     if scenario == "control-plane-v1":
         return _control_plane_sse(request_number, request)
+    if scenario == "headless-permission-v1":
+        _require_tools(request, "Write")
+        if request_number == 1:
+            return _tool_sse(
+                request_number,
+                "headless-protected-write",
+                "Write",
+                {"file_path": ".gitignore", "content": "must-not-write\n"},
+            )
+        if request_number == 2:
+            content, is_error = _result_text(request, "headless-protected-write")
+            if not is_error or '"code":"permission_denied"' not in content:
+                raise ScenarioError("headless protected Write was not denied")
+            return _final_sse(request_number, "protected write was denied safely")
+        raise ScenarioError("headless-permission-v1 received more than two requests")
+    if scenario == "guessed-disabled-tool-v1":
+        pair = (request_number + 1) // 2
+        call_id = f"guessed-disabled-plan-{pair}"
+        if request_number % 2 == 1:
+            if "EnterPlanMode" in _tool_names(request):
+                raise ScenarioError("disabled plan tool remained provider-visible")
+            # Deliberately violate the advertised schema. The host must still
+            # enforce the same ceiling at dispatch rather than trusting the
+            # provider to call only declared tools.
+            return _tool_sse(request_number, call_id, "EnterPlanMode", {})
+        content, is_error = _result_text(request, call_id)
+        if not is_error or '"code":"permission_denied"' not in content:
+            raise ScenarioError("guessed disabled tool escaped dispatch policy")
+        return _final_sse(request_number, "guessed disabled tool was denied safely")
     raise ScenarioError(f"unsupported scenario: {scenario}")
 
 
@@ -428,6 +460,14 @@ class _Handler(BaseHTTPRequestHandler):
                 "body_sha256": hashlib.sha256(body).hexdigest(),
                 "model": request.get("model"),
                 "stream": request.get("stream"),
+                "tool_names": sorted(_tool_names(request)),
+                "tool_schema_sha256": hashlib.sha256(
+                    json.dumps(
+                        request.get("tools", []),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
                 "control_metrics_absent": b"control_metrics" not in body,
             }
             with self.server.request_log.open("ab") as handle:  # type: ignore[attr-defined]

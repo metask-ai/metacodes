@@ -26,6 +26,8 @@ const api_stream = @import("../api/stream.zig");
 const tool_error = @import("tool_error.zig");
 const context_pressure_mod = @import("context_pressure.zig");
 const compact_kernel = @import("compact_kernel.zig");
+const result_projection = @import("result_projection.zig");
+const verification_progress_mod = @import("verification_progress.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
 const ui_backend = @import("protocol/ui_backend.zig");
@@ -312,6 +314,10 @@ pub const Options = struct {
     /// embedding AgentSession 显式开启，使 Host 提供的 Workspace 真正成为工具执行基准。
     resolve_relative_paths: bool = false,
     home_dir: []const u8 = "",
+    /// Session directory that owns recoverable tool-result artifacts. The
+    /// artifact envelope never exposes this path to the model.
+    artifact_root: []const u8 = "",
+    tool_result_metrics: ?*@import("tool_result_metrics.zig").Metrics = null,
     /// 额外工作目录(--add-dir / additionalDirectories,绝对路径;sandbox 可写白名单)。
     additional_dirs: []const []const u8 = &.{},
     /// 当前 session plan 文件路径(ExitPlanMode 读盘兜底用;仅顶层接)。
@@ -339,6 +345,10 @@ pub const Options = struct {
     tool_observer: ?tools_mod.ToolObservationSink = null,
     /// Project-specific Lean gate propagated to every ToolContext and depth.
     project_rule_gate: ?tools_mod.ProjectRuleGate = null,
+    /// Opt-in experiment: after a host-reobserved file mutation, append one
+    /// late checkpoint when a conservative test command succeeds. This never
+    /// changes the stable system prompt or tool definitions.
+    verification_checkpoint: bool = false,
     /// 统一 UI 请求回调(替代旧 ask_question/exit_plan 三套;ctx 指 *TuiBackend)。
     /// 仅顶层 TUI 接(agent_depth==0)——子 agent 无 tty。见 UiRequester。
     ui_requester: ?@import("protocol/ui_request.zig").UiRequester = null,
@@ -381,6 +391,7 @@ fn emitProgress(backend: *const UiBackend, sess: @import("session_id.zig").Sessi
 const EffectiveToolSet = struct {
     policy_filtered: ?[]json_mod.ToolDefinition = null,
     filtered_pool: ?[]json_mod.ToolDefinition = null,
+    discovery_filtered: ?[]json_mod.ToolDefinition = null,
     deferred_filtered: ?[]json_mod.ToolDefinition = null,
     cap_filtered: ?[]json_mod.ToolDefinition = null,
     defs: []const json_mod.ToolDefinition = &.{},
@@ -388,6 +399,7 @@ const EffectiveToolSet = struct {
     fn deinit(self: *EffectiveToolSet, allocator: std.mem.Allocator) void {
         if (self.policy_filtered) |pf| allocator.free(pf);
         if (self.filtered_pool) |fp| allocator.free(fp);
+        if (self.discovery_filtered) |df| allocator.free(df);
         if (self.deferred_filtered) |df| allocator.free(df);
         if (self.cap_filtered) |cf| allocator.free(cf);
         self.* = .{};
@@ -422,28 +434,51 @@ fn buildEffectiveToolSet(
     const skill_filtered = if (out.filtered_pool) |fp| fp else policy_filtered;
     out.defs = skill_filtered;
 
-    const effective_tool_defs = blk: {
-        const acts = activated_tools orelse break :blk skill_filtered;
+    // ToolSearch is useful only while at least one deferred schema remains in
+    // the policy/Skill-visible catalog. Reapply the same invariant used by
+    // tools.toToolDefinitionsFull after later runtime filtering, otherwise the
+    // model receives a discovery tool that can only return NoToolMatch.
+    const discovery_filtered = blk: {
         var has_deferred = false;
-        for (skill_filtered) |d| {
+        var has_tool_search = false;
+        for (skill_filtered) |definition| {
+            has_deferred = has_deferred or definition.deferred;
+            has_tool_search = has_tool_search or std.mem.eql(u8, definition.name, "ToolSearch");
+        }
+        if (has_deferred or !has_tool_search) break :blk skill_filtered;
+        var keep: std.ArrayList(json_mod.ToolDefinition) = .empty;
+        errdefer keep.deinit(allocator);
+        for (skill_filtered) |definition| {
+            if (std.mem.eql(u8, definition.name, "ToolSearch")) continue;
+            try keep.append(allocator, definition);
+        }
+        out.discovery_filtered = try keep.toOwnedSlice(allocator);
+        break :blk out.discovery_filtered.?;
+    };
+    out.defs = discovery_filtered;
+
+    const effective_tool_defs = blk: {
+        const acts = activated_tools orelse break :blk discovery_filtered;
+        var has_deferred = false;
+        for (discovery_filtered) |d| {
             if (d.deferred) {
                 has_deferred = true;
                 break;
             }
         }
-        if (!has_deferred) break :blk skill_filtered;
+        if (!has_deferred) break :blk discovery_filtered;
 
         var keep: std.ArrayList(json_mod.ToolDefinition) = .empty;
-        for (skill_filtered) |d| {
+        for (discovery_filtered) |d| {
             if (d.deferred and !acts.contains(d.name)) continue;
             keep.append(allocator, d) catch {
                 keep.deinit(allocator);
-                break :blk skill_filtered;
+                break :blk discovery_filtered;
             };
         }
         out.deferred_filtered = keep.toOwnedSlice(allocator) catch {
             keep.deinit(allocator);
-            break :blk skill_filtered;
+            break :blk discovery_filtered;
         };
         break :blk out.deferred_filtered.?;
     };
@@ -533,6 +568,7 @@ pub fn run(
     const trace_id = log.genRequestId().bytes;
     const depth = opts.agent_depth;
     var turns: u32 = 0;
+    var verification_progress = verification_progress_mod.State{};
     var total_tool_calls: u32 = 0;
     // max_tokens 续写计数:防止模型一直撞上限导致无限续写。上限 3 次。
     var continuations: u32 = 0;
@@ -543,6 +579,17 @@ pub fn run(
     // were actually returned. It is shared by every turn/tool context in this
     // run and never persisted into the canonical TinyKG store.
     var kg_lexical_ledger = @import("../kg/lexical_query_plan.zig").Ledger{};
+    const kg_retrieval_protocol = @import("../kg/retrieval_protocol.zig");
+    const kg_enumeration_query_hint = kg_retrieval_protocol.queryRequiresEnumerationCoverage(latestUserText(conversation)) or
+        (if (opts.synthetic_user_input) |synthetic|
+            kg_retrieval_protocol.queryRequiresEnumerationCoverage(synthetic)
+        else
+            false);
+    var kg_coverage_reminder_emitted = false;
+    var kg_context_reminder_emitted = false;
+    var kg_coverage_repair_attempts: u8 = 0;
+    var kg_context_repair_attempts: u8 = 0;
+    var kg_coverage_borrowed_turns: u32 = 0;
     // 成本次闸:累计本 run 成本(USD),达 opts.cost_budget_usd → 停(.budget)。
     const cost_rates = @import("../util/pricing.zig").rateFor(provider.model());
     var run_cost_usd: f64 = 0;
@@ -556,7 +603,7 @@ pub fn run(
     // the transcript or across process revisions.
     var compact_summary_reserve_tokens: usize = 0;
 
-    while (turns < opts.max_turns) : (turns += 1) {
+    while (turns < opts.max_turns +| kg_coverage_borrowed_turns) : (turns += 1) {
         // 开头检查 abort
         if (opts.abort) |a| if (a.isAborted()) {
             log.warn("agent", "aborted before turn {d}", .{turns + 1});
@@ -584,26 +631,9 @@ pub fn run(
         // L4 诊断:turn span 起点。
         backend.emitEvent(sess, .{ .diag_turn_begin = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1 } });
 
-        // Plan 模式每轮把 plan 指令追加到 system prompt(对齐 mecode 每轮 developer_instructions):
-        // 根治"指令只在 EnterPlanMode 返回出现一次,后续轮模型忘了 <proposed_plan> 格式"。
-        // turn 作用域 alloc,用后 free;非 plan 模式直接用 opts.system_prompt(零开销)。
-        var sys_prompt_owned: ?[]u8 = null;
-        defer if (sys_prompt_owned) |p| allocator.free(p);
-        const effective_system_prompt: ?[]const u8 = blk: {
-            const in_plan = permission_ctx.modeValue() == .plan;
-            // swarm 纪律:有 team 时追加 addendum(裸文本对 teammate 不可见,必须用 SendMessage;
-            // 对齐 cc teammate addendum,Linus/PM SW2 F3)。lead 与 teammate 都注入。
-            const in_swarm = if (opts.swarm) |s| s.hasTeam() else false;
-            if (!in_plan and !in_swarm) break :blk opts.system_prompt;
-            const base = opts.system_prompt orelse "";
-            const plan_seg = if (in_plan) "\n\n# Plan Mode (active)\n" ++ @import("../tools/plan_mode.zig").PLAN_MODE_INSTRUCTIONS else "";
-            const swarm_seg = if (in_swarm) "\n\n" ++ @import("../swarm/tools.zig").SWARM_ADDENDUM else "";
-            sys_prompt_owned = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ base, plan_seg, swarm_seg }) catch null;
-            break :blk if (sys_prompt_owned) |p| p else opts.system_prompt;
-        };
-
-        // 工具池过滤必须在 compact 判断之前完成。auto-compact 以"实际下一次请求"
-        // 为准，而不是未经过 skill/deferred/capability 门控的全量工具表。
+        // 工具池过滤必须在 prompt 投影和 compact 判断之前完成。App 初始化时构造的
+        // prompt 不知道 per-run execution policy；先算真实 pool，才能避免 prompt 广告
+        // provider schema 已隐藏的 deferred tool。
         var effective_tools = try buildEffectiveToolSet(
             allocator,
             tool_defs,
@@ -616,6 +646,47 @@ pub fn run(
         // 对齐 codex:无 breaker_finalization gate,gated_tool_defs 即 effective_tools.defs。
         // 保留别名减少下游改动,为将来可选 gate 预留。
         const gated_tool_defs: []const json_mod.ToolDefinition = effective_tools.defs;
+        // Deferred catalog sees policy + active-skill filtering, but intentionally
+        // precedes activation filtering: unactivated deferred tools are exactly
+        // the tools the catalog exists to advertise.
+        const deferred_catalog_defs = if (effective_tools.discovery_filtered) |defs|
+            defs
+        else if (effective_tools.filtered_pool) |defs|
+            defs
+        else if (effective_tools.policy_filtered) |defs|
+            defs
+        else
+            tool_defs;
+
+        // Plan 模式每轮把 plan 指令追加到 system prompt(对齐 mecode 每轮 developer_instructions):
+        // 根治"指令只在 EnterPlanMode 返回出现一次,后续轮模型忘了 <proposed_plan> 格式"。
+        // turn 作用域 alloc,用后 free;非 plan 模式直接用 opts.system_prompt(零开销)。
+        var sys_prompt_owned: ?[]u8 = null;
+        defer if (sys_prompt_owned) |p| allocator.free(p);
+        const augmented_system_prompt: ?[]const u8 = blk: {
+            const in_plan = permission_ctx.modeValue() == .plan;
+            // swarm 纪律:有 team 时追加 addendum(裸文本对 teammate 不可见,必须用 SendMessage;
+            // 对齐 cc teammate addendum,Linus/PM SW2 F3)。lead 与 teammate 都注入。
+            const in_swarm = if (opts.swarm) |s| s.hasTeam() else false;
+            if (!in_plan and !in_swarm) break :blk opts.system_prompt;
+            const base = opts.system_prompt orelse "";
+            const plan_seg = if (in_plan) "\n\n# Plan Mode (active)\n" ++ @import("../tools/plan_mode.zig").PLAN_MODE_INSTRUCTIONS else "";
+            const swarm_seg = if (in_swarm) "\n\n" ++ @import("../swarm/tools.zig").SWARM_ADDENDUM else "";
+            sys_prompt_owned = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ base, plan_seg, swarm_seg }) catch null;
+            break :blk if (sys_prompt_owned) |p| p else opts.system_prompt;
+        };
+        var projected_system_prompt_owned: ?[]u8 = null;
+        defer if (projected_system_prompt_owned) |p| allocator.free(p);
+        const effective_system_prompt: ?[]const u8 = blk: {
+            const base = augmented_system_prompt orelse break :blk null;
+            projected_system_prompt_owned = try @import("system_prompt.zig").projectDeferredToolsForExecution(
+                allocator,
+                base,
+                deferred_catalog_defs,
+                gated_tool_defs,
+            );
+            break :blk if (projected_system_prompt_owned) |p| p else base;
+        };
 
         // 自动 compact：发请求前检查 token 估算,超阈值则保留最近 N 条。
         // 阈值 null 时 = input context window * 0.8(逼近 context 上限才压缩,留出回复空间)。
@@ -786,6 +857,8 @@ pub fn run(
             .cwd_abs = opts.cwd_abs,
             .resolve_relative_paths = opts.resolve_relative_paths,
             .home_dir = opts.home_dir,
+            .artifact_root = opts.artifact_root,
+            .tool_result_metrics = opts.tool_result_metrics,
             .additional_dirs = opts.additional_dirs,
             .plan_file_path = opts.plan_file_path,
             .agents = opts.agents,
@@ -888,6 +961,7 @@ pub fn run(
             var aborted_during_stream = false;
             var stream_error = false;
             var stream_context_window_exceeded = false;
+            var response_usage = @import("cache_break.zig").ResponseUsage{};
             while (true) {
                 const ev_opt = stream.next() catch |err| switch (err) {
                     error.Aborted => {
@@ -979,20 +1053,27 @@ pub fn run(
                         backend.emitEvent(sess, .{ .usage = u });
                         // 成本次闸累计(本 run):按模型单价把本响应 usage 折算成本。
                         run_cost_usd += @import("../util/pricing.zig").computeCost(cost_rates, u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens);
-                        // usage 锚点:服务端实计 prompt tokens(in+cache_r+cache_w)。
-                        // auto-compact 估算以此为基准,只对之后新 append 的消息做本地估算
-                        // (估算器 vs 各家 tokenizer 偏差不再随会话放大;glm-5.2 262K 窗口
-                        // 下旧的纯字节估算超估 ~3.5x,在真实 ~65K 时就误触发 blocking 清空)。
-                        const anchor_tokens = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens;
-                        conversation.setUsageAnchor(@intCast(anchor_tokens));
-                        if (cache_detector.checkResponse(u.cache_read_input_tokens, u.cache_creation_input_tokens)) |reason| {
-                            log.warnId("cache", rid, "PROMPT CACHE BREAK: {s} [cache_read {d} creation {d}]", .{ reason, u.cache_read_input_tokens, u.cache_creation_input_tokens });
-                            // L4 诊断:cache 击穿。
-                            backend.emitEvent(sess, .{ .diag_cache_break = .{ .trace_id = trace_id, .depth = depth, .cache_read = u.cache_read_input_tokens, .cache_creation = u.cache_creation_input_tokens } });
-                        }
+                        response_usage.observe(u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens);
                         log.infoId("agent", rid, "usage in={d} out={d} cache_r={d} cache_w={d}", .{ u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens });
                     },
                     .done => {},
+                }
+            }
+
+            // message_start/message_delta usage 是同一个 provider response 的片段，而不是
+            // 两个请求。只在成功收完整条响应后更新 token anchor 和 cache detector；否则
+            // preliminary zero usage 会把每个 warm request 误报成 cache break，partial error
+            // 也会污染下一轮基线。
+            if (!aborted_during_stream and !stream_error and response_usage.has_metering) {
+                conversation.setUsageAnchor(@intCast(response_usage.promptTokens()));
+                if (cache_detector.checkResponse(response_usage.cache_read_tokens, response_usage.cache_write_tokens)) |reason| {
+                    log.warnId("cache", rid, "PROMPT CACHE BREAK: {s} [cache_read {d} creation {d}]", .{ reason, response_usage.cache_read_tokens, response_usage.cache_write_tokens });
+                    backend.emitEvent(sess, .{ .diag_cache_break = .{
+                        .trace_id = trace_id,
+                        .depth = depth,
+                        .cache_read = response_usage.cache_read_tokens,
+                        .cache_creation = response_usage.cache_write_tokens,
+                    } });
                 }
             }
             backend.emitEvent(sess, .{ .diag_model_request = .{
@@ -1143,6 +1224,41 @@ pub fn run(
                 backend.emitEvent(sess, .{ .diag_continuation = .{ .trace_id = trace_id, .depth = depth, .n = continuations, .max = MAX_CONTINUATIONS } });
                 try conversation.appendText(.user, "Your previous response was cut off by the token limit. Continue exactly where you left off, without repeating.");
                 continue;
+            }
+            const kg_pending = kgEnumerationPending(
+                &kg_lexical_ledger,
+                gated_tool_defs,
+                kg_enumeration_query_hint,
+            );
+            if (kg_pending != .none) {
+                const repair_attempts = switch (kg_pending) {
+                    .batch => &kg_coverage_repair_attempts,
+                    .context => &kg_context_repair_attempts,
+                    .none => unreachable,
+                };
+                if (repair_attempts.* == 0) {
+                    repair_attempts.* = 1;
+                    // A rejected batch-final may still need batch + context +
+                    // final; a rejected context-final needs context + final.
+                    // Budget/request gates still guard every provider boundary.
+                    kg_coverage_borrowed_turns +|= switch (kg_pending) {
+                        .batch => 3,
+                        .context => 2,
+                        .none => unreachable,
+                    };
+                    backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                    try conversation.appendText(.user, switch (kg_pending) {
+                        .batch => kg_retrieval_protocol.ENUMERATION_COVERAGE_REPAIR,
+                        .context => kg_retrieval_protocol.ENUMERATION_CONTEXT_REPAIR,
+                        .none => unreachable,
+                    });
+                    continue;
+                }
+                // A second premature final is not accepted as a valid answer.
+                // Preserve the trace for audit and fail closed as a controlled
+                // tool loop rather than laundering an uncovered conclusion.
+                backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
             }
             // L4 诊断:本轮无 tool_use → turn 结束(span 平衡:每个 turn_begin 都配一个
             // turn_end,无论有无工具)。紧接 run_end(end_turn)收口。
@@ -1330,6 +1446,8 @@ pub fn run(
             .cwd_abs = opts.cwd_abs,
             .resolve_relative_paths = opts.resolve_relative_paths,
             .home_dir = opts.home_dir,
+            .artifact_root = opts.artifact_root,
+            .tool_result_metrics = opts.tool_result_metrics,
             .additional_dirs = opts.additional_dirs,
             .plan_file_path = opts.plan_file_path,
             .last_proposed_plan = if (proposed_plan_buf) |p| p else "",
@@ -1400,6 +1518,8 @@ pub fn run(
                 s.file_refs = pf.file_refs;
                 s.is_error = pf.is_error;
                 s.elapsed_ms = pf.elapsed_ms;
+                s.effect = pf.effect;
+                s.effect_valid = pf.effect_valid;
                 s.prefetched = true;
             }
         }
@@ -1435,7 +1555,15 @@ pub fn run(
             // 收集**所有非挂起点**工具的结果(已完成的用真实结果;其余 pending 用错误占位)——
             // 它们都要在 resume 时与挂起点的迟来结果同 turn 补齐,满足 API 配对。
             var completed: std.ArrayList(SuspendInfo.CompletedResult) = .empty;
-            errdefer completed.deinit(allocator);
+            errdefer {
+                for (completed.items) |entry| {
+                    allocator.free(entry.tool_use_id);
+                    allocator.free(entry.content);
+                }
+                completed.deinit(allocator);
+            }
+            var completed_names: std.ArrayList([]const u8) = .empty;
+            defer completed_names.deinit(allocator);
             for (slots.items) |*o| {
                 if (o == s or o.decision != .run) continue;
                 const content: []const u8 = if (o.pending)
@@ -1448,6 +1576,7 @@ pub fn run(
                     .content = content,
                     .is_error = if (o.pending) true else o.is_error,
                 });
+                try completed_names.append(allocator, o.name);
                 // 释放 slot 原 owned 内存(content 已 dupe 进 completed;pending 的 kind/payload
                 // 不进 SuspendInfo)——否则泄漏(正常路径 content 移交 result_blocks,此处改 dupe)。
                 if (o.content) |c| {
@@ -1461,6 +1590,24 @@ pub fn run(
                     o.pending_payload = null;
                 }
             }
+            // Suspended sibling results are persisted before suspend.json is
+            // written. They cannot bypass the same one-shot projection simply
+            // because another tool requested asynchronous UI.
+            const suspended_items = try allocator.alloc(result_projection.Item, completed.items.len);
+            defer allocator.free(suspended_items);
+            for (completed.items, 0..) |*entry, index| {
+                suspended_items[index] = .{
+                    .tool_name = completed_names.items[index],
+                    .content = &entry.content,
+                    .is_error = entry.is_error,
+                };
+            }
+            const suspended_projection_stats = try result_projection.project(allocator, suspended_items, .{
+                .session_root = opts.artifact_root,
+                .per_result_bytes = conversation_mod.toolResultContextBytes(provider.maxInputTokens()),
+                .per_turn_bytes = result_projection.turnBudgetBytes(provider.maxInputTokens()),
+            });
+            if (opts.tool_result_metrics) |metrics| metrics.recordProjection(suspended_projection_stats);
             // result_blocks 这轮不提交(挂起不落 partial user 消息);释放已 append 的(本应为空)。
             result_blocks.clearAndFree(allocator);
             const kind = s.pending_kind orelse "";
@@ -1480,6 +1627,9 @@ pub fn run(
             log.infoId("agent", rid, "run SUSPENDED tool_use_id={s} kind={s} completed_siblings={d}", .{ s.id, kind, si.completed_results.len });
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .suspended, .turns = turns + 1, .tool_calls = total_tool_calls, .suspend_info = si });
         }
+
+        const inject_verification_checkpoint = opts.verification_checkpoint and
+            verification_progress.observeTurn(allocator, slots.items);
 
         // 6d. 按原顺序回填 result_blocks。
         // P0.2 PostToolUse:执行后 hook 产出的 additionalContext,拼成一段注入本轮 user 消息(下轮模型可见)。
@@ -1535,10 +1685,63 @@ pub fn run(
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_error, .turns = turns + 1, .tool_calls = total_tool_calls });
         }
 
+        // Hooks and UI above observe the exact execution result. Only now do
+        // we commit the deterministic model-visible representation. This runs
+        // once per result; later requests reuse the same Conversation bytes,
+        // preserving provider prompt-cache prefixes.
+        const projection_items = try allocator.alloc(result_projection.Item, result_blocks.items.len);
+        defer allocator.free(projection_items);
+        for (result_blocks.items, 0..) |*block, index| {
+            if (block.* != .tool_result) unreachable;
+            projection_items[index] = .{
+                .tool_name = slots.items[index].name,
+                .content = &block.tool_result.content,
+                .is_error = block.tool_result.is_error,
+            };
+        }
+        const projection_stats = try result_projection.project(allocator, projection_items, .{
+            .session_root = opts.artifact_root,
+            .per_result_bytes = conversation_mod.toolResultContextBytes(provider.maxInputTokens()),
+            .per_turn_bytes = result_projection.turnBudgetBytes(provider.maxInputTokens()),
+        });
+        if (opts.tool_result_metrics) |metrics| metrics.recordProjection(projection_stats);
+        if (projection_stats.changed() or projection_stats.budget_exhausted) {
+            log.info("agent", "tool-result projection: raw={d} projected={d} artifact_bytes={d} spills={d} fallback={d} turn_spills={d} budget_exhausted={}", .{
+                projection_stats.raw_bytes,
+                projection_stats.projected_bytes,
+                projection_stats.artifact_bytes,
+                projection_stats.artifact_spill_count,
+                projection_stats.unrecoverable_fallback_count,
+                projection_stats.turn_budget_spills,
+                projection_stats.budget_exhausted,
+            });
+        }
+
         // PostToolUse additionalContext → 同一 user 消息追加一个 text block(下轮模型可见)。
         if (post_ctx.items.len > 0) {
             const ctx_text = try std.fmt.allocPrint(allocator, "[PostToolUse hook]\n{s}", .{post_ctx.items});
             try result_blocks.append(allocator, .{ .text = ctx_text });
+        }
+        if (inject_verification_checkpoint) {
+            const checkpoint = try allocator.dupe(
+                u8,
+                verification_progress_mod.CHECKPOINT_TEXT,
+            );
+            try result_blocks.append(allocator, .{ .text = checkpoint });
+        }
+        const kg_pending = kgEnumerationPending(
+            &kg_lexical_ledger,
+            gated_tool_defs,
+            kg_enumeration_query_hint,
+        );
+        if (kg_pending == .batch and !kg_coverage_reminder_emitted) {
+            const reminder = try allocator.dupe(u8, kg_retrieval_protocol.ENUMERATION_COVERAGE_REMINDER);
+            try result_blocks.append(allocator, .{ .text = reminder });
+            kg_coverage_reminder_emitted = true;
+        } else if (kg_pending == .context and !kg_context_reminder_emitted) {
+            const reminder = try allocator.dupe(u8, kg_retrieval_protocol.ENUMERATION_CONTEXT_REMINDER);
+            try result_blocks.append(allocator, .{ .text = reminder });
+            kg_context_reminder_emitted = true;
         }
 
         const blocks_owned = try result_blocks.toOwnedSlice(allocator);
@@ -1588,6 +1791,46 @@ pub fn run(
 
     // 循环正常退出 = turns >= max_turns
     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .max_turns, .turns = turns, .tool_calls = total_tool_calls });
+}
+
+const KgEnumerationPending = enum { none, batch, context };
+
+fn kgEnumerationPending(
+    ledger: *@import("../kg/lexical_query_plan.zig").Ledger,
+    tool_defs: []const json_mod.ToolDefinition,
+    query_hint: bool,
+) KgEnumerationPending {
+    var kg_recall_visible = false;
+    var kg_context_visible = false;
+    for (tool_defs) |definition| {
+        if (std.mem.eql(u8, definition.name, "KgRecall")) {
+            kg_recall_visible = true;
+        } else if (std.mem.eql(u8, definition.name, "KgContext")) {
+            kg_context_visible = true;
+        }
+    }
+    if (!kg_recall_visible) return .none;
+    const coverage = ledger.coverageState();
+    const enumeration_active = coverage.successful_plan_calls > 0 and
+        (query_hint or coverage.enumeration_plan_calls > 0);
+    if (!enumeration_active) return .none;
+    if (!coverage.enumeration_batch_committed) return .batch;
+    if (kg_context_visible and
+        coverage.enumeration_context_required and
+        !coverage.enumeration_context_committed) return .context;
+    return .none;
+}
+
+test "enumeration coverage gate ignores query wording before a successful recall" {
+    var ledger = @import("../kg/lexical_query_plan.zig").Ledger{};
+    const tool_defs = [_]json_mod.ToolDefinition{.{
+        .name = "KgRecall",
+        .description = "recall",
+        .input_schema = .{ .prop_specs = &.{}, .required = &.{} },
+    }};
+
+    try std.testing.expectEqual(KgEnumerationPending.none, kgEnumerationPending(&ledger, &tool_defs, true));
+    try std.testing.expectEqual(KgEnumerationPending.none, kgEnumerationPending(&ledger, &.{}, true));
 }
 
 fn elapsedSinceNs(started_ns: util_time.Nanos) u64 {
@@ -1972,13 +2215,6 @@ fn runAutoCompactIfNeeded(
     abort: ?*const AbortSignal,
 ) !AutoCompactOutcome {
     var outcome: AutoCompactOutcome = .not_needed;
-    const tool_result_limit = conversation_mod.toolResultContextBytes(provider.maxInputTokens());
-    const preflight_truncated = conversation.truncateLargeToolResults(tool_result_limit);
-    if (preflight_truncated.changed()) {
-        outcome = .compacted;
-        log.info("agent", "tool-result truncate: truncated={d} cleared={d} bytes={d}->{d} max_inline={d}", .{ preflight_truncated.truncated, preflight_truncated.cleared, preflight_truncated.bytes_before, preflight_truncated.bytes_after, tool_result_limit });
-        emitContextProjection(backend, sess, conversation, "large_tool_result_truncation", trigger_cause, preflight_truncated);
-    }
 
     var request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
     var pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), configured_threshold, request_tokens_before);
@@ -2688,7 +2924,7 @@ test "usage anchor suppresses false blocking-limit nuke (glm-5.2 并发工具风
     }
 }
 
-test "auto-compact preflight truncates huge recent tool_result before next request estimate" {
+test "auto-compact preflight never rewrites an already committed tool_result" {
     const a = std.testing.allocator;
     var c = Conversation.init(a);
     defer c.deinit();
@@ -2778,13 +3014,10 @@ test "auto-compact preflight truncates huge recent tool_result before next reque
         null,
         null,
     );
-    try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
-    try std.testing.expectEqual(@as(u32, 1), cap.count);
-    try std.testing.expectEqualStrings("large_tool_result_truncation", cap.kind.?);
-    try std.testing.expectEqual(@as(u32, 1), cap.changed_items);
-    try std.testing.expect(cap.bytes_after < cap.bytes_before);
+    try std.testing.expectEqual(AutoCompactOutcome.not_needed, outcome);
+    try std.testing.expectEqual(@as(u32, 0), cap.count);
     const after = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
-    try std.testing.expect(after < before);
+    try std.testing.expectEqual(before, after);
 
     var api = try buildApiMessages(&c, a, null, null);
     defer freeApiMessages(&api, a);
@@ -2796,11 +3029,10 @@ test "auto-compact preflight truncates huge recent tool_result before next reque
         .tools = &.{},
     }, a);
     defer a.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "original_bytes") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "toolu_huge") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "Z") != null);
     try std.testing.expectEqual(Conversation.estimateTokens(body), after);
-    try std.testing.expect(body.len < body_before.len);
+    try std.testing.expectEqualStrings(body_before, body);
 }
 
 test "auto-compact emits stale tool-result projection from the real microcompact path" {

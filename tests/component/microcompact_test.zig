@@ -63,6 +63,23 @@ test "L2 microcompact: 幂等(重复清,第二次 0)" {
     try std.testing.expectEqual(@as(usize, 0), c2);
 }
 
+test "L2 microcompact: recoverable Bash channel artifact remains readable" {
+    const a = std.testing.allocator;
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    const artifact_id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const result =
+        "{\"schema_version\":\"metacodes.bash-result.v2\",\"stdout\":\"head\\n...[middle omitted]...\\ntail\",\"stdout_artifact_id\":\"" ++ artifact_id ++
+        "\",\"stdout_recoverable\":true,\"stderr_artifact_id\":null,\"stderr_recoverable\":true}";
+    try appendToolResult(&conv, a, "bash", result);
+    try conv.appendText(.assistant, "after bash");
+
+    const cleared = conv.microcompactToolResultsByRecentResults(0);
+    try std.testing.expectEqual(@as(usize, 0), cleared.cleared);
+    const preserved = conv.messages.items[0].blocks[0].tool_result.content;
+    try std.testing.expect(std.mem.indexOf(u8, preserved, artifact_id) != null);
+}
+
 test "L2 microcompact: 消息少于 keep_recent_n → 不清" {
     const a = std.testing.allocator;
     var conv = Conversation.init(a);

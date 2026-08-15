@@ -10,6 +10,7 @@ const glob_tool = @import("tools/glob.zig");
 const bash_tool = @import("tools/bash.zig");
 const grep_tool = @import("tools/grep.zig");
 const bash_output_tool = @import("tools/bash_output.zig");
+const read_artifact_tool = @import("tools/read_artifact.zig");
 const task_output_tool = @import("tools/task_output.zig");
 const swarm_tools = @import("swarm/tools.zig");
 const kill_shell_tool = @import("tools/kill_shell.zig");
@@ -218,6 +219,16 @@ pub const registry: []const ToolEntry = &.{
         .execute = bash_output_tool.execute,
     },
     .{
+        .name = "ReadArtifact",
+        .description = "Read a bounded byte range from a recoverable tool-result artifact. Use the sha256 artifact_id returned by a tool-result projection; offset is zero-based bytes and limit is capped at 32768 bytes. The result is always bounded and never spills recursively.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "artifact_id", .type = "string", .description = "Content-addressed id in sha256:<64 lowercase hex> form" },
+            .{ .name = "offset", .type = "integer", .description = "Zero-based byte offset (default 0)" },
+            .{ .name = "limit", .type = "integer", .description = "Maximum bytes to return (default 16384, maximum 32768)" },
+        }, .required = &.{"artifact_id"} },
+        .execute = read_artifact_tool.execute,
+    },
+    .{
         .name = "KillShell",
         .description = "Terminate a running backgrounded Bash job by job_id",
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -395,22 +406,20 @@ pub const registry: []const ToolEntry = &.{
                 .type = "object",
                 .description = kg_retrieval.PLAN_DESCRIPTION,
                 .object_props = &.{
-                    .{ .name = "schema_version", .type = "string", .enum_values = &.{"lexical-query-plan-v1"} },
-                    .{ .name = "intent", .type = "string", .enum_values = &.{ "fact_lookup", "procedure_reuse", "task_recovery", "enumeration", "temporal", "causal", "entity", "other" } },
+                    .{ .name = "schema_version", .type = "string", .enum_values = &.{"lexical-query-plan-v3"} },
+                    .{ .name = "intent", .type = "string", .description = "Use enumeration for count/cardinality, exhaustive-list, all/every-match, or absence questions; one positive hit is not complete coverage.", .enum_values = &.{ "fact_lookup", "procedure_reuse", "task_recovery", "enumeration", "temporal", "causal", "entity", "other" } },
                     .{ .name = "stage", .type = "string", .enum_values = &.{ "seed", "semantic_expansion", "focused_refinement" } },
                     .{
                         .name = "variants",
                         .type = "array",
                         .items_props = &.{
-                            .{ .name = "kind", .type = "string", .enum_values = &.{ "exact", "alias", "paraphrase", "mechanism", "symptom", "outcome", "broader", "narrower", "relation", "type", "time" } },
+                            .{ .name = "kind", .type = "string", .enum_values = &.{ "exact", "alias", "synonym", "paraphrase", "mechanism", "symptom", "outcome", "broader", "narrower", "relation", "type", "time" } },
                             .{ .name = "text", .type = "string", .description = "One compact lexical probe, 1-400 UTF-8 bytes." },
                         },
                         .items_required = &.{ "kind", "text" },
                     },
-                    .{ .name = "variant_index", .type = "integer", .description = "Zero-based member of variants executed by this call." },
-                    .{ .name = "seen_node_ids", .type = "array", .items_type = "integer", .description = "Exactly the up-to-32 unique positive node IDs already returned under this same fixed plan. Empty on a new seed/expansion plan; the host rejects invented, omitted, stale, or cross-plan IDs." },
                 },
-                .object_required = &.{ "schema_version", "intent", "stage", "variants", "variant_index", "seen_node_ids" },
+                .object_required = &.{ "schema_version", "intent", "stage", "variants" },
             },
         }, .required = &.{ "query", "lexical_plan" } },
         .execute = kg_tools.executeRecall,
@@ -820,6 +829,7 @@ fn missingRequiredFieldError(field: []const u8) anyerror {
     if (std.mem.eql(u8, field, "query")) return error.MissingQuery;
     if (std.mem.eql(u8, field, "url")) return error.MissingUrl;
     if (std.mem.eql(u8, field, "items")) return error.MissingItems;
+    if (std.mem.eql(u8, field, "artifact_id")) return error.MissingArtifactId;
     return error.MissingRequiredField;
 }
 
@@ -1144,7 +1154,7 @@ fn similarity(a: []const u8, b: []const u8) f32 {
 ///   Write/Edit/Bash/Task*/NotebookEdit/MCP/Skill 等有副作用或写共享态 → unsafe。
 /// 一期按工具名判定(cc 是 per-input;cc-zig 工具名足够,Bash 即便 readonly 也保守串行)。
 pub fn isConcurrencySafe(name: []const u8) bool {
-    const safe = [_][]const u8{ "Read", "Glob", "Grep", "WebFetch", "BashOutput" };
+    const safe = [_][]const u8{ "Read", "ReadArtifact", "Glob", "Grep", "WebFetch", "BashOutput" };
     for (safe) |s| if (std.mem.eql(u8, name, s)) return true;
     return false;
 }

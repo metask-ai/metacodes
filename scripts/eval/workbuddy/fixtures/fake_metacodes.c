@@ -80,7 +80,10 @@ int main(int argc, char **argv) {
         return fail("missing runtime binding");
     if (getenv("METACODES_ROUTE_TOKEN") || getenv("TINYKG_REMOTE_URL") ||
         getenv("TINYKG_API_KEY") || getenv("TINYKG_REMOTE_EXPECTED_BUILD_ID") ||
-        getenv("TINYKG_REMOTE_CONFIG") || getenv("METASK_API_KEY"))
+        getenv("TINYKG_REMOTE_CONFIG") || getenv("METACODES_KG_CONFIG") ||
+        getenv("METACODES_KG_URL") || getenv("METACODES_KG_API_KEY") ||
+        getenv("METACODES_KG_EXPECTED_BUILD_ID") ||
+        getenv("METACODES_KG_EXPECTED_SCHEMA_DIGEST") || getenv("METASK_API_KEY"))
         return fail("ambient credential or remote TinyKG configuration leaked");
     if (!network_is_loopback_only())
         return fail("container network namespace is not isolated");

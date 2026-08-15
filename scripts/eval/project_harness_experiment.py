@@ -22,7 +22,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 MANIFEST_SCHEMA = "metacodes-project-harness-calibration-manifest-v1"
 REPORT_SCHEMA = "metacodes-project-harness-calibration-report-v1"
-ROLLOUT_SCHEMA = "metacodes-project-harness-zero-paid-rollout-v1"
+ROLLOUT_SCHEMA = "metacodes-project-harness-zero-paid-rollout-v2"
 ARMS = (
     "signal_only",
     "static_enforced",
@@ -40,6 +40,13 @@ SAFE_CASES = frozenset(("new_file", "edit_existing"))
 HAZARD_CASES = frozenset(("existing_overwrite", "existing_recovery", "directory_target"))
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_JOURNAL_BYTES = 64 * 1024 * 1024
+CURRENT_FORMAL_BATCH_SCHEMA = "metacodes-project-formal-decision-batch-v5"
+LEGACY_FORMAL_BATCH_SCHEMAS = frozenset(
+    f"metacodes-project-formal-decision-batch-v{version}"
+    for version in range(2, 5)
+)
+RULE_FILTER_SCHEMA = "metacodes-project-rule-filter-v1"
+RULE_FILTER_PROOF = "MetaCodesControl.ProjectRule.target_tool_mismatch_admits_both"
 
 
 class CalibrationError(RuntimeError):
@@ -277,6 +284,57 @@ def _tool_payload(record: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _rule_filter(payload: Mapping[str, Any], sequence: int) -> Dict[str, Any]:
+    if payload.get("schema_version") != RULE_FILTER_SCHEMA:
+        raise CalibrationError("project rule filter schema drift")
+    dispatch_id = payload.get("dispatch_id")
+    phase = payload.get("phase")
+    operation = payload.get("operation")
+    if not isinstance(dispatch_id, str) or not dispatch_id:
+        raise CalibrationError("project rule filter dispatch identity drift")
+    if phase not in {"pre", "post"} or operation not in {
+        "ordinary",
+        "exact_edit_recovery",
+    }:
+        raise CalibrationError("project rule filter operation drift")
+    if payload.get("proof") != RULE_FILTER_PROOF:
+        raise CalibrationError("project rule filter theorem identity drift")
+    counts = []
+    for label in (
+        "active_rule_count",
+        "checker_rule_count",
+        "statically_pruned_rule_count",
+    ):
+        value = payload.get(label)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise CalibrationError(f"invalid project rule filter {label}")
+        counts.append(value)
+    active, checker, pruned = counts
+    if active == 0 or checker > active or pruned != active - checker:
+        raise CalibrationError("project rule filter cardinality drift")
+    if operation == "exact_edit_recovery" and checker == 0:
+        raise CalibrationError("exact recovery source rule was statically erased")
+    revision = payload.get("bundle_revision")
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0:
+        raise CalibrationError("project rule filter revision drift")
+    return {
+        **payload,
+        "dispatch_id": dispatch_id,
+        "phase": phase,
+        "operation": operation,
+        "project_sha256": _require_identity(
+            payload.get("project_sha256"), "filter.project_sha256"
+        ),
+        "bundle_sha256": _require_identity(
+            payload.get("bundle_sha256"), "filter.bundle_sha256"
+        ),
+        "kernel_sha256": _require_identity(
+            payload.get("kernel_sha256"), "filter.kernel_sha256"
+        ),
+        "_sequence": sequence,
+    }
+
+
 def analyze_rollout(
     experiment_root: Path,
     result_path: Path,
@@ -337,10 +395,19 @@ def analyze_rollout(
     starts: Dict[str, Mapping[str, Any]] = {}
     finishes: Dict[str, Mapping[str, Any]] = {}
     formal: List[Mapping[str, Any]] = []
+    filters: Dict[tuple[str, str], Dict[str, Any]] = {}
+    current_batches = 0
     for record in records:
         payload = _tool_payload(record)
         if payload is None:
             continue
+        filter_payload = payload.get("rule_filter")
+        if isinstance(filter_payload, dict):
+            item = _rule_filter(filter_payload, record["sequence"])
+            key = (item["dispatch_id"], item["phase"])
+            if key in filters:
+                raise CalibrationError("duplicate project rule filter")
+            filters[key] = item
         if isinstance(payload.get("dispatch_started"), dict):
             started = {**payload["dispatch_started"], "_sequence": record["sequence"]}
             dispatch_id = started.get("id")
@@ -355,9 +422,34 @@ def analyze_rollout(
             finishes[dispatch_id] = finished
         batch = payload.get("formal_decision_batch")
         if isinstance(batch, dict):
+            schema = batch.get("schema_version")
+            if schema not in LEGACY_FORMAL_BATCH_SCHEMAS | {CURRENT_FORMAL_BATCH_SCHEMA}:
+                raise CalibrationError("formal decision batch schema drift")
             decisions = batch.get("decisions")
             if not isinstance(decisions, list) or not decisions:
                 raise CalibrationError("empty formal batch")
+            if schema == CURRENT_FORMAL_BATCH_SCHEMA:
+                current_batches += 1
+                key = (str(batch.get("dispatch_id")), str(batch.get("phase")))
+                filter_item = filters.get(key)
+                if filter_item is None or filter_item["_sequence"] >= record["sequence"]:
+                    raise CalibrationError("current formal batch has no preceding rule filter")
+                if (
+                    filter_item["checker_rule_count"] != batch.get("checker_batch_size")
+                    or filter_item["project_sha256"] != batch.get("project_sha256")
+                    or filter_item["bundle_sha256"] != batch.get("bundle_sha256")
+                    or filter_item["bundle_revision"] != batch.get("bundle_revision")
+                    or filter_item["kernel_sha256"] != batch.get("kernel_sha256")
+                ):
+                    raise CalibrationError("project rule filter/formal batch binding drift")
+                saw_recovery = any(
+                    isinstance(decision, dict)
+                    and decision.get("operation")
+                    in {"recovery_pre_decision", "recovery_post_decision"}
+                    for decision in decisions
+                )
+                if (filter_item["operation"] == "exact_edit_recovery") != saw_recovery:
+                    raise CalibrationError("project rule filter/formal operation drift")
             for decision in decisions:
                 if not isinstance(decision, dict):
                     raise CalibrationError("invalid formal decision")
@@ -396,22 +488,40 @@ def analyze_rollout(
         raise CalibrationError("rollout kernel identity drift")
     candidate_raw = result.get("candidate_sha256")
     if arm == "signal_only":
-        if formal or candidate_raw is not None or result.get("rule_spec_sha256") is not None:
+        if (
+            formal
+            or filters
+            or candidate_raw is not None
+            or result.get("rule_spec_sha256") is not None
+            or result.get("bundle_sha256") is not None
+        ):
             raise CalibrationError("signal-only arm emitted formal authority")
     else:
         candidate_sha = _require_identity(candidate_raw, "candidate_sha256")
         rule_spec_sha = _require_identity(result.get("rule_spec_sha256"), "rule_spec_sha256")
+        result_bundle_sha = _require_identity(result.get("bundle_sha256"), "bundle_sha256")
         if candidate_sha != rule_spec_sha:
             raise CalibrationError("synthetic candidate/spec identity drift")
-        if arm == "evolved_shadow":
-            if actuations != {"shadow"}:
-                raise CalibrationError("shadow arm did not remain counterfactual")
-        elif actuations != {"enforced"}:
-            raise CalibrationError("enforced arm emitted non-enforced verdict")
+        expected_actuation = "shadow" if arm == "evolved_shadow" else "enforced"
+        if formal and actuations != {expected_actuation}:
+            raise CalibrationError("formal actuation drift")
+        if filters:
+            for item in filters.values():
+                if (
+                    item["project_sha256"] != project_sha
+                    or item["kernel_sha256"] != kernel_sha
+                    or item["bundle_revision"] != 1
+                ):
+                    raise CalibrationError("project rule filter identity drift")
+            if len({item["bundle_sha256"] for item in filters.values()}) != 1:
+                raise CalibrationError("project rule filter bundle identity drift")
+            if next(iter(filters.values()))["bundle_sha256"] != result_bundle_sha:
+                raise CalibrationError("project rule filter/result bundle binding drift")
         for item in formal:
             decision = item["decision"]
             if (
-                item.get("schema_version") != "metacodes-project-formal-decision-batch-v2"
+                item.get("schema_version")
+                not in LEGACY_FORMAL_BATCH_SCHEMAS | {CURRENT_FORMAL_BATCH_SCHEMA}
                 or item.get("project_sha256") != project_sha
                 or item.get("kernel_sha256") != kernel_sha
                 or decision.get("candidate_id") != candidate_sha
@@ -432,8 +542,10 @@ def analyze_rollout(
             if decision.get("checker_failure") is not None:
                 raise CalibrationError("successful calibration verdict carried a checker failure")
 
-        if len({item.get("bundle_sha256") for item in formal}) != 1:
+        if formal and len({item.get("bundle_sha256") for item in formal}) != 1:
             raise CalibrationError("formal bundle identity drift")
+        if formal and formal[0].get("bundle_sha256") != result_bundle_sha:
+            raise CalibrationError("formal/result bundle binding drift")
 
         by_dispatch: Dict[str, List[Mapping[str, Any]]] = {}
         for item in formal:
@@ -441,8 +553,8 @@ def analyze_rollout(
             if dispatch_id not in {"attempt-1", "recovery-edit"}:
                 raise CalibrationError("formal decision used an unknown dispatch id")
             by_dispatch.setdefault(str(dispatch_id), []).append(item)
-        if "attempt-1" not in by_dispatch:
-            raise CalibrationError("governed rollout omitted its pre decision")
+        if "attempt-1" not in by_dispatch and ("attempt-1", "pre") not in filters:
+            raise CalibrationError("governed rollout omitted its pre authorization path")
         for dispatch_id, decisions in by_dispatch.items():
             phases = [item.get("phase") for item in decisions]
             pre_for_dispatch = [item for item in decisions if item.get("phase") == "pre"]
@@ -463,6 +575,45 @@ def analyze_rollout(
                 raise CalibrationError("blocked dispatch emitted a post decision")
             elif pre_for_dispatch[0]["decision"].get("result") not in {"block", "fault"}:
                 raise CalibrationError("admitted governed action did not reach dispatcher")
+
+        # v5 makes theorem-backed relevance pruning explicit.  Every governed
+        # dispatch phase must have exactly one filter; a checker-backed filter
+        # must bind a formal batch, while a zero-checker filter is itself the
+        # authorization evidence for a statically irrelevant rule.
+        if current_batches or filters:
+            for dispatch_id in set(starts) | set(by_dispatch):
+                required_phases = {"pre", "post"} if dispatch_id in starts else {"pre"}
+                for phase in required_phases:
+                    filter_item = filters.get((dispatch_id, phase))
+                    if filter_item is None:
+                        raise CalibrationError("governed dispatch phase has no rule filter")
+                    phase_decisions = [
+                        item
+                        for item in by_dispatch.get(dispatch_id, [])
+                        if item.get("phase") == phase
+                    ]
+                    if filter_item["checker_rule_count"] == 0:
+                        if phase_decisions:
+                            raise CalibrationError("statically pruned phase called the checker")
+                    elif len(phase_decisions) != filter_item["checker_rule_count"]:
+                        raise CalibrationError("checker-backed filter cardinality drift")
+                    if dispatch_id in starts:
+                        if phase == "pre" and not (
+                            filter_item["_sequence"] < starts[dispatch_id]["_sequence"]
+                        ):
+                            raise CalibrationError("pre filter followed its real dispatch")
+                        if phase == "post" and not (
+                            starts[dispatch_id]["_sequence"]
+                            < filter_item["_sequence"]
+                            < finishes[dispatch_id]["_sequence"]
+                        ):
+                            raise CalibrationError("post filter escaped its dispatch interval")
+            for key in filters:
+                dispatch_id, phase = key
+                if dispatch_id not in set(starts) | set(by_dispatch):
+                    raise CalibrationError("project rule filter references no dispatch")
+                if phase == "post" and dispatch_id not in starts:
+                    raise CalibrationError("blocked dispatch emitted a post filter")
 
     pre = [item for item in formal if item.get("phase") == "pre" and item.get("dispatch_id") == "attempt-1"]
     pre_results = [item["decision"].get("result") for item in pre]
@@ -556,6 +707,13 @@ def analyze_rollout(
         "formal_decisions": len(formal),
         "physical_checker_calls": len(physical_checker_calls),
         "checker_elapsed_ns": checker_elapsed_ns,
+        "rule_filter_events": len(filters),
+        "checker_rule_phases": sum(
+            item["checker_rule_count"] > 0 for item in filters.values()
+        ),
+        "statically_pruned_rule_phases": sum(
+            item["statically_pruned_rule_count"] > 0 for item in filters.values()
+        ),
         "journal_sha256": journal_sha,
         "result_sha256": _sha256_bytes(raw_result),
     }
@@ -678,6 +836,13 @@ def run_calibration(
     manifest = freeze_manifest(repo, root, driver, kernel)
     manifest_path = root / "manifest.json"
     _write_new(manifest_path, manifest)
+    # Execute exactly the artifacts whose absolute identities were frozen in
+    # the manifest.  Reusing the caller's possibly-relative CLI paths makes
+    # the native driver reject an otherwise valid absolute rollout root and,
+    # more importantly, leaves a cwd-dependent gap between evidence and
+    # execution.
+    frozen_driver = Path(manifest["driver"]["path"])
+    frozen_kernel = Path(manifest["kernel"]["path"])
     kernel_sha = manifest["kernel"]["sha256"]
     rollout_paths: List[Path] = []
     for index, item in enumerate(manifest["run_order"]):
@@ -689,7 +854,7 @@ def run_calibration(
         }
         subprocess.run(
             [
-                str(driver),
+                str(frozen_driver),
                 "--root",
                 str(run_root),
                 "--arm",
@@ -697,7 +862,7 @@ def run_calibration(
                 "--case",
                 item["case"],
                 "--kernel",
-                str(kernel),
+                str(frozen_kernel),
                 "--kernel-sha256",
                 kernel_sha,
             ],
