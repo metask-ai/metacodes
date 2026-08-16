@@ -16,9 +16,13 @@ const bash_parser = @import("../permission/bash_parser.zig");
 pub const CHECKPOINT_TEXT =
     "[verification checkpoint]\n" ++
     "A post-mutation verification command succeeded. Before doing more work:\n" ++
-    "1. Compare the implementation and exact user-visible behavior with the nearest existing repository tests/contracts.\n" ++
-    "2. If the requested behavior is satisfied, run at most one proportionate regression check and finish.\n" ++
-    "3. Continue editing only when a concrete failure or unmet requirement justifies it.\n" ++
+    "1. Re-read the ORIGINAL task statement and check each explicitly requested " ++
+    "behavior or requirement is actually implemented — visible tests passing " ++
+    "does not prove the statement is satisfied (test suites routinely cover " ++
+    "less than what was asked).\n" ++
+    "2. Compare the implementation and exact user-visible behavior with the nearest existing repository tests/contracts.\n" ++
+    "3. If the requested behavior is satisfied, run at most one proportionate regression check and finish.\n" ++
+    "4. Continue editing only when a concrete failure or unmet requirement justifies it.\n" ++
     "Do not add unrelated tests, docs, or refactors.";
 
 pub const FINAL_GATE_TEXT =

@@ -66,10 +66,31 @@ fn resolve() ?[:0]const u8 {
     }
     // 2. PATH 逐目录探测
     if (searchPath()) |p| return p;
+    // 2.5 可执行文件同目录(split-mount 部署把 rg 和 metacodes 并排装在 bin/;
+    // 容器 PATH 不含 mount,靠环境变量协调则是隐式契约——同目录探测让部署
+    // 自然成立。WorkBuddy 实证:缺这条时 Grep/Glob 在容器里 100% RipgrepNotFound)。
+    if (nextToExecutable()) |p| return p;
     // 3. fallback
     for (FALLBACK_PATHS) |p| {
         if (pfs.exists(p.ptr)) return p;
     }
+    return null;
+}
+
+var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+/// <dir-of-self-executable>/rg[.exe]。resolve() 已在 init_mutex 内,静态 buf 安全。
+fn nextToExecutable() ?[:0]const u8 {
+    const paths = @import("platform").paths;
+    const exe = paths.selfExePath(exe_dir_buf[0 .. exe_dir_buf.len - RG_NAME.len - 2]) orelse return null;
+    const dir_sep: u8 = if (is_windows) '\\' else '/';
+    const cut = std.mem.lastIndexOfScalar(u8, exe, dir_sep) orelse return null;
+    const need = cut + 1 + RG_NAME.len;
+    if (need + 1 > exe_dir_buf.len) return null;
+    // selfExePath 写在 buf 头部;截到目录后原地续接文件名。
+    @memcpy(exe_dir_buf[cut + 1 ..][0..RG_NAME.len], RG_NAME);
+    exe_dir_buf[need] = 0;
+    if (pfs.exists(@ptrCast(&exe_dir_buf))) return exe_dir_buf[0..need :0];
     return null;
 }
 
@@ -98,4 +119,21 @@ test "ripgrepPath finds some rg or returns NotFound" {
         try std.testing.expect(err == error.RipgrepNotFound);
         return;
     };
+}
+
+test "next-to-executable probe finds an adjacent rg" {
+    if (is_windows) return error.SkipZigTest;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const paths = @import("platform").paths;
+    const exe = paths.selfExePath(&buf) orelse return error.SkipZigTest;
+    const cut = std.mem.lastIndexOfScalar(u8, exe, '/') orelse return error.SkipZigTest;
+    var rg_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rg_path = try std.fmt.bufPrint(&rg_path_buf, "{s}/rg", .{exe[0..cut]});
+    std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = rg_path,
+        .data = "#!/bin/sh\n",
+    }) catch return error.SkipZigTest;
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, rg_path) catch {};
+    const found = nextToExecutable() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.endsWith(u8, found, "/rg"));
 }
