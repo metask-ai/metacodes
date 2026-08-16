@@ -1430,6 +1430,7 @@ def freeze_verification_manifest(
             "max_total_cost_usd": max_total_cost_usd,
             "max_total_metered_tokens": max_total_metered_tokens,
             "max_output_tokens": max_output_tokens,
+            "rollout_timeout_seconds": 300,
             "serial_rollouts": True,
             "fresh_home_per_rollout": True,
         },
