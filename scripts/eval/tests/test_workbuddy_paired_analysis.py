@@ -613,3 +613,114 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ProgressAnalyzerSuccessionTest(unittest.TestCase):
+    """The succession verifier is fail-closed on every branch that is not the
+    exact earned case: only the analyzer differs, the current analyzer is the
+    treatment's, and baseline metrics reproduce byte-identically."""
+
+    @staticmethod
+    def _comparison(analyzer_sha):
+        return {
+            "comparison_id": "pair",
+            "covariates_sha256": "x" * 64,
+            "covariates": {
+                "budget": {"total_cost_microusd": 1},
+                "host_control_plane": {
+                    "launch_gate": {"bytes": 1, "sha256": "a" * 64},
+                    "progress_analysis": {"bytes": 2, "sha256": analyzer_sha},
+                },
+            },
+        }
+
+    def test_rejects_any_second_covariate_difference(self):
+        from scripts.eval.workbuddy.paired_analysis import (
+            LaunchError,
+            _verify_progress_analyzer_succession,
+        )
+
+        base = self._comparison("b" * 64)
+        treatment = self._comparison("c" * 64)
+        treatment["covariates"]["budget"] = {"total_cost_microusd": 2}
+        with self.assertRaises(LaunchError):
+            _verify_progress_analyzer_succession(
+                base, treatment, {}, Path("/nonexistent")
+            )
+
+    def test_rejects_analyzer_that_did_not_measure_the_treatment(self):
+        from scripts.eval.workbuddy.paired_analysis import (
+            LaunchError,
+            _verify_progress_analyzer_succession,
+        )
+
+        base = self._comparison("b" * 64)
+        treatment = self._comparison("c" * 64)
+        with self.assertRaisesRegex(LaunchError, "measured the treatment"):
+            _verify_progress_analyzer_succession(
+                base, treatment, {}, Path("/nonexistent")
+            )
+
+    def test_accepts_only_after_byte_identical_baseline_reverification(self):
+        import hashlib
+        import json as json_mod
+        import tempfile
+
+        from scripts.eval.workbuddy import paired_analysis as pa
+        from scripts.eval.workbuddy.progress_analysis import analyze_progress
+
+        current_sha = hashlib.sha256(
+            (Path(pa.__file__).resolve().parent / "progress_analysis.py").read_bytes()
+        ).hexdigest()
+        base = self._comparison("b" * 64)
+        treatment = self._comparison(current_sha)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trial = root / "checkout" / "results" / "job" / "run" / "trial" / "agent"
+            trial.mkdir(parents=True)
+            transcript = trial / "metacodes-transcript.jsonl"
+            observation = trial / "metacodes-tool-observations.jsonl"
+            transcript.write_text(
+                json_mod.dumps({"role": "assistant", "blocks": [{
+                    "type": "tool_use", "id": "call", "name": "Bash",
+                    "input": {"command": "true"},
+                }]}) + "\n" + json_mod.dumps({"role": "user", "blocks": [{
+                    "type": "tool_result", "tool_use_id": "call",
+                    "content": "{\"exit_code\":0}", "is_error": False,
+                }]}) + "\n"
+            )
+            observation.write_text(json_mod.dumps({
+                "monotonic_elapsed_ns": 0,
+                "event": {"tool_observation": {"dispatch_finished": {
+                    "id": "call", "requested_name": "Bash",
+                    "dispatched_name": "Bash", "origin": "authoritative",
+                    "agent_depth": 0, "outcome": "succeeded",
+                    "effect": None, "effect_valid": True,
+                }}},
+            }) + "\n")
+            committed = analyze_progress(transcript, observation)
+            receipt = root / "receipt.json"
+            receipt.write_text(json_mod.dumps({
+                "usage": {"tasks": {"task-a": {"progress_metrics": committed}}}
+            }))
+            manifests = {"baseline": {
+                "workbuddy": {"checkout": str(root / "checkout")},
+                "job": {"slug": "job"},
+            }}
+            record = pa._verify_progress_analyzer_succession(
+                base, treatment, manifests, receipt
+            )
+            self.assertEqual(
+                record["baseline_tasks_reverified_byte_identical"], 1
+            )
+            # Any drift in the committed metrics must reject.
+            drifted = dict(committed)
+            drifted["progress"] = dict(committed["progress"])
+            drifted["progress"]["tool_calls"] = 99
+            receipt.write_text(json_mod.dumps({
+                "usage": {"tasks": {"task-a": {"progress_metrics": drifted}}}
+            }))
+            with self.assertRaisesRegex(pa.LaunchError, "changed baseline measurement"):
+                pa._verify_progress_analyzer_succession(
+                    base, treatment, manifests, receipt
+                )
+
