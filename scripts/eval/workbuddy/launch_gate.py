@@ -434,6 +434,10 @@ def _artifact_contract(path: Path) -> Dict[str, object]:
         "tinykg": stage / "bin/tinykg",
         "metacodes-formal-kernel": stage / "libexec/metacodes-formal-kernel",
     }
+    # ripgrep ships beside metacodes as of the Grep/Glob restoration; the
+    # roster stays two-era so pre-restoration manifests remain readable.
+    if isinstance(manifest.get("executables"), dict) and "ripgrep" in manifest["executables"]:
+        expected["ripgrep"] = stage / "bin/rg"
     executables = manifest.get("executables")
     if not isinstance(executables, dict) or set(executables) != set(expected):
         raise LaunchError("split-mount executable manifest is incomplete")

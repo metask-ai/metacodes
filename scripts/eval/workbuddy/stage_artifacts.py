@@ -177,6 +177,7 @@ def stage(
     metacodes: Path,
     tinykg: Path,
     formal_kernel: Path,
+    ripgrep: Path | None = None,
     metacodes_commit: str,
     tinykg_commit: str,
     licenses: Iterable[Tuple[str, str, Path]],
@@ -196,6 +197,11 @@ def stage(
         "tinykg": tinykg.resolve(),
         "metacodes-formal-kernel": formal_kernel.resolve(),
     }
+    if ripgrep is not None:
+        # Grep/Glob are schema-declared tools backed by rg; shipping it beside
+        # bin/metacodes satisfies the resolver's next-to-executable probe.
+        # 90/90 container dispatches failed with RipgrepNotFound before this.
+        binaries["ripgrep"] = ripgrep.resolve()
     if (project_kernel is None) != (project_rules is None):
         raise StageError("project kernel and project-rules template must be staged together")
     license_rows = list(licenses)
@@ -226,6 +232,8 @@ def stage(
         "tinykg": output / "bin/tinykg",
         "metacodes-formal-kernel": output / "libexec/metacodes-formal-kernel",
     }
+    if "ripgrep" in binaries:
+        executable_targets["ripgrep"] = output / "bin/rg"
     executable_meta = {
         name: _copy_regular(source, executable_targets[name], 0o755)
         for name, source in binaries.items()
@@ -344,6 +352,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--metacodes", type=Path, required=True)
     parser.add_argument("--tinykg", type=Path, required=True)
     parser.add_argument("--formal-kernel", type=Path, required=True)
+    parser.add_argument("--ripgrep", type=Path)
     parser.add_argument("--project-kernel", type=Path)
     parser.add_argument("--project-rules", type=Path)
     parser.add_argument("--metacodes-commit", required=True)
@@ -362,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
             metacodes=args.metacodes,
             tinykg=args.tinykg,
             formal_kernel=args.formal_kernel,
+        ripgrep=args.ripgrep,
             metacodes_commit=args.metacodes_commit,
             tinykg_commit=args.tinykg_commit,
             licenses=(

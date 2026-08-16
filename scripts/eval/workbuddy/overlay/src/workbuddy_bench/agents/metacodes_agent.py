@@ -216,7 +216,7 @@ class MetacodesAgent(BaseInstalledAgent):
                 f"test -d {mount}; cd {mount}; "
                 "test -f share/metacodes/SHA256SUMS; "
                 "sha256sum -c share/metacodes/SHA256SUMS; "
-                "test -x bin/metacodes; test -x bin/tinykg; "
+                "test -x bin/metacodes; test -x bin/tinykg; test -x bin/rg; "
                 "test -x libexec/metacodes-formal-kernel"
                 f"{project_check}; "
                 "ln -sf \"$PWD/bin/metacodes\" /usr/local/bin/metacodes; "
