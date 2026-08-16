@@ -21,6 +21,7 @@ from scripts.eval.memory_budget_journal import (
     validate_checkpoint_payload,
 )
 from scripts.eval.model import ValidationError, stable_json
+from scripts.eval.workbuddy import launch_gate
 from scripts.eval.workbuddy.launch_gate import (
     AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION,
     AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION_V1,
@@ -2247,3 +2248,45 @@ with urllib.request.urlopen(
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunnerToolLocaleTest(unittest.TestCase):
+    """A localized version banner must not reject a valid GNU Bash runner."""
+
+    def _fake_bash(self, directory: Path) -> Path:
+        # Prints the zh_CN banner unless the caller forces a C locale, which
+        # is exactly how a real bash behaves on a Chinese-locale host.
+        path = directory / "bash"
+        path.write_text(
+            "#!/bin/sh\n"
+            'if [ "${LC_ALL:-}" = "C" ] || [ "${LANG:-}" = "C" ]; then\n'
+            '  echo "GNU bash, version 5.3.15(1)-release (aarch64-apple-darwin25.4.0)"\n'
+            "else\n"
+            '  echo "GNU bash，版本 5.3.15(1)-release (aarch64-apple-darwin25.4.0)"\n'
+            "fi\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+        return path
+
+    def test_localized_bash_banner_is_still_identified(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wb-locale-") as temporary:
+            directory = Path(temporary)
+            probed = launch_gate._runner_tool(
+                self._fake_bash(directory), ("--version",), bash=True
+            )
+        # The recorded banner is the C-locale spelling, so the launch
+        # manifest identity is host-locale independent too.
+        self.assertIn("GNU bash, version 5.3.15", str(probed["version_first_line"]))
+
+    def test_bash_3_is_still_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wb-locale-old-") as temporary:
+            directory = Path(temporary)
+            path = directory / "bash"
+            path.write_text(
+                "#!/bin/sh\necho 'GNU bash, version 3.2.57(1)-release'\n",
+                encoding="utf-8",
+            )
+            path.chmod(0o755)
+            with self.assertRaisesRegex(launch_gate.LaunchError, "GNU Bash 4 or newer"):
+                launch_gate._runner_tool(path, ("--version",), bash=True)

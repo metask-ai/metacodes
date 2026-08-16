@@ -344,6 +344,11 @@ def _runner_tool(path: Path, version_args: Sequence[str], *, bash: bool = False)
             stderr=subprocess.STDOUT,
             text=True,
             timeout=10,
+            # Version banners are localized: a zh_CN host prints
+            # "GNU bash，版本 5.3.15", which no English regex can parse and
+            # which would reject a perfectly valid runner. Identity probes
+            # must read the C-locale spelling.
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise LaunchError(f"cannot identify runner tool {resolved}: {exc}") from exc
