@@ -443,7 +443,9 @@ test "verification classifier accepts bounded test forms and rejects ambiguous s
     try std.testing.expect(isVerificationCommand(a, "python -m pytest -q 2>&1 | tail -20"));
     try std.testing.expect(!isVerificationCommand(a, "python -m pytest -q | grep passed"));
     try std.testing.expect(!isVerificationCommand(a, "grep -n test src/a.zig"));
-    try std.testing.expect(!isVerificationCommand(a, "python -m pytest -q; true"));
+    // Retired strictness: a pure-display suffix after a pytest head now
+    // yields summary-text evidence (the exit code stays untrusted).
+    try std.testing.expect(isVerificationCommand(a, "python -m pytest -q; true"));
     try std.testing.expect(!isVerificationCommand(a, "python -m pytest --version"));
     try std.testing.expect(!isVerificationCommand(a, "zig test --help"));
     try std.testing.expect(!isVerificationCommand(a, "cd /workspace && git status"));
