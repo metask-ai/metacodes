@@ -2833,13 +2833,8 @@ from workbuddy_bench.agents import metacodes_agent as module
 from workbuddy_bench.agents.metacodes_agent import MetacodesAgent
 
 class StubEnvironment:
-    def __init__(self, export_payload: bytes):
-        self.uploads = []
-        self.export_payload = export_payload
-    async def upload_file(self, source, target):
-        self.uploads.append((source, target))
-    async def download_file(self, source, target):
-        Path(target).write_bytes(self.export_payload)
+    """The continuity channel is the /logs/agent bind mount; the environment
+    object needs no transfer API at all."""
 
 def make_agent(logs, **extra):
     return MetacodesAgent(
@@ -2864,19 +2859,24 @@ with tempfile.TemporaryDirectory() as directory:
     logs1 = jobs / "batch-1" / "task-a__x1" / "agent"
     logs1.mkdir(parents=True)
     export1 = store_tar(b"first-trial-store")
-    env1 = StubEnvironment(export1)
-    agent1 = make_agent(logs1)
+    exports = {}
     captured = {}
-    async def fake_exec(environment, command, env, cwd):
-        captured["command"] = command
-    agent1.exec_as_agent = fake_exec
-    asyncio.run(agent1.run("instruction", env1, None))
+    def exec_for(logs):
+        async def fake_exec(environment, command, env, cwd):
+            captured["command"] = command
+            # The container-side export lands on the bind mount.
+            (logs / "kg-export.tar").write_bytes(exports[logs])
+        return fake_exec
+    agent1 = make_agent(logs1)
+    exports[logs1] = export1
+    agent1.exec_as_agent = exec_for(logs1)
+    asyncio.run(agent1.run("instruction", StubEnvironment(), None))
     command1 = captured["command"]
-    # Empty start keeps the absent-store assertion and uploads nothing.
+    # Empty start keeps the absent-store assertion and stages no import.
     assert 'test ! -e "$METACODES_KG_STORE" || exit 85' in command1
     assert "kg-import.tar" not in command1
-    assert env1.uploads == []
-    assert "tar -cf /tmp/kg-export.tar" in command1
+    assert not (logs1 / "kg-import.tar").exists()
+    assert "tar -cf /logs/agent/kg-export.tar" in command1
     contract = json.loads((logs1 / "metacodes-runtime-contract.json").read_text()) if (logs1 / "metacodes-runtime-contract.json").exists() else None
     root = jobs / "kg-store-continuity"
     ledger = [json.loads(l) for l in (root / "ledger.jsonl").read_text().splitlines()]
@@ -2889,15 +2889,15 @@ with tempfile.TemporaryDirectory() as directory:
     logs2 = jobs / "batch-1" / "task-b__x2" / "agent"
     logs2.mkdir(parents=True)
     export2 = store_tar(b"second-trial-store")
-    env2 = StubEnvironment(export2)
     agent2 = make_agent(logs2)
-    agent2.exec_as_agent = fake_exec
-    asyncio.run(agent2.run("instruction", env2, None))
+    exports[logs2] = export2
+    agent2.exec_as_agent = exec_for(logs2)
+    asyncio.run(agent2.run("instruction", StubEnvironment(), None))
     command2 = captured["command"]
     assert sha1 in command2
-    assert "tar -xf /tmp/kg-import.tar" in command2
+    assert "tar -xf /logs/agent/kg-import.tar" in command2
     assert 'test ! -e "$METACODES_KG_STORE" || exit 85' not in command2
-    assert env2.uploads and env2.uploads[0][1] == "/tmp/kg-import.tar"
+    assert (logs2 / "kg-import.tar").read_bytes() == export1
     ledger = [json.loads(l) for l in (root / "ledger.jsonl").read_text().splitlines()]
     assert len(ledger) == 2 and ledger[1]["import_sha256"] == sha1
     assert (root / "store-latest.tar").read_bytes() == export2
@@ -2907,9 +2907,10 @@ with tempfile.TemporaryDirectory() as directory:
     logs3 = jobs / "batch-1" / "task-c__x3" / "agent"
     logs3.mkdir(parents=True)
     agent3 = make_agent(logs3)
-    agent3.exec_as_agent = fake_exec
+    exports[logs3] = b""
+    agent3.exec_as_agent = exec_for(logs3)
     try:
-        asyncio.run(agent3.run("instruction", StubEnvironment(b""), None))
+        asyncio.run(agent3.run("instruction", StubEnvironment(), None))
     except ValueError as error:
         assert "chain is broken" in str(error)
     else:
@@ -2935,8 +2936,7 @@ with tempfile.TemporaryDirectory() as directory:
         captured["command"] = command
     agent.exec_as_agent = fake_exec
     class StubEnvironment:
-        async def upload_file(self, *a): raise AssertionError("no upload expected")
-        async def download_file(self, *a): raise AssertionError("no download expected")
+        pass
     asyncio.run(agent.run("instruction", StubEnvironment(), None))
     command = captured["command"]
     assert 'test ! -e "$METACODES_KG_STORE" || exit 85' in command

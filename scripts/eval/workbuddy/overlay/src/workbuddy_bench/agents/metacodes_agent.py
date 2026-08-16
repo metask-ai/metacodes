@@ -373,9 +373,10 @@ class MetacodesAgent(BaseInstalledAgent):
                     raise ValueError(
                         "kg store continuity ledger chain is broken"
                     )
-                await environment.upload_file(
-                    str(continuity_tar), "/tmp/kg-import.tar"
-                )
+                # /logs/agent is the bind mount the transcript itself uses;
+                # /tmp is not shared across Harbor exec containers.
+                import_host = self.logs_dir / "kg-import.tar"
+                import_host.write_bytes(tar_bytes)
         runtime_contract = json.dumps(
             {
                 "schema_version": "metacodes-workbuddy-runtime-contract-v2",
@@ -404,12 +405,12 @@ class MetacodesAgent(BaseInstalledAgent):
             # Continuity witness replaces the empty-start assertion: the
             # imported bytes must hash to the ledger head before extraction.
             store_gate = (
-                "test -f /tmp/kg-import.tar || exit 89; "
-                'test "$(sha256sum /tmp/kg-import.tar | cut -d" " -f1)" = '
+                "test -f /logs/agent/kg-import.tar || exit 89; "
+                'test "$(sha256sum /logs/agent/kg-import.tar | cut -d" " -f1)" = '
                 + shlex.quote(store_import_sha)
                 + " || exit 89; "
                 + 'mkdir -p "$(dirname "$METACODES_KG_STORE")" || exit 89; '
-                + 'tar -xf /tmp/kg-import.tar -C "$(dirname "$METACODES_KG_STORE")" || exit 89; '
+                + 'tar -xf /logs/agent/kg-import.tar -C "$(dirname "$METACODES_KG_STORE")" || exit 89; '
                 + 'test -d "$METACODES_KG_STORE" || exit 89; '
             )
         if self._memory_accumulation:
@@ -418,7 +419,7 @@ class MetacodesAgent(BaseInstalledAgent):
             # next trial's import witness never has to guess.
             store_export = (
                 'mkdir -p "$METACODES_KG_STORE" || exit 78; '
-                'tar -cf /tmp/kg-export.tar -C "$(dirname "$METACODES_KG_STORE")" '
+                'tar -cf /logs/agent/kg-export.tar -C "$(dirname "$METACODES_KG_STORE")" '
                 '"$(basename "$METACODES_KG_STORE")" || exit 78; '
             )
         else:
@@ -487,12 +488,16 @@ class MetacodesAgent(BaseInstalledAgent):
         )
         if self._memory_accumulation:
             continuity_root = _continuity_root(self.logs_dir)
-            staging = continuity_root / f".export-{self._session_id}.tar"
-            await environment.download_file("/tmp/kg-export.tar", str(staging))
-            exported = staging.read_bytes()
+            export_host = self.logs_dir / "kg-export.tar"
+            if not export_host.is_file():
+                raise ValueError(
+                    "kg store continuity export did not appear on the log mount"
+                )
+            exported = export_host.read_bytes()
             if len(exported) > _MAX_CONTINUITY_TAR_BYTES:
-                staging.unlink()
                 raise ValueError("kg store continuity export exceeds its bound")
+            staging = continuity_root / f".export-{self._session_id}.tar"
+            staging.write_bytes(exported)
             export_sha = hashlib.sha256(exported).hexdigest()
             ledger_path = continuity_root / _CONTINUITY_LEDGER
             row = {
