@@ -313,6 +313,107 @@ class WorkBuddyTraceTest(unittest.TestCase):
             with self.assertRaises(TraceError):
                 analyze_progress(transcript, observation)
 
+    def _blocked_call_transcript_rows(self, call_id):
+        return [
+            {"role": "assistant", "blocks": [{
+                "type": "tool_use", "id": call_id, "name": "Write",
+                "input": {"file_path": "/workspace/out.json", "content": "x"},
+            }]},
+            {"role": "user", "blocks": [{
+                "type": "tool_result", "tool_use_id": call_id,
+                "content": "{\"error\":{\"code\":\"project_rule_blocked\"}}",
+                "is_error": True,
+            }]},
+        ]
+
+    def _formal_block_event(self, call_id, *, actuation="enforced", phase="pre"):
+        return {
+            "tool_observation": {
+                "formal_decision_batch": {
+                    "dispatch_id": call_id,
+                    "phase": phase,
+                    "actuation": actuation,
+                    "decisions": [{"operation": "pre_decision", "result": "block"}],
+                }
+            }
+        }
+
+    def test_progress_analysis_accepts_enforced_pre_blocked_call_without_dispatch(self):
+        # A pre-dispatch enforced formal block consumes the model's tool call
+        # without dispatching it: the transcript records the denial while the
+        # observation journal has no dispatch rows for that id.  That is the
+        # one legitimate identity mismatch, and the blocked call must not be
+        # counted as a dispatch in progress metrics.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            rows = self._blocked_call_transcript_rows("call_blocked")
+            rows.extend([
+                {"role": "assistant", "blocks": [{
+                    "type": "tool_use", "id": "call_bash", "name": "Bash",
+                    "input": {"command": "ls"},
+                }]},
+                {"role": "user", "blocks": [{
+                    "type": "tool_result", "tool_use_id": "call_bash",
+                    "content": "{\"exit_code\":0}", "is_error": False,
+                }]},
+            ])
+            self._write_jsonl(transcript, rows)
+            journal = self._journal(
+                self._formal_block_event("call_blocked"),
+                {"tool_observation": {"dispatch_finished": {
+                    "id": "call_bash", "requested_name": "Bash",
+                    "dispatched_name": "Bash", "origin": "authoritative",
+                    "agent_depth": 0, "outcome": "succeeded",
+                    "effect": None, "effect_valid": True,
+                }}},
+            )
+            for index, row in enumerate(journal):
+                row["monotonic_elapsed_ns"] = index * 1_000_000_000
+            self._write_jsonl(observation, journal)
+            metrics = analyze_progress(transcript, observation)
+        self.assertEqual(metrics["progress"]["tool_calls"], 1)
+        self.assertEqual(metrics["progress"]["mutation_calls"], 0)
+
+    def test_progress_analysis_rejects_shadow_block_as_dispatch_justification(self):
+        # Shadow-mode blocks actuate as admit, so the dispatch must exist; a
+        # shadow block cannot explain a missing dispatch observation.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(
+                transcript, self._blocked_call_transcript_rows("call_blocked")
+            )
+            journal = self._journal(
+                self._formal_block_event("call_blocked", actuation="shadow")
+            )
+            for index, row in enumerate(journal):
+                row["monotonic_elapsed_ns"] = index * 1_000_000_000
+            self._write_jsonl(observation, journal)
+            with self.assertRaises(TraceError):
+                analyze_progress(transcript, observation)
+
+    def test_progress_analysis_rejects_post_phase_block_as_dispatch_justification(self):
+        # A post-phase decision happens after a dispatch; it can never explain
+        # a missing dispatch observation.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(
+                transcript, self._blocked_call_transcript_rows("call_blocked")
+            )
+            journal = self._journal(
+                self._formal_block_event("call_blocked", phase="post")
+            )
+            for index, row in enumerate(journal):
+                row["monotonic_elapsed_ns"] = index * 1_000_000_000
+            self._write_jsonl(observation, journal)
+            with self.assertRaises(TraceError):
+                analyze_progress(transcript, observation)
+
     def test_progress_analysis_same_turn_mutation_and_green_is_not_causal_progress(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

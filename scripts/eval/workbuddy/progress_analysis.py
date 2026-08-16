@@ -259,13 +259,65 @@ def _observation_rows(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Dict[str, 
     return finished
 
 
+def _enforced_pre_blocked_ids(rows: Iterable[Mapping[str, Any]]) -> set[str]:
+    """Dispatch ids the formal gate blocked before dispatch, under enforcement.
+
+    A pre-dispatch enforced block is the one legitimate way a transcript tool
+    call can lack a dispatch observation: blocking means the dispatch never
+    happened, while the model still receives the denial as a tool result.  A
+    shadow-mode block cannot justify a missing dispatch (shadow actuates as
+    admit), so actuation must be literally "enforced"."""
+
+    blocked: set[str] = set()
+    for row in rows:
+        event = row.get("event")
+        item = event.get("tool_observation") if isinstance(event, dict) else None
+        if not isinstance(item, dict):
+            continue
+        batch = item.get("formal_decision_batch")
+        if isinstance(batch, dict):
+            decisions = batch.get("decisions")
+            if (
+                batch.get("phase") == "pre"
+                and batch.get("actuation") == "enforced"
+                and isinstance(batch.get("dispatch_id"), str)
+                and isinstance(decisions, list)
+                and any(
+                    isinstance(decision, dict) and decision.get("result") == "block"
+                    for decision in decisions
+                )
+            ):
+                blocked.add(batch["dispatch_id"])
+        single = item.get("formal_decision")
+        if isinstance(single, dict):
+            if (
+                single.get("phase") == "pre"
+                and single.get("actuation") == "enforced"
+                and single.get("result") == "block"
+                and isinstance(single.get("dispatch_id"), str)
+            ):
+                blocked.add(single["dispatch_id"])
+    return blocked
+
+
 def analyze_progress(transcript_path: Path, observation_path: Path) -> Dict[str, Any]:
     transcript, transcript_sha256 = _observed_rows(transcript_path)
     observation_rows, observation_sha256 = _observed_rows(observation_path)
     tools = _tool_rows(transcript)
     observations = _observation_rows(observation_rows)
-    if set(observations) != {item["id"] for item in tools}:
+    # Every transcript call must either have dispatched (an observation row)
+    # or be individually justified by an enforced pre-dispatch formal block —
+    # the one mechanism that consumes a call without dispatching it.  A block
+    # that recovered (host-synthesized replacement dispatch) reuses the same
+    # call id and therefore has an observation row; it never needs the
+    # exemption.  Everything else stays fail-closed exactly as before.
+    transcript_only = {item["id"] for item in tools} - set(observations)
+    unjustified = transcript_only - _enforced_pre_blocked_ids(observation_rows)
+    if unjustified or set(observations) - {item["id"] for item in tools}:
         raise TraceError("transcript and observation dispatch identities differ")
+    if transcript_only:
+        # A blocked call is not a dispatch; progress metrics index dispatches.
+        tools = [item for item in tools if item["id"] not in transcript_only]
 
     first_mutation: Optional[int] = None
     first_mutation_turn: Optional[int] = None
