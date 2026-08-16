@@ -22,7 +22,7 @@ pub const FORMAL_BATCH_SCHEMA_VERSION = "metacodes-project-formal-decision-batch
 pub const RULE_FILTER_SCHEMA_VERSION = "metacodes-project-rule-filter-v1";
 pub const RULE_COVERAGE_GAP_SCHEMA_VERSION = "metacodes-project-rule-coverage-gap-v1";
 pub const RULE_BOUNDS_OVERFLOW_SCHEMA_VERSION = "metacodes-project-rule-bounds-overflow-v1";
-pub const VERIFICATION_FINAL_GATE_SCHEMA_VERSION = "metacodes-verification-final-gate-v1";
+pub const VERIFICATION_FINAL_GATE_SCHEMA_VERSION = "metacodes-verification-final-gate-v2";
 
 pub const Origin = enum {
     authoritative,
@@ -221,6 +221,17 @@ pub const Event = union(enum) {
         obligation_met: bool,
         nudges: u8,
         max_nudges: u8,
+        /// v2 sensor tiers: canonical test-runner evidence vs validating
+        /// re-observation of a mutated artifact. Together they explain HOW an
+        /// obligation was satisfied instead of a bare met bit.
+        tier1_verifications: u32,
+        tier2_verifications: u32,
+        /// Churn shadow counter: realized mutations that landed while the
+        /// session was in a verified state.
+        reopened_after_verification: u32,
+        /// Negative evidence at session end: the last verification-shaped
+        /// attempt after the final mutation failed.
+        known_failing: bool,
     },
     /// A matched verify-only rule admitted a dispatch whose input or agent
     /// depth exceeds the rule's authored envelope. The envelope is a

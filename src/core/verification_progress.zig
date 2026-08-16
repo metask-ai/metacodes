@@ -32,6 +32,37 @@ pub const FINAL_GATE_TEXT =
     "If no verification command can exist for this change, state that " ++
     "explicitly in your final answer instead of implying it was verified.";
 
+/// Negative-evidence variant: the host observed a FAILED verification attempt
+/// after the last mutation with no success since. "Go verify" would be the
+/// wrong instruction — the model already knows the state; the obligation is to
+/// fix or to report honestly.
+pub const FINAL_GATE_KNOWN_FAILING_TEXT =
+    "[verification obligation]\n" ++
+    "You are about to finish, but the last verification attempt after your " ++
+    "file mutations FAILED and no successful verification has followed. " ++
+    "Before your final answer:\n" ++
+    "1. Fix the failure and re-run the verification, or\n" ++
+    "2. If the failure is expected or out of scope, state the failing status " ++
+    "explicitly and honestly in your final answer.\n" ++
+    "Do not imply the change was verified.";
+
+/// Injected at most once per session when a mutation lands after a successful
+/// verification (the churn signature observed to flip previously-passing
+/// work). Task-agnostic process guidance only.
+pub const FRESHNESS_TEXT =
+    "[verification freshness]\n" ++
+    "This mutation happened after a successful verification; that " ++
+    "verification no longer covers the current state.\n" ++
+    "1. Re-run the relevant verification before finishing.\n" ++
+    "2. Verification is for confirming behavior — do not rewrite " ++
+    "already-passing implementations without a concrete failing reason.";
+
+/// Bounded value-semantics name set: HashMap keys into growable buffers dangle
+/// after realloc, and this state must survive arbitrarily long sessions with
+/// zero allocator lifetime coupling.
+const MAX_TRACKED_NAMES = 16;
+const MAX_NAME_BYTES = 128;
+
 pub const State = struct {
     mutation_seen: bool = false,
     checkpoint_emitted: bool = false,
@@ -41,6 +72,27 @@ pub const State = struct {
     /// checkpoint): a turn that both mutates and verifies leaves the
     /// obligation open until a verification-only turn clears it.
     unverified_mutation: bool = false,
+    /// A verification-shaped attempt after the last mutation FAILED and no
+    /// success has followed. Selects the honest-report nudge variant.
+    known_failing: bool = false,
+    /// Tier-1: canonical test-runner evidence (existing conservative grammar).
+    tier1_verifications: u32 = 0,
+    /// Tier-2: validating re-observation — a non-display computation that
+    /// references a mutated file and exited 0 (inline import probes,
+    /// py_compile, pipeline re-runs). Real verification behavior observed in
+    /// the field that the tier-1 grammar cannot see.
+    tier2_verifications: u32 = 0,
+    /// Churn signature: a realized mutation landed while the session was in a
+    /// verified state. Observational counter for the shadow phase of any
+    /// future formal rule.
+    reopened_after_verification: u32 = 0,
+    churn_caution_pending: bool = false,
+    churn_caution_emitted: bool = false,
+    /// Basenames of files with realized mutations this session (bounded;
+    /// overflow only widens tier-2 misses, never falsely satisfies).
+    name_bytes: [MAX_TRACKED_NAMES][MAX_NAME_BYTES]u8 = undefined,
+    name_lens: [MAX_TRACKED_NAMES]usize = [_]usize{0} ** MAX_TRACKED_NAMES,
+    name_count: usize = 0,
 
     /// Observe one completed tool-use turn.  A mutation and verification in the
     /// same parallel turn do not trigger: their real execution order is not a
@@ -52,29 +104,239 @@ pub const State = struct {
         slots: []const tool_exec.Slot,
     ) bool {
         const mutation_preceded_turn = self.mutation_seen;
+        const was_verified = self.mutation_seen and !self.unverified_mutation;
         var realized_mutation = false;
-        var any_successful_verification = false;
+        var tier1 = false;
+        var tier2 = false;
+        var failed_attempt = false;
+        // Classification pass uses the PRE-turn name set: a same-turn
+        // mutation+probe pair must not close the obligation (intra-turn order
+        // is untrusted), and the obligation branch below already keeps it
+        // open on mutating turns.
         for (slots) |slot| {
-            if (isRealizedMutation(slot.effect, slot.effect_valid))
+            if (isSuccessfulVerification(allocator, slot)) {
+                tier1 = true;
+            } else if (self.isSuccessfulReobservation(allocator, slot)) {
+                tier2 = true;
+            } else if (self.isFailedVerificationAttempt(allocator, slot)) {
+                failed_attempt = true;
+            }
+        }
+        for (slots) |slot| {
+            if (isRealizedMutation(slot.effect, slot.effect_valid)) {
                 realized_mutation = true;
-            if (isSuccessfulVerification(allocator, slot))
-                any_successful_verification = true;
+                self.recordMutatedName(allocator, slot.input);
+            }
         }
         self.mutation_seen = self.mutation_seen or realized_mutation;
+        if (tier1) self.tier1_verifications += 1;
+        if (tier2) self.tier2_verifications += 1;
         // Final-gate obligation: a mutating turn (re)opens it regardless of a
         // same-turn verification; a verification-only turn closes it.
         if (realized_mutation) {
+            if (was_verified) {
+                self.reopened_after_verification += 1;
+                if (!self.churn_caution_emitted) self.churn_caution_pending = true;
+            }
             self.unverified_mutation = true;
-        } else if (any_successful_verification) {
+            self.known_failing = false;
+        } else if (tier1 or tier2) {
             self.unverified_mutation = false;
+            self.known_failing = false;
+        } else if (failed_attempt and self.unverified_mutation) {
+            self.known_failing = true;
         }
         const checkpoint = mutation_preceded_turn and
-            !self.checkpoint_emitted and any_successful_verification;
+            !self.checkpoint_emitted and tier1;
         if (!checkpoint) return false;
         self.checkpoint_emitted = true;
         return true;
     }
+
+    /// One-shot churn caution consumption for the freshness injection.
+    pub fn takeChurnCaution(self: *State) bool {
+        if (!self.churn_caution_pending) return false;
+        self.churn_caution_pending = false;
+        self.churn_caution_emitted = true;
+        return true;
+    }
+
+    fn recordMutatedName(
+        self: *State,
+        allocator: std.mem.Allocator,
+        input: []const u8,
+    ) void {
+        const encoded = common.extractJsonArg(input, "file_path") orelse
+            common.extractJsonArg(input, "notebook_path") orelse return;
+        const path = util_json.unescapeString(encoded, allocator) catch return;
+        defer allocator.free(path);
+        const name = basename(path);
+        if (name.len == 0 or name.len > MAX_NAME_BYTES) return;
+        for (0..self.name_count) |i| {
+            if (std.mem.eql(u8, self.name_bytes[i][0..self.name_lens[i]], name))
+                return;
+        }
+        if (self.name_count >= MAX_TRACKED_NAMES) return;
+        @memcpy(self.name_bytes[self.name_count][0..name.len], name);
+        self.name_lens[self.name_count] = name.len;
+        self.name_count += 1;
+    }
+
+    /// Tier-2 verification: a successful Bash command that consumes a mutated
+    /// artifact. Conservative on laundering: heredoc payloads are data, and a
+    /// non-heredoc command may only chain with `&&`.
+    fn isSuccessfulReobservation(
+        self: *const State,
+        allocator: std.mem.Allocator,
+        slot: tool_exec.Slot,
+    ) bool {
+        if (self.name_count == 0) return false;
+        if (slot.decision != .run or slot.pending or slot.is_error or
+            !std.mem.eql(u8, slot.name, "Bash")) return false;
+        const content = slot.content orelse return false;
+        if (std.mem.indexOf(u8, content, "\"exit_code\":") == null or
+            util_json.extractIntField(content, "exit_code") != 0) return false;
+        const command = decodedCommand(allocator, slot.input) orelse return false;
+        defer allocator.free(command);
+        if (!tierTwoCommandShape(command)) return false;
+        return self.commandReferencesMutated(command);
+    }
+
+    /// A verification-shaped attempt (tier-1 grammar or tier-2 reference)
+    /// whose exit code is nonzero: negative evidence, not noise.
+    fn isFailedVerificationAttempt(
+        self: *const State,
+        allocator: std.mem.Allocator,
+        slot: tool_exec.Slot,
+    ) bool {
+        if (slot.decision != .run or slot.pending or
+            !std.mem.eql(u8, slot.name, "Bash")) return false;
+        const content = slot.content orelse return false;
+        if (std.mem.indexOf(u8, content, "\"exit_code\":") == null) return false;
+        if (util_json.extractIntField(content, "exit_code") == 0) return false;
+        const command = decodedCommand(allocator, slot.input) orelse return false;
+        defer allocator.free(command);
+        if (isVerificationCommand(allocator, command)) return true;
+        return tierTwoCommandShape(command) and self.commandReferencesMutated(command);
+    }
+
+    fn commandReferencesMutated(self: *const State, command: []const u8) bool {
+        for (0..self.name_count) |i| {
+            const name = self.name_bytes[i][0..self.name_lens[i]];
+            if (std.mem.indexOf(u8, command, name) != null) return true;
+            const stem = nameStem(name);
+            if (stem.len >= 4 and containsBoundedToken(command, stem)) return true;
+        }
+        return false;
+    }
 };
+
+fn decodedCommand(allocator: std.mem.Allocator, input: []const u8) ?[]u8 {
+    const encoded = common.extractJsonArg(input, "command") orelse return null;
+    return util_json.unescapeString(encoded, allocator) catch null;
+}
+
+fn nameStem(name: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return name;
+    if (dot == 0) return name;
+    return name[0..dot];
+}
+
+fn isWordByte(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or c == '_';
+}
+
+/// `stem` must appear bounded by non-word bytes so short module stems cannot
+/// match inside unrelated identifiers.
+fn containsBoundedToken(haystack: []const u8, stem: []const u8) bool {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, from, stem)) |at| {
+        const before_ok = at == 0 or !isWordByte(haystack[at - 1]);
+        const end = at + stem.len;
+        const after_ok = end >= haystack.len or !isWordByte(haystack[end]);
+        if (before_ok and after_ok) return true;
+        from = at + 1;
+    }
+    return false;
+}
+
+/// Shape guard for tier-2: reject display-only heads outright, treat a heredoc
+/// tail as opaque data, and forbid exit-code laundering separators (`;`, `||`,
+/// `|`, `&` backgrounding) in the shell-visible prefix. `&&` chains and the
+/// `2>&1` presentation redirect stay legal.
+fn tierTwoCommandShape(command: []const u8) bool {
+    const shell_visible = heredocPrefix(command);
+    var tokens = std.mem.tokenizeAny(u8, shell_visible, " \t\r\n");
+    var first = tokens.next() orelse return false;
+    // Skip leading `cd dir &&` segments for the display-head check.
+    while (std.mem.eql(u8, basename(first), "cd")) {
+        while (tokens.next()) |token| {
+            if (std.mem.eql(u8, token, "&&")) break;
+        } else return false;
+        first = tokens.next() orelse return false;
+    }
+    const head = basename(first);
+    const display_heads = [_][]const u8{
+        "cat",  "echo", "ls",   "head", "tail", "less",
+        "more", "printf", "true", "stat", "wc", "grep",
+        "find", "rg",
+    };
+    for (display_heads) |d| {
+        if (std.mem.eql(u8, head, d)) return false;
+    }
+    // Laundering guard on the shell-visible prefix only.
+    var in_single = false;
+    var in_double = false;
+    var i: usize = 0;
+    while (i < shell_visible.len) : (i += 1) {
+        const c = shell_visible[i];
+        if (c == '\\' and !in_single and i + 1 < shell_visible.len) {
+            i += 1;
+            continue;
+        }
+        if (c == '\'' and !in_double) in_single = !in_single;
+        if (c == '"' and !in_single) in_double = !in_double;
+        if (in_single or in_double) continue;
+        switch (c) {
+            ';', '|' => return false,
+            '&' => {
+                const double = i + 1 < shell_visible.len and shell_visible[i + 1] == '&';
+                const redirect = i >= 2 and
+                    std.mem.eql(u8, shell_visible[i - 2 .. i + 2], "2>&1");
+                if (redirect) {
+                    i += 1;
+                    continue;
+                }
+                if (!double) return false;
+                i += 1;
+            },
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// Return the shell-visible prefix: everything before the first unquoted `<<`
+/// (the heredoc body is interpreter data, not shell grammar).
+fn heredocPrefix(command: []const u8) []const u8 {
+    var in_single = false;
+    var in_double = false;
+    var i: usize = 0;
+    while (i < command.len) : (i += 1) {
+        const c = command[i];
+        if (c == '\\' and !in_single and i + 1 < command.len) {
+            i += 1;
+            continue;
+        }
+        if (c == '\'' and !in_double) in_single = !in_single;
+        if (c == '"' and !in_single) in_double = !in_double;
+        if (in_single or in_double) continue;
+        if (c == '<' and i + 1 < command.len and command[i + 1] == '<')
+            return command[0..i];
+    }
+    return command;
+}
 
 fn isRealizedMutation(effect: ?observation.Effect, effect_valid: bool) bool {
     if (!effect_valid) return false;
@@ -449,4 +711,142 @@ test "verification classifier accepts bounded test forms and rejects ambiguous s
     try std.testing.expect(!isVerificationCommand(a, "python -m pytest --version"));
     try std.testing.expect(!isVerificationCommand(a, "zig test --help"));
     try std.testing.expect(!isVerificationCommand(a, "cd /workspace && git status"));
+}
+
+// ---------------------------------------------------------------------------
+// v2 sensor tests: tiered verification, negative evidence, churn signature.
+// Fixture shapes mirror behaviors observed in real WorkBuddy trials.
+// ---------------------------------------------------------------------------
+
+fn testBashSlot(input: []const u8, content: []const u8) tool_exec.Slot {
+    return .{
+        .decision = .run,
+        .name = "Bash",
+        .id = "b",
+        .input = input,
+        .content = @constCast(content),
+    };
+}
+
+fn testEditSlot(input: []const u8) tool_exec.Slot {
+    return .{
+        .decision = .run,
+        .name = "Edit",
+        .id = "e",
+        .input = input,
+        .effect = .{ .file_mutation_v2 = .{
+            .mutation = .{
+                .path_sha256 = [_]u8{'0'} ** 64,
+                .before_state = .known,
+                .before_sha256 = [_]u8{'0'} ** 64,
+                .after_sha256 = [_]u8{'1'} ** 64,
+                .before_bytes = 1,
+                .after_bytes = 2,
+                .change = .changed,
+            },
+            .reobservation = .{
+                .state = .matched,
+                .observed_sha256 = [_]u8{'1'} ** 64,
+                .observed_bytes = 2,
+            },
+        } },
+    };
+}
+
+const OK = "{\"exit_code\":0,\"stdout\":\"\",\"stderr\":\"\"}";
+const FAIL = "{\"exit_code\":1,\"stdout\":\"\",\"stderr\":\"\"}";
+const EDIT_HEADERS = "{\"file_path\":\"/workspace/tornado_like/headers.py\",\"old_string\":\"a\",\"new_string\":\"b\"}";
+
+test "tier-2 heredoc import probe closes the obligation" {
+    const a = std.testing.allocator;
+    var state = State{};
+    _ = state.observeTurn(a, &.{testEditSlot(EDIT_HEADERS)});
+    try std.testing.expect(state.unverified_mutation);
+    const probe = "{\"command\":\"cd /workspace && python3 - <<'PY'\\nfrom tornado_like.headers import HTTPHeaders\\nprint(HTTPHeaders)\\nPY\"}";
+    _ = state.observeTurn(a, &.{testBashSlot(probe, OK)});
+    try std.testing.expect(!state.unverified_mutation);
+    try std.testing.expectEqual(@as(u32, 1), state.tier2_verifications);
+    try std.testing.expectEqual(@as(u32, 0), state.tier1_verifications);
+}
+
+test "tier-2 accepts py_compile chains and pipeline re-runs, rejects laundering and display heads" {
+    const a = std.testing.allocator;
+    var state = State{};
+    _ = state.observeTurn(a, &.{testEditSlot(EDIT_HEADERS)});
+    // Semicolon in the shell-visible prefix launders the exit code; stays open.
+    const laundered = "{\"command\":\"python3 headers.py; echo ok\"}";
+    _ = state.observeTurn(a, &.{testBashSlot(laundered, OK)});
+    try std.testing.expect(state.unverified_mutation);
+    // Display head is re-reading, not validating; stays open.
+    const display = "{\"command\":\"cat tornado_like/headers.py\"}";
+    _ = state.observeTurn(a, &.{testBashSlot(display, OK)});
+    try std.testing.expect(state.unverified_mutation);
+    // py_compile with an && display tail is a real validating computation.
+    const compile = "{\"command\":\"cd /workspace && python3 -m py_compile tornado_like/headers.py && echo ok\"}";
+    _ = state.observeTurn(a, &.{testBashSlot(compile, OK)});
+    try std.testing.expect(!state.unverified_mutation);
+
+    var rerun_state = State{};
+    const edit_pipeline = "{\"file_path\":\"/workspace/app/clean_labels.py\",\"old_string\":\"x\",\"new_string\":\"y\"}";
+    _ = rerun_state.observeTurn(a, &.{testEditSlot(edit_pipeline)});
+    const rerun = "{\"command\":\"cd /workspace && python app/clean_labels.py --data data/labels.csv\"}";
+    _ = rerun_state.observeTurn(a, &.{testBashSlot(rerun, OK)});
+    try std.testing.expect(!rerun_state.unverified_mutation);
+}
+
+test "short stems never match inside identifiers" {
+    const a = std.testing.allocator;
+    var state = State{};
+    const edit_app = "{\"file_path\":\"/workspace/app.py\",\"old_string\":\"x\",\"new_string\":\"y\"}";
+    _ = state.observeTurn(a, &.{testEditSlot(edit_app)});
+    const unrelated = "{\"command\":\"python3 -c 'import application'\"}";
+    _ = state.observeTurn(a, &.{testBashSlot(unrelated, OK)});
+    try std.testing.expect(state.unverified_mutation);
+}
+
+test "failed verification attempts set known_failing; success clears it" {
+    const a = std.testing.allocator;
+    var state = State{};
+    _ = state.observeTurn(a, &.{testEditSlot(EDIT_HEADERS)});
+    const pytest_cmd = "{\"command\":\"cd /workspace && python -m pytest -q\"}";
+    _ = state.observeTurn(a, &.{testBashSlot(pytest_cmd, FAIL)});
+    try std.testing.expect(state.known_failing);
+    try std.testing.expect(state.unverified_mutation);
+    _ = state.observeTurn(a, &.{testBashSlot(pytest_cmd, OK)});
+    try std.testing.expect(!state.known_failing);
+    try std.testing.expect(!state.unverified_mutation);
+    try std.testing.expectEqual(@as(u32, 1), state.tier1_verifications);
+}
+
+test "mutation after verified state counts churn and arms one caution" {
+    const a = std.testing.allocator;
+    var state = State{};
+    _ = state.observeTurn(a, &.{testEditSlot(EDIT_HEADERS)});
+    const pytest_cmd = "{\"command\":\"python -m pytest -q\"}";
+    _ = state.observeTurn(a, &.{testBashSlot(pytest_cmd, OK)});
+    try std.testing.expect(!state.unverified_mutation);
+    _ = state.observeTurn(a, &.{testEditSlot(EDIT_HEADERS)});
+    try std.testing.expectEqual(@as(u32, 1), state.reopened_after_verification);
+    try std.testing.expect(state.takeChurnCaution());
+    try std.testing.expect(!state.takeChurnCaution());
+    // A second churn round increments the counter but never re-arms the
+    // one-shot caution.
+    _ = state.observeTurn(a, &.{testBashSlot(pytest_cmd, OK)});
+    _ = state.observeTurn(a, &.{testEditSlot(EDIT_HEADERS)});
+    try std.testing.expectEqual(@as(u32, 2), state.reopened_after_verification);
+    try std.testing.expect(!state.takeChurnCaution());
+    // Mutation resets known_failing (the fix attempt makes the state unknown).
+    _ = state.observeTurn(a, &.{testBashSlot(pytest_cmd, FAIL)});
+    try std.testing.expect(state.known_failing);
+    _ = state.observeTurn(a, &.{testEditSlot(EDIT_HEADERS)});
+    try std.testing.expect(!state.known_failing);
+}
+
+test "same-turn mutation plus probe keeps the obligation open" {
+    const a = std.testing.allocator;
+    var state = State{};
+    _ = state.observeTurn(a, &.{testEditSlot(EDIT_HEADERS)});
+    const probe = "{\"command\":\"python3 -m py_compile tornado_like/headers.py\"}";
+    _ = state.observeTurn(a, &.{ testEditSlot(EDIT_HEADERS), testBashSlot(probe, OK) });
+    try std.testing.expect(state.unverified_mutation);
 }

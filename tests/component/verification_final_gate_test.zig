@@ -40,6 +40,10 @@ const GateRecordSink = struct {
     mutations_occurred: bool = false,
     obligation_met: bool = false,
     nudges: u8 = 255,
+    tier1: u32 = 0,
+    tier2: u32 = 0,
+    reopened: u32 = 0,
+    known_failing: bool = false,
 
     fn emit(raw: *anyopaque, event: cc.tools.tool_observation.Event) bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -50,6 +54,10 @@ const GateRecordSink = struct {
                 self.mutations_occurred = record.mutations_occurred;
                 self.obligation_met = record.obligation_met;
                 self.nudges = record.nudges;
+                self.tier1 = record.tier1_verifications;
+                self.tier2 = record.tier2_verifications;
+                self.reopened = record.reopened_after_verification;
+                self.known_failing = record.known_failing;
             },
             else => {},
         }
@@ -64,10 +72,12 @@ const GateRecordSink = struct {
 const GateRun = struct {
     requests: usize,
     nudge_request: ?[]u8,
+    caution_request: ?[]u8,
     record: GateRecordSink,
 
     fn deinit(self: *GateRun, allocator: std.mem.Allocator) void {
         if (self.nudge_request) |bytes| allocator.free(bytes);
+        if (self.caution_request) |bytes| allocator.free(bytes);
     }
 };
 
@@ -127,16 +137,24 @@ fn runGate(
     );
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
     var nudge_request: ?[]u8 = null;
+    var caution_request: ?[]u8 = null;
     var index: usize = 0;
     while (server.requestAt(index)) |request| : (index += 1) {
-        if (std.mem.indexOf(u8, request.body(), "[verification obligation]") != null) {
+        if (nudge_request == null and
+            std.mem.indexOf(u8, request.body(), "[verification obligation]") != null)
+        {
             nudge_request = try allocator.dupe(u8, request.body());
-            break;
+        }
+        if (caution_request == null and
+            std.mem.indexOf(u8, request.body(), "[verification freshness]") != null)
+        {
+            caution_request = try allocator.dupe(u8, request.body());
         }
     }
     return .{
         .requests = server.requestCount(),
         .nudge_request = nudge_request,
+        .caution_request = caution_request,
         .record = record,
     };
 }
@@ -395,4 +413,116 @@ test "L2 zero-retry default preserves the api_error surface" {
         a,
     );
     try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
+}
+
+fn probeCommand(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
+    // A validating computation that is not a canonical test runner: it
+    // consumes its argument and exits 0. Mirrors the inline-probe /
+    // pipeline-re-run idioms observed in real trials.
+    const path = try std.fmt.allocPrint(allocator, "{s}/check", .{root});
+    defer allocator.free(path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = path,
+        .data = "#!/bin/sh\ntest -f \"$1\"\n",
+    });
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    if (std.c.chmod(path_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    return allocator.dupe(u8, path);
+}
+
+fn redCommand(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
+    // Canonical test-runner shape (basename pytest) that always fails.
+    const dir = try std.fmt.allocPrint(allocator, "{s}/red", .{root});
+    defer allocator.free(dir);
+    std.Io.Dir.cwd().createDirPath(std.testing.io, dir) catch {};
+    const path = try std.fmt.allocPrint(allocator, "{s}/pytest", .{dir});
+    defer allocator.free(path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = path,
+        .data = "#!/bin/sh\nprintf '1 failed in 0.01s\\n'\nexit 1\n",
+    });
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    if (std.c.chmod(path_z.ptr, 0o700) != 0) return error.SkipZigTest;
+    return allocator.dupe(u8, path);
+}
+
+test "L2 tier-2 validating re-observation satisfies the gate" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const probe = try probeCommand(a, root);
+    defer a.free(probe);
+    const write = try writeSse(a, root);
+    defer a.free(write);
+    const probe_cmd = try std.fmt.allocPrint(a, "{s} {s}/patched.zig", .{ probe, root });
+    defer a.free(probe_cmd);
+    const bash = try bashSse(a, probe_cmd);
+    defer a.free(bash);
+    // write → premature final (nudged) → tier-2 probe → final.
+    var run = try runGate(a, root, true, &.{ write, END_TURN, bash, END_TURN });
+    defer run.deinit(a);
+    try std.testing.expectEqual(@as(usize, 4), run.requests);
+    try std.testing.expect(run.record.obligation_met);
+    try std.testing.expectEqual(@as(u8, 1), run.record.nudges);
+    try std.testing.expectEqual(@as(u32, 0), run.record.tier1);
+    try std.testing.expectEqual(@as(u32, 1), run.record.tier2);
+}
+
+test "L2 known-failing state selects the honest-report nudge variant" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const red = try redCommand(a, root);
+    defer a.free(red);
+    const write = try writeSse(a, root);
+    defer a.free(write);
+    const bash = try bashSse(a, red);
+    defer a.free(bash);
+    // write → failing verification attempt → premature final (nudged with the
+    // negative-evidence variant) → stubborn finals until nudges exhaust.
+    var run = try runGate(a, root, true, &.{ write, bash, END_TURN, END_TURN, END_TURN });
+    defer run.deinit(a);
+    try std.testing.expect(run.record.known_failing);
+    try std.testing.expect(!run.record.obligation_met);
+    try std.testing.expect(run.nudge_request != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, run.nudge_request.?, "state the failing status") != null,
+    );
+}
+
+test "L2 churn after a verified state injects one freshness caution and counts the reopen" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const command = try greenCommand(a, root);
+    defer a.free(command);
+    const write = try writeSse(a, root);
+    defer a.free(write);
+    // Identical content would re-observe as unchanged; churn needs a real
+    // second mutation.
+    const rewrite_input = try std.fmt.allocPrint(
+        a,
+        "{{\"file_path\":\"{s}/patched.zig\",\"content\":\"test \\\"two\\\" {{}}\\n\"}}",
+        .{root},
+    );
+    defer a.free(rewrite_input);
+    const rewrite = try toolSse(a, "write_2", "Write", rewrite_input);
+    defer a.free(rewrite);
+    const bash = try bashSse(a, command);
+    defer a.free(bash);
+    // write → verify → write again (churn: caution) → verify → final.
+    var run = try runGate(a, root, true, &.{ write, bash, rewrite, bash, END_TURN });
+    defer run.deinit(a);
+    try std.testing.expect(run.record.obligation_met);
+    try std.testing.expectEqual(@as(u32, 1), run.record.reopened);
+    try std.testing.expectEqual(@as(u8, 0), run.record.nudges);
+    try std.testing.expect(run.caution_request != null);
 }

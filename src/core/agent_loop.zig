@@ -599,6 +599,10 @@ pub fn run(
                 .obligation_met = !verification_progress.unverified_mutation,
                 .nudges = verification_nudges,
                 .max_nudges = MAX_VERIFICATION_NUDGES,
+                .tier1_verifications = verification_progress.tier1_verifications,
+                .tier2_verifications = verification_progress.tier2_verifications,
+                .reopened_after_verification = verification_progress.reopened_after_verification,
+                .known_failing = verification_progress.known_failing,
             } });
         }
     };
@@ -1313,7 +1317,10 @@ pub fn run(
                 verification_nudges += 1;
                 log.infoId("agent", rid, "verification final gate nudge {d}/{d}", .{ verification_nudges, MAX_VERIFICATION_NUDGES });
                 backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
-                try conversation.appendText(.user, verification_progress_mod.FINAL_GATE_TEXT);
+                try conversation.appendText(.user, if (verification_progress.known_failing)
+                    verification_progress_mod.FINAL_GATE_KNOWN_FAILING_TEXT
+                else
+                    verification_progress_mod.FINAL_GATE_TEXT);
                 continue;
             }
             // L4 诊断:本轮无 tool_use → turn 结束(span 平衡:每个 turn_begin 都配一个
@@ -1787,6 +1794,16 @@ pub fn run(
                 verification_progress_mod.CHECKPOINT_TEXT,
             );
             try result_blocks.append(allocator, .{ .text = checkpoint });
+        }
+        // Churn caution: enforced-gate arms only (observe mode must stay
+        // behavior-neutral), at most once per session, fired the turn a
+        // mutation lands on previously-verified state.
+        if (opts.verification_final_gate and verification_progress.takeChurnCaution()) {
+            const caution = try allocator.dupe(
+                u8,
+                verification_progress_mod.FRESHNESS_TEXT,
+            );
+            try result_blocks.append(allocator, .{ .text = caution });
         }
         const kg_pending = kgEnumerationPending(
             &kg_lexical_ledger,
