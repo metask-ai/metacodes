@@ -2943,3 +2943,63 @@ with tempfile.TemporaryDirectory() as directory:
     assert "kg-export.tar" not in command and "kg-import.tar" not in command
     assert not (Path(directory) / "results" / "arm" / "kg-store-continuity").exists()
 ''')
+
+
+class WorkBuddyProgressRejectionTest(unittest.TestCase):
+    """Pre-dispatch rejections (permission denials) legitimately appear only
+    in the transcript; a transcript-only call with a SUCCESS result stays a
+    fail-closed ledger hole."""
+
+    def _run(self, result_content, is_error=True):
+        from scripts.eval.workbuddy.progress_analysis import analyze_progress
+        rows = [
+            {"role": "assistant", "blocks": [{
+                "type": "tool_use", "id": "denied-1", "name": "Task",
+                "input": "{}",
+            }]},
+            {"role": "user", "blocks": [{
+                "type": "tool_result", "tool_use_id": "denied-1",
+                "content": result_content, "is_error": is_error,
+            }]},
+        ]
+        journal = [
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 0, "monotonic_elapsed_ns": 1,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_started": {}}},
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 1, "monotonic_elapsed_ns": 2,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_finished": {}}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "t.jsonl"
+            observation = root / "o.jsonl"
+            self._write(transcript, rows)
+            self._write(observation, journal)
+            return analyze_progress(transcript, observation)
+
+    @staticmethod
+    def _write(path, rows):
+        path.write_text(
+            "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8"
+        )
+
+    def test_permission_denied_call_is_a_legitimate_non_dispatch(self):
+        metrics = self._run(json.dumps({
+            "error": {"code": "permission_denied", "category": "safety",
+                      "detail": "tool 'Task' denied", "recoverable": False},
+        }))
+        self.assertEqual(metrics["progress"]["tool_calls"], 0)
+
+    def test_successful_transcript_only_call_stays_a_ledger_hole(self):
+        with self.assertRaisesRegex(TraceError, "identities differ"):
+            self._run(json.dumps({"ok": True}), is_error=False)
+
+    def test_unrecognized_error_shape_stays_fail_closed(self):
+        with self.assertRaisesRegex(TraceError, "identities differ"):
+            self._run(json.dumps({
+                "error": {"code": "other", "category": "system_error",
+                          "detail": "x", "recoverable": True},
+            }))

@@ -300,19 +300,56 @@ def _enforced_pre_blocked_ids(rows: Iterable[Mapping[str, Any]]) -> set[str]:
     return blocked
 
 
+_PREDISPATCH_REJECTION_CODES = {"permission_denied"}
+
+
+def _predispatch_rejected_ids(transcript) -> set:
+    """Call ids whose result is a host-side pre-dispatch rejection."""
+
+    rejected = set()
+    for row in transcript:
+        for block in row.get("blocks") or []:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            if block.get("is_error") is not True:
+                continue
+            content = block.get("content")
+            if not isinstance(content, str):
+                continue
+            try:
+                payload = json.loads(content)
+            except json.JSONDecodeError:
+                continue
+            code = (
+                payload.get("error", {}).get("code")
+                if isinstance(payload, dict) and isinstance(payload.get("error"), dict)
+                else None
+            )
+            if code in _PREDISPATCH_REJECTION_CODES:
+                rejected.add(block.get("tool_use_id"))
+    return rejected
+
+
 def analyze_progress(transcript_path: Path, observation_path: Path) -> Dict[str, Any]:
     transcript, transcript_sha256 = _observed_rows(transcript_path)
     observation_rows, observation_sha256 = _observed_rows(observation_path)
     tools = _tool_rows(transcript)
     observations = _observation_rows(observation_rows)
     # Every transcript call must either have dispatched (an observation row)
-    # or be individually justified by an enforced pre-dispatch formal block —
-    # the one mechanism that consumes a call without dispatching it.  A block
-    # that recovered (host-synthesized replacement dispatch) reuses the same
-    # call id and therefore has an observation row; it never needs the
-    # exemption.  Everything else stays fail-closed exactly as before.
+    # or be individually justified by a host-side pre-dispatch rejection.
+    # Two such mechanisms exist: an enforced formal pre-block, and a
+    # permission denial (observed in the field when a model hallucinates a
+    # disabled tool like Task — the call appears in the transcript with a
+    # permission_denied error result and legitimately never dispatches).
+    # The rejection roster is closed: a transcript-only call with a SUCCESS
+    # result, or with an unrecognized error shape, stays fail-closed — that
+    # is a real ledger hole, not a rejection.
     transcript_only = {item["id"] for item in tools} - set(observations)
-    unjustified = transcript_only - _enforced_pre_blocked_ids(observation_rows)
+    unjustified = (
+        transcript_only
+        - _enforced_pre_blocked_ids(observation_rows)
+        - _predispatch_rejected_ids(transcript)
+    )
     if unjustified or set(observations) - {item["id"] for item in tools}:
         raise TraceError("transcript and observation dispatch identities differ")
     if transcript_only:
