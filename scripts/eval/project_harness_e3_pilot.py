@@ -494,6 +494,7 @@ def _run_one(
     quality_evidence_eligible: bool = True,
     extra_child_args: Sequence[str] = (),
     disallowed_tools_override: Sequence[str] | None = None,
+    allowed_tools_override: Sequence[str] | None = None,
 ) -> Mapping[str, Any]:
     sequence = int(schedule["sequence"])
     arm = str(schedule["arm"])
@@ -667,7 +668,11 @@ def _run_one(
                     if factorial_treatment.tinykg_enabled
                     else None
                 ),
-                "allowed_tools": list(FACTORIAL_ALLOWED_TOOLS),
+                "allowed_tools": list(
+                    allowed_tools_override
+                    if allowed_tools_override is not None
+                    else FACTORIAL_ALLOWED_TOOLS
+                ),
             }
         )
     run_id = f"{manifest['manifest_id']}:{sequence}:{case['id']}:{arm}{cell_suffix}"
@@ -702,7 +707,9 @@ def _run_one(
             ),
         ),
         allowed_tools=(
-            FACTORIAL_ALLOWED_TOOLS
+            tuple(allowed_tools_override)
+            if allowed_tools_override is not None
+            else FACTORIAL_ALLOWED_TOOLS
             if factorial_treatment is not None
             else E3_ALLOWED_TOOLS
         ),

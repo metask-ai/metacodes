@@ -140,6 +140,12 @@ VERIFICATION_FAMILY_DISALLOWED = tuple(
     for tool in FACTORIAL_DISALLOWED_TOOLS
     if tool not in {"Bash", "BashOutput"}
 )
+# Bash is the family's verification instrument; the allowed list is the
+# actual tool gate on the eval-metadata channel, so it must widen too.
+VERIFICATION_FAMILY_ALLOWED = (
+    "Read", "Write", "Edit", "Glob", "Grep", "Bash", "BashOutput",
+    "KgRecall", "KgContext",
+)
 VERIFICATION_MEMORY_QUERY = (
     "derive result run command compute verify test before final answer"
 )
@@ -197,6 +203,7 @@ FAMILIES = {
         "memory_query": PROCEDURAL_MEMORY_QUERY,
         "extra_args": {True: (), False: ()},
         "disallowed_tools": None,
+        "allowed_tools": None,
         "protocol_id": "metacodes-tinykg-lean-attribution-v1",
     },
     "verification_obligation": {
@@ -208,6 +215,7 @@ FAMILIES = {
             False: ("--verification-final-observe",),
         },
         "disallowed_tools": VERIFICATION_FAMILY_DISALLOWED,
+        "allowed_tools": VERIFICATION_FAMILY_ALLOWED,
         "protocol_id": "metacodes-verification-obligation-attribution-v1",
     },
 }
@@ -752,6 +760,7 @@ def execute_cell(
     }
     extra_child_args = tuple(family_spec["extra_args"][lean_enabled])
     disallowed_override = family_spec["disallowed_tools"]
+    allowed_override = family_spec["allowed_tools"]
     treatment = FactorialRuntimeTreatment(
         cell=cell,
         tinykg_enabled=tinykg_enabled,
@@ -780,6 +789,7 @@ def execute_cell(
             quality_evidence_eligible=quality_evidence_eligible,
             extra_child_args=extra_child_args,
             disallowed_tools_override=disallowed_override,
+            allowed_tools_override=allowed_override,
         )
     except (E3Error, ValidationError) as exc:
         raise type(exc)(f"factorial cell {cell}: {exc}") from exc
