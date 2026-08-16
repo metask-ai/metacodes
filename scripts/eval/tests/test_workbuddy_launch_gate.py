@@ -2455,3 +2455,65 @@ class WorkBuddyResumeAuditTest(WorkBuddyPaidLaunchGateL2Test):
                     receipt_path=root / "receipt.json",
                     started_ns=started_ns,
                 )
+
+
+
+class WorkBuddyRequestAuditRetryTest(unittest.TestCase):
+    """The provider request ledger legitimately contains failed attempts the
+    runtime retried; the REAL _collect_usage predicate must accept them,
+    keep exact success accounting, and bound failures by the retry budget."""
+
+    def _with_extra_records(self, extra_records, turns=None):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self._fixture(Path(directory))
+            workbuddy = Path(manifest["workbuddy"]["checkout"])
+            request_log = next(workbuddy.rglob("agent/requests.jsonl"))
+            rows = [
+                json.loads(line)
+                for line in request_log.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            merged = [dict(record) for record in extra_records] + rows
+            for seq, record in enumerate(merged, start=1):
+                record["seq"] = seq
+                record.setdefault("response", {"status": 200})
+                record.setdefault("error", None)
+            request_log.write_text(
+                "".join(json.dumps(row) + "\n" for row in merged),
+                encoding="utf-8",
+            )
+            if turns is not None:
+                trajectory_path = request_log.with_name("trajectory.json")
+                trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+                trajectory["final_metrics"]["extra"]["metacodes_turns"] = turns
+                trajectory_path.write_text(
+                    json.dumps(trajectory) + "\n", encoding="utf-8"
+                )
+            return _collect_usage(manifest, started_ns=0, official_runner=True)
+
+    def _fixture(self, root):
+        manifest = self._official_usage_fixture(root, 1.0)
+        manifest["schema_version"] = SCHEMA_VERSION
+        return manifest
+
+    _official_usage_fixture = (
+        WorkBuddyPaidLaunchGateL2Test.__dict__["_official_usage_fixture"]
+    )
+
+    @staticmethod
+    def _failed_record():
+        return {
+            "request": {"body": {}},
+            "response": {"status": 502, "raw_bytes": 3},
+            "error": "bad gateway",
+            "duration_ms": 5.0,
+        }
+
+    def test_retried_failure_before_success_is_legal(self):
+        usage = self._with_extra_records([self._failed_record()], turns=1)
+        self.assertEqual(usage["quality"]["mean_verifier_reward"], 1.0)
+
+    def test_failures_beyond_the_retry_budget_are_rejected(self):
+        records = [self._failed_record() for _ in range(3)]
+        with self.assertRaisesRegex(LaunchError, "incomplete or out of order"):
+            self._with_extra_records(records, turns=1)

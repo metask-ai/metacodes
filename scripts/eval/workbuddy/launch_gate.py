@@ -2136,6 +2136,18 @@ def _collect_usage(
                 )
                 for record in request_records
             ]
+            # The runtime retries a failed provider attempt up to
+            # MAX_STREAM_TURN_RETRIES(=2) times per turn (headless), so the
+            # audit ledger legitimately contains failed attempts beside the
+            # successful ones. Accounting stays exact: successful responses
+            # must number exactly the committed turns, failures are bounded
+            # by the retry budget, and ordering/uniqueness never relax.
+            failed_attempts = sum(
+                1
+                for status, error in response_states
+                if status != 200 or error is not None
+            )
+            successful_responses = len(response_states) - failed_attempts
             if (
                 any(
                     not isinstance(sequence, int) or isinstance(sequence, bool)
@@ -2146,8 +2158,8 @@ def _collect_usage(
                 or not isinstance(metacodes_turns, int)
                 or isinstance(metacodes_turns, bool)
                 or metacodes_turns <= 0
-                or len(request_records) != metacodes_turns
-                or any(status != 200 or error is not None for status, error in response_states)
+                or successful_responses != metacodes_turns
+                or failed_attempts > 2 * metacodes_turns
             ):
                 raise LaunchError(
                     f"provider request audit is incomplete or out of order: {trajectory_path}"
