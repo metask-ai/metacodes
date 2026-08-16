@@ -1365,6 +1365,7 @@ def freeze_verification_manifest(
     shadow binary participates. The repository must still be clean and every
     artifact content-addressed."""
 
+    from .memory_replay import PRODUCTION_MODEL_PROVIDER
     from .project_harness_e3_experiment import (
         PRODUCTION_MODEL_FINGERPRINT,
         PRODUCTION_MODEL_ID,
@@ -1423,6 +1424,7 @@ def freeze_verification_manifest(
         "cases": [dict(case) for case in VERIFICATION_CASES],
         "execution": {
             "model_id": PRODUCTION_MODEL_ID,
+            "model_provider": PRODUCTION_MODEL_PROVIDER,
             "model_fingerprint": PRODUCTION_MODEL_FINGERPRINT,
             "provider_identity": PRODUCTION_PROVIDER_ID,
             "max_rollout_cost_usd": max_rollout_cost_usd,

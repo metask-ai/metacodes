@@ -296,7 +296,7 @@
     "scripts/eval/run_project_rule_evolution_mac_pilot.py": "cc824f751529603f8995c7f11351179531c9745ec5bd69b11efb255bebd51f03",
     "scripts/eval/tinykg_lean_factorial.py": "a460b167a1f6dae85495a9b950d451d2f43c9b8a05d0b0fe65910da82cded26d",
     "scripts/eval/tinykg_lean_factorial_block.py": "ed5b6546c8f98f5bbc69c1b715b4ebe4b7a611d3eb4a9ae60abc8f424e0d6043",
-    "scripts/eval/tinykg_lean_factorial_executor.py": "504fde4389c138335801402d3618e71529642915a475e13914f460bc1ef98e16",
+    "scripts/eval/tinykg_lean_factorial_executor.py": "f2bf79b359e5f7f93e57cd18ec2abe1834786cafb7c78f73384f0b68cbbcd288",
     "scripts/project_harness_eval_driver.zig": "99ac435b90ebef1a69aa89ff9fbf3e6ba07708cb9829212a2612962eba2d483c"
   },
   "known_gaps": [
