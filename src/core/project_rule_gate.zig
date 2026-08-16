@@ -229,8 +229,9 @@ pub const RuntimeGate = struct {
             .authoritative = signal.authoritative,
             .file_target_state = signal.file_target_state,
             .exact_recovery_material_ready = signal.exact_edit_material.writeNeedsEdit(),
+            .file_mutating = signal.file_mutating,
         };
-        const matching = self.matchingRuleCount(signal.tool);
+        const matching = self.matchingRuleCount(formal_signal);
         if (matching == 0) {
             if (!self.recordRuleFilter(signal.dispatch_id, .pre, .ordinary, 0))
                 return .{ .result = .fault };
@@ -246,7 +247,7 @@ pub const RuntimeGate = struct {
         defer self.allocator.free(request_ids);
         var index: usize = 0;
         for (self.active.rules) |entry| {
-            if (!std.mem.eql(u8, entry.rule_spec.target_tool, signal.tool)) continue;
+            if (!spec_mod.wireTargetMatchesPre(entry.rule_spec, formal_signal)) continue;
             const candidate_id = parseHex(entry.candidate_id) orelse return error.InvalidCandidateId;
             request_ids[index] = kernel.requestId(
                 .pre_decision,
@@ -303,6 +304,7 @@ pub const RuntimeGate = struct {
             .authoritative = signal.pre.authoritative,
             .file_target_state = signal.pre.file_target_state,
             .exact_recovery_material_ready = signal.pre.exact_edit_material.writeNeedsEdit(),
+            .file_mutating = signal.pre.file_mutating,
         };
         const formal_signal = spec_mod.PostSignal{
             .pre = formal_pre,
@@ -311,7 +313,7 @@ pub const RuntimeGate = struct {
             .has_file_mutation_v1 = hasFileMutation(signal.effect),
             .post_reobserved = postReobserved(signal.effect),
         };
-        const matching = self.matchingRuleCount(signal.pre.tool);
+        const matching = self.matchingRuleCount(formal_pre);
         if (matching == 0) {
             if (!self.recordRuleFilter(signal.pre.dispatch_id, .post, .ordinary, 0))
                 return .{ .result = .fault };
@@ -338,7 +340,7 @@ pub const RuntimeGate = struct {
         defer self.allocator.free(request_ids);
         var index: usize = 0;
         for (self.active.rules) |entry| {
-            if (!std.mem.eql(u8, entry.rule_spec.target_tool, signal.pre.tool)) continue;
+            if (!spec_mod.wireTargetMatchesPre(entry.rule_spec, formal_pre)) continue;
             const candidate_id = parseHex(entry.candidate_id) orelse return error.InvalidCandidateId;
             request_ids[index] = kernel.requestId(
                 .post_decision,
@@ -528,7 +530,7 @@ pub const RuntimeGate = struct {
         var checker_rule_count: usize = 1;
         for (self.active.rules, 0..) |entry, index| {
             if (index != rule_index and
-                std.mem.eql(u8, entry.rule_spec.target_tool, ordinaryTool(ordinary_payload)))
+                spec_mod.wireTargetMatchesPre(entry.rule_spec, ordinarySignal(ordinary_payload)))
                 checker_rule_count += 1;
         }
         const requests = try self.allocator.alloc(kernel.Request, checker_rule_count);
@@ -547,7 +549,7 @@ pub const RuntimeGate = struct {
                 const is_recovery = index == rule_index;
                 if ((pass == 0) != is_recovery) continue;
                 if (!is_recovery and
-                    !std.mem.eql(u8, entry.rule_spec.target_tool, ordinaryTool(ordinary_payload)))
+                    !spec_mod.wireTargetMatchesPre(entry.rule_spec, ordinarySignal(ordinary_payload)))
                     continue;
                 const candidate_id = parseHex(entry.candidate_id) orelse
                     return error.InvalidCandidateId;
@@ -747,10 +749,13 @@ pub const RuntimeGate = struct {
         return null;
     }
 
-    fn matchingRuleCount(self: *const RuntimeGate, tool: []const u8) usize {
+    fn matchingRuleCount(
+        self: *const RuntimeGate,
+        signal: spec_mod.PreSignal,
+    ) usize {
         var count: usize = 0;
         for (self.active.rules) |entry| {
-            if (std.mem.eql(u8, entry.rule_spec.target_tool, tool)) count += 1;
+            if (spec_mod.wireTargetMatchesPre(entry.rule_spec, signal)) count += 1;
         }
         return count;
     }
@@ -900,10 +905,10 @@ fn isRecoveryOperation(operation: kernel.Operation) bool {
     };
 }
 
-fn ordinaryTool(payload: kernel.Payload) []const u8 {
+fn ordinarySignal(payload: kernel.Payload) spec_mod.PreSignal {
     return switch (payload) {
-        .pre => |signal| signal.tool,
-        .post => |signal| signal.pre.tool,
+        .pre => |signal| signal,
+        .post => |signal| signal.pre,
         .promotion, .recovery_pre, .recovery_post => unreachable,
     };
 }

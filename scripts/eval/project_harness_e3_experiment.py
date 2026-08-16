@@ -110,7 +110,7 @@ E3_MIN_ROLLOUT_METERED_TOKENS = 300_000
 E3_ROLLOUT_TIMEOUT_SECONDS = 300
 CURRENT_FORMAL_BATCH_SCHEMA = "metacodes-project-formal-decision-batch-v5"
 RULE_FILTER_SCHEMA = "metacodes-project-rule-filter-v1"
-RULE_FILTER_PROOF = "MetaCodesControl.ProjectRule.target_tool_mismatch_admits_both"
+RULE_FILTER_PROOF = "MetaCodesControl.ProjectRule.target_mismatch_admits_both"
 COMMITTED_BUDGET_RECEIPT_FIELDS = frozenset(
     {
         "journal_id",

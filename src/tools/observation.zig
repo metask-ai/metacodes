@@ -231,7 +231,7 @@ pub const Event = union(enum) {
         /// retained despite its ordinary target mismatch. This is therefore a
         /// prune count, not the raw number of mismatching targets.
         statically_pruned_rule_count: u32,
-        proof: []const u8 = "MetaCodesControl.ProjectRule.target_tool_mismatch_admits_both",
+        proof: []const u8 = "MetaCodesControl.ProjectRule.target_mismatch_admits_both",
     },
     formal_decision: struct {
         // This is an additive journal event with a separate schema. Reusing

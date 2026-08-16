@@ -189,7 +189,8 @@ def _proposal() -> str:
         "invariant": "Ontology context never authorizes its own promotion.",
         "falsifier": "A held-out replay observes context self-authorizing promotion.",
         "rule_spec": {
-            "target_tool": "Write",
+            "target_kind": "tool",
+            "target": "Write",
             "target_scope": "existing_file",
             "deny_target": True,
             "max_input_bytes": 8192,

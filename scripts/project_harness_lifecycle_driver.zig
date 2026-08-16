@@ -622,7 +622,7 @@ fn leanSourceFor(flavor: RuleFlavor) []const u8 {
 fn specFor(flavor: RuleFlavor) cc.project_rule_spec.Spec {
     return switch (flavor) {
         .evolved => .{
-            .target_tool = "Write",
+            .target = .{ .tool = "Write" },
             .target_scope = .existing_file,
             .deny_target = true,
             .max_input_bytes = 8192,
@@ -631,7 +631,7 @@ fn specFor(flavor: RuleFlavor) cc.project_rule_spec.Spec {
             .effect_requirement = .none,
         },
         .static => .{
-            .target_tool = "Write",
+            .target = .{ .tool = "Write" },
             .target_scope = .all,
             .deny_target = false,
             .max_input_bytes = 8192,

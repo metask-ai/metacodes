@@ -343,6 +343,10 @@ test "L2 Lean-selected source-CAS rewrites existing Write through one host-synth
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(!done.is_error);
             const content = done.content orelse return error.MissingToolResult;
             try std.testing.expect(std.mem.indexOf(
@@ -422,6 +426,10 @@ test "L2 malformed Write cannot be normalized by source-CAS lowering" {
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
             const content = done.content orelse return error.MissingToolResult;
             try std.testing.expect(std.mem.indexOf(
@@ -458,6 +466,10 @@ test "L2 malformed Write cannot be normalized by source-CAS lowering" {
     switch (signal_result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -516,6 +528,10 @@ test "L2 host synthesis rejects non-UTF8 source without starting a dispatch" {
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -579,6 +595,10 @@ test "L2 execution policy can reject synthesized Edit with zero file effect" {
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -697,6 +717,10 @@ test "L2 source drift between synthesis selection and recovery pre starts no dis
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -761,6 +785,10 @@ test "L2 source drift after recovery admission is reobserved without overwrite" 
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -808,6 +836,10 @@ test "L2 admitted new-file Write cannot truncate a target created after observat
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -863,6 +895,10 @@ test "L2 Lean-admitted exact Edit refuses a source changed before native dispatc
     switch (blocked) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -891,6 +927,10 @@ test "L2 Lean-admitted exact Edit refuses a source changed before native dispatc
     switch (rejected) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
             var parsed = try std.json.parseFromSlice(
                 std.json.Value,
@@ -965,6 +1005,10 @@ test "L2 exact recovery preserves content CAS across the blocked Write and later
     switch (blocked) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -993,6 +1037,10 @@ test "L2 exact recovery preserves content CAS across the blocked Write and later
     switch (rejected) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -1046,6 +1094,10 @@ test "L2 exact recovery can fill an existing empty file without ordinary empty-n
     switch (blocked) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -1069,6 +1121,10 @@ test "L2 exact recovery can fill an existing empty file without ordinary empty-n
     switch (recovered) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(!done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -1121,6 +1177,10 @@ test "L2 malformed unrelated Edit remains a tool error while an exact obligation
     switch (blocked) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -1137,6 +1197,10 @@ test "L2 malformed unrelated Edit remains a tool error while an exact obligation
     switch (malformed) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -1193,6 +1257,10 @@ test "L2 rejected dispatch start cancels exact recovery inflight state" {
     switch (blocked) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -1289,6 +1357,10 @@ test "L2 exact-edit admission never delegates to an embedding Session executor" 
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
             var parsed = try std.json.parseFromSlice(
                 std.json.Value,
@@ -1369,6 +1441,10 @@ test "L2 governed executeOne rejects detached Bash and Monitor before process cr
     switch (explicit) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
             try std.testing.expect(std.mem.indexOf(
                 u8,
@@ -1394,6 +1470,10 @@ test "L2 governed executeOne rejects detached Bash and Monitor before process cr
     switch (foreground) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(!done.is_error);
             try std.testing.expect(std.mem.indexOf(
                 u8,
@@ -1420,6 +1500,10 @@ test "L2 governed executeOne rejects detached Bash and Monitor before process cr
     switch (monitor) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
             try std.testing.expect(std.mem.indexOf(
                 u8,
@@ -1677,7 +1761,7 @@ test "L2 promoted Lean deny rule blocks the real dispatcher before side effects"
         .proposer_sha256 = proposer,
         .invariant = "Project policy denies Write before dispatch.",
         .rule_spec = .{
-            .target_tool = "Write",
+            .target = .{ .tool = "Write" },
             .deny_target = true,
             .max_input_bytes = 8192,
             .max_agent_depth = 4,
@@ -1808,6 +1892,10 @@ test "L2 promoted Lean deny rule blocks the real dispatcher before side effects"
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
             var parsed = try std.json.parseFromSlice(std.json.Value, allocator, done.content.?, .{});
             defer parsed.deinit();
@@ -1895,7 +1983,7 @@ fn promoteFixture(
             .case_id = "target-negative",
             .expected_admit = false,
             .signal = .{ .pre = .{
-                .tool = spec.target_tool,
+                .tool = spec.target.tool,
                 .input_bytes = negative_bytes,
                 .agent_depth = 0,
                 .authoritative = true,
@@ -1906,7 +1994,7 @@ fn promoteFixture(
             .case_id = "target-proven-missing",
             .expected_admit = spec.target_scope == .existing_file or !spec.deny_target,
             .signal = .{ .pre = .{
-                .tool = spec.target_tool,
+                .tool = spec.target.tool,
                 .input_bytes = 2,
                 .agent_depth = 0,
                 .authoritative = true,
@@ -1980,7 +2068,7 @@ test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edi
         project,
         config,
         .{
-            .target_tool = "Write",
+            .target = .{ .tool = "Write" },
             .target_scope = .existing_file,
             .deny_target = true,
             .max_input_bytes = 8192,
@@ -2033,6 +2121,10 @@ test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edi
     switch (blocked) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
             var parsed = try std.json.parseFromSlice(
                 std.json.Value,
@@ -2099,6 +2191,10 @@ test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edi
     switch (other_edit) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(!done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -2129,6 +2225,10 @@ test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edi
     switch (partial) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -2154,6 +2254,10 @@ test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edi
     switch (recovered) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(!done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -2183,6 +2287,10 @@ test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edi
     switch (created) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(!done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -2206,6 +2314,10 @@ test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edi
     switch (directory_block) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
             var parsed = try std.json.parseFromSlice(
                 std.json.Value,
@@ -2299,7 +2411,7 @@ test "L2 shadow project rule records Lean blocks without changing real dispatch"
         project,
         config,
         .{
-            .target_tool = "Write",
+            .target = .{ .tool = "Write" },
             .target_scope = .existing_file,
             .deny_target = true,
             .max_input_bytes = 8192,
@@ -2353,6 +2465,10 @@ test "L2 shadow project rule records Lean blocks without changing real dispatch"
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(!done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -2418,7 +2534,7 @@ test "L2 active project rules fail closed before dispatch on artifact or kernel 
         project,
         config,
         .{
-            .target_tool = "Write",
+            .target = .{ .tool = "Write" },
             .deny_target = true,
             .max_input_bytes = 8192,
             .max_agent_depth = 4,
@@ -2570,7 +2686,7 @@ test "L2 normal RunControl finish publishes a bound operational observer" {
         project,
         config,
         .{
-            .target_tool = "Write",
+            .target = .{ .tool = "Write" },
             .deny_target = true,
             .max_input_bytes = 8192,
             .max_agent_depth = 4,
@@ -2616,6 +2732,10 @@ test "L2 normal RunControl finish publishes a bound operational observer" {
         switch (result) {
             .done => |done| {
                 defer if (done.content) |bytes| allocator.free(bytes);
+                defer if (done.file_refs) |refs| {
+                    for (refs) |*ref| ref.deinit(allocator);
+                    allocator.free(refs);
+                };
                 try std.testing.expect(!done.is_error);
             },
             else => return error.UnexpectedToolResult,
@@ -2697,7 +2817,7 @@ test "L2 extending an active bundle reattests the prior promotion before mutatio
         project,
         config,
         .{
-            .target_tool = "Write",
+            .target = .{ .tool = "Write" },
             .deny_target = true,
             .max_input_bytes = 8192,
             .max_agent_depth = 4,
@@ -2735,7 +2855,7 @@ test "L2 extending an active bundle reattests the prior promotion before mutatio
             project,
             config,
             .{
-                .target_tool = "Edit",
+                .target = .{ .tool = "Edit" },
                 .deny_target = true,
                 .max_input_bytes = 4096,
                 .max_agent_depth = 3,
@@ -2842,7 +2962,7 @@ fn syntheticActiveForTool(
         rule.* = .{
             .candidate_id = try a.dupe(u8, &candidate),
             .rule_spec = cc.project_rule_spec.toWire(.{
-                .target_tool = target_tool,
+                .target = .{ .tool = target_tool },
                 .deny_target = false,
                 .max_input_bytes = 8192,
                 .max_agent_depth = 4,
@@ -2879,7 +2999,7 @@ fn syntheticOrderedRecoveryActive(
     const generic = cc.project_rule_bundle.RuleEntry{
         .candidate_id = try a.dupe(u8, &generic_id),
         .rule_spec = cc.project_rule_spec.toWire(.{
-            .target_tool = "Write",
+            .target = .{ .tool = "Write" },
             .target_scope = .all,
             .deny_target = true,
             .max_input_bytes = 8192,
@@ -2891,7 +3011,7 @@ fn syntheticOrderedRecoveryActive(
     const recovery = cc.project_rule_bundle.RuleEntry{
         .candidate_id = try a.dupe(u8, &recovery_id),
         .rule_spec = cc.project_rule_spec.toWire(.{
-            .target_tool = "Write",
+            .target = .{ .tool = "Write" },
             .target_scope = .existing_file,
             .deny_target = true,
             .max_input_bytes = 8192,
@@ -2930,7 +3050,7 @@ fn syntheticRecoveryWithEditAndBash(
     const source = cc.project_rule_bundle.RuleEntry{
         .candidate_id = try a.dupe(u8, &source_id),
         .rule_spec = cc.project_rule_spec.toWire(.{
-            .target_tool = "Write",
+            .target = .{ .tool = "Write" },
             .target_scope = .existing_file,
             .deny_target = true,
             .max_input_bytes = 8192,
@@ -2942,7 +3062,7 @@ fn syntheticRecoveryWithEditAndBash(
     const edit = cc.project_rule_bundle.RuleEntry{
         .candidate_id = try a.dupe(u8, &edit_id),
         .rule_spec = cc.project_rule_spec.toWire(.{
-            .target_tool = "Edit",
+            .target = .{ .tool = "Edit" },
             .deny_target = false,
             .max_input_bytes = 8192,
             .max_agent_depth = 4,
@@ -2954,7 +3074,7 @@ fn syntheticRecoveryWithEditAndBash(
     rules[1] = .{
         .candidate_id = try a.dupe(u8, &bash_id),
         .rule_spec = cc.project_rule_spec.toWire(.{
-            .target_tool = "Bash",
+            .target = .{ .tool = "Bash" },
             .deny_target = true,
             .max_input_bytes = 8192,
             .max_agent_depth = 4,
@@ -3043,6 +3163,10 @@ test "L2 multi-target recovery keeps obligations independent and journals one mi
         switch (result) {
             .done => |done| {
                 defer if (done.content) |bytes| allocator.free(bytes);
+                defer if (done.file_refs) |refs| {
+                    for (refs) |*ref| ref.deinit(allocator);
+                    allocator.free(refs);
+                };
                 try std.testing.expect(done.is_error);
             },
             else => return error.UnexpectedToolResult,
@@ -3067,6 +3191,10 @@ test "L2 multi-target recovery keeps obligations independent and journals one mi
     switch (recovered_a) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(!done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -3096,6 +3224,10 @@ test "L2 multi-target recovery keeps obligations independent and journals one mi
     switch (recovered_b) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(!done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -3204,6 +3336,10 @@ test "L2 exact recovery obligation capacity fails closed before a new target" {
             switch (result) {
                 .done => |done| {
                     defer if (done.content) |bytes| allocator.free(bytes);
+                    defer if (done.file_refs) |refs| {
+                        for (refs) |*ref| ref.deinit(allocator);
+                        allocator.free(refs);
+                    };
                     try std.testing.expect(done.is_error);
                 },
                 else => return error.UnexpectedToolResult,
@@ -3262,6 +3398,10 @@ test "L2 multi-rule recovery follows the first blocking Lean verdict only" {
         switch (result) {
             .done => |done| {
                 defer if (done.content) |bytes| allocator.free(bytes);
+                defer if (done.file_refs) |refs| {
+                    for (refs) |*ref| ref.deinit(allocator);
+                    allocator.free(refs);
+                };
                 try std.testing.expect(done.is_error);
                 var parsed = try std.json.parseFromSlice(
                     std.json.Value,
@@ -3468,6 +3608,10 @@ test "L2 target mismatch skips checker while retaining auditable dispatch filter
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(!done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -3550,6 +3694,10 @@ test "L2 exact recovery retains source and Edit rules while pruning unrelated to
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(!done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -3833,6 +3981,10 @@ test "L2 exact recovery checker fault fails closed before Edit side effects" {
     switch (blocked) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -3955,7 +4107,7 @@ test "L2 promoted Lean post rule admits matched Write and poisons unavailable re
         project,
         config,
         .{
-            .target_tool = "Write",
+            .target = .{ .tool = "Write" },
             .deny_target = false,
             .max_input_bytes = 8192,
             .max_agent_depth = 4,
@@ -4007,6 +4159,10 @@ test "L2 promoted Lean post rule admits matched Write and poisons unavailable re
     switch (matched) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
             try std.testing.expect(!done.is_error);
         },
         else => return error.UnexpectedToolResult,
@@ -4116,7 +4272,7 @@ test "L2 promoted Lean post rule admits matched Write and poisons unavailable re
         .proposer_sha256 = .{'9'} ** 64,
         .invariant = "A successful Write must retain a matched host re-observation.",
         .rule_spec = .{
-            .target_tool = "Write",
+            .target = .{ .tool = "Write" },
             .deny_target = false,
             .max_input_bytes = 8192,
             .max_agent_depth = 4,
@@ -4334,4 +4490,170 @@ test "L2 a covered dispatch and a harmless uncovered dispatch report no coverage
         else => {},
     }
     try std.testing.expectEqual(@as(usize, 0), gap_sink.gaps);
+}
+
+/// Counts checker consultations so pruning semantics are directly observable.
+const EffectClassRoutingSink = struct {
+    formal_batches: usize = 0,
+    rule_filters: usize = 0,
+    last_checker_rule_count: u32 = 0,
+    gaps: usize = 0,
+
+    fn emit(raw: *anyopaque, event: cc.tools.tool_observation.Event) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        switch (event) {
+            .formal_decision_batch => self.formal_batches += 1,
+            .rule_filter => |filter| {
+                self.rule_filters += 1;
+                self.last_checker_rule_count = filter.checker_rule_count;
+            },
+            .rule_coverage_gap => self.gaps += 1,
+            else => {},
+        }
+        return true;
+    }
+
+    fn sink(self: *@This()) cc.tools.tool_observation.Sink {
+        return .{ .ctx = @ptrCast(self), .emitFn = emit };
+    }
+};
+
+fn syntheticEffectClassActive(
+    allocator: std.mem.Allocator,
+    config: cc.project_harness_runtime.Config,
+) !cc.project_rule_bundle.LoadedActive {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const rules = try a.alloc(cc.project_rule_bundle.RuleEntry, 1);
+    const rule_id = cc.tools.tool_observation.sha256Hex("effect-class-verify");
+    rules[0] = .{
+        .candidate_id = try a.dupe(u8, &rule_id),
+        .rule_spec = cc.project_rule_spec.toWire(.{
+            .target = .{ .effect_class = .existing_file_rewrite },
+            .deny_target = false,
+            .max_input_bytes = 8192,
+            .max_agent_depth = 4,
+            .authoritative_only = true,
+            .effect_requirement = .file_mutation_v1_reobserved,
+        }),
+    };
+    return .{
+        .arena = arena,
+        .project_sha256 = .{'a'} ** 64,
+        .bundle_sha256 = .{'b'} ** 64,
+        .revision = 9,
+        .kernel_sha256 = config.expected_sha256,
+        .promotion_receipt_id = .{'c'} ** 64,
+        .promotion_request_sha256 = .{'d'} ** 64,
+        .promotion_verdict_sha256 = .{'e'} ** 64,
+        .active_pointer_sha256 = .{'f'} ** 64,
+        .rules = rules,
+    };
+}
+
+test "L2 effect-class rule reaches the checker for Edit and is pruned for Bash" {
+    // The block-2 bypass, closed: under tool targeting an Edit rewriting an
+    // existing file never consulted the checker (all rules pruned).  An
+    // effect-class rule must route that same Edit INTO the checker — and must
+    // still statically prune tools outside the mutating roster (Bash), so the
+    // pruning fast path keeps its proof-backed semantics.
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/effect-class-target.txt",
+        .{root_buffer[0..root_len]},
+    );
+    defer allocator.free(path);
+    try overwriteArtifact(allocator, path, "effect-original\n");
+
+    var active = try syntheticEffectClassActive(allocator, config);
+    defer active.deinit();
+    var evidence_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const evidence_dir = try std.fmt.bufPrint(
+        &evidence_buffer,
+        "{s}/evidence",
+        .{root_buffer[0..root_len]},
+    );
+    try std.Io.Dir.createDirAbsolute(std.testing.io, evidence_dir, .default_dir);
+    var routing = EffectClassRoutingSink{};
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+        .evidence_dir = evidence_dir,
+        .observation_sink = routing.sink(),
+    };
+    var read_state = cc.core_read_state.ReadState.init(allocator);
+    defer read_state.deinit();
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.read_state = &read_state;
+    ctx.project_rule_gate = runtime.protocolGate();
+    ctx.tool_observer = routing.sink();
+    const seed_stat = try cc.core_read_state.statPath(path);
+    try read_state.record(path, seed_stat.mtime_ns, seed_stat.size);
+
+    const edit_args = try std.json.Stringify.valueAlloc(allocator, .{
+        .file_path = path,
+        .old_string = "effect-original",
+        .new_string = "effect-replaced",
+    }, .{});
+    defer allocator.free(edit_args);
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Edit",
+        edit_args,
+        "effect-class-edit",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
+            // A verify-only rule admits a real, reobserved Edit.
+            try std.testing.expect(!done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    // The checker was consulted (pre and post), never statically pruned.
+    try std.testing.expect(routing.formal_batches >= 2);
+    // The Edit no longer produces a coverage gap: the effect class covers it.
+    try std.testing.expectEqual(@as(usize, 0), routing.gaps);
+
+    const before_batches = routing.formal_batches;
+    const bash_args = try std.json.Stringify.valueAlloc(allocator, .{
+        .command = "true",
+    }, .{});
+    defer allocator.free(bash_args);
+    const bash_result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Bash",
+        bash_args,
+        "effect-class-bash",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (bash_result) {
+        .done => |done| {
+            if (done.content) |bytes| allocator.free(bytes);
+            if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            }
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    // Bash is outside the mutating roster: statically pruned, zero checker calls.
+    try std.testing.expectEqual(before_batches, routing.formal_batches);
+    try std.testing.expectEqual(@as(u32, 0), routing.last_checker_rule_count);
 }

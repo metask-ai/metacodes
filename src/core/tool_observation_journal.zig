@@ -977,7 +977,7 @@ fn validateRuleFilter(
         !std.mem.eql(
             u8,
             filter.proof,
-            "MetaCodesControl.ProjectRule.target_tool_mismatch_admits_both",
+            "MetaCodesControl.ProjectRule.target_mismatch_admits_both",
         ) or
         filter.bundle_revision == 0 or filter.active_rule_count == 0 or
         filter.checker_rule_count > filter.active_rule_count or

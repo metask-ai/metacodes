@@ -826,11 +826,20 @@ pub fn renderCanonicalLean(
         .none => "none",
         .file_mutation_v1_reobserved => "fileMutationV1Reobserved",
     };
+    const target_expr = switch (spec.target) {
+        .tool => |name| try std.fmt.allocPrint(allocator, ".tool \"{s}\"", .{name}),
+        .effect_class => |cls| try std.fmt.allocPrint(allocator, ".effectClass .{s}", .{
+            switch (cls) {
+                .existing_file_rewrite => "existingFileRewrite",
+            },
+        }),
+    };
+    defer allocator.free(target_expr);
     return std.fmt.allocPrint(
         allocator,
-        "def spec : RuleSpec := {{ targetTool := \"{s}\", targetScope := .{s}, denyTarget := {}, maxInputBytes := {}, maxAgentDepth := {}, authoritativeOnly := {}, effectRequirement := .{s} }}\ntheorem spec_valid : valid spec = true := by rfl",
+        "def spec : RuleSpec := {{ target := {s}, targetScope := .{s}, denyTarget := {}, maxInputBytes := {}, maxAgentDepth := {}, authoritativeOnly := {}, effectRequirement := .{s} }}\ntheorem spec_valid : valid spec = true := by rfl",
         .{
-            spec.target_tool,
+            target_expr,
             scope,
             spec.deny_target,
             spec.max_input_bytes,
@@ -1756,9 +1765,9 @@ test "v1 rule author prompt remains byte-compatible for cache and old receipts" 
     try std.testing.expectEqualStrings(SYSTEM_PROMPT, systemPrompt(.v1));
 }
 
-test "canonical Lean is deterministic and carries the full RuleSpec v2" {
+test "canonical Lean is deterministic and carries the full RuleSpec v3" {
     const source = try renderCanonicalLean(std.testing.allocator, .{
-        .target_tool = "Write",
+        .target = .{ .tool = "Write" },
         .target_scope = .existing_file,
         .deny_target = true,
         .max_input_bytes = 8192,
@@ -1768,7 +1777,7 @@ test "canonical Lean is deterministic and carries the full RuleSpec v2" {
     });
     defer std.testing.allocator.free(source);
     try std.testing.expectEqualStrings(
-        "def spec : RuleSpec := { targetTool := \"Write\", targetScope := .existingFile, denyTarget := true, maxInputBytes := 8192, maxAgentDepth := 4, authoritativeOnly := true, effectRequirement := .none }\ntheorem spec_valid : valid spec = true := by rfl",
+        "def spec : RuleSpec := { target := .tool \"Write\", targetScope := .existingFile, denyTarget := true, maxInputBytes := 8192, maxAgentDepth := 4, authoritativeOnly := true, effectRequirement := .none }\ntheorem spec_valid : valid spec = true := by rfl",
         source,
     );
 }

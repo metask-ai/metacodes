@@ -1132,7 +1132,7 @@ const TestFixture = struct {
             .proposer_sha256 = .{'b'} ** 64,
             .invariant = "Completed effects retain a terminal observation.",
             .rule_spec = .{
-                .target_tool = "Write",
+                .target = .{ .tool = "Write" },
                 .deny_target = false,
                 .max_input_bytes = 8192,
                 .max_agent_depth = 4,

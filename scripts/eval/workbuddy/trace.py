@@ -33,7 +33,7 @@ OBSERVATION_JOURNAL_SCHEMA = "metacodes-tool-observation-journal-v1"
 TOOL_OBSERVATION_SCHEMA = "metacodes-tool-observation-v1"
 RULE_FILTER_SCHEMA = "metacodes-project-rule-filter-v1"
 RULE_FILTER_PROOF = (
-    "MetaCodesControl.ProjectRule.target_tool_mismatch_admits_both"
+    "MetaCodesControl.ProjectRule.target_mismatch_admits_both"
 )
 FORMAL_DECISION_SCHEMAS = {
     "metacodes-project-formal-decision-v1",

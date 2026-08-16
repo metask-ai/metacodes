@@ -1489,7 +1489,7 @@ test "project harness request rendering is byte-stable and identity-bound" {
         .bundle_sha256 = bundle[0..],
         .bundle_revision = 1,
         .rule_spec = spec_mod.toWire(.{
-            .target_tool = "Write",
+            .target = .{ .tool = "Write" },
             .deny_target = true,
             .max_input_bytes = 8192,
             .max_agent_depth = 4,

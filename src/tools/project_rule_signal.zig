@@ -15,6 +15,17 @@ const project_rule_spec = @import("../core/project_rule_spec.zig");
 const path_mod = @import("../util/path.zig");
 const util_json = @import("../util/json.zig");
 
+/// The single source of truth for which tools an effect-class rule can see.
+/// A tool belongs here exactly when its primary operation mutates one observed
+/// file target — the same roster `observeFileTarget` senses. Opaque tools
+/// (Bash) are deliberately absent: their file effects are not attributable at
+/// pre time, and post-hoc the rule_coverage_gap signal reports them.
+pub fn isFileMutatingTool(tool: []const u8) bool {
+    return std.mem.eql(u8, tool, "Write") or
+        std.mem.eql(u8, tool, "Edit") or
+        std.mem.eql(u8, tool, "NotebookEdit");
+}
+
 pub fn observePre(
     ctx: *const ToolContext,
     dispatch_id: []const u8,
@@ -29,6 +40,7 @@ pub fn observePre(
         .authoritative = ctx.tool_observation_origin == .authoritative,
         .file_target_state = observeFileTarget(ctx, tool, input),
         .exact_edit_material = observeExactEditMaterial(ctx, tool, input),
+        .file_mutating = isFileMutatingTool(tool),
     };
 }
 
@@ -126,10 +138,7 @@ pub fn observeFileTarget(
     tool: []const u8,
     input: []const u8,
 ) project_rule_spec.FileTargetState {
-    const is_file_target = std.mem.eql(u8, tool, "Write") or
-        std.mem.eql(u8, tool, "Edit") or
-        std.mem.eql(u8, tool, "NotebookEdit");
-    if (!is_file_target)
+    if (!isFileMutatingTool(tool))
         return .unobserved;
     const escaped = if (std.mem.eql(u8, tool, "NotebookEdit"))
         common.extractJsonArg(input, "notebook_path") orelse
