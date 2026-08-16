@@ -357,6 +357,14 @@ pub const Options = struct {
     /// nudging. Measurement-only: conversation and control flow untouched.
     /// Gives control arms the same outcome record the gate arms get.
     verification_final_observe: bool = false,
+    /// Bounded same-turn retries after a mid-stream provider failure. The
+    /// stream-error path already discards the partial turn (nothing was
+    /// committed to the conversation), so re-issuing the identical request is
+    /// semantically clean. Default 0 preserves interactive behavior — a TUI
+    /// user has watched the partial text stream and a silent re-run would
+    /// duplicate it; headless evaluation enables 2, where one transient
+    /// otherwise destroys an entire paired arm's evidence.
+    max_stream_turn_retries: u8 = 0,
     /// 统一 UI 请求回调(替代旧 ask_question/exit_plan 三套;ctx 指 *TuiBackend)。
     /// 仅顶层 TUI 接(agent_depth==0)——子 agent 无 tty。见 UiRequester。
     ui_requester: ?@import("protocol/ui_request.zig").UiRequester = null,
@@ -582,6 +590,7 @@ pub fn run(
     var continuations: u32 = 0;
     var verification_nudges: u8 = 0;
     const MAX_VERIFICATION_NUDGES: u8 = 2;
+    var stream_turn_retries: u8 = 0;
     defer if (opts.verification_final_gate or opts.verification_final_observe) {
         if (opts.tool_observer) |observer| {
             _ = observer.emit(.{ .verification_final_gate = .{
@@ -1192,6 +1201,18 @@ pub fn run(
                     )) {
                         return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
                     }
+                    continue :request_recovery;
+                }
+                // Mid-stream transient (connection drop, malformed tail):
+                // the partial turn was fully discarded above, so a bounded
+                // re-issue of the same request is safe. Aborts keep their
+                // own path; context-window exhaustion was handled before.
+                const abort_pending = if (opts.abort) |a| a.isAborted() else false;
+                if (stream_turn_retries < opts.max_stream_turn_retries and
+                    !abort_pending)
+                {
+                    stream_turn_retries += 1;
+                    log.warnId("agent", rid_for_turn, "mid-stream failure → same-turn retry {d}/{d}", .{ stream_turn_retries, opts.max_stream_turn_retries });
                     continue :request_recovery;
                 }
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });

@@ -18,9 +18,10 @@ const FINAL_SCHEMA = "metacodes-project-harness-lifecycle-final-v2";
 const AUDIT_SCHEMA = "metacodes-project-harness-lifecycle-audit-v2";
 const EVOLVED_CORRECTION = "In this project, never use Write to overwrite an existing regular file; use Edit for targeted changes.";
 const STATIC_CORRECTION = "In this project, every successful Write must remain bounded, authoritative, and carry a host-reobserved file mutation.";
+const EFFECT_CORRECTION = "In this project, any rewrite of an existing regular file — through any tool — must carry a host-reobserved file mutation.";
 const EVOLVED_LEAN_SOURCE =
     \\def spec : RuleSpec := {
-    \\  targetTool := "Write"
+    \\  target := .tool "Write"
     \\  targetScope := .existingFile
     \\  denyTarget := true
     \\  maxInputBytes := 8192
@@ -30,9 +31,21 @@ const EVOLVED_LEAN_SOURCE =
     \\}
     \\theorem spec_valid : valid spec = true := by rfl
 ;
+const EFFECT_LEAN_SOURCE =
+    \\def spec : RuleSpec := {
+    \\  target := .effectClass .existingFileRewrite
+    \\  targetScope := .all
+    \\  denyTarget := false
+    \\  maxInputBytes := 8192
+    \\  maxAgentDepth := 4
+    \\  authoritativeOnly := true
+    \\  effectRequirement := .fileMutationV1Reobserved
+    \\}
+    \\theorem spec_valid : valid spec = true := by rfl
+;
 const STATIC_LEAN_SOURCE =
     \\def spec : RuleSpec := {
-    \\  targetTool := "Write"
+    \\  target := .tool "Write"
     \\  targetScope := .all
     \\  denyTarget := false
     \\  maxInputBytes := 8192
@@ -46,7 +59,7 @@ const CORRECTION_SID = "0123456789abcdef01234567";
 const RUNTIME_SID = "fedcba9876543210fedcba98";
 
 const Phase = enum { prepare, finalize, audit };
-const RuleFlavor = enum { evolved, static };
+const RuleFlavor = enum { evolved, static, effect_class };
 
 const Options = struct {
     phase: Phase,
@@ -390,7 +403,7 @@ fn finalize(init: std.process.Init, allocator: std.mem.Allocator, options: Optio
             try requireToolSuccess(allocator, write_outcome);
             break :blk true;
         },
-        .static => blk: {
+        .static, .effect_class => blk: {
             try requireToolSuccess(allocator, write_outcome);
             break :blk false;
         },
@@ -602,6 +615,7 @@ fn correctionFor(flavor: RuleFlavor) []const u8 {
     return switch (flavor) {
         .evolved => EVOLVED_CORRECTION,
         .static => STATIC_CORRECTION,
+        .effect_class => EFFECT_CORRECTION,
     };
 }
 
@@ -609,6 +623,7 @@ fn invariantFor(flavor: RuleFlavor) []const u8 {
     return switch (flavor) {
         .evolved => "Existing regular files are changed through Edit, never overwritten through Write.",
         .static => "Successful authoritative Write calls are bounded and retain host-reobserved mutation evidence.",
+        .effect_class => "Every rewrite of an existing regular file retains host-reobserved mutation evidence, regardless of the tool that produced it.",
     };
 }
 
@@ -616,6 +631,7 @@ fn leanSourceFor(flavor: RuleFlavor) []const u8 {
     return switch (flavor) {
         .evolved => EVOLVED_LEAN_SOURCE,
         .static => STATIC_LEAN_SOURCE,
+        .effect_class => EFFECT_LEAN_SOURCE,
     };
 }
 
@@ -632,6 +648,15 @@ fn specFor(flavor: RuleFlavor) cc.project_rule_spec.Spec {
         },
         .static => .{
             .target = .{ .tool = "Write" },
+            .target_scope = .all,
+            .deny_target = false,
+            .max_input_bytes = 8192,
+            .max_agent_depth = 4,
+            .authoritative_only = true,
+            .effect_requirement = .file_mutation_v1_reobserved,
+        },
+        .effect_class => .{
+            .target = .{ .effect_class = .existing_file_rewrite },
             .target_scope = .all,
             .deny_target = false,
             .max_input_bytes = 8192,
@@ -698,7 +723,7 @@ fn replayCases(flavor: RuleFlavor) [5]cc.rule_evaluation.ReplayCase {
                 .agent_depth = 0,
                 .authoritative = true,
             } } },
-            .{ .case_id = "deep-write-blocked", .expected_admit = false, .signal = .{ .pre = .{
+            .{ .case_id = "deep-write-admitted-overflow-observed", .expected_admit = true, .signal = .{ .pre = .{
                 .tool = "Write",
                 .input_bytes = 2,
                 .agent_depth = 5,
@@ -709,6 +734,44 @@ fn replayCases(flavor: RuleFlavor) [5]cc.rule_evaluation.ReplayCase {
                 .input_bytes = 2,
                 .agent_depth = 0,
                 .authoritative = false,
+            } } },
+        },
+        .effect_class => .{
+            .{ .case_id = "read-admitted", .expected_admit = true, .signal = .{ .pre = .{
+                .tool = "Read",
+                .input_bytes = 2,
+                .agent_depth = 0,
+                .authoritative = true,
+            } } },
+            .{ .case_id = "edit-existing-matched-admitted", .expected_admit = true, .signal = .{ .pre = .{
+                .tool = "Edit",
+                .input_bytes = 2,
+                .agent_depth = 0,
+                .authoritative = true,
+                .file_target_state = .regular_existing,
+                .file_mutating = true,
+            } } },
+            .{ .case_id = "missing-write-admitted", .expected_admit = true, .signal = .{ .pre = .{
+                .tool = "Write",
+                .input_bytes = 2,
+                .agent_depth = 0,
+                .authoritative = true,
+                .file_target_state = .missing,
+                .file_mutating = true,
+            } } },
+            .{ .case_id = "opaque-bash-admitted", .expected_admit = true, .signal = .{ .pre = .{
+                .tool = "Bash",
+                .input_bytes = 2,
+                .agent_depth = 0,
+                .authoritative = true,
+            } } },
+            .{ .case_id = "non-authoritative-edit-blocked", .expected_admit = false, .signal = .{ .pre = .{
+                .tool = "Edit",
+                .input_bytes = 2,
+                .agent_depth = 0,
+                .authoritative = false,
+                .file_target_state = .regular_existing,
+                .file_mutating = true,
             } } },
         },
     };

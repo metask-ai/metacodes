@@ -296,3 +296,103 @@ test "L2 observe-only records the outcome and never touches the conversation" {
     try std.testing.expect(!record.obligation_met);
     try std.testing.expectEqual(@as(u8, 0), record.nudges);
 }
+
+test "L2 a mid-stream provider failure retries the same turn instead of dying" {
+    // One transient stream drop destroyed an entire paired evaluation arm's
+    // evidence twice in one day. The stream-error path fully discards the
+    // partial turn, so a bounded re-issue of the identical request is
+    // semantically clean. Headless enables 2 retries; default stays 0.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const write = try writeSse(a, root);
+    defer a.free(write);
+    // Response #1 (index 1) is cut mid-body; the retry replays it complete.
+    var server = try harness.MockServer.startCassetteMidStreamCut(
+        &.{ write, END_TURN, END_TURN },
+        1,
+    );
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "key", "model", url);
+    defer client.deinit();
+    var conversation = cc.conversation.Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "repair the repository");
+    var permission = cc.permission.createContext(.bypass_permissions, a);
+    permission.no_interactive_prompt = true;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    const result = try cc.agent_loop.run(
+        &conversation,
+        client.provider(),
+        defs,
+        &permission,
+        .{
+            .max_turns = 8,
+            .system_prompt = "STABLE-PREFIX",
+            .max_stream_turn_retries = 2,
+            .cwd_abs = root,
+            .home_dir = root,
+            .auto_compact_threshold = std.math.maxInt(usize),
+        },
+        &backend,
+        a,
+    );
+    // Turn 1: Write. Turn 2: cut mid-stream → retried → complete END_TURN.
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 3), server.requestCount());
+}
+
+test "L2 zero-retry default preserves the api_error surface" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const write = try writeSse(a, root);
+    defer a.free(write);
+    var server = try harness.MockServer.startCassetteMidStreamCut(
+        &.{ write, END_TURN, END_TURN },
+        1,
+    );
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "key", "model", url);
+    defer client.deinit();
+    var conversation = cc.conversation.Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "repair the repository");
+    var permission = cc.permission.createContext(.bypass_permissions, a);
+    permission.no_interactive_prompt = true;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    const result = try cc.agent_loop.run(
+        &conversation,
+        client.provider(),
+        defs,
+        &permission,
+        .{
+            .max_turns = 8,
+            .system_prompt = "STABLE-PREFIX",
+            .cwd_abs = root,
+            .home_dir = root,
+            .auto_compact_threshold = std.math.maxInt(usize),
+        },
+        &backend,
+        a,
+    );
+    try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
+}

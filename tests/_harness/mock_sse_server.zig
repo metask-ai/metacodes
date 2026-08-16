@@ -43,6 +43,11 @@ pub const MockServer = struct {
     cassette: ?[]const []const u8 = null,
     /// cassette 当前轮游标(serveLoop 递增)。
     cassette_pos: usize = 0,
+    /// 流中期截断:该 0-based 响应序号只发一半 SSE body 就断连(模拟正文流
+    /// 中断,与 flaky 的建连期断相互独立)。null = 不截断。
+    midstream_cut_index: ?usize = null,
+    /// serveLoop 为当前连接算好的"本响应要截断"标记。
+    current_response_cut: bool = false,
     /// flaky 模式:前 N 个连接读完请求后直接 close 不写响应(模拟服务端建连阶段断连,
     /// 客户端 receiveHead 拿到 ConnectionClosing/EOF)。serveLoop 每断一次递减,归 0 后正常服务。
     flaky_close_remaining: usize = 0,
@@ -122,6 +127,17 @@ pub const MockServer = struct {
     /// flaky 模式:前 close_first_n 个连接读完请求后直接断开(不写响应),之后正常回 body。
     /// 用于测试网络瞬态错误重试:客户端前 N 次 receiveHead 失败、第 N+1 次成功。
     /// close_first_n 很大(如 99)= 永远断,测重试耗尽。body 借用 caller(server 存活期间有效)。
+    /// cassette 多轮 + 指定响应序号流中期截断:响应 cut_index 只发一半正文
+    /// 后断连,其余照常。用于测 turn 级 mid-stream 重试。
+    pub fn startCassetteMidStreamCut(
+        bodies: []const []const u8,
+        cut_index: usize,
+    ) !*MockServer {
+        const self = try startCassette(bodies, 0);
+        self.midstream_cut_index = cut_index;
+        return self;
+    }
+
     pub fn startFlaky(body: []const u8, close_first_n: usize) !*MockServer {
         const listener = try net.listenLoopback(0, 16);
         errdefer net.closeSocket(listener.sock);
@@ -248,7 +264,12 @@ pub const MockServer = struct {
             const bodies = self.cassette orelse &[_][]const u8{self.body};
             const idx = @min(self.cassette_pos, bodies.len - 1);
             self.body = bodies[idx];
+            const response_index = self.cassette_pos;
             self.cassette_pos += 1;
+            self.current_response_cut = if (self.midstream_cut_index) |cut|
+                response_index == cut
+            else
+                false;
 
             // 读请求(同 serveOne)
             const cap: usize = MAX_REQUEST_BYTES;
@@ -353,17 +374,22 @@ pub const MockServer = struct {
             self.response_gate_entered.store(false, .release);
         }
 
+        const effective_body = if (self.current_response_cut)
+            self.body[0 .. self.body.len / 2]
+        else
+            self.body;
         var cursor: usize = 0;
-        while (cursor < self.body.len) {
-            const end = std.mem.indexOfPos(u8, self.body, cursor, "\n\n") orelse self.body.len;
-            const chunk_end = @min(end + 2, self.body.len);
-            const chunk = self.body[cursor..chunk_end];
+        while (cursor < effective_body.len) {
+            const end = std.mem.indexOfPos(u8, effective_body, cursor, "\n\n") orelse effective_body.len;
+            const chunk_end = @min(end + 2, effective_body.len);
+            const chunk = effective_body[cursor..chunk_end];
             writeChunk(conn, chunk);
             cursor = chunk_end;
             if (self.chunk_delay_ms > 0) {
                 psync.sleepMs(self.chunk_delay_ms);
             }
         }
+        if (self.current_response_cut) return; // 不发终止 chunk:模拟正文流中断
         sendAll(conn, "0\r\n\r\n");
     }
 
