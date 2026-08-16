@@ -582,6 +582,16 @@ pub fn run(
     var continuations: u32 = 0;
     var verification_nudges: u8 = 0;
     const MAX_VERIFICATION_NUDGES: u8 = 2;
+    defer if (opts.verification_final_gate or opts.verification_final_observe) {
+        if (opts.tool_observer) |observer| {
+            _ = observer.emit(.{ .verification_final_gate = .{
+                .mutations_occurred = verification_progress.mutation_seen,
+                .obligation_met = !verification_progress.unverified_mutation,
+                .nudges = verification_nudges,
+                .max_nudges = MAX_VERIFICATION_NUDGES,
+            } });
+        }
+    };
     const MAX_CONTINUATIONS: u32 = 3;
 
     // Governed lexical recall is run-scoped: the model proposes aliases and
@@ -1283,16 +1293,6 @@ pub fn run(
                 backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
                 try conversation.appendText(.user, verification_progress_mod.FINAL_GATE_TEXT);
                 continue;
-            }
-            if (opts.verification_final_gate or opts.verification_final_observe) {
-                if (opts.tool_observer) |observer| {
-                    _ = observer.emit(.{ .verification_final_gate = .{
-                        .mutations_occurred = verification_progress.mutation_seen,
-                        .obligation_met = !verification_progress.unverified_mutation,
-                        .nudges = verification_nudges,
-                        .max_nudges = MAX_VERIFICATION_NUDGES,
-                    } });
-                }
             }
             // L4 诊断:本轮无 tool_use → turn 结束(span 平衡:每个 turn_begin 都配一个
             // turn_end,无论有无工具)。紧接 run_end(end_turn)收口。

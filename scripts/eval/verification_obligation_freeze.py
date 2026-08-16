@@ -20,11 +20,11 @@ def main(argv=None) -> int:
     parser.add_argument("--production-binary", type=Path, required=True)
     parser.add_argument("--ripgrep", type=Path, required=True)
     parser.add_argument("--root", type=Path, required=True)
-    parser.add_argument("--max-rollout-cost-usd", type=float, default=1.0)
-    parser.add_argument("--max-rollout-metered-tokens", type=int, default=400_000)
+    parser.add_argument("--max-rollout-cost-usd", type=float, default=0.9)
+    parser.add_argument("--max-rollout-metered-tokens", type=int, default=300_000)
     parser.add_argument("--max-total-cost-usd", type=float, default=60.0)
     parser.add_argument("--max-total-metered-tokens", type=int, default=25_000_000)
-    parser.add_argument("--max-output-tokens", type=int, default=16_384)
+    parser.add_argument("--max-output-tokens", type=int, default=4_096)
     args = parser.parse_args(argv)
     manifest = freeze_verification_manifest(
         repo=args.repo,
