@@ -101,8 +101,15 @@ def _receipt(
         "evaluation_treatment",
         "comparison",
     }
-    if set(receipt) != required or receipt.get("schema_version") != RECEIPT_SCHEMA_VERSION:
+    # resume_audit is optional: a receipt committed by launch_gate's audit
+    # resumption path carries its instrument-succession disclosure inline.
+    if (
+        set(receipt) - {"resume_audit"} != required
+        or receipt.get("schema_version") != RECEIPT_SCHEMA_VERSION
+    ):
         raise LaunchError("paired WorkBuddy receipt schema is unsupported")
+    if "resume_audit" in receipt and not isinstance(receipt["resume_audit"], dict):
+        raise LaunchError("paired WorkBuddy receipt resume_audit disclosure is invalid")
     if (
         receipt.get("launch_manifest_content_sha256") != manifest["content_sha256"]
         or receipt.get("run_id") != manifest["run_id"]
@@ -449,23 +456,26 @@ def _control_delta(
     }
 
 
-def _verify_progress_analyzer_succession(
+def _verify_instrument_succession(
     b_comparison: Mapping[str, Any],
     t_comparison: Mapping[str, Any],
     manifests: Mapping[str, Mapping[str, Any]],
     baseline_receipt_path: Path,
 ) -> Dict[str, object]:
-    """Admit exactly one covariate difference — the progress analyzer — and
-    only after proving it measurement-neutral on the baseline arm.
+    """Admit host-control-plane (auditor) covariate differences only with
+    earned, per-module proof of measurement neutrality.
 
-    The progress analyzer is the measuring instrument, not a treatment
-    variable, but silently accepting a different instrument per arm would
-    let measurement drift masquerade as treatment effect.  Succession is
-    therefore earned, not declared: the current in-repo analyzer must (a)
+    The auditors are the measuring instrument, not treatment variables, but
+    silently accepting a different instrument per arm would let measurement
+    drift masquerade as treatment effect.  Succession is therefore earned,
+    not declared, per differing module: (a) the current in-repo module must
     be byte-identical to the one that measured the treatment arm, and (b)
-    reproduce the baseline receipt's committed progress metrics exactly,
-    from artifacts located by the receipt's own content hashes.  Anything
-    else stays the original fail-closed rejection."""
+    the baseline side must be proven neutral either by the receipt's own
+    resume-audit witness (the committed baseline receipt names the current
+    instrument) or by reproducing the receipt's committed per-task metrics
+    exactly from artifacts located by the receipt's content hashes.
+    Modules with neither proof path stay fail-closed, and treatment
+    identities (binary/bundle/overlay/model) admit no succession at all."""
 
     from .progress_analysis import analyze_progress
 
@@ -487,65 +497,120 @@ def _verify_progress_analyzer_succession(
         if json.dumps(b_host.get(key), sort_keys=True)
         != json.dumps(t_host.get(key), sort_keys=True)
     }
-    if inner != {"progress_analysis"}:
+    # Every host-control-plane module is an auditor — part of the measuring
+    # instrument, never the treatment (the treatment lives in the mounted
+    # binary/bundle/overlay identities, which admit no succession at all).
+    # Still, succession is earned per module, and modules with no earned
+    # proof path stay fail-closed.
+    AUDITOR_MODULES = {
+        "progress_analysis",
+        "workbuddy_trace",
+        "launch_gate",
+        "paired_analysis",
+    }
+    if not inner or not inner <= AUDITOR_MODULES:
         raise LaunchError("paired WorkBuddy frozen covariates differ between arms")
-    current_path = Path(__file__).resolve().parent / "progress_analysis.py"
-    current_sha256 = hashlib.sha256(current_path.read_bytes()).hexdigest()
-    treatment_sha256 = str((t_host.get("progress_analysis") or {}).get("sha256"))
-    baseline_sha256 = str((b_host.get("progress_analysis") or {}).get("sha256"))
-    if current_sha256 != treatment_sha256:
-        raise LaunchError(
-            "progress analyzer succession requires the current analyzer to be "
-            "the one that measured the treatment arm"
-        )
+    from .launch_gate import HOST_CONTROL_PLANE_MODULES
+
+    current_shas: Dict[str, str] = {}
+    for module in sorted(inner):
+        module_path = HOST_CONTROL_PLANE_MODULES[module]
+        current_shas[module] = hashlib.sha256(
+            module_path.read_bytes()
+        ).hexdigest()
+        if current_shas[module] != str(
+            (t_host.get(module) or {}).get("sha256")
+        ):
+            raise LaunchError(
+                "instrument succession requires the current auditor to be "
+                f"the one that measured the treatment arm ({module})"
+            )
     receipt, _receipt_sha, _receipt_bytes = _observed_json(baseline_receipt_path)
-    tasks = ((receipt.get("usage") or {}).get("tasks")) or {}
-    if not isinstance(tasks, Mapping) or not tasks:
-        raise LaunchError("progress analyzer succession requires baseline task evidence")
-    checkout = Path(str(manifests["baseline"]["workbuddy"]["checkout"]))
-    result_root = checkout / "results" / str(manifests["baseline"]["job"]["slug"])
-    by_sha: Dict[str, Path] = {}
-    if result_root.exists():
-        for transcript in result_root.rglob("metacodes-transcript.jsonl"):
-            digest = hashlib.sha256(transcript.read_bytes()).hexdigest()
-            by_sha[digest] = transcript
-    reverified = 0
-    for task, row in tasks.items():
-        committed = (row or {}).get("progress_metrics")
-        if not isinstance(committed, Mapping):
+    resume_auditor = (
+        (receipt.get("resume_audit") or {}).get("auditor")
+        if isinstance(receipt.get("resume_audit"), Mapping)
+        else None
+    )
+    directly_witnessed = {
+        module
+        for module in inner
+        if isinstance(resume_auditor, Mapping)
+        and resume_auditor.get(module) == current_shas[module]
+    }
+    needs_reproduction = inner - directly_witnessed
+    if not needs_reproduction <= {"progress_analysis", "workbuddy_trace"}:
+        raise LaunchError(
+            "instrument succession has no earned proof for "
+            f"{sorted(needs_reproduction - {'progress_analysis', 'workbuddy_trace'})}; "
+            "commit the baseline through launch_gate resume-audit first"
+        )
+    reverified = {module: "resume_audit_witness" for module in directly_witnessed}
+    if needs_reproduction:
+        from .trace import load_control_metrics
+
+        tasks = ((receipt.get("usage") or {}).get("tasks")) or {}
+        if not isinstance(tasks, Mapping) or not tasks:
             raise LaunchError(
-                f"progress analyzer succession lacks committed metrics for {task}"
+                "instrument succession requires baseline task evidence"
             )
-        source = committed.get("source") or {}
-        transcript_sha = str(source.get("transcript_sha256"))
-        observation_sha = str(source.get("observation_journal_sha256"))
-        transcript_path = by_sha.get(transcript_sha)
-        if transcript_path is None:
-            raise LaunchError(
-                f"progress analyzer succession cannot locate baseline artifacts for {task}"
-            )
-        observation_path = transcript_path.parent / "metacodes-tool-observations.jsonl"
-        if (
-            not observation_path.is_file()
-            or hashlib.sha256(observation_path.read_bytes()).hexdigest()
-            != observation_sha
-        ):
-            raise LaunchError(
-                f"progress analyzer succession cannot bind baseline observations for {task}"
-            )
-        recomputed = analyze_progress(transcript_path, observation_path)
-        if json.dumps(recomputed, sort_keys=True) != json.dumps(
-            committed, sort_keys=True
-        ):
-            raise LaunchError(
-                f"progress analyzer succession changed baseline measurement for {task}"
-            )
-        reverified += 1
+        checkout = Path(str(manifests["baseline"]["workbuddy"]["checkout"]))
+        result_root = checkout / "results" / str(manifests["baseline"]["job"]["slug"])
+        by_sha: Dict[str, Path] = {}
+        if result_root.exists():
+            for transcript in result_root.rglob("metacodes-transcript.jsonl"):
+                digest = hashlib.sha256(transcript.read_bytes()).hexdigest()
+                by_sha[digest] = transcript
+        analyzers = {
+            "progress_analysis": ("progress_metrics", analyze_progress),
+            "workbuddy_trace": ("control_metrics", load_control_metrics),
+        }
+        for module in sorted(needs_reproduction):
+            metrics_key, recompute = analyzers[module]
+            count = 0
+            for task, row in tasks.items():
+                committed = (row or {}).get(metrics_key)
+                if not isinstance(committed, Mapping):
+                    raise LaunchError(
+                        f"instrument succession lacks committed {metrics_key} for {task}"
+                    )
+                source = committed.get("source") or {}
+                transcript_sha = str(source.get("transcript_sha256"))
+                observation_sha = str(source.get("observation_journal_sha256"))
+                transcript_path = by_sha.get(transcript_sha)
+                if transcript_path is None:
+                    raise LaunchError(
+                        f"instrument succession cannot locate baseline artifacts for {task}"
+                    )
+                observation_path = (
+                    transcript_path.parent / "metacodes-tool-observations.jsonl"
+                )
+                if (
+                    not observation_path.is_file()
+                    or hashlib.sha256(observation_path.read_bytes()).hexdigest()
+                    != observation_sha
+                ):
+                    raise LaunchError(
+                        f"instrument succession cannot bind baseline observations for {task}"
+                    )
+                recomputed = recompute(transcript_path, observation_path)
+                if json.dumps(recomputed, sort_keys=True) != json.dumps(
+                    committed, sort_keys=True
+                ):
+                    raise LaunchError(
+                        f"instrument succession changed baseline {metrics_key} for {task}"
+                    )
+                count += 1
+            reverified[module] = f"reproduced_byte_identical:{count}"
     return {
-        "covariate": "host_control_plane.progress_analysis",
-        "baseline_analyzer_sha256": baseline_sha256,
-        "treatment_analyzer_sha256": treatment_sha256,
-        "baseline_tasks_reverified_byte_identical": reverified,
+        "covariate": "host_control_plane",
+        "modules": {
+            module: {
+                "baseline_sha256": str((b_host.get(module) or {}).get("sha256")),
+                "treatment_sha256": str((t_host.get(module) or {}).get("sha256")),
+                "proof": reverified[module],
+            }
+            for module in sorted(inner)
+        },
     }
 
 
@@ -603,7 +668,7 @@ def build_report(
     ):
         if not accept_progress_analyzer_succession:
             raise LaunchError("paired WorkBuddy frozen covariates differ between arms")
-        instrument_succession = _verify_progress_analyzer_succession(
+        instrument_succession = _verify_instrument_succession(
             b_comparison, t_comparison, manifests, baseline_receipt_path
         )
 

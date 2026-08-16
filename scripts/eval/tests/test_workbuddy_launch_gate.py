@@ -2344,3 +2344,114 @@ class WorkBuddyEvidenceFreezerTest(unittest.TestCase):
             launch_gate.MAX_FAILURE_ARTIFACT_TOTAL_BYTES,
             4 * launch_gate.MAX_FAILURE_ARTIFACT_BYTES,
         )
+
+
+class WorkBuddyResumeAuditTest(WorkBuddyPaidLaunchGateL2Test):
+    """Faithful reenactment of the 88MB incident and its governed recovery.
+
+    A fully valid paid run fails only its post-run audit because the audit's
+    read bound is smaller than a legitimate artifact.  The money is spent and
+    the runner exited 0; after the instrument is fixed, resume-audit must
+    verify the failure receipt's evidence freeze byte-for-byte, re-run the
+    audit offline (no credential, no runner), and commit actual usage.
+    """
+
+    def test_resume_audit_commits_after_instrument_fix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest = self._manifest(root)
+            journal = root / "budget.json"
+            failure_receipt = root / "audit-failure.json"
+            committed_receipt = root / "receipt.json"
+            repo = Path(__file__).resolve().parents[3]
+            started_ns = time.time_ns()
+            with _Server(journal) as provider:
+                with mock.patch.object(launch_gate, "MAX_REQUEST_LOG_BYTES", 8):
+                    with self.assertRaisesRegex(
+                        LaunchError,
+                        "post-run evidence audit failed after runner exit 0",
+                    ):
+                        execute_launch(
+                            manifest_path=manifest,
+                            journal_path=journal,
+                            receipt_path=failure_receipt,
+                            credential_fd=self._credential_fd(),
+                            runner_argv=[
+                                sys.executable,
+                                "-c",
+                                self._runner_code(),
+                                str(repo),
+                                provider.url,
+                                str(root / "workbuddy"),
+                            ],
+                        )
+            failure = validate_authorized_failure_receipt(
+                failure_receipt, journal_path=journal
+            )
+            self.assertEqual(failure["failure_stage"], "post_run_evidence_audit")
+            self.assertEqual(failure["runner"]["returncode"], 0)
+            self.assertFalse(failure["retry_allowed"])
+
+            result = launch_gate.resume_post_run_audit(
+                manifest_path=manifest,
+                journal_path=journal,
+                failure_receipt_path=failure_receipt,
+                receipt_path=committed_receipt,
+                started_ns=started_ns,
+            )
+            self.assertEqual(result["budget_transaction"]["state"], "committed")
+            self.assertEqual(result["usage"]["cost_microusd"], 10_000)
+            self.assertEqual(result["usage"]["metered_tokens"], 240)
+            disclosure = result["resume_audit"]
+            self.assertGreater(disclosure["evidence_verified"], 0)
+            self.assertEqual(
+                disclosure["original_failure_stage"], "post_run_evidence_audit"
+            )
+            self.assertIn("launch_gate", disclosure["auditor"])
+            self.assertTrue(committed_receipt.is_file())
+            self.assertEqual(committed_receipt.stat().st_mode & 0o777, 0o600)
+
+    def test_resume_audit_rejects_drifted_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest = self._manifest(root)
+            journal = root / "budget.json"
+            failure_receipt = root / "audit-failure.json"
+            repo = Path(__file__).resolve().parents[3]
+            started_ns = time.time_ns()
+            with _Server(journal) as provider:
+                with mock.patch.object(launch_gate, "MAX_REQUEST_LOG_BYTES", 8):
+                    with self.assertRaisesRegex(LaunchError, "post-run evidence audit"):
+                        execute_launch(
+                            manifest_path=manifest,
+                            journal_path=journal,
+                            receipt_path=failure_receipt,
+                            credential_fd=self._credential_fd(),
+                            runner_argv=[
+                                sys.executable,
+                                "-c",
+                                self._runner_code(),
+                                str(repo),
+                                provider.url,
+                                str(root / "workbuddy"),
+                            ],
+                        )
+            failure = validate_authorized_failure_receipt(
+                failure_receipt, journal_path=journal
+            )
+            # Tamper with one frozen artifact: resumption must fail closed.
+            frozen = failure["failure_evidence"]["artifacts"]
+            target = root / "workbuddy" / frozen[0]["relative_path"]
+            target.write_bytes(target.read_bytes() + b"\n# tampered\n")
+            with self.assertRaisesRegex(
+                LaunchError, "evidence drifted since the failure freeze"
+            ):
+                launch_gate.resume_post_run_audit(
+                    manifest_path=manifest,
+                    journal_path=journal,
+                    failure_receipt_path=failure_receipt,
+                    receipt_path=root / "receipt.json",
+                    started_ns=started_ns,
+                )

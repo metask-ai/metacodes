@@ -636,27 +636,27 @@ class ProgressAnalyzerSuccessionTest(unittest.TestCase):
     def test_rejects_any_second_covariate_difference(self):
         from scripts.eval.workbuddy.paired_analysis import (
             LaunchError,
-            _verify_progress_analyzer_succession,
+            _verify_instrument_succession,
         )
 
         base = self._comparison("b" * 64)
         treatment = self._comparison("c" * 64)
         treatment["covariates"]["budget"] = {"total_cost_microusd": 2}
         with self.assertRaises(LaunchError):
-            _verify_progress_analyzer_succession(
+            _verify_instrument_succession(
                 base, treatment, {}, Path("/nonexistent")
             )
 
     def test_rejects_analyzer_that_did_not_measure_the_treatment(self):
         from scripts.eval.workbuddy.paired_analysis import (
             LaunchError,
-            _verify_progress_analyzer_succession,
+            _verify_instrument_succession,
         )
 
         base = self._comparison("b" * 64)
         treatment = self._comparison("c" * 64)
         with self.assertRaisesRegex(LaunchError, "measured the treatment"):
-            _verify_progress_analyzer_succession(
+            _verify_instrument_succession(
                 base, treatment, {}, Path("/nonexistent")
             )
 
@@ -706,11 +706,12 @@ class ProgressAnalyzerSuccessionTest(unittest.TestCase):
                 "workbuddy": {"checkout": str(root / "checkout")},
                 "job": {"slug": "job"},
             }}
-            record = pa._verify_progress_analyzer_succession(
+            record = pa._verify_instrument_succession(
                 base, treatment, manifests, receipt
             )
             self.assertEqual(
-                record["baseline_tasks_reverified_byte_identical"], 1
+                record["modules"]["progress_analysis"]["proof"],
+                "reproduced_byte_identical:1",
             )
             # Any drift in the committed metrics must reject.
             drifted = dict(committed)
@@ -719,8 +720,8 @@ class ProgressAnalyzerSuccessionTest(unittest.TestCase):
             receipt.write_text(json_mod.dumps({
                 "usage": {"tasks": {"task-a": {"progress_metrics": drifted}}}
             }))
-            with self.assertRaisesRegex(pa.LaunchError, "changed baseline measurement"):
-                pa._verify_progress_analyzer_succession(
+            with self.assertRaisesRegex(pa.LaunchError, "changed baseline progress_metrics"):
+                pa._verify_instrument_succession(
                     base, treatment, manifests, receipt
                 )
 

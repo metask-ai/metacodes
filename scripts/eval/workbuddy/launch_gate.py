@@ -2903,6 +2903,224 @@ def _persist_authorized_failure_receipt(
     )
 
 
+def resume_post_run_audit(
+    *,
+    manifest_path: Path,
+    journal_path: Path,
+    failure_receipt_path: Path,
+    receipt_path: Path,
+    started_ns: int,
+) -> Dict[str, Any]:
+    """Re-run the post-run evidence audit and commit an authorized failure.
+
+    Retry-forbidden protects against paid re-exposure: re-running the model.
+    It must not conflate that with re-reading artifacts.  When the runner
+    exited 0 and only the audit failed (an instrument defect), the artifacts
+    are intact, the money is spent, and refusing to account for it forever
+    would punish fixing the auditor.  Succession is earned, not declared:
+    every artifact the original failure receipt froze must still be
+    byte-identical, anything the audit reads beyond that freeze is hashed
+    and disclosed as late-frozen, and the committed receipt names the
+    instrument that produced it.  No provider credential exists here and the
+    runner is never invoked.
+    """
+
+    manifest = validate_launch_manifest(manifest_path)
+    failure = validate_authorized_failure_receipt(
+        failure_receipt_path, journal_path=journal_path
+    )
+    if (
+        failure.get("failure_stage") != "post_run_evidence_audit"
+        or (failure.get("runner") or {}).get("returncode") != 0
+        or failure.get("launch_manifest_content_sha256")
+        != manifest["content_sha256"]
+        or failure.get("run_id") != manifest["run_id"]
+        or failure.get("retry_allowed") is not False
+    ):
+        raise LaunchError(
+            "audit resumption requires a post-run-audit failure receipt with "
+            "runner exit 0 bound to this manifest"
+        )
+    try:
+        started_ns = int(started_ns)
+    except (TypeError, ValueError) as exc:
+        raise LaunchError("audit resumption start time is invalid") from exc
+    if started_ns <= 0 or started_ns > time.time_ns():
+        raise LaunchError("audit resumption start time is invalid")
+    # official_runner is an invocation property (runner_argv is None), not a
+    # manifest property; the failure receipt's identity scope records which
+    # mode actually ran.
+    identity_scope = failure["failure_evidence"].get("identity_scope")
+    if identity_scope == "official-run-id-and-task":
+        official_runner = True
+    elif identity_scope == "isolated-test-time":
+        official_runner = False
+    else:
+        raise LaunchError("audit resumption cannot determine the runner mode")
+    if official_runner:
+        _reobserve_launch_inputs(manifest)
+
+    # Continuity is verified directly against the receipt's frozen rows: the
+    # launcher's cleanup tears down live run state (instance manifests, proxy
+    # routes), so a resumption must never re-derive roots from that state —
+    # the freeze is the authority on what existed at failure time.
+    checkout = Path(manifest["workbuddy"]["checkout"]).resolve(strict=True)
+    frozen = {
+        str(row["relative_path"]): row
+        for row in failure["failure_evidence"]["artifacts"]
+    }
+    if not frozen:
+        raise LaunchError("audit resumption requires frozen failure evidence")
+    frozen_shas = set()
+    for relative, row in sorted(frozen.items()):
+        candidate = Path(relative)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise LaunchError(
+                f"audit resumption evidence path escapes checkout: {relative}"
+            )
+        try:
+            identity = _identity(
+                checkout / candidate, maximum=MAX_FAILURE_ARTIFACT_BYTES
+            )
+        except (LaunchError, OSError) as exc:
+            raise LaunchError(
+                f"audit resumption evidence drifted since the failure freeze: {relative}"
+            ) from exc
+        if (
+            identity["sha256"] != row["sha256"]
+            or identity["bytes"] != row["bytes"]
+        ):
+            raise LaunchError(
+                f"audit resumption evidence drifted since the failure freeze: {relative}"
+            )
+        frozen_shas.add(str(row["sha256"]))
+
+    usage = _collect_usage(
+        manifest, started_ns=started_ns, official_runner=official_runner
+    )
+
+    # Everything the audit consumed is identity-pinned inside usage; disclose
+    # what it read beyond the freeze (e.g. an artifact the old freezer's
+    # bounds silently dropped) instead of pretending the freeze was complete.
+    audited_shas: Dict[str, str] = {}
+    for task, row in sorted((usage.get("tasks") or {}).items()):
+        for key in (
+            "requests_sha256",
+            "trajectory_sha256",
+            "trial_result_sha256",
+        ):
+            value = row.get(key)
+            if isinstance(value, str):
+                audited_shas.setdefault(value, f"{task}:{key}")
+        source = ((row.get("control_metrics") or {}).get("source")) or {}
+        for key in ("transcript_sha256", "observation_journal_sha256"):
+            value = source.get(key)
+            if isinstance(value, str):
+                audited_shas.setdefault(value, f"{task}:{key}")
+    late_frozen = [
+        {"sha256": sha, "pinned_by": pin}
+        for sha, pin in sorted(audited_shas.items())
+        if sha not in frozen_shas
+    ]
+
+    failure_receipt_identity = _identity(failure_receipt_path)
+    auditor_identity = {
+        name: _identity(path.resolve(), maximum=16 * 1024 * 1024)["sha256"]
+        for name, path in sorted(HOST_CONTROL_PLANE_MODULES.items())
+    }
+
+    budget = manifest["budget"]
+    model = manifest["model"]
+    authority = BudgetAuthority(
+        manifest_sha256=manifest["content_sha256"],
+        model_fingerprint=model["fingerprint"],
+        provider_identity=model["provider_identity"],
+        total_cost_microusd=budget["total_cost_microusd"],
+        total_metered_tokens=budget["total_metered_tokens"],
+    )
+    receipt_parent, receipt_parent_fd = _open_private_artifact_parent(receipt_path)
+    try:
+        receipt_storage_path = receipt_parent / receipt_path.name
+        if _entry_exists(receipt_parent_fd, receipt_path.name) or _entry_exists(
+            receipt_parent_fd, receipt_path.name + ".tmp"
+        ):
+            raise LaunchError(
+                "paid launch receipt path is already occupied or incomplete"
+            )
+        with BudgetJournal(journal_path, authority) as journal:
+            matches = [
+                transaction
+                for transaction in journal.transaction_receipts()
+                if transaction["run_id"] == manifest["run_id"]
+                and transaction["manifest_sha256"] == manifest["content_sha256"]
+            ]
+            if (
+                len(matches) != 1
+                or matches[0]["state"] != "request_authorized"
+                or str(matches[0]["transaction_id"])
+                != str(failure["budget_transaction"]["transaction_id"])
+            ):
+                raise LaunchError(
+                    "audit resumption requires the exact authorized transaction "
+                    "from the failure receipt"
+                )
+            committed = journal.commit(
+                str(matches[0]["transaction_id"]),
+                actual_cost_microusd=usage["cost_microusd"],
+                actual_metered_tokens=usage["metered_tokens"],
+            )
+            snapshot = journal.snapshot()
+            receipt = {
+                "schema_version": (
+                    RECEIPT_SCHEMA_VERSION
+                    if manifest["schema_version"]
+                    in {PAIRED_SCHEMA_VERSION, SCHEMA_VERSION}
+                    else LEGACY_RECEIPT_SCHEMA_VERSION
+                ),
+                "quality_evidence": _receipt_quality_evidence(
+                    manifest, official_runner=official_runner
+                ),
+                "launch_manifest_content_sha256": manifest["content_sha256"],
+                "run_id": manifest["run_id"],
+                "cohort": manifest["cohort"],
+                "usage": usage,
+                "budget_transaction": committed,
+                "journal": {
+                    "journal_id": snapshot["journal_id"],
+                    "revision": snapshot["revision"],
+                    "head_sha256": snapshot["head_sha256"],
+                    "transaction_states": snapshot["transaction_states"],
+                },
+                "elapsed_seconds": (time.time_ns() - started_ns)
+                / 1_000_000_000,
+                "resume_audit": {
+                    "original_failure_receipt_sha256": failure_receipt_identity[
+                        "sha256"
+                    ],
+                    "original_failure_stage": "post_run_evidence_audit",
+                    "evidence_verified": len(frozen),
+                    "late_frozen": late_frozen,
+                    "auditor": auditor_identity,
+                },
+            }
+            if manifest["schema_version"] in {
+                PAIRED_SCHEMA_VERSION,
+                SCHEMA_VERSION,
+            }:
+                receipt["evaluation_treatment"] = manifest["evaluation_treatment"]
+                receipt["comparison"] = manifest["comparison"]
+            _write_private_new(
+                receipt_storage_path,
+                (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode(
+                    "utf-8"
+                ),
+                preopened_parent_fd=receipt_parent_fd,
+            )
+            return receipt
+    finally:
+        os.close(receipt_parent_fd)
+
+
 def recover_authorized_failure_receipt(
     *,
     manifest_path: Path,
@@ -3277,6 +3495,12 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--budget-journal", type=Path, required=True)
     run.add_argument("--receipt", type=Path, required=True)
     run.add_argument("--credential-fd", type=int, required=True)
+    resume_audit = subparsers.add_parser("resume-audit")
+    resume_audit.add_argument("--manifest", type=Path, required=True)
+    resume_audit.add_argument("--budget-journal", type=Path, required=True)
+    resume_audit.add_argument("--failure-receipt", type=Path, required=True)
+    resume_audit.add_argument("--receipt", type=Path, required=True)
+    resume_audit.add_argument("--started-ns", type=int, required=True)
     recover_failure = subparsers.add_parser("recover-failure-receipt")
     recover_failure.add_argument("--manifest", type=Path, required=True)
     recover_failure.add_argument("--budget-journal", type=Path, required=True)
@@ -3316,6 +3540,32 @@ def main(argv: list[str] | None = None) -> int:
                 (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode("utf-8"),
             )
             print(json.dumps(manifest["dry_run"], sort_keys=True))
+            return 0
+        if args.command == "resume-audit":
+            receipt = resume_post_run_audit(
+                manifest_path=args.manifest,
+                journal_path=args.budget_journal,
+                failure_receipt_path=args.failure_receipt,
+                receipt_path=args.receipt,
+                started_ns=args.started_ns,
+            )
+            print(
+                json.dumps(
+                    {
+                        "run_id": receipt["run_id"],
+                        "state": "committed",
+                        "resume_audit": {
+                            "evidence_verified": receipt["resume_audit"][
+                                "evidence_verified"
+                            ],
+                            "late_frozen": len(
+                                receipt["resume_audit"]["late_frozen"]
+                            ),
+                        },
+                    },
+                    sort_keys=True,
+                )
+            )
             return 0
         if args.command == "recover-failure-receipt":
             receipt = recover_authorized_failure_receipt(
