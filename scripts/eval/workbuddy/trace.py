@@ -1212,6 +1212,44 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                 formal["statically_pruned_rule_phases"] += item[
                     "statically_pruned_rule_count"
                 ]
+            elif observation_kind == "verification_final_gate":
+                # Terminal record of the session-end verification obligation:
+                # exactly one per run, schema-pinned, both arms carry it (the
+                # baseline in record-only observe mode). Surfaced so paired
+                # analysis can read the obligation outcome from the ATIF row.
+                if (
+                    observation.get("schema_version")
+                    != "metacodes-verification-final-gate-v1"
+                    or not isinstance(observation.get("enforced"), bool)
+                    or not isinstance(observation.get("obligation_met"), bool)
+                ):
+                    raise TraceError("verification final-gate record is invalid")
+                if formal.get("verification_final_gate_records"):
+                    raise TraceError("duplicate verification final-gate record")
+                nudges = observation.get("nudges")
+                if not isinstance(nudges, int) or isinstance(nudges, bool) or nudges < 0:
+                    raise TraceError("verification final-gate nudges are invalid")
+                # Integer counters only: the control-metrics contract validates
+                # every value in this namespace as a non-negative integer, and
+                # the keys appear only when the record exists so historical
+                # trajectories recompute unchanged.
+                formal["verification_final_gate_records"] = 1
+                formal["verification_gate_enforced"] = int(
+                    bool(observation.get("enforced"))
+                )
+                formal["verification_obligation_met"] = int(
+                    bool(observation.get("obligation_met"))
+                )
+                formal["verification_mutations_occurred"] = int(
+                    bool(observation.get("mutations_occurred"))
+                )
+                formal["verification_nudges"] = nudges
+            elif observation_kind in {"rule_coverage_gap", "rule_bounds_overflow"}:
+                # Diagnostic-only signals: no identity to cross-check here,
+                # but count them so silence stays distinguishable from absence.
+                formal[observation_kind + "_events"] = (
+                    formal.get(observation_kind + "_events", 0) + 1
+                )
             else:
                 raise TraceError("tool observation kind is unsupported")
     if run_started != 1 or run_finished != 1:
