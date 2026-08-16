@@ -36,6 +36,7 @@ fn toolSse(allocator: std.mem.Allocator, id: []const u8, name: []const u8, input
 
 const GateRecordSink = struct {
     records: usize = 0,
+    enforced: bool = false,
     mutations_occurred: bool = false,
     obligation_met: bool = false,
     nudges: u8 = 255,
@@ -45,6 +46,7 @@ const GateRecordSink = struct {
         switch (event) {
             .verification_final_gate => |record| {
                 self.records += 1;
+                self.enforced = record.enforced;
                 self.mutations_occurred = record.mutations_occurred;
                 self.obligation_met = record.obligation_met;
                 self.nudges = record.nudges;
@@ -175,6 +177,7 @@ test "L2 unverified mutation nudges once and a green run then satisfies the obli
     try std.testing.expectEqual(@as(usize, 4), run.requests);
     try std.testing.expect(run.nudge_request != null);
     try std.testing.expectEqual(@as(usize, 1), run.record.records);
+    try std.testing.expect(run.record.enforced);
     try std.testing.expect(run.record.mutations_occurred);
     try std.testing.expect(run.record.obligation_met);
     try std.testing.expectEqual(@as(u8, 1), run.record.nudges);
@@ -286,8 +289,9 @@ test "L2 observe-only records the outcome and never touches the conversation" {
             std.mem.indexOf(u8, request.body(), "[verification obligation]") == null,
         );
     }
-    // But the outcome was recorded honestly.
+    // But the outcome was recorded honestly, witnessed as not enforced.
     try std.testing.expectEqual(@as(usize, 1), record.records);
+    try std.testing.expect(!record.enforced);
     try std.testing.expect(record.mutations_occurred);
     try std.testing.expect(!record.obligation_met);
     try std.testing.expectEqual(@as(u8, 0), record.nudges);

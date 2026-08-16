@@ -294,9 +294,9 @@
     "scripts/eval/project_harness_experiment.py": "176b2896adfbd76606a7f1aa140fe1f4540fdd3dcd369636daf98269761cc5ab",
     "scripts/eval/project_harness_rule_impact_prospective.py": "ce160017a91696e56ed46af663d546f63a9c93401919857bee8c5afffd594094",
     "scripts/eval/run_project_rule_evolution_mac_pilot.py": "cc824f751529603f8995c7f11351179531c9745ec5bd69b11efb255bebd51f03",
-    "scripts/eval/tinykg_lean_factorial.py": "568a9129992ed7d486fe580bf6d5625121b37d9866fd53f39a91614cb9fc76e9",
+    "scripts/eval/tinykg_lean_factorial.py": "22053bb1623169be905a45bfff8180a126be50ede9ae53cc17e188732ddbcfa7",
     "scripts/eval/tinykg_lean_factorial_block.py": "ed5b6546c8f98f5bbc69c1b715b4ebe4b7a611d3eb4a9ae60abc8f424e0d6043",
-    "scripts/eval/tinykg_lean_factorial_executor.py": "17d2dad913d506e9e2e56870ec9bc37a83b7fd21217f568a4316a0955703642a",
+    "scripts/eval/tinykg_lean_factorial_executor.py": "a3ad9957bdd63ee2e5c639369dbf39ba2594b1126cf69733e219c57eb8a5d71d",
     "scripts/project_harness_eval_driver.zig": "99ac435b90ebef1a69aa89ff9fbf3e6ba07708cb9829212a2612962eba2d483c"
   },
   "known_gaps": [

@@ -213,6 +213,10 @@ pub const Event = union(enum) {
     /// nudges is the measurable "declared done without verifying" outcome.
     verification_final_gate: struct {
         schema_version: []const u8 = VERIFICATION_FINAL_GATE_SCHEMA_VERSION,
+        /// True when the obligation was enforced (nudges possible); false in
+        /// record-only observe mode. This is the treatment-actuation witness:
+        /// an evaluation arm claiming enforcement must show it here.
+        enforced: bool,
         mutations_occurred: bool,
         obligation_met: bool,
         nudges: u8,

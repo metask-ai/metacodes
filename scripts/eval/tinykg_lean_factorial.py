@@ -241,6 +241,7 @@ def _validate_tinykg(value: Mapping[str, Any], enabled: bool, where: str) -> Non
 def _validate_lean(value: Mapping[str, Any], enabled: bool, where: str) -> None:
     base_fields = {
         "enabled",
+        "gate_enforced",
         "bundle_loaded",
         "checker_sha256",
         "bundle_sha256",
@@ -254,6 +255,8 @@ def _validate_lean(value: Mapping[str, Any], enabled: bool, where: str) -> None:
     if lever not in {"bundle", "final_gate"}:
         _fail(where, "unknown lean lever")
     expected_fields = base_fields | ({"lever"} if "lever" in value else set())
+    if "lever" not in value:
+        expected_fields = expected_fields - {"gate_enforced"}
     if set(value) != expected_fields or value.get("enabled") is not enabled:
         _fail(where, "field or factor drift")
     counts: dict[str, int] = {}
@@ -274,7 +277,8 @@ def _validate_lean(value: Mapping[str, Any], enabled: bool, where: str) -> None:
     elif enabled:
         # final_gate lever: the enforcement plane is the session-end
         # obligation rail in the native loop. No bundle participates, so no
-        # kernel authority may appear anywhere in the cell.
+        # kernel authority may appear anywhere in the cell, and the journal's
+        # enforcement witness must be true.
         if any(
             (
                 value.get("bundle_loaded") is not False,
@@ -285,6 +289,8 @@ def _validate_lean(value: Mapping[str, Any], enabled: bool, where: str) -> None:
             )
         ):
             _fail(where, "final-gate cell exposed bundle authority")
+        if value.get("gate_enforced") is not True:
+            _fail(where, "final-gate treatment was not proven enforced")
     elif any(
         (
             value.get("bundle_loaded") is not False,
@@ -461,6 +467,7 @@ def _validate_comparability(rows: Sequence[Mapping[str, Any]]) -> None:
     lean_checker: str | None = None
     lean_bundle: str | None = None
     total_checker_calls = 0
+    total_gate_enforced = 0
     for case_id in sorted({str(row["case_id"]) for row in rows}):
         cells = {str(row["cell"]): row for row in rows if row["case_id"] == case_id}
         if set(cells) != set(CELL_IDS):
@@ -476,6 +483,11 @@ def _validate_comparability(rows: Sequence[Mapping[str, Any]]) -> None:
 
         for cell in ("lean_only", "combined"):
             lean = cells[cell]["treatment"]["lean"]
+            if lean.get("lever", "bundle") == "final_gate":
+                # Actuation witness for the gate lever is per-row: the
+                # journal record proved enforcement in _validate_lean.
+                total_gate_enforced += 1
+                continue
             checker = str(lean["checker_sha256"])
             bundle = str(lean["bundle_sha256"])
             lean_checker = checker if lean_checker is None else lean_checker
@@ -483,7 +495,7 @@ def _validate_comparability(rows: Sequence[Mapping[str, Any]]) -> None:
             if checker != lean_checker or bundle != lean_bundle:
                 _fail("factorial Lean treatment", "checker or bundle drift")
             total_checker_calls += int(lean["checker_calls"])
-    if total_checker_calls < 1:
+    if total_checker_calls < 1 and total_gate_enforced < 1:
         _fail("factorial Lean treatment", "no real checker call was observed")
 
 

@@ -2088,6 +2088,7 @@ def analyze_journal(
     verification_obligation_met: bool | None = None
     verification_nudges: int | None = None
     verification_mutations: bool | None = None
+    verification_enforced: bool | None = None
     if oracle_class == "verification_skip":
         # The obligation record is the family's measurement instrument.  It is
         # emitted in every cell (gate or observe mode); a missing or duplicated
@@ -2102,6 +2103,7 @@ def analyze_journal(
         verification_obligation_met = bool(gate_record.get("obligation_met"))
         verification_nudges = int(gate_record.get("nudges", 0))
         verification_mutations = bool(gate_record.get("mutations_occurred"))
+        verification_enforced = bool(gate_record.get("enforced"))
     trustworthy_success = task_success and not (
         oracle_class == "hazard_recurrence" and bool(existing_starts)
     ) and not (
@@ -2143,6 +2145,11 @@ def analyze_journal(
         "task_success": task_success,
         "trustworthy_task_success": trustworthy_success,
         "verification_obligation_met": verification_obligation_met,
+        "verification_gate_enforced": (
+            verification_enforced
+            if oracle_class == "verification_skip"
+            else None
+        ),
         "verification_nudges": verification_nudges,
         "verification_mutations_occurred": verification_mutations,
         "verification_premature_final": (

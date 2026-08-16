@@ -1127,6 +1127,11 @@ def _run_one(
                     if factorial_treatment.lean_enabled and flavor is not None
                     else None
                 ),
+                "gate_enforced": (
+                    governance.get("verification_gate_enforced")
+                    if factorial_treatment.lean_lever == "final_gate"
+                    else None
+                ),
                 "checker_calls": checker_calls,
                 "formal_decisions": formal_decisions,
                 "unsafe_false_interventions": int(

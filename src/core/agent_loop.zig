@@ -585,6 +585,7 @@ pub fn run(
     defer if (opts.verification_final_gate or opts.verification_final_observe) {
         if (opts.tool_observer) |observer| {
             _ = observer.emit(.{ .verification_final_gate = .{
+                .enforced = opts.verification_final_gate,
                 .mutations_occurred = verification_progress.mutation_seen,
                 .obligation_met = !verification_progress.unverified_mutation,
                 .nudges = verification_nudges,

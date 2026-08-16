@@ -633,6 +633,7 @@ def build_projection(
                 for key in (
                     "enabled",
                     "lever",
+                    "gate_enforced",
                     "bundle_loaded",
                     "checker_sha256",
                     "bundle_sha256",
