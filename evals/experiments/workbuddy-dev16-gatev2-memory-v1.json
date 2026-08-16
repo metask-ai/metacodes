@@ -1,0 +1,38 @@
+{
+  "schema_version": "metacodes-experiment-protocol-v1",
+  "protocol_id": "workbuddy-dev16-gatev2-memory-v1",
+  "preregistered": "2026-08-17 before any gate-v2 or memory-accumulation paired arm ran",
+  "context": "Follow-up to the verification_final_gate pair (report 85d583cc: mean +0.068, pairs 6up/2down/8tied, p~0.29). Failure-class analysis (KG 12240) found the sensor's verification grammar was a strict subset of real verification behavior, plus a churn regression class. Sensor v2 (tier-2 validating re-observation, known-failing nudge variant, one-shot churn caution) and arm-level store continuity are the two treatments under test.",
+  "studies": [
+    {
+      "study": "verification_final_gate",
+      "name": "gate-v2",
+      "treatment_definition": "Session-end verification obligation with the v2 tiered sensor: tier-1 canonical test runners or tier-2 validating re-observation satisfy the obligation; at most 2 nudges (known-failing variant when a failed attempt was observed); one-shot churn caution when a mutation lands on a verified state. Baseline runs record-only observe mode with the SAME v2 sensor for measurement symmetry.",
+      "arms": {"baseline": "observe", "treatment": "enforced"},
+      "cohort": "code/dev16 frozen task list (same 16 tasks as report 85d583cc)",
+      "primary_metric": "paired verifier_reward delta per task; sign test over non-tied pairs; full-pass count delta",
+      "secondary": ["tier1/tier2 verification counts per arm", "obligation_met under the v2 sensor", "reopened_after_verification (churn shadow distribution)", "nudges spent", "cost/tokens deltas"],
+      "predictions": [
+        "obligation_met rises in BOTH arms versus the v1 sensor run (sensor recognition, not behavior change): v1 measured 4/16 per arm",
+        "nudges per treatment task fall versus v1 (nudges stop where tier-2 verification already happened; v1 spent 26)",
+        "churn regressions shrink or persist as measurable reopened counts; the caution is one-shot and task-agnostic"
+      ]
+    },
+    {
+      "study": "memory_accumulation",
+      "name": "memory-v1",
+      "treatment_definition": "Arm-level TinyKG store continuity: the local store starts EMPTY at the arm's first task and persists across the serial arm via a hash-chained export/import ledger. Baseline keeps the per-trial fresh store. Every verification treatment (checkpoint/gate/observe) is OFF in both arms.",
+      "arms": {"baseline": "fresh store per trial", "treatment": "accumulating store"},
+      "cohort": "code/dev16 frozen task list, fixed task order (alphabetical, serial n_concurrent=1)",
+      "primary_metric": "paired verifier_reward delta per task; sign test; full-pass delta",
+      "secondary": ["KgRecall/KgRemember/KgContext usage counts per arm", "store size growth across the arm (ledger bytes)", "position effects: deltas for early vs late tasks (memory can only help tasks after knowledge exists)"],
+      "predictions": [
+        "if memory transfers, gains concentrate in later tasks and environment-understanding classes; a null or negative result (interference) is a legitimate finding and will be reported as such"
+      ]
+    }
+  ],
+  "anti_contamination": "Per the standing red line (KG 12205): both treatments are task-agnostic process machinery; no rule, memory seed, prompt, or sensor pattern encodes WorkBuddy task content. The accumulating store starts empty (runtime contract witnesses store_import_sha256=null at the arm's first task) so all transferred knowledge originates inside the evaluated run. dev16 remains the only iteration surface; promo/sealed cohorts stay unread.",
+  "claim_boundary": "One model sample per arm per study on the frozen dev16 cohort: directional evidence only, no causal effect-size claims. Cross-roll variance observed between attempt-6 and attempt-7 baselines (0.767 vs 0.679) is of the same magnitude as treatment effects; any promotion decision requires more rolls or the promotion cohort.",
+  "budget": "~$25 cap per arm, 4 arms (~$45 expected actual), inside the standing $2000 authorization",
+  "instruments": "binary 91d38da5 (sensor v2, commit c2f0a61 lineage), overlay 893d1cb1, preflight ctx 46b6b29b; auditors: trace with v1/v2 gate-record roster; gate state machine proven in Lean (VerificationGate.lean, axiom audit propext-only)"
+}
