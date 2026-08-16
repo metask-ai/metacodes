@@ -115,7 +115,83 @@ pub fn isVerificationCommand(allocator: std.mem.Allocator, command: []const u8) 
     return verificationEvidence(allocator, command) != null;
 }
 
+/// A `;`-joined command can never prove anything through its shell exit code
+/// (a failed test followed by `echo` exits 0), but the ubiquitous agent idiom
+/// `./pytest; echo "exit=$?"` still carries unlaunderable evidence: the pytest
+/// summary text. Accept a semicolon chain only when the head is a pytest-kind
+/// command and every trailing segment is pure display (echo/printf/cat/true,
+/// no redirects, pipes or control operators), and downgrade the evidence to
+/// the summary text, never the exit code.
+fn semicolonDisplayChainEvidence(
+    allocator: std.mem.Allocator,
+    command: []const u8,
+) ?Evidence {
+    var segments = std.ArrayList([]const u8).empty;
+    defer segments.deinit(allocator);
+    var in_single = false;
+    var in_double = false;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < command.len) : (i += 1) {
+        const c = command[i];
+        if (c == '\\' and !in_single and i + 1 < command.len) {
+            i += 1;
+            continue;
+        }
+        if (c == '\'' and !in_double) in_single = !in_single;
+        if (c == '"' and !in_single) in_double = !in_double;
+        if (c == ';' and !in_single and !in_double) {
+            segments.append(allocator, command[start..i]) catch return null;
+            start = i + 1;
+        }
+    }
+    if (in_single or in_double) return null;
+    segments.append(allocator, command[start..]) catch return null;
+    var effective: usize = 0;
+    for (segments.items) |raw| {
+        if (std.mem.trim(u8, raw, " \t\r").len != 0) effective += 1;
+    }
+    if (effective < 2) return null;
+    var head: ?[]const u8 = null;
+    for (segments.items) |raw| {
+        const segment = std.mem.trim(u8, raw, " \t\r");
+        if (segment.len == 0) continue;
+        if (head == null) {
+            head = segment;
+            continue;
+        }
+        if (!displayOnlySegment(segment)) return null;
+    }
+    const head_command = head orelse return null;
+    _ = verificationEvidence(allocator, head_command) orelse return null;
+    if (!headIsPytest(allocator, head_command)) return null;
+    return .pytest_summary;
+}
+
+fn displayOnlySegment(segment: []const u8) bool {
+    if (std.mem.indexOfAny(u8, segment, "><|&`") != null) return false;
+    var tokens = std.mem.tokenizeAny(u8, segment, " \t\r");
+    const first = basename(tokens.next() orelse return false);
+    return std.mem.eql(u8, first, "echo") or std.mem.eql(u8, first, "printf") or
+        std.mem.eql(u8, first, "cat") or std.mem.eql(u8, first, "true");
+}
+
+fn headIsPytest(allocator: std.mem.Allocator, head: []const u8) bool {
+    const pipeline = stripDisplayPipeline(head) orelse return false;
+    if (!onlyAndConjunctions(pipeline.command)) return false;
+    const segments = splitAndConjunctions(allocator, pipeline.command) catch return false;
+    defer allocator.free(segments);
+    for (segments) |raw| {
+        const segment = bash_parser.stripWrappers(raw);
+        if (testKind(segment)) |kind| {
+            if (kind == .pytest) return true;
+        }
+    }
+    return false;
+}
+
 fn verificationEvidence(allocator: std.mem.Allocator, command: []const u8) ?Evidence {
+    if (semicolonDisplayChainEvidence(allocator, command)) |evidence| return evidence;
     const pipeline = stripDisplayPipeline(command) orelse return null;
     if (!onlyAndConjunctions(pipeline.command)) return null;
     // The general permission parser deliberately treats every `&` as a shell
@@ -337,6 +413,24 @@ fn testKind(segment: []const u8) ?TestKind {
     if (std.mem.eql(u8, first, "make"))
         return if (std.mem.startsWith(u8, tokens.next() orelse return null, "test")) .other else null;
     return null;
+}
+
+test "semicolon display chains carry pytest summary evidence only" {
+    const a = std.testing.allocator;
+    // The ubiquitous agent idiom: run the test, then echo the exit code.
+    try std.testing.expect(isVerificationCommand(a, "./pytest; echo \"exit=$?\""));
+    try std.testing.expect(isVerificationCommand(
+        a,
+        "./pytest; echo \"exit=$?\"; cat result.txt",
+    ));
+    // A non-display suffix could do work after a failed test; reject.
+    try std.testing.expect(!isVerificationCommand(a, "./pytest; rm -rf junk"));
+    // Redirects inside the suffix write state; reject.
+    try std.testing.expect(!isVerificationCommand(a, "./pytest; cat > out.txt"));
+    // A non-test head gains nothing from a display suffix.
+    try std.testing.expect(!isVerificationCommand(a, "ls; echo ok"));
+    // Non-pytest kinds have no summary text to fall back on; reject.
+    try std.testing.expect(!isVerificationCommand(a, "make test; echo done"));
 }
 
 test "verification classifier accepts bounded test forms and rejects ambiguous shell status" {
