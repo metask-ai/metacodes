@@ -566,7 +566,10 @@ def _tool_control_metrics(messages: Iterable[Mapping[str, Any]]) -> Dict[str, An
                     raise TraceError("control metrics found an invalid or duplicate tool call id")
                 if not isinstance(name, str) or not name:
                     raise TraceError("control metrics found a tool call without a name")
-                calls[call_id] = {"name": name, "input": block.get("input")}
+                # Transcript stores tool_use input as the raw JSON string; normalize
+                # through the same parser the trajectory path uses so coverage checks
+                # see the declared arguments, not their serialization.
+                calls[call_id] = {"name": name, "input": _tool_arguments(block.get("input"))}
             elif kind == "tool_result":
                 call_id = block.get("tool_use_id")
                 if not isinstance(call_id, str) or not call_id or call_id in results:

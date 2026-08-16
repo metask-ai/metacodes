@@ -807,6 +807,73 @@ class WorkBuddyTraceTest(unittest.TestCase):
         self.assertEqual(tinykg["task_tinykg_status_results"], 4)
         self.assertEqual(tinykg["task_terminal_commits"], 1)
 
+    def test_control_metrics_accept_serialized_tool_use_input(self):
+        # The metacodes transcript stores tool_use input as the raw JSON string;
+        # batch coverage checks must see the parsed arguments, not the encoding.
+        payload = {
+            "count": 0,
+            "hits": [],
+            "lexical_query_plan": {
+                "schema_version": "lexical-query-plan-v3",
+                "plan_sha256": "5" * 64,
+                "intent": "task_recovery",
+                "stage": "seed",
+                "variant_count": 1,
+                "seen_state_verified": True,
+                "ledger_scope": "agent_run_batch",
+                "execution": "host_batch_all",
+                "all_variants_executed": True,
+                "executed_variant_count": 1,
+                "merged_hit_count": 0,
+                "merged_new_hit_count": 0,
+                "merged_previously_seen_count": 0,
+                "probe_new_hit_count": 0,
+                "probe_repeated_hit_count": 0,
+                "variant_receipts": [{
+                    "variant_index": 0,
+                    "variant_kind": "exact",
+                    "node_ids": [],
+                    "new_hit_count": 0,
+                    "repeated_hit_count": 0,
+                }],
+            },
+        }
+        tool_input = {
+            "query": "header passthrough",
+            "lexical_plan": {
+                "schema_version": "lexical-query-plan-v3",
+                "intent": "task_recovery",
+                "stage": "seed",
+                "variants": [{"kind": "exact", "text": "header passthrough"}],
+            },
+        }
+        transcript_rows = [
+            {"role": "assistant", "blocks": [{
+                "type": "tool_use",
+                "id": "recall-serialized",
+                "name": "KgRecall",
+                "input": json.dumps(tool_input),
+            }]},
+            {"role": "user", "blocks": [{
+                "type": "tool_result",
+                "tool_use_id": "recall-serialized",
+                "content": json.dumps(payload),
+                "is_error": False,
+            }]},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(transcript, transcript_rows)
+            self._write_jsonl(observation, self._journal())
+            metrics = load_control_metrics(transcript, observation)
+        tinykg = metrics["tinykg"]
+        self.assertEqual(tinykg["recall_calls"], 1)
+        self.assertEqual(tinykg["recall_succeeded"], 1)
+        self.assertEqual(tinykg["recall_miss_calls"], 1)
+        self.assertEqual(tinykg["recall_governed_calls"], 1)
+
     def test_control_metrics_count_bound_auto_context_as_real_observation(self):
         tool_input = {
             "query": "commencement attendance",
