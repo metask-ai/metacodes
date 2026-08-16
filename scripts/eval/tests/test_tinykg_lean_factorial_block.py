@@ -116,18 +116,53 @@ class TinyKgLeanFactorialBlockTest(unittest.TestCase):
         }
 
     def test_procedural_seed_is_fixed_and_does_not_leak_scored_cases(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="factorial-block-seed-") as temporary:
-            payload, query = executor._block_seed(workspace=Path(temporary))
-        self.assertEqual(executor.PROCEDURAL_MEMORY_QUERY, query)
-        self.assertIn(b"source-CAS", payload)
-        for forbidden in (
+        forbidden = (
             *executor.BLOCK_CASE_IDS,
+            *executor.HELDOUT_CASE_IDS,
             ".archive.env",
             "nodes.json",
             "lifecycle.yaml",
             "proxy.conf",
-        ):
-            self.assertNotIn(forbidden.encode(), payload)
+            "queue.ini",
+            "CHANGELOG.adoc",
+            "attestation.cue",
+            "package.stamp.json",
+        )
+        with tempfile.TemporaryDirectory(prefix="factorial-block-seed-") as temporary:
+            payload, query = executor._block_seed(
+                workspace=Path(temporary), forbidden=forbidden
+            )
+        self.assertEqual(executor.PROCEDURAL_MEMORY_QUERY, query)
+        self.assertIn(b"source-CAS", payload)
+        for value in forbidden:
+            self.assertNotIn(value.encode(), payload)
+
+    def test_procedural_seed_leak_check_fails_closed(self) -> None:
+        # The guard must actually reject: a token that is present in the seed
+        # has to fail, otherwise the no-leak assertion above proves nothing.
+        with tempfile.TemporaryDirectory(prefix="factorial-block-leak-") as temporary:
+            with self.assertRaisesRegex(
+                executor.ValidationError, "leaks scored case identity"
+            ):
+                executor._block_seed(
+                    workspace=Path(temporary), forbidden=("source-CAS",)
+                )
+
+    def test_heldout_cohort_is_the_complete_non_calibration_partition(self) -> None:
+        self.assertEqual(8, len(executor.HELDOUT_CASE_IDS))
+        self.assertEqual(
+            len(set(executor.HELDOUT_CASE_IDS)), len(executor.HELDOUT_CASE_IDS)
+        )
+        self.assertFalse(
+            set(executor.HELDOUT_CASE_IDS) & set(executor.BLOCK_CASE_IDS),
+            "held-out cases must never overlap the calibration block",
+        )
+        frozen = json.loads(
+            (executor.HELDOUT_CASES_RELATIVE).read_text()
+            if executor.HELDOUT_CASES_RELATIVE.is_absolute()
+            else (Path(__file__).resolve().parents[3] / executor.HELDOUT_CASES_RELATIVE).read_text()
+        )
+        self.assertEqual(list(executor.HELDOUT_CASE_IDS), frozen)
 
     def test_preflight_probe_rejects_incompatible_tinykg_format(self) -> None:
         for version, should_pass in (("3", True), ("2", False)):

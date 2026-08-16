@@ -36,6 +36,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--auth-file", type=Path, default=Path.home() / ".metacodes/auth.json"
     )
+    parser.add_argument(
+        "--cohort",
+        choices=("block", "heldout"),
+        default="block",
+        help="frozen case cohort: the 4-case calibration block or the 8-case held-out set",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--allow-paid-rollouts", action="store_true")
@@ -52,6 +58,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "run_dir": args.run_dir,
         "budget_path": args.budget_journal,
         "resume": args.resume,
+        "cohort": args.cohort,
     }
     if args.dry_run:
         result = preflight_block(**common)

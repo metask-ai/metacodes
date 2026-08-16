@@ -1,0 +1,10 @@
+[
+  "create_package_stamp_json_v4",
+  "create_rotation_note_v4",
+  "synthesize_attestation_cue_v4",
+  "synthesize_commit_policy_lua_v4",
+  "synthesize_partition_plan_ron_v4",
+  "synthesize_restore_table_tsv_v4",
+  "targeted_changelog_marker_edit_v4",
+  "targeted_queue_depth_edit_v4"
+]

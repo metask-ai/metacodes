@@ -90,6 +90,34 @@ BLOCK_CASE_IDS = (
     "regenerate_lifecycle_yaml_v4",
     "rewrite_proxy_conf_v4",
 )
+HELDOUT_CASES_RELATIVE = Path(
+    "evals/experiments/tinykg-lean-factorial-heldout-v1-cases.json"
+)
+# The protocol pre-registers `heldout_cases: 8`.  The held-out cohort is
+# therefore every frozen manifest case outside the calibration block: running
+# all of them removes case-selection discretion entirely, so a harness change
+# tuned on the calibration cases cannot be validated on a hand-picked subset.
+HELDOUT_CASE_IDS = (
+    "create_package_stamp_json_v4",
+    "create_rotation_note_v4",
+    "synthesize_attestation_cue_v4",
+    "synthesize_commit_policy_lua_v4",
+    "synthesize_partition_plan_ron_v4",
+    "synthesize_restore_table_tsv_v4",
+    "targeted_changelog_marker_edit_v4",
+    "targeted_queue_depth_edit_v4",
+)
+COHORTS = {
+    "block": (BLOCK_CASE_IDS, BLOCK_CASES_RELATIVE),
+    "heldout": (HELDOUT_CASE_IDS, HELDOUT_CASES_RELATIVE),
+}
+
+
+def _cohort_spec(cohort: str) -> tuple[tuple[str, ...], Path]:
+    spec = COHORTS.get(cohort)
+    if spec is None:
+        _fail("factorial cohort", f"unknown cohort {cohort!r}")
+    return spec
 PROCEDURAL_MEMORY_QUERY = (
     "existing file inspect read replace regenerate canonical exact preserve verify"
 )
@@ -736,7 +764,7 @@ def _calibration_seed(
     return payload, query
 
 
-def _block_seed(*, workspace: Path) -> tuple[bytes, str]:
+def _block_seed(*, workspace: Path, forbidden: Sequence[str]) -> tuple[bytes, str]:
     """Freeze a reusable, answer-free procedural treatment.
 
     The lesson deliberately contains no case id, filename, opaque value, or
@@ -762,7 +790,6 @@ def _block_seed(*, workspace: Path) -> tuple[bytes, str]:
         {"op": "edge", "id": 1, "src": 1, "rel": "contain", "dst": 2},
     )
     payload = ("\n".join(stable_json(row) for row in rows) + "\n").encode("utf-8")
-    forbidden = (*BLOCK_CASE_IDS, ".archive.env", "nodes.json", "lifecycle.yaml", "proxy.conf")
     if any(value.encode("utf-8") in payload for value in forbidden):
         _fail("factorial block memory", "procedural seed leaks scored case identity")
     return payload, PROCEDURAL_MEMORY_QUERY
@@ -1337,14 +1364,16 @@ def _prepare_block(
     run_dir: Path,
     budget_path: Path,
     resume: bool,
+    cohort: str = "block",
 ) -> BlockContext:
     # Reuse the already-audited filesystem, executable, manifest, budget, and
     # private-path boundary.  The scored block then replaces only the case
     # cohort, schedule, seed, and evidence identity.
+    case_ids, cases_relative = _cohort_spec(cohort)
     base = _prepare_calibration(
         repo=repo,
         manifest_path=manifest_path,
-        case_id=BLOCK_CASE_IDS[0],
+        case_id=case_ids[0],
         tinykg_binary=tinykg_binary,
         ripgrep=ripgrep,
         run_dir=run_dir,
@@ -1353,7 +1382,7 @@ def _prepare_block(
     )
     protocol_path = base.repo / ATTRIBUTION_PROTOCOL_RELATIVE
     validate_protocol(load_protocol(protocol_path), base.repo)
-    cases_path = base.repo / BLOCK_CASES_RELATIVE
+    cases_path = base.repo / cases_relative
     cases_payload = _read_regular(
         cases_path,
         root=base.repo,
@@ -1365,16 +1394,16 @@ def _prepare_block(
         _fail("factorial block case cohort", f"invalid JSON: {exc}")
     if (
         not isinstance(raw_case_ids, list)
-        or tuple(raw_case_ids) != BLOCK_CASE_IDS
+        or tuple(raw_case_ids) != case_ids
         or len(set(raw_case_ids)) != len(raw_case_ids)
     ):
-        _fail("factorial block case cohort", "frozen four-case identity drift")
+        _fail("factorial block case cohort", "frozen case cohort identity drift")
     available = {
         str(case.get("id"))
         for case in base.manifest["cases"]
         if isinstance(case, Mapping)
     }
-    if any(case_id not in available for case_id in BLOCK_CASE_IDS):
+    if any(case_id not in available for case_id in case_ids):
         _fail("factorial block case cohort", "case is outside the frozen manifest")
     if not resume and (
         base.budget_path.exists()
@@ -1386,11 +1415,25 @@ def _prepare_block(
         binary=base.tinykg_binary,
         binary_sha256=base.tinykg_sha256,
     )
-    schedules = tuple(balanced_factorial_schedule(BLOCK_CASE_IDS))
-    seed_batch, recall_query = _block_seed(workspace=base.workspace)
+    schedules = tuple(balanced_factorial_schedule(case_ids))
+    forbidden: list[str] = list(case_ids)
+    for case in base.manifest["cases"]:
+        if not isinstance(case, Mapping) or str(case.get("id")) not in case_ids:
+            continue
+        initial = case.get("initial_files")
+        if isinstance(initial, Mapping):
+            forbidden.extend(str(name) for name in initial)
+        grader = case.get("grader")
+        expected = grader.get("expected_files") if isinstance(grader, Mapping) else None
+        if isinstance(expected, Mapping):
+            forbidden.extend(str(name) for name in expected)
+    seed_batch, recall_query = _block_seed(
+        workspace=base.workspace,
+        forbidden=tuple(sorted(set(forbidden))),
+    )
     identity = _block_identity(
         manifest=base.manifest,
-        case_ids=BLOCK_CASE_IDS,
+        case_ids=case_ids,
         schedules=schedules,
         tinykg_sha256=base.tinykg_sha256,
         tinykg_contract=tinykg_contract,
@@ -1404,7 +1447,7 @@ def _prepare_block(
         repo=base.repo,
         manifest=base.manifest,
         templates=base.templates,
-        case_ids=BLOCK_CASE_IDS,
+        case_ids=case_ids,
         root=base.root,
         workspace=base.workspace,
         run_dir=base.run_dir,
@@ -1460,6 +1503,7 @@ def preflight_block(
     run_dir: Path,
     budget_path: Path,
     resume: bool,
+    cohort: str = "block",
 ) -> Mapping[str, Any]:
     context = _prepare_block(
         repo=repo,
@@ -1469,6 +1513,7 @@ def preflight_block(
         run_dir=run_dir,
         budget_path=budget_path,
         resume=resume,
+        cohort=cohort,
     )
     completed = 0
     if resume:
@@ -1741,6 +1786,7 @@ def run_block(
     budget_path: Path,
     auth_file: Path,
     resume: bool,
+    cohort: str = "block",
 ) -> Mapping[str, Any]:
     context = _prepare_block(
         repo=repo,
@@ -1750,6 +1796,7 @@ def run_block(
         run_dir=run_dir,
         budget_path=budget_path,
         resume=resume,
+        cohort=cohort,
     )
     if not resume:
         context.run_dir.mkdir(mode=0o700)
