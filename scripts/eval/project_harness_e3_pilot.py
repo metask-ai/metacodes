@@ -973,7 +973,9 @@ def _run_one(
     if not requests:
         raise E3Error("E3 provider cassette is empty")
     allowed_tools = (
-        FACTORIAL_ALLOWED_TOOLS
+        tuple(allowed_tools_override)
+        if allowed_tools_override is not None
+        else FACTORIAL_ALLOWED_TOOLS
         if factorial_treatment is not None
         else E3_ALLOWED_TOOLS
     )
