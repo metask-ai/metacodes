@@ -192,6 +192,10 @@ class FactorialRuntimeTreatment:
     tinykg_binary_sha256: str
     seed_batch: bytes = b""
     recall_query: str = ""
+    # "bundle": the lean factor is the promoted rule bundle (arm-driven).
+    # "final_gate": the lean factor is the session-end verification obligation
+    # flag; every arm stays signal_only and no bundle participates.
+    lean_lever: str = "bundle"
 
     def validate(self, arm_config: Mapping[str, Any]) -> None:
         expected = {
@@ -202,10 +206,16 @@ class FactorialRuntimeTreatment:
         }.get(self.cell)
         if expected != (self.tinykg_enabled, self.lean_enabled):
             raise E3Error("factorial cell/factor declaration drift")
-        if (arm_config.get("rule_flavor") is not None) != self.lean_enabled:
-            raise E3Error("factorial Lean factor disagrees with the E3 arm")
-        if self.lean_enabled and arm_config.get("actuation") != "enforced":
-            raise E3Error("factorial Lean treatment must use enforced actuation")
+        if self.lean_lever == "bundle":
+            if (arm_config.get("rule_flavor") is not None) != self.lean_enabled:
+                raise E3Error("factorial Lean factor disagrees with the E3 arm")
+            if self.lean_enabled and arm_config.get("actuation") != "enforced":
+                raise E3Error("factorial Lean treatment must use enforced actuation")
+        elif self.lean_lever == "final_gate":
+            if arm_config.get("rule_flavor") is not None:
+                raise E3Error("final-gate family must not carry a rule bundle")
+        else:
+            raise E3Error("unknown factorial lean lever")
         binary = self.tinykg_binary.expanduser().resolve(strict=True)
         _assert_executable_identity(
             binary,
@@ -295,6 +305,10 @@ def _reset_workspace(workspace: Path, case: Mapping[str, Any], root: Path) -> No
         if Path(name).name != name or name in {"", ".", ".."}:
             raise E3Error("case file name is unsafe")
         _write_new(workspace / name, content.encode("utf-8"))
+    for name in case.get("executable_files", ()):  # authored runners, e.g. ./pytest
+        if name not in case["initial_files"]:
+            raise E3Error("executable case file is not an initial file")
+        (workspace / name).chmod(0o755)
 
 
 def _rule_target(home: Path, template: Mapping[str, Any]) -> Path:
@@ -478,6 +492,8 @@ def _run_one(
     run_authorization: Mapping[str, Any] | None = None,
     factorial_treatment: FactorialRuntimeTreatment | None = None,
     quality_evidence_eligible: bool = True,
+    extra_child_args: Sequence[str] = (),
+    disallowed_tools_override: Sequence[str] | None = None,
 ) -> Mapping[str, Any]:
     sequence = int(schedule["sequence"])
     arm = str(schedule["arm"])
@@ -740,7 +756,9 @@ def _run_one(
             env["METACODES_KG_STORE"] = str(disabled_store)
     execution = manifest["execution"]
     disallowed_tools = (
-        FACTORIAL_DISALLOWED_TOOLS
+        tuple(disallowed_tools_override)
+        if disallowed_tools_override is not None
+        else FACTORIAL_DISALLOWED_TOOLS
         if factorial_treatment is not None
         else E3_DISALLOWED_TOOLS
     )
@@ -755,6 +773,7 @@ def _run_one(
             "-p", str(case["prompt"]),
             "--json",
     ]
+    child_args.extend(str(argument) for argument in extra_child_args)
     if test_base_url is not None:
         child_args[1:1] = ["--base-url", test_base_url]
     command = sandbox.command(child_args)
@@ -1081,7 +1100,13 @@ def _run_one(
             },
             "lean": {
                 "enabled": factorial_treatment.lean_enabled,
-                "bundle_loaded": factorial_treatment.lean_enabled,
+                "lever": factorial_treatment.lean_lever,
+                # For the final-gate lever no bundle participates by design;
+                # actuation is the session-end obligation flag on the child.
+                "bundle_loaded": (
+                    factorial_treatment.lean_enabled
+                    and factorial_treatment.lean_lever == "bundle"
+                ),
                 "checker_sha256": (
                     kernel_sha256 if factorial_treatment.lean_enabled else None
                 ),

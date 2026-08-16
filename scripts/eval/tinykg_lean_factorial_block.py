@@ -38,7 +38,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--cohort",
-        choices=("block", "heldout"),
+        choices=("block", "heldout", "verification-block", "verification-heldout"),
         default="block",
         help="frozen case cohort: the 4-case calibration block or the 8-case held-out set",
     )

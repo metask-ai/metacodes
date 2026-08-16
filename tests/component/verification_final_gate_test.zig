@@ -233,3 +233,62 @@ test "L2 disabled gate never nudges and never records" {
     try std.testing.expect(run.nudge_request == null);
     try std.testing.expectEqual(@as(usize, 0), run.record.records);
 }
+
+test "L2 observe-only records the outcome and never touches the conversation" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const write = try writeSse(a, root);
+    defer a.free(write);
+    var server = try harness.MockServer.startCassette(&.{ write, END_TURN }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "key", "model", url);
+    defer client.deinit();
+    var conversation = cc.conversation.Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "repair the repository");
+    var permission = cc.permission.createContext(.bypass_permissions, a);
+    permission.no_interactive_prompt = true;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    var record = GateRecordSink{};
+    const result = try cc.agent_loop.run(
+        &conversation,
+        client.provider(),
+        defs,
+        &permission,
+        .{
+            .max_turns = 8,
+            .system_prompt = "STABLE-PREFIX",
+            .verification_final_observe = true,
+            .tool_observer = record.sink(),
+            .cwd_abs = root,
+            .home_dir = root,
+            .auto_compact_threshold = std.math.maxInt(usize),
+        },
+        &backend,
+        a,
+    );
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    // No nudge: the unverified final finished untouched in two requests.
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    var index: usize = 0;
+    while (server.requestAt(index)) |request| : (index += 1) {
+        try std.testing.expect(
+            std.mem.indexOf(u8, request.body(), "[verification obligation]") == null,
+        );
+    }
+    // But the outcome was recorded honestly.
+    try std.testing.expectEqual(@as(usize, 1), record.records);
+    try std.testing.expect(record.mutations_occurred);
+    try std.testing.expect(!record.obligation_met);
+    try std.testing.expectEqual(@as(u8, 0), record.nudges);
+}

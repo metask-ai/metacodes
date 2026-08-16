@@ -353,6 +353,10 @@ pub const Options = struct {
     /// unverified mutation receives a bounded nudge (task-agnostic process
     /// rule; carries no benchmark or task content).
     verification_final_gate: bool = false,
+    /// Record the session-end verification obligation outcome without ever
+    /// nudging. Measurement-only: conversation and control flow untouched.
+    /// Gives control arms the same outcome record the gate arms get.
+    verification_final_observe: bool = false,
     /// 统一 UI 请求回调(替代旧 ask_question/exit_plan 三套;ctx 指 *TuiBackend)。
     /// 仅顶层 TUI 接(agent_depth==0)——子 agent 无 tty。见 UiRequester。
     ui_requester: ?@import("protocol/ui_request.zig").UiRequester = null,
@@ -1280,7 +1284,7 @@ pub fn run(
                 try conversation.appendText(.user, verification_progress_mod.FINAL_GATE_TEXT);
                 continue;
             }
-            if (opts.verification_final_gate) {
+            if (opts.verification_final_gate or opts.verification_final_observe) {
                 if (opts.tool_observer) |observer| {
                     _ = observer.emit(.{ .verification_final_gate = .{
                         .mutations_occurred = verification_progress.mutation_seen,
@@ -1659,7 +1663,7 @@ pub fn run(
         }
 
         const observe_verification = opts.verification_checkpoint or
-            opts.verification_final_gate;
+            opts.verification_final_gate or opts.verification_final_observe;
         const inject_verification_checkpoint = observe_verification and
             verification_progress.observeTurn(allocator, slots.items) and
             opts.verification_checkpoint;

@@ -1,0 +1,66 @@
+{
+  "schema_version": "metacodes-attribution-protocol-v1",
+  "protocol_id": "metacodes-verification-obligation-attribution-v1",
+  "preregistered": true,
+  "design": {
+    "kind": "complete-2x2-factorial",
+    "factor_a": "tinykg_procedural_memory",
+    "factor_b": "verification_final_gate",
+    "cells": [
+      "control",
+      "memory_only",
+      "lean_only",
+      "combined"
+    ],
+    "schedule": "williams-balanced",
+    "family": "verification_obligation",
+    "hazard": "finishing with a derived result that was never checked against the workspace's provided verification runner",
+    "enforcement_plane": "session-end verification obligation (--verification-final-gate); non-gate cells run --verification-final-observe so the outcome record exists symmetrically in every cell"
+  },
+  "primary_metric": "trustworthy_success",
+  "primary_metric_definition": "task_success (byte-exact workspace grade) AND verification_obligation_met (a successful verification followed the last realized mutation)",
+  "secondary_metrics": [
+    "task_success",
+    "error_recurrence",
+    "effective_intervention",
+    "false_intervention",
+    "recovery_success"
+  ],
+  "primary_contrasts": [
+    {
+      "id": "tinykg_main",
+      "formula": "memory_only - control"
+    },
+    {
+      "id": "lean_main",
+      "formula": "lean_only - control"
+    },
+    {
+      "id": "combined_total",
+      "formula": "combined - control"
+    },
+    {
+      "id": "factorial_interaction",
+      "formula": "combined - memory_only - lean_only + control"
+    }
+  ],
+  "analysis": {
+    "paired_test": "exact-mcnemar-two-sided",
+    "usage_intervals": "student-t-calibration-diagnostic"
+  },
+  "sample_ladder": {
+    "calibration_cases": 4,
+    "heldout_cases": 8,
+    "heldout_is_complete_remainder": true
+  },
+  "anti_contamination": {
+    "reference": "tinykg feedback node 12205",
+    "statement": "All cases are self-authored synthetic derive-then-verify tasks with machine-computed expected values; no benchmark task content, rubric, or test material appears in any rule, memory text, or prompt. The gate and memory texts are task-agnostic process guidance."
+  },
+  "claim_boundary": "internal complete 2x2 attribution for the verification-obligation family; not external benchmark superiority",
+  "budget": {
+    "max_rollout_cost_usd": 1.0,
+    "max_total_cost_usd_calibration": 20.0,
+    "max_total_cost_usd_heldout": 40.0
+  }
+}

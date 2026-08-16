@@ -897,6 +897,8 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             config.verification_checkpoint = true;
         } else if (std.mem.eql(u8, arg, "--verification-final-gate")) {
             config.verification_final_gate = true;
+        } else if (std.mem.eql(u8, arg, "--verification-final-observe")) {
+            config.verification_final_observe = true;
         } else if (std.mem.eql(u8, arg, "--add-dir")) {
             if (args.next()) |s| config.add_dirs = appendNulList(allocator, config.add_dirs, s);
         } else if (std.mem.eql(u8, arg, "--answers-file")) {

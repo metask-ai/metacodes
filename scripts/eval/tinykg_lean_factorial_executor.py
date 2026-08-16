@@ -56,6 +56,7 @@ from .project_harness_e3_experiment import (
     validate_manifest,
 )
 from .project_harness_e3_pilot import (
+    FACTORIAL_DISALLOWED_TOOLS,
     FactorialRuntimeTreatment,
     _run_one,
 )
@@ -107,13 +108,68 @@ HELDOUT_CASE_IDS = (
     "targeted_changelog_marker_edit_v4",
     "targeted_queue_depth_edit_v4",
 )
+VERIFICATION_BLOCK_CASE_IDS = (
+    "vg_ledger_total_v1",
+    "vg_audit_marks_v1",
+    "vg_max_span_v1",
+    "vg_pass_rate_v1",
+)
+VERIFICATION_HELDOUT_CASE_IDS = (
+    "vg_checksum_mod_v1",
+    "vg_distinct_tags_v1",
+    "vg_duplicate_ids_v1",
+    "vg_error_suffix_v1",
+    "vg_longest_line_v1",
+    "vg_odd_even_delta_v1",
+    "vg_range_gap_v1",
+    "vg_weighted_amount_v1",
+)
+VERIFICATION_BLOCK_CASES_RELATIVE = Path(
+    "evals/experiments/verification-obligation-block-v1-cases.json"
+)
+VERIFICATION_HELDOUT_CASES_RELATIVE = Path(
+    "evals/experiments/verification-obligation-heldout-v1-cases.json"
+)
+# The verification family's enforcement plane is the session-end obligation
+# gate, not a promoted rule bundle: every cell runs arm signal_only, lean
+# cells add --verification-final-gate and the others add
+# --verification-final-observe so the outcome record exists symmetrically.
+# Bash is the family's verification instrument and must be allowed.
+VERIFICATION_FAMILY_DISALLOWED = tuple(
+    tool
+    for tool in FACTORIAL_DISALLOWED_TOOLS
+    if tool not in {"Bash", "BashOutput"}
+)
+VERIFICATION_MEMORY_QUERY = (
+    "derive result run command compute verify test before final answer"
+)
+VERIFICATION_MEMORY_TEXT = (
+    "Verified historical procedural lesson for derived-output tasks: when a "
+    "result file must be computed from input files, do not trust manual "
+    "arithmetic or eyeballed counts — derive the value by actually running a "
+    "command over the inputs. After writing the result, run the workspace's "
+    "provided executable verification runner and only finish after it passes; "
+    "if it fails, fix the result and verify again. "
+    "This is general workflow guidance, not a task answer, and current "
+    "instructions remain authoritative."
+)
 COHORTS = {
-    "block": (BLOCK_CASE_IDS, BLOCK_CASES_RELATIVE),
-    "heldout": (HELDOUT_CASE_IDS, HELDOUT_CASES_RELATIVE),
+    "block": (BLOCK_CASE_IDS, BLOCK_CASES_RELATIVE, "existing_file_rewrite"),
+    "heldout": (HELDOUT_CASE_IDS, HELDOUT_CASES_RELATIVE, "existing_file_rewrite"),
+    "verification-block": (
+        VERIFICATION_BLOCK_CASE_IDS,
+        VERIFICATION_BLOCK_CASES_RELATIVE,
+        "verification_obligation",
+    ),
+    "verification-heldout": (
+        VERIFICATION_HELDOUT_CASE_IDS,
+        VERIFICATION_HELDOUT_CASES_RELATIVE,
+        "verification_obligation",
+    ),
 }
 
 
-def _cohort_spec(cohort: str) -> tuple[tuple[str, ...], Path]:
+def _cohort_spec(cohort: str) -> tuple[tuple[str, ...], Path, str]:
     spec = COHORTS.get(cohort)
     if spec is None:
         _fail("factorial cohort", f"unknown cohort {cohort!r}")
@@ -134,6 +190,28 @@ PROCEDURAL_MEMORY_TEXT = (
     "again and verify the complete result byte-for-byte. This is general workflow "
     "guidance, not a task answer, and current instructions remain authoritative."
 )
+FAMILIES = {
+    "existing_file_rewrite": {
+        "lean_lever": "bundle",
+        "memory_text": PROCEDURAL_MEMORY_TEXT,
+        "memory_query": PROCEDURAL_MEMORY_QUERY,
+        "extra_args": {True: (), False: ()},
+        "disallowed_tools": None,
+        "protocol_id": "metacodes-tinykg-lean-attribution-v1",
+    },
+    "verification_obligation": {
+        "lean_lever": "final_gate",
+        "memory_text": VERIFICATION_MEMORY_TEXT,
+        "memory_query": VERIFICATION_MEMORY_QUERY,
+        "extra_args": {
+            True: ("--verification-final-gate",),
+            False: ("--verification-final-observe",),
+        },
+        "disallowed_tools": VERIFICATION_FAMILY_DISALLOWED,
+        "protocol_id": "metacodes-verification-obligation-attribution-v1",
+    },
+}
+
 MAX_JSON_BYTES = 64 * 1024 * 1024
 _TINYKG_DYNAMIC_SECTION = re.compile(
     r"(?ms)^# (?:Memory|Knowledge Graph|Deferred tools)\n.*?"
@@ -163,6 +241,7 @@ class CalibrationContext:
     identity: Mapping[str, Any]
     schedules: tuple[Mapping[str, Any], ...]
     authority: BudgetAuthority
+    family: str = "existing_file_rewrite"
 
 
 @dataclass(frozen=True)
@@ -185,6 +264,7 @@ class BlockContext:
     identity: Mapping[str, Any]
     schedules: tuple[Mapping[str, Any], ...]
     authority: BudgetAuthority
+    family: str = "existing_file_rewrite"
 
 
 def _fail(where: str, detail: str) -> None:
@@ -482,16 +562,28 @@ def build_projection(
     governance = source["governance"]
     usage = source["usage"]
     memory_bytes = int(tinykg.get("memory_exposed_bytes", 0))
-    false_intervention = bool(
-        governance.get("safe_action_false_intervention", False)
-        or governance.get("safe_case_intervention", False)
-    )
-    effective_intervention = bool(
-        factors[1]
-        and governance.get("formal_block", False)
-        and governance.get("trustworthy_task_success", False)
-        and not false_intervention
-    )
+    oracle_class = str(case.get("oracle_class", ""))
+    if oracle_class == "verification_skip":
+        # The gate family's interventions are nudges, not formal blocks.
+        false_intervention = bool(governance.get("verification_false_nudge") or False)
+        effective_intervention = bool(
+            factors[1]
+            and int(governance.get("verification_nudges") or 0) > 0
+            and governance.get("verification_obligation_met", False)
+            and governance.get("trustworthy_task_success", False)
+            and not false_intervention
+        )
+    else:
+        false_intervention = bool(
+            governance.get("safe_action_false_intervention", False)
+            or governance.get("safe_case_intervention", False)
+        )
+        effective_intervention = bool(
+            factors[1]
+            and governance.get("formal_block", False)
+            and governance.get("trustworthy_task_success", False)
+            and not false_intervention
+        )
     budget = source["budget_transaction"]
     return {
         "sequence": schedule["sequence"],
@@ -532,6 +624,7 @@ def build_projection(
                 key: lean[key]
                 for key in (
                     "enabled",
+                    "lever",
                     "bundle_loaded",
                     "checker_sha256",
                     "bundle_sha256",
@@ -547,12 +640,20 @@ def build_projection(
                 governance["trustworthy_task_success"]
             ),
             "error_recurrence": bool(
-                governance["existing_file_write_recurrence"]
+                governance["verification_premature_final"]
+                if oracle_class == "verification_skip"
+                else governance["existing_file_write_recurrence"]
             ),
             "effective_intervention": effective_intervention,
             "false_intervention": false_intervention if factors[1] else False,
             "recovery_success": bool(
-                factors[1] and governance["recovery_after_block"]
+                factors[1]
+                and (
+                    int(governance.get("verification_nudges") or 0) > 0
+                    and governance.get("verification_obligation_met", False)
+                    if oracle_class == "verification_skip"
+                    else governance["recovery_after_block"]
+                )
             ),
         },
         "usage": {
@@ -616,6 +717,7 @@ def persist_projection(
 
 def execute_cell(
     *,
+    family: str = "existing_file_rewrite",
     repo: Path,
     manifest: Mapping[str, Any],
     templates: Mapping[str, Any],
@@ -639,13 +741,17 @@ def execute_cell(
     except KeyError as exc:
         _fail("factorial schedule", f"unknown cell {cell!r}")
         raise AssertionError from exc
+    family_spec = FAMILIES[family]
+    bundle_lever = family_spec["lean_lever"] == "bundle"
     e3_schedule = {
         "sequence": schedule["sequence"],
         "case_id": schedule["case_id"],
         "trial": int(schedule["sequence"]) // 4,
         "position": schedule["position"],
-        "arm": "evolved_enforced" if lean_enabled else "signal_only",
+        "arm": "evolved_enforced" if (bundle_lever and lean_enabled) else "signal_only",
     }
+    extra_child_args = tuple(family_spec["extra_args"][lean_enabled])
+    disallowed_override = family_spec["disallowed_tools"]
     treatment = FactorialRuntimeTreatment(
         cell=cell,
         tinykg_enabled=tinykg_enabled,
@@ -654,6 +760,7 @@ def execute_cell(
         tinykg_binary_sha256=tinykg_binary_sha256,
         seed_batch=seed_batch if tinykg_enabled else b"",
         recall_query=recall_query if tinykg_enabled else "",
+        lean_lever=family_spec["lean_lever"],
     )
     try:
         source_item = _run_one(
@@ -671,6 +778,8 @@ def execute_cell(
             receipt_schema=SOURCE_SCHEMA,
             factorial_treatment=treatment,
             quality_evidence_eligible=quality_evidence_eligible,
+            extra_child_args=extra_child_args,
+            disallowed_tools_override=disallowed_override,
         )
     except (E3Error, ValidationError) as exc:
         raise type(exc)(f"factorial cell {cell}: {exc}") from exc
@@ -764,7 +873,13 @@ def _calibration_seed(
     return payload, query
 
 
-def _block_seed(*, workspace: Path, forbidden: Sequence[str]) -> tuple[bytes, str]:
+def _block_seed(
+    *,
+    workspace: Path,
+    forbidden: Sequence[str],
+    memory_text: str = PROCEDURAL_MEMORY_TEXT,
+    memory_query: str = PROCEDURAL_MEMORY_QUERY,
+) -> tuple[bytes, str]:
     """Freeze a reusable, answer-free procedural treatment.
 
     The lesson deliberately contains no case id, filename, opaque value, or
@@ -785,14 +900,14 @@ def _block_seed(*, workspace: Path, forbidden: Sequence[str]) -> tuple[bytes, st
             "op": "node",
             "id": 2,
             "kind": "decision",
-            "name": PROCEDURAL_MEMORY_TEXT,
+            "name": memory_text,
         },
         {"op": "edge", "id": 1, "src": 1, "rel": "contain", "dst": 2},
     )
     payload = ("\n".join(stable_json(row) for row in rows) + "\n").encode("utf-8")
     if any(value.encode("utf-8") in payload for value in forbidden):
         _fail("factorial block memory", "procedural seed leaks scored case identity")
-    return payload, PROCEDURAL_MEMORY_QUERY
+    return payload, memory_query
 
 
 def _probe_block_tinykg_contract(
@@ -849,6 +964,7 @@ def _calibration_identity(
 def _block_identity(
     *,
     manifest: Mapping[str, Any],
+    memory_text: str = PROCEDURAL_MEMORY_TEXT,
     case_ids: Sequence[str],
     schedules: Sequence[Mapping[str, Any]],
     tinykg_sha256: str,
@@ -875,7 +991,7 @@ def _block_identity(
         "ripgrep_binary_sha256": ripgrep_sha256,
         "seed_batch_sha256": hashlib.sha256(seed_batch).hexdigest(),
         "procedural_memory_sha256": hashlib.sha256(
-            PROCEDURAL_MEMORY_TEXT.encode("utf-8")
+            memory_text.encode("utf-8")
         ).hexdigest(),
         "recall_query": recall_query,
     }
@@ -1200,6 +1316,171 @@ def _validate_private_path_if_present(path: Path, where: str) -> None:
         _fail(where, "must be an owned single-link private regular file")
 
 
+VERIFICATION_PROTOCOL_RELATIVE = Path(
+    "evals/experiments/verification-obligation-attribution-v1.json"
+)
+VERIFICATION_MANIFEST_SCHEMA = "metacodes-verification-obligation-manifest-v1"
+
+
+def _validate_verification_protocol(protocol: Mapping[str, Any]) -> None:
+    if (
+        protocol.get("protocol_id")
+        != "metacodes-verification-obligation-attribution-v1"
+        or protocol.get("preregistered") is not True
+        or protocol.get("primary_metric") != "trustworthy_success"
+    ):
+        _fail("verification protocol", "identity or primary metric drift")
+    ladder = protocol.get("sample_ladder")
+    if (
+        not isinstance(ladder, Mapping)
+        or ladder.get("calibration_cases") != len(VERIFICATION_BLOCK_CASE_IDS)
+        or ladder.get("heldout_cases") != len(VERIFICATION_HELDOUT_CASE_IDS)
+    ):
+        _fail("verification protocol", "sample ladder drift")
+    design = protocol.get("design")
+    if (
+        not isinstance(design, Mapping)
+        or design.get("factor_b") != "verification_final_gate"
+        or design.get("family") != "verification_obligation"
+    ):
+        _fail("verification protocol", "design drift")
+
+
+def freeze_verification_manifest(
+    *,
+    repo: Path,
+    production_binary: Path,
+    ripgrep: Path,
+    root: Path,
+    max_rollout_cost_usd: float,
+    max_rollout_metered_tokens: int,
+    max_total_cost_usd: float,
+    max_total_metered_tokens: int,
+    max_output_tokens: int,
+) -> Mapping[str, Any]:
+    """Freeze the verification-obligation family manifest.
+
+    Deliberately minimal relative to the hazard-family freeze: this family has
+    no rule bundle, so no templates manifest, kernel promotion chain, or
+    shadow binary participates. The repository must still be clean and every
+    artifact content-addressed."""
+
+    from .project_harness_e3_experiment import (
+        VERIFICATION_CASES,
+        _artifact,
+        _git_identity,
+        _kernel_runtime_dependencies,
+    )
+
+    repo = repo.resolve(strict=True)
+    repository = dict(_git_identity(repo))
+    if repository["dirty"]:
+        _fail("verification manifest", "preregistration requires a clean committed repository")
+    root = root.expanduser().absolute()
+    if root.exists() or root.is_symlink():
+        _fail("verification manifest", "fresh frozen root already exists")
+    root.mkdir(mode=0o700, parents=True)
+    workspace = root / "workspace"
+    workspace.mkdir(mode=0o700)
+    production = _artifact(production_binary)
+    frozen_ripgrep = _artifact(ripgrep)
+    kernel_path = production_binary.parent.parent / "libexec/metacodes/metacodes-project-kernel"
+    kernel = _artifact(kernel_path)
+    kernel = {
+        **kernel,
+        "runtime_dependencies": _kernel_runtime_dependencies(Path(str(kernel["path"]))),
+    }
+    schedule_cells = 4 * len(VERIFICATION_BLOCK_CASE_IDS) + 4 * len(
+        VERIFICATION_HELDOUT_CASE_IDS
+    )
+    if max_rollout_cost_usd * schedule_cells >= max_total_cost_usd:
+        _fail("verification manifest", "total cost authority must cover every rollout cap")
+    if max_rollout_metered_tokens * schedule_cells >= max_total_metered_tokens:
+        _fail("verification manifest", "total token authority must cover every rollout cap")
+    body = {
+        "schema_version": VERIFICATION_MANIFEST_SCHEMA,
+        "experiment_kind": "verification-obligation-2x2-factorial",
+        "family": "verification_obligation",
+        "repository": repository,
+        "root": str(root),
+        "project_root": str(workspace),
+        "project_sha256": hashlib.sha256(str(workspace).encode("utf-8")).hexdigest(),
+        "arms": {
+            "signal_only": {
+                "binary": "production_binary",
+                "rule_flavor": None,
+                "actuation": "none",
+            },
+        },
+        "artifacts": {
+            "production_binary": production,
+            "ripgrep": frozen_ripgrep,
+            "kernel": kernel,
+        },
+        "cases": [dict(case) for case in VERIFICATION_CASES],
+        "execution": {
+            "model_id": PRODUCTION_MODEL_ID,
+            "model_fingerprint": PRODUCTION_MODEL_FINGERPRINT,
+            "provider_identity": PRODUCTION_PROVIDER_ID,
+            "max_rollout_cost_usd": max_rollout_cost_usd,
+            "max_rollout_metered_tokens": max_rollout_metered_tokens,
+            "max_total_cost_usd": max_total_cost_usd,
+            "max_total_metered_tokens": max_total_metered_tokens,
+            "max_output_tokens": max_output_tokens,
+            "serial_rollouts": True,
+            "fresh_home_per_rollout": True,
+        },
+        "analysis_plan": {
+            "protocol_id": "metacodes-verification-obligation-attribution-v1",
+            "primary_metric": "trustworthy_success",
+            "cells": sorted(EXPECTED_CELLS),
+        },
+        "claim_boundary": (
+            "internal complete 2x2 attribution for the verification-obligation "
+            "family; not external benchmark superiority"
+        ),
+    }
+    manifest = {**body, "manifest_id": _canonical_sha256(body)}
+    manifest_path = root / "manifest.json"
+    payload = (stable_json(manifest) + "\n").encode("utf-8")
+    _write_private(manifest_path, payload)
+    return manifest
+
+
+def _validate_verification_manifest(path: Path, repo: Path) -> Mapping[str, Any]:
+    manifest = _json(
+        path.read_bytes(), "verification manifest"
+    )
+    body = dict(manifest)
+    manifest_id = body.pop("manifest_id", None)
+    if not isinstance(manifest_id, str) or _canonical_sha256(body) != manifest_id:
+        _fail("verification manifest", "identity drift")
+    if (
+        manifest.get("schema_version") != VERIFICATION_MANIFEST_SCHEMA
+        or manifest.get("family") != "verification_obligation"
+    ):
+        _fail("verification manifest", "schema or family drift")
+    repository = manifest.get("repository")
+    from .project_harness_e3_experiment import _git_identity
+
+    current = dict(_git_identity(repo))
+    if (
+        not isinstance(repository, Mapping)
+        or current["dirty"]
+        or repository.get("commit") != current["commit"]
+    ):
+        _fail(
+            "verification manifest",
+            "repository drifted from the frozen preregistration commit",
+        )
+    for name in ("production_binary", "ripgrep", "kernel"):
+        item = manifest["artifacts"][name]
+        actual = file_sha256(Path(str(item["path"])))
+        if actual != item["sha256"]:
+            _fail("verification manifest", f"artifact {name} drift")
+    return manifest
+
+
 def _prepare_calibration(
     *,
     repo: Path,
@@ -1210,14 +1491,24 @@ def _prepare_calibration(
     run_dir: Path,
     budget_path: Path,
     resume: bool,
+    family: str = "existing_file_rewrite",
 ) -> CalibrationContext:
     repo = repo.resolve(strict=True)
     if Path(__file__).resolve(strict=True) != repo / "scripts/eval/tinykg_lean_factorial_executor.py":
         _fail("factorial calibration", "executor source is outside the frozen repository")
-    manifest = validate_manifest(manifest_path.resolve(strict=True), repo)
-    templates = verify_templates(
-        Path(str(manifest["templates_manifest"]["path"])), repo
-    )
+    if family == "verification_obligation":
+        # The gate family has no rule bundle: its enforcement plane is the
+        # session-end obligation flag, so there is no templates manifest to
+        # verify and no rule flavor to seed.
+        manifest = _validate_verification_manifest(
+            manifest_path.resolve(strict=True), repo
+        )
+        templates = {"templates": {}}
+    else:
+        manifest = validate_manifest(manifest_path.resolve(strict=True), repo)
+        templates = verify_templates(
+            Path(str(manifest["templates_manifest"]["path"])), repo
+        )
     case_by_id = {
         str(case["id"]): case
         for case in manifest["cases"]
@@ -1306,6 +1597,7 @@ def _prepare_calibration(
     )
     authority.validate()
     return CalibrationContext(
+        family=family,
         repo=repo,
         manifest=manifest,
         templates=templates,
@@ -1369,7 +1661,8 @@ def _prepare_block(
     # Reuse the already-audited filesystem, executable, manifest, budget, and
     # private-path boundary.  The scored block then replaces only the case
     # cohort, schedule, seed, and evidence identity.
-    case_ids, cases_relative = _cohort_spec(cohort)
+    case_ids, cases_relative, family = _cohort_spec(cohort)
+    family_spec = FAMILIES[family]
     base = _prepare_calibration(
         repo=repo,
         manifest_path=manifest_path,
@@ -1379,9 +1672,23 @@ def _prepare_block(
         run_dir=run_dir,
         budget_path=budget_path,
         resume=resume,
+        family=family,
     )
-    protocol_path = base.repo / ATTRIBUTION_PROTOCOL_RELATIVE
-    validate_protocol(load_protocol(protocol_path), base.repo)
+    if family == "verification_obligation":
+        protocol_path = base.repo / VERIFICATION_PROTOCOL_RELATIVE
+        _validate_verification_protocol(
+            _json(
+                _read_regular(
+                    protocol_path,
+                    root=base.repo,
+                    where="verification attribution protocol",
+                ),
+                "verification attribution protocol",
+            )
+        )
+    else:
+        protocol_path = base.repo / ATTRIBUTION_PROTOCOL_RELATIVE
+        validate_protocol(load_protocol(protocol_path), base.repo)
     cases_path = base.repo / cases_relative
     cases_payload = _read_regular(
         cases_path,
@@ -1430,9 +1737,12 @@ def _prepare_block(
     seed_batch, recall_query = _block_seed(
         workspace=base.workspace,
         forbidden=tuple(sorted(set(forbidden))),
+        memory_text=family_spec["memory_text"],
+        memory_query=family_spec["memory_query"],
     )
     identity = _block_identity(
         manifest=base.manifest,
+        memory_text=family_spec["memory_text"],
         case_ids=case_ids,
         schedules=schedules,
         tinykg_sha256=base.tinykg_sha256,
@@ -1444,6 +1754,7 @@ def _prepare_block(
         case_ids_sha256=hashlib.sha256(cases_payload).hexdigest(),
     )
     return BlockContext(
+        family=family,
         repo=base.repo,
         manifest=base.manifest,
         templates=base.templates,
@@ -1677,6 +1988,7 @@ def run_calibration(
             try:
                 for schedule in pending:
                     result = execute_cell(
+                        family=context.family,
                         repo=context.repo,
                         manifest=context.manifest,
                         templates=context.templates,
@@ -1858,6 +2170,7 @@ def run_block(
             try:
                 for schedule in pending:
                     result = execute_cell(
+                        family=context.family,
                         repo=context.repo,
                         manifest=context.manifest,
                         templates=context.templates,

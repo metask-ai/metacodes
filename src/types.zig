@@ -90,6 +90,7 @@ pub const Config = struct {
     /// out of the default product path until measured on fixed benchmarks.
     verification_checkpoint: bool = false,
     verification_final_gate: bool = false,
+    verification_final_observe: bool = false,
     /// `--add-dir <path>`(可重复):额外可读写目录,注入 additionalDirectories。
     /// 多个用 `\x00` 分隔拼一串(parseArgs 累加)。
     add_dirs: ?[]const u8 = null,
