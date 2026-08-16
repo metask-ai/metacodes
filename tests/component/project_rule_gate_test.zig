@@ -200,7 +200,7 @@ const AutoRecoveryDispatchProbe = struct {
     fn emit(raw: *anyopaque, event: cc.tools.tool_observation.Event) bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
         switch (event) {
-            .rule_filter, .formal_decision, .formal_decision_batch => {},
+            .rule_filter, .rule_coverage_gap, .formal_decision, .formal_decision_batch => {},
             .dispatch_started => |started| {
                 self.starts += 1;
                 self.requested_write = std.mem.eql(u8, started.requested_name, "Write");
@@ -253,7 +253,7 @@ const RejectDispatchStartSink = struct {
     fn emit(raw: *anyopaque, event: cc.tools.tool_observation.Event) bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
         return switch (event) {
-            .rule_filter, .formal_decision, .formal_decision_batch => blk: {
+            .rule_filter, .rule_coverage_gap, .formal_decision, .formal_decision_batch => blk: {
                 self.formal_events += 1;
                 break :blk true;
             },
@@ -4133,4 +4133,205 @@ test "L2 promoted Lean post rule admits matched Write and poisons unavailable re
     var next_loaded = try cc.rule_candidate.load(allocator, evidence_dir, next.candidate_id);
     defer next_loaded.deinit();
     try std.testing.expectEqual(cc.rule_candidate.SourceKind.runtime_counterexample, next_loaded.source_kind);
+}
+
+/// Records only the coverage-gap signal so the assertion cannot be satisfied
+/// by some other event happening to fire.
+const CoverageGapSink = struct {
+    gaps: usize = 0,
+    last_tool: [32]u8 = [_]u8{0} ** 32,
+    last_tool_len: usize = 0,
+    last_effect_class: [64]u8 = [_]u8{0} ** 64,
+    last_effect_class_len: usize = 0,
+    last_active_rule_count: u32 = 0,
+    last_matching_rule_count: u32 = 1,
+
+    fn emit(raw: *anyopaque, event: cc.tools.tool_observation.Event) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        switch (event) {
+            .rule_coverage_gap => |gap| {
+                self.gaps += 1;
+                self.last_tool_len = @min(gap.tool.len, self.last_tool.len);
+                @memcpy(self.last_tool[0..self.last_tool_len], gap.tool[0..self.last_tool_len]);
+                self.last_effect_class_len = @min(gap.effect_class.len, self.last_effect_class.len);
+                @memcpy(
+                    self.last_effect_class[0..self.last_effect_class_len],
+                    gap.effect_class[0..self.last_effect_class_len],
+                );
+                self.last_active_rule_count = gap.active_rule_count;
+                self.last_matching_rule_count = gap.matching_rule_count;
+            },
+            else => {},
+        }
+        return true;
+    }
+
+    fn sink(self: *@This()) cc.tools.tool_observation.Sink {
+        return .{ .ctx = @ptrCast(self), .emitFn = emit };
+    }
+
+    fn tool(self: *const @This()) []const u8 {
+        return self.last_tool[0..self.last_tool_len];
+    }
+
+    fn effectClass(self: *const @This()) []const u8 {
+        return self.last_effect_class[0..self.last_effect_class_len];
+    }
+};
+
+test "L2 an Edit that rewrites an existing file under Write-only rules reports a coverage gap" {
+    // This is the block-2 failure shape, made observable. Active rules target
+    // Write; the model instead rewrites the same existing file with Edit. The
+    // rule plane admits (nothing claims Edit) — correct — but the governed
+    // effect still happened with zero coverage, and that must be reported
+    // rather than reconstructed from transcripts afterwards.
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/coverage-gap-target.txt",
+        .{root_buffer[0..root_len]},
+    );
+    defer allocator.free(path);
+    try overwriteArtifact(allocator, path, "original-bytes\n");
+
+    var active = try syntheticOrderedRecoveryActive(allocator, true, config);
+    defer active.deinit();
+    var evidence_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const evidence_dir = try std.fmt.bufPrint(
+        &evidence_buffer,
+        "{s}/evidence",
+        .{root_buffer[0..root_len]},
+    );
+    try std.Io.Dir.createDirAbsolute(std.testing.io, evidence_dir, .default_dir);
+    var gap_sink = CoverageGapSink{};
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+        .evidence_dir = evidence_dir,
+        .observation_sink = gap_sink.sink(),
+    };
+    var read_state = cc.core_read_state.ReadState.init(allocator);
+    defer read_state.deinit();
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.read_state = &read_state;
+    ctx.project_rule_gate = runtime.protocolGate();
+    ctx.tool_observer = gap_sink.sink();
+    // Ordinary Edit requires a prior model-visible Read; seed that fact.
+    const seed_stat = try cc.core_read_state.statPath(path);
+    try read_state.record(path, seed_stat.mtime_ns, seed_stat.size);
+
+    const edit_args = try std.json.Stringify.valueAlloc(allocator, .{
+        .file_path = path,
+        .old_string = "original-bytes",
+        .new_string = "replacement-bytes",
+    }, .{});
+    defer allocator.free(edit_args);
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Edit",
+        edit_args,
+        "coverage-gap-edit",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
+            // The verdict must be untouched: instrumentation never enforces.
+            try std.testing.expect(!done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), gap_sink.gaps);
+    try std.testing.expectEqualStrings("Edit", gap_sink.tool());
+    try std.testing.expectEqualStrings("existing_file_rewritten", gap_sink.effectClass());
+    try std.testing.expectEqual(@as(u32, 2), gap_sink.last_active_rule_count);
+    try std.testing.expectEqual(@as(u32, 0), gap_sink.last_matching_rule_count);
+}
+
+test "L2 a covered dispatch and a harmless uncovered dispatch report no coverage gap" {
+    // Negative side: the signal must not fire merely because a tool is
+    // uncovered. Creating a new file is not the governed effect class, and a
+    // Write is covered by the active rules, so neither may report a gap.
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const fresh_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/coverage-gap-fresh.txt",
+        .{root_buffer[0..root_len]},
+    );
+    defer allocator.free(fresh_path);
+
+    var active = try syntheticOrderedRecoveryActive(allocator, true, config);
+    defer active.deinit();
+    var evidence_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const evidence_dir = try std.fmt.bufPrint(
+        &evidence_buffer,
+        "{s}/evidence",
+        .{root_buffer[0..root_len]},
+    );
+    try std.Io.Dir.createDirAbsolute(std.testing.io, evidence_dir, .default_dir);
+    var gap_sink = CoverageGapSink{};
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+        .evidence_dir = evidence_dir,
+        .observation_sink = gap_sink.sink(),
+    };
+    var read_state = cc.core_read_state.ReadState.init(allocator);
+    defer read_state.deinit();
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.read_state = &read_state;
+    ctx.project_rule_gate = runtime.protocolGate();
+    ctx.tool_observer = gap_sink.sink();
+
+    // Edit that creates nothing pre-existing cannot happen, so exercise the
+    // uncovered-but-harmless path with an Edit whose target is absent: the
+    // dispatch fails and no governed effect is produced.
+    const missing_args = try std.json.Stringify.valueAlloc(allocator, .{
+        .file_path = fresh_path,
+        .old_string = "nothing",
+        .new_string = "something",
+    }, .{});
+    defer allocator.free(missing_args);
+    const missing = cc.tool_exec.executeOne(
+        &ctx,
+        "Edit",
+        missing_args,
+        "coverage-gap-missing",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    ) catch |err| blk: {
+        try std.testing.expect(err == error.FileNotFound or err == error.NotRead);
+        break :blk cc.tool_exec.OneResult{ .host_fatal = {} };
+    };
+    switch (missing) {
+        .done => |done| {
+            if (done.content) |bytes| allocator.free(bytes);
+            if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            }
+        },
+        else => {},
+    }
+    try std.testing.expectEqual(@as(usize, 0), gap_sink.gaps);
 }

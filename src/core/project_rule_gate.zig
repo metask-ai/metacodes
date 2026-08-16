@@ -315,6 +315,17 @@ pub const RuntimeGate = struct {
         if (matching == 0) {
             if (!self.recordRuleFilter(signal.pre.dispatch_id, .post, .ordinary, 0))
                 return .{ .result = .fault };
+            // Admitting here is correct — no rule claims this tool — but if the
+            // dispatch nevertheless produced a governed effect, the obligation
+            // was met by nobody. Report the gap; do not change the verdict, so
+            // instrumentation can never become a covert enforcement path.
+            if (governedEffectClass(signal.effect)) |effect_class| {
+                if (!self.recordCoverageGap(
+                    signal.pre.dispatch_id,
+                    signal.pre.tool,
+                    effect_class,
+                )) return .{ .result = .fault };
+            }
             return .{ .result = .admit };
         }
         const signal_json = try std.json.Stringify.valueAlloc(self.allocator, formal_signal, .{});
@@ -720,12 +731,53 @@ pub const RuntimeGate = struct {
         return null;
     }
 
+    /// Governed effect classes. A rule bundle expresses obligations about the
+    /// *effect* ("do not rewrite an existing file out from under its reader"),
+    /// but rule applicability is keyed on the tool name. Any other route to the
+    /// same effect is therefore outside every rule's reach — not denied, simply
+    /// never evaluated. Name the class so the gap is reportable.
+    fn governedEffectClass(effect: ?observation.Effect) ?[]const u8 {
+        const value = effect orelse return null;
+        const mutation = switch (value) {
+            .file_mutation_v1 => |m| m,
+            .file_mutation_v2 => |m| m.mutation,
+        };
+        if (mutation.before_state == .known and mutation.change == .changed)
+            return "existing_file_rewritten";
+        return null;
+    }
+
     fn matchingRuleCount(self: *const RuntimeGate, tool: []const u8) usize {
         var count: usize = 0;
         for (self.active.rules) |entry| {
             if (std.mem.eql(u8, entry.rule_spec.target_tool, tool)) count += 1;
         }
         return count;
+    }
+
+    /// Report a dispatch that produced a governed effect while zero active
+    /// rules targeted its tool. This is the signal that an advisory plane
+    /// (memory/prompt) has routed work around the enforced plane: the rule
+    /// never fired because it was never consulted. Without it the bypass is
+    /// only recoverable by reading transcripts after the fact.
+    fn recordCoverageGap(
+        self: *const RuntimeGate,
+        dispatch_id: []const u8,
+        tool: []const u8,
+        effect_class: []const u8,
+    ) bool {
+        if ((self.evidence_dir != null) != (self.observation_sink != null)) return false;
+        const sink = self.observation_sink orelse return true;
+        if (self.active.rules.len > std.math.maxInt(u32)) return false;
+        return sink.emit(.{ .rule_coverage_gap = .{
+            .dispatch_id = dispatch_id,
+            .tool = tool,
+            .effect_class = effect_class,
+            .project_sha256 = self.active.project_sha256,
+            .bundle_sha256 = self.active.bundle_sha256,
+            .bundle_revision = self.active.revision,
+            .active_rule_count = @intCast(self.active.rules.len),
+        } });
     }
 
     fn recordRuleFilter(
