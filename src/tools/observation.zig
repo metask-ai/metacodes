@@ -21,6 +21,7 @@ pub const FORMAL_BATCH_SCHEMA_VERSION_V4 = "metacodes-project-formal-decision-ba
 pub const FORMAL_BATCH_SCHEMA_VERSION = "metacodes-project-formal-decision-batch-v5";
 pub const RULE_FILTER_SCHEMA_VERSION = "metacodes-project-rule-filter-v1";
 pub const RULE_COVERAGE_GAP_SCHEMA_VERSION = "metacodes-project-rule-coverage-gap-v1";
+pub const RULE_BOUNDS_OVERFLOW_SCHEMA_VERSION = "metacodes-project-rule-bounds-overflow-v1";
 
 pub const Origin = enum {
     authoritative,
@@ -203,6 +204,24 @@ pub const Event = union(enum) {
     /// that shifts the action distribution can therefore move traffic off the
     /// enforced plane silently. Emit that as a first-class signal instead of
     /// leaving it to be reconstructed from transcripts after the fact.
+    /// A matched verify-only rule admitted a dispatch whose input or agent
+    /// depth exceeds the rule's authored envelope. The envelope is a
+    /// reasoning bound, not a safety verdict — enforcement here produced a
+    /// reproducible false intervention — so overflow is reported, never
+    /// blocked. Repeated overflows are the signal to re-author the rule.
+    rule_bounds_overflow: struct {
+        schema_version: []const u8 = RULE_BOUNDS_OVERFLOW_SCHEMA_VERSION,
+        dispatch_id: []const u8,
+        tool: []const u8,
+        candidate_id: []const u8,
+        input_bytes: u64,
+        max_input_bytes: u64,
+        agent_depth: u8,
+        max_agent_depth: u8,
+        project_sha256: [64]u8,
+        bundle_sha256: [64]u8,
+        bundle_revision: u64,
+    },
     rule_coverage_gap: struct {
         schema_version: []const u8 = RULE_COVERAGE_GAP_SCHEMA_VERSION,
         dispatch_id: []const u8,

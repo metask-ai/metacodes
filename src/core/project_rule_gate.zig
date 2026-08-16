@@ -248,6 +248,16 @@ pub const RuntimeGate = struct {
         var index: usize = 0;
         for (self.active.rules) |entry| {
             if (!spec_mod.wireTargetMatchesPre(entry.rule_spec, formal_signal)) continue;
+            // Envelope overflow on a verify-only rule is a host observation,
+            // never a verdict: the kernel admits it by theorem
+            // verify_only_bounds_overflow_admits, and this signal is how a
+            // rule earns re-authoring instead of silently blocking work.
+            if (!entry.rule_spec.deny_target and
+                spec_mod.wireBoundsOverflow(entry.rule_spec, formal_signal))
+            {
+                if (!self.recordBoundsOverflow(signal, entry))
+                    return .{ .result = .fault };
+            }
             const candidate_id = parseHex(entry.candidate_id) orelse return error.InvalidCandidateId;
             request_ids[index] = kernel.requestId(
                 .pre_decision,
@@ -758,6 +768,27 @@ pub const RuntimeGate = struct {
             if (spec_mod.wireTargetMatchesPre(entry.rule_spec, signal)) count += 1;
         }
         return count;
+    }
+
+    fn recordBoundsOverflow(
+        self: *const RuntimeGate,
+        signal: protocol.PreSignal,
+        entry: bundle_mod.RuleEntry,
+    ) bool {
+        if ((self.evidence_dir != null) != (self.observation_sink != null)) return false;
+        const sink = self.observation_sink orelse return true;
+        return sink.emit(.{ .rule_bounds_overflow = .{
+            .dispatch_id = signal.dispatch_id,
+            .tool = signal.tool,
+            .candidate_id = entry.candidate_id,
+            .input_bytes = signal.input_bytes,
+            .max_input_bytes = entry.rule_spec.max_input_bytes,
+            .agent_depth = signal.agent_depth,
+            .max_agent_depth = entry.rule_spec.max_agent_depth,
+            .project_sha256 = self.active.project_sha256,
+            .bundle_sha256 = self.active.bundle_sha256,
+            .bundle_revision = self.active.revision,
+        } });
     }
 
     /// Report a dispatch that produced a governed effect while zero active

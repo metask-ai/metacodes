@@ -200,7 +200,7 @@ const AutoRecoveryDispatchProbe = struct {
     fn emit(raw: *anyopaque, event: cc.tools.tool_observation.Event) bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
         switch (event) {
-            .rule_filter, .rule_coverage_gap, .formal_decision, .formal_decision_batch => {},
+            .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .formal_decision, .formal_decision_batch => {},
             .dispatch_started => |started| {
                 self.starts += 1;
                 self.requested_write = std.mem.eql(u8, started.requested_name, "Write");
@@ -253,7 +253,7 @@ const RejectDispatchStartSink = struct {
     fn emit(raw: *anyopaque, event: cc.tools.tool_observation.Event) bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
         return switch (event) {
-            .rule_filter, .rule_coverage_gap, .formal_decision, .formal_decision_batch => blk: {
+            .rule_filter, .rule_coverage_gap, .rule_bounds_overflow, .formal_decision, .formal_decision_batch => blk: {
                 self.formal_events += 1;
                 break :blk true;
             },
@@ -1964,10 +1964,10 @@ fn promoteFixture(
     });
     var build = try recordVerifiedBuild(allocator, evidence_dir, candidate.candidate_id, project);
     defer build.deinit(allocator);
-    const negative_bytes: usize = if (spec.deny_target)
-        2
-    else
-        @intCast(spec.max_input_bytes + 1);
+    // Verify-only rules no longer block on the authored envelope (bounds are
+    // observational); their honest negative case is the trust boundary. Deny
+    // rules keep a matched in-envelope dispatch as the negative case.
+    const negative_authoritative = spec.deny_target or !spec.authoritative_only;
     const replay_cases = [_]cc.rule_evaluation.ReplayCase{
         .{
             .case_id = "unrelated-read-admitted",
@@ -1984,9 +1984,9 @@ fn promoteFixture(
             .expected_admit = false,
             .signal = .{ .pre = .{
                 .tool = spec.target.tool,
-                .input_bytes = negative_bytes,
+                .input_bytes = 2,
                 .agent_depth = 0,
-                .authoritative = true,
+                .authoritative = negative_authoritative,
                 .file_target_state = .regular_existing,
             } },
         },
@@ -4656,4 +4656,144 @@ test "L2 effect-class rule reaches the checker for Edit and is pruned for Bash" 
     // Bash is outside the mutating roster: statically pruned, zero checker calls.
     try std.testing.expectEqual(before_batches, routing.formal_batches);
     try std.testing.expectEqual(@as(u32, 0), routing.last_checker_rule_count);
+}
+
+const BoundsOverflowSink = struct {
+    overflows: usize = 0,
+    last_input_bytes: u64 = 0,
+    last_max_input_bytes: u64 = 0,
+    blocks: usize = 0,
+
+    fn emit(raw: *anyopaque, event: cc.tools.tool_observation.Event) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        switch (event) {
+            .rule_bounds_overflow => |overflow| {
+                self.overflows += 1;
+                self.last_input_bytes = overflow.input_bytes;
+                self.last_max_input_bytes = overflow.max_input_bytes;
+            },
+            .formal_decision_batch => |batch| {
+                for (batch.decisions) |decision| {
+                    if (decision.result == .block) self.blocks += 1;
+                }
+            },
+            else => {},
+        }
+        return true;
+    }
+
+    fn sink(self: *@This()) cc.tools.tool_observation.Sink {
+        return .{ .ctx = @ptrCast(self), .emitFn = emit };
+    }
+};
+
+test "L2 verify-only rule admits an oversized new-file Write and reports the overflow" {
+    // The doubly-reproduced WorkBuddy false intervention, end to end: a
+    // deliverable larger than the rule's authored envelope, written to a
+    // missing path, under the exact static-bundle rule shape.  The dispatch
+    // must run; the envelope overflow must surface as an observation with
+    // the real numbers; nothing may block.
+    const config = testKernel() orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/oversized-deliverable.json",
+        .{root_buffer[0..root_len]},
+    );
+    defer allocator.free(path);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rules = try a.alloc(cc.project_rule_bundle.RuleEntry, 1);
+    const rule_id = cc.tools.tool_observation.sha256Hex("static-write-verify");
+    rules[0] = .{
+        .candidate_id = try a.dupe(u8, &rule_id),
+        .rule_spec = cc.project_rule_spec.toWire(.{
+            .target = .{ .tool = "Write" },
+            .deny_target = false,
+            .max_input_bytes = 8192,
+            .max_agent_depth = 4,
+            .authoritative_only = true,
+            .effect_requirement = .file_mutation_v1_reobserved,
+        }),
+    };
+    var active = cc.project_rule_bundle.LoadedActive{
+        .arena = arena,
+        .project_sha256 = .{'a'} ** 64,
+        .bundle_sha256 = .{'b'} ** 64,
+        .revision = 3,
+        .kernel_sha256 = config.expected_sha256,
+        .promotion_receipt_id = .{'c'} ** 64,
+        .promotion_request_sha256 = .{'d'} ** 64,
+        .promotion_verdict_sha256 = .{'e'} ** 64,
+        .active_pointer_sha256 = .{'f'} ** 64,
+        .rules = rules,
+    };
+    var evidence_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const evidence_dir = try std.fmt.bufPrint(
+        &evidence_buffer,
+        "{s}/evidence",
+        .{root_buffer[0..root_len]},
+    );
+    try std.Io.Dir.createDirAbsolute(std.testing.io, evidence_dir, .default_dir);
+    var overflow_sink = BoundsOverflowSink{};
+    var runtime = cc.project_rule_gate.RuntimeGate{
+        .allocator = allocator,
+        .active = &active,
+        .config = config,
+        .abort = null,
+        .evidence_dir = evidence_dir,
+        .observation_sink = overflow_sink.sink(),
+    };
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.project_rule_gate = runtime.protocolGate();
+    ctx.tool_observer = overflow_sink.sink();
+
+    var big = std.ArrayList(u8).empty;
+    defer big.deinit(allocator);
+    try big.appendSlice(allocator, "{\"file_path\":\"");
+    try big.appendSlice(allocator, path);
+    try big.appendSlice(allocator, "\",\"content\":\"");
+    try big.appendNTimes(allocator, 'x', 14 * 1024);
+    try big.appendSlice(allocator, "\"}");
+    try std.testing.expect(big.items.len > 8192);
+
+    const result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        big.items,
+        "oversized-deliverable",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (result) {
+        .done => |done| {
+            defer if (done.content) |bytes| allocator.free(bytes);
+            defer if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            };
+            try std.testing.expect(!done.is_error);
+        },
+        else => return error.UnexpectedToolResult,
+    }
+    // Emitted once at pre; the numbers are the real envelope facts.
+    try std.testing.expectEqual(@as(usize, 1), overflow_sink.overflows);
+    try std.testing.expectEqual(@as(u64, big.items.len), overflow_sink.last_input_bytes);
+    try std.testing.expectEqual(@as(u64, 8192), overflow_sink.last_max_input_bytes);
+    try std.testing.expectEqual(@as(usize, 0), overflow_sink.blocks);
+    // The file really was written: verification, not enforcement.
+    const written = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        path,
+        allocator,
+        .limited(64 * 1024),
+    );
+    defer allocator.free(written);
+    try std.testing.expectEqual(@as(usize, 14 * 1024), written.len);
 }

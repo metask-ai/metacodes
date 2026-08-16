@@ -39,6 +39,7 @@ expected_axioms="'MetaCodesControl.ProjectHarness.safePromotion_sound' depends o
 'MetaCodesControl.ProjectRule.effect_class_allows_proven_new_file' depends on axioms: [propext]
 'MetaCodesControl.ProjectRule.effect_class_fails_closed_on_ambiguous_target' depends on axioms: [propext]
 'MetaCodesControl.ProjectRule.effect_class_cannot_deny' depends on axioms: [propext]
+'MetaCodesControl.ProjectRule.verify_only_bounds_overflow_admits' depends on axioms: [propext]
 'MetaCodesControl.ProjectRule.denied_observed_overwrite_selects_exact_edit_recovery' depends on axioms: [propext]
 'MetaCodesControl.ProjectRule.nonregular_target_has_no_exact_edit_recovery' depends on axioms: [propext]
 'MetaCodesControl.ProjectRule.exact_edit_recovery_pre_sound' depends on axioms: [propext]
@@ -107,6 +108,18 @@ effect_bindings=${effect_bindings/\"effect_requirement\":\"none\"/\"effect_requi
 prefix="${request_prefix}\"operation\":\"pre_decision\",${request_bindings}\"payload\":{\"pre\":{"
 deny_request="${prefix}\"tool\":\"Write\",\"input_bytes\":10,\"agent_depth\":0,\"authoritative\":true,\"file_target_state\":\"regular_existing\",\"exact_recovery_material_ready\":true,\"file_mutating\":true}}}"
 admit_request=${deny_request/\"regular_existing\"/\"missing\"}
+# The doubly-reproduced false-intervention shape must admit under a
+# verify-only rule: oversized input on a missing target is the author's
+# envelope exceeded, not a hazard.
+overflow_bindings=${request_bindings/\"target_scope\":\"existing_file\",\"deny_target\":true/\"target_scope\":\"all\",\"deny_target\":false}
+overflow_bindings=${overflow_bindings/\"effect_requirement\":\"none\"/\"effect_requirement\":\"file_mutation_v1_reobserved\"}
+overflow_prefix="${request_prefix}\"operation\":\"pre_decision\",${overflow_bindings}\"payload\":{\"pre\":{"
+overflow_request="${overflow_prefix}\"tool\":\"Write\",\"input_bytes\":14892,\"agent_depth\":0,\"authoritative\":true,\"file_target_state\":\"missing\",\"exact_recovery_material_ready\":false,\"file_mutating\":true}}}"
+overflow_verdict=$(printf '%s' "$overflow_request" | "$output")
+[[ "$overflow_verdict" == *'"decision":"admit"'* ]] || {
+  echo "build-project-harness-kernel: verify-only bounds-overflow smoke failed" >&2
+  exit 1
+}
 deny_verdict=$(printf '%s' "$deny_request" | "$output")
 admit_verdict=$(printf '%s' "$admit_request" | "$output")
 # Effect-class probes: the rule names an outcome, so an Edit over an existing

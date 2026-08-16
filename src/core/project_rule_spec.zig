@@ -258,10 +258,27 @@ pub fn preDecision(spec: Spec, signal: PreSignal) bool {
         },
     }
     if (spec.deny_target) return false;
-    if (signal.input_bytes > spec.max_input_bytes or
-        signal.agent_depth > spec.max_agent_depth) return false;
+    // Verify-only rules admit matched dispatches: obligations bind at post
+    // time, and the input/depth bounds are the author's reasoned envelope,
+    // not a safety verdict. Conflating the two blocked a legitimate 14KB
+    // new-file deliverable twice in independent paid runs and pushed the
+    // model into an ungoverned Bash escape. Overflow is reported by the
+    // gate as an observation, never enforced here.
     if (spec.authoritative_only and !signal.authoritative) return false;
     return true;
+}
+
+/// The reasoned envelope, exceeded. Instrumentation only — must never feed
+/// preDecision/postDecision.
+pub fn boundsOverflow(spec: Spec, signal: PreSignal) bool {
+    return signal.input_bytes > spec.max_input_bytes or
+        signal.agent_depth > spec.max_agent_depth;
+}
+
+/// Wire-level overflow check for the gate (which holds Wire entries).
+pub fn wireBoundsOverflow(wire: Wire, signal: PreSignal) bool {
+    return signal.input_bytes > wire.max_input_bytes or
+        signal.agent_depth > wire.max_agent_depth;
 }
 
 pub fn postDecision(spec: Spec, signal: PostSignal) bool {

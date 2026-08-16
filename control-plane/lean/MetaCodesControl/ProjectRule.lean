@@ -125,11 +125,23 @@ def valid (spec : RuleSpec) : Bool :=
   spec.maxAgentDepth ≤ 16 &&
   (!spec.denyTarget || spec.effectRequirement == .none)
 
+/-- Matched-dispatch decision.  Deny rules block.  Verify-only rules admit:
+their obligations bind at post time, and the input/depth bounds are the rule
+author's *reasoned envelope*, not a safety verdict — conflating the two blocked
+a legitimate 14KB new-file deliverable twice in independent paid runs and
+pushed the model into an ungoverned Bash escape.  Exceeding the envelope is
+reported by the host as a bounds-overflow observation, never enforced here.
+`authoritativeOnly` is a trust boundary, not a resource bound, and keeps its
+gating role. -/
 def matchedDecision (spec : RuleSpec) (signal : PreSignal) : Bool :=
   if spec.denyTarget then false
-  else signal.inputBytes ≤ spec.maxInputBytes &&
-    signal.agentDepth ≤ spec.maxAgentDepth &&
-    (!spec.authoritativeOnly || signal.authoritative)
+  else !spec.authoritativeOnly || signal.authoritative
+
+/-- The reasoned envelope, exceeded.  Host instrumentation keys on this; it
+must never influence `preDecision`/`postDecision`. -/
+def boundsOverflow (spec : RuleSpec) (signal : PreSignal) : Bool :=
+  signal.inputBytes > spec.maxInputBytes ||
+    signal.agentDepth > spec.maxAgentDepth
 
 /-- True when this dispatch is one the rule is *about*.  Static pruning must
 key on this predicate — not on the tool-name string — and
@@ -215,6 +227,25 @@ def recoveryAction (spec : RuleSpec) (signal : PreSignal) : RecoveryAction :=
       else
         .none
   | _, _ => .none
+
+/-- The doubly-reproduced WorkBuddy false intervention, made impossible: a
+verify-only rule admits a matched dispatch even when the input exceeds the
+authored envelope.  The obligation still binds at post time. -/
+theorem verify_only_bounds_overflow_admits (spec : RuleSpec) (signal : PreSignal)
+    (target : spec.target = .tool signal.tool)
+    (scope : spec.targetScope = .all)
+    (verify_only : spec.denyTarget = false)
+    (authority : !spec.authoritativeOnly || signal.authoritative = true)
+    (_overflow : boundsOverflow spec signal = true) :
+    preDecision spec signal = true := by
+  cases h : spec.authoritativeOnly with
+  | false => simp [preDecision, targetMatchesPre, matchedDecision, target,
+      scope, verify_only, h]
+  | true =>
+      have auth : signal.authoritative = true := by
+        simpa [h] using authority
+      simp [preDecision, targetMatchesPre, matchedDecision, target, scope,
+        verify_only, h, auth]
 
 theorem denied_all_target_blocks (spec : RuleSpec) (signal : PreSignal)
     (target : spec.target = .tool signal.tool) (scope : spec.targetScope = .all)
