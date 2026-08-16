@@ -1366,6 +1366,9 @@ def freeze_verification_manifest(
     artifact content-addressed."""
 
     from .project_harness_e3_experiment import (
+        PRODUCTION_MODEL_FINGERPRINT,
+        PRODUCTION_MODEL_ID,
+        PRODUCTION_PROVIDER_ID,
         VERIFICATION_CASES,
         _artifact,
         _git_identity,
