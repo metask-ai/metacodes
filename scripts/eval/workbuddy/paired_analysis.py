@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
 import math
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
@@ -427,6 +428,106 @@ def _control_delta(
     }
 
 
+def _verify_progress_analyzer_succession(
+    b_comparison: Mapping[str, Any],
+    t_comparison: Mapping[str, Any],
+    manifests: Mapping[str, Mapping[str, Any]],
+    baseline_receipt_path: Path,
+) -> Dict[str, object]:
+    """Admit exactly one covariate difference — the progress analyzer — and
+    only after proving it measurement-neutral on the baseline arm.
+
+    The progress analyzer is the measuring instrument, not a treatment
+    variable, but silently accepting a different instrument per arm would
+    let measurement drift masquerade as treatment effect.  Succession is
+    therefore earned, not declared: the current in-repo analyzer must (a)
+    be byte-identical to the one that measured the treatment arm, and (b)
+    reproduce the baseline receipt's committed progress metrics exactly,
+    from artifacts located by the receipt's own content hashes.  Anything
+    else stays the original fail-closed rejection."""
+
+    from .progress_analysis import analyze_progress
+
+    b_cov = dict(b_comparison.get("covariates") or {})
+    t_cov = dict(t_comparison.get("covariates") or {})
+    diff_keys = {
+        key
+        for key in set(b_cov) | set(t_cov)
+        if json.dumps(b_cov.get(key), sort_keys=True)
+        != json.dumps(t_cov.get(key), sort_keys=True)
+    }
+    if diff_keys != {"host_control_plane"}:
+        raise LaunchError("paired WorkBuddy frozen covariates differ between arms")
+    b_host = dict(b_cov["host_control_plane"])
+    t_host = dict(t_cov["host_control_plane"])
+    inner = {
+        key
+        for key in set(b_host) | set(t_host)
+        if json.dumps(b_host.get(key), sort_keys=True)
+        != json.dumps(t_host.get(key), sort_keys=True)
+    }
+    if inner != {"progress_analysis"}:
+        raise LaunchError("paired WorkBuddy frozen covariates differ between arms")
+    current_path = Path(__file__).resolve().parent / "progress_analysis.py"
+    current_sha256 = hashlib.sha256(current_path.read_bytes()).hexdigest()
+    treatment_sha256 = str((t_host.get("progress_analysis") or {}).get("sha256"))
+    baseline_sha256 = str((b_host.get("progress_analysis") or {}).get("sha256"))
+    if current_sha256 != treatment_sha256:
+        raise LaunchError(
+            "progress analyzer succession requires the current analyzer to be "
+            "the one that measured the treatment arm"
+        )
+    receipt, _receipt_sha, _receipt_bytes = _observed_json(baseline_receipt_path)
+    tasks = ((receipt.get("usage") or {}).get("tasks")) or {}
+    if not isinstance(tasks, Mapping) or not tasks:
+        raise LaunchError("progress analyzer succession requires baseline task evidence")
+    checkout = Path(str(manifests["baseline"]["workbuddy"]["checkout"]))
+    result_root = checkout / "results" / str(manifests["baseline"]["job"]["slug"])
+    by_sha: Dict[str, Path] = {}
+    if result_root.exists():
+        for transcript in result_root.rglob("metacodes-transcript.jsonl"):
+            digest = hashlib.sha256(transcript.read_bytes()).hexdigest()
+            by_sha[digest] = transcript
+    reverified = 0
+    for task, row in tasks.items():
+        committed = (row or {}).get("progress_metrics")
+        if not isinstance(committed, Mapping):
+            raise LaunchError(
+                f"progress analyzer succession lacks committed metrics for {task}"
+            )
+        source = committed.get("source") or {}
+        transcript_sha = str(source.get("transcript_sha256"))
+        observation_sha = str(source.get("observation_journal_sha256"))
+        transcript_path = by_sha.get(transcript_sha)
+        if transcript_path is None:
+            raise LaunchError(
+                f"progress analyzer succession cannot locate baseline artifacts for {task}"
+            )
+        observation_path = transcript_path.parent / "metacodes-tool-observations.jsonl"
+        if (
+            not observation_path.is_file()
+            or hashlib.sha256(observation_path.read_bytes()).hexdigest()
+            != observation_sha
+        ):
+            raise LaunchError(
+                f"progress analyzer succession cannot bind baseline observations for {task}"
+            )
+        recomputed = analyze_progress(transcript_path, observation_path)
+        if json.dumps(recomputed, sort_keys=True) != json.dumps(
+            committed, sort_keys=True
+        ):
+            raise LaunchError(
+                f"progress analyzer succession changed baseline measurement for {task}"
+            )
+        reverified += 1
+    return {
+        "covariate": "host_control_plane.progress_analysis",
+        "baseline_analyzer_sha256": baseline_sha256,
+        "treatment_analyzer_sha256": treatment_sha256,
+        "baseline_tasks_reverified_byte_identical": reverified,
+    }
+
+
 def build_report(
     *,
     study: str = PROJECT_CONTROL,
@@ -436,6 +537,7 @@ def build_report(
     treatment_manifest_path: Path,
     treatment_receipt_path: Path,
     treatment_journal_path: Path,
+    accept_progress_analyzer_succession: bool = False,
 ) -> Dict[str, object]:
     manifest_observations = {
         "baseline": _observed_json(baseline_manifest_path),
@@ -470,13 +572,19 @@ def build_report(
                 )
     b_comparison = manifests["baseline"]["comparison"]
     t_comparison = manifests["treatment"]["comparison"]
+    instrument_succession: Dict[str, object] | None = None
+    if b_comparison.get("comparison_id") != t_comparison.get("comparison_id"):
+        raise LaunchError("paired WorkBuddy frozen covariates differ between arms")
     if (
-        b_comparison.get("comparison_id") != t_comparison.get("comparison_id")
-        or b_comparison.get("covariates_sha256")
+        b_comparison.get("covariates_sha256")
         != t_comparison.get("covariates_sha256")
         or b_comparison.get("covariates") != t_comparison.get("covariates")
     ):
-        raise LaunchError("paired WorkBuddy frozen covariates differ between arms")
+        if not accept_progress_analyzer_succession:
+            raise LaunchError("paired WorkBuddy frozen covariates differ between arms")
+        instrument_succession = _verify_progress_analyzer_succession(
+            b_comparison, t_comparison, manifests, baseline_receipt_path
+        )
 
     receipt_observations = {
         "baseline": _receipt(
@@ -618,6 +726,11 @@ def build_report(
         "quality_evidence": quality_evidence,
         "comparison_id": b_comparison["comparison_id"],
         "covariates_sha256": b_comparison["covariates_sha256"],
+        **(
+            {"instrument_succession": instrument_succession}
+            if instrument_succession is not None
+            else {}
+        ),
         "arms": {
             arm: {
                 "manifest": manifest_identities[arm],
@@ -695,9 +808,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--treatment-receipt", type=Path, required=True)
     parser.add_argument("--treatment-budget-journal", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--accept-progress-analyzer-succession",
+        action="store_true",
+        help=(
+            "Admit a progress-analyzer difference between arms only after the "
+            "current analyzer is proven byte-identical to the treatment's and "
+            "reproduces every committed baseline progress metric exactly."
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         report = build_report(
+            accept_progress_analyzer_succession=args.accept_progress_analyzer_succession,
             study=args.study,
             baseline_manifest_path=args.baseline_manifest,
             baseline_receipt_path=args.baseline_receipt,
