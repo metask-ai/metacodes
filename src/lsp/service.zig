@@ -482,7 +482,7 @@ fn writeFileZ(path: []const u8, content: []const u8) void {
 test "Service e2e: 真 zls 报类型错误的 delta 诊断(需装 zls)" {
     const a = testing.allocator;
     var zbuf: [std.fs.max_path_bytes]u8 = undefined;
-    if (servers.which("zls", &zbuf) == null) return; // 未装 zls → skip
+    if (servers.which("zls", &zbuf) == null) return error.SkipZigTest; // 未装 zls → skip
 
     // 建 /tmp/cc_lsp_zls_<pid>/{.git, main.zig}。fake .git 让 workspace gate 过。
     const base = std.fmt.allocPrint(a, "/tmp/cc_lsp_zls_{d}", .{pprocess.currentPid()}) catch return;
@@ -520,7 +520,7 @@ test "Service e2e: 真 zls 报类型错误的 delta 诊断(需装 zls)" {
 test "Service e2e: 真 zls documentSymbol 抽 struct/function 符号(需装 zls)" {
     const a = testing.allocator;
     var zbuf: [std.fs.max_path_bytes]u8 = undefined;
-    if (servers.which("zls", &zbuf) == null) return; // 未装 → skip
+    if (servers.which("zls", &zbuf) == null) return error.SkipZigTest; // 未装 → skip
 
     const base = std.fmt.allocPrint(a, "/tmp/cc_lsp_sym_{d}", .{pprocess.currentPid()}) catch return;
     defer a.free(base);

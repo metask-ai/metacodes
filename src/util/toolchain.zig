@@ -114,11 +114,20 @@ fn searchPath() ?[:0]const u8 {
     return null;
 }
 
-test "ripgrepPath finds some rg or returns NotFound" {
-    _ = ripgrepPath() catch |err| {
+test "ripgrepPath resolves whenever a vendored rg exists" {
+    // The dual-outcome ancestor of this test ("finds some rg or returns
+    // NotFound") passed in every environment by construction and let the
+    // deployed resolver stay broken for ~200 container trials.  A conditional
+    // POSITIVE is the honest form: when the repo's vendored rg is present
+    // (every dev/CI checkout), resolution MUST succeed; only environments
+    // that genuinely lack any rg may skip.
+    const reachable = pfs.exists("./vendor/ripgrep/rg") or searchPath() != null;
+    const resolved = ripgrepPath() catch |err| {
         try std.testing.expect(err == error.RipgrepNotFound);
-        return;
+        if (reachable) return error.TestUnexpectedResult;
+        return error.SkipZigTest;
     };
+    try std.testing.expect(resolved.len > 0);
 }
 
 test "next-to-executable probe finds an adjacent rg" {

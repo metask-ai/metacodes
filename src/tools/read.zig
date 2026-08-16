@@ -914,7 +914,7 @@ test "Read outline e2e: 真 zls documentSymbol → 大纲(需装 zls)" {
     const a = std.testing.allocator;
     const lsp_servers = @import("../lsp/servers.zig");
     var zbuf: [std.fs.max_path_bytes]u8 = undefined;
-    if (lsp_servers.which("zls", &zbuf) == null) return; // 未装 → skip
+    if (lsp_servers.which("zls", &zbuf) == null) return error.SkipZigTest; // 未装 → skip
 
     const base = std.fmt.allocPrint(a, "/tmp/cc_lsp_read_{d}", .{pprocess.currentPid()}) catch return;
     defer a.free(base);

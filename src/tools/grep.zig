@@ -541,7 +541,7 @@ test "Grep 搭车:裸标识符前置 FindSymbol 定义块;正则不触发(需 zl
     // Y2 砍 tree-sitter 后:FindSymbol 走 LSP documentSymbol,搭车需 ctx.lsp + git workspace + zls。
     const lsp_servers = @import("../lsp/servers.zig");
     var zbuf: [std.fs.max_path_bytes]u8 = undefined;
-    if (lsp_servers.which("zls", &zbuf) == null) return; // 未装 zls → skip
+    if (lsp_servers.which("zls", &zbuf) == null) return error.SkipZigTest; // 未装 zls → skip
 
     // per-pid 唯一目录 + fake .git 过 workspace gate。
     var dbuf: [256]u8 = undefined;
