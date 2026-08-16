@@ -32,7 +32,13 @@ expected_axioms="'MetaCodesControl.ProjectHarness.safePromotion_sound' depends o
 'MetaCodesControl.ProjectHarness.rule_author_promotion_requires_receipt' depends on axioms: [propext]
 'MetaCodesControl.ProjectHarness.denied_all_predecision_blocks' depends on axioms: [propext]
 'MetaCodesControl.ProjectHarness.denied_existing_file_predecision_blocks' depends on axioms: [propext]
-'MetaCodesControl.ProjectRule.target_tool_mismatch_admits_both' depends on axioms: [propext]
+'MetaCodesControl.ProjectRule.target_mismatch_admits_both' depends on axioms: [propext]
+'MetaCodesControl.ProjectRule.reobservation_required' depends on axioms: [propext]
+'MetaCodesControl.ProjectRule.effect_class_matches_any_mutating_tool' depends on axioms: [propext]
+'MetaCodesControl.ProjectRule.effect_class_ignores_opaque_tools' depends on axioms: [propext]
+'MetaCodesControl.ProjectRule.effect_class_allows_proven_new_file' depends on axioms: [propext]
+'MetaCodesControl.ProjectRule.effect_class_fails_closed_on_ambiguous_target' depends on axioms: [propext]
+'MetaCodesControl.ProjectRule.effect_class_cannot_deny' depends on axioms: [propext]
 'MetaCodesControl.ProjectRule.denied_observed_overwrite_selects_exact_edit_recovery' depends on axioms: [propext]
 'MetaCodesControl.ProjectRule.nonregular_target_has_no_exact_edit_recovery' depends on axioms: [propext]
 'MetaCodesControl.ProjectRule.exact_edit_recovery_pre_sound' depends on axioms: [propext]
@@ -95,12 +101,32 @@ hex_e=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 hex_f=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 zero_hex=0000000000000000000000000000000000000000000000000000000000000000
 request_prefix="{\"schema_version\":\"metacodes-project-harness-request-v3\",\"request_id\":\"$hex_a\","
-request_bindings="\"expected_checker_version\":\"metacodes-project-harness-kernel-v3\",\"kernel_sha256\":\"$hex_a\",\"candidate_id\":\"$hex_b\",\"project_sha256\":\"$hex_c\",\"bundle_sha256\":\"$hex_d\",\"bundle_revision\":1,\"rule_spec\":{\"schema_version\":\"metacodes-project-rule-spec-v2\",\"target_tool\":\"Write\",\"target_scope\":\"existing_file\",\"deny_target\":true,\"max_input_bytes\":8192,\"max_agent_depth\":4,\"authoritative_only\":true,\"effect_requirement\":\"none\"},"
+request_bindings="\"expected_checker_version\":\"metacodes-project-harness-kernel-v3\",\"kernel_sha256\":\"$hex_a\",\"candidate_id\":\"$hex_b\",\"project_sha256\":\"$hex_c\",\"bundle_sha256\":\"$hex_d\",\"bundle_revision\":1,\"rule_spec\":{\"schema_version\":\"metacodes-project-rule-spec-v3\",\"target_kind\":\"tool\",\"target\":\"Write\",\"target_scope\":\"existing_file\",\"deny_target\":true,\"max_input_bytes\":8192,\"max_agent_depth\":4,\"authoritative_only\":true,\"effect_requirement\":\"none\"},"
+effect_bindings=${request_bindings/\"target_kind\":\"tool\",\"target\":\"Write\",\"target_scope\":\"existing_file\",\"deny_target\":true/\"target_kind\":\"effect_class\",\"target\":\"existing_file_rewrite\",\"target_scope\":\"all\",\"deny_target\":false}
+effect_bindings=${effect_bindings/\"effect_requirement\":\"none\"/\"effect_requirement\":\"file_mutation_v1_reobserved\"}
 prefix="${request_prefix}\"operation\":\"pre_decision\",${request_bindings}\"payload\":{\"pre\":{"
-deny_request="${prefix}\"tool\":\"Write\",\"input_bytes\":10,\"agent_depth\":0,\"authoritative\":true,\"file_target_state\":\"regular_existing\",\"exact_recovery_material_ready\":true}}}"
+deny_request="${prefix}\"tool\":\"Write\",\"input_bytes\":10,\"agent_depth\":0,\"authoritative\":true,\"file_target_state\":\"regular_existing\",\"exact_recovery_material_ready\":true,\"file_mutating\":true}}}"
 admit_request=${deny_request/\"regular_existing\"/\"missing\"}
 deny_verdict=$(printf '%s' "$deny_request" | "$output")
 admit_verdict=$(printf '%s' "$admit_request" | "$output")
+# Effect-class probes: the rule names an outcome, so an Edit over an existing
+# regular file is inside scope (pre admits: verify-only rule), and the post
+# obligation demands a reobserved mutation.
+effect_pre_prefix="${request_prefix}\"operation\":\"pre_decision\",${effect_bindings}\"payload\":{\"pre\":{"
+effect_pre_edit="${effect_pre_prefix}\"tool\":\"Edit\",\"input_bytes\":10,\"agent_depth\":0,\"authoritative\":true,\"file_target_state\":\"regular_existing\",\"exact_recovery_material_ready\":false,\"file_mutating\":true}}}"
+effect_pre_bash=${effect_pre_edit/\"tool\":\"Edit\"/\"tool\":\"Bash\"}
+effect_pre_bash=${effect_pre_bash/\"file_mutating\":true/\"file_mutating\":false}
+effect_post_prefix="${request_prefix}\"operation\":\"post_decision\",${effect_bindings}\"payload\":{\"post\":{\"pre\":{"
+effect_post_unobserved="${effect_post_prefix}\"tool\":\"Edit\",\"input_bytes\":10,\"agent_depth\":0,\"authoritative\":true,\"file_target_state\":\"regular_existing\",\"exact_recovery_material_ready\":false,\"file_mutating\":true},\"succeeded\":true,\"effect_valid\":true,\"has_file_mutation_v1\":true,\"post_reobserved\":false}}}"
+effect_pre_edit_verdict=$(printf '%s' "$effect_pre_edit" | "$output")
+effect_pre_bash_verdict=$(printf '%s' "$effect_pre_bash" | "$output")
+effect_post_unobserved_verdict=$(printf '%s' "$effect_post_unobserved" | "$output")
+[[ "$effect_pre_edit_verdict" == *'"decision":"admit"'* &&
+  "$effect_pre_bash_verdict" == *'"decision":"admit"'* &&
+  "$effect_post_unobserved_verdict" == *'"decision":"block"'* ]] || {
+  echo "build-project-harness-kernel: effect-class smoke failed" >&2
+  exit 1
+}
 [[ "$deny_verdict" == *'"decision":"block"'* &&
   "$deny_verdict" == *'"rule_precondition_blocked"'* &&
   "$deny_verdict" == *'"recover_edit_existing_file_exact"'* ]] || {

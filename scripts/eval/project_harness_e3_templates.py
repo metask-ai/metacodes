@@ -94,8 +94,9 @@ KERNEL_PROVENANCE_FIELDS = frozenset(
 )
 EXPECTED_SPECS: Mapping[str, Mapping[str, Any]] = {
     "static": {
-        "schema_version": "metacodes-project-rule-spec-v2",
-        "target_tool": "Write",
+        "schema_version": "metacodes-project-rule-spec-v3",
+        "target_kind": "tool",
+        "target": "Write",
         "target_scope": "all",
         "deny_target": False,
         "max_input_bytes": 8192,
@@ -104,8 +105,9 @@ EXPECTED_SPECS: Mapping[str, Mapping[str, Any]] = {
         "effect_requirement": "file_mutation_v1_reobserved",
     },
     "evolved": {
-        "schema_version": "metacodes-project-rule-spec-v2",
-        "target_tool": "Write",
+        "schema_version": "metacodes-project-rule-spec-v3",
+        "target_kind": "tool",
+        "target": "Write",
         "target_scope": "existing_file",
         "deny_target": True,
         "max_input_bytes": 8192,

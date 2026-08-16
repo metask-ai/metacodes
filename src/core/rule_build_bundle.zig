@@ -567,7 +567,7 @@ test "build bundle verifier re-reads real artifacts before lifecycle receipts" {
         .proposer_sha256 = proposer,
         .invariant = "Successful Write effects are re-observed.",
         .rule_spec = .{
-            .target_tool = "Write",
+            .target = .{ .tool = "Write" },
             .deny_target = false,
             .max_input_bytes = 8192,
             .max_agent_depth = 4,

@@ -294,7 +294,7 @@ fn textSse(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
 
 fn proposalJson(allocator: std.mem.Allocator) ![]u8 {
     const spec = cc.project_rule_spec.Spec{
-        .target_tool = "Write",
+        .target = .{ .tool = "Write" },
         .target_scope = .existing_file,
         .deny_target = true,
         .max_input_bytes = 8192,

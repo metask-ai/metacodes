@@ -46,7 +46,7 @@ LEGACY_FORMAL_BATCH_SCHEMAS = frozenset(
     for version in range(2, 5)
 )
 RULE_FILTER_SCHEMA = "metacodes-project-rule-filter-v1"
-RULE_FILTER_PROOF = "MetaCodesControl.ProjectRule.target_tool_mismatch_admits_both"
+RULE_FILTER_PROOF = "MetaCodesControl.ProjectRule.target_mismatch_admits_both"
 
 
 class CalibrationError(RuntimeError):

@@ -20,6 +20,7 @@ pub const FORMAL_BATCH_SCHEMA_VERSION_V3 = "metacodes-project-formal-decision-ba
 pub const FORMAL_BATCH_SCHEMA_VERSION_V4 = "metacodes-project-formal-decision-batch-v4";
 pub const FORMAL_BATCH_SCHEMA_VERSION = "metacodes-project-formal-decision-batch-v5";
 pub const RULE_FILTER_SCHEMA_VERSION = "metacodes-project-rule-filter-v1";
+pub const RULE_COVERAGE_GAP_SCHEMA_VERSION = "metacodes-project-rule-coverage-gap-v1";
 
 pub const Origin = enum {
     authoritative,
@@ -195,6 +196,26 @@ pub const EffectSlot = struct {
 };
 
 pub const Event = union(enum) {
+    /// A dispatch produced a governed effect class while **zero** active rules
+    /// targeted its tool. The rule plane did not fail here — it was never
+    /// consulted, because rule applicability is keyed on the tool name while
+    /// the obligation is about the effect. An advisory plane (memory, prompt)
+    /// that shifts the action distribution can therefore move traffic off the
+    /// enforced plane silently. Emit that as a first-class signal instead of
+    /// leaving it to be reconstructed from transcripts after the fact.
+    rule_coverage_gap: struct {
+        schema_version: []const u8 = RULE_COVERAGE_GAP_SCHEMA_VERSION,
+        dispatch_id: []const u8,
+        tool: []const u8,
+        effect_class: []const u8,
+        project_sha256: [64]u8,
+        bundle_sha256: [64]u8,
+        bundle_revision: u64,
+        active_rule_count: u32,
+        /// Always zero when this event is emitted; kept explicit so a reader
+        /// never has to infer the absence.
+        matching_rule_count: u32 = 0,
+    },
     rule_filter: struct {
         schema_version: []const u8 = RULE_FILTER_SCHEMA_VERSION,
         dispatch_id: []const u8,
@@ -210,7 +231,7 @@ pub const Event = union(enum) {
         /// retained despite its ordinary target mismatch. This is therefore a
         /// prune count, not the raw number of mismatching targets.
         statically_pruned_rule_count: u32,
-        proof: []const u8 = "MetaCodesControl.ProjectRule.target_tool_mismatch_admits_both",
+        proof: []const u8 = "MetaCodesControl.ProjectRule.target_mismatch_admits_both",
     },
     formal_decision: struct {
         // This is an additive journal event with a separate schema. Reusing

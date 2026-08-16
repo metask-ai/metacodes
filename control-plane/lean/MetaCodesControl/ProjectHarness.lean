@@ -195,20 +195,22 @@ theorem rule_author_promotion_requires_receipt (request : Request)
 
 theorem denied_all_predecision_blocks (request : Request) (signal : PreSignal)
     (payload : request.payload = .pre signal)
-    (same : signal.tool = request.ruleSpec.targetTool)
+    (target : request.ruleSpec.target = .tool signal.tool)
     (scope : request.ruleSpec.targetScope = .all)
     (denied : request.ruleSpec.denyTarget = true) :
     decide request = false := by
-  simp [decide, payload, preDecision, matchedDecision, same, scope, denied]
+  simp [decide, payload, preDecision, targetMatchesPre, matchedDecision,
+    target, scope, denied]
 
 theorem denied_existing_file_predecision_blocks (request : Request)
     (signal : PreSignal) (payload : request.payload = .pre signal)
-    (same : signal.tool = request.ruleSpec.targetTool)
+    (target : request.ruleSpec.target = .tool signal.tool)
     (scope : request.ruleSpec.targetScope = .existingFile)
     (state : signal.fileTargetState = .regularExisting)
     (denied : request.ruleSpec.denyTarget = true) :
     decide request = false := by
-  simp [decide, payload, preDecision, matchedDecision, same, scope, state, denied]
+  simp [decide, payload, preDecision, targetMatchesPre, matchedDecision,
+    target, scope, state, denied]
 
 /-- A batch is admitted exactly when every independently bound request is
 admitted.  Batching changes process topology only; it cannot let one rule hide
@@ -286,11 +288,24 @@ def parseFileTargetStateField (cursor : Cursor) (name : String) :
   | some state => pure (state, cursor)
   | none => throw "unsupported file target state"
 
+def effectClassOfString? : String → Option EffectClass
+  | "existing_file_rewrite" => some .existingFileRewrite
+  | _ => none
+
 def parseRuleSpec (cursor : Cursor) : Except String (RuleSpec × Cursor) := do
   let cursor ← expectLiteral cursor "{\"schema_version\":"
   let (schema, cursor) ← parseString cursor
   let cursor ← expectLiteral cursor ","
-  let (targetTool, cursor) ← parseStringField cursor "target_tool"
+  let (targetKindRaw, cursor) ← parseStringField cursor "target_kind"
+  let cursor ← expectLiteral cursor ","
+  let (targetRaw, cursor) ← parseStringField cursor "target"
+  let target ← match targetKindRaw with
+    | "tool" => pure (RuleTarget.tool targetRaw)
+    | "effect_class" =>
+        match effectClassOfString? targetRaw with
+        | some cls => pure (RuleTarget.effectClass cls)
+        | none => throw "unsupported effect class"
+    | _ => throw "unsupported target kind"
   let cursor ← expectLiteral cursor ","
   let (targetScope, cursor) ← parseScopeField cursor "target_scope"
   let cursor ← expectLiteral cursor ","
@@ -306,7 +321,7 @@ def parseRuleSpec (cursor : Cursor) : Except String (RuleSpec × Cursor) := do
   let cursor ← expectLiteral cursor "}"
   if schema != specSchema then throw "unsupported project rule spec"
   let spec : RuleSpec := {
-    targetTool := targetTool
+    target := target
     targetScope := targetScope
     denyTarget := denyTarget
     maxInputBytes := maxInputBytes
@@ -331,6 +346,8 @@ def parsePreSignal (cursor : Cursor) : Except String (PreSignal × Cursor) := do
   let cursor ← expectLiteral cursor ","
   let (exactRecoveryMaterialReady, cursor) ←
     parseBoolField cursor "exact_recovery_material_ready"
+  let cursor ← expectLiteral cursor ","
+  let (fileMutating, cursor) ← parseBoolField cursor "file_mutating"
   let cursor ← expectLiteral cursor "}"
   let signal : PreSignal := {
     tool := tool
@@ -339,6 +356,7 @@ def parsePreSignal (cursor : Cursor) : Except String (PreSignal × Cursor) := do
     authoritative := authoritative
     fileTargetState := fileTargetState
     exactRecoveryMaterialReady := exactRecoveryMaterialReady
+    fileMutating := fileMutating
   }
   pure (signal, cursor)
 

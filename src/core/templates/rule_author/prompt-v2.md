@@ -26,9 +26,10 @@ and no Markdown, using the response schema below:
   "invariant": null | "precise project invariant",
   "falsifier": null | "concrete replay condition that rejects the invariant",
   "rule_spec": null | {
-    "schema_version": "metacodes-project-rule-spec-v2",
-    "target_tool": "tool name",
-    "target_scope": "all" | "existing_file",
+    "schema_version": "metacodes-project-rule-spec-v3",
+    "target_kind": "tool" | "effect_class",
+    "target": "tool name, or the effect class existing_file_rewrite",
+    "target_scope": "all" | "existing_file (tool targets only)",
     "deny_target": true | false,
     "max_input_bytes": 1..16777216,
     "max_agent_depth": 0..16,
@@ -37,6 +38,13 @@ and no Markdown, using the response schema below:
   },
   "lean_source": null | "Lean source"
 }
+
+Target kinds: `tool` scopes the rule to one tool by name. `effect_class`
+scopes it to a governed outcome — `existing_file_rewrite` covers every
+file-mutating tool (Write/Edit/NotebookEdit) that rewrites an existing
+regular file, so one rule survives the model switching tools. Effect-class
+rules must use `target_scope` "all" and `deny_target` false: they verify
+(typically `file_mutation_v1_reobserved`), they do not deny.
 
 Use "abstain" unless the authenticated generation evidence plus non-authorizing
 ontology context support one narrow RuleSpec v2. For abstention, reason must be

@@ -879,7 +879,7 @@ test "user correction source remains distinct and requires authority evidence" {
 
 fn testRuleSpec() project_rule_spec.Spec {
     return .{
-        .target_tool = "Write",
+        .target = .{ .tool = "Write" },
         .deny_target = false,
         .max_input_bytes = 8192,
         .max_agent_depth = 4,

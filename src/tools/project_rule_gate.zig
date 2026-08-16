@@ -67,6 +67,10 @@ pub const PreSignal = struct {
     authoritative: bool,
     file_target_state: project_rule_spec.FileTargetState = .unobserved,
     exact_edit_material: ExactEditMaterial = .{},
+    /// Host fact from `project_rule_signal.isFileMutatingTool`; effect-class
+    /// applicability keys on it. Defaults false so a caller that never senses
+    /// file tools cannot accidentally claim mutation capability.
+    file_mutating: bool = false,
 };
 
 pub const PostSignal = struct {

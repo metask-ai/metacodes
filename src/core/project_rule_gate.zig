@@ -229,8 +229,9 @@ pub const RuntimeGate = struct {
             .authoritative = signal.authoritative,
             .file_target_state = signal.file_target_state,
             .exact_recovery_material_ready = signal.exact_edit_material.writeNeedsEdit(),
+            .file_mutating = signal.file_mutating,
         };
-        const matching = self.matchingRuleCount(signal.tool);
+        const matching = self.matchingRuleCount(formal_signal);
         if (matching == 0) {
             if (!self.recordRuleFilter(signal.dispatch_id, .pre, .ordinary, 0))
                 return .{ .result = .fault };
@@ -246,7 +247,7 @@ pub const RuntimeGate = struct {
         defer self.allocator.free(request_ids);
         var index: usize = 0;
         for (self.active.rules) |entry| {
-            if (!std.mem.eql(u8, entry.rule_spec.target_tool, signal.tool)) continue;
+            if (!spec_mod.wireTargetMatchesPre(entry.rule_spec, formal_signal)) continue;
             const candidate_id = parseHex(entry.candidate_id) orelse return error.InvalidCandidateId;
             request_ids[index] = kernel.requestId(
                 .pre_decision,
@@ -303,6 +304,7 @@ pub const RuntimeGate = struct {
             .authoritative = signal.pre.authoritative,
             .file_target_state = signal.pre.file_target_state,
             .exact_recovery_material_ready = signal.pre.exact_edit_material.writeNeedsEdit(),
+            .file_mutating = signal.pre.file_mutating,
         };
         const formal_signal = spec_mod.PostSignal{
             .pre = formal_pre,
@@ -311,10 +313,21 @@ pub const RuntimeGate = struct {
             .has_file_mutation_v1 = hasFileMutation(signal.effect),
             .post_reobserved = postReobserved(signal.effect),
         };
-        const matching = self.matchingRuleCount(signal.pre.tool);
+        const matching = self.matchingRuleCount(formal_pre);
         if (matching == 0) {
             if (!self.recordRuleFilter(signal.pre.dispatch_id, .post, .ordinary, 0))
                 return .{ .result = .fault };
+            // Admitting here is correct — no rule claims this tool — but if the
+            // dispatch nevertheless produced a governed effect, the obligation
+            // was met by nobody. Report the gap; do not change the verdict, so
+            // instrumentation can never become a covert enforcement path.
+            if (governedEffectClass(signal.effect)) |effect_class| {
+                if (!self.recordCoverageGap(
+                    signal.pre.dispatch_id,
+                    signal.pre.tool,
+                    effect_class,
+                )) return .{ .result = .fault };
+            }
             return .{ .result = .admit };
         }
         const signal_json = try std.json.Stringify.valueAlloc(self.allocator, formal_signal, .{});
@@ -327,7 +340,7 @@ pub const RuntimeGate = struct {
         defer self.allocator.free(request_ids);
         var index: usize = 0;
         for (self.active.rules) |entry| {
-            if (!std.mem.eql(u8, entry.rule_spec.target_tool, signal.pre.tool)) continue;
+            if (!spec_mod.wireTargetMatchesPre(entry.rule_spec, formal_pre)) continue;
             const candidate_id = parseHex(entry.candidate_id) orelse return error.InvalidCandidateId;
             request_ids[index] = kernel.requestId(
                 .post_decision,
@@ -517,7 +530,7 @@ pub const RuntimeGate = struct {
         var checker_rule_count: usize = 1;
         for (self.active.rules, 0..) |entry, index| {
             if (index != rule_index and
-                std.mem.eql(u8, entry.rule_spec.target_tool, ordinaryTool(ordinary_payload)))
+                spec_mod.wireTargetMatchesPre(entry.rule_spec, ordinarySignal(ordinary_payload)))
                 checker_rule_count += 1;
         }
         const requests = try self.allocator.alloc(kernel.Request, checker_rule_count);
@@ -536,7 +549,7 @@ pub const RuntimeGate = struct {
                 const is_recovery = index == rule_index;
                 if ((pass == 0) != is_recovery) continue;
                 if (!is_recovery and
-                    !std.mem.eql(u8, entry.rule_spec.target_tool, ordinaryTool(ordinary_payload)))
+                    !spec_mod.wireTargetMatchesPre(entry.rule_spec, ordinarySignal(ordinary_payload)))
                     continue;
                 const candidate_id = parseHex(entry.candidate_id) orelse
                     return error.InvalidCandidateId;
@@ -720,12 +733,56 @@ pub const RuntimeGate = struct {
         return null;
     }
 
-    fn matchingRuleCount(self: *const RuntimeGate, tool: []const u8) usize {
+    /// Governed effect classes. A rule bundle expresses obligations about the
+    /// *effect* ("do not rewrite an existing file out from under its reader"),
+    /// but rule applicability is keyed on the tool name. Any other route to the
+    /// same effect is therefore outside every rule's reach — not denied, simply
+    /// never evaluated. Name the class so the gap is reportable.
+    fn governedEffectClass(effect: ?observation.Effect) ?[]const u8 {
+        const value = effect orelse return null;
+        const mutation = switch (value) {
+            .file_mutation_v1 => |m| m,
+            .file_mutation_v2 => |m| m.mutation,
+        };
+        if (mutation.before_state == .known and mutation.change == .changed)
+            return "existing_file_rewritten";
+        return null;
+    }
+
+    fn matchingRuleCount(
+        self: *const RuntimeGate,
+        signal: spec_mod.PreSignal,
+    ) usize {
         var count: usize = 0;
         for (self.active.rules) |entry| {
-            if (std.mem.eql(u8, entry.rule_spec.target_tool, tool)) count += 1;
+            if (spec_mod.wireTargetMatchesPre(entry.rule_spec, signal)) count += 1;
         }
         return count;
+    }
+
+    /// Report a dispatch that produced a governed effect while zero active
+    /// rules targeted its tool. This is the signal that an advisory plane
+    /// (memory/prompt) has routed work around the enforced plane: the rule
+    /// never fired because it was never consulted. Without it the bypass is
+    /// only recoverable by reading transcripts after the fact.
+    fn recordCoverageGap(
+        self: *const RuntimeGate,
+        dispatch_id: []const u8,
+        tool: []const u8,
+        effect_class: []const u8,
+    ) bool {
+        if ((self.evidence_dir != null) != (self.observation_sink != null)) return false;
+        const sink = self.observation_sink orelse return true;
+        if (self.active.rules.len > std.math.maxInt(u32)) return false;
+        return sink.emit(.{ .rule_coverage_gap = .{
+            .dispatch_id = dispatch_id,
+            .tool = tool,
+            .effect_class = effect_class,
+            .project_sha256 = self.active.project_sha256,
+            .bundle_sha256 = self.active.bundle_sha256,
+            .bundle_revision = self.active.revision,
+            .active_rule_count = @intCast(self.active.rules.len),
+        } });
     }
 
     fn recordRuleFilter(
@@ -848,10 +905,10 @@ fn isRecoveryOperation(operation: kernel.Operation) bool {
     };
 }
 
-fn ordinaryTool(payload: kernel.Payload) []const u8 {
+fn ordinarySignal(payload: kernel.Payload) spec_mod.PreSignal {
     return switch (payload) {
-        .pre => |signal| signal.tool,
-        .post => |signal| signal.pre.tool,
+        .pre => |signal| signal,
+        .post => |signal| signal.pre,
         .promotion, .recovery_pre, .recovery_post => unreachable,
     };
 }

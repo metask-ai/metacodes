@@ -447,6 +447,10 @@ pub fn loadRunDispatches(
                 stop_reason = finished.stop_reason;
             },
             .tool_observation => |event| switch (event) {
+                // Diagnostic-only: a coverage gap binds no rule identity and
+                // no checker call, so replay has nothing to validate. It must
+                // still never be silently dropped from the hashed interval.
+                .rule_coverage_gap => {},
                 .rule_filter => |filter| try rule_filters.append(a, .{
                     .sequence = envelope.sequence,
                     .dispatch_id = filter.dispatch_id,
@@ -702,6 +706,7 @@ fn validateFd(
                     }
                 }
                 switch (tool_event) {
+                    .rule_coverage_gap => {},
                     .rule_filter => |filter| {
                         try validateRuleFilter(&rule_filter_identities, filter);
                         const key = ruleFilterKey(filter.dispatch_id, filter.phase);
@@ -972,7 +977,7 @@ fn validateRuleFilter(
         !std.mem.eql(
             u8,
             filter.proof,
-            "MetaCodesControl.ProjectRule.target_tool_mismatch_admits_both",
+            "MetaCodesControl.ProjectRule.target_mismatch_admits_both",
         ) or
         filter.bundle_revision == 0 or filter.active_rule_count == 0 or
         filter.checker_rule_count > filter.active_rule_count or

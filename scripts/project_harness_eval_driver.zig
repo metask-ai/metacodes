@@ -275,7 +275,7 @@ fn syntheticActive(
     const a = arena.allocator();
     const spec: cc.project_rule_spec.Spec = switch (arm) {
         .static_enforced => .{
-            .target_tool = "Write",
+            .target = .{ .tool = "Write" },
             .deny_target = false,
             .max_input_bytes = 8192,
             .max_agent_depth = 4,
@@ -283,7 +283,7 @@ fn syntheticActive(
             .effect_requirement = .file_mutation_v1_reobserved,
         },
         .evolved_shadow, .evolved_enforced => .{
-            .target_tool = "Write",
+            .target = .{ .tool = "Write" },
             .target_scope = .existing_file,
             .deny_target = true,
             .max_input_bytes = 8192,

@@ -2,7 +2,7 @@ import Std
 
 namespace MetaCodesControl.ProjectRule
 
-def specSchema : String := "metacodes-project-rule-spec-v2"
+def specSchema : String := "metacodes-project-rule-spec-v3"
 
 inductive EffectRequirement where
   | none
@@ -12,6 +12,23 @@ inductive EffectRequirement where
 inductive TargetScope where
   | all
   | existingFile
+  deriving Repr, BEq, DecidableEq
+
+/-- A governed effect class names the *outcome* a rule is about, so one rule
+covers every tool that can produce it.  Tool-name targeting alone let an
+advisory plane route the same effect through an uncovered tool.  The class is
+a closed enum for the same reason `TargetScope` is: the fixed kernel, not
+candidate Lean source, owns the applicability predicate. -/
+inductive EffectClass where
+  | existingFileRewrite
+  deriving Repr, BEq, DecidableEq
+
+/-- What a rule targets: one concrete tool by name, or one governed effect
+class.  The union replaces the old bare `targetTool : String`; a rule cannot
+be simultaneously tool- and effect-scoped, and there is no sentinel name. -/
+inductive RuleTarget where
+  | tool (name : String)
+  | effectClass (cls : EffectClass)
   deriving Repr, BEq, DecidableEq
 
 inductive FileTargetState where
@@ -32,7 +49,7 @@ inductive RecoveryAction where
   deriving Repr, BEq, DecidableEq
 
 structure RuleSpec where
-  targetTool : String
+  target : RuleTarget
   targetScope : TargetScope := .all
   denyTarget : Bool
   maxInputBytes : Nat
@@ -48,6 +65,11 @@ structure PreSignal where
   authoritative : Bool
   fileTargetState : FileTargetState := .unobserved
   exactRecoveryMaterialReady : Bool := false
+  /-- Host-owned fact: the dispatched tool's primary operation mutates a
+  single observed file target.  The kernel cannot know the tool roster; it
+  trusts this bit exactly the way it trusts `fileTargetState`.  Opaque tools
+  (Bash) stay `false` and remain outside effect-class coverage. -/
+  fileMutating : Bool := false
   deriving Repr, BEq
 
 structure RecoveryPreSignal where
@@ -83,9 +105,22 @@ structure PostSignal where
 Keeping host encoding validation outside this predicate lets candidate proofs
 remain axiom-free: Std's optimized Char classification currently introduces
 `propext` into `#print axioms` even for a closed `rfl` proof. -/
+def validTarget (spec : RuleSpec) : Bool :=
+  match spec.target with
+  | .tool name =>
+      !name.isEmpty && name.length ≤ 128 &&
+        (spec.targetScope != .existingFile || name == "Write")
+  | .effectClass _ =>
+      -- The class itself encodes the file-state condition; a scope on top
+      -- would double-encode it.  Deny is a phase restriction: deny-on-class
+      -- would also deny the exact-edit recovery rail (the rail ends in an
+      -- Edit, which matches the class), and a deny without a recovery
+      -- protocol manufactures escape routes.  Until deny carries a
+      -- class-shaped recovery design, effect-class rules verify only.
+      spec.targetScope == .all && !spec.denyTarget
+
 def valid (spec : RuleSpec) : Bool :=
-  !spec.targetTool.isEmpty && spec.targetTool.length ≤ 128 &&
-  (spec.targetScope != .existingFile || spec.targetTool == "Write") &&
+  validTarget spec &&
   0 < spec.maxInputBytes && spec.maxInputBytes ≤ 16 * 1024 * 1024 &&
   spec.maxAgentDepth ≤ 16 &&
   (!spec.denyTarget || spec.effectRequirement == .none)
@@ -96,17 +131,35 @@ def matchedDecision (spec : RuleSpec) (signal : PreSignal) : Bool :=
     signal.agentDepth ≤ spec.maxAgentDepth &&
     (!spec.authoritativeOnly || signal.authoritative)
 
+/-- True when this dispatch is one the rule is *about*.  Static pruning must
+key on this predicate — not on the tool-name string — and
+`target_mismatch_admits_both` proves pruning on its negation is
+semantics-preserving. -/
+def targetMatchesPre (spec : RuleSpec) (signal : PreSignal) : Bool :=
+  match spec.target with
+  | .tool name => signal.tool == name
+  | .effectClass .existingFileRewrite => signal.fileMutating
+
 def preDecision (spec : RuleSpec) (signal : PreSignal) : Bool :=
-  if signal.tool != spec.targetTool then true
-  else match spec.targetScope with
-    | .all => matchedDecision spec signal
-    | .existingFile => match signal.fileTargetState with
+  if !targetMatchesPre spec signal then true
+  else match spec.target with
+    | .tool _ => match spec.targetScope with
+      | .all => matchedDecision spec signal
+      | .existingFile => match signal.fileTargetState with
+        | .missing => true
+        | .regularExisting => matchedDecision spec signal
+        | .unobserved | .otherExisting | .unavailable => false
+    | .effectClass .existingFileRewrite =>
+      -- Same conservative ladder as the existingFile scope: a mutating tool
+      -- over an ambiguous target state cannot be proven not to be rewriting
+      -- an existing file, so it fails closed.
+      match signal.fileTargetState with
       | .missing => true
       | .regularExisting => matchedDecision spec signal
       | .unobserved | .otherExisting | .unavailable => false
 
 def postDecision (spec : RuleSpec) (signal : PostSignal) : Bool :=
-  if signal.pre.tool != spec.targetTool then true
+  if !targetMatchesPre spec signal.pre then true
   else if !preDecision spec signal.pre then false
   else if !signal.succeeded then true
   else match spec.effectRequirement with
@@ -115,7 +168,10 @@ def postDecision (spec : RuleSpec) (signal : PostSignal) : Bool :=
         signal.effectValid && signal.hasFileMutationV1 && signal.postReobserved
 
 def supportsExactEditRecovery (spec : RuleSpec) : Bool :=
-  valid spec && spec.targetTool == "Write" &&
+  valid spec &&
+    (match spec.target with
+      | .tool name => name == "Write"
+      | .effectClass _ => false) &&
     spec.targetScope == .existingFile && spec.denyTarget
 
 def recoveryPreDecision (spec : RuleSpec) (signal : RecoveryPreSignal) : Bool :=
@@ -154,77 +210,128 @@ def recoveryAction (spec : RuleSpec) (signal : PreSignal) : RecoveryAction :=
   match spec.targetScope, signal.fileTargetState with
   | .existingFile, .regularExisting =>
       if supportsExactEditRecovery spec &&
-          signal.tool == spec.targetTool && !preDecision spec signal then
+          targetMatchesPre spec signal && !preDecision spec signal then
         if signal.exactRecoveryMaterialReady then .editExistingFileExact else .none
       else
         .none
   | _, _ => .none
 
 theorem denied_all_target_blocks (spec : RuleSpec) (signal : PreSignal)
-    (same : signal.tool = spec.targetTool) (scope : spec.targetScope = .all)
+    (target : spec.target = .tool signal.tool) (scope : spec.targetScope = .all)
     (denied : spec.denyTarget = true) :
     preDecision spec signal = false := by
-  simp [preDecision, matchedDecision, same, scope, denied]
+  simp [preDecision, targetMatchesPre, matchedDecision, target, scope, denied]
 
 theorem denied_existing_file_blocks_regular (spec : RuleSpec) (signal : PreSignal)
-    (same : signal.tool = spec.targetTool)
+    (target : spec.target = .tool signal.tool)
     (scope : spec.targetScope = .existingFile)
     (state : signal.fileTargetState = .regularExisting)
     (denied : spec.denyTarget = true) :
     preDecision spec signal = false := by
-  simp [preDecision, matchedDecision, same, scope, state, denied]
+  simp [preDecision, targetMatchesPre, matchedDecision, target, scope, state,
+    denied]
 
 theorem existing_file_scope_allows_missing (spec : RuleSpec) (signal : PreSignal)
-    (same : signal.tool = spec.targetTool)
+    (target : spec.target = .tool signal.tool)
     (scope : spec.targetScope = .existingFile)
     (state : signal.fileTargetState = .missing) :
     preDecision spec signal = true := by
-  simp [preDecision, same, scope, state]
+  simp [preDecision, targetMatchesPre, target, scope, state]
 
 theorem existing_file_scope_fails_closed_without_regular_observation
     (spec : RuleSpec) (signal : PreSignal)
-    (same : signal.tool = spec.targetTool)
+    (target : spec.target = .tool signal.tool)
     (scope : spec.targetScope = .existingFile)
     (uncertain : signal.fileTargetState = .unobserved ∨
       signal.fileTargetState = .otherExisting ∨
       signal.fileTargetState = .unavailable) :
     preDecision spec signal = false := by
   rcases uncertain with state | state | state <;>
-    simp [preDecision, same, scope, state]
+    simp [preDecision, targetMatchesPre, target, scope, state]
 
-/-- The host may erase rules whose target tool differs from the concrete tool
-signal before invoking the sidecar. This is a semantics-preserving fast path,
-not a second authorization policy: both fixed-kernel decisions are
-definitionally `true` for every non-target tool. -/
-theorem target_tool_mismatch_admits_both (spec : RuleSpec) (signal : PostSignal)
-    (different : signal.pre.tool ≠ spec.targetTool) :
+/-- The host may erase rules whose target predicate does not hold for the
+concrete pre signal before invoking the sidecar.  This is a
+semantics-preserving fast path, not a second authorization policy: both
+fixed-kernel decisions are definitionally `true` whenever the target does not
+match.  This generalizes the retired `target_tool_mismatch_admits_both`: the
+predicate is `targetMatchesPre`, which covers effect-class targets too. -/
+theorem target_mismatch_admits_both (spec : RuleSpec) (signal : PostSignal)
+    (different : targetMatchesPre spec signal.pre = false) :
     preDecision spec signal.pre = true ∧ postDecision spec signal = true := by
   simp [preDecision, postDecision, different]
 
 theorem reobservation_required (spec : RuleSpec) (signal : PostSignal)
-    (same : signal.pre.tool = spec.targetTool)
+    (matched : targetMatchesPre spec signal.pre = true)
     (pre : preDecision spec signal.pre = true)
     (succeeded : signal.succeeded = true)
     (required : spec.effectRequirement = .fileMutationV1Reobserved)
     (admitted : postDecision spec signal = true) :
     signal.effectValid = true ∧ signal.hasFileMutationV1 = true ∧
       signal.postReobserved = true := by
-  simp [postDecision, same, pre, succeeded, required] at admitted
+  simp [postDecision, matched, pre, succeeded, required] at admitted
   simpa only [and_assoc] using admitted
+
+theorem effect_class_matches_any_mutating_tool (spec : RuleSpec)
+    (signal : PreSignal)
+    (target : spec.target = .effectClass .existingFileRewrite)
+    (mutating : signal.fileMutating = true) :
+    targetMatchesPre spec signal = true := by
+  simp [targetMatchesPre, target, mutating]
+
+theorem effect_class_ignores_opaque_tools (spec : RuleSpec) (signal : PostSignal)
+    (target : spec.target = .effectClass .existingFileRewrite)
+    (opaqueTool : signal.pre.fileMutating = false) :
+    preDecision spec signal.pre = true ∧ postDecision spec signal = true := by
+  refine target_mismatch_admits_both spec signal ?_
+  simp [targetMatchesPre, target, opaqueTool]
+
+theorem effect_class_allows_proven_new_file (spec : RuleSpec)
+    (signal : PreSignal)
+    (target : spec.target = .effectClass .existingFileRewrite)
+    (state : signal.fileTargetState = .missing) :
+    preDecision spec signal = true := by
+  cases hm : signal.fileMutating with
+  | false => simp [preDecision, targetMatchesPre, target, hm]
+  | true => simp [preDecision, targetMatchesPre, target, hm, state]
+
+theorem effect_class_fails_closed_on_ambiguous_target (spec : RuleSpec)
+    (signal : PreSignal)
+    (target : spec.target = .effectClass .existingFileRewrite)
+    (mutating : signal.fileMutating = true)
+    (uncertain : signal.fileTargetState = .unobserved ∨
+      signal.fileTargetState = .otherExisting ∨
+      signal.fileTargetState = .unavailable) :
+    preDecision spec signal = false := by
+  rcases uncertain with state | state | state <;>
+    simp [preDecision, targetMatchesPre, target, mutating, state]
+
+/-- Deny on an effect class is structurally unrepresentable in a valid spec.
+Whoever lifts the phase restriction must replace this theorem with the
+class-shaped recovery design, not merely delete it. -/
+theorem effect_class_cannot_deny (spec : RuleSpec) (cls : EffectClass)
+    (target : spec.target = .effectClass cls)
+    (validSpec : valid spec = true) :
+    spec.denyTarget = false := by
+  cases hd : spec.denyTarget with
+  | false => rfl
+  | true =>
+      exfalso
+      simp [valid, validTarget, target, hd] at validSpec
 
 theorem denied_observed_overwrite_selects_exact_edit_recovery
     (spec : RuleSpec) (signal : PreSignal)
     (validSpec : valid spec = true)
-    (target : spec.targetTool = "Write")
+    (target : spec.target = .tool "Write")
     (scope : spec.targetScope = .existingFile)
     (denied : spec.denyTarget = true)
-    (same : signal.tool = spec.targetTool)
+    (same : signal.tool = "Write")
     (state : signal.fileTargetState = .regularExisting)
     (material : signal.exactRecoveryMaterialReady = true) :
     recoveryAction spec signal = .editExistingFileExact := by
   simp [recoveryAction, validSpec, target, scope, denied, same, state,
-    material, supportsExactEditRecovery, preDecision, matchedDecision]
-  rfl
+    material, supportsExactEditRecovery, targetMatchesPre, preDecision,
+    matchedDecision]
+  decide
 
 theorem nonregular_target_has_no_exact_edit_recovery
     (spec : RuleSpec) (signal : PreSignal)
@@ -278,14 +385,27 @@ def scopeName : TargetScope → String
   | .all => "all"
   | .existingFile => "existing_file"
 
+def effectClassName : EffectClass → String
+  | .existingFileRewrite => "existing_file_rewrite"
+
+def targetKindName : RuleTarget → String
+  | .tool _ => "tool"
+  | .effectClass _ => "effect_class"
+
+def targetName : RuleTarget → String
+  | .tool name => name
+  | .effectClass cls => effectClassName cls
+
 def boolJson (value : Bool) : String := if value then "true" else "false"
 
 /-- Candidate build exports this byte-stable representation.  The host compares
-it to the proposal's canonical JSON before issuing a build receipt. -/
+it to the proposal's canonical JSON before issuing a build receipt.  Field
+order mirrors the Zig `Wire` struct declaration order exactly. -/
 def renderCanonical (spec : RuleSpec) : String :=
   "{" ++
   "\"schema_version\":\"" ++ specSchema ++ "\"," ++
-  "\"target_tool\":\"" ++ spec.targetTool ++ "\"," ++
+  "\"target_kind\":\"" ++ targetKindName spec.target ++ "\"," ++
+  "\"target\":\"" ++ targetName spec.target ++ "\"," ++
   "\"target_scope\":\"" ++ scopeName spec.targetScope ++ "\"," ++
   "\"deny_target\":" ++ boolJson spec.denyTarget ++ "," ++
   "\"max_input_bytes\":" ++ toString spec.maxInputBytes ++ "," ++

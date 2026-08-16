@@ -33,8 +33,9 @@ def candidate(
     **spec_overrides: object,
 ) -> tuple[str, bytes]:
     spec = {
-        "schema_version": "metacodes-project-rule-spec-v2",
-        "target_tool": "Write",
+        "schema_version": "metacodes-project-rule-spec-v3",
+        "target_kind": "tool",
+        "target": "Write",
         "target_scope": "all",
         "deny_target": False,
         "max_input_bytes": 8192,
@@ -67,7 +68,7 @@ def candidate(
 
 GOOD_SOURCE = """
 def spec : RuleSpec := {
-  targetTool := "Write"
+  target := .tool "Write"
   denyTarget := false
   maxInputBytes := 8192
   maxAgentDepth := 4
@@ -144,7 +145,7 @@ class ProjectRuleBuildTests(unittest.TestCase):
     def test_existing_file_scope_is_typed_and_write_only(self) -> None:
         identity, raw = candidate(
             GOOD_SOURCE,
-            target_tool="Edit",
+            target="Edit",
             target_scope="existing_file",
         )
         with self.assertRaisesRegex(build_project_rule.BuildError, "requires Write"):

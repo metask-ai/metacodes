@@ -553,7 +553,7 @@ class ProjectHarnessE3ExperimentTest(unittest.TestCase):
                 "active_rule_count": 1,
                 "checker_rule_count": checker_count,
                 "statically_pruned_rule_count": 1 - checker_count,
-                "proof": "MetaCodesControl.ProjectRule.target_tool_mismatch_admits_both",
+                "proof": "MetaCodesControl.ProjectRule.target_mismatch_admits_both",
             }}}
 
         def decision_batch(

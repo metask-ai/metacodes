@@ -10,7 +10,7 @@
 const std = @import("std");
 const observation = @import("../tools/observation.zig");
 
-pub const SCHEMA_VERSION = "metacodes-project-rule-spec-v2";
+pub const SCHEMA_VERSION = "metacodes-project-rule-spec-v3";
 pub const MAX_TOOL_NAME_BYTES: usize = 128;
 pub const MAX_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_AGENT_DEPTH: u8 = 16;
@@ -18,6 +18,24 @@ pub const MAX_AGENT_DEPTH: u8 = 16;
 pub const EffectRequirement = enum {
     none,
     file_mutation_v1_reobserved,
+};
+
+/// A governed effect class names the *outcome* a rule is about, so one rule
+/// covers every tool that can produce it. Tool-name targeting alone let an
+/// advisory plane (memory/prompt) route the same effect through an uncovered
+/// tool: the paid factorial block saw a memory-steered direct Edit rewrite an
+/// existing file while every active rule targeted Write and was statically
+/// pruned. The class is a closed enum for the same reason TargetScope is: the
+/// fixed kernel, not candidate Lean source, owns the applicability predicate.
+pub const EffectClass = enum {
+    existing_file_rewrite,
+};
+
+pub const TargetKind = enum { tool, effect_class };
+
+pub const Target = union(TargetKind) {
+    tool: []const u8,
+    effect_class: EffectClass,
 };
 
 /// Selects which concrete host state makes a rule applicable.  This remains a
@@ -37,7 +55,7 @@ pub const TargetScope = enum {
 pub const FileTargetState = observation.FileTargetState;
 
 pub const Spec = struct {
-    target_tool: []const u8,
+    target: Target,
     target_scope: TargetScope = .all,
     deny_target: bool,
     max_input_bytes: u64,
@@ -46,9 +64,13 @@ pub const Spec = struct {
     effect_requirement: EffectRequirement,
 };
 
+/// Wire keeps the union as a (kind, name) discriminator pair so the strict
+/// positional Lean parser and the byte-for-byte canonical comparison stay
+/// trivial. Field order is the canonical JSON order — do not reorder.
 pub const Wire = struct {
     schema_version: []const u8 = SCHEMA_VERSION,
-    target_tool: []const u8,
+    target_kind: TargetKind,
+    target: []const u8,
     target_scope: TargetScope = .all,
     deny_target: bool,
     max_input_bytes: u64,
@@ -64,6 +86,13 @@ pub const PreSignal = struct {
     authoritative: bool,
     file_target_state: FileTargetState = .unobserved,
     exact_recovery_material_ready: bool = false,
+    /// Host-owned fact: the dispatched tool is one whose primary operation
+    /// mutates a single observed file target (Write/Edit/NotebookEdit). The
+    /// kernel cannot know the tool roster; it only trusts this bit the same
+    /// way it trusts file_target_state. Bash and other opaque tools stay
+    /// false and are therefore outside effect-class coverage — that hole is
+    /// reported post-hoc by the rule_coverage_gap signal, not hidden.
+    file_mutating: bool = false,
 };
 
 /// Host comparisons for one pending exact-edit obligation. Plaintext paths
@@ -101,10 +130,27 @@ pub const PostSignal = struct {
 };
 
 pub fn validate(spec: Spec) !void {
-    if (!validToolName(spec.target_tool)) return error.InvalidTargetTool;
-    if (spec.target_scope == .existing_file and
-        !std.mem.eql(u8, spec.target_tool, "Write"))
-        return error.InvalidTargetScope;
+    switch (spec.target) {
+        .tool => |name| {
+            if (!validToolName(name)) return error.InvalidTargetTool;
+            if (spec.target_scope == .existing_file and
+                !std.mem.eql(u8, name, "Write"))
+                return error.InvalidTargetScope;
+        },
+        .effect_class => {
+            // The class itself encodes the file-state condition; a scope on
+            // top would double-encode it and invite contradictions.
+            if (spec.target_scope != .all) return error.InvalidTargetScope;
+            // Phase restriction, not a final answer: deny-on-effect-class
+            // would also deny the exact-edit recovery rail (the rail ends in
+            // an Edit, which matches the class), and a deny without a
+            // recovery protocol manufactures escape routes — the WorkBuddy
+            // false intervention showed the model answering a bare block
+            // with a Bash heredoc. Until deny carries a class-shaped
+            // recovery design, effect-class rules are verification-only.
+            if (spec.deny_target) return error.EffectClassDenyUnsupported;
+        },
+    }
     if (spec.max_input_bytes == 0 or spec.max_input_bytes > MAX_INPUT_BYTES)
         return error.InvalidInputBound;
     if (spec.max_agent_depth > MAX_AGENT_DEPTH) return error.InvalidDepthBound;
@@ -114,7 +160,11 @@ pub fn validate(spec: Spec) !void {
 
 pub fn toWire(spec: Spec) Wire {
     return .{
-        .target_tool = spec.target_tool,
+        .target_kind = std.meta.activeTag(spec.target),
+        .target = switch (spec.target) {
+            .tool => |name| name,
+            .effect_class => |cls| @tagName(cls),
+        },
         .target_scope = spec.target_scope,
         .deny_target = spec.deny_target,
         .max_input_bytes = spec.max_input_bytes,
@@ -127,8 +177,15 @@ pub fn toWire(spec: Spec) Wire {
 pub fn fromWire(wire: Wire) !Spec {
     if (!std.mem.eql(u8, wire.schema_version, SCHEMA_VERSION))
         return error.UnsupportedRuleSpec;
+    const target: Target = switch (wire.target_kind) {
+        .tool => .{ .tool = wire.target },
+        .effect_class => .{
+            .effect_class = std.meta.stringToEnum(EffectClass, wire.target) orelse
+                return error.UnsupportedEffectClass,
+        },
+    };
     const spec = Spec{
-        .target_tool = wire.target_tool,
+        .target = target,
         .target_scope = wire.target_scope,
         .deny_target = wire.deny_target,
         .max_input_bytes = wire.max_input_bytes,
@@ -145,17 +202,59 @@ pub fn renderCanonical(allocator: std.mem.Allocator, spec: Spec) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, toWire(spec), .{});
 }
 
+/// True when this dispatch is one the rule is *about*. This predicate — not
+/// the tool-name string — is what static pruning must key on; the paired Lean
+/// theorem `target_mismatch_admits_both` proves pruning on its negation is
+/// semantics-preserving.
+pub fn targetMatchesPre(spec: Spec, signal: PreSignal) bool {
+    return switch (spec.target) {
+        .tool => |name| std.mem.eql(u8, signal.tool, name),
+        .effect_class => |cls| switch (cls) {
+            .existing_file_rewrite => signal.file_mutating,
+        },
+    };
+}
+
+/// Wire-level applicability used for static pruning at the gate. This must
+/// stay total: an uninterpretable target deliberately counts as "matches", so
+/// a malformed rule reaches the kernel and faults there instead of being
+/// silently pruned into a no-op.
+pub fn wireTargetMatchesPre(wire: Wire, signal: PreSignal) bool {
+    switch (wire.target_kind) {
+        .tool => return std.mem.eql(u8, signal.tool, wire.target),
+        .effect_class => {
+            const cls = std.meta.stringToEnum(EffectClass, wire.target) orelse
+                return true;
+            return switch (cls) {
+                .existing_file_rewrite => signal.file_mutating,
+            };
+        },
+    }
+}
+
 pub fn preDecision(spec: Spec, signal: PreSignal) bool {
-    if (!std.mem.eql(u8, signal.tool, spec.target_tool)) return true;
-    switch (spec.target_scope) {
-        .all => {},
-        .existing_file => switch (signal.file_target_state) {
-            // A missing target is outside this rule's scope.  Every state that
-            // fails to prove a regular existing file is conservative except
-            // the explicit, host-observed missing state.
-            .missing => return true,
-            .regular_existing => {},
-            .unobserved, .other_existing, .unavailable => return false,
+    if (!targetMatchesPre(spec, signal)) return true;
+    switch (spec.target) {
+        .tool => switch (spec.target_scope) {
+            .all => {},
+            .existing_file => switch (signal.file_target_state) {
+                // A missing target is outside this rule's scope.  Every state
+                // that fails to prove a regular existing file is conservative
+                // except the explicit, host-observed missing state.
+                .missing => return true,
+                .regular_existing => {},
+                .unobserved, .other_existing, .unavailable => return false,
+            },
+        },
+        .effect_class => |cls| switch (cls) {
+            // Same conservative ladder as the existing_file scope: a mutating
+            // tool over an ambiguous target state cannot be proven not to be
+            // rewriting an existing file, so it fails closed.
+            .existing_file_rewrite => switch (signal.file_target_state) {
+                .missing => return true,
+                .regular_existing => {},
+                .unobserved, .other_existing, .unavailable => return false,
+            },
         },
     }
     if (spec.deny_target) return false;
@@ -166,7 +265,7 @@ pub fn preDecision(spec: Spec, signal: PreSignal) bool {
 }
 
 pub fn postDecision(spec: Spec, signal: PostSignal) bool {
-    if (!std.mem.eql(u8, signal.pre.tool, spec.target_tool)) return true;
+    if (!targetMatchesPre(spec, signal.pre)) return true;
     if (!preDecision(spec, signal.pre)) return false;
     if (!signal.succeeded) return true;
     return switch (spec.effect_requirement) {
@@ -186,7 +285,7 @@ fn validToolName(value: []const u8) bool {
 
 test "project rule spec denies target and requires grounded post effects" {
     const deny = Spec{
-        .target_tool = "Bash",
+        .target = .{ .tool = "Bash" },
         .deny_target = true,
         .max_input_bytes = 4096,
         .max_agent_depth = 4,
@@ -208,7 +307,7 @@ test "project rule spec denies target and requires grounded post effects" {
     }));
 
     const mutate = Spec{
-        .target_tool = "Write",
+        .target = .{ .tool = "Write" },
         .deny_target = false,
         .max_input_bytes = 8192,
         .max_agent_depth = 2,
@@ -233,7 +332,7 @@ test "project rule spec denies target and requires grounded post effects" {
 
 test "existing-file scope blocks regular Write but admits a proven new file" {
     const spec = Spec{
-        .target_tool = "Write",
+        .target = .{ .tool = "Write" },
         .target_scope = .existing_file,
         .deny_target = true,
         .max_input_bytes = 8192,
@@ -263,7 +362,7 @@ test "existing-file scope blocks regular Write but admits a proven new file" {
 
 test "existing-file scope is only valid for Write" {
     try std.testing.expectError(error.InvalidTargetScope, validate(.{
-        .target_tool = "Edit",
+        .target = .{ .tool = "Edit" },
         .target_scope = .existing_file,
         .deny_target = true,
         .max_input_bytes = 8192,
@@ -275,7 +374,7 @@ test "existing-file scope is only valid for Write" {
 
 test "project rule spec canonical JSON round-trips strictly" {
     const spec = Spec{
-        .target_tool = "Edit",
+        .target = .{ .tool = "Edit" },
         .deny_target = false,
         .max_input_bytes = 1234,
         .max_agent_depth = 3,
@@ -290,6 +389,116 @@ test "project rule spec canonical JSON round-trips strictly" {
     });
     defer parsed.deinit();
     const decoded = try fromWire(parsed.value);
-    try std.testing.expectEqualStrings(spec.target_tool, decoded.target_tool);
+    try std.testing.expectEqualStrings(spec.target.tool, decoded.target.tool);
     try std.testing.expectEqual(spec.effect_requirement, decoded.effect_requirement);
+}
+
+test "effect-class rule covers every mutating tool and ignores the rest" {
+    const spec = Spec{
+        .target = .{ .effect_class = .existing_file_rewrite },
+        .deny_target = false,
+        .max_input_bytes = 8192,
+        .max_agent_depth = 4,
+        .authoritative_only = true,
+        .effect_requirement = .file_mutation_v1_reobserved,
+    };
+    try validate(spec);
+    // Any mutating tool over an existing regular file is in scope — the tool
+    // name never appears in the predicate.
+    for ([_][]const u8{ "Write", "Edit", "NotebookEdit" }) |tool| {
+        const matched = PreSignal{
+            .tool = tool,
+            .input_bytes = 128,
+            .agent_depth = 0,
+            .authoritative = true,
+            .file_target_state = .regular_existing,
+            .file_mutating = true,
+        };
+        try std.testing.expect(targetMatchesPre(spec, matched));
+        try std.testing.expect(preDecision(spec, matched));
+        // The verification obligation binds at post time.
+        try std.testing.expect(!postDecision(spec, .{
+            .pre = matched,
+            .succeeded = true,
+            .effect_valid = true,
+            .has_file_mutation_v1 = true,
+            .post_reobserved = false,
+        }));
+        try std.testing.expect(postDecision(spec, .{
+            .pre = matched,
+            .succeeded = true,
+            .effect_valid = true,
+            .has_file_mutation_v1 = true,
+            .post_reobserved = true,
+        }));
+    }
+    // Creating a new file is not this effect class.
+    var fresh = PreSignal{
+        .tool = "Write",
+        .input_bytes = 128,
+        .agent_depth = 0,
+        .authoritative = true,
+        .file_target_state = .missing,
+        .file_mutating = true,
+    };
+    try std.testing.expect(preDecision(spec, fresh));
+    // Ambiguous target state on a mutating tool fails closed.
+    fresh.file_target_state = .unavailable;
+    try std.testing.expect(!preDecision(spec, fresh));
+    // Non-mutating tools are outside the class entirely.
+    const opaque_tool = PreSignal{
+        .tool = "Bash",
+        .input_bytes = 128,
+        .agent_depth = 0,
+        .authoritative = true,
+        .file_mutating = false,
+    };
+    try std.testing.expect(!targetMatchesPre(spec, opaque_tool));
+    try std.testing.expect(preDecision(spec, opaque_tool));
+}
+
+test "effect-class rules reject deny and non-all scope until recovery exists" {
+    try std.testing.expectError(error.EffectClassDenyUnsupported, validate(.{
+        .target = .{ .effect_class = .existing_file_rewrite },
+        .deny_target = true,
+        .max_input_bytes = 8192,
+        .max_agent_depth = 4,
+        .authoritative_only = true,
+        .effect_requirement = .none,
+    }));
+    try std.testing.expectError(error.InvalidTargetScope, validate(.{
+        .target = .{ .effect_class = .existing_file_rewrite },
+        .target_scope = .existing_file,
+        .deny_target = false,
+        .max_input_bytes = 8192,
+        .max_agent_depth = 4,
+        .authoritative_only = true,
+        .effect_requirement = .file_mutation_v1_reobserved,
+    }));
+}
+
+test "effect-class wire round-trips and rejects unknown classes" {
+    const spec = Spec{
+        .target = .{ .effect_class = .existing_file_rewrite },
+        .deny_target = false,
+        .max_input_bytes = 4096,
+        .max_agent_depth = 2,
+        .authoritative_only = false,
+        .effect_requirement = .file_mutation_v1_reobserved,
+    };
+    const encoded = try renderCanonical(std.testing.allocator, spec);
+    defer std.testing.allocator.free(encoded);
+    var parsed = try std.json.parseFromSlice(Wire, std.testing.allocator, encoded, .{
+        .ignore_unknown_fields = false,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer parsed.deinit();
+    const decoded = try fromWire(parsed.value);
+    try std.testing.expectEqual(
+        EffectClass.existing_file_rewrite,
+        decoded.target.effect_class,
+    );
+    var bogus = parsed.value;
+    bogus.target = "grow_arbitrary_state";
+    try std.testing.expectError(error.UnsupportedEffectClass, fromWire(bogus));
 }

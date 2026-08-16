@@ -860,7 +860,7 @@ test "replay and shadow require mixed cases and a completed grounded interval" {
         .proposer_sha256 = proposer,
         .invariant = "Authoritative Write inputs stay within the project bound.",
         .rule_spec = .{
-            .target_tool = "Write",
+            .target = .{ .tool = "Write" },
             .deny_target = false,
             .max_input_bytes = 100,
             .max_agent_depth = 2,
