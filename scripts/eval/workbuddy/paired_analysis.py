@@ -43,7 +43,13 @@ CHECKPOINT_REPORT_SCHEMA_VERSION = (
 PROJECT_CONTROL = "project_control"
 VERIFICATION_CHECKPOINT = "verification_checkpoint"
 VERIFICATION_FINAL_GATE = "verification_final_gate"
-STUDIES = {PROJECT_CONTROL, VERIFICATION_CHECKPOINT, VERIFICATION_FINAL_GATE}
+MEMORY_ACCUMULATION = "memory_accumulation"
+STUDIES = {
+    PROJECT_CONTROL,
+    VERIFICATION_CHECKPOINT,
+    VERIFICATION_FINAL_GATE,
+    MEMORY_ACCUMULATION,
+}
 PROJECT_CONTROL_ARMS = {"baseline": "disabled", "treatment": "enforced"}
 CHECKPOINT_ARMS = {"baseline": False, "treatment": True}
 FINAL_GATE_REPORT_SCHEMA_VERSION = (
@@ -53,6 +59,13 @@ FINAL_GATE_REPORT_SCHEMA_VERSION = (
 # both arms carry the obligation outcome; only the treatment arm enforces.
 FINAL_GATE_ARMS = {"baseline": False, "treatment": True}
 FINAL_OBSERVE_ARMS = {"baseline": True, "treatment": False}
+MEMORY_REPORT_SCHEMA_VERSION = (
+    "metacodes-workbuddy-memory-accumulation-paired-report-v1"
+)
+# The memory study varies exactly one thing: whether the local TinyKG store
+# accumulates across the arm's tasks. Both arms hold every verification
+# treatment off so memory transfer is not confounded with gate actuation.
+MEMORY_ARMS = {"baseline": False, "treatment": True}
 
 
 def _number(value: object, where: str, *, minimum: float = 0.0) -> float:
@@ -279,18 +292,35 @@ def _validate_study_treatment(
         treatment = manifest["evaluation_treatment"]
         project_mode = treatment.get("project_control")
         checkpoint = treatment.get("verification_checkpoint")
+        memory = treatment.get("memory_accumulation")
         if study == PROJECT_CONTROL:
             if (
                 project_mode != PROJECT_CONTROL_ARMS[arm]
                 or checkpoint not in {None, False}
+                or memory not in {None, False}
             ):
                 raise LaunchError(
                     f"paired WorkBuddy {arm} has the wrong project-control treatment"
                 )
         elif study == VERIFICATION_CHECKPOINT:
-            if project_mode != "disabled" or checkpoint is not CHECKPOINT_ARMS[arm]:
+            if (
+                project_mode != "disabled"
+                or checkpoint is not CHECKPOINT_ARMS[arm]
+                or memory not in {None, False}
+            ):
                 raise LaunchError(
                     f"paired WorkBuddy {arm} has the wrong verification-checkpoint treatment"
+                )
+        elif study == MEMORY_ACCUMULATION:
+            if (
+                project_mode != "disabled"
+                or checkpoint is not False
+                or treatment.get("verification_final_gate") is not False
+                or treatment.get("verification_final_observe") is not False
+                or memory is not MEMORY_ARMS[arm]
+            ):
+                raise LaunchError(
+                    f"paired WorkBuddy {arm} has the wrong memory-accumulation treatment"
                 )
         else:
             if (
@@ -300,6 +330,7 @@ def _validate_study_treatment(
                 is not FINAL_GATE_ARMS[arm]
                 or treatment.get("verification_final_observe")
                 is not FINAL_OBSERVE_ARMS[arm]
+                or memory not in {None, False}
             ):
                 raise LaunchError(
                     f"paired WorkBuddy {arm} has the wrong final-gate treatment"
@@ -808,6 +839,8 @@ def build_report(
             if study == PROJECT_CONTROL
             else FINAL_GATE_REPORT_SCHEMA_VERSION
             if study == VERIFICATION_FINAL_GATE
+            else MEMORY_REPORT_SCHEMA_VERSION
+            if study == MEMORY_ACCUMULATION
             else CHECKPOINT_REPORT_SCHEMA_VERSION
         ),
         **({"study": study} if study != PROJECT_CONTROL else {}),

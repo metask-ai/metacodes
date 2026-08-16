@@ -178,6 +178,7 @@ def _comparison_covariates(
         overrides.pop("METACODES_VERIFICATION_CHECKPOINT", None)
         overrides.pop("METACODES_VERIFICATION_FINAL_GATE", None)
         overrides.pop("METACODES_VERIFICATION_FINAL_OBSERVE", None)
+        overrides.pop("METACODES_MEMORY_ACCUMULATION", None)
     stable_artifacts = json.loads(json.dumps(artifacts))
     # Absolute staging paths describe where identical bytes were observed, not
     # an experimental variable.  Keep every digest/size/architecture field.
@@ -673,6 +674,13 @@ def build_launch_manifest(
         raise LaunchError(
             "WorkBuddy verification final gate and observe modes are exclusive"
         )
+    memory_accumulation = project_overrides.get(
+        "METACODES_MEMORY_ACCUMULATION", False
+    )
+    if not isinstance(memory_accumulation, bool):
+        raise LaunchError(
+            "WorkBuddy memory accumulation treatment must be an explicit boolean"
+        )
     expected_project_overrides = (
         {
             "METACODES_PROJECT_CONTROL_MODE": project_control_mode,
@@ -813,6 +821,7 @@ def build_launch_manifest(
             "provider_cache_prefix_changed_by_control_plane": False,
             "verification_checkpoint": verification_checkpoint,
             "verification_final_gate": verification_final_gate,
+            "memory_accumulation": memory_accumulation,
             "verification_final_observe": verification_final_observe,
         },
         "comparison": (
@@ -938,6 +947,11 @@ def _validate_launch_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
                     if "verification_final_gate" in treatment
                     else {}
                 ),
+                **(
+                    {"memory_accumulation": treatment.get("memory_accumulation")}
+                    if "memory_accumulation" in treatment
+                    else {}
+                ),
             }
             or treatment.get("project_control") not in PROJECT_CONTROL_MODES
             or ("verification_checkpoint" in treatment and not isinstance(checkpoint, bool))
@@ -947,6 +961,10 @@ def _validate_launch_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
                     isinstance(treatment.get("verification_final_gate"), bool)
                     and isinstance(treatment.get("verification_final_observe"), bool)
                 )
+            )
+            or (
+                "memory_accumulation" in treatment
+                and not isinstance(treatment.get("memory_accumulation"), bool)
             )
         ):
             raise LaunchError("paid launch treatment contract is incomplete")
@@ -1815,6 +1833,30 @@ def _validate_verification_checkpoint_kwargs(
         raise LaunchError(f"{label} verification checkpoint treatment drifted")
 
 
+def _validate_memory_accumulation_kwargs(
+    kwargs: object, manifest: Mapping[str, Any], *, label: str
+) -> None:
+    if not isinstance(kwargs, dict):
+        raise LaunchError(f"{label} has no agent kwargs")
+    expected = _expected_memory_accumulation(manifest)
+    if expected is None:
+        if "METACODES_MEMORY_ACCUMULATION" in kwargs:
+            raise LaunchError(f"{label} unexpectedly enables memory accumulation")
+        return
+    if kwargs.get("METACODES_MEMORY_ACCUMULATION", False) is not expected:
+        raise LaunchError(f"{label} memory accumulation treatment drifted")
+
+
+def _expected_memory_accumulation(manifest: Mapping[str, Any]) -> bool | None:
+    treatment = manifest.get("evaluation_treatment")
+    if not isinstance(treatment, dict) or "memory_accumulation" not in treatment:
+        return None
+    value = treatment.get("memory_accumulation")
+    if not isinstance(value, bool):
+        raise LaunchError("paid launch memory accumulation treatment is invalid")
+    return value
+
+
 def _expected_verification_checkpoint(
     manifest: Mapping[str, Any]
 ) -> bool | None:
@@ -1844,6 +1886,9 @@ def _validate_trial_project_control(
     _validate_verification_checkpoint_kwargs(
         agent.get("kwargs"), manifest, label="official WorkBuddy trial"
     )
+    _validate_memory_accumulation_kwargs(
+        agent.get("kwargs"), manifest, label="official WorkBuddy trial"
+    )
     runtime = _json(trial_dir / "agent/metacodes-runtime-contract.json")
     backend_model_name = str(manifest.get("model", {}).get("backend_model_name") or "")
     if (
@@ -1854,6 +1899,11 @@ def _validate_trial_project_control(
         is not _expected_verification_checkpoint(manifest)
     ):
         raise LaunchError("official WorkBuddy runtime model identity drifted")
+    expected_memory = _expected_memory_accumulation(manifest)
+    if expected_memory is not None and (
+        runtime.get("memory_accumulation") is not expected_memory
+    ):
+        raise LaunchError("official WorkBuddy runtime memory treatment drifted")
     project = runtime.get("project_control")
     if not isinstance(project, dict) or project != {
         "staged": expected["staged"],

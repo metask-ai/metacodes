@@ -8,7 +8,9 @@ gets a fresh HOME and an isolated local TinyKG store.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import shlex
 from pathlib import Path
 
@@ -64,6 +66,35 @@ def _relative_mount_path(value: object, label: str) -> str:
     return path.as_posix()
 
 
+_CONTINUITY_DIRNAME = "kg-store-continuity"
+_CONTINUITY_TAR = "store-latest.tar"
+_CONTINUITY_LEDGER = "ledger.jsonl"
+# The store accumulates over at most a 16-task arm; a bound far above any
+# observed store keeps a runaway artifact from silently monopolizing the
+# transfer channel.  Fail loud, never truncate.
+_MAX_CONTINUITY_TAR_BYTES = 64 * 1024 * 1024
+
+
+def _continuity_root(logs_dir: Path) -> Path:
+    """Arm-level store home: <jobs_dir>/kg-store-continuity.
+
+    Trial layout is <jobs_dir>/<batch>/<trial>/agent; the jobs_dir is the
+    per-arm root, so one serial arm shares exactly one ledger.
+    """
+
+    return logs_dir.resolve().parents[2] / _CONTINUITY_DIRNAME
+
+
+def _read_continuity_ledger(path: Path) -> list:
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+    return rows
+
+
 class MetacodesAgent(BaseInstalledAgent):
     """Run a split-mounted metacodes artifact under WorkBuddy/Harbor."""
 
@@ -95,6 +126,12 @@ class MetacodesAgent(BaseInstalledAgent):
             )
         self._verification_final_gate = final_gate
         self._verification_final_observe = final_observe
+        memory_accumulation = kwargs.pop("METACODES_MEMORY_ACCUMULATION", False)
+        if not isinstance(memory_accumulation, bool):
+            raise ValueError(
+                "METACODES_MEMORY_ACCUMULATION must be an explicit boolean"
+            )
+        self._memory_accumulation = memory_accumulation
         project_rules = kwargs.pop("METACODES_PROJECT_RULES_RELATIVE", None)
         project_kernel = kwargs.pop("METACODES_PROJECT_KERNEL_RELATIVE", None)
         project_control_mode = kwargs.pop("METACODES_PROJECT_CONTROL_MODE", None)
@@ -310,6 +347,35 @@ class MetacodesAgent(BaseInstalledAgent):
         remote_tinykg_env_absent = all(name not in env for name in _REMOTE_TINYKG_ENV)
         if not remote_tinykg_env_absent:
             raise ValueError("metacodes WorkBuddy trial received remote TinyKG authority")
+        # Arm-level store continuity: single-transaction lifecycle over the
+        # serial arm.  The store starts empty at the arm's first task and is
+        # imported/exported through a hash-chained ledger; a broken chain
+        # fails loud instead of silently forking memory.
+        store_import_sha = None
+        if self._memory_accumulation:
+            continuity_root = _continuity_root(self.logs_dir)
+            continuity_root.mkdir(parents=True, exist_ok=True)
+            continuity_tar = continuity_root / _CONTINUITY_TAR
+            continuity_ledger = continuity_root / _CONTINUITY_LEDGER
+            if continuity_tar.exists():
+                tar_bytes = continuity_tar.read_bytes()
+                if len(tar_bytes) > _MAX_CONTINUITY_TAR_BYTES:
+                    raise ValueError(
+                        "kg store continuity tar exceeds its transfer bound"
+                    )
+                store_import_sha = hashlib.sha256(tar_bytes).hexdigest()
+                ledger_rows = _read_continuity_ledger(continuity_ledger)
+                if not ledger_rows:
+                    raise ValueError(
+                        "kg store continuity tar has no ledger provenance"
+                    )
+                if ledger_rows[-1].get("export_sha256") != store_import_sha:
+                    raise ValueError(
+                        "kg store continuity ledger chain is broken"
+                    )
+                await environment.upload_file(
+                    str(continuity_tar), "/tmp/kg-import.tar"
+                )
         runtime_contract = json.dumps(
             {
                 "schema_version": "metacodes-workbuddy-runtime-contract-v2",
@@ -317,7 +383,9 @@ class MetacodesAgent(BaseInstalledAgent):
                 "fresh_home": True,
                 "local_tinykg": True,
                 "remote_tinykg_env_absent": remote_tinykg_env_absent,
-                "tinykg_store_absent_before_first_provider_request": True,
+                "tinykg_store_absent_before_first_provider_request": store_import_sha is None,
+                "memory_accumulation": self._memory_accumulation,
+                "store_import_sha256": store_import_sha,
                 "credential_delivery": "anonymous-fd-route-token",
                 "transport_model_is_route": True,
                 "actor_model_identity": self._model_display_name,
@@ -330,6 +398,31 @@ class MetacodesAgent(BaseInstalledAgent):
             separators=(",", ":"),
         )
 
+        if store_import_sha is None:
+            store_gate = 'test ! -e "$METACODES_KG_STORE" || exit 85; '
+        else:
+            # Continuity witness replaces the empty-start assertion: the
+            # imported bytes must hash to the ledger head before extraction.
+            store_gate = (
+                "test -f /tmp/kg-import.tar || exit 89; "
+                'test "$(sha256sum /tmp/kg-import.tar | cut -d" " -f1)" = '
+                + shlex.quote(store_import_sha)
+                + " || exit 89; "
+                + 'mkdir -p "$(dirname "$METACODES_KG_STORE")" || exit 89; '
+                + 'tar -xf /tmp/kg-import.tar -C "$(dirname "$METACODES_KG_STORE")" || exit 89; '
+                + 'test -d "$METACODES_KG_STORE" || exit 89; '
+            )
+        if self._memory_accumulation:
+            # Always produce an export: an untouched store still advances the
+            # ledger chain deterministically (empty dir tars are tiny), so the
+            # next trial's import witness never has to guess.
+            store_export = (
+                'mkdir -p "$METACODES_KG_STORE" || exit 78; '
+                'tar -cf /tmp/kg-export.tar -C "$(dirname "$METACODES_KG_STORE")" '
+                '"$(basename "$METACODES_KG_STORE")" || exit 78; '
+            )
+        else:
+            store_export = ""
         # Bash is intentional: WorkBuddy's installed-agent contract already
         # uses shell commands, and anonymous-FD handoff plus PIPESTATUS need a
         # real shell.  No credential value is interpolated into this command.
@@ -356,7 +449,7 @@ class MetacodesAgent(BaseInstalledAgent):
             '${METACODES_KG_CONFIG+x}${METACODES_KG_URL+x}${METACODES_KG_API_KEY+x}'
             '${METACODES_KG_EXPECTED_BUILD_ID+x}${METACODES_KG_EXPECTED_SCHEMA_DIGEST+x}'
             '${METASK_API_KEY+x}" || exit 84; '
-            'test ! -e "$METACODES_KG_STORE" || exit 85; '
+            f"{store_gate}"
             f"printf '%s\\n' {shlex.quote(runtime_contract)} > "
             f"{shlex.quote(runtime_contract_path)} || exit 86; "
             f"chmod 0600 {shlex.quote(runtime_contract_path)} || exit 87; "
@@ -383,6 +476,7 @@ class MetacodesAgent(BaseInstalledAgent):
             f'cp -- "${{observations[0]}}" {shlex.quote(observation_path)} || exit 75; '
             'chmod 0600 "${transcripts[0]}" "${observations[0]}" '
             f"{shlex.quote(transcript_path)} {shlex.quote(observation_path)} {shlex.quote(output_path)} || exit 76; "
+            f"{store_export}"
             'exit "$agent_status"'
         )
         await self.exec_as_agent(
@@ -391,6 +485,27 @@ class MetacodesAgent(BaseInstalledAgent):
             env=env,
             cwd="/workspace",
         )
+        if self._memory_accumulation:
+            continuity_root = _continuity_root(self.logs_dir)
+            staging = continuity_root / f".export-{self._session_id}.tar"
+            await environment.download_file("/tmp/kg-export.tar", str(staging))
+            exported = staging.read_bytes()
+            if len(exported) > _MAX_CONTINUITY_TAR_BYTES:
+                staging.unlink()
+                raise ValueError("kg store continuity export exceeds its bound")
+            export_sha = hashlib.sha256(exported).hexdigest()
+            ledger_path = continuity_root / _CONTINUITY_LEDGER
+            row = {
+                "trial": self._session_id,
+                "import_sha256": store_import_sha or "empty",
+                "export_sha256": export_sha,
+                "bytes": len(exported),
+            }
+            with open(ledger_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(staging, continuity_root / _CONTINUITY_TAR)
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         try:

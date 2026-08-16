@@ -2797,3 +2797,149 @@ class WorkBuddyGateRecordTest(unittest.TestCase):
                 "tier1_verifications": 0, "tier2_verifications": "two",
                 "reopened_after_verification": 0, "known_failing": False,
             })
+
+
+class WorkBuddyMemoryContinuityTest(unittest.TestCase):
+    """Arm-level TinyKG store continuity (V7): empty start, hash-chained
+    ledger, single-transaction rotation, fail-loud on a broken chain."""
+
+    def _run_program(self, program: str) -> None:
+        checkout_raw = os.environ.get("METACODES_WORKBUDDY_CHECKOUT")
+        if not checkout_raw:
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        checkout = Path(checkout_raw).resolve()
+        if not checkout.is_dir():
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        # The checkout's installed overlay is the code under test (the repo
+        # source tree is a namespace portion that a regular installed package
+        # would shadow anyway); installation identity is verified first.
+        overlay_installer.validate_installed_overlay(checkout)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(checkout / "src")
+        subprocess.run(
+            [str(checkout / ".venv/bin/python"), "-c", program],
+            cwd=checkout,
+            env=env,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def test_continuity_lifecycle_empty_start_then_chained_import(self):
+        self._run_program(r'''
+import asyncio, hashlib, json, tarfile, tempfile
+from pathlib import Path
+from workbuddy_bench.agents import metacodes_agent as module
+from workbuddy_bench.agents.metacodes_agent import MetacodesAgent
+
+class StubEnvironment:
+    def __init__(self, export_payload: bytes):
+        self.uploads = []
+        self.export_payload = export_payload
+    async def upload_file(self, source, target):
+        self.uploads.append((source, target))
+    async def download_file(self, source, target):
+        Path(target).write_bytes(self.export_payload)
+
+def make_agent(logs, **extra):
+    return MetacodesAgent(
+        logs, model_name="route-l2", model_params={},
+        METACODES_MODEL_DISPLAY_NAME="glm-5.2",
+        connection={"mode": "local_proxy", "proxy_url": "http://127.0.0.1:1"},
+        METACODES_MEMORY_ACCUMULATION=True, **extra,
+    )
+
+def store_tar(payload: bytes) -> bytes:
+    with tempfile.TemporaryDirectory() as d:
+        store = Path(d) / "store"
+        store.mkdir()
+        (store / "events.bin").write_bytes(payload)
+        out = Path(d) / "out.tar"
+        with tarfile.open(out, "w") as tar:
+            tar.add(store, arcname="store")
+        return out.read_bytes()
+
+with tempfile.TemporaryDirectory() as directory:
+    jobs = Path(directory) / "results" / "arm-slug"
+    logs1 = jobs / "batch-1" / "task-a__x1" / "agent"
+    logs1.mkdir(parents=True)
+    export1 = store_tar(b"first-trial-store")
+    env1 = StubEnvironment(export1)
+    agent1 = make_agent(logs1)
+    captured = {}
+    async def fake_exec(environment, command, env, cwd):
+        captured["command"] = command
+    agent1.exec_as_agent = fake_exec
+    asyncio.run(agent1.run("instruction", env1, None))
+    command1 = captured["command"]
+    # Empty start keeps the absent-store assertion and uploads nothing.
+    assert 'test ! -e "$METACODES_KG_STORE" || exit 85' in command1
+    assert "kg-import.tar" not in command1
+    assert env1.uploads == []
+    assert "tar -cf /tmp/kg-export.tar" in command1
+    contract = json.loads((logs1 / "metacodes-runtime-contract.json").read_text()) if (logs1 / "metacodes-runtime-contract.json").exists() else None
+    root = jobs / "kg-store-continuity"
+    ledger = [json.loads(l) for l in (root / "ledger.jsonl").read_text().splitlines()]
+    assert len(ledger) == 1 and ledger[0]["import_sha256"] == "empty"
+    sha1 = hashlib.sha256(export1).hexdigest()
+    assert ledger[0]["export_sha256"] == sha1
+    assert (root / "store-latest.tar").read_bytes() == export1
+
+    # Trial 2 imports the chained tar with a hash witness in the command.
+    logs2 = jobs / "batch-1" / "task-b__x2" / "agent"
+    logs2.mkdir(parents=True)
+    export2 = store_tar(b"second-trial-store")
+    env2 = StubEnvironment(export2)
+    agent2 = make_agent(logs2)
+    agent2.exec_as_agent = fake_exec
+    asyncio.run(agent2.run("instruction", env2, None))
+    command2 = captured["command"]
+    assert sha1 in command2
+    assert "tar -xf /tmp/kg-import.tar" in command2
+    assert 'test ! -e "$METACODES_KG_STORE" || exit 85' not in command2
+    assert env2.uploads and env2.uploads[0][1] == "/tmp/kg-import.tar"
+    ledger = [json.loads(l) for l in (root / "ledger.jsonl").read_text().splitlines()]
+    assert len(ledger) == 2 and ledger[1]["import_sha256"] == sha1
+    assert (root / "store-latest.tar").read_bytes() == export2
+
+    # A tampered tar breaks the chain and fails loud before any upload.
+    (root / "store-latest.tar").write_bytes(b"tampered")
+    logs3 = jobs / "batch-1" / "task-c__x3" / "agent"
+    logs3.mkdir(parents=True)
+    agent3 = make_agent(logs3)
+    agent3.exec_as_agent = fake_exec
+    try:
+        asyncio.run(agent3.run("instruction", StubEnvironment(b""), None))
+    except ValueError as error:
+        assert "chain is broken" in str(error)
+    else:
+        raise AssertionError("broken continuity chain was accepted")
+''')
+
+    def test_accumulation_off_keeps_the_original_contract(self):
+        self._run_program(r'''
+import asyncio, json, tempfile
+from pathlib import Path
+from workbuddy_bench.agents.metacodes_agent import MetacodesAgent
+
+with tempfile.TemporaryDirectory() as directory:
+    logs = Path(directory) / "results" / "arm" / "batch" / "task__x" / "agent"
+    logs.mkdir(parents=True)
+    agent = MetacodesAgent(
+        logs, model_name="route-l2", model_params={},
+        METACODES_MODEL_DISPLAY_NAME="glm-5.2",
+        connection={"mode": "local_proxy", "proxy_url": "http://127.0.0.1:1"},
+    )
+    captured = {}
+    async def fake_exec(environment, command, env, cwd):
+        captured["command"] = command
+    agent.exec_as_agent = fake_exec
+    class StubEnvironment:
+        async def upload_file(self, *a): raise AssertionError("no upload expected")
+        async def download_file(self, *a): raise AssertionError("no download expected")
+    asyncio.run(agent.run("instruction", StubEnvironment(), None))
+    command = captured["command"]
+    assert 'test ! -e "$METACODES_KG_STORE" || exit 85' in command
+    assert "kg-export.tar" not in command and "kg-import.tar" not in command
+    assert not (Path(directory) / "results" / "arm" / "kg-store-continuity").exists()
+''')
