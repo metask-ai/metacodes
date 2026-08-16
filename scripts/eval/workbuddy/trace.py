@@ -1265,9 +1265,17 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                 # exactly one per run, schema-pinned, both arms carry it (the
                 # baseline in record-only observe mode). Surfaced so paired
                 # analysis can read the obligation outcome from the ATIF row.
+                # Closed two-era roster: v1 carries the obligation outcome;
+                # v2 adds the tiered-sensor evidence (tier1/tier2 counts,
+                # churn reopens, known_failing). Historical journals stay
+                # readable.
+                gate_schema = observation.get("schema_version")
                 if (
-                    observation.get("schema_version")
-                    != "metacodes-verification-final-gate-v1"
+                    gate_schema
+                    not in {
+                        "metacodes-verification-final-gate-v1",
+                        "metacodes-verification-final-gate-v2",
+                    }
                     or not isinstance(observation.get("enforced"), bool)
                     or not isinstance(observation.get("obligation_met"), bool)
                 ):
@@ -1292,6 +1300,29 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                     bool(observation.get("mutations_occurred"))
                 )
                 formal["verification_nudges"] = nudges
+                if gate_schema == "metacodes-verification-final-gate-v2":
+                    for key, where in (
+                        ("tier1_verifications", "tier-1 count"),
+                        ("tier2_verifications", "tier-2 count"),
+                        ("reopened_after_verification", "churn count"),
+                    ):
+                        value = observation.get(key)
+                        if (
+                            not isinstance(value, int)
+                            or isinstance(value, bool)
+                            or value < 0
+                        ):
+                            raise TraceError(
+                                f"verification final-gate {where} is invalid"
+                            )
+                        formal["verification_" + key] = value
+                    if not isinstance(observation.get("known_failing"), bool):
+                        raise TraceError(
+                            "verification final-gate known_failing is invalid"
+                        )
+                    formal["verification_known_failing"] = int(
+                        bool(observation.get("known_failing"))
+                    )
             elif observation_kind in {"rule_coverage_gap", "rule_bounds_overflow"}:
                 # Diagnostic-only signals: no identity to cross-check here,
                 # but count them so silence stays distinguishable from absence.

@@ -2734,3 +2734,66 @@ class WorkBuddyCohortManifestTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkBuddyGateRecordTest(unittest.TestCase):
+    """The gate record is a closed two-era roster (v1 outcome, v2 tiers)."""
+
+    def _metrics(self, gate):
+        rows = [
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 0, "monotonic_elapsed_ns": 1,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_started": {}}},
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 1, "monotonic_elapsed_ns": 2,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"tool_observation": {"verification_final_gate": gate}}},
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 2, "monotonic_elapsed_ns": 3,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_finished": {}}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "observation.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            observation.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            return load_control_metrics(transcript, observation)
+
+    def test_v1_gate_record_stays_readable(self):
+        lean = self._metrics({
+            "schema_version": "metacodes-verification-final-gate-v1",
+            "enforced": True, "mutations_occurred": True,
+            "obligation_met": False, "nudges": 2, "max_nudges": 2,
+        })["lean"]
+        self.assertEqual(lean["verification_final_gate_records"], 1)
+        self.assertEqual(lean["verification_nudges"], 2)
+        self.assertNotIn("verification_tier1_verifications", lean)
+
+    def test_v2_gate_record_exports_tier_and_churn_counters(self):
+        lean = self._metrics({
+            "schema_version": "metacodes-verification-final-gate-v2",
+            "enforced": True, "mutations_occurred": True,
+            "obligation_met": True, "nudges": 1, "max_nudges": 2,
+            "tier1_verifications": 0, "tier2_verifications": 2,
+            "reopened_after_verification": 1, "known_failing": False,
+        })["lean"]
+        self.assertEqual(lean["verification_tier1_verifications"], 0)
+        self.assertEqual(lean["verification_tier2_verifications"], 2)
+        self.assertEqual(lean["verification_reopened_after_verification"], 1)
+        self.assertEqual(lean["verification_known_failing"], 0)
+
+    def test_v2_gate_record_with_bad_tier_count_fails_loudly(self):
+        with self.assertRaisesRegex(TraceError, "tier-2 count is invalid"):
+            self._metrics({
+                "schema_version": "metacodes-verification-final-gate-v2",
+                "enforced": True, "mutations_occurred": True,
+                "obligation_met": True, "nudges": 0, "max_nudges": 2,
+                "tier1_verifications": 0, "tier2_verifications": "two",
+                "reopened_after_verification": 0, "known_failing": False,
+            })

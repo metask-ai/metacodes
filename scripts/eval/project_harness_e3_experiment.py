@@ -2098,7 +2098,10 @@ def analyze_journal(
                 "verification_skip rollout lacks exactly one final-gate record"
             )
         gate_record = verification_gate_records[0]
-        if gate_record.get("schema_version") != "metacodes-verification-final-gate-v1":
+        if gate_record.get("schema_version") not in {
+            "metacodes-verification-final-gate-v1",
+            "metacodes-verification-final-gate-v2",
+        }:
             raise E3Error("verification final-gate record schema drift")
         verification_obligation_met = bool(gate_record.get("obligation_met"))
         verification_nudges = int(gate_record.get("nudges", 0))
