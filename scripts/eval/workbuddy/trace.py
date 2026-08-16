@@ -32,9 +32,13 @@ CONTROL_METRICS_SCHEMAS = frozenset(
 OBSERVATION_JOURNAL_SCHEMA = "metacodes-tool-observation-journal-v1"
 TOOL_OBSERVATION_SCHEMA = "metacodes-tool-observation-v1"
 RULE_FILTER_SCHEMA = "metacodes-project-rule-filter-v1"
-RULE_FILTER_PROOF = (
-    "MetaCodesControl.ProjectRule.target_mismatch_admits_both"
-)
+# Closed historical roster, like FORMAL_DECISION_SCHEMAS below: the theorem was
+# renamed when rule targets became a tool|effect_class union, and the auditor
+# must keep reading journals emitted by binaries shipped under either name.
+RULE_FILTER_PROOFS = {
+    "MetaCodesControl.ProjectRule.target_tool_mismatch_admits_both",
+    "MetaCodesControl.ProjectRule.target_mismatch_admits_both",
+}
 FORMAL_DECISION_SCHEMAS = {
     "metacodes-project-formal-decision-v1",
     "metacodes-project-formal-decision-v2",
@@ -522,11 +526,14 @@ def _task_list_has_kg_status(content: Any) -> bool:
         task_id = item.get("id")
         subject = item.get("subject")
         status = item.get("status")
+        # subject may legitimately be empty (the emitter titles KG rows with
+        # the node text's first line and accepts empty subjects on create);
+        # emptiness is cosmetic, not a governance invariant, so it must not
+        # kill an arm.  Identity (id) stays mandatory.
         if (
             not isinstance(task_id, str)
             or not task_id
             or not isinstance(subject, str)
-            or not subject
             or status not in {"pending", "in_progress", "completed", "blocked"}
         ):
             raise TraceError("TaskList task row is malformed")
@@ -716,6 +723,48 @@ def _tool_control_metrics(messages: Iterable[Mapping[str, Any]]) -> Dict[str, An
                             plan.get("variant_count"),
                             "KgRecall variant_count",
                         )
+                        # The emitter has two legal v3 execution modes: the full
+                        # host batch, and the proof-carrying seed-shape rewrite
+                        # (a deliberately tolerated model formatting slip where
+                        # only the seed anchor runs and every semantic variant
+                        # is explicitly left unexecuted).  Rejecting the second
+                        # mode would punish the runtime for being forgiving.
+                        execution = plan.get("execution")
+                        if execution == "host_batch_all":
+                            mode_consistent = (
+                                executed == variant_count
+                                and plan.get("all_variants_executed") is True
+                                and isinstance(variant_receipts, list)
+                                and len(variant_receipts) == executed
+                            )
+                        elif execution == "host_seed_shape_rewrite":
+                            rewrite = plan.get("rewrite")
+                            mode_consistent = (
+                                executed == 1
+                                and plan.get("all_variants_executed") is False
+                                and isinstance(variant_receipts, list)
+                                and len(variant_receipts) == 1
+                                and isinstance(rewrite, dict)
+                                and rewrite.get("schema_version")
+                                == "metacodes-seed-shape-rewrite-v1"
+                                and rewrite.get("effective_stage") == "seed"
+                                and rewrite.get("executed_variant_count") == 1
+                                # A rewrite can never satisfy enumeration
+                                # coverage, so it must not smuggle in the
+                                # batch-only auto_context observation.
+                                and payload.get("auto_context") is None
+                            )
+                            if mode_consistent:
+                                _hex_identity(
+                                    rewrite.get("input_plan_sha256"),
+                                    "KgRecall rewrite input identity",
+                                )
+                                _hex_identity(
+                                    rewrite.get("effective_seed_sha256"),
+                                    "KgRecall rewrite seed identity",
+                                )
+                        else:
+                            mode_consistent = False
                         if (
                             not isinstance(call_input, dict)
                             or not isinstance(declared_plan, dict)
@@ -723,13 +772,9 @@ def _tool_control_metrics(messages: Iterable[Mapping[str, Any]]) -> Dict[str, An
                             or not isinstance(declared_variants, list)
                             or not 1 <= len(declared_variants) <= 4
                             or variant_count != len(declared_variants)
-                            or executed != variant_count
+                            or not mode_consistent
                             or plan.get("intent") != declared_plan.get("intent")
                             or plan.get("stage") != declared_plan.get("stage")
-                            or plan.get("execution") != "host_batch_all"
-                            or plan.get("all_variants_executed") is not True
-                            or not isinstance(variant_receipts, list)
-                            or len(variant_receipts) != executed
                             or _non_negative_int(plan.get("merged_hit_count"), "KgRecall merged_hit_count") != count
                             or _non_negative_int(plan.get("merged_new_hit_count"), "KgRecall merged_new_hit_count") != observed_new
                             or _non_negative_int(plan.get("merged_previously_seen_count"), "KgRecall merged_previously_seen_count") != observed_repeated
@@ -968,7 +1013,7 @@ def _rule_filter_metrics(payload: Mapping[str, Any]) -> Dict[str, Any]:
         "exact_edit_recovery",
     }:
         raise TraceError("project rule filter phase or operation is invalid")
-    if payload.get("proof") != RULE_FILTER_PROOF:
+    if payload.get("proof") not in RULE_FILTER_PROOFS:
         raise TraceError("project rule filter proof identity is invalid")
     active = _non_negative_int(payload.get("active_rule_count"), "active rule count")
     checker = _non_negative_int(

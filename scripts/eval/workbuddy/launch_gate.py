@@ -82,8 +82,17 @@ AUTHORIZED_FAILURE_STAGES = {
 PROVIDER_KEY_ENV = "METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF"
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$")
 MAX_FAILURE_ARTIFACTS = 256
-MAX_FAILURE_ARTIFACT_BYTES = 64 * 1024 * 1024
-MAX_FAILURE_ARTIFACT_TOTAL_BYTES = 256 * 1024 * 1024
+# Request logs re-send the full accumulated conversation every provider turn,
+# so a single long trial's requests.jsonl scales with (turns x context), not
+# with the transcript.  Derivation from the budget cap this gate enforces:
+# 40M metered tokens/arm x ~4 bytes/token x ~2x JSON-escaping overhead is a
+# ~320MB worst case for one trial that burned the whole arm budget.  A 64MB
+# guess already rejected a real, legitimate 88MB log after runner exit 0 and
+# silently dropped it from the evidence freeze; bounds must dominate what the
+# producer can actually produce.
+MAX_FAILURE_ARTIFACT_BYTES = 512 * 1024 * 1024
+MAX_FAILURE_ARTIFACT_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
+MAX_REQUEST_LOG_BYTES = 512 * 1024 * 1024
 MAX_FAILURE_REQUEST_RECORDS = 4096
 MAX_FAILURE_WALK_ENTRIES = 8192
 FaultHook = Callable[[str, Mapping[str, Any]], None]
@@ -1932,7 +1941,7 @@ def _runtime_contract(manifest: Mapping[str, Any]) -> Dict[str, object]:
     unattributed = workbuddy / "scripts/logs/proxy" / f"{run_id}.jsonl"
     if unattributed.exists() and any(
         line.strip()
-        for line in _read_regular(unattributed, maximum=64 * 1024 * 1024).splitlines()
+        for line in _read_regular(unattributed, maximum=MAX_REQUEST_LOG_BYTES).splitlines()
     ):
         raise LaunchError("WorkBuddy left unattributed provider requests outside task receipts")
     return {
@@ -2043,7 +2052,7 @@ def _collect_usage(
             raise LaunchError(f"trajectory has invalid token usage: {trajectory_path}")
         request_log = trajectory_path.parent / "requests.jsonl"
         request_lines = [
-            line for line in _read_regular(request_log, maximum=64 * 1024 * 1024).splitlines()
+            line for line in _read_regular(request_log, maximum=MAX_REQUEST_LOG_BYTES).splitlines()
             if line.strip()
         ]
         if not request_lines:
@@ -2114,7 +2123,7 @@ def _collect_usage(
             # back to _identity's 16 MiB default would reject a complete long
             # trajectory after successfully validating the exact same bytes.
             "requests_sha256": _identity(
-                request_log, maximum=64 * 1024 * 1024
+                request_log, maximum=MAX_REQUEST_LOG_BYTES
             )["sha256"],
             "provider_requests": len(request_records),
             "cacheable_first_request_sha256": prefix_hash,
@@ -2410,10 +2419,30 @@ def _authorized_failure_artifacts(
     }
     artifacts: list[Dict[str, object]] = []
     request_summaries: list[Dict[str, object]] = []
+    # Accepted-name candidates that could not be frozen, BY NAME.  A bare
+    # counter hides which artifact vanished; the one time this fired for real
+    # it silently dropped the exact 88MB request log whose size had just
+    # killed the audit — the single most forensically relevant file.
+    skipped: list[Dict[str, object]] = []
     total_bytes = 0
     walked_entries = 0
     truncated = False
     seen: set[Path] = set()
+
+    def _skip(candidate: Path, reason: str) -> None:
+        nonlocal unsafe_entries
+        unsafe_entries += 1
+        if len(skipped) < 64:
+            try:
+                relative = candidate.relative_to(workbuddy).as_posix()
+            except ValueError:
+                relative = candidate.name
+            row: Dict[str, object] = {"relative_path": relative, "reason": reason}
+            try:
+                row["bytes"] = candidate.lstat().st_size
+            except OSError:
+                pass
+            skipped.append(row)
     for root in sorted(set(roots)):
         for directory, directories, files in os.walk(root, followlinks=False):
             walked_entries += len(directories) + len(files)
@@ -2448,23 +2477,26 @@ def _authorized_failure_artifacts(
                 try:
                     info = candidate.lstat()
                 except OSError:
-                    unsafe_entries += 1
+                    _skip(candidate, "unreadable")
                     continue
-                if (
-                    not stat.S_ISREG(info.st_mode)
-                    or info.st_nlink != 1
-                    or info.st_size <= 0
-                    or info.st_size > MAX_FAILURE_ARTIFACT_BYTES
-                    or total_bytes + info.st_size > MAX_FAILURE_ARTIFACT_TOTAL_BYTES
-                ):
-                    unsafe_entries += 1
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    _skip(candidate, "not a single-link regular file")
+                    continue
+                if info.st_size <= 0:
+                    _skip(candidate, "empty")
+                    continue
+                if info.st_size > MAX_FAILURE_ARTIFACT_BYTES:
+                    _skip(candidate, "exceeds per-artifact freeze bound")
+                    continue
+                if total_bytes + info.st_size > MAX_FAILURE_ARTIFACT_TOTAL_BYTES:
+                    _skip(candidate, "exceeds total freeze bound")
                     continue
                 try:
                     identity = _identity(
                         candidate, maximum=MAX_FAILURE_ARTIFACT_BYTES
                     )
                 except (LaunchError, OSError):
-                    unsafe_entries += 1
+                    _skip(candidate, "identity hash failed")
                     continue
                 relative = candidate.relative_to(workbuddy).as_posix()
                 artifact: Dict[str, object] = {
@@ -2482,7 +2514,7 @@ def _authorized_failure_artifacts(
                         or summary["source_sha256"] != identity["sha256"]
                         or current_identity != identity
                     ):
-                        unsafe_entries += 1
+                        _skip(candidate, "changed during freeze")
                         continue
                     artifact["kind"] = "request_audit"
                     artifact["request_audit"] = summary
@@ -2491,7 +2523,7 @@ def _authorized_failure_artifacts(
                     if _identity(
                         candidate, maximum=MAX_FAILURE_ARTIFACT_BYTES
                     ) != identity:
-                        unsafe_entries += 1
+                        _skip(candidate, "changed during freeze")
                         continue
                     artifact["kind"] = "local_artifact"
                 artifacts.append(artifact)
@@ -2515,6 +2547,7 @@ def _authorized_failure_artifacts(
         "artifact_bytes": total_bytes,
         "truncated": truncated,
         "unsafe_entries": unsafe_entries,
+        "skipped_artifacts": skipped,
         "identity_scope": (
             "official-run-id-and-task" if official_runner else "isolated-test-time"
         ),
@@ -2677,7 +2710,10 @@ def validate_authorized_failure_receipt(
     summary = evidence.get("request_audit")
     artifacts = evidence.get("artifacts")
     if (
-        set(evidence)
+        # skipped_artifacts is optional: receipts persisted before the freezer
+        # learned to name its skips must stay readable (closed two-era roster,
+        # not a moving pin).
+        set(evidence) - {"skipped_artifacts"}
         != {
             "artifacts",
             "artifact_count",
@@ -2689,6 +2725,7 @@ def validate_authorized_failure_receipt(
             "request_audit",
         }
         or not isinstance(artifacts, list)
+        or not isinstance(evidence.get("skipped_artifacts", []), list)
         or evidence.get("artifact_count") != len(artifacts)
         or not isinstance(summary, dict)
         or summary.get("request_body_retained") is not False
@@ -3141,7 +3178,7 @@ def execute_launch(
                         "WorkBuddy post-run evidence audit failed after runner exit 0; "
                         "authorized maximum remains exposed and retry is forbidden; "
                         f"failure receipt: {receipt_path}; "
-                        f"audit_error={type(exc).__name__}"
+                        f"audit_error={type(exc).__name__}: {str(exc)[:512]}"
                     ) from exc
                 committed = journal.commit(
                     transaction_id,

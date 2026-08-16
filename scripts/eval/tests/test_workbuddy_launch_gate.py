@@ -2290,3 +2290,57 @@ class RunnerToolLocaleTest(unittest.TestCase):
             path.chmod(0o755)
             with self.assertRaisesRegex(launch_gate.LaunchError, "GNU Bash 4 or newer"):
                 launch_gate._runner_tool(path, ("--version",), bash=True)
+
+
+class WorkBuddyEvidenceFreezerTest(unittest.TestCase):
+    """The freezer is part of the auditor: what it cannot freeze it must name.
+
+    The one real firing of the old silent-skip path dropped the exact 88MB
+    request log whose size had just killed the post-run audit, leaving a
+    nameless unsafe_entries counter as the only trace."""
+
+    def _manifest(self, checkout: Path) -> dict:
+        return {"workbuddy": {"checkout": str(checkout)}, "job": {"slug": "job-x"}}
+
+    def test_freezer_names_skipped_oversized_artifact(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wb-freeze-") as temporary:
+            checkout = Path(temporary)
+            trial = checkout / "results" / "job-x" / "run" / "task__abc" / "agent"
+            trial.mkdir(parents=True)
+            (trial / "trial.log").write_text("ok\n", encoding="utf-8")
+            (trial / "requests.jsonl").write_text("x" * 4096, encoding="utf-8")
+            with mock.patch.object(launch_gate, "MAX_FAILURE_ARTIFACT_BYTES", 1024):
+                evidence = launch_gate._authorized_failure_artifacts(
+                    self._manifest(checkout), started_ns=0, official_runner=False
+                )
+        frozen = {row["relative_path"] for row in evidence["artifacts"]}
+        self.assertIn("results/job-x/run/task__abc/agent/trial.log", frozen)
+        skipped = evidence["skipped_artifacts"]
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(
+            skipped[0]["relative_path"],
+            "results/job-x/run/task__abc/agent/requests.jsonl",
+        )
+        self.assertEqual(skipped[0]["reason"], "exceeds per-artifact freeze bound")
+        self.assertEqual(skipped[0]["bytes"], 4096)
+        self.assertEqual(evidence["unsafe_entries"], 1)
+
+    def test_audit_read_bound_dominates_producer_and_freezer(self) -> None:
+        # The audit's request-log read bound must dominate what a trial can
+        # actually produce under the standard arm authorization (40M metered
+        # tokens x ~4 bytes/token x ~2x JSON escaping), and the freezer must
+        # be able to freeze anything the audit reads — otherwise the file
+        # that kills the audit is the file missing from the evidence.
+        standard_arm_metered_tokens = 40_000_000
+        producer_worst_case = standard_arm_metered_tokens * 4 * 2
+        self.assertGreaterEqual(
+            launch_gate.MAX_REQUEST_LOG_BYTES, producer_worst_case
+        )
+        self.assertGreaterEqual(
+            launch_gate.MAX_FAILURE_ARTIFACT_BYTES,
+            launch_gate.MAX_REQUEST_LOG_BYTES,
+        )
+        self.assertGreaterEqual(
+            launch_gate.MAX_FAILURE_ARTIFACT_TOTAL_BYTES,
+            4 * launch_gate.MAX_FAILURE_ARTIFACT_BYTES,
+        )

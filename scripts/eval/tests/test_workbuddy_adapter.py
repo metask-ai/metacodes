@@ -33,7 +33,7 @@ from scripts.eval.workbuddy.key_fd import (
 )
 from scripts.eval.workbuddy.trace import (
     CONTROL_METRICS_SCHEMA,
-    RULE_FILTER_PROOF,
+    RULE_FILTER_PROOFS,
     OBSERVATION_JOURNAL_SCHEMA,
     TOOL_OBSERVATION_SCHEMA,
     TraceError,
@@ -670,7 +670,7 @@ class WorkBuddyTraceTest(unittest.TestCase):
                 "active_rule_count": 2,
                 "checker_rule_count": 0,
                 "statically_pruned_rule_count": 2,
-                "proof": RULE_FILTER_PROOF,
+                "proof": sorted(RULE_FILTER_PROOFS)[0],
             }
             start = {
                 "schema_version": TOOL_OBSERVATION_SCHEMA,
@@ -873,6 +873,149 @@ class WorkBuddyTraceTest(unittest.TestCase):
         self.assertEqual(tinykg["recall_succeeded"], 1)
         self.assertEqual(tinykg["recall_miss_calls"], 1)
         self.assertEqual(tinykg["recall_governed_calls"], 1)
+
+    def _rewrite_recall_rows(self, *, all_executed=False, with_auto_context=False):
+        # Shape mirrors src/tools/kg_tools.zig appendSeedShapeRewriteReceipt:
+        # the host executed only the seed anchor and left every declared
+        # semantic variant explicitly unexecuted, with a proof-carrying
+        # rewrite object binding input and effective plans.
+        payload = {
+            "count": 1,
+            "hits": [{"node_id": 7, "seen_before": False}],
+            "lexical_query_plan": {
+                "schema_version": "lexical-query-plan-v3",
+                "plan_sha256": "6" * 64,
+                "intent": "enumeration",
+                "stage": "semantic_expansion",
+                "variant_count": 3,
+                "executed_variant_count": 1,
+                "all_variants_executed": all_executed,
+                "seen_node_count": 0,
+                "seen_state_verified": True,
+                "ledger_scope": "agent_run_batch",
+                "merged_hit_count": 1,
+                "merged_new_hit_count": 1,
+                "merged_previously_seen_count": 0,
+                "probe_new_hit_count": 1,
+                "probe_repeated_hit_count": 0,
+                "variant_receipts": [{
+                    "variant_index": 0,
+                    "variant_kind": "exact",
+                    "node_ids": [7],
+                    "new_hit_count": 1,
+                    "repeated_hit_count": 0,
+                }],
+                "execution": "host_seed_shape_rewrite",
+                "rewrite": {
+                    "schema_version": "metacodes-seed-shape-rewrite-v1",
+                    "reason": "seed_prefixed_semantic_expansion",
+                    "input_plan_sha256": "7" * 64,
+                    "effective_plan_sha256": "6" * 64,
+                    "effective_seed_sha256": "8" * 64,
+                    "input_stage": "semantic_expansion",
+                    "effective_stage": "seed",
+                    "declared_variant_count": 3,
+                    "executed_variant_count": 1,
+                    "unexecuted_semantic_variant_count": 2,
+                },
+            },
+        }
+        if with_auto_context:
+            payload["auto_context"] = {"schema_version": "metacodes-auto-context-v1"}
+        tool_input = {
+            "query": "rollback ledger",
+            "lexical_plan": {
+                "schema_version": "lexical-query-plan-v3",
+                "intent": "enumeration",
+                "stage": "semantic_expansion",
+                "variants": [
+                    {"kind": "exact", "text": "rollback ledger"},
+                    {"kind": "synonym", "text": "undo journal"},
+                    {"kind": "mechanism", "text": "compensating transaction"},
+                ],
+            },
+        }
+        return [
+            {"role": "assistant", "blocks": [{
+                "type": "tool_use", "id": "recall-rewrite", "name": "KgRecall",
+                "input": json.dumps(tool_input),
+            }]},
+            {"role": "user", "blocks": [{
+                "type": "tool_result", "tool_use_id": "recall-rewrite",
+                "content": json.dumps(payload), "is_error": False,
+            }]},
+        ]
+
+    def test_control_metrics_accept_seed_shape_rewrite_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(transcript, self._rewrite_recall_rows())
+            self._write_jsonl(observation, self._journal())
+            metrics = load_control_metrics(transcript, observation)
+        tinykg = metrics["tinykg"]
+        self.assertEqual(tinykg["recall_governed_calls"], 1)
+        self.assertEqual(tinykg["recall_new_nodes"], 1)
+        self.assertEqual(tinykg["auto_context_succeeded"], 0)
+
+    def test_control_metrics_reject_rewrite_claiming_full_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(
+                transcript, self._rewrite_recall_rows(all_executed=True)
+            )
+            self._write_jsonl(observation, self._journal())
+            with self.assertRaisesRegex(TraceError, "batch coverage"):
+                load_control_metrics(transcript, observation)
+
+    def test_control_metrics_reject_rewrite_smuggling_auto_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(
+                transcript, self._rewrite_recall_rows(with_auto_context=True)
+            )
+            self._write_jsonl(observation, self._journal())
+            with self.assertRaisesRegex(TraceError, "batch coverage"):
+                load_control_metrics(transcript, observation)
+
+    def test_control_metrics_accept_historical_rule_filter_proof(self):
+        self.assertIn(
+            "MetaCodesControl.ProjectRule.target_tool_mismatch_admits_both",
+            RULE_FILTER_PROOFS,
+        )
+        self.assertIn(
+            "MetaCodesControl.ProjectRule.target_mismatch_admits_both",
+            RULE_FILTER_PROOFS,
+        )
+
+    def test_task_list_tolerates_empty_subject(self):
+        rows = [
+            {"role": "assistant", "blocks": [{
+                "type": "tool_use", "id": "list-1", "name": "TaskList",
+                "input": "{}",
+            }]},
+            {"role": "user", "blocks": [{
+                "type": "tool_result", "tool_use_id": "list-1",
+                "content": json.dumps([
+                    {"id": "kg-9", "subject": "", "status": "pending",
+                     "kg_status": "open"},
+                ]),
+                "is_error": False,
+            }]},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(transcript, rows)
+            self._write_jsonl(observation, self._journal())
+            metrics = load_control_metrics(transcript, observation)
+        self.assertEqual(metrics["tinykg"]["task_tinykg_status_results"], 1)
 
     def test_control_metrics_count_bound_auto_context_as_real_observation(self):
         tool_input = {
