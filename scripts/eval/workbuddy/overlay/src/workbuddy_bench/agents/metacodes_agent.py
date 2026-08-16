@@ -83,6 +83,18 @@ class MetacodesAgent(BaseInstalledAgent):
                 "METACODES_VERIFICATION_CHECKPOINT must be an explicit boolean"
             )
         self._verification_checkpoint = verification_checkpoint
+        final_gate = kwargs.pop("METACODES_VERIFICATION_FINAL_GATE", False)
+        final_observe = kwargs.pop("METACODES_VERIFICATION_FINAL_OBSERVE", False)
+        if not isinstance(final_gate, bool) or not isinstance(final_observe, bool):
+            raise ValueError(
+                "METACODES_VERIFICATION_FINAL_GATE/OBSERVE must be explicit booleans"
+            )
+        if final_gate and final_observe:
+            raise ValueError(
+                "verification final gate and observe modes are mutually exclusive"
+            )
+        self._verification_final_gate = final_gate
+        self._verification_final_observe = final_observe
         project_rules = kwargs.pop("METACODES_PROJECT_RULES_RELATIVE", None)
         project_kernel = kwargs.pop("METACODES_PROJECT_KERNEL_RELATIVE", None)
         project_control_mode = kwargs.pop("METACODES_PROJECT_CONTROL_MODE", None)
@@ -223,6 +235,10 @@ class MetacodesAgent(BaseInstalledAgent):
             flags += ["--max-tokens", str(self._max_output_tokens)]
         if self._verification_checkpoint:
             flags.append("--verification-checkpoint")
+        if self._verification_final_gate:
+            flags.append("--verification-final-gate")
+        if self._verification_final_observe:
+            flags.append("--verification-final-observe")
 
         project_setup = ""
         project_postcheck = ""
@@ -306,6 +322,8 @@ class MetacodesAgent(BaseInstalledAgent):
                 "transport_model_is_route": True,
                 "actor_model_identity": self._model_display_name,
                 "verification_checkpoint": self._verification_checkpoint,
+                "verification_final_gate": self._verification_final_gate,
+                "verification_final_observe": self._verification_final_observe,
                 "project_control": project_contract,
             },
             sort_keys=True,

@@ -42,9 +42,17 @@ CHECKPOINT_REPORT_SCHEMA_VERSION = (
 )
 PROJECT_CONTROL = "project_control"
 VERIFICATION_CHECKPOINT = "verification_checkpoint"
-STUDIES = {PROJECT_CONTROL, VERIFICATION_CHECKPOINT}
+VERIFICATION_FINAL_GATE = "verification_final_gate"
+STUDIES = {PROJECT_CONTROL, VERIFICATION_CHECKPOINT, VERIFICATION_FINAL_GATE}
 PROJECT_CONTROL_ARMS = {"baseline": "disabled", "treatment": "enforced"}
 CHECKPOINT_ARMS = {"baseline": False, "treatment": True}
+FINAL_GATE_REPORT_SCHEMA_VERSION = (
+    "metacodes-workbuddy-verification-final-gate-paired-report-v1"
+)
+# Measurement symmetry: the baseline arm must run record-only observation so
+# both arms carry the obligation outcome; only the treatment arm enforces.
+FINAL_GATE_ARMS = {"baseline": False, "treatment": True}
+FINAL_OBSERVE_ARMS = {"baseline": True, "treatment": False}
 
 
 def _number(value: object, where: str, *, minimum: float = 0.0) -> float:
@@ -272,10 +280,23 @@ def _validate_study_treatment(
                 raise LaunchError(
                     f"paired WorkBuddy {arm} has the wrong project-control treatment"
                 )
-        elif project_mode != "disabled" or checkpoint is not CHECKPOINT_ARMS[arm]:
-            raise LaunchError(
-                f"paired WorkBuddy {arm} has the wrong verification-checkpoint treatment"
-            )
+        elif study == VERIFICATION_CHECKPOINT:
+            if project_mode != "disabled" or checkpoint is not CHECKPOINT_ARMS[arm]:
+                raise LaunchError(
+                    f"paired WorkBuddy {arm} has the wrong verification-checkpoint treatment"
+                )
+        else:
+            if (
+                project_mode != "disabled"
+                or checkpoint is not False
+                or treatment.get("verification_final_gate")
+                is not FINAL_GATE_ARMS[arm]
+                or treatment.get("verification_final_observe")
+                is not FINAL_OBSERVE_ARMS[arm]
+            ):
+                raise LaunchError(
+                    f"paired WorkBuddy {arm} has the wrong final-gate treatment"
+                )
 
 
 def _lean_is_inactive(control: object) -> bool:
@@ -563,7 +584,7 @@ def build_report(
         ):
             raise LaunchError("paired WorkBuddy comparison identity is missing")
     _validate_study_treatment(manifests, study)
-    if study == VERIFICATION_CHECKPOINT:
+    if study in {VERIFICATION_CHECKPOINT, VERIFICATION_FINAL_GATE}:
         for arm, manifest in manifests.items():
             host_modules = manifest.get("host_control_plane")
             if not isinstance(host_modules, dict) or "progress_analysis" not in host_modules:
@@ -720,9 +741,11 @@ def build_report(
         "schema_version": (
             REPORT_SCHEMA_VERSION
             if study == PROJECT_CONTROL
+            else FINAL_GATE_REPORT_SCHEMA_VERSION
+            if study == VERIFICATION_FINAL_GATE
             else CHECKPOINT_REPORT_SCHEMA_VERSION
         ),
-        **({"study": study} if study == VERIFICATION_CHECKPOINT else {}),
+        **({"study": study} if study != PROJECT_CONTROL else {}),
         "quality_evidence": quality_evidence,
         "comparison_id": b_comparison["comparison_id"],
         "covariates_sha256": b_comparison["covariates_sha256"],
@@ -788,7 +811,7 @@ def build_report(
             "evidence of general Lean/TinyKG superiority"
             if study == PROJECT_CONTROL
             else "observed paired difference for this frozen task cohort with only the "
-            "verification-checkpoint treatment intentionally changed; one model sample "
+            f"{study.replace('_', '-')} treatment intentionally changed; one model sample "
             "per arm is directional evidence, not a general causal effect estimate"
         ),
     }

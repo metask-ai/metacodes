@@ -167,6 +167,8 @@ def _comparison_covariates(
     if isinstance(overrides, dict):
         overrides.pop("METACODES_PROJECT_CONTROL_MODE", None)
         overrides.pop("METACODES_VERIFICATION_CHECKPOINT", None)
+        overrides.pop("METACODES_VERIFICATION_FINAL_GATE", None)
+        overrides.pop("METACODES_VERIFICATION_FINAL_OBSERVE", None)
     stable_artifacts = json.loads(json.dumps(artifacts))
     # Absolute staging paths describe where identical bytes were observed, not
     # an experimental variable.  Keep every digest/size/architecture field.
@@ -646,6 +648,22 @@ def build_launch_manifest(
         raise LaunchError(
             "WorkBuddy verification checkpoint treatment must be an explicit boolean"
         )
+    verification_final_gate = project_overrides.get(
+        "METACODES_VERIFICATION_FINAL_GATE", False
+    )
+    verification_final_observe = project_overrides.get(
+        "METACODES_VERIFICATION_FINAL_OBSERVE", False
+    )
+    if not isinstance(verification_final_gate, bool) or not isinstance(
+        verification_final_observe, bool
+    ):
+        raise LaunchError(
+            "WorkBuddy verification final-gate treatment must be explicit booleans"
+        )
+    if verification_final_gate and verification_final_observe:
+        raise LaunchError(
+            "WorkBuddy verification final gate and observe modes are exclusive"
+        )
     expected_project_overrides = (
         {
             "METACODES_PROJECT_CONTROL_MODE": project_control_mode,
@@ -785,6 +803,8 @@ def build_launch_manifest(
             "tool_schema_changed": False,
             "provider_cache_prefix_changed_by_control_plane": False,
             "verification_checkpoint": verification_checkpoint,
+            "verification_final_gate": verification_final_gate,
+            "verification_final_observe": verification_final_observe,
         },
         "comparison": (
             {
@@ -897,9 +917,28 @@ def _validate_launch_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
                     if "verification_checkpoint" in treatment
                     else {}
                 ),
+                **(
+                    {
+                        "verification_final_gate": treatment.get(
+                            "verification_final_gate"
+                        ),
+                        "verification_final_observe": treatment.get(
+                            "verification_final_observe"
+                        ),
+                    }
+                    if "verification_final_gate" in treatment
+                    else {}
+                ),
             }
             or treatment.get("project_control") not in PROJECT_CONTROL_MODES
             or ("verification_checkpoint" in treatment and not isinstance(checkpoint, bool))
+            or (
+                "verification_final_gate" in treatment
+                and not (
+                    isinstance(treatment.get("verification_final_gate"), bool)
+                    and isinstance(treatment.get("verification_final_observe"), bool)
+                )
+            )
         ):
             raise LaunchError("paid launch treatment contract is incomplete")
     elif treatment is not None:
