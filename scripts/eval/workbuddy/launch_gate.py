@@ -1152,8 +1152,17 @@ def _reobserve_host_control_plane(manifest: Mapping[str, Any]) -> None:
         raise LaunchError("WorkBuddy host control plane changed after manifest creation")
 
 
-def _reobserve_launch_inputs(manifest: Mapping[str, Any]) -> None:
-    _reobserve_host_control_plane(manifest)
+def _reobserve_launch_inputs(
+    manifest: Mapping[str, Any], *, include_host_control_plane: bool = True
+) -> None:
+    # Audit resumption legitimately runs under a NEWER control plane than the
+    # manifest pinned — a fixed auditor is its entire premise.  The resumption
+    # receipt discloses the exact module hashes instead, and paired analysis
+    # only admits them through earned instrument succession.  Every
+    # treatment-identity input below (checkout commit, overlay, artifacts,
+    # kernel, configs) is still re-observed unconditionally.
+    if include_host_control_plane:
+        _reobserve_host_control_plane(manifest)
     workbuddy = Path(manifest["workbuddy"]["checkout"])
     if _git(workbuddy, "rev-parse", "HEAD") != WORKBUDDY_PINNED_COMMIT:
         raise LaunchError("WorkBuddy checkout changed after launch manifest creation")
@@ -2958,7 +2967,7 @@ def resume_post_run_audit(
     else:
         raise LaunchError("audit resumption cannot determine the runner mode")
     if official_runner:
-        _reobserve_launch_inputs(manifest)
+        _reobserve_launch_inputs(manifest, include_host_control_plane=False)
 
     # Continuity is verified directly against the receipt's frozen rows: the
     # launcher's cleanup tears down live run state (instance manifests, proxy
