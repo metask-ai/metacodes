@@ -858,7 +858,7 @@ test "replay and shadow require mixed cases and a completed grounded interval" {
     const candidate_result = try candidate_mod.persist(root, .{
         .project_sha256 = project,
         .proposer_sha256 = proposer,
-        .invariant = "Authoritative Write inputs stay within the project bound.",
+        .invariant = "Authoritative Write dispatches are governed; others are not admitted.",
         .rule_spec = .{
             .target = .{ .tool = "Write" },
             .deny_target = false,
@@ -871,7 +871,7 @@ test "replay and shadow require mixed cases and a completed grounded interval" {
         .source = .{ .agent_reflection = .{
             .observation = binding,
             .reflector_sha256 = proposer,
-            .falsifier = "An oversized authoritative Write is admitted.",
+            .falsifier = "A non-authoritative Write is admitted.",
         } },
     });
     var candidate = try candidate_mod.load(std.testing.allocator, root, candidate_result.candidate_id);
@@ -921,9 +921,9 @@ test "replay and shadow require mixed cases and a completed grounded interval" {
             .signal = .{ .pre = .{ .tool = "Write", .input_bytes = 10, .agent_depth = 0, .authoritative = true } },
         },
         .{
-            .case_id = "over-bound",
+            .case_id = "non-authoritative-blocked",
             .expected_admit = false,
-            .signal = .{ .pre = .{ .tool = "Write", .input_bytes = 101, .agent_depth = 0, .authoritative = true } },
+            .signal = .{ .pre = .{ .tool = "Write", .input_bytes = 10, .agent_depth = 0, .authoritative = false } },
         },
     };
     const replay = try evaluateAndRecordReplay(

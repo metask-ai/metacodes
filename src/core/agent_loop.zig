@@ -349,6 +349,10 @@ pub const Options = struct {
     /// late checkpoint when a conservative test command succeeds. This never
     /// changes the stable system prompt or tool definitions.
     verification_checkpoint: bool = false,
+    /// Session-end verification obligation: a premature final answer after an
+    /// unverified mutation receives a bounded nudge (task-agnostic process
+    /// rule; carries no benchmark or task content).
+    verification_final_gate: bool = false,
     /// 统一 UI 请求回调(替代旧 ask_question/exit_plan 三套;ctx 指 *TuiBackend)。
     /// 仅顶层 TUI 接(agent_depth==0)——子 agent 无 tty。见 UiRequester。
     ui_requester: ?@import("protocol/ui_request.zig").UiRequester = null,
@@ -572,6 +576,8 @@ pub fn run(
     var total_tool_calls: u32 = 0;
     // max_tokens 续写计数:防止模型一直撞上限导致无限续写。上限 3 次。
     var continuations: u32 = 0;
+    var verification_nudges: u8 = 0;
+    const MAX_VERIFICATION_NUDGES: u8 = 2;
     const MAX_CONTINUATIONS: u32 = 3;
 
     // Governed lexical recall is run-scoped: the model proposes aliases and
@@ -1260,6 +1266,30 @@ pub fn run(
                 backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
             }
+            // Verification obligation (task-agnostic process rule): a final
+            // answer after an unverified mutation gets a bounded nudge with a
+            // concrete recovery protocol. Budget exhausted → finish normally
+            // and record obligation_unmet; never block indefinitely.
+            if (opts.verification_final_gate and
+                verification_progress.unverified_mutation and
+                verification_nudges < MAX_VERIFICATION_NUDGES)
+            {
+                verification_nudges += 1;
+                log.infoId("agent", rid, "verification final gate nudge {d}/{d}", .{ verification_nudges, MAX_VERIFICATION_NUDGES });
+                backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                try conversation.appendText(.user, verification_progress_mod.FINAL_GATE_TEXT);
+                continue;
+            }
+            if (opts.verification_final_gate) {
+                if (opts.tool_observer) |observer| {
+                    _ = observer.emit(.{ .verification_final_gate = .{
+                        .mutations_occurred = verification_progress.mutation_seen,
+                        .obligation_met = !verification_progress.unverified_mutation,
+                        .nudges = verification_nudges,
+                        .max_nudges = MAX_VERIFICATION_NUDGES,
+                    } });
+                }
+            }
             // L4 诊断:本轮无 tool_use → turn 结束(span 平衡:每个 turn_begin 都配一个
             // turn_end,无论有无工具)。紧接 run_end(end_turn)收口。
             backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
@@ -1628,8 +1658,11 @@ pub fn run(
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .suspended, .turns = turns + 1, .tool_calls = total_tool_calls, .suspend_info = si });
         }
 
-        const inject_verification_checkpoint = opts.verification_checkpoint and
-            verification_progress.observeTurn(allocator, slots.items);
+        const observe_verification = opts.verification_checkpoint or
+            opts.verification_final_gate;
+        const inject_verification_checkpoint = observe_verification and
+            verification_progress.observeTurn(allocator, slots.items) and
+            opts.verification_checkpoint;
 
         // 6d. 按原顺序回填 result_blocks。
         // P0.2 PostToolUse:执行后 hook 产出的 additionalContext,拼成一段注入本轮 user 消息(下轮模型可见)。

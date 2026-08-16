@@ -450,7 +450,7 @@ pub fn loadRunDispatches(
                 // Diagnostic-only: a coverage gap binds no rule identity and
                 // no checker call, so replay has nothing to validate. It must
                 // still never be silently dropped from the hashed interval.
-                .rule_coverage_gap, .rule_bounds_overflow => {},
+                .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate => {},
                 .rule_filter => |filter| try rule_filters.append(a, .{
                     .sequence = envelope.sequence,
                     .dispatch_id = filter.dispatch_id,
@@ -706,7 +706,7 @@ fn validateFd(
                     }
                 }
                 switch (tool_event) {
-                    .rule_coverage_gap, .rule_bounds_overflow => {},
+                    .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate => {},
                     .rule_filter => |filter| {
                         try validateRuleFilter(&rule_filter_identities, filter);
                         const key = ruleFilterKey(filter.dispatch_id, filter.phase);

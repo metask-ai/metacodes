@@ -21,9 +21,26 @@ pub const CHECKPOINT_TEXT =
     "3. Continue editing only when a concrete failure or unmet requirement justifies it.\n" ++
     "Do not add unrelated tests, docs, or refactors.";
 
+pub const FINAL_GATE_TEXT =
+    "[verification obligation]\n" ++
+    "You are about to finish, but the last file mutation has not been " ++
+    "followed by a successful verification run. Before your final answer:\n" ++
+    "1. Run the most relevant verification command (the project's tests, the " ++
+    "task's acceptance checks, or a direct execution of the changed code).\n" ++
+    "2. If it fails, fix the code and verify again.\n" ++
+    "3. Only then give your final answer.\n" ++
+    "If no verification command can exist for this change, state that " ++
+    "explicitly in your final answer instead of implying it was verified.";
+
 pub const State = struct {
     mutation_seen: bool = false,
     checkpoint_emitted: bool = false,
+    /// True while the most recent realized mutation has not been followed by
+    /// a successful verification in a *later* completed turn. Intra-turn
+    /// ordering is deliberately not trusted (same reasoning as the
+    /// checkpoint): a turn that both mutates and verifies leaves the
+    /// obligation open until a verification-only turn clears it.
+    unverified_mutation: bool = false,
 
     /// Observe one completed tool-use turn.  A mutation and verification in the
     /// same parallel turn do not trigger: their real execution order is not a
@@ -36,17 +53,24 @@ pub const State = struct {
     ) bool {
         const mutation_preceded_turn = self.mutation_seen;
         var realized_mutation = false;
-        var successful_verification = false;
+        var any_successful_verification = false;
         for (slots) |slot| {
             if (isRealizedMutation(slot.effect, slot.effect_valid))
                 realized_mutation = true;
-            if (mutation_preceded_turn and
-                !self.checkpoint_emitted and
-                isSuccessfulVerification(allocator, slot))
-                successful_verification = true;
+            if (isSuccessfulVerification(allocator, slot))
+                any_successful_verification = true;
         }
         self.mutation_seen = self.mutation_seen or realized_mutation;
-        if (!successful_verification) return false;
+        // Final-gate obligation: a mutating turn (re)opens it regardless of a
+        // same-turn verification; a verification-only turn closes it.
+        if (realized_mutation) {
+            self.unverified_mutation = true;
+        } else if (any_successful_verification) {
+            self.unverified_mutation = false;
+        }
+        const checkpoint = mutation_preceded_turn and
+            !self.checkpoint_emitted and any_successful_verification;
+        if (!checkpoint) return false;
         self.checkpoint_emitted = true;
         return true;
     }

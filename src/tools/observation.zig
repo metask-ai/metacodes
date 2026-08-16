@@ -22,6 +22,7 @@ pub const FORMAL_BATCH_SCHEMA_VERSION = "metacodes-project-formal-decision-batch
 pub const RULE_FILTER_SCHEMA_VERSION = "metacodes-project-rule-filter-v1";
 pub const RULE_COVERAGE_GAP_SCHEMA_VERSION = "metacodes-project-rule-coverage-gap-v1";
 pub const RULE_BOUNDS_OVERFLOW_SCHEMA_VERSION = "metacodes-project-rule-bounds-overflow-v1";
+pub const VERIFICATION_FINAL_GATE_SCHEMA_VERSION = "metacodes-verification-final-gate-v1";
 
 pub const Origin = enum {
     authoritative,
@@ -204,6 +205,19 @@ pub const Event = union(enum) {
     /// that shifts the action distribution can therefore move traffic off the
     /// enforced plane silently. Emit that as a first-class signal instead of
     /// leaving it to be reconstructed from transcripts after the fact.
+    /// Terminal record of the session-end verification obligation. Emitted
+    /// exactly once per run when the final gate was armed: whether any
+    /// realized mutation occurred, whether the obligation was met (every
+    /// mutation followed by a later successful verification), and how many
+    /// bounded nudges were spent. `obligation_met=false` with exhausted
+    /// nudges is the measurable "declared done without verifying" outcome.
+    verification_final_gate: struct {
+        schema_version: []const u8 = VERIFICATION_FINAL_GATE_SCHEMA_VERSION,
+        mutations_occurred: bool,
+        obligation_met: bool,
+        nudges: u8,
+        max_nudges: u8,
+    },
     /// A matched verify-only rule admitted a dispatch whose input or agent
     /// depth exceeds the rule's authored envelope. The envelope is a
     /// reasoning bound, not a safety verdict — enforcement here produced a

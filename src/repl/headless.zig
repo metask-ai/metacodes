@@ -266,6 +266,7 @@ fn buildOptions(
         .tool_observer = tool_observer,
         .project_rule_gate = project_rule_gate,
         .verification_checkpoint = app.config.verification_checkpoint,
+        .verification_final_gate = app.config.verification_final_gate,
         // Tool lifecycle events are part of the evaluation protocol even
         // though the null writer renders no cards.  Leaving this false made
         // headless traces contain policy decisions without tool attempts.
