@@ -1117,7 +1117,10 @@ def _run_one(
                     and factorial_treatment.lean_lever == "bundle"
                 ),
                 "checker_sha256": (
-                    kernel_sha256 if factorial_treatment.lean_enabled else None
+                    kernel_sha256
+                    if factorial_treatment.lean_enabled
+                    and factorial_treatment.lean_lever == "bundle"
+                    else None
                 ),
                 "bundle_sha256": (
                     templates["templates"][flavor]["bundle_sha256"]

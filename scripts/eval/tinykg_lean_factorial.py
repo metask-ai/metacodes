@@ -239,7 +239,7 @@ def _validate_tinykg(value: Mapping[str, Any], enabled: bool, where: str) -> Non
 
 
 def _validate_lean(value: Mapping[str, Any], enabled: bool, where: str) -> None:
-    expected_fields = {
+    base_fields = {
         "enabled",
         "bundle_loaded",
         "checker_sha256",
@@ -248,6 +248,12 @@ def _validate_lean(value: Mapping[str, Any], enabled: bool, where: str) -> None:
         "formal_decisions",
         "unsafe_false_interventions",
     }
+    # Receipts before the final-gate lever carry no "lever" field and are
+    # bundle-shaped by construction.
+    lever = value.get("lever", "bundle")
+    if lever not in {"bundle", "final_gate"}:
+        _fail(where, "unknown lean lever")
+    expected_fields = base_fields | ({"lever"} if "lever" in value else set())
     if set(value) != expected_fields or value.get("enabled") is not enabled:
         _fail(where, "field or factor drift")
     counts: dict[str, int] = {}
@@ -258,13 +264,27 @@ def _validate_lean(value: Mapping[str, Any], enabled: bool, where: str) -> None:
         counts[field] = raw
     if counts["unsafe_false_interventions"] != 0:
         _fail(where, "unsafe Lean false intervention")
-    if enabled:
+    if enabled and lever == "bundle":
         if (
             value.get("bundle_loaded") is not True
             or not _is_sha256(value.get("checker_sha256"))
             or not _is_sha256(value.get("bundle_sha256"))
         ):
             _fail(where, "Lean treatment was not loaded")
+    elif enabled:
+        # final_gate lever: the enforcement plane is the session-end
+        # obligation rail in the native loop. No bundle participates, so no
+        # kernel authority may appear anywhere in the cell.
+        if any(
+            (
+                value.get("bundle_loaded") is not False,
+                value.get("checker_sha256") is not None,
+                value.get("bundle_sha256") is not None,
+                counts["checker_calls"] != 0,
+                counts["formal_decisions"] != 0,
+            )
+        ):
+            _fail(where, "final-gate cell exposed bundle authority")
     elif any(
         (
             value.get("bundle_loaded") is not False,
