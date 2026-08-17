@@ -625,6 +625,8 @@ pub fn run(
                 .max_nudges = MAX_VERIFICATION_NUDGES,
                 .tier1_verifications = verification_progress.tier1_verifications,
                 .tier2_verifications = verification_progress.tier2_verifications,
+                .redundant_verifications = verification_progress.redundant_verifications,
+                .final_closure_tier = verification_progress.final_closure_tier,
                 .reopened_after_verification = verification_progress.reopened_after_verification,
                 .known_failing = verification_progress.known_failing,
             } });

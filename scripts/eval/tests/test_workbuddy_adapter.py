@@ -3118,6 +3118,30 @@ class WorkBuddyGateRecordTest(unittest.TestCase):
         self.assertEqual(lean["verification_reopened_after_verification"], 1)
         self.assertEqual(lean["verification_known_failing"], 0)
 
+    def test_v3_gate_record_exports_freshness_sensors(self):
+        # PO-V2 M4 observe sensors: green-rerun count + closing evidence tier.
+        lean = self._metrics({
+            "schema_version": "metacodes-verification-final-gate-v3",
+            "enforced": True, "mutations_occurred": True,
+            "obligation_met": True, "nudges": 0, "max_nudges": 2,
+            "tier1_verifications": 2, "tier2_verifications": 0,
+            "reopened_after_verification": 0, "known_failing": False,
+            "redundant_verifications": 1, "final_closure_tier": 1,
+        })["lean"]
+        self.assertEqual(lean["verification_tier1_verifications"], 2)
+        self.assertEqual(lean["verification_redundant_verifications"], 1)
+        self.assertEqual(lean["verification_final_closure_tier"], 1)
+
+    def test_v3_gate_record_missing_sensors_fails_loudly(self):
+        with self.assertRaisesRegex(TraceError, "freshness sensors are invalid"):
+            self._metrics({
+                "schema_version": "metacodes-verification-final-gate-v3",
+                "enforced": True, "mutations_occurred": True,
+                "obligation_met": True, "nudges": 0, "max_nudges": 2,
+                "tier1_verifications": 1, "tier2_verifications": 0,
+                "reopened_after_verification": 0, "known_failing": False,
+            })
+
     def test_v2_gate_record_with_bad_tier_count_fails_loudly(self):
         with self.assertRaisesRegex(TraceError, "tier-2 count is invalid"):
             self._metrics({

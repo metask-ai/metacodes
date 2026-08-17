@@ -90,6 +90,11 @@ pub const State = struct {
     /// verified state. Observational counter for the shadow phase of any
     /// future formal rule.
     reopened_after_verification: u32 = 0,
+    /// v3 传感器(PO-V2 M4,observe):义务已闭合时又来的验证事件计数
+    /// (每轮至多 +1;"绿灯重跑"的可观察面),与最终一次闭合义务的证据级
+    /// (0=未闭合/被重开,1=tier1 测试命令,2=tier2 变更面重观察)。
+    redundant_verifications: u32 = 0,
+    final_closure_tier: u8 = 0,
     /// 最近一次验证尝试(tier1/tier2 形状)的结局是失败(PO-V2 M2 信号位:
     /// 失败之后的测试文件编辑是"弱化候选")。成功验证清零。
     last_verification_failed: bool = false,
@@ -147,7 +152,14 @@ pub const State = struct {
             }
             self.unverified_mutation = true;
             self.known_failing = false;
+            self.final_closure_tier = 0;
         } else if (tier1 or tier2) {
+            if (!self.unverified_mutation and mutation_preceded_turn) {
+                // M4 传感器:没有待验变更却在验证——"绿灯重跑"面,只计数不判定。
+                self.redundant_verifications += 1;
+            } else if (self.unverified_mutation) {
+                self.final_closure_tier = if (tier2) 2 else 1;
+            }
             self.unverified_mutation = false;
             self.known_failing = false;
         } else if (failed_attempt and self.unverified_mutation) {

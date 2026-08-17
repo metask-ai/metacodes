@@ -1285,6 +1285,7 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                     not in {
                         "metacodes-verification-final-gate-v1",
                         "metacodes-verification-final-gate-v2",
+                        "metacodes-verification-final-gate-v3",
                     }
                     or not isinstance(observation.get("enforced"), bool)
                     or not isinstance(observation.get("obligation_met"), bool)
@@ -1310,7 +1311,10 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                     bool(observation.get("mutations_occurred"))
                 )
                 formal["verification_nudges"] = nudges
-                if gate_schema == "metacodes-verification-final-gate-v2":
+                if gate_schema in {
+                    "metacodes-verification-final-gate-v2",
+                    "metacodes-verification-final-gate-v3",
+                }:
                     for key, where in (
                         ("tier1_verifications", "tier-1 count"),
                         ("tier2_verifications", "tier-2 count"),
@@ -1333,6 +1337,24 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                     formal["verification_known_failing"] = int(
                         bool(observation.get("known_failing"))
                     )
+                if gate_schema == "metacodes-verification-final-gate-v3":
+                    # PO-V2 M4 observe sensors: green-rerun count and the
+                    # evidence tier that finally closed the obligation.
+                    redundant = observation.get("redundant_verifications")
+                    closure_tier = observation.get("final_closure_tier")
+                    if (
+                        not isinstance(redundant, int)
+                        or isinstance(redundant, bool)
+                        or redundant < 0
+                        or not isinstance(closure_tier, int)
+                        or isinstance(closure_tier, bool)
+                        or closure_tier not in {0, 1, 2}
+                    ):
+                        raise TraceError(
+                            "verification final-gate freshness sensors are invalid"
+                        )
+                    formal["verification_redundant_verifications"] = redundant
+                    formal["verification_final_closure_tier"] = closure_tier
             elif observation_kind == "requirement_ledger":
                 # Terminal record of the requirement-ledger closure
                 # obligation: at most one per run, both arms carry it

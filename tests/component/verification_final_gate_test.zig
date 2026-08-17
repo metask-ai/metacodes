@@ -42,6 +42,8 @@ const GateRecordSink = struct {
     nudges: u8 = 255,
     tier1: u32 = 0,
     tier2: u32 = 0,
+    redundant: u32 = 255,
+    closure_tier: u8 = 255,
     reopened: u32 = 0,
     known_failing: bool = false,
 
@@ -56,6 +58,8 @@ const GateRecordSink = struct {
                 self.nudges = record.nudges;
                 self.tier1 = record.tier1_verifications;
                 self.tier2 = record.tier2_verifications;
+                self.redundant = record.redundant_verifications;
+                self.closure_tier = record.final_closure_tier;
                 self.reopened = record.reopened_after_verification;
                 self.known_failing = record.known_failing;
             },
@@ -632,4 +636,36 @@ test "L2 a test-file edit after a failed verification emits a hot weakening cand
     try std.testing.expectEqual(@as(usize, 1), record.hot);
     try std.testing.expect(!record.last_failed_flags[0]);
     try std.testing.expect(record.last_failed_flags[1]);
+}
+
+
+// PO-V2 M4(observe 传感器):义务闭合后的再验证 = "绿灯重跑"计数;
+// 闭合证据级记录最终一次闭合靠的层(1=tier1 测试命令)。
+// fstack-r2 实测:freshness nudge 三次触发全部只产生已绿检查的重跑,
+// 现行事件对此不可见——本传感器让它可见(只计数,不判定)。
+test "L2 a green rerun after closure counts as redundant and closure tier is recorded" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const command = try greenCommand(a, root);
+    defer a.free(command);
+    const write = try writeSse(a, root);
+    defer a.free(write);
+    const bash_close = try bashSse(a, command);
+    defer a.free(bash_close);
+    const rerun_input = try std.fmt.allocPrint(a, "{{\"command\":\"{s}\"}}", .{command});
+    defer a.free(rerun_input);
+    const bash_rerun = try toolSse(a, "test_2", "Bash", rerun_input);
+    defer a.free(bash_rerun);
+    // write → green close(tier1) → green rerun(redundant) → final.
+    var run = try runGate(a, root, true, &.{ write, bash_close, bash_rerun, END_TURN });
+    defer run.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), run.record.records);
+    try std.testing.expect(run.record.obligation_met);
+    try std.testing.expectEqual(@as(u32, 2), run.record.tier1);
+    try std.testing.expectEqual(@as(u32, 1), run.record.redundant);
+    try std.testing.expectEqual(@as(u8, 1), run.record.closure_tier);
+    try std.testing.expectEqual(@as(u8, 0), run.record.nudges);
 }

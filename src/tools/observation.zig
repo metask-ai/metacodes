@@ -22,7 +22,7 @@ pub const FORMAL_BATCH_SCHEMA_VERSION = "metacodes-project-formal-decision-batch
 pub const RULE_FILTER_SCHEMA_VERSION = "metacodes-project-rule-filter-v1";
 pub const RULE_COVERAGE_GAP_SCHEMA_VERSION = "metacodes-project-rule-coverage-gap-v1";
 pub const RULE_BOUNDS_OVERFLOW_SCHEMA_VERSION = "metacodes-project-rule-bounds-overflow-v1";
-pub const VERIFICATION_FINAL_GATE_SCHEMA_VERSION = "metacodes-verification-final-gate-v2";
+pub const VERIFICATION_FINAL_GATE_SCHEMA_VERSION = "metacodes-verification-final-gate-v3";
 pub const REQUIREMENT_LEDGER_SCHEMA_VERSION = "metacodes-requirement-ledger-v1";
 pub const TEST_WEAKENING_SCHEMA_VERSION = "metacodes-test-weakening-candidate-v1";
 
@@ -240,6 +240,12 @@ pub const Event = union(enum) {
         /// obligation was satisfied instead of a bare met bit.
         tier1_verifications: u32,
         tier2_verifications: u32,
+        /// v3 sensors(PO-V2 M4,observe):义务已闭合状态下的验证事件计数
+        /// (freshness nudge 的橡皮图章面),与最终闭合靠的证据级
+        /// (0=未闭合,1=tier1 测试命令,2=tier2 变更面重观察)。
+        /// 无默认值:发射点必须显式赋值(within_root 恒 true 事故的教训)。
+        redundant_verifications: u32,
+        final_closure_tier: u8,
         /// Churn shadow counter: realized mutations that landed while the
         /// session was in a verified state.
         reopened_after_verification: u32,
