@@ -23,7 +23,16 @@ pub const LEDGER_PROMPT_TEXT =
     "requirement, including edge conditions the statement names. Close each " ++
     "item (status=completed) only when it is implemented and verified; close " ++
     "inapplicable items with a short reason. Keep the ledger current as you " ++
-    "work.";
+    "work.\n" ++
+    // PO-V2 M3(prompt 协议,任务无关):计划期钉下的具体选择要落成可核对
+    // 的 decision;fstack-r2 的 dotenv 死法 = 计划两次决定 debug 级,下一个
+    // Edit 写成 info,自测把漂移钉死——typed 决策 + 收尾核对是它的直接猎物。
+    "When your plan fixes a concrete choice (a level, a format, an " ++
+    "algorithm, a name), record it as a one-line decision (KgRemember, " ++
+    "kind=decision). Before your final answer, re-check each recorded " ++
+    "decision against your actual changes: honored, or explicitly revised " ++
+    "with a reason. If you discover a defect you decide not to fix, record " ++
+    "it as an open task item instead of prose.";
 
 /// Premature final answer with open ledger items. `{d}` = open count.
 pub const OPEN_NUDGE_FMT =
@@ -91,4 +100,13 @@ test "closure disarms and coverage fires once" {
     try std.testing.expectEqual(Decision.coverage, state.decide(0, 0, true));
     state.coverage_nudge_used = true;
     try std.testing.expectEqual(Decision.none, state.decide(0, 0, true));
+}
+
+test "M3: ledger prompt carries the decision-record and defect-to-ledger protocol" {
+    // 提示协议是机制的一部分(fstack-r2:dotenv 计划→代码漂移;security
+    // 亲口识别缺陷后散文带过)。钉住条款,防无声回退。
+    try std.testing.expect(std.mem.indexOf(u8, LEDGER_PROMPT_TEXT, "KgRemember") != null);
+    try std.testing.expect(std.mem.indexOf(u8, LEDGER_PROMPT_TEXT, "kind=decision") != null);
+    try std.testing.expect(std.mem.indexOf(u8, LEDGER_PROMPT_TEXT, "honored, or explicitly revised") != null);
+    try std.testing.expect(std.mem.indexOf(u8, LEDGER_PROMPT_TEXT, "open task item") != null);
 }
