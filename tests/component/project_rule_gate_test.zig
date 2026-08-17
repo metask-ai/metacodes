@@ -4797,3 +4797,114 @@ test "L2 verify-only rule admits an oversized new-file Write and reports the ove
     defer allocator.free(written);
     try std.testing.expectEqual(@as(usize, 14 * 1024), written.len);
 }
+
+// 2026-08-17 复审:batch/dispatch 事件的 within_root 带默认 true,发射端曾不
+// 接线 → journal 恒记 true(两次 /tmp 根外拦截被记成 within_root=true——内核
+// 判对了,审计字段说谎)。本测不依赖 Lean checker:tool_observer 存在即触发
+// observePre 真分类,断言 dispatch_started 落盘的 within_root 反映真实包含性。
+test "dispatch_started 记录真实 within_root(根外 false/根内 true)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const evidence_dir = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root});
+    defer allocator.free(evidence_dir);
+    const inner_root = try std.fmt.allocPrint(allocator, "{s}/proj", .{root});
+    defer allocator.free(inner_root);
+    try cc.util_fs.mkdirParents(evidence_dir);
+    try cc.util_fs.mkdirParents(inner_root);
+
+    const sid = cc.session_id.SessionId.fromSlice("aaaabbbbccccddddeeeeffff").?;
+    var journal = try cc.tool_observation_journal.Journal.init(evidence_dir, sid);
+    const sink = journal.sink();
+    var ctx = cc.tool_context.ToolContext.simple(allocator);
+    ctx.tool_observer = sink;
+    ctx.cwd_abs = inner_root;
+
+    // 根外:写到 tmp 根(inner_root 的父级)——分类器必须判 within_root=false。
+    const outside_path = try std.fmt.allocPrint(allocator, "{s}/outside.txt", .{root});
+    defer allocator.free(outside_path);
+    const outside_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"x\"}}",
+        .{outside_path},
+    );
+    defer allocator.free(outside_args);
+    const out_result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        outside_args,
+        "wr-outside",
+        allocator,
+        .{ .bytes = [_]u8{'1'} ** 12 },
+    );
+    switch (out_result) {
+        .done => |done| {
+            if (done.content) |bytes| allocator.free(bytes);
+            if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            }
+        },
+        else => return error.UnexpectedResult,
+    }
+
+    // 根内:写进 inner_root——within_root=true。
+    const inside_path = try std.fmt.allocPrint(allocator, "{s}/inside.txt", .{inner_root});
+    defer allocator.free(inside_path);
+    const inside_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_path\":\"{s}\",\"content\":\"x\"}}",
+        .{inside_path},
+    );
+    defer allocator.free(inside_args);
+    const in_result = try cc.tool_exec.executeOne(
+        &ctx,
+        "Write",
+        inside_args,
+        "wr-inside",
+        allocator,
+        .{ .bytes = [_]u8{'2'} ** 12 },
+    );
+    switch (in_result) {
+        .done => |done| {
+            if (done.content) |bytes| allocator.free(bytes);
+            if (done.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(allocator);
+                allocator.free(refs);
+            }
+        },
+        else => return error.UnexpectedResult,
+    }
+
+    try journal.finishRun("end_turn");
+    journal.deinit();
+
+    const journal_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/tool-observations.jsonl",
+        .{evidence_dir},
+    );
+    defer allocator.free(journal_path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        journal_path,
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(bytes);
+    var outside_line: ?[]const u8 = null;
+    var inside_line: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "dispatch_started") == null) continue;
+        if (std.mem.indexOf(u8, line, "\"wr-outside\"") != null) outside_line = line;
+        if (std.mem.indexOf(u8, line, "\"wr-inside\"") != null) inside_line = line;
+    }
+    try std.testing.expect(outside_line != null);
+    try std.testing.expect(inside_line != null);
+    try std.testing.expect(std.mem.indexOf(u8, outside_line.?, "\"within_root\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inside_line.?, "\"within_root\":true") != null);
+}

@@ -302,6 +302,7 @@ pub const RuntimeGate = struct {
             signal.dispatch_id,
             .pre,
             signal.file_target_state,
+            signal.within_root,
             &batch,
             .ordinary,
         );
@@ -396,6 +397,7 @@ pub const RuntimeGate = struct {
             signal.pre.dispatch_id,
             .post,
             signal.pre.file_target_state,
+            signal.pre.within_root,
             &batch,
             .ordinary,
         );
@@ -467,6 +469,7 @@ pub const RuntimeGate = struct {
         return self.decideMixed(
             signal.dispatch_id,
             signal.file_target_state,
+            signal.within_root,
             .pre,
             recovery.obligation.rule_index,
             .pre_decision,
@@ -516,6 +519,7 @@ pub const RuntimeGate = struct {
         return self.decideMixed(
             signal.pre.dispatch_id,
             signal.pre.file_target_state,
+            signal.pre.within_root,
             .post,
             rule_index,
             .post_decision,
@@ -531,6 +535,7 @@ pub const RuntimeGate = struct {
         self: *RuntimeGate,
         dispatch_id: []const u8,
         file_target_state: observation.FileTargetState,
+        within_root: bool,
         phase: observation.FormalPhase,
         rule_index: usize,
         ordinary_operation: kernel.Operation,
@@ -613,6 +618,7 @@ pub const RuntimeGate = struct {
             dispatch_id,
             phase,
             file_target_state,
+            within_root,
             &batch,
             .exact_edit_recovery,
         );
@@ -623,6 +629,7 @@ pub const RuntimeGate = struct {
         dispatch_id: []const u8,
         phase: observation.FormalPhase,
         file_target_state: observation.FileTargetState,
+        within_root: bool,
         batch: *const kernel.BatchInvocation,
         filter_operation: observation.RuleFilterOperation,
     ) BatchDecision {
@@ -720,6 +727,7 @@ pub const RuntimeGate = struct {
             .phase = phase,
             .actuation = self.actuation,
             .file_target_state = file_target_state,
+            .within_root = within_root,
             .project_sha256 = self.active.project_sha256,
             .bundle_sha256 = self.active.bundle_sha256,
             .bundle_revision = self.active.revision,

@@ -164,6 +164,7 @@ fn emitDispatchStarted(
     dispatched_name: []const u8,
     input: []const u8,
     file_target_state: tool_observation.FileTargetState,
+    within_root: bool,
 ) bool {
     const sink = ctx.tool_observer orelse return true;
     return sink.emit(.{ .dispatch_started = .{
@@ -175,6 +176,7 @@ fn emitDispatchStarted(
         .input_bytes = input.len,
         .input_sha256 = tool_observation.sha256Hex(input),
         .file_target_state = file_target_state,
+        .within_root = within_root,
     } });
 }
 
@@ -224,6 +226,10 @@ const DispatchObservation = struct {
     terminal_attempted: bool = false,
     input_bytes: usize = 0,
     file_target_state: @import("project_rule_spec.zig").FileTargetState = .unobserved,
+    // 与 file_target_state 同源(分类器判定)。事件 struct 的 within_root 带
+    // 默认 true——发射时不显式传值 = journal 恒记 true(2026-08-17 复审:两次
+    // /tmp 根外拦截被记成 within_root=true,内核判对了但审计字段说谎)。
+    within_root: bool = true,
     project_pre_signal: ?project_gate_protocol.PreSignal = null,
 
     fn start(self: *DispatchObservation, input: []const u8) bool {
@@ -234,6 +240,7 @@ const DispatchObservation = struct {
             self.dispatched_name,
             input,
             self.file_target_state,
+            self.within_root,
         )) return false;
         self.input_bytes = input.len;
         self.started = true;
@@ -526,6 +533,7 @@ pub fn executeOne(
             input,
         );
         dispatch_observation.file_target_state = project_pre_signal.?.file_target_state;
+        dispatch_observation.within_root = project_pre_signal.?.within_root;
         dispatch_observation.project_pre_signal = project_pre_signal.?;
     } else if (builtin_file_tool) {
         // File references need only the bounded lstat-style target state. Do
@@ -533,11 +541,13 @@ pub fn executeOne(
         // AgentCore Runs: it reads and hashes full files and may block on a
         // FIFO. The complete observePre path remains reserved for formal
         // rules or an explicitly installed observation sink.
-        dispatch_observation.file_target_state = project_rule_signal.observeFileTarget(
+        const lite_target = project_rule_signal.observeFileTarget(
             &job_ctx,
             dispatched_name,
             input,
-        ).state;
+        );
+        dispatch_observation.file_target_state = lite_target.state;
+        dispatch_observation.within_root = lite_target.within_root;
     }
     if (job_ctx.project_rule_gate) |gate| {
         switch (gate.pre(project_pre_signal.?)) {
@@ -621,6 +631,7 @@ pub fn executeOne(
                 project_pre_signal = exact_signal;
                 dispatch_observation.dispatched_name = dispatched_name;
                 dispatch_observation.file_target_state = exact_signal.file_target_state;
+                dispatch_observation.within_root = exact_signal.within_root;
                 dispatch_observation.project_pre_signal = exact_signal;
             },
             .block => |recovery_action| {
