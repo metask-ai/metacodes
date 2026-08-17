@@ -2092,6 +2092,31 @@ def _collect_usage(
         expected_model_route = str(_json(resolved_path).get("model_route") or "")
         if not expected_model_route or "__" in expected_model_route:
             raise LaunchError("official WorkBuddy model route is missing or Harbor-unsafe")
+    # The journal's formal identities were shape-checked but never bound to
+    # the STAGED project-control artifacts: "which rules actually ran" was
+    # matched by eye, not by mechanism (2026-08-17 global review, L1 gap).
+    # Resolve the expected kernel/bundle identities once; every trial whose
+    # journal shows formal activity must name exactly these.
+    project_control_artifacts = (
+        (manifest.get("artifacts") or {}).get("project_control") or {}
+    )
+    expected_kernel_sha = (
+        (project_control_artifacts.get("kernel") or {}).get("sha256")
+    )
+    expected_bundle_sha = None
+    rules_path = (project_control_artifacts.get("rules") or {}).get("path")
+    if isinstance(rules_path, str) and rules_path:
+        try:
+            active_pointer = json.loads(
+                (Path(rules_path) / "active.json").read_text(encoding="utf-8")
+            )
+            expected_bundle_sha = (active_pointer.get("body") or {}).get(
+                "bundle_sha256"
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise LaunchError(
+                f"staged project rules active pointer is unreadable: {exc}"
+            ) from exc
     for trajectory_path in sorted(trajectories):
         trial_result_path: Path | None = None
         trial_result: Dict[str, Any] | None = None
@@ -2129,6 +2154,23 @@ def _collect_usage(
             raise LaunchError(
                 f"invalid WorkBuddy progress metrics for {trajectory_path}: {exc}"
             ) from exc
+        lean_metrics = control_metrics.get("lean") or {}
+        observed_kernels = set(lean_metrics.get("kernel_sha256s") or [])
+        observed_bundles = set(lean_metrics.get("bundle_sha256s") or [])
+        if observed_kernels or observed_bundles:
+            if (
+                expected_kernel_sha is None
+                or observed_kernels - {expected_kernel_sha}
+                or (expected_bundle_sha is None and observed_bundles)
+                or (
+                    expected_bundle_sha is not None
+                    and observed_bundles - {expected_bundle_sha}
+                )
+            ):
+                raise LaunchError(
+                    "journal formal identities are not the staged "
+                    f"project-control artifacts: {trajectory_path}"
+                )
         if progress_metrics.get("source") != {
             "transcript_sha256": control_metrics["source"]["transcript_sha256"],
             "observation_journal_sha256": control_metrics["source"][

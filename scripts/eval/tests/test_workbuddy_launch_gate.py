@@ -22,6 +22,10 @@ from scripts.eval.memory_budget_journal import (
 )
 from scripts.eval.model import ValidationError, stable_json
 from scripts.eval.workbuddy import launch_gate
+from scripts.eval.workbuddy.trace import (
+    CURRENT_FORMAL_BATCH_SCHEMA,
+    RULE_FILTER_PROOFS,
+)
 from scripts.eval.workbuddy.launch_gate import (
     AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION,
     AUTHORIZED_FAILURE_RECEIPT_SCHEMA_VERSION_V1,
@@ -2628,6 +2632,107 @@ class WorkBuddyRequestAuditRetryTest(unittest.TestCase):
     def test_compact_subrequest_never_counts_as_a_turn(self):
         with self.assertRaisesRegex(LaunchError, "incomplete or out of order"):
             self._with_extra_records([self._compact_record()], turns=2)
+
+    def test_journal_formal_identities_must_match_staged_artifacts(self):
+        # Global review 2026-08-17 (trust topology, L1 gap): the journal's
+        # kernel/bundle sha256s were shape-checked but never bound to the
+        # manifest's staged project-control artifacts — "which rules
+        # actually ran" was matched by eye. A journal showing formal
+        # activity under a manifest that staged NO project control must
+        # fail closed. (The positive direction — matching identities pass —
+        # is exercised by every real enforced wave at commit time.)
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self._fixture(Path(directory))
+            workbuddy = Path(manifest["workbuddy"]["checkout"])
+            observation = next(workbuddy.rglob("agent/" + OBSERVATION_FILENAME))
+            identity = {
+                "project_sha256": "1" * 64,
+                "bundle_sha256": "2" * 64,
+                "bundle_revision": 1,
+                "kernel_sha256": "3" * 64,
+            }
+            def rule_filter(phase):
+                return {"tool_observation": {"rule_filter": {
+                    "schema_version": "metacodes-project-rule-filter-v1",
+                    "dispatch_id": "formal-1", "phase": phase,
+                    "operation": "ordinary", **identity,
+                    "active_rule_count": 1, "checker_rule_count": 1,
+                    "statically_pruned_rule_count": 0,
+                    "proof": sorted(RULE_FILTER_PROOFS)[0],
+                }}}
+            def batch(phase, token):
+                return {"tool_observation": {"formal_decision_batch": {
+                    "schema_version": CURRENT_FORMAL_BATCH_SCHEMA,
+                    "dispatch_id": "formal-1", "phase": phase,
+                    "actuation": "enforced", **identity,
+                    "checker_call_sha256": token * 64,
+                    "checker_batch_size": 1, "checker_elapsed_ns": 1,
+                    "checker_bytes": 1,
+                    "decisions": [{
+                        "operation": f"{phase}_decision", "result": "admit",
+                        "recovery_action": "none",
+                    }],
+                }}}
+            start = {
+                "schema_version": "metacodes-tool-observation-v1",
+                "id": "formal-1", "requested_name": "Read",
+                "dispatched_name": "Read", "origin": "authoritative",
+                "agent_depth": 0,
+            }
+            events = [
+                {"run_started": {}},
+                rule_filter("pre"), batch("pre", "4"),
+                {"tool_observation": {"dispatch_started": start}},
+                rule_filter("post"), batch("post", "5"),
+                {"tool_observation": {"dispatch_finished": {
+                    **start, "outcome": "succeeded"}}},
+                {"run_finished": {}},
+            ]
+            observation.write_text(
+                "".join(
+                    json.dumps({
+                        "schema_version": "metacodes-tool-observation-journal-v1",
+                        "sequence": seq, "monotonic_elapsed_ns": seq,
+                        "session_id": "session-official-reward-l2",
+                        "run_id": "run-official-reward-l2",
+                        "event": payload,
+                    }) + "\n"
+                    for seq, payload in enumerate(events)
+                ),
+                encoding="utf-8",
+            )
+            # The progress analyzer cross-checks transcript tool_use ids
+            # against journal dispatch ids; give the dispatch its transcript
+            # counterpart.
+            observation.with_name("metacodes-transcript.jsonl").write_text(
+                json.dumps({"role": "assistant", "blocks": [{
+                    "type": "tool_use", "id": "formal-1", "name": "Read",
+                    "input": {"file_path": "README.md"},
+                }]}) + "\n"
+                + json.dumps({"role": "user", "blocks": [{
+                    "type": "tool_result", "tool_use_id": "formal-1",
+                    "content": "ok", "is_error": False,
+                }]}) + "\n",
+                encoding="utf-8",
+            )
+            # Re-derive the embedded control metrics so the trajectory stays
+            # byte-consistent with the rewritten journal.
+            trajectory_path = observation.with_name("trajectory.json")
+            trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+            trajectory["final_metrics"]["extra"]["control_metrics"] = (
+                load_control_metrics(
+                    observation.with_name("metacodes-transcript.jsonl"),
+                    observation,
+                )
+            )
+            trajectory["final_metrics"]["extra"]["metacodes_turns"] = 1
+            trajectory_path.write_text(
+                json.dumps(trajectory) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                LaunchError, "not the staged project-control artifacts"
+            ):
+                _collect_usage(manifest, started_ns=0, official_runner=True)
 
 
 class WorkBuddyRecoveryReceiptCollisionTest(unittest.TestCase):

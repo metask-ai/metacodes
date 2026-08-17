@@ -114,6 +114,7 @@ def _receipt(
     path: Path,
     journal_path: Path,
     manifest: Mapping[str, Any],
+    results_root: Path | None = None,
 ) -> tuple[Dict[str, Any], Dict[str, object], Dict[str, object]]:
     receipt, receipt_identity, _ = _observed_json(path)
     required = {
@@ -310,14 +311,20 @@ def _receipt(
             "paired WorkBuddy receipt lacks trial-result bindings for some tasks"
         )
     if reward_bound_rows:
-        checkout_raw = (manifest.get("workbuddy") or {}).get("checkout")
-        if not isinstance(checkout_raw, str) or not checkout_raw:
-            raise LaunchError(
-                "paired WorkBuddy manifest lacks its checkout path for reward binding"
+        if results_root is not None:
+            # Analysis-time override: the manifest pins the checkout's
+            # absolute (typically tmp) path; after archival the same
+            # receipts remain analyzable against the moved results tree.
+            result_root = results_root / str(manifest["job"]["slug"])
+        else:
+            checkout_raw = (manifest.get("workbuddy") or {}).get("checkout")
+            if not isinstance(checkout_raw, str) or not checkout_raw:
+                raise LaunchError(
+                    "paired WorkBuddy manifest lacks its checkout path for reward binding"
+                )
+            result_root = (
+                Path(checkout_raw) / "results" / str(manifest["job"]["slug"])
             )
-        result_root = (
-            Path(checkout_raw) / "results" / str(manifest["job"]["slug"])
-        )
         by_sha: Dict[str, Path] = {}
         if result_root.exists():
             for candidate in result_root.rglob("result.json"):
@@ -753,6 +760,7 @@ def build_report(
     treatment_receipt_path: Path,
     treatment_journal_path: Path,
     accept_progress_analyzer_succession: bool = False,
+    results_root: Path | None = None,
 ) -> Dict[str, object]:
     manifest_observations = {
         "baseline": _observed_json(baseline_manifest_path),
@@ -806,11 +814,13 @@ def build_report(
             baseline_receipt_path,
             baseline_journal_path,
             manifests["baseline"],
+            results_root=results_root,
         ),
         "treatment": _receipt(
             treatment_receipt_path,
             treatment_journal_path,
             manifests["treatment"],
+            results_root=results_root,
         ),
     }
     receipts = {arm: observation[0] for arm, observation in receipt_observations.items()}
@@ -1030,6 +1040,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--treatment-budget-journal", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
+        "--results-root",
+        type=Path,
+        default=None,
+        help=(
+            "Override the manifest-pinned checkout results directory for the "
+            "reward-artifact binding (use after the checkout tree was "
+            "archived or moved); expects the directory containing the "
+            "<job-slug> result folders."
+        ),
+    )
+    parser.add_argument(
         "--accept-progress-analyzer-succession",
         action="store_true",
         help=(
@@ -1042,6 +1063,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         report = build_report(
             accept_progress_analyzer_succession=args.accept_progress_analyzer_succession,
+            results_root=args.results_root,
             study=args.study,
             baseline_manifest_path=args.baseline_manifest,
             baseline_receipt_path=args.baseline_receipt,

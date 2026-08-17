@@ -344,6 +344,38 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                     treatment_journal_path=tj,
                 )
 
+    def test_results_root_override_survives_checkout_relocation(self):
+        # The manifest pins the checkout's absolute path; after archival the
+        # same receipts must stay analyzable via --results-root (global
+        # review roadmap #1 — without this, cleaning the tmp checkout makes
+        # historical pairs permanently un-analyzable).
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bm, br, bj, tm, tr, tj, *_ = self._pair(root)
+            moved = root / "archived-results"
+            (root / "checkout" / "results").rename(moved)
+            with self.assertRaisesRegex(
+                LaunchError, "trial result artifact is missing"
+            ):
+                build_report(
+                    baseline_manifest_path=bm,
+                    baseline_receipt_path=br,
+                    baseline_journal_path=bj,
+                    treatment_manifest_path=tm,
+                    treatment_receipt_path=tr,
+                    treatment_journal_path=tj,
+                )
+            report = build_report(
+                baseline_manifest_path=bm,
+                baseline_receipt_path=br,
+                baseline_journal_path=bj,
+                treatment_manifest_path=tm,
+                treatment_receipt_path=tr,
+                treatment_journal_path=tj,
+                results_root=moved,
+            )
+            self.assertEqual(report["mean_reward_delta"], 0.5)
+
     def test_report_binds_equal_cache_prefix_and_quality_cost_time_deltas(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
