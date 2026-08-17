@@ -383,3 +383,103 @@ with BudgetJournal(Path(%r), authority):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TrialResumeAuthorizationTest(MemoryBudgetJournalTest):
+    """Rev2 first increment: trial_resume_authorized is an annotation-with-
+    authorization on an authorized transaction — state stays
+    request_authorized, no new money is authorized (the original max keeps
+    bounding total spend across attempts), the resume decision and its
+    evidence hashes are journaled BEFORE any retry spend, and the budget is
+    hard-bounded (<=3 trials per event, <=2 events per transaction)."""
+
+    def _resume(self, journal, authorized, trials, *, evidence="evidence", receipt="receipt"):
+        return journal.authorize_trial_resume(
+            authorized["transaction_id"],
+            trials=trials,
+            evidence_sha256=digest(evidence),
+            failure_receipt_sha256=digest(receipt),
+            expected_revision=authorized["journal_revision"],
+            expected_head_sha256=authorized["journal_head_sha256"],
+        )
+
+    def test_resume_then_commit_replays_and_bounds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "budget.json"
+            with BudgetJournal(path, self.authority()) as journal:
+                authorized = self.authorize(journal, self.transaction())
+                resumed = self._resume(
+                    journal, authorized, ["feature-medium-install_and_run_script"]
+                )
+                self.assertEqual(resumed["state"], "request_authorized")
+                committed = journal.commit(
+                    resumed["transaction_id"],
+                    actual_cost_microusd=1_000,
+                    actual_metered_tokens=10,
+                )
+                self.assertEqual(committed["state"], "committed")
+            # Replay from disk validates the whole chain including the
+            # resume event and its recorded attempt number.
+            with BudgetJournal(path, self.authority()) as recovered:
+                receipts = recovered.transaction_receipts()
+                self.assertEqual(len(receipts), 1)
+                self.assertEqual(receipts[0]["state"], "committed")
+
+    def test_second_resume_allowed_third_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "budget.json"
+            with BudgetJournal(path, self.authority()) as journal:
+                authorized = self.authorize(journal, self.transaction())
+                first = self._resume(journal, authorized, ["task-a"])
+                second = self._resume(journal, first, ["task-b"], evidence="e2")
+                with self.assertRaisesRegex(ValidationError, "resume budget"):
+                    self._resume(journal, second, ["task-c"], evidence="e3")
+
+    def test_resume_requires_authorized_state_and_bounded_trials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "budget.json"
+            with BudgetJournal(path, self.authority()) as journal:
+                reserved = journal.reserve(self.transaction())
+                with self.assertRaisesRegex(ValidationError, "request_authorized"):
+                    journal.authorize_trial_resume(
+                        reserved["transaction_id"],
+                        trials=["task-a"],
+                        evidence_sha256=digest("e"),
+                        failure_receipt_sha256=digest("r"),
+                        expected_revision=reserved["journal_revision"],
+                        expected_head_sha256=reserved["journal_head_sha256"],
+                    )
+                authorized = journal.authorize_request(
+                    reserved["transaction_id"],
+                    expected_revision=reserved["journal_revision"],
+                    expected_head_sha256=reserved["journal_head_sha256"],
+                )
+                with self.assertRaisesRegex(ValidationError, "payload is invalid"):
+                    self._resume(journal, authorized, ["a", "b", "c", "d"])
+                with self.assertRaisesRegex(ValidationError, "payload is invalid"):
+                    self._resume(journal, authorized, ["dup", "dup"])
+                with self.assertRaisesRegex(ValidationError, "payload is invalid"):
+                    self._resume(journal, authorized, [])
+
+    def test_handcrafted_wrong_attempt_fails_replay(self):
+        # Replay-side attack: an event claiming attempt=3 with no prior
+        # resume event must fail closed on reload.
+        import json as _json
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "budget.json"
+            with BudgetJournal(path, self.authority()) as journal:
+                authorized = self.authorize(journal, self.transaction())
+                self._resume(journal, authorized, ["task-a"])
+            doc = _json.loads(path.read_text())
+            event = doc["events"][-1]
+            event["resume"]["attempt"] = 3
+            # re-seal the tampered event hash + head so only the semantic
+            # check can catch it
+            from scripts.eval.memory_budget_journal import _canonical_sha256
+            without = {k: v for k, v in event.items() if k != "event_sha256"}
+            event["event_sha256"] = _canonical_sha256(without)
+            doc["head_sha256"] = event["event_sha256"]
+            path.write_text(_json.dumps(doc))
+            with self.assertRaisesRegex(ValidationError, "payload is invalid"):
+                with BudgetJournal(path, self.authority()):
+                    pass

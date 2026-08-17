@@ -334,6 +334,12 @@ def _replay_document(document: Mapping[str, Any]) -> Mapping[str, Any]:
     head = ZERO_HEAD_SHA256
     for index, raw_event in enumerate(events, start=1):
         where = f"budget journal.events[{index - 1}]"
+        # trial_resume_authorized 事件独有 resume 载荷;其他 action 出现该
+        # 字段一律 fail-closed(闭集校验按 action 分表)。
+        resume_shaped = (
+            isinstance(raw_event, dict)
+            and raw_event.get("action") == "trial_resume_authorized"
+        )
         event = _exact_object(
             raw_event,
             where,
@@ -347,7 +353,8 @@ def _replay_document(document: Mapping[str, Any]) -> Mapping[str, Any]:
                 "actual_metered_tokens",
                 "recorded_at_unix_ns",
                 "event_sha256",
-            ),
+            )
+            + (("resume",) if resume_shaped else ()),
         )
         if _require_integer(event["revision"], f"{where}.revision", minimum=1) != index:
             _fail(f"{where}.revision", "is not contiguous")
@@ -361,7 +368,13 @@ def _replay_document(document: Mapping[str, Any]) -> Mapping[str, Any]:
             _fail(f"{where}.event_sha256", "does not bind event")
         head = observed_event_hash
         action = event["action"]
-        if action not in {"reserved", "request_authorized", "committed", "aborted_pre_request"}:
+        if action not in {
+            "reserved",
+            "request_authorized",
+            "committed",
+            "aborted_pre_request",
+            "trial_resume_authorized",
+        }:
             _fail(f"{where}.action", "unsupported transition")
         transaction_id = _require_hash(event["transaction_id"], f"{where}.transaction_id")
         identity = _validate_identity_record(event["identity"], f"{where}.identity")
@@ -403,6 +416,7 @@ def _replay_document(document: Mapping[str, Any]) -> Mapping[str, Any]:
                 "commit_head_sha256": None,
                 "actual_cost_microusd": None,
                 "actual_metered_tokens": None,
+                "resume_events": [],
             }
         else:
             if current is None:
@@ -423,6 +437,55 @@ def _replay_document(document: Mapping[str, Any]) -> Mapping[str, Any]:
                 if actual_cost is not None or actual_tokens is not None:
                     _fail(where, "pre-request abort cannot contain actual usage")
                 current["state"] = action
+            elif action == "trial_resume_authorized":
+                # Trial-resume(Rev2 首增量):对已授权、runner 已跑过但审计
+                # 拒收的臂,授权重跑指定 trial。这是"带授权的注记"而非状态
+                # 迁移——状态保持 request_authorized,原 max 上界继续约束
+                # 跨 attempt 总花费(不新增授权);resume 决定与其证据在
+                # 任何重跑花费之前落账,构成可审计的事前授权。
+                if current["state"] != "request_authorized":
+                    _fail(where, "trial resume requires request_authorized state")
+                if actual_cost is not None or actual_tokens is not None:
+                    _fail(where, "trial resume cannot contain actual usage")
+                resume = event.get("resume")
+                if (
+                    not isinstance(resume, Mapping)
+                    or set(resume)
+                    != {
+                        "trials",
+                        "attempt",
+                        "evidence_sha256",
+                        "failure_receipt_sha256",
+                    }
+                    or not isinstance(resume["trials"], list)
+                    or not resume["trials"]
+                    or len(resume["trials"]) > 3
+                    or not all(
+                        isinstance(t, str) and 0 < len(t) <= 200
+                        for t in resume["trials"]
+                    )
+                    or len(set(resume["trials"])) != len(resume["trials"])
+                    or resume["attempt"] != len(current["resume_events"]) + 2
+                ):
+                    _fail(where, "trial resume payload is invalid")
+                _require_hash(
+                    resume["evidence_sha256"], f"{where}.resume.evidence_sha256"
+                )
+                _require_hash(
+                    resume["failure_receipt_sha256"],
+                    f"{where}.resume.failure_receipt_sha256",
+                )
+                if len(current["resume_events"]) >= 2:
+                    _fail(where, "trial resume budget is exhausted")
+                current["resume_events"].append(
+                    {
+                        "revision": index,
+                        "head_sha256": head,
+                        "trials": list(resume["trials"]),
+                        "evidence_sha256": resume["evidence_sha256"],
+                        "failure_receipt_sha256": resume["failure_receipt_sha256"],
+                    }
+                )
             else:
                 if current["state"] != "request_authorized":
                     _fail(where, "commit requires request_authorized state")
@@ -739,6 +802,7 @@ class BudgetJournal:
         identity: Mapping[str, Any],
         actual_cost_microusd: int | None = None,
         actual_metered_tokens: int | None = None,
+        resume: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         self._require_open()
         self._reobserve()
@@ -755,6 +819,9 @@ class BudgetJournal:
             "actual_metered_tokens": actual_metered_tokens,
             "recorded_at_unix_ns": time.time_ns(),
         }
+        if resume is not None:
+            # 只在 trial_resume_authorized 事件上携带,其他事件字节形状不变。
+            event_without_hash["resume"] = dict(resume)
         event = {
             **event_without_hash,
             "event_sha256": _canonical_sha256(event_without_hash),
@@ -838,6 +905,34 @@ class BudgetJournal:
             action="request_authorized",
             transaction_id=transaction_id,
             identity=current["identity"],
+        )
+
+    def authorize_trial_resume(
+        self,
+        transaction_id: str,
+        *,
+        trials: list[str],
+        evidence_sha256: str,
+        failure_receipt_sha256: str,
+        expected_revision: int,
+        expected_head_sha256: str,
+    ) -> Mapping[str, Any]:
+        current = self._transaction(transaction_id)
+        self._require_cas(expected_revision, expected_head_sha256)
+        if current["state"] != "request_authorized":
+            _fail("budget transaction", "trial resume requires request_authorized state")
+        if len(current["resume_events"]) >= 2:
+            _fail("budget transaction", "trial resume budget is exhausted")
+        return self._append(
+            action="trial_resume_authorized",
+            transaction_id=transaction_id,
+            identity=current["identity"],
+            resume={
+                "trials": list(trials),
+                "attempt": len(current["resume_events"]) + 2,
+                "evidence_sha256": evidence_sha256,
+                "failure_receipt_sha256": failure_receipt_sha256,
+            },
         )
 
     def commit(
