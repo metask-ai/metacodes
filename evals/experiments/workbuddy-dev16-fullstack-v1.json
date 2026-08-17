@@ -1,0 +1,35 @@
+{
+  "schema_version": "metacodes-experiment-protocol-v1",
+  "protocol_id": "workbuddy-dev16-fullstack-v1",
+  "preregistered": "2026-08-17 before any full-stack paired arm ran",
+  "context": "Merged-solution evaluation the campaign converges on (user directive: merge all features into one complete solution, then evaluate once). Prior single-treatment pairs measured each lever alone: project control (v5, one proven-but-wrong block), final gate three-round convergence (+0.068 -> +0.018 -> -0.061 as instruments healed), memory accumulation (zero-recall null). Since then the harness gained: effective-target kernel semantics (withinRoot, RRP-001, promoted through the governed lifecycle under kernel 65b3e367 with a 10-gate E2 pass), sensor v2 tiered verification, the requirement-ledger closure obligation (Lean-proven bounded nudge policy), the rg deployment fix, and the meta-governance constitution. This pair measures the merged control plane as one treatment.",
+  "studies": [
+    {
+      "study": "full_stack",
+      "name": "fstack",
+      "treatment_definition": "Treatment arm: project rules enforced (effect_class bundle c5de1d6c pinned to kernel 65b3e367 with resolved-target containment) + verification final gate enforced (v2 tiered sensor) + requirement ledger enforced (decompose-then-close, max 2 nudges). Baseline arm: project control disabled, gate and ledger in record-only observe mode for measurement symmetry. Memory accumulation off in both arms. Identical binary 7941360e, rg f401154e, overlay f18ecabb in both arms.",
+      "arms": {
+        "baseline": "all actuation off; gate+ledger observe",
+        "treatment": "project enforced + gate enforced + ledger enforced"
+      },
+      "cohort": "code/dev16 frozen task list (same 16 tasks as reports 85d583cc and the gate-v2/memory pairs)",
+      "primary_metric": "paired verifier_reward delta per task; sign test over non-tied pairs; full-pass count delta",
+      "secondary": [
+        "false-intervention count under project enforcement (misfire target: 0; the v5 dotenv symlink kill must not recur)",
+        "gate obligation_met and tier1/tier2 counts per arm",
+        "requirement_ledger records: prompt_emitted, items_total, items_open_at_final, nudges per arm",
+        "cost/time/token deltas"
+      ],
+      "decision_rule": "This is the campaign's comprehensive merged measurement, not a lever isolation. Any enforced-arm block is adjudicated per-case against the effective-target semantics; a repeat proven-but-wrong block is a stop-and-fix finding regardless of reward delta. Cross-roll noise on dev16 is approximately +/-0.13 mean reward; deltas inside that band are reported as within-noise."
+    }
+  ],
+  "red_lines": "Rules, memory text and prompts contain no WorkBuddy-specific content; dev16 is the only iteration surface; sealed48 remains one-shot and unread; generation and evaluation windows do not overlap (RRP-001 lifecycle evidence is synthetic-correction replay, not benchmark traffic).",
+  "artifacts": {
+    "metacodes_sha256_prefix": "7941360e2a66a174",
+    "ripgrep_sha256_prefix": "f401154e2393f900",
+    "project_kernel_sha256": "65b3e367a01eb29e6cf03e8a299b8e87b7cfc9c369839ad46c6906074128c3cd",
+    "rules_bundle_sha256": "c5de1d6c984b2a2f73ae738243a9082ea3a9aeae33f6a4f3679d1b1593f1d11d",
+    "lifecycle_promotion_receipt": "312e7bd6796cef7fd0c6871ddc33ae0ed417f13e95e27cd58a01c103cc738322",
+    "metacodes_commit": "4570e26d28906161032f222cc5b4fceca0219f7c"
+  }
+}
