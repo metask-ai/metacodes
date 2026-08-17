@@ -2478,6 +2478,7 @@ assert failed, "enforced run without rule_filter events must fail loudly"
                     + overlay_installer._GENERIC_ANCHOR
                     + overlay_installer._MODEL_ROUTE_OLD
                     + overlay_installer._RESOLVER_MOUNT_OLD
+                    + overlay_installer._RESUME_SUBSET_OLD
                 ),
                 overlay_installer._PREPARE_JOB_PATH:
                     (

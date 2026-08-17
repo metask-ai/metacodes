@@ -132,13 +132,43 @@ def _receipt(
     }
     # resume_audit is optional: a receipt committed by launch_gate's audit
     # resumption path carries its instrument-succession disclosure inline.
+    # resumes is optional: a receipt committed by resume-trials additionally
+    # discloses which trials were rerun after a proven infrastructure
+    # transient, with the tainted attempt-1 evidence hashes.
     if (
-        set(receipt) - {"resume_audit"} != required
+        set(receipt) - {"resume_audit", "resumes"} != required
         or receipt.get("schema_version") != RECEIPT_SCHEMA_VERSION
     ):
         raise LaunchError("paired WorkBuddy receipt schema is unsupported")
     if "resume_audit" in receipt and not isinstance(receipt["resume_audit"], dict):
         raise LaunchError("paired WorkBuddy receipt resume_audit disclosure is invalid")
+    if "resumes" in receipt:
+        resumes = receipt["resumes"]
+        selected_for_resume = set(manifest["cohort"]["selected_tasks"])
+        if (
+            not isinstance(resumes, list)
+            or not resumes
+            or len(resumes) > 3
+            or "resume_audit" not in receipt
+        ):
+            raise LaunchError("paired WorkBuddy resumes disclosure is invalid")
+        for row in resumes:
+            if (
+                not isinstance(row, dict)
+                or set(row)
+                != {
+                    "task",
+                    "reason",
+                    "result_sha256",
+                    "original_dir_rel",
+                    "tainted_dir_rel",
+                }
+                or row["task"] not in selected_for_resume
+            ):
+                raise LaunchError(
+                    "paired WorkBuddy resumes disclosure is invalid"
+                )
+            _sha256(row["result_sha256"], "resumed trial evidence")
     if (
         receipt.get("launch_manifest_content_sha256") != manifest["content_sha256"]
         or receipt.get("run_id") != manifest["run_id"]
@@ -970,6 +1000,11 @@ def build_report(
                 "run_id": manifests[arm]["run_id"],
                 "project_control": manifests[arm]["evaluation_treatment"][
                     "project_control"
+                ],
+                # 基础设施事件披露(非 treatment):哪些 trial 因已证实的
+                # 瞬态被重跑。两臂并排给出,供解读者判断。
+                "resumed_trials": [
+                    row["task"] for row in receipts[arm].get("resumes", [])
                 ],
                 **(
                     {

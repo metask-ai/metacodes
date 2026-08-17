@@ -501,6 +501,38 @@ def _head_file(repo: Path, relative: Path) -> bytes:
         raise OverlayError(f"cannot read pinned upstream {relative}: {exc}") from exc
 
 
+_RESUME_SUBSET_OLD = """    try:
+        task_selection, selected_tasks = resolve_task_selection(
+            selection_spec, task_listing, dataset=dataset
+        )
+    except ValueError as exc:
+        raise ValueError(f"{job_config_path}: {exc}") from exc
+"""
+# Trial-resume(增量 B):重跑调用通过环境变量把选择收窄到账本授权的
+# trial 子集。此机制本身不需要被信任——审计端强制 attempt-2 目录恰好
+# 匹配 journal 的 trial_resume_authorized 集合;越界名在此 fail-closed
+# 只是为了更早更清晰地失败。
+_RESUME_SUBSET_NEW = _RESUME_SUBSET_OLD + """
+    resume_subset_raw = os.environ.get("METACODES_WB_RESUME_TASKS")
+    if resume_subset_raw:
+        resume_subset = [name for name in resume_subset_raw.split(",") if name]
+        unknown = sorted(set(resume_subset) - set(selected_tasks))
+        if unknown:
+            raise ValueError(
+                f"{job_config_path}: resume subset names outside the job "
+                f"selection: {unknown}"
+            )
+        keep = set(resume_subset)
+        selected_tasks = [name for name in selected_tasks if name in keep]
+        task_selection = {
+            "mode": "name",
+            "names": list(selected_tasks),
+            "count_selected": len(selected_tasks),
+            "resume_subset": True,
+        }
+"""
+
+
 def _patched_upstream(repo: Path) -> Dict[Path, bytes]:
     adapter = _head_file(repo, _ADAPTER_PATH).decode("utf-8")
     if adapter.count(_ADAPTER_ANCHOR) != 1:
@@ -524,6 +556,9 @@ def _patched_upstream(repo: Path) -> Dict[Path, bytes]:
     if resolver.count(_RESOLVER_MOUNT_OLD) != 1:
         raise OverlayError("WorkBuddy resolver mount-requirement anchor drifted")
     resolver = resolver.replace(_RESOLVER_MOUNT_OLD, _RESOLVER_MOUNT_NEW, 1)
+    if resolver.count(_RESUME_SUBSET_OLD) != 1:
+        raise OverlayError("WorkBuddy resolver task-selection anchor drifted")
+    resolver = resolver.replace(_RESUME_SUBSET_OLD, _RESUME_SUBSET_NEW, 1)
 
     prepare_job = _head_file(repo, _PREPARE_JOB_PATH).decode("utf-8")
     if prepare_job.count(_PREPARE_AGENT_IDENTITY_OLD) != 1:

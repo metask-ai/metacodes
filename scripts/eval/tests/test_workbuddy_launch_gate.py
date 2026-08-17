@@ -2980,3 +2980,120 @@ class TrialResumeEligibilityTest(unittest.TestCase):
         )
         self.assertFalse(eligible)
         self.assertIn("no provider ledger", reason)
+
+
+class TrialResumeAuditTest(WorkBuddyRequestAuditRetryTest):
+    """Increment C mechanics, driven through the REAL _collect_usage: a
+    tainted attempt-1 directory is excluded from binding but its ledger
+    still counts toward wave-1 contiguity; the attempt-2 directory binds
+    and its ledger must be contiguous from 1; tainted evidence drift or a
+    wave gap fails closed."""
+
+    def _resumed_fixture(self, root, *, tamper_tainted=False, wave2_gap=False):
+        manifest = self._fixture(root)
+        workbuddy = Path(manifest["workbuddy"]["checkout"])
+        trial_dir = next(workbuddy.rglob("agent/trajectory.json")).parent.parent
+        result_root = workbuddy / "results" / str(manifest["job"]["slug"])
+        # attempt-1 = the fixture trial, given an exception + a 5xx tail,
+        # then tainted (renamed). Its two ledger records are wave-1 seqs 1-2.
+        request_log = trial_dir / "agent" / "requests.jsonl"
+        rows = [
+            json.loads(line)
+            for line in request_log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        rows[0].update({"seq": 1, "response": {"status": 200}, "error": None})
+        rows.append(
+            {
+                "seq": 2,
+                "request": {"body": {}},
+                "tools": [{"name": "Read"}],
+                "response": {"status": 502},
+                "error": "ConnectTimeout after 1 attempts",
+            }
+        )
+        request_log.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+        )
+        result_path = trial_dir / "result.json"
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result["exception_info"] = {"exception_type": "NonZeroAgentExitCodeError"}
+        result_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
+        result_sha = hashlib.sha256(result_path.read_bytes()).hexdigest()
+        tainted_dir = trial_dir.with_name(trial_dir.name + ".tainted-a1")
+        # attempt-2 = a fresh clean copy of the whole trial, ledger seqs 1..N.
+        attempt2 = trial_dir.with_name(trial_dir.name.replace("__1", "__2"))
+        shutil.copytree(trial_dir, attempt2)
+        a2_rows = [
+            json.loads(line)
+            for line in (attempt2 / "agent" / "requests.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ][:1]
+        a2_rows[0].update(
+            {
+                "seq": 2 if wave2_gap else 1,
+                "response": {"status": 200},
+                "error": None,
+            }
+        )
+        (attempt2 / "agent" / "requests.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in a2_rows),
+            encoding="utf-8",
+        )
+        a2_trajectory_path = attempt2 / "agent" / "trajectory.json"
+        a2_trajectory = json.loads(a2_trajectory_path.read_text(encoding="utf-8"))
+        a2_trajectory["final_metrics"]["extra"]["metacodes_turns"] = 1
+        a2_trajectory_path.write_text(
+            json.dumps(a2_trajectory) + "\n", encoding="utf-8"
+        )
+        a2_result = json.loads((attempt2 / "result.json").read_text(encoding="utf-8"))
+        a2_result["exception_info"] = None
+        a2_result["trial_uri"] = attempt2.resolve().as_uri()
+        (attempt2 / "result.json").write_text(
+            json.dumps(a2_result) + "\n", encoding="utf-8"
+        )
+        trial_dir.rename(tainted_dir)
+        if tamper_tainted:
+            (tainted_dir / "result.json").write_text(
+                json.dumps({"tampered": True}) + "\n", encoding="utf-8"
+            )
+        resumes = [
+            {
+                "task": "code-task-a",
+                "original_dir_rel": str(trial_dir.relative_to(result_root)),
+                "tainted_dir_rel": str(tainted_dir.relative_to(result_root)),
+                "result_sha256": result_sha,
+                "reason": "test transient",
+            }
+        ]
+        return manifest, resumes
+
+    def test_resumed_arm_audits_with_two_wave_ledgers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest, resumes = self._resumed_fixture(Path(directory))
+            usage = _collect_usage(
+                manifest, started_ns=0, official_runner=True, resumes=resumes
+            )
+            self.assertEqual(usage["quality"]["task_count"], 1)
+
+    def test_tainted_evidence_drift_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest, resumes = self._resumed_fixture(
+                Path(directory), tamper_tainted=True
+            )
+            with self.assertRaisesRegex(LaunchError, "evidence drifted"):
+                _collect_usage(
+                    manifest, started_ns=0, official_runner=True, resumes=resumes
+                )
+
+    def test_wave2_sequence_gap_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest, resumes = self._resumed_fixture(
+                Path(directory), wave2_gap=True
+            )
+            with self.assertRaisesRegex(LaunchError, "wave-2 sequence"):
+                _collect_usage(
+                    manifest, started_ns=0, official_runner=True, resumes=resumes
+                )
