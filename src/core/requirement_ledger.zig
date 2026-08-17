@@ -32,7 +32,11 @@ pub const LEDGER_PROMPT_TEXT =
     "kind=decision). Before your final answer, re-check each recorded " ++
     "decision against your actual changes: honored, or explicitly revised " ++
     "with a reason. If you discover a defect you decide not to fix, record " ++
-    "it as an open task item instead of prose.";
+    "it as an open task item instead of prose. When a convention is NOT " ++
+    "stated by the task (accepted input values, an output field's exact " ++
+    "shape, an argv form), search the repository for prior art before " ++
+    "inventing one — existing tests, caches, and sibling call sites usually " ++
+    "already pin it.";
 
 /// Premature final answer with open ledger items. `{d}` = open count.
 pub const OPEN_NUDGE_FMT =
