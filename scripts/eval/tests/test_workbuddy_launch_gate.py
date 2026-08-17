@@ -539,7 +539,7 @@ trajectory = {
   }
 }
 (agent / "trajectory.json").write_text(json.dumps(trajectory) + "\n")
-record = {"seq": 1, "request": {"body": {"model": "volatile-route", "system": "stable", "messages": [{"role": "user", "content": "task"}]}}, "response": {"status": 200}, "error": None}
+record = {"seq": 1, "request": {"body": {"model": "volatile-route", "system": "stable", "messages": [{"role": "user", "content": "task"}]}}, "tools": [{"name": "Read"}], "response": {"status": 200}, "error": None}
 (agent / "requests.jsonl").write_text(json.dumps(record) + "\n")
 '''
 
@@ -1784,7 +1784,8 @@ with urllib.request.urlopen(
                             "system": "stable",
                             "messages": [{"role": "user", "content": "task"}],
                         }
-                    }
+                    },
+                    "tools": [{"name": "Read"}, {"name": "Bash"}],
                 }
             )
             + "\n",
@@ -2528,6 +2529,7 @@ class WorkBuddyRequestAuditRetryTest(unittest.TestCase):
             "response": {"status": 502, "raw_bytes": 3},
             "error": "bad gateway",
             "duration_ms": 5.0,
+            "tools": [{"name": "Read"}, {"name": "Bash"}],
         }
 
     def test_retried_failure_before_success_is_legal(self):
@@ -2573,6 +2575,59 @@ class WorkBuddyRequestAuditRetryTest(unittest.TestCase):
             self._with_extra_records(
                 [self._websearch_record()], turns=2, websearch_steps=1
             )
+
+    @staticmethod
+    def _failed_websearch_record():
+        return {
+            "request": {"body": {}},
+            "response": {"status": 529, "raw_bytes": 3},
+            "error": "overloaded",
+            "duration_ms": 5.0,
+            "tools": [{"name": "web_search"}],
+            "messages": [{"role": "user", "content": "Perform a web search"}],
+        }
+
+    def test_websearch_failures_up_to_the_emitter_budget_are_legal(self):
+        # WEB_SEARCH_MAX_RETRIES=3 (src/tools/web_search.zig): one dispatch
+        # may put THREE failed attempts in the ledger before succeeding or
+        # giving up. The first audit cut bounded at 2 and would have killed
+        # a throttled-search arm at commit (re-review finding #1).
+        records = [self._failed_websearch_record() for _ in range(3)]
+        usage = self._with_extra_records(records, turns=1, websearch_steps=1)
+        self.assertEqual(usage["quality"]["mean_verifier_reward"], 1.0)
+
+    def test_websearch_failures_beyond_the_emitter_budget_are_rejected(self):
+        records = [self._failed_websearch_record() for _ in range(4)]
+        with self.assertRaisesRegex(LaunchError, "incomplete or out of order"):
+            self._with_extra_records(records, turns=1, websearch_steps=1)
+
+    @staticmethod
+    def _compact_record():
+        # The auto-compact summarization sub-request: a provider call with
+        # NO tools at all (compact_summary.zig passes tools=null).
+        return {
+            "request": {"body": {}},
+            "response": {"status": 200, "raw_bytes": 9},
+            "error": None,
+            "duration_ms": 5.0,
+            "messages": [{"role": "user", "content": "summarize"}],
+        }
+
+    def test_compact_subrequest_with_matching_turn_budget_is_legal(self):
+        # A long trial that full-compacted once: 1 turn + 1 tool-less
+        # summarization call must audit clean (re-review finding #2 — the
+        # next trial-length landmine after WebSearch).
+        usage = self._with_extra_records([self._compact_record()], turns=1)
+        self.assertEqual(usage["quality"]["mean_verifier_reward"], 1.0)
+
+    def test_compact_subrequests_beyond_one_per_turn_are_rejected(self):
+        records = [self._compact_record(), self._compact_record()]
+        with self.assertRaisesRegex(LaunchError, "incomplete or out of order"):
+            self._with_extra_records(records, turns=1)
+
+    def test_compact_subrequest_never_counts_as_a_turn(self):
+        with self.assertRaisesRegex(LaunchError, "incomplete or out of order"):
+            self._with_extra_records([self._compact_record()], turns=2)
 
 
 class WorkBuddyRecoveryReceiptCollisionTest(unittest.TestCase):

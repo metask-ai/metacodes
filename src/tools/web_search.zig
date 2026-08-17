@@ -24,6 +24,11 @@ const admission = @import("../api/web_search_admission.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
 /// 子请求建连重试上限(< 主对话 defaultMaxRetries=10:工具内快速失败优于长时间钉死)。
+/// LOCKSTEP:WorkBuddy 审计按这个预算给 websearch 失败记录设上界
+/// (launch_gate.py `websearch_failures > 3 * websearch_dispatches`)——改这里
+/// 必须同步改审计,否则重试耗尽的付费 trial 会在 commit 期被误杀。
+/// 已知张力(登记):评估模式主循环 providerAttemptLimit=1(请求门/事件/cassette
+/// 一一对应不变量),本重试绕过了该帽——二期把它接进同一 limit。
 const WEB_SEARCH_MAX_RETRIES: u32 = 3;
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {

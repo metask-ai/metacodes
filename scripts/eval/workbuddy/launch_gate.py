@@ -2172,22 +2172,35 @@ def _collect_usage(
         if manifest.get("schema_version") == SCHEMA_VERSION:
             sequences = [record.get("seq") for record in request_records]
             metacodes_turns = extra.get("metacodes_turns")
-            # WebSearch executes as an ISOLATED provider sub-request (a single
-            # message carrying exactly one tool named "web_search" — the shape
-            # that keeps server-tool entries out of the main tools array).
-            # Those records are real, audited provider traffic but are NOT
-            # agent-loop turns, so they get their own ledger column instead of
-            # silently breaking the turn equation.  Known open gap, kept loud:
-            # subagent (Task-spawned) provider requests would likewise fall
-            # outside `metacodes_turns`; no selected WorkBuddy task exercises
-            # them today, and this audit will fail closed — not miscount —
-            # if one ever does.
-            def _is_websearch_subrequest(record: Mapping[str, Any]) -> bool:
+            # Provider traffic is a three-way ledger. Beside agent-loop turns
+            # (full tools array) the runtime issues two kinds of ISOLATED
+            # sub-requests that are real, audited traffic but NOT turns:
+            #  - WebSearch: a single message carrying exactly one tool named
+            #    "web_search" (the shape that keeps server-tool entries out of
+            #    the main tools array);
+            #  - auto-compact summarization (compact_summary.zig): a provider
+            #    call with NO tools at all.
+            # Each gets its own column instead of silently breaking the turn
+            # equation.  Known open gap, kept loud: subagent (Task-spawned)
+            # provider requests would likewise fall outside `metacodes_turns`;
+            # the cohort disables those tools, and this audit fails closed —
+            # not miscounts — if one ever appears.
+            def _request_kind(record: Mapping[str, Any]) -> str:
                 tools = record.get("tools")
-                if not isinstance(tools, list) or len(tools) != 1:
-                    return False
-                sole = tools[0]
-                return isinstance(sole, Mapping) and sole.get("name") == "web_search"
+                if (
+                    isinstance(tools, list)
+                    and len(tools) == 1
+                    and isinstance(tools[0], Mapping)
+                    and tools[0].get("name") == "web_search"
+                ):
+                    return "websearch"
+                if not tools:
+                    # A turn request always carries the full tool array; the
+                    # only tool-less provider call is the compact summary.  A
+                    # hypothetical tool-less agent loop would drive
+                    # successful turns to zero and fail the equation loudly.
+                    return "compact"
+                return "turn"
 
             websearch_dispatches = sum(
                 1
@@ -2195,42 +2208,30 @@ def _collect_usage(
                 for call in (step.get("tool_calls") or [] if isinstance(step, Mapping) else [])
                 if isinstance(call, Mapping) and call.get("function_name") == "WebSearch"
             )
-            response_states = [
-                (
-                    (record.get("response") or {}).get("status"),
-                    record.get("error"),
-                    _is_websearch_subrequest(record),
-                )
-                for record in request_records
-            ]
-            # The runtime retries a failed provider attempt up to
-            # MAX_STREAM_TURN_RETRIES(=2) times per turn (headless), so the
-            # audit ledger legitimately contains failed attempts beside the
-            # successful ones. Accounting stays exact: successful turn
-            # responses must number exactly the committed turns, successful
-            # WebSearch sub-requests are bounded by the WebSearch dispatches
-            # recorded in the trajectory, failures are bounded by the retry
-            # budget, and ordering/uniqueness never relax.
-            failed_attempts = sum(
-                1
-                for status, error, is_ws in response_states
-                if not is_ws and (status != 200 or error is not None)
-            )
-            successful_responses = sum(
-                1
-                for status, error, is_ws in response_states
-                if not is_ws and status == 200 and error is None
-            )
-            websearch_successes = sum(
-                1
-                for status, error, is_ws in response_states
-                if is_ws and status == 200 and error is None
-            )
-            websearch_failures = sum(
-                1
-                for status, error, is_ws in response_states
-                if is_ws and (status != 200 or error is not None)
-            )
+            tallies = {
+                "turn": [0, 0],
+                "websearch": [0, 0],
+                "compact": [0, 0],
+            }
+            for record in request_records:
+                status = (record.get("response") or {}).get("status")
+                error = record.get("error")
+                bucket = tallies[_request_kind(record)]
+                if status == 200 and error is None:
+                    bucket[0] += 1
+                else:
+                    bucket[1] += 1
+            successful_responses, failed_attempts = tallies["turn"]
+            websearch_successes, websearch_failures = tallies["websearch"]
+            compact_successes, compact_failures = tallies["compact"]
+            # Retry budgets mirror the emitters exactly: turns retry up to
+            # MAX_STREAM_TURN_RETRIES(=2) in headless; WebSearch hardcodes
+            # WEB_SEARCH_MAX_RETRIES=3 (src/tools/web_search.zig — change
+            # either side only in lockstep); compaction issues one attempt
+            # per trigger, at most one trigger per turn. Accounting stays
+            # exact: successful turn responses must equal the committed
+            # turns, sub-request successes are bounded by their observed
+            # causes, and ordering/uniqueness never relax.
             if (
                 any(
                     not isinstance(sequence, int) or isinstance(sequence, bool)
@@ -2244,7 +2245,9 @@ def _collect_usage(
                 or successful_responses != metacodes_turns
                 or failed_attempts > 2 * metacodes_turns
                 or websearch_successes > websearch_dispatches
-                or websearch_failures > 2 * websearch_dispatches
+                or websearch_failures > 3 * websearch_dispatches
+                or compact_successes > metacodes_turns
+                or compact_failures > metacodes_turns
             ):
                 raise LaunchError(
                     f"provider request audit is incomplete or out of order: {trajectory_path}"
@@ -3064,20 +3067,38 @@ def _reject_journal_receipt_collision(receipt_path: Path, journal_path: Path) ->
     j.json.lock) permanently bricks the journal: BudgetJournal.__enter__
     fail-closes on unexpected internals, and per the state machine an
     authorized transaction could then never be closed. execute_launch has
-    always guarded this; the recovery paths must too (harness review
-    2026-08-17 F9)."""
+    always guarded this with two layers (lexical, then canonicalizing);
+    the recovery paths run both too (harness review 2026-08-17 F9, and
+    re-review: the lexical layer alone misses symlinked parents and
+    case-insensitive filesystems)."""
     receipt_absolute = Path(os.path.abspath(os.fspath(receipt_path)))
     journal_absolute = Path(os.path.abspath(os.fspath(journal_path)))
-    journal_internal = {
-        journal_absolute,
-        journal_absolute.with_name(journal_absolute.name + ".lock"),
-        journal_absolute.with_name(journal_absolute.name + ".tmp"),
+    journal_names = {
+        journal_absolute.name,
+        journal_absolute.name + ".lock",
+        journal_absolute.name + ".tmp",
     }
-    receipt_internal = {
-        receipt_absolute,
-        receipt_absolute.with_name(receipt_absolute.name + ".tmp"),
-    }
-    if journal_internal & receipt_internal:
+    receipt_names = {receipt_absolute.name, receipt_absolute.name + ".tmp"}
+    if {journal_absolute.parent / name for name in journal_names} & {
+        receipt_absolute.parent / name for name in receipt_names
+    }:
+        raise LaunchError(
+            "paid launch receipt must not collide with budget journal internals"
+        )
+    # Canonical layer: a receipt reaching the journal's directory through a
+    # symlinked parent — or colliding only after case folding on APFS —
+    # must be caught before any write. Lexical layer runs first so the
+    # collision message wins when parents do not resolve.
+    try:
+        journal_parent = journal_absolute.parent.resolve(strict=True)
+        receipt_parent = receipt_absolute.parent.resolve(strict=True)
+    except OSError as exc:
+        raise LaunchError(
+            f"receipt or journal parent cannot be resolved: {exc}"
+        ) from exc
+    if journal_parent == receipt_parent and {
+        name.casefold() for name in receipt_names
+    } & {name.casefold() for name in journal_names}:
         raise LaunchError(
             "paid launch receipt must not collide with budget journal internals"
         )
