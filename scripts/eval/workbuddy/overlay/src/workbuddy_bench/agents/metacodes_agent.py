@@ -540,6 +540,25 @@ class MetacodesAgent(BaseInstalledAgent):
                 self.logs_dir / _TRANSCRIPT_FILENAME,
                 self.logs_dir / OBSERVATION_FILENAME,
             )
+            # Runtime receipt for the enforced arm, symmetric with the
+            # disabled arm's exit-88 bundle-absence postcheck: the binary
+            # derives the project-rules directory from its own XxHash64 of
+            # the cwd and silently runs bare-rules when the lookup misses
+            # (harness review 2026-08-17 finding #2 — the treatment dose
+            # would drop to zero with no error anywhere). A dispatching
+            # enforced run whose journal carries zero rule_filter events
+            # means the bundle was never loaded; fail the trial loudly.
+            if self._project_control_mode == "enforced":
+                runtime = control_metrics.get("tool_runtime") or {}
+                lean = control_metrics.get("lean") or {}
+                if runtime.get("dispatch_started", 0) > 0 and not lean.get(
+                    "rule_filter_events", 0
+                ):
+                    raise RuntimeError(
+                        "enforced project control produced no rule_filter "
+                        "events across a dispatching run: the rule bundle "
+                        "was staged but never loaded by the binary"
+                    )
             trace["control_metrics"] = control_metrics
             trajectory = self._build_trajectory(trace)
         except (OSError, TraceError, ValueError) as exc:

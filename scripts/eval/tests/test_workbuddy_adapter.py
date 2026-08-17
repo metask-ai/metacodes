@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -721,6 +722,62 @@ class WorkBuddyTraceTest(unittest.TestCase):
                 emitted = line.split('"')[1]
         self.assertEqual(CURRENT_FORMAL_BATCH_SCHEMA, emitted)
         self.assertIn(CURRENT_FORMAL_BATCH_SCHEMA, FILTER_BINDING_BATCH_SCHEMAS)
+
+    def test_every_current_zig_schema_constant_is_known_to_the_auditor(self):
+        # Table-driven generalization of the pin above (harness review
+        # 2026-08-17: 16 emitter constants had no lockstep guard, so any
+        # version bump only surfaced inside a paid run). Every CURRENT
+        # emitter schema constant — the unversioned names; the _V<n>
+        # suffixed ones are explicitly-historical roster entries — must
+        # appear verbatim in trace.py, as a constant or roster literal.
+        root = Path(__file__).resolve().parents[3]
+        pattern = re.compile(r'pub const ([A-Z0-9_]+) = "(metacodes[^"]+)";')
+        constants: dict[str, str] = {}
+        for source in (
+            root / "src" / "tools" / "observation.zig",
+            root / "src" / "core" / "tool_observation_journal.zig",
+        ):
+            for name, value in pattern.findall(source.read_text(encoding="utf-8")):
+                if re.search(r"_V\d+$", name):
+                    continue
+                constants[name] = value
+        # Floor guards against the regex silently matching nothing.
+        self.assertGreaterEqual(len(constants), 8, constants)
+        trace_source = (
+            root / "scripts" / "eval" / "workbuddy" / "trace.py"
+        ).read_text(encoding="utf-8")
+        missing = {
+            name: value
+            for name, value in constants.items()
+            if value not in trace_source
+        }
+        self.assertEqual(missing, {})
+
+    def test_zig_rule_filter_proof_literal_is_in_the_python_roster(self):
+        zig = (
+            Path(__file__).resolve().parents[3] / "src" / "tools" / "observation.zig"
+        ).read_text(encoding="utf-8")
+        proofs = set(re.findall(r'"(MetaCodesControl\.[A-Za-z0-9_.]+)"', zig))
+        self.assertGreaterEqual(len(proofs), 1)
+        for proof in proofs:
+            self.assertIn(proof, RULE_FILTER_PROOFS)
+
+    def test_every_zig_effect_union_tag_is_handled_by_progress_analysis(self):
+        zig = (
+            Path(__file__).resolve().parents[3] / "src" / "tools" / "observation.zig"
+        ).read_text(encoding="utf-8")
+        match = re.search(
+            r"pub const Effect = union\(enum\) \{\n(.*?)\n\};", zig, re.S
+        )
+        self.assertIsNotNone(match)
+        tags = re.findall(r"^\s+(\w+):", match.group(1), re.M)
+        self.assertGreaterEqual(len(tags), 2, tags)
+        analysis_source = (
+            Path(__file__).resolve().parents[3]
+            / "scripts" / "eval" / "workbuddy" / "progress_analysis.py"
+        ).read_text(encoding="utf-8")
+        for tag in tags:
+            self.assertIn(f'"{tag}"', analysis_source)
 
     @staticmethod
     def _checker_backed_filter_events(*, include_batch: bool):
@@ -2176,6 +2233,113 @@ with tempfile.TemporaryDirectory() as directory:
     assert context.n_cache_tokens == 80
     assert context.n_output_tokens == 30
     assert context.cost_usd == 0.01
+'''
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(checkout / "src")
+        subprocess.run(
+            [str(checkout / ".venv/bin/python"), "-c", program],
+            cwd=checkout,
+            env=env,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def test_installed_adapter_enforced_mode_requires_rule_filter_receipt(self):
+        # Runtime receipt for the enforced arm (harness review 2026-08-17
+        # finding #2): a dispatching enforced run whose journal has zero
+        # rule_filter events means the binary never loaded the staged
+        # bundle — the trial must die loudly, not score with rules off.
+        checkout_raw = os.environ.get("METACODES_WORKBUDDY_CHECKOUT")
+        if not checkout_raw:
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        checkout = Path(checkout_raw).resolve()
+        if not checkout.is_dir():
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        installed_agent = (
+            checkout / "src/workbuddy_bench/agents/metacodes_agent.py"
+        )
+        if "no rule_filter" not in installed_agent.read_text(encoding="utf-8"):
+            self.skipTest(
+                "installed overlay predates the enforced rule-load receipt; "
+                "reinstall the overlay to activate this gate"
+            )
+        overlay_installer.validate_installed_overlay(checkout)
+        program = r'''
+import json, tempfile
+from pathlib import Path
+from workbuddy_bench.agents._metacodes_trace import (
+    OBSERVATION_JOURNAL_SCHEMA, OBSERVATION_FILENAME,
+    TOOL_OBSERVATION_SCHEMA, RULE_FILTER_PROOFS,
+)
+from workbuddy_bench.agents.metacodes_agent import MetacodesAgent
+from harbor.models.agent.context import AgentContext
+
+def journal_rows(events):
+    payloads = [{"run_started": {}}, *events, {"run_finished": {}}]
+    return [
+        {"schema_version": OBSERVATION_JOURNAL_SCHEMA, "sequence": seq,
+         "monotonic_elapsed_ns": seq, "session_id": "s-l2", "run_id": "r-l2",
+         "event": payload}
+        for seq, payload in enumerate(payloads)
+    ]
+
+start = {"schema_version": TOOL_OBSERVATION_SCHEMA, "id": "d-1",
+         "requested_name": "Read", "dispatched_name": "Read",
+         "origin": "authoritative", "agent_depth": 0}
+finish = {**start, "outcome": "succeeded"}
+identity = {
+    "schema_version": "metacodes-project-rule-filter-v1", "operation": "ordinary",
+    "project_sha256": "1" * 64, "bundle_sha256": "2" * 64, "bundle_revision": 1,
+    "kernel_sha256": "3" * 64, "active_rule_count": 1, "checker_rule_count": 0,
+    "statically_pruned_rule_count": 1, "proof": sorted(RULE_FILTER_PROOFS)[0],
+}
+
+def run_trial(directory, with_filters):
+    logs = Path(directory) / "trial" / "agent"
+    logs.mkdir(parents=True)
+    for name, rows in (
+        ("metacodes-output.jsonl", [{
+            "type": "result", "stop_reason": "end_turn", "turns": 1,
+            "tool_calls": 1, "input_tokens": 10, "output_tokens": 5,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+            "cost_usd": 0.001, "text": "done"}]),
+        ("metacodes-transcript.jsonl", [
+            {"role": "assistant", "blocks": [{"type": "text", "text": "done"}]}]),
+    ):
+        (logs / name).write_text(
+            "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    events = []
+    if with_filters:
+        events.append({"tool_observation": {"rule_filter": {
+            **identity, "dispatch_id": "d-1", "phase": "pre"}}})
+    events.append({"tool_observation": {"dispatch_started": start}})
+    if with_filters:
+        events.append({"tool_observation": {"rule_filter": {
+            **identity, "dispatch_id": "d-1", "phase": "post"}}})
+    events.append({"tool_observation": {"dispatch_finished": finish}})
+    (logs / OBSERVATION_FILENAME).write_text(
+        "".join(json.dumps(r) + "\n" for r in journal_rows(events)),
+        encoding="utf-8")
+    agent = MetacodesAgent(
+        logs, model_name="route-l2", model_params={},
+        METACODES_MODEL_DISPLAY_NAME="glm-5.2",
+        METACODES_PROJECT_RULES_RELATIVE="share/metacodes/project-rules",
+        METACODES_PROJECT_KERNEL_RELATIVE="share/metacodes/kernel",
+        METACODES_PROJECT_CONTROL_MODE="enforced",
+        connection={"mode": "local_proxy", "proxy_url": "http://127.0.0.1:1"},
+    )
+    agent.populate_context_post_run(AgentContext())
+
+with tempfile.TemporaryDirectory() as directory:
+    run_trial(directory, with_filters=True)   # receipt present: must pass
+failed = False
+try:
+    with tempfile.TemporaryDirectory() as directory:
+        run_trial(directory, with_filters=False)
+except RuntimeError as exc:
+    failed = "no rule_filter" in str(exc)
+assert failed, "enforced run without rule_filter events must fail loudly"
 '''
         env = dict(os.environ)
         env["PYTHONPATH"] = str(checkout / "src")

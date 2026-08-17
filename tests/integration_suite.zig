@@ -23,6 +23,7 @@ test {
     _ = @import("component/http_error_test.zig");
     _ = @import("component/answer_queue_test.zig");
     _ = @import("component/base_url_flag_test.zig");
+    _ = @import("component/unknown_flag_test.zig");
     _ = @import("component/task_error_test.zig");
     _ = @import("component/tool_loop_breaker_test.zig");
     _ = @import("component/plan_mode_inject_test.zig");

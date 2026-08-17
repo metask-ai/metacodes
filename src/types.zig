@@ -2,6 +2,10 @@ const std = @import("std");
 
 /// 通用配置
 pub const Config = struct {
+    /// 第一个无法识别的命令行参数(fail-closed:main 检查后报错退出)。
+    /// 静默吞掉未知 flag 会让 treatment/评估参数拼错时无声降级——参数面
+    /// 是外部契约,必须拒绝而不是忽略。
+    parse_error: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     /// Stable actor-visible identity used only in the system prompt.  The
     /// transport/request model remains `model`; keeping these separate lets a

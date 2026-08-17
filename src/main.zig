@@ -268,6 +268,11 @@ pub fn main(init: std.process.Init) !void {
 
     var config = parseArgs(init, allocator);
 
+    if (config.parse_error) |bad| {
+        std.debug.print("error: unknown argument '{s}' (use --help to list supported flags)\n", .{bad});
+        std.process.exit(2);
+    }
+
     // 捕获 argv[0] 解析可执行文件目录(供 KgClient 定位 vendor/tinykg;H1)。
     // argv[0] 含 '/' 才可定位;裸命令名(PATH 启动)→ null,回落 env/dev。realpath 解 symlink。
     {
@@ -853,6 +858,10 @@ fn parseArgs(init: std.process.Init, allocator: std.mem.Allocator) types.Config 
 
 /// 共享解析逻辑(parseArgs 生产路径 + parseArgsForTest 测试路径都走它)。
 fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, allocator: std.mem.Allocator) void {
+    // argv[0] 是程序名,显式消费。旧实现靠"未匹配即忽略"让它混过循环——
+    // 那个静默 else 同时也吞掉了所有拼错的 flag(评估 treatment 参数
+    // 拼错 → 无声降级),所以这里改为显式跳过 + 尾部 fail-closed。
+    _ = args.next();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
@@ -997,6 +1006,11 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
         } else if (std.mem.eql(u8, arg, "-")) {
             // 从 stdin 读全部作为 prompt（headless pipe 模式）
             config.prompt = readAllStdin(allocator) catch null;
+        } else {
+            // 未识别参数一律 fail-closed:记录后停止解析,由 main 报错退出。
+            // 绝不静默忽略——flag 面是外部契约(评估 harness 靠它传 treatment)。
+            config.parse_error = allocator.dupe(u8, arg) catch arg;
+            return;
         }
     }
 }

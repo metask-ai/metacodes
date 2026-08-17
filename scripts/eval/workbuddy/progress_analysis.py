@@ -152,6 +152,17 @@ def _pytest_summary_passed(result: Mapping[str, Any]) -> bool:
 def _realized_mutation(effect: Any, valid: Any) -> bool:
     if valid is not True or not isinstance(effect, dict):
         return False
+    # Closed union roster mirroring Zig's observation.Effect. A v1 effect
+    # carries no reobservation evidence, so it can never prove a realized
+    # mutation — but an UNKNOWN tag (a future file_mutation_v3) must fail
+    # loudly instead of silently reading as "nothing was mutated"
+    # (harness review 2026-08-17 finding #3: five modules keyed on the
+    # v2 literal with a False fallthrough).
+    unknown = set(effect) - {"file_mutation_v1", "file_mutation_v2"}
+    if unknown:
+        raise TraceError(
+            f"tool effect union tag is unsupported: {sorted(unknown)}"
+        )
     value = effect.get("file_mutation_v2")
     if not isinstance(value, dict):
         return False

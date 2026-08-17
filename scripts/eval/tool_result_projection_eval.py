@@ -251,6 +251,17 @@ def analyze(
                 projection = value.get("projection")
                 projection_artifacts += int(projection == "artifact")
                 projection_fallbacks += int(projection == "fallback")
+            elif isinstance(schema, str) and schema.startswith(
+                ("metacodes.bash-result.", "metacodes.tool-result-projection.", "metacodes.read-artifact.")
+            ):
+                # A recognized envelope family at an unrecognized version:
+                # counting it as absent would make a fully-unparsed run
+                # indistinguishable from a clean one. Transcripts carry many
+                # OTHER schema_version objects, so only these families are
+                # closed here.
+                raise EvaluationError(
+                    f"unsupported tool-result envelope schema: {schema}"
+                )
 
     usage_totals = {
         "input_tokens": 0,

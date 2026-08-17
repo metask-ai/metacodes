@@ -1370,6 +1370,15 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
             elif observation_kind in {"rule_coverage_gap", "rule_bounds_overflow"}:
                 # Diagnostic-only signals: no identity to cross-check here,
                 # but count them so silence stays distinguishable from absence.
+                # The schema is still pinned — this was the only journal
+                # branch without a version check, i.e. the only place a wire
+                # reshape could keep incrementing a counter that now means
+                # something else (harness review 2026-08-17 finding #5).
+                if observation.get("schema_version") != {
+                    "rule_coverage_gap": "metacodes-project-rule-coverage-gap-v1",
+                    "rule_bounds_overflow": "metacodes-project-rule-bounds-overflow-v1",
+                }[observation_kind]:
+                    raise TraceError(f"{observation_kind} schema is unsupported")
                 formal[observation_kind + "_events"] = (
                     formal.get(observation_kind + "_events", 0) + 1
                 )
