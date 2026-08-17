@@ -783,3 +783,106 @@ class MemoryStudyValidationTest(unittest.TestCase):
                 ),
                 paired_analysis.VERIFICATION_FINAL_GATE,
             )
+
+
+class FullStackStudyValidationTest(unittest.TestCase):
+    """full_stack merges project rules + final gate + requirement ledger into
+    one treatment arm; the baseline observes the gate and the ledger so both
+    arms carry obligation outcomes."""
+
+    @staticmethod
+    def _manifests(**treatments):
+        base = {
+            "project_control": "disabled",
+            "verification_checkpoint": False,
+            "verification_final_gate": False,
+            "verification_final_observe": False,
+            "requirement_ledger": False,
+            "requirement_ledger_observe": False,
+            "memory_accumulation": False,
+        }
+        out = {}
+        for arm in ("baseline", "treatment"):
+            merged = dict(base)
+            merged.update(treatments.get(arm, {}))
+            out[arm] = {"evaluation_treatment": merged}
+        return out
+
+    def _full_stack_arms(self):
+        return self._manifests(
+            baseline={
+                "verification_final_observe": True,
+                "requirement_ledger_observe": True,
+            },
+            treatment={
+                "project_control": "enforced",
+                "verification_final_gate": True,
+                "requirement_ledger": True,
+            },
+        )
+
+    def test_correct_full_stack_arms_pass(self):
+        paired_analysis._validate_study_treatment(
+            self._full_stack_arms(), paired_analysis.FULL_STACK
+        )
+
+    def test_full_stack_rejects_a_disabled_project_treatment_arm(self):
+        manifests = self._full_stack_arms()
+        manifests["treatment"]["evaluation_treatment"]["project_control"] = "disabled"
+        with self.assertRaisesRegex(paired_analysis.LaunchError, "full-stack"):
+            paired_analysis._validate_study_treatment(
+                manifests, paired_analysis.FULL_STACK
+            )
+
+    def test_full_stack_rejects_a_silent_baseline_ledger(self):
+        manifests = self._full_stack_arms()
+        manifests["baseline"]["evaluation_treatment"][
+            "requirement_ledger_observe"
+        ] = False
+        with self.assertRaisesRegex(paired_analysis.LaunchError, "full-stack"):
+            paired_analysis._validate_study_treatment(
+                manifests, paired_analysis.FULL_STACK
+            )
+
+    def test_full_stack_rejects_memory_confounding(self):
+        manifests = self._full_stack_arms()
+        manifests["treatment"]["evaluation_treatment"]["memory_accumulation"] = True
+        with self.assertRaisesRegex(paired_analysis.LaunchError, "full-stack"):
+            paired_analysis._validate_study_treatment(
+                manifests, paired_analysis.FULL_STACK
+            )
+
+    def test_full_stack_rejects_legacy_manifests_without_ledger_fields(self):
+        manifests = self._full_stack_arms()
+        for arm in manifests:
+            del manifests[arm]["evaluation_treatment"]["requirement_ledger"]
+            del manifests[arm]["evaluation_treatment"]["requirement_ledger_observe"]
+        with self.assertRaisesRegex(paired_analysis.LaunchError, "full-stack"):
+            paired_analysis._validate_study_treatment(
+                manifests, paired_analysis.FULL_STACK
+            )
+
+    def test_ledger_leaking_into_the_gate_study_is_rejected(self):
+        with self.assertRaisesRegex(paired_analysis.LaunchError, "final-gate"):
+            paired_analysis._validate_study_treatment(
+                self._manifests(
+                    baseline={"verification_final_observe": True},
+                    treatment={
+                        "verification_final_gate": True,
+                        "requirement_ledger": True,
+                    },
+                ),
+                paired_analysis.VERIFICATION_FINAL_GATE,
+            )
+
+    def test_ledger_leaking_into_the_project_study_is_rejected(self):
+        with self.assertRaisesRegex(paired_analysis.LaunchError, "project-control"):
+            paired_analysis._validate_study_treatment(
+                self._manifests(
+                    treatment={
+                        "project_control": "enforced",
+                        "requirement_ledger": True,
+                    },
+                ),
+                paired_analysis.PROJECT_CONTROL,
+            )

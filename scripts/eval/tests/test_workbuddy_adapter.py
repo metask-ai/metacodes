@@ -3070,3 +3070,89 @@ class WorkBuddyRequirementLedgerRecordTest(unittest.TestCase):
         bad["schema_version"] = "metacodes-requirement-ledger-v0"
         with self.assertRaisesRegex(TraceError, "requirement ledger record"):
             self._metrics(bad)
+
+
+class WorkBuddyRequirementLedgerTreatmentTest(unittest.TestCase):
+    """The requirement-ledger treatment kwargs are wired end to end: the
+    adapter validates them, emits the CLI flags, and discloses them in the
+    runtime contract."""
+
+    @staticmethod
+    def _source() -> str:
+        return (
+            Path(__file__).parents[1]
+            / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
+        ).read_text(encoding="utf-8")
+
+    def test_ledger_kwargs_reach_flags_and_runtime_contract(self):
+        source = self._source()
+        self.assertIn('kwargs.pop("METACODES_REQUIREMENT_LEDGER", False)', source)
+        self.assertIn(
+            'kwargs.pop("METACODES_REQUIREMENT_LEDGER_OBSERVE", False)', source
+        )
+        self.assertIn('flags.append("--requirement-ledger")', source)
+        self.assertIn('flags.append("--requirement-ledger-observe")', source)
+        self.assertIn(
+            '"requirement_ledger": self._requirement_ledger,', source
+        )
+        self.assertIn(
+            '"requirement_ledger_observe": self._requirement_ledger_observe,',
+            source,
+        )
+
+    def test_ledger_enforce_and_observe_are_exclusive_in_the_real_adapter(self):
+        checkout_raw = os.environ.get("METACODES_WORKBUDDY_CHECKOUT")
+        if not checkout_raw:
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        checkout = Path(checkout_raw).resolve()
+        if not checkout.is_dir():
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        overlay_installer.validate_installed_overlay(checkout)
+        program = r'''
+import tempfile
+from pathlib import Path
+from workbuddy_bench.agents.metacodes_agent import MetacodesAgent
+
+with tempfile.TemporaryDirectory() as directory:
+    logs = Path(directory) / "trial" / "agent"
+    logs.mkdir(parents=True)
+    common = dict(
+        model_name="route-l2", model_params={},
+        METACODES_MODEL_DISPLAY_NAME="glm-5.2",
+        connection={"mode": "local_proxy", "proxy_url": "http://127.0.0.1:1"},
+    )
+    agent = MetacodesAgent(
+        logs, METACODES_REQUIREMENT_LEDGER=True, **common,
+    )
+    assert agent._requirement_ledger is True
+    assert agent._requirement_ledger_observe is False
+    try:
+        MetacodesAgent(
+            logs,
+            METACODES_REQUIREMENT_LEDGER=True,
+            METACODES_REQUIREMENT_LEDGER_OBSERVE=True,
+            **common,
+        )
+    except ValueError as error:
+        assert "mutually exclusive" in str(error), error
+    else:
+        raise AssertionError("exclusive ledger modes were accepted")
+    try:
+        MetacodesAgent(
+            logs, METACODES_REQUIREMENT_LEDGER="yes", **common,
+        )
+    except ValueError as error:
+        assert "explicit booleans" in str(error), error
+    else:
+        raise AssertionError("non-boolean ledger treatment was accepted")
+'''
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(checkout / "src")
+        subprocess.run(
+            [str(checkout / ".venv/bin/python"), "-c", program],
+            cwd=checkout,
+            env=env,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )

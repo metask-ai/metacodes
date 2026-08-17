@@ -126,6 +126,18 @@ class MetacodesAgent(BaseInstalledAgent):
             )
         self._verification_final_gate = final_gate
         self._verification_final_observe = final_observe
+        ledger = kwargs.pop("METACODES_REQUIREMENT_LEDGER", False)
+        ledger_observe = kwargs.pop("METACODES_REQUIREMENT_LEDGER_OBSERVE", False)
+        if not isinstance(ledger, bool) or not isinstance(ledger_observe, bool):
+            raise ValueError(
+                "METACODES_REQUIREMENT_LEDGER/OBSERVE must be explicit booleans"
+            )
+        if ledger and ledger_observe:
+            raise ValueError(
+                "requirement ledger enforce and observe modes are mutually exclusive"
+            )
+        self._requirement_ledger = ledger
+        self._requirement_ledger_observe = ledger_observe
         memory_accumulation = kwargs.pop("METACODES_MEMORY_ACCUMULATION", False)
         if not isinstance(memory_accumulation, bool):
             raise ValueError(
@@ -276,6 +288,10 @@ class MetacodesAgent(BaseInstalledAgent):
             flags.append("--verification-final-gate")
         if self._verification_final_observe:
             flags.append("--verification-final-observe")
+        if self._requirement_ledger:
+            flags.append("--requirement-ledger")
+        if self._requirement_ledger_observe:
+            flags.append("--requirement-ledger-observe")
 
         project_setup = ""
         project_postcheck = ""
@@ -393,6 +409,8 @@ class MetacodesAgent(BaseInstalledAgent):
                 "verification_checkpoint": self._verification_checkpoint,
                 "verification_final_gate": self._verification_final_gate,
                 "verification_final_observe": self._verification_final_observe,
+                "requirement_ledger": self._requirement_ledger,
+                "requirement_ledger_observe": self._requirement_ledger_observe,
                 "project_control": project_contract,
             },
             sort_keys=True,

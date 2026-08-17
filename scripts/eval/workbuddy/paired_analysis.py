@@ -44,11 +44,13 @@ PROJECT_CONTROL = "project_control"
 VERIFICATION_CHECKPOINT = "verification_checkpoint"
 VERIFICATION_FINAL_GATE = "verification_final_gate"
 MEMORY_ACCUMULATION = "memory_accumulation"
+FULL_STACK = "full_stack"
 STUDIES = {
     PROJECT_CONTROL,
     VERIFICATION_CHECKPOINT,
     VERIFICATION_FINAL_GATE,
     MEMORY_ACCUMULATION,
+    FULL_STACK,
 }
 PROJECT_CONTROL_ARMS = {"baseline": "disabled", "treatment": "enforced"}
 CHECKPOINT_ARMS = {"baseline": False, "treatment": True}
@@ -66,6 +68,19 @@ MEMORY_REPORT_SCHEMA_VERSION = (
 # accumulates across the arm's tasks. Both arms hold every verification
 # treatment off so memory transfer is not confounded with gate actuation.
 MEMORY_ARMS = {"baseline": False, "treatment": True}
+FULL_STACK_REPORT_SCHEMA_VERSION = (
+    "metacodes-workbuddy-full-stack-paired-report-v1"
+)
+# The full-stack study measures the merged control plane as one treatment:
+# project rules enforced + verification final gate enforced + requirement
+# ledger enforced, against a baseline with all actuation off. Measurement
+# symmetry: the baseline arm runs the gate and ledger in record-only observe
+# mode so both arms carry the obligation outcomes.
+FULL_STACK_PROJECT_ARMS = {"baseline": "disabled", "treatment": "enforced"}
+FULL_STACK_GATE_ARMS = {"baseline": False, "treatment": True}
+FULL_STACK_OBSERVE_ARMS = {"baseline": True, "treatment": False}
+FULL_STACK_LEDGER_ARMS = {"baseline": False, "treatment": True}
+FULL_STACK_LEDGER_OBSERVE_ARMS = {"baseline": True, "treatment": False}
 
 
 def _number(value: object, where: str, *, minimum: float = 0.0) -> float:
@@ -298,6 +313,7 @@ def _validate_study_treatment(
                 project_mode != PROJECT_CONTROL_ARMS[arm]
                 or checkpoint not in {None, False}
                 or memory not in {None, False}
+                or treatment.get("requirement_ledger") not in {None, False}
             ):
                 raise LaunchError(
                     f"paired WorkBuddy {arm} has the wrong project-control treatment"
@@ -307,9 +323,27 @@ def _validate_study_treatment(
                 project_mode != "disabled"
                 or checkpoint is not CHECKPOINT_ARMS[arm]
                 or memory not in {None, False}
+                or treatment.get("requirement_ledger") not in {None, False}
             ):
                 raise LaunchError(
                     f"paired WorkBuddy {arm} has the wrong verification-checkpoint treatment"
+                )
+        elif study == FULL_STACK:
+            if (
+                project_mode != FULL_STACK_PROJECT_ARMS[arm]
+                or checkpoint is not False
+                or treatment.get("verification_final_gate")
+                is not FULL_STACK_GATE_ARMS[arm]
+                or treatment.get("verification_final_observe")
+                is not FULL_STACK_OBSERVE_ARMS[arm]
+                or treatment.get("requirement_ledger")
+                is not FULL_STACK_LEDGER_ARMS[arm]
+                or treatment.get("requirement_ledger_observe")
+                is not FULL_STACK_LEDGER_OBSERVE_ARMS[arm]
+                or memory is not False
+            ):
+                raise LaunchError(
+                    f"paired WorkBuddy {arm} has the wrong full-stack treatment"
                 )
         elif study == MEMORY_ACCUMULATION:
             if (
@@ -318,6 +352,7 @@ def _validate_study_treatment(
                 or treatment.get("verification_final_gate") is not False
                 or treatment.get("verification_final_observe") is not False
                 or memory is not MEMORY_ARMS[arm]
+                or treatment.get("requirement_ledger") not in {None, False}
             ):
                 raise LaunchError(
                     f"paired WorkBuddy {arm} has the wrong memory-accumulation treatment"
@@ -331,6 +366,7 @@ def _validate_study_treatment(
                 or treatment.get("verification_final_observe")
                 is not FINAL_OBSERVE_ARMS[arm]
                 or memory not in {None, False}
+                or treatment.get("requirement_ledger") not in {None, False}
             ):
                 raise LaunchError(
                     f"paired WorkBuddy {arm} has the wrong final-gate treatment"
@@ -680,7 +716,7 @@ def build_report(
         ):
             raise LaunchError("paired WorkBuddy comparison identity is missing")
     _validate_study_treatment(manifests, study)
-    if study in {VERIFICATION_CHECKPOINT, VERIFICATION_FINAL_GATE}:
+    if study in {VERIFICATION_CHECKPOINT, VERIFICATION_FINAL_GATE, FULL_STACK}:
         for arm, manifest in manifests.items():
             host_modules = manifest.get("host_control_plane")
             if not isinstance(host_modules, dict) or "progress_analysis" not in host_modules:
@@ -841,6 +877,8 @@ def build_report(
             if study == VERIFICATION_FINAL_GATE
             else MEMORY_REPORT_SCHEMA_VERSION
             if study == MEMORY_ACCUMULATION
+            else FULL_STACK_REPORT_SCHEMA_VERSION
+            if study == FULL_STACK
             else CHECKPOINT_REPORT_SCHEMA_VERSION
         ),
         **({"study": study} if study != PROJECT_CONTROL else {}),

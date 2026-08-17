@@ -2611,3 +2611,61 @@ class WorkBuddyMemoryTreatmentValidationTest(unittest.TestCase):
             _validate_memory_accumulation_kwargs(
                 {"METACODES_MEMORY_ACCUMULATION": True}, undeclared, label="t"
             )
+
+
+class RequirementLedgerTreatmentContractTest(unittest.TestCase):
+    """The paid-launch treatment roster admits the requirement-ledger pair
+    only as explicit booleans; the check sits ahead of every later manifest
+    check so a partial manifest reaches it deterministically."""
+
+    @staticmethod
+    def _manifest(treatment):
+        manifest = {
+            "schema_version": SCHEMA_VERSION,
+            "quality_evidence": False,
+            "evaluation_treatment": treatment,
+        }
+        manifest["content_sha256"] = hashlib.sha256(
+            stable_json(manifest).encode("utf-8")
+        ).hexdigest()
+        return manifest
+
+    def _base_treatment(self):
+        return {
+            "project_control": "absent",
+            "actor_prompt_changed": False,
+            "tool_schema_changed": False,
+            "provider_cache_prefix_changed_by_control_plane": False,
+            "verification_checkpoint": False,
+            "verification_final_gate": False,
+            "memory_accumulation": False,
+            "verification_final_observe": False,
+            "requirement_ledger": False,
+            "requirement_ledger_observe": False,
+        }
+
+    def test_boolean_ledger_pair_passes_the_treatment_roster(self):
+        # The treatment roster accepts the pair: validation proceeds past it
+        # and fails on the NEXT contract check instead.
+        with self.assertRaisesRegex(
+            LaunchError, "commit evidence classification"
+        ):
+            _validate_launch_manifest(self._manifest(self._base_treatment()))
+
+    def test_non_boolean_ledger_fails_the_treatment_roster(self):
+        treatment = self._base_treatment()
+        treatment["requirement_ledger"] = "on"
+        with self.assertRaisesRegex(LaunchError, "treatment contract is incomplete"):
+            _validate_launch_manifest(self._manifest(treatment))
+
+    def test_ledger_without_observe_field_fails_the_treatment_roster(self):
+        treatment = self._base_treatment()
+        del treatment["requirement_ledger_observe"]
+        with self.assertRaisesRegex(LaunchError, "treatment contract is incomplete"):
+            _validate_launch_manifest(self._manifest(treatment))
+
+    def test_unknown_treatment_key_still_fails_closed(self):
+        treatment = self._base_treatment()
+        treatment["requirement_ledger_extra"] = True
+        with self.assertRaisesRegex(LaunchError, "treatment contract is incomplete"):
+            _validate_launch_manifest(self._manifest(treatment))

@@ -178,6 +178,8 @@ def _comparison_covariates(
         overrides.pop("METACODES_VERIFICATION_CHECKPOINT", None)
         overrides.pop("METACODES_VERIFICATION_FINAL_GATE", None)
         overrides.pop("METACODES_VERIFICATION_FINAL_OBSERVE", None)
+        overrides.pop("METACODES_REQUIREMENT_LEDGER", None)
+        overrides.pop("METACODES_REQUIREMENT_LEDGER_OBSERVE", None)
         overrides.pop("METACODES_MEMORY_ACCUMULATION", None)
     stable_artifacts = json.loads(json.dumps(artifacts))
     # Absolute staging paths describe where identical bytes were observed, not
@@ -678,6 +680,22 @@ def build_launch_manifest(
         raise LaunchError(
             "WorkBuddy verification final gate and observe modes are exclusive"
         )
+    requirement_ledger = project_overrides.get(
+        "METACODES_REQUIREMENT_LEDGER", False
+    )
+    requirement_ledger_observe = project_overrides.get(
+        "METACODES_REQUIREMENT_LEDGER_OBSERVE", False
+    )
+    if not isinstance(requirement_ledger, bool) or not isinstance(
+        requirement_ledger_observe, bool
+    ):
+        raise LaunchError(
+            "WorkBuddy requirement-ledger treatment must be explicit booleans"
+        )
+    if requirement_ledger and requirement_ledger_observe:
+        raise LaunchError(
+            "WorkBuddy requirement ledger enforce and observe modes are exclusive"
+        )
     memory_accumulation = project_overrides.get(
         "METACODES_MEMORY_ACCUMULATION", False
     )
@@ -827,6 +845,8 @@ def build_launch_manifest(
             "verification_final_gate": verification_final_gate,
             "memory_accumulation": memory_accumulation,
             "verification_final_observe": verification_final_observe,
+            "requirement_ledger": requirement_ledger,
+            "requirement_ledger_observe": requirement_ledger_observe,
         },
         "comparison": (
             {
@@ -956,6 +976,16 @@ def _validate_launch_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
                     if "memory_accumulation" in treatment
                     else {}
                 ),
+                **(
+                    {
+                        "requirement_ledger": treatment.get("requirement_ledger"),
+                        "requirement_ledger_observe": treatment.get(
+                            "requirement_ledger_observe"
+                        ),
+                    }
+                    if "requirement_ledger" in treatment
+                    else {}
+                ),
             }
             or treatment.get("project_control") not in PROJECT_CONTROL_MODES
             or ("verification_checkpoint" in treatment and not isinstance(checkpoint, bool))
@@ -969,6 +999,15 @@ def _validate_launch_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
             or (
                 "memory_accumulation" in treatment
                 and not isinstance(treatment.get("memory_accumulation"), bool)
+            )
+            or (
+                "requirement_ledger" in treatment
+                and not (
+                    isinstance(treatment.get("requirement_ledger"), bool)
+                    and isinstance(
+                        treatment.get("requirement_ledger_observe"), bool
+                    )
+                )
             )
         ):
             raise LaunchError("paid launch treatment contract is incomplete")
