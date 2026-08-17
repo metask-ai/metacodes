@@ -28,6 +28,7 @@ pub const api_request_overrides = @import("api/request_overrides.zig");
 pub const model_adapter = @import("api/model_adapter.zig");
 pub const client_mod = client; // alias for L2 component tests
 pub const task_store = @import("core/task_store.zig"); // L2 requirement-ledger tests
+pub const requirement_ledger = @import("core/requirement_ledger.zig"); // L2 ledger decide tests
 pub const types_mod = types;
 pub const json_mod = @import("json.zig");
 pub const util_abort = @import("util/abort.zig");

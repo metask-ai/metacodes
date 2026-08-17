@@ -377,12 +377,15 @@ fn createKgTask(ctx: *const ToolContext, subject: []const u8, description: []con
     return node;
 }
 
-/// 从 store 移除 kg- 镜像(闭合/删除计划步骤或 todo 后,让 TaskTab/TaskList 同步消失)。
+/// 终态处置(completed/failed/stop-closed)后移除 kg- 镜像,并累进账本终身
+/// 计数(TaskTab/TaskList 同步消失,但 ledgerCounts 的 total 语义是"曾登记
+/// 过的需求项"——三个调用点全部是终态,取消路径不存在;PO-V2 M1)。
 fn removeKgMirror(ctx: *const ToolContext, node_id: u64) void {
     const store = ctx.tasks orelse return;
     var idbuf: [24]u8 = undefined;
     const kg_id = std.fmt.bufPrint(&idbuf, "kg-{d}", .{node_id}) catch return;
-    store.updateStatus(kg_id, .deleted) catch {}; // 缺失 → no-op
+    store.updateStatus(kg_id, .deleted) catch {}; // 缺失 → no-op(计数仍进:KG 侧已终态)
+    store.noteKgMirrorClosed();
 }
 
 /// 懒建 inbox root(会话待办容器)。读 kg_inbox 指针;缺失/stale → 建新 root task + 写指针。

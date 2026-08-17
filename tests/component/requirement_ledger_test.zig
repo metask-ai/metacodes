@@ -240,3 +240,39 @@ test "L2 observe mode records the ledger without prompting or nudging" {
     try std.testing.expect(!run.record.enforced);
     try std.testing.expectEqual(@as(u32, 1), run.record.items_open);
 }
+
+// PO-V2 M1(fstack-r2 断线):KG write-through 任务闭合时镜像被物理删除,
+// 旧 ledgerCounts 只数存活行 → 健康的"全建全闭"会话被记 items_total=0,
+// end-gate 据此误发"从未记录需求账本"。终身计数修复后,闭合不再抹掉
+// "曾登记"的事实。
+test "kg mirror closure keeps the lifetime ledger total" {
+    const a = std.testing.allocator;
+    var store = cc.task_store.TaskStore.init(a);
+    defer store.deinit();
+
+    try store.createWithId("kg-101", "requirement one", "desc", .pending);
+    try store.createWithId("kg-102", "requirement two", "desc", .pending);
+    var counts = store.ledgerCounts();
+    try std.testing.expectEqual(@as(usize, 2), counts.open);
+    try std.testing.expectEqual(@as(usize, 2), counts.total);
+
+    // 终态处置 = 镜像删除 + 终身计数(removeKgMirror 的两步)。
+    try store.updateStatus("kg-101", .deleted);
+    store.noteKgMirrorClosed();
+    counts = store.ledgerCounts();
+    try std.testing.expectEqual(@as(usize, 1), counts.open);
+    try std.testing.expectEqual(@as(usize, 2), counts.total);
+
+    // 全部闭合:open 归零,total 保持——coverage nudge 的 decide(0, 2, true)
+    // 必须是 none(修复前这里是 decide(0, 0, true) → 假 coverage nudge)。
+    try store.updateStatus("kg-102", .deleted);
+    store.noteKgMirrorClosed();
+    counts = store.ledgerCounts();
+    try std.testing.expectEqual(@as(usize, 0), counts.open);
+    try std.testing.expectEqual(@as(usize, 2), counts.total);
+    var state = cc.requirement_ledger.State{ .prompt_emitted = true };
+    try std.testing.expectEqual(
+        cc.requirement_ledger.Decision.none,
+        state.decide(counts.open, counts.total, true),
+    );
+}

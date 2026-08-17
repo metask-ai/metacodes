@@ -81,6 +81,8 @@ pub const TaskStore = struct {
     allocator: std.mem.Allocator,
     tasks: std.ArrayList(*Task), // pointers so addresses stable across growth
     next_id: u64 = 1,
+    /// 终态处置后被移除的 KG 镜像任务终身计数(见 ledgerCounts/noteKgMirrorClosed)。
+    kg_closed: usize = 0,
     /// **task#19**:driver 单线程改 tasks;attach 快照(HTTP 线程)要跨线程读 → mutex 串行,免
     /// grow-during-iterate 悬挂 / torn 读 task 内容。所有**改 tasks / 改 task 内容**的公开方法锁内跑;
     /// get() 无锁(driver 内部/单线程用 + 被上锁方法内部调,不能重入)。snapshotTasks 锁内 dup 值语义。
@@ -499,7 +501,20 @@ pub const TaskStore = struct {
         for (self.tasks.items) |t| {
             if (t.status == .pending or t.status == .in_progress) open += 1;
         }
-        return .{ .open = open, .total = self.tasks.items.len };
+        // KG write-through 任务的镜像在终态处置时被物理删除(TaskTab 显示
+        // 同步需要),但账本语义的 total 是"曾登记过的需求项"——不含终身
+        // 计数时,全部闭合的健康会话会被记成 items_total=0,end-gate 据此
+        // 误发"从未记录需求账本"(fstack-r2 全部 16 个 trial 实测如此,
+        // 假 nudge 在训练模型无视 nudge;PO-V2 M1)。
+        return .{ .open = open, .total = self.tasks.items.len + self.kg_closed };
+    }
+
+    /// KG 镜像任务进入终态(completed/failed/stop-closed)被移除时的终身
+    /// 计数。只在终态处置点调用——取消/GC 不是需求项生命周期的完成。
+    pub fn noteKgMirrorClosed(self: *TaskStore) void {
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
+        self.kg_closed += 1;
     }
 
     pub fn updateStatus(self: *TaskStore, id: []const u8, status: TaskStatus) !void {
