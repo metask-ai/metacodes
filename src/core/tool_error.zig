@@ -203,6 +203,39 @@ pub const PROJECT_RULE_RECOVERY_SCHEMA = "metacodes-project-rule-recovery-v1";
 /// Render the task-level recovery contract selected by the fixed Lean kernel.
 /// `recoverable` remains false for the denied Write itself: only the distinct
 /// Edit path is recoverable, and it must pass the normal gate again.
+/// State-aware no-recovery block detail. The one field-adjudicated false
+/// intervention (mkdocs `docs/index.md -> README.md`) cost a 12-turn
+/// confusion spiral mostly because the bare message carried nothing
+/// actionable; the target state is host-observed and task-agnostic, so say
+/// it.
+pub fn projectRuleBlockedJson(
+    tool: []const u8,
+    target_state: @import("../tools/observation.zig").FileTargetState,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    const hint: []const u8 = switch (target_state) {
+        .other_existing => " The target path exists but is not a regular file — it is likely a symlink or a directory. Check with `ls -la <path>`; if it is a symlink, read and edit the resolved real path directly instead of retrying this call.",
+        .unavailable => " The target path could not be observed (ambiguous filesystem state); verify the path exists and is accessible before retrying a different approach.",
+        .missing, .regular_existing, .unobserved => "",
+    };
+    return errToJsonState(tool, hint, allocator);
+}
+
+fn errToJsonState(tool: []const u8, hint: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    const detail = try std.fmt.allocPrint(
+        allocator,
+        "Project formal rule blocked tool '{s}' before dispatch.{s}",
+        .{ tool, hint },
+    );
+    defer allocator.free(detail);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try aw.writer.writeAll("{\"error\":{\"code\":\"project_rule_blocked\",\"category\":\"safety\",\"detail\":");
+    try std.json.Stringify.encodeJsonString(detail, .{}, &aw.writer);
+    try aw.writer.writeAll(",\"recoverable\":false}}");
+    return aw.toOwnedSlice();
+}
+
 pub fn projectRuleExactEditBlockedJson(
     tool: []const u8,
     allocator: std.mem.Allocator,
@@ -404,4 +437,16 @@ test "project rule exact edit recovery distinguishes denied action from task rec
         parsed.value.@"error".recovery.requirements[1],
         "ends with a newline",
     ) != null);
+}
+
+test "no-recovery block detail names a non-regular target actionably" {
+    const a = std.testing.allocator;
+    const other = try projectRuleBlockedJson("Edit", .other_existing, a);
+    defer a.free(other);
+    try std.testing.expect(std.mem.indexOf(u8, other, "symlink") != null);
+    try std.testing.expect(std.mem.indexOf(u8, other, "resolved real path") != null);
+    const plain = try projectRuleBlockedJson("Edit", .regular_existing, a);
+    defer a.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "symlink") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "project_rule_blocked") != null);
 }

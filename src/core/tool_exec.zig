@@ -597,10 +597,9 @@ pub fn executeOne(
                         const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
                         const tool_error = @import("tool_error.zig");
                         const denied = switch (recovery_action) {
-                            .none => tool_error.errorToJson(
-                                "ProjectRuleBlocked",
-                                "Project formal rule blocked synthesized tool '{s}' before dispatch",
-                                .{dispatched_name},
+                            .none => tool_error.projectRuleBlockedJson(
+                                dispatched_name,
+                                exact_signal.file_target_state,
                                 parent_allocator,
                             ),
                             .edit_existing_file_exact => tool_error.projectRuleExactEditBlockedJson(
@@ -628,10 +627,9 @@ pub fn executeOne(
                 const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
                 const tool_error = @import("tool_error.zig");
                 const denied = switch (recovery_action) {
-                    .none => tool_error.errorToJson(
-                        "ProjectRuleBlocked",
-                        "Project formal rule blocked tool '{s}' before dispatch",
-                        .{dispatched_name},
+                    .none => tool_error.projectRuleBlockedJson(
+                        dispatched_name,
+                        project_pre_signal.?.file_target_state,
                         parent_allocator,
                     ),
                     .edit_existing_file_exact => tool_error.projectRuleExactEditBlockedJson(
