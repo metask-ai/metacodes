@@ -425,3 +425,63 @@ test "P3/缓存: OpenAI cached_tokens → 中立 UsageDelta.cache_read(onUsage �
     const cap = srv.lastRequest().?;
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "\"include_usage\":true") != null);
 }
+
+// 后端漏发 tool_call id 的变体(2026-08-17 复审发射侧 #1 的 OpenAI 面):
+// 旧实现让空 id 直通,流进观察日志成空 dispatch_id(trace fail-closed,同轮
+// 多工具还必撞重复)。修法 = buildFlush 兜底合成进程级唯一 id。
+const OPENAI_TOOLCALL_NO_ID_SSE =
+    "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"type\":\"function\",\"function\":{\"name\":\"get_time\",\"arguments\":\"\"}}]}}]}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" ++
+    "data: [DONE]\n\n";
+
+test "OpenAI tool_call 无 id → 合成非空唯一 id(不流空 dispatch_id)" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(
+        &[_][]const u8{ OPENAI_TOOLCALL_NO_ID_SSE, OPENAI_TOOLCALL_NO_ID_SSE },
+        0,
+    );
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-4o", url);
+    defer client.deinit();
+
+    const p = client.provider();
+    const msgs = [_]cc.types_mod.ApiMessage{
+        .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
+    };
+
+    var ids: [2][]const u8 = undefined;
+    var got: usize = 0;
+    defer for (ids[0..got]) |id| a.free(id);
+
+    for (0..2) |_| {
+        var handle = p.sendStream(&msgs, null, null, null, null, null, "") catch |e| {
+            std.debug.print("openai sendStream failed: {s}\n", .{@errorName(e)});
+            return error.SkipZigTest;
+        };
+        defer handle.deinit();
+        while (try handle.next()) |ev| switch (ev) {
+            .text => |t| a.free(t),
+            .tool_use_start => |tu| {
+                if (got < 2) {
+                    ids[got] = tu.id;
+                    got += 1;
+                } else a.free(tu.id);
+                a.free(tu.name);
+                a.free(tu.input_json);
+            },
+            else => {},
+        };
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), got);
+    try std.testing.expect(ids[0].len > 0);
+    try std.testing.expect(ids[1].len > 0);
+    try std.testing.expect(std.mem.startsWith(u8, ids[0], "call_"));
+    try std.testing.expect(!std.mem.eql(u8, ids[0], ids[1]));
+}

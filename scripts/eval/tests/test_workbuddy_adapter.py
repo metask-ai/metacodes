@@ -732,7 +732,11 @@ class WorkBuddyTraceTest(unittest.TestCase):
         # appear verbatim in trace.py, as a constant or roster literal.
         root = Path(__file__).resolve().parents[3]
         pattern = re.compile(r'pub const ([A-Z0-9_]+) = "(metacodes[^"]+)";')
-        constants: dict[str, str] = {}
+        # Keyed by (file, name): both sources define a bare SCHEMA_VERSION
+        # with different values, and a name-keyed dict silently drops one
+        # of them — the exact vacuous-guard failure this test exists to
+        # prevent.
+        constants: dict[tuple[str, str], str] = {}
         for source in (
             root / "src" / "tools" / "observation.zig",
             root / "src" / "core" / "tool_observation_journal.zig",
@@ -740,15 +744,20 @@ class WorkBuddyTraceTest(unittest.TestCase):
             for name, value in pattern.findall(source.read_text(encoding="utf-8")):
                 if re.search(r"_V\d+$", name):
                     continue
-                constants[name] = value
-        # Floor guards against the regex silently matching nothing.
-        self.assertGreaterEqual(len(constants), 8, constants)
+                constants[(source.name, name)] = value
+        # Floor guards against the regex silently matching nothing, and the
+        # journal schema must have survived alongside observation's twin.
+        self.assertGreaterEqual(len(constants), 9, constants)
+        self.assertIn(
+            ("tool_observation_journal.zig", "SCHEMA_VERSION"), constants
+        )
+        self.assertIn(("observation.zig", "SCHEMA_VERSION"), constants)
         trace_source = (
             root / "scripts" / "eval" / "workbuddy" / "trace.py"
         ).read_text(encoding="utf-8")
         missing = {
-            name: value
-            for name, value in constants.items()
+            key: value
+            for key, value in constants.items()
             if value not in trace_source
         }
         self.assertEqual(missing, {})

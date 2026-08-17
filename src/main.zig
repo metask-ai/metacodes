@@ -268,8 +268,8 @@ pub fn main(init: std.process.Init) !void {
 
     var config = parseArgs(init, allocator);
 
-    if (config.parse_error) |bad| {
-        std.debug.print("error: unknown argument '{s}' (use --help to list supported flags)\n", .{bad});
+    if (config.parse_error) |parse_err| {
+        std.debug.print("error: {s} (use --help to list supported flags)\n", .{parse_err});
         std.process.exit(2);
     }
 
@@ -498,6 +498,10 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
     _ = args.next(); // 跳过 argv[0](程序名)
     const cmd = args.next() orelse return null;
     if (std.mem.eql(u8, cmd, "logout")) {
+        if (args.next()) |extra| {
+            std.debug.print("error: unknown logout argument '{s}'\n", .{extra});
+            return 2;
+        }
         auth.clearDefault(allocator) catch |err| switch (err) {
             error.NoHome => {
                 std.debug.print("No HOME set; no credentials cleared.\n", .{});
@@ -536,6 +540,12 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u
             open_browser = false;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             mode = .help;
+        } else {
+            // auth 面同样 fail-closed(2026-08-17 复审 #1):`login --api-kye X`
+            // 曾静默丢掉 typo 的 flag 和密钥,转进浏览器 OAuth 并无限挂起——
+            // 非交互环境下这是最恶劣的失败形态。
+            std.debug.print("error: unknown login/logout argument '{s}'\n", .{arg});
+            return 2;
         }
     }
 
@@ -857,6 +867,22 @@ fn parseArgs(init: std.process.Init, allocator: std.mem.Allocator) types.Config 
 }
 
 /// 共享解析逻辑(parseArgs 生产路径 + parseArgsForTest 测试路径都走它)。
+fn isAllDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (c < '0' or c > '9') return false;
+    return true;
+}
+
+/// 参数错误统一落 config.parse_error(完整人话消息);main 打印后 exit 2。
+fn setParseError(
+    config: *types.Config,
+    allocator: std.mem.Allocator,
+    comptime fmt: []const u8,
+    fmt_args: anytype,
+) void {
+    config.parse_error = std.fmt.allocPrint(allocator, fmt, fmt_args) catch "argument parse error";
+}
+
 fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, allocator: std.mem.Allocator) void {
     // argv[0] 是程序名,显式消费。旧实现靠"未匹配即忽略"让它混过循环——
     // 那个静默 else 同时也吞掉了所有拼错的 flag(评估 treatment 参数
@@ -876,11 +902,33 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
                 config.model_display_name = allocator.dupe(u8, name) catch name;
             }
         } else if (std.mem.eql(u8, arg, "--reasoning-effort") or std.mem.eql(u8, arg, "--thinking")) {
-            if (args.next()) |e| config.reasoning_effort = types.ReasoningEffort.parse(e);
+            // 值域 fail-closed:拼错的档位静默落自适应 = 评估 treatment 无声降级。
+            const e = args.next() orelse {
+                setParseError(config, allocator, "missing value for {s}", .{arg});
+                return;
+            };
+            config.reasoning_effort = types.ReasoningEffort.parse(e) orelse {
+                setParseError(config, allocator, "invalid value '{s}' for {s}", .{ e, arg });
+                return;
+            };
         } else if (std.mem.eql(u8, arg, "--temperature")) {
-            if (args.next()) |s| config.temperature = std.fmt.parseFloat(f32, s) catch null;
+            const s = args.next() orelse {
+                setParseError(config, allocator, "missing value for --temperature", .{});
+                return;
+            };
+            config.temperature = std.fmt.parseFloat(f32, s) catch {
+                setParseError(config, allocator, "invalid value '{s}' for --temperature", .{s});
+                return;
+            };
         } else if (std.mem.eql(u8, arg, "--top-p")) {
-            if (args.next()) |s| config.top_p = std.fmt.parseFloat(f32, s) catch null;
+            const s = args.next() orelse {
+                setParseError(config, allocator, "missing value for --top-p", .{});
+                return;
+            };
+            config.top_p = std.fmt.parseFloat(f32, s) catch {
+                setParseError(config, allocator, "invalid value '{s}' for --top-p", .{s});
+                return;
+            };
         } else if (std.mem.eql(u8, arg, "--prompt-cache-key")) {
             if (args.next()) |s| config.prompt_cache_key = allocator.dupe(u8, s) catch s;
         } else if (std.mem.eql(u8, arg, "--parallel-tool-calls")) {
@@ -896,7 +944,16 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
         } else if (std.mem.eql(u8, arg, "--api-key")) {
             if (args.next()) |k| config.api_key = allocator.dupe(u8, k) catch k;
         } else if (std.mem.eql(u8, arg, "--permission") or std.mem.eql(u8, arg, "--permission-mode")) {
-            if (args.next()) |m| config.permission_mode = parsePermMode(m);
+            // 词表外的 mode 曾静默落 .default(最严档)——评估 harness 传
+            // bypassPermissions 拼错时,付费 arm 会在错误权限档下跑完全程。
+            const m = args.next() orelse {
+                setParseError(config, allocator, "missing value for {s}", .{arg});
+                return;
+            };
+            config.permission_mode = @import("permission/mode.zig").parseStrict(m) orelse {
+                setParseError(config, allocator, "invalid permission mode '{s}'", .{m});
+                return;
+            };
         } else if (std.mem.eql(u8, arg, "--settings")) {
             if (args.next()) |s| config.settings_path = allocator.dupe(u8, s) catch s;
         } else if (std.mem.eql(u8, arg, "--allowedTools") or std.mem.eql(u8, arg, "--allowed-tools")) {
@@ -926,9 +983,14 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
         } else if (std.mem.eql(u8, arg, "--record")) {
             if (args.next()) |s| config.record_dir = allocator.dupe(u8, s) catch s;
         } else if (std.mem.eql(u8, arg, "--max-tokens")) {
-            if (args.next()) |s| {
-                config.max_tokens = std.fmt.parseInt(u32, s, 10) catch null;
-            }
+            const s = args.next() orelse {
+                setParseError(config, allocator, "missing value for --max-tokens", .{});
+                return;
+            };
+            config.max_tokens = std.fmt.parseInt(u32, s, 10) catch {
+                setParseError(config, allocator, "invalid value '{s}' for --max-tokens", .{s});
+                return;
+            };
         } else if (std.mem.eql(u8, arg, "--no-theme")) {
             config.no_theme = true;
         } else if (std.mem.eql(u8, arg, "--verbose")) {
@@ -948,7 +1010,19 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
         } else if (std.mem.eql(u8, arg, "--teammate-cwd")) {
             if (args.next()) |v| config.teammate_cwd = allocator.dupe(u8, v) catch v;
         } else if (std.mem.eql(u8, arg, "--teammate-mode")) {
-            if (args.next()) |v| config.teammate_out_of_process = std.mem.eql(u8, v, "process");
+            const v = args.next() orelse {
+                setParseError(config, allocator, "missing value for --teammate-mode", .{});
+                return;
+            };
+            if (std.mem.eql(u8, v, "process")) {
+                config.teammate_out_of_process = true;
+            } else if (std.mem.eql(u8, v, "thread") or std.mem.eql(u8, v, "in-process")) {
+                // "thread" 是 --help 文档化的进程内档名;in-process 作别名。
+                config.teammate_out_of_process = false;
+            } else {
+                setParseError(config, allocator, "invalid value '{s}' for --teammate-mode (process|thread)", .{v});
+                return;
+            }
         } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--print")) {
             if (args.next()) |p| config.prompt = allocator.dupe(u8, p) catch p;
         } else if (std.mem.eql(u8, arg, "--json")) {
@@ -962,7 +1036,12 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
                 if (std.fmt.parseInt(u16, maybe_port, 10)) |p| {
                     config.web_port = p;
                     _ = args.next();
-                } else |_| {}
+                } else |_| if (isAllDigits(maybe_port)) {
+                    // 纯数字但超出 u16:这是写错的端口,不是别的 flag——
+                    // 落到终结 else 会误报 "unknown argument",在此给准确错误。
+                    setParseError(config, allocator, "invalid port '{s}' for --web (0-65535)", .{maybe_port});
+                    return;
+                }
             }
         } else if (std.mem.eql(u8, arg, "serve")) {
             // U10-D:`serve [port]` daemon 模式(位置子命令)。可选端口(下一个 arg 是数字才吃)。
@@ -972,7 +1051,10 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
                 if (std.fmt.parseInt(u16, maybe_port, 10)) |p| {
                     config.serve_port = p;
                     _ = args.next();
-                } else |_| {}
+                } else |_| if (isAllDigits(maybe_port)) {
+                    setParseError(config, allocator, "invalid port '{s}' for serve (0-65535)", .{maybe_port});
+                    return;
+                }
             }
         } else if (std.mem.eql(u8, arg, "--sessions")) {
             // U10-C:daemon 静态 session 数(>1 → serveMulti)。
@@ -1009,7 +1091,11 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
         } else {
             // 未识别参数一律 fail-closed:记录后停止解析,由 main 报错退出。
             // 绝不静默忽略——flag 面是外部契约(评估 harness 靠它传 treatment)。
-            config.parse_error = allocator.dupe(u8, arg) catch arg;
+            if (arg.len > 0 and arg[0] == '-') {
+                setParseError(config, allocator, "unknown flag '{s}'", .{arg});
+            } else {
+                setParseError(config, allocator, "unexpected positional argument '{s}' (metacodes takes no positionals)", .{arg});
+            }
             return;
         }
     }
@@ -1083,6 +1169,17 @@ fn printHelp() void {
         \\  --allowedTools <list> Comma-separated allow rules, e.g. "Bash(git *),Read"
         \\  --disallowedTools <l> Comma-separated deny rules
         \\  --verification-checkpoint  Enable the experimental post-test checkpoint
+        \\  --verification-final-gate  Enforce the session-end verification obligation
+        \\  --verification-final-observe  Record (not enforce) the session-end verification obligation
+        \\  --requirement-ledger  Enforce the requirement-ledger closure obligation
+        \\  --requirement-ledger-observe  Record (not enforce) the requirement ledger
+        \\  --max-tokens <n>      Override max output tokens per request
+        \\  --session <id>        Explicit session id (resume a suspended session directory)
+        \\  --suspendable         Headless: suspend on UI tools (write suspend.json) instead of failing
+        \\  --dump-prompt         Print the assembled system prompt and exit
+        \\  serve [port]          Daemon mode (HTTP; default port 7777)
+        \\  --sessions <n>        Daemon: static session count (>1 enables multi-session)
+        \\  --uds <path>          Daemon: additional UDS+NDJSON binding
         \\  --add-dir <path>      Extra read/write directory (repeatable)
         \\  --answers-file <path> Preset answers for permission .ask / AskUserQuestion (non-tty)
         \\  --base-url <url>      Override API endpoint (must end with /v1/messages)

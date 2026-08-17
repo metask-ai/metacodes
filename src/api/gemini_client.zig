@@ -64,6 +64,10 @@ pub const CacheEntry = struct {
     expire_mono_ms: i64, // 过期时刻(单调时钟毫秒);<=now 视为过期,需重建
 };
 
+/// 合成 functionCall id 的进程级单调序号(Gemini 不回传 tool id)。
+/// dispatch_id 要求会话内全局唯一;u64 不 wrap,原子递增线程安全。
+var g_call_serial = std.atomic.Value(u64).init(1);
+
 pub const GeminiClient = struct {
     allocator: std.mem.Allocator,
     api_key: []const u8,
@@ -412,16 +416,19 @@ const GeminiStream = struct {
                 const name = util_json.extractStringField(obj, "name") orelse continue;
                 const args = extractArgsObject(obj) orelse "{}";
                 self.fc_counter += 1;
-                // id 必须掺入本请求的 RequestId:GeminiStream 每请求新建,
-                // fc_counter 每轮归零,裸 call_N 会跨轮碰撞——而 dispatch_id
-                // 是观察日志/规则门/审计的全局身份,重复 = trace fail-closed
-                // + journal 封死(2026-08-17 harness review 发射侧 #1)。
-                var id_buf: [40]u8 = undefined;
+                // dispatch_id 是观察日志/规则门/审计的全局身份,重复 = trace
+                // fail-closed + journal 封死(2026-08-17 harness review 发射侧 #1)。
+                // GeminiStream 每请求新建,fc_counter 每轮归零,裸 call_N 跨轮必撞;
+                // RequestId 只含 seq 低 16 位,65536 次请求后也会 wrap(生成器自述
+                // "够 grep 用,不是密码学 ID")。唯一性由进程级单调 u64 承担
+                // (2^64 不 wrap);rid 仍掺入,供与请求日志对账。
+                const serial = g_call_serial.fetchAdd(1, .monotonic);
+                var id_buf: [64]u8 = undefined;
                 const id_str = std.fmt.bufPrint(
                     &id_buf,
-                    "call_{s}_{d}",
-                    .{ self.id.asSlice(), self.fc_counter },
-                ) catch unreachable; // 5+12+1+10 < 40,编译期可证
+                    "call_{s}_{d}_{d}",
+                    .{ self.id.asSlice(), serial, self.fc_counter },
+                ) catch unreachable; // 5+12+1+20+1+10 = 49 < 64,编译期可证
 
                 // 逐段 dupe + 逐段 errdefer:任一 dupe/append 失败都释放本迭代已 owned 的段(无泄漏)。
                 const id_dup = try self.allocator.dupe(u8, id_str);

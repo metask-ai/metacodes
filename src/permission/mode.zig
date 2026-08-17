@@ -8,11 +8,13 @@ const types = @import("../types.zig");
 
 pub const Mode = types.PermissionMode;
 
-/// 解析 CLI 参数中的 mode 字符串。未知值退化为 .default。
+/// 严格解析:词表外返回 null,由调用方决定 fail-closed 还是回退。
+/// CLI 边界必须用这个——`--permission BOGUS` 静默落 .default 会让评估
+/// treatment 参数拼错时无声降级(2026-08-17 harness 复审 #3)。
 /// 接受:default/acceptEdits/plan/auto/dontAsk/bypassPermissions(官方驼峰)
 ///   + accept_edits/dont_ask/bypass_permissions(下划线变体)
 ///   + prompt/bypass(历史 cc-zig 名)
-pub fn parse(s: []const u8) Mode {
+pub fn parseStrict(s: []const u8) ?Mode {
     // 官方驼峰
     if (std.mem.eql(u8, s, "default")) return .default;
     if (std.mem.eql(u8, s, "acceptEdits")) return .accept_edits;
@@ -27,7 +29,12 @@ pub fn parse(s: []const u8) Mode {
     // 历史别名
     if (std.mem.eql(u8, s, "prompt")) return .default;
     if (std.mem.eql(u8, s, "bypass")) return .bypass_permissions;
-    return .default;
+    return null;
+}
+
+/// 宽松解析(settings/config 层沿用):未知值退化为 .default。
+pub fn parse(s: []const u8) Mode {
+    return parseStrict(s) orelse .default;
 }
 
 /// 把 Mode 标准化:把 prompt/bypass 历史别名映到 default/bypass_permissions。

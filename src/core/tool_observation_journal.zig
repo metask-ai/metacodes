@@ -320,19 +320,23 @@ pub const Journal = struct {
             .event = event,
         };
         const line = try std.json.Stringify.valueAlloc(std.heap.c_allocator, envelope, .{});
-        defer std.heap.c_allocator.free(line);
-        if (line.len + 1 > MAX_ARTIFACT_BYTES -| self.file_bytes)
-            return error.ArtifactTooLarge;
-        // 单次 write:record+换行分两次 write 会在中间被 kill/ENOSPC 撕裂,
-        // 留下无终止符的尾行——审计侧对撕裂尾行 fail-closed(整 trial 作废)。
-        // 单缓冲一次提交把撕裂窗口收敛到单次 write 内部(O_APPEND 语义)。
-        const record = try std.heap.c_allocator.alloc(u8, line.len + 1);
+        // realloc +1 通常原地扩(单分配),失败路径下面手动释放——不能用 defer free(line):
+        // realloc 成功后 line 已失效。
+        const record = std.heap.c_allocator.realloc(line, line.len + 1) catch {
+            std.heap.c_allocator.free(line);
+            return error.OutOfMemory;
+        };
         defer std.heap.c_allocator.free(record);
-        @memcpy(record[0..line.len], line);
-        record[line.len] = '\n';
+        record[record.len - 1] = '\n';
+        if (record.len > MAX_ARTIFACT_BYTES -| self.file_bytes)
+            return error.ArtifactTooLarge;
+        // 单缓冲提交:record+换行曾是两次 writeAll,SIGKILL 落在两次 syscall 之间
+        // 必然留下无终止符的尾行。合并后 kill 窗口关死;short write(ENOSPC 等)
+        // 仍可能撕裂半行——那条路径 failed=true→sealRun 拒写 run_finished,
+        // 两侧审计器都因缺终止记录 fail-closed,不会当好数据读。
         try writeAll(self.fd, record);
         try pfs.fsyncChecked(self.fd);
-        self.file_bytes += line.len + 1;
+        self.file_bytes += record.len;
         self.sequence += 1;
     }
 

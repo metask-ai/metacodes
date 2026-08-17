@@ -240,6 +240,9 @@ fn secureFree(allocator: std.mem.Allocator, buf: []u8) void {
 }
 
 /// OpenAI 流式响应:持 Response + transfer buffer + 逐行 SSE 解析状态。包成中立 StreamHandle。
+/// 合成 tool_call id 的进程级单调序号(后端漏发 id 时兜底;u64 不 wrap)。
+var g_synth_id_serial = std.atomic.Value(u64).init(1);
+
 const OpenAIStream = struct {
     allocator: std.mem.Allocator,
     model: []const u8,
@@ -419,7 +422,15 @@ const OpenAIStream = struct {
         const a = self.allocator;
         for (self.tcs.items) |*tc| {
             if (tc.name.items.len == 0) continue; // 无 name = 不完整,跳过
-            const id = tc.id.toOwnedSlice(a) catch continue;
+            var id = tc.id.toOwnedSlice(a) catch continue;
+            if (id.len == 0) {
+                // 后端漏发 id → 空串会当 dispatch_id 流进观察日志/审计,
+                // trace.py 对空 id fail-closed 且同轮多工具全空必撞重复
+                // (2026-08-17 复审发射侧 #1 的 OpenAI 变体)。合成进程级唯一 id。
+                a.free(id);
+                const serial = g_synth_id_serial.fetchAdd(1, .monotonic);
+                id = std.fmt.allocPrint(a, "call_{s}_{d}", .{ self.id.asSlice(), serial }) catch continue;
+            }
             const name = tc.name.toOwnedSlice(a) catch {
                 a.free(id);
                 continue;
