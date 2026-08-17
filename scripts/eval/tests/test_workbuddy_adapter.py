@@ -2997,6 +2997,14 @@ class WorkBuddyProgressRejectionTest(unittest.TestCase):
         with self.assertRaisesRegex(TraceError, "identities differ"):
             self._run(json.dumps({"ok": True}), is_error=False)
 
+    def test_invalid_args_rejection_is_a_legitimate_non_dispatch(self):
+        metrics = self._run(json.dumps({
+            "error": {"code": "invalid_args", "category": "user_error",
+                      "detail": "Write failed with MissingFilePath",
+                      "recoverable": True},
+        }))
+        self.assertEqual(metrics["progress"]["tool_calls"], 0)
+
     def test_unrecognized_error_shape_stays_fail_closed(self):
         with self.assertRaisesRegex(TraceError, "identities differ"):
             self._run(json.dumps({

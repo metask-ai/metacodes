@@ -23,6 +23,7 @@ pub const RULE_FILTER_SCHEMA_VERSION = "metacodes-project-rule-filter-v1";
 pub const RULE_COVERAGE_GAP_SCHEMA_VERSION = "metacodes-project-rule-coverage-gap-v1";
 pub const RULE_BOUNDS_OVERFLOW_SCHEMA_VERSION = "metacodes-project-rule-bounds-overflow-v1";
 pub const VERIFICATION_FINAL_GATE_SCHEMA_VERSION = "metacodes-verification-final-gate-v2";
+pub const REQUIREMENT_LEDGER_SCHEMA_VERSION = "metacodes-requirement-ledger-v1";
 
 pub const Origin = enum {
     authoritative,
@@ -211,6 +212,18 @@ pub const Event = union(enum) {
     /// mutation followed by a later successful verification), and how many
     /// bounded nudges were spent. `obligation_met=false` with exhausted
     /// nudges is the measurable "declared done without verifying" outcome.
+    requirement_ledger: struct {
+        schema_version: []const u8 = REQUIREMENT_LEDGER_SCHEMA_VERSION,
+        /// Treatment-actuation witness: true when the obligation could inject
+        /// prompts/nudges; false in record-only observe mode.
+        enforced: bool,
+        prompt_emitted: bool,
+        items_total: u32,
+        items_open_at_final: u32,
+        mutations_occurred: bool,
+        nudges: u8,
+        max_nudges: u8,
+    },
     verification_final_gate: struct {
         schema_version: []const u8 = VERIFICATION_FINAL_GATE_SCHEMA_VERSION,
         /// True when the obligation was enforced (nudges possible); false in

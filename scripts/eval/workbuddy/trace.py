@@ -1323,6 +1323,40 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                     formal["verification_known_failing"] = int(
                         bool(observation.get("known_failing"))
                     )
+            elif observation_kind == "requirement_ledger":
+                # Terminal record of the requirement-ledger closure
+                # obligation: at most one per run, both arms carry it
+                # (record-only in observe mode).
+                if (
+                    observation.get("schema_version")
+                    != "metacodes-requirement-ledger-v1"
+                    or not isinstance(observation.get("enforced"), bool)
+                    or not isinstance(observation.get("prompt_emitted"), bool)
+                    or not isinstance(observation.get("mutations_occurred"), bool)
+                ):
+                    raise TraceError("requirement ledger record is invalid")
+                if formal.get("requirement_ledger_records"):
+                    raise TraceError("duplicate requirement ledger record")
+                formal["requirement_ledger_records"] = 1
+                formal["requirement_ledger_enforced"] = int(
+                    bool(observation.get("enforced"))
+                )
+                formal["requirement_ledger_prompted"] = int(
+                    bool(observation.get("prompt_emitted"))
+                )
+                for key, where in (
+                    ("items_total", "ledger total"),
+                    ("items_open_at_final", "ledger open count"),
+                    ("nudges", "ledger nudges"),
+                ):
+                    value = observation.get(key)
+                    if (
+                        not isinstance(value, int)
+                        or isinstance(value, bool)
+                        or value < 0
+                    ):
+                        raise TraceError(f"requirement ledger {where} is invalid")
+                    formal["requirement_ledger_" + key] = value
             elif observation_kind in {"rule_coverage_gap", "rule_bounds_overflow"}:
                 # Diagnostic-only signals: no identity to cross-check here,
                 # but count them so silence stays distinguishable from absence.

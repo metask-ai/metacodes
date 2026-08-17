@@ -268,6 +268,8 @@ fn buildOptions(
         .verification_checkpoint = app.config.verification_checkpoint,
         .verification_final_gate = app.config.verification_final_gate,
         .verification_final_observe = app.config.verification_final_observe,
+        .requirement_ledger = app.config.requirement_ledger,
+        .requirement_ledger_observe = app.config.requirement_ledger_observe,
         .max_stream_turn_retries = 2,
         // Tool lifecycle events are part of the evaluation protocol even
         // though the null writer renders no cards.  Leaving this false made

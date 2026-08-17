@@ -27,6 +27,7 @@ pub const api_request = @import("api/request.zig");
 pub const api_request_overrides = @import("api/request_overrides.zig");
 pub const model_adapter = @import("api/model_adapter.zig");
 pub const client_mod = client; // alias for L2 component tests
+pub const task_store = @import("core/task_store.zig"); // L2 requirement-ledger tests
 pub const types_mod = types;
 pub const json_mod = @import("json.zig");
 pub const util_abort = @import("util/abort.zig");
@@ -899,6 +900,10 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             config.verification_final_gate = true;
         } else if (std.mem.eql(u8, arg, "--verification-final-observe")) {
             config.verification_final_observe = true;
+        } else if (std.mem.eql(u8, arg, "--requirement-ledger")) {
+            config.requirement_ledger = true;
+        } else if (std.mem.eql(u8, arg, "--requirement-ledger-observe")) {
+            config.requirement_ledger_observe = true;
         } else if (std.mem.eql(u8, arg, "--add-dir")) {
             if (args.next()) |s| config.add_dirs = appendNulList(allocator, config.add_dirs, s);
         } else if (std.mem.eql(u8, arg, "--answers-file")) {

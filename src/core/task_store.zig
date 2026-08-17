@@ -22,6 +22,11 @@ const file_lock = @import("../swarm/file_lock.zig");
 
 const max_mirror_bytes = 4 * 1024 * 1024;
 
+/// Requirement-ledger counts for the session-end closure obligation.
+/// Mutex-held snapshot; kg-mirror rows count like local rows (they are the
+/// model's declared ledger either way).
+pub const LedgerCounts = struct { open: usize, total: usize };
+
 pub const TaskStatus = enum {
     pending,
     in_progress,
@@ -487,6 +492,16 @@ pub const TaskStore = struct {
     }
 
     /// 更新 status。若 deleted 则实际从列表删除并释放。
+    pub fn ledgerCounts(self: *TaskStore) LedgerCounts {
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
+        var open: usize = 0;
+        for (self.tasks.items) |t| {
+            if (t.status == .pending or t.status == .in_progress) open += 1;
+        }
+        return .{ .open = open, .total = self.tasks.items.len };
+    }
+
     pub fn updateStatus(self: *TaskStore, id: []const u8, status: TaskStatus) !void {
         _ = self.mutex.lock(); // task#19
         defer _ = self.mutex.unlock();

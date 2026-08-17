@@ -28,6 +28,7 @@ const context_pressure_mod = @import("context_pressure.zig");
 const compact_kernel = @import("compact_kernel.zig");
 const result_projection = @import("result_projection.zig");
 const verification_progress_mod = @import("verification_progress.zig");
+const requirement_ledger_mod = @import("requirement_ledger.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
 const ui_backend = @import("protocol/ui_backend.zig");
@@ -357,6 +358,11 @@ pub const Options = struct {
     /// nudging. Measurement-only: conversation and control flow untouched.
     /// Gives control arms the same outcome record the gate arms get.
     verification_final_observe: bool = false,
+    /// Session-end requirement-ledger closure obligation: decompose the task
+    /// statement into the task list and close every item before finishing.
+    requirement_ledger: bool = false,
+    /// Record-only twin for measurement symmetry in control arms.
+    requirement_ledger_observe: bool = false,
     /// Bounded same-turn retries after a mid-stream provider failure. The
     /// stream-error path already discards the partial turn (nothing was
     /// committed to the conversation), so re-issuing the identical request is
@@ -591,6 +597,24 @@ pub fn run(
     var verification_nudges: u8 = 0;
     const MAX_VERIFICATION_NUDGES: u8 = 2;
     var stream_turn_retries: u8 = 0;
+    var requirement_ledger_state = requirement_ledger_mod.State{};
+    defer if (opts.requirement_ledger or opts.requirement_ledger_observe) {
+        if (opts.tool_observer) |observer| {
+            const counts = if (opts.tasks) |store|
+                store.ledgerCounts()
+            else
+                @import("task_store.zig").LedgerCounts{ .open = 0, .total = 0 };
+            _ = observer.emit(.{ .requirement_ledger = .{
+                .enforced = opts.requirement_ledger,
+                .prompt_emitted = requirement_ledger_state.prompt_emitted,
+                .items_total = @intCast(@min(counts.total, std.math.maxInt(u32))),
+                .items_open_at_final = @intCast(@min(counts.open, std.math.maxInt(u32))),
+                .mutations_occurred = verification_progress.mutation_seen,
+                .nudges = requirement_ledger_state.nudges,
+                .max_nudges = requirement_ledger_mod.MAX_LEDGER_NUDGES,
+            } });
+        }
+    };
     defer if (opts.verification_final_gate or opts.verification_final_observe) {
         if (opts.tool_observer) |observer| {
             _ = observer.emit(.{ .verification_final_gate = .{
@@ -1323,6 +1347,45 @@ pub fn run(
                     verification_progress_mod.FINAL_GATE_TEXT);
                 continue;
             }
+            // Requirement-ledger closure obligation: a final answer with open
+            // ledger items (or with mutations but no ledger despite the
+            // prompt) gets one bounded nudge per premature final. The
+            // verification gate keeps priority — at most one injection per
+            // round. Formal model: RequirementLedger.lean.
+            if (opts.requirement_ledger) {
+                const counts = if (opts.tasks) |store|
+                    store.ledgerCounts()
+                else
+                    @import("task_store.zig").LedgerCounts{ .open = 0, .total = 0 };
+                switch (requirement_ledger_state.decide(
+                    counts.open,
+                    counts.total,
+                    verification_progress.mutation_seen,
+                )) {
+                    .none => {},
+                    .open_items => {
+                        requirement_ledger_state.nudges += 1;
+                        log.infoId("agent", rid, "requirement ledger nudge {d}/{d} open={d}", .{ requirement_ledger_state.nudges, requirement_ledger_mod.MAX_LEDGER_NUDGES, counts.open });
+                        backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                        const nudge = try std.fmt.allocPrint(
+                            allocator,
+                            requirement_ledger_mod.OPEN_NUDGE_FMT,
+                            .{counts.open},
+                        );
+                        defer allocator.free(nudge);
+                        try conversation.appendText(.user, nudge);
+                        continue;
+                    },
+                    .coverage => {
+                        requirement_ledger_state.nudges += 1;
+                        requirement_ledger_state.coverage_nudge_used = true;
+                        log.infoId("agent", rid, "requirement ledger coverage nudge {d}/{d}", .{ requirement_ledger_state.nudges, requirement_ledger_mod.MAX_LEDGER_NUDGES });
+                        backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                        try conversation.appendText(.user, requirement_ledger_mod.COVERAGE_NUDGE_TEXT);
+                        continue;
+                    },
+                }
+            }
             // L4 诊断:本轮无 tool_use → turn 结束(span 平衡:每个 turn_begin 都配一个
             // turn_end,无论有无工具)。紧接 run_end(end_turn)收口。
             backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
@@ -1692,7 +1755,8 @@ pub fn run(
         }
 
         const observe_verification = opts.verification_checkpoint or
-            opts.verification_final_gate or opts.verification_final_observe;
+            opts.verification_final_gate or opts.verification_final_observe or
+            opts.requirement_ledger or opts.requirement_ledger_observe;
         const inject_verification_checkpoint = observe_verification and
             verification_progress.observeTurn(allocator, slots.items) and
             opts.verification_checkpoint;
@@ -1794,6 +1858,16 @@ pub fn run(
                 verification_progress_mod.CHECKPOINT_TEXT,
             );
             try result_blocks.append(allocator, .{ .text = checkpoint });
+        }
+        // Requirement-ledger prompt: once, at the first tool-result boundary
+        // (the cacheable first request stays byte-identical across arms).
+        if (opts.requirement_ledger and !requirement_ledger_state.prompt_emitted) {
+            requirement_ledger_state.prompt_emitted = true;
+            const prompt = try allocator.dupe(
+                u8,
+                requirement_ledger_mod.LEDGER_PROMPT_TEXT,
+            );
+            try result_blocks.append(allocator, .{ .text = prompt });
         }
         // Churn caution: enforced-gate arms only (observe mode must stay
         // behavior-neutral), at most once per session, fired the turn a

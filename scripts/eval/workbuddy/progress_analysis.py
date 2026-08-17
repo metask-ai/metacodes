@@ -300,7 +300,11 @@ def _enforced_pre_blocked_ids(rows: Iterable[Mapping[str, Any]]) -> set[str]:
     return blocked
 
 
-_PREDISPATCH_REJECTION_CODES = {"permission_denied"}
+# Closed roster of host-side pre-dispatch rejection codes. Extended only
+# when a real trial exhibits a new legitimate shape (permission_denied:
+# hallucinated disabled tool; invalid_args: argument validation before
+# dispatch, e.g. Write without file_path).
+_PREDISPATCH_REJECTION_CODES = {"permission_denied", "invalid_args"}
 
 
 def _predispatch_rejected_ids(transcript) -> set:
