@@ -3017,6 +3017,30 @@ def _persist_authorized_failure_receipt(
     )
 
 
+def _reject_journal_receipt_collision(receipt_path: Path, journal_path: Path) -> None:
+    """A receipt written into the journal's own namespace (j.json.tmp,
+    j.json.lock) permanently bricks the journal: BudgetJournal.__enter__
+    fail-closes on unexpected internals, and per the state machine an
+    authorized transaction could then never be closed. execute_launch has
+    always guarded this; the recovery paths must too (harness review
+    2026-08-17 F9)."""
+    receipt_absolute = Path(os.path.abspath(os.fspath(receipt_path)))
+    journal_absolute = Path(os.path.abspath(os.fspath(journal_path)))
+    journal_internal = {
+        journal_absolute,
+        journal_absolute.with_name(journal_absolute.name + ".lock"),
+        journal_absolute.with_name(journal_absolute.name + ".tmp"),
+    }
+    receipt_internal = {
+        receipt_absolute,
+        receipt_absolute.with_name(receipt_absolute.name + ".tmp"),
+    }
+    if journal_internal & receipt_internal:
+        raise LaunchError(
+            "paid launch receipt must not collide with budget journal internals"
+        )
+
+
 def resume_post_run_audit(
     *,
     manifest_path: Path,
@@ -3039,6 +3063,7 @@ def resume_post_run_audit(
     runner is never invoked.
     """
 
+    _reject_journal_receipt_collision(receipt_path, journal_path)
     manifest = validate_launch_manifest(manifest_path)
     failure = validate_authorized_failure_receipt(
         failure_receipt_path, journal_path=journal_path
@@ -3251,6 +3276,7 @@ def recover_authorized_failure_receipt(
     publishes only bounded, privacy-reduced failure evidence.
     """
 
+    _reject_journal_receipt_collision(receipt_path, journal_path)
     manifest = validate_launch_manifest(manifest_path)
     if runner_returncode < 0 or failure_stage not in AUTHORIZED_FAILURE_STAGES:
         raise LaunchError("failure receipt recovery arguments are invalid")

@@ -2519,6 +2519,40 @@ class WorkBuddyRequestAuditRetryTest(unittest.TestCase):
             self._with_extra_records(records, turns=1)
 
 
+class WorkBuddyRecoveryReceiptCollisionTest(unittest.TestCase):
+    """execute_launch has always refused a receipt inside the journal's own
+    namespace; the recovery paths write receipts too and used to skip the
+    check — a receipt at j.json.tmp permanently bricks the journal
+    (harness review 2026-08-17 F9). The guard fires before any path is
+    opened, so dummy manifest paths prove the wiring."""
+
+    def test_recovery_paths_reject_journal_internal_receipts(self):
+        journal = Path("/nonexistent-collision-probe/budget.json")
+        collisions = (
+            journal,
+            journal.with_name("budget.json.tmp"),
+            journal.with_name("budget.json.lock"),
+        )
+        for receipt in collisions:
+            with self.assertRaisesRegex(LaunchError, "must not collide"):
+                launch_gate.recover_authorized_failure_receipt(
+                    manifest_path=journal.with_name("manifest.json"),
+                    journal_path=journal,
+                    receipt_path=receipt,
+                    runner_returncode=1,
+                    failure_stage="runner_nonzero",
+                    started_ns=1,
+                )
+            with self.assertRaisesRegex(LaunchError, "must not collide"):
+                launch_gate.resume_post_run_audit(
+                    manifest_path=journal.with_name("manifest.json"),
+                    journal_path=journal,
+                    failure_receipt_path=journal.with_name("failure.json"),
+                    receipt_path=receipt,
+                    started_ns=1,
+                )
+
+
 class WorkBuddyRipgrepRosterTest(unittest.TestCase):
     """The executable set is a two-era roster: pre-restoration manifests
     (no ripgrep) stay readable, rg-bearing manifests are validated at
