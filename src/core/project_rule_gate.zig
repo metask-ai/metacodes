@@ -230,6 +230,7 @@ pub const RuntimeGate = struct {
             .file_target_state = signal.file_target_state,
             .exact_recovery_material_ready = signal.exact_edit_material.writeNeedsEdit(),
             .file_mutating = signal.file_mutating,
+            .within_root = signal.within_root,
         };
         const matching = self.matchingRuleCount(formal_signal);
         if (matching == 0) {
@@ -315,6 +316,7 @@ pub const RuntimeGate = struct {
             .file_target_state = signal.pre.file_target_state,
             .exact_recovery_material_ready = signal.pre.exact_edit_material.writeNeedsEdit(),
             .file_mutating = signal.pre.file_mutating,
+            .within_root = signal.pre.within_root,
         };
         const formal_signal = spec_mod.PostSignal{
             .pre = formal_pre,
@@ -447,6 +449,7 @@ pub const RuntimeGate = struct {
             .agent_depth = signal.agent_depth,
             .authoritative = signal.authoritative,
             .file_target_state = signal.file_target_state,
+            .within_root = signal.within_root,
             .exact_recovery_material_ready = false,
         };
         const ordinary_json = try std.json.Stringify.valueAlloc(
@@ -488,6 +491,7 @@ pub const RuntimeGate = struct {
             .agent_depth = signal.pre.agent_depth,
             .authoritative = signal.pre.authoritative,
             .file_target_state = signal.pre.file_target_state,
+            .within_root = signal.pre.within_root,
             .exact_recovery_material_ready = false,
         };
         const ordinary = spec_mod.PostSignal{

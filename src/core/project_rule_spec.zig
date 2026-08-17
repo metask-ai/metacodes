@@ -93,6 +93,10 @@ pub const PreSignal = struct {
     /// false and are therefore outside effect-class coverage — that hole is
     /// reported post-hoc by the rule_coverage_gap signal, not hidden.
     file_mutating: bool = false,
+    /// Containment of the EFFECTIVE (symlink-resolved) target inside the
+    /// project root. Wire order: keep LAST — the kernel's positional parser
+    /// reads it after file_mutating. Mirrors Lean `PreSignal.withinRoot`.
+    within_root: bool = true,
 };
 
 /// Host comparisons for one pending exact-edit obligation. Plaintext paths
@@ -237,23 +241,32 @@ pub fn preDecision(spec: Spec, signal: PreSignal) bool {
     switch (spec.target) {
         .tool => switch (spec.target_scope) {
             .all => {},
-            .existing_file => switch (signal.file_target_state) {
-                // A missing target is outside this rule's scope.  Every state
-                // that fails to prove a regular existing file is conservative
-                // except the explicit, host-observed missing state.
-                .missing => return true,
-                .regular_existing => {},
-                .unobserved, .other_existing, .unavailable => return false,
+            .existing_file => {
+                if (!signal.within_root) return false;
+                switch (signal.file_target_state) {
+                    // A missing target is outside this rule's scope.  Every
+                    // state that fails to prove a regular existing file is
+                    // conservative except the explicit, host-observed
+                    // missing state.
+                    .missing => return true,
+                    .regular_existing => {},
+                    .unobserved, .other_existing, .unavailable => return false,
+                }
             },
         },
         .effect_class => |cls| switch (cls) {
             // Same conservative ladder as the existing_file scope: a mutating
             // tool over an ambiguous target state cannot be proven not to be
-            // rewriting an existing file, so it fails closed.
-            .existing_file_rewrite => switch (signal.file_target_state) {
-                .missing => return true,
-                .regular_existing => {},
-                .unobserved, .other_existing, .unavailable => return false,
+            // rewriting an existing file, so it fails closed.  Containment is
+            // judged first: an effective target outside the project root
+            // never admits (Lean: escaping_resolution_fails_closed).
+            .existing_file_rewrite => {
+                if (!signal.within_root) return false;
+                switch (signal.file_target_state) {
+                    .missing => return true,
+                    .regular_existing => {},
+                    .unobserved, .other_existing, .unavailable => return false,
+                }
             },
         },
     }

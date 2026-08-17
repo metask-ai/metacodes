@@ -32,13 +32,15 @@ pub fn observePre(
     tool: []const u8,
     input: []const u8,
 ) protocol.PreSignal {
+    const target = observeFileTarget(ctx, tool, input);
     return .{
         .dispatch_id = dispatch_id,
         .tool = tool,
         .input_bytes = input.len,
         .agent_depth = ctx.agent_depth,
         .authoritative = ctx.tool_observation_origin == .authoritative,
-        .file_target_state = observeFileTarget(ctx, tool, input),
+        .file_target_state = target.state,
+        .within_root = target.within_root,
         .exact_edit_material = observeExactEditMaterial(ctx, tool, input),
         .file_mutating = isFileMutatingTool(tool),
     };
@@ -137,34 +139,106 @@ pub fn observeFileTarget(
     ctx: *const ToolContext,
     tool: []const u8,
     input: []const u8,
-) project_rule_spec.FileTargetState {
+) TargetObservation {
     if (!isFileMutatingTool(tool))
-        return .unobserved;
+        return .{ .state = .unobserved, .within_root = true };
     const escaped = if (std.mem.eql(u8, tool, "NotebookEdit"))
         common.extractJsonArg(input, "notebook_path") orelse
             common.extractJsonArg(input, "file_path") orelse
-            common.extractJsonArg(input, "path") orelse return .unavailable
+            common.extractJsonArg(input, "path") orelse return .{ .state = .unavailable, .within_root = false }
     else
         common.extractJsonArg(input, "file_path") orelse
-            common.extractJsonArg(input, "path") orelse return .unavailable;
+            common.extractJsonArg(input, "path") orelse return .{ .state = .unavailable, .within_root = false };
     const path_unescaped = util_json.unescapeString(escaped, ctx.allocator) catch
-        return .unavailable;
+        return .{ .state = .unavailable, .within_root = false };
     defer ctx.allocator.free(path_unescaped);
-    if (path_unescaped.len == 0) return .unavailable;
+    if (path_unescaped.len == 0) return .{ .state = .unavailable, .within_root = false };
     const normalized = path_mod.normalizeChecked(ctx.allocator, path_unescaped, .{
         .home = ctx.home_dir,
         .base_dir = ctx.cwd_abs,
         .resolve_relative = ctx.resolve_relative_paths,
-    }) catch return .unavailable;
+    }) catch return .{ .state = .unavailable, .within_root = false };
     defer ctx.allocator.free(normalized);
-    const path_z = ctx.allocator.dupeZ(u8, normalized) catch return .unavailable;
+    const path_z = ctx.allocator.dupeZ(u8, normalized) catch return .{ .state = .unavailable, .within_root = false };
     defer ctx.allocator.free(path_z);
-    return switch (pfs.pathKindNoFollow(path_z.ptr)) {
-        .missing => .missing,
-        .regular => .regular_existing,
-        .other => .other_existing,
-        .unavailable => .unavailable,
-    };
+    return classifyEffectiveTarget(ctx, path_z, normalized);
+}
+
+pub const TargetObservation = struct {
+    state: project_rule_spec.FileTargetState,
+    within_root: bool,
+};
+
+/// Classify the EFFECTIVE mutation target (RRP-001): symlinks are resolved
+/// before classification, so the state describes the file whose bytes would
+/// actually change, and `within_root` reports containment of the resolved
+/// path inside the project root.  The adjudicated false intervention (mkdocs
+/// `docs/index.md -> README.md`) was a handle-vs-target confusion; this
+/// classifier removes the class while keeping every escape closed:
+/// resolution failing, escaping the root, or landing on a non-regular file
+/// all stay conservative.  Lean mirror: `escaping_resolution_fails_closed`,
+/// `resolved_regular_within_root_admits`.
+fn classifyEffectiveTarget(
+    ctx: *const ToolContext,
+    path_z: [:0]const u8,
+    normalized: []const u8,
+) TargetObservation {
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_z = ctx.allocator.dupeZ(u8, ctx.cwd_abs) catch
+        return .{ .state = .unavailable, .within_root = false };
+    defer ctx.allocator.free(root_z);
+    const root_resolved: []const u8 = if (pfs.realpath(root_z.ptr, &root_buf)) |r|
+        std.mem.span(r)
+    else
+        ctx.cwd_abs;
+
+    switch (pfs.pathKindNoFollow(path_z.ptr)) {
+        .missing => {
+            // A to-be-created path: containment is judged on the resolved
+            // parent directory plus the final component, so a symlinked
+            // ancestor cannot smuggle the creation out of the root.
+            const dir = std.fs.path.dirname(normalized) orelse
+                return .{ .state = .missing, .within_root = false };
+            const base = std.fs.path.basename(normalized);
+            const dir_z = ctx.allocator.dupeZ(u8, dir) catch
+                return .{ .state = .unavailable, .within_root = false };
+            defer ctx.allocator.free(dir_z);
+            var parent_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const parent = pfs.realpath(dir_z.ptr, &parent_buf) orelse
+                return .{ .state = .missing, .within_root = false };
+            var joined_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const joined = std.fmt.bufPrint(&joined_buf, "{s}/{s}", .{
+                std.mem.span(parent), base,
+            }) catch return .{ .state = .unavailable, .within_root = false };
+            return .{
+                .state = .missing,
+                .within_root = pathContained(root_resolved, joined),
+            };
+        },
+        .regular, .other => {
+            var target_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const resolved = pfs.realpath(path_z.ptr, &target_buf) orelse
+                // Broken symlink or unresolvable target: fail closed.
+                return .{ .state = .unavailable, .within_root = false };
+            const resolved_slice = std.mem.span(resolved);
+            const contained = pathContained(root_resolved, resolved_slice);
+            const mode_regular = blk: {
+                const followed = pfs.statMode(path_z.ptr, true) orelse break :blk false;
+                break :blk (followed & 0o170000) == 0o100000;
+            };
+            return .{
+                .state = if (mode_regular) .regular_existing else .other_existing,
+                .within_root = contained,
+            };
+        },
+        .unavailable => return .{ .state = .unavailable, .within_root = false },
+    }
+}
+
+fn pathContained(root: []const u8, target: []const u8) bool {
+    if (std.mem.eql(u8, root, target)) return true;
+    if (!std.mem.startsWith(u8, target, root)) return false;
+    return target.len > root.len and target[root.len] == '/';
 }
 
 fn observeExactEditMaterial(
@@ -258,9 +332,104 @@ test "project rule Write sensor distinguishes new regular and non-regular target
     const dir_input = try std.fmt.allocPrint(allocator, "{{\"file_path\":\"{s}\",\"content\":\"x\"}}", .{dir});
     defer allocator.free(dir_input);
     const ctx = ToolContext.simple(allocator);
-    try std.testing.expectEqual(project_rule_spec.FileTargetState.regular_existing, observeFileTarget(&ctx, "Write", existing_input));
-    try std.testing.expectEqual(project_rule_spec.FileTargetState.missing, observeFileTarget(&ctx, "Write", missing_input));
-    try std.testing.expectEqual(project_rule_spec.FileTargetState.other_existing, observeFileTarget(&ctx, "Write", dir_input));
-    try std.testing.expectEqual(project_rule_spec.FileTargetState.unavailable, observeFileTarget(&ctx, "Write", "{}"));
-    try std.testing.expectEqual(project_rule_spec.FileTargetState.regular_existing, observeFileTarget(&ctx, "Edit", existing_input));
+    try std.testing.expectEqual(project_rule_spec.FileTargetState.regular_existing, observeFileTarget(&ctx, "Write", existing_input).state);
+    try std.testing.expectEqual(project_rule_spec.FileTargetState.missing, observeFileTarget(&ctx, "Write", missing_input).state);
+    try std.testing.expectEqual(project_rule_spec.FileTargetState.other_existing, observeFileTarget(&ctx, "Write", dir_input).state);
+    try std.testing.expectEqual(project_rule_spec.FileTargetState.unavailable, observeFileTarget(&ctx, "Write", "{}").state);
+    try std.testing.expectEqual(project_rule_spec.FileTargetState.regular_existing, observeFileTarget(&ctx, "Edit", existing_input).state);
+}
+
+test "effective target: symlink to a regular file inside the root is regular+contained" {
+    // The adjudicated false-intervention shape (RRP-001): docs symlink to an
+    // in-root README must classify as the resolved regular file.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real = try std.fmt.bufPrint(&real_buf, "{s}/README.md", .{root});
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = real, .data = "readme\n" });
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const link = try std.fmt.bufPrint(&link_buf, "{s}/index.md", .{root});
+    {
+        const link_z = try a.dupeZ(u8, link);
+        defer a.free(link_z);
+        const target_z = try a.dupeZ(u8, "README.md");
+        defer a.free(target_z);
+        if (std.c.symlink(target_z.ptr, link_z.ptr) != 0) return error.SkipZigTest;
+    }
+    var ctx = ToolContext{ .allocator = a, .cwd_abs = root, .home_dir = root };
+    var input_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf, "{{\"file_path\":\"{s}\"}}", .{link});
+    const obs = observeFileTarget(&ctx, "Edit", input);
+    try std.testing.expectEqual(project_rule_spec.FileTargetState.regular_existing, obs.state);
+    try std.testing.expect(obs.within_root);
+}
+
+test "effective target: symlink escaping the root stays fail-closed" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const whole = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    // root = <tmp>/proj; escape target lives beside it, outside the root.
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "{s}/proj", .{whole});
+    std.Io.Dir.cwd().createDirPath(std.testing.io, root) catch return error.SkipZigTest;
+    var out_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const outside = try std.fmt.bufPrint(&out_buf, "{s}/secret.txt", .{whole});
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = outside, .data = "s\n" });
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const link = try std.fmt.bufPrint(&link_buf, "{s}/escape.md", .{root});
+    {
+        const link_z = try a.dupeZ(u8, link);
+        defer a.free(link_z);
+        const target_z = try a.dupeZ(u8, "../secret.txt");
+        defer a.free(target_z);
+        if (std.c.symlink(target_z.ptr, link_z.ptr) != 0) return error.SkipZigTest;
+    }
+    var ctx = ToolContext{ .allocator = a, .cwd_abs = root, .home_dir = root };
+    var input_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf, "{{\"file_path\":\"{s}\"}}", .{link});
+    const obs = observeFileTarget(&ctx, "Edit", input);
+    // Resolved regular, but OUTSIDE the root: the decision ladders block it.
+    try std.testing.expect(!obs.within_root);
+    const spec = project_rule_spec.Spec{
+        .target = .{ .effect_class = .existing_file_rewrite },
+        .deny_target = false,
+        .max_input_bytes = 100000,
+        .max_agent_depth = 4,
+        .authoritative_only = false,
+        .effect_requirement = .file_mutation_v1_reobserved,
+    };
+    const sig = project_rule_spec.PreSignal{
+        .tool = "Edit",
+        .input_bytes = 10,
+        .agent_depth = 0,
+        .authoritative = true,
+        .file_target_state = obs.state,
+        .file_mutating = true,
+        .within_root = obs.within_root,
+    };
+    try std.testing.expect(!project_rule_spec.preDecision(spec, sig));
+}
+
+test "effective target: directory still fails closed even inside the root" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sub = try std.fmt.bufPrint(&dir_buf, "{s}/docs", .{root});
+    std.Io.Dir.cwd().createDirPath(std.testing.io, sub) catch return error.SkipZigTest;
+    var ctx = ToolContext{ .allocator = a, .cwd_abs = root, .home_dir = root };
+    var input_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf, "{{\"file_path\":\"{s}\"}}", .{sub});
+    const obs = observeFileTarget(&ctx, "Edit", input);
+    try std.testing.expectEqual(project_rule_spec.FileTargetState.other_existing, obs.state);
 }

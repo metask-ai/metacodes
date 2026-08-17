@@ -18,7 +18,7 @@ pub const FORMAL_SCHEMA_VERSION = "metacodes-project-formal-decision-v2";
 pub const FORMAL_BATCH_SCHEMA_VERSION_V2 = "metacodes-project-formal-decision-batch-v2";
 pub const FORMAL_BATCH_SCHEMA_VERSION_V3 = "metacodes-project-formal-decision-batch-v3";
 pub const FORMAL_BATCH_SCHEMA_VERSION_V4 = "metacodes-project-formal-decision-batch-v4";
-pub const FORMAL_BATCH_SCHEMA_VERSION = "metacodes-project-formal-decision-batch-v5";
+pub const FORMAL_BATCH_SCHEMA_VERSION = "metacodes-project-formal-decision-batch-v6";
 pub const RULE_FILTER_SCHEMA_VERSION = "metacodes-project-rule-filter-v1";
 pub const RULE_COVERAGE_GAP_SCHEMA_VERSION = "metacodes-project-rule-coverage-gap-v1";
 pub const RULE_BOUNDS_OVERFLOW_SCHEMA_VERSION = "metacodes-project-rule-bounds-overflow-v1";
@@ -303,6 +303,7 @@ pub const Event = union(enum) {
         phase: FormalPhase,
         actuation: FormalActuation = .enforced,
         file_target_state: FileTargetState = .unobserved,
+        within_root: bool = true,
         result: FormalResult,
         candidate_id: [64]u8,
         project_sha256: [64]u8,
@@ -328,6 +329,7 @@ pub const Event = union(enum) {
         phase: FormalPhase,
         actuation: FormalActuation = .enforced,
         file_target_state: FileTargetState = .unobserved,
+        within_root: bool = true,
         project_sha256: [64]u8,
         bundle_sha256: [64]u8,
         bundle_revision: u64,
@@ -349,6 +351,7 @@ pub const Event = union(enum) {
         input_bytes: usize,
         input_sha256: [64]u8,
         file_target_state: FileTargetState = .unobserved,
+        within_root: bool = true,
     },
     dispatch_finished: struct {
         schema_version: []const u8 = SCHEMA_VERSION,

@@ -71,6 +71,10 @@ pub const PreSignal = struct {
     /// applicability keys on it. Defaults false so a caller that never senses
     /// file tools cannot accidentally claim mutation capability.
     file_mutating: bool = false,
+    /// Containment of the EFFECTIVE (symlink-resolved) target inside the
+    /// project root. Defaults true so non-file signals stay neutral; the
+    /// classifier computes it for every file-targeted dispatch.
+    within_root: bool = true,
 };
 
 pub const PostSignal = struct {

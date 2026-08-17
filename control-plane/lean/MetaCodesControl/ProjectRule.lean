@@ -63,7 +63,18 @@ structure PreSignal where
   inputBytes : Nat
   agentDepth : Nat
   authoritative : Bool
+  /-- State of the EFFECTIVE mutation target: the host resolves symlinks
+  before classifying, so this describes the file whose bytes would actually
+  change, never the path handle the model happened to use.  Resolution
+  invariance is therefore by construction — the kernel has no handle field
+  to look at.  (Field adjudication: a proven fail-closed block on the
+  mkdocs `docs/index.md -> README.md` symlink was a false intervention;
+  the policy error was judging the handle, not the effective target.) -/
   fileTargetState : FileTargetState := .unobserved
+  /-- Host-observed containment: the RESOLVED target lies inside the project
+  root.  A symlink escaping the root keeps failing closed regardless of the
+  resolved state — the original escape protection, now explicit. -/
+  withinRoot : Bool := true
   exactRecoveryMaterialReady : Bool := false
   /-- Host-owned fact: the dispatched tool's primary operation mutates a
   single observed file target.  The kernel cannot know the tool roster; it
@@ -157,18 +168,22 @@ def preDecision (spec : RuleSpec) (signal : PreSignal) : Bool :=
   else match spec.target with
     | .tool _ => match spec.targetScope with
       | .all => matchedDecision spec signal
-      | .existingFile => match signal.fileTargetState with
-        | .missing => true
-        | .regularExisting => matchedDecision spec signal
-        | .unobserved | .otherExisting | .unavailable => false
+      | .existingFile =>
+        if !signal.withinRoot then false
+        else match signal.fileTargetState with
+          | .missing => true
+          | .regularExisting => matchedDecision spec signal
+          | .unobserved | .otherExisting | .unavailable => false
     | .effectClass .existingFileRewrite =>
       -- Same conservative ladder as the existingFile scope: a mutating tool
       -- over an ambiguous target state cannot be proven not to be rewriting
-      -- an existing file, so it fails closed.
-      match signal.fileTargetState with
-      | .missing => true
-      | .regularExisting => matchedDecision spec signal
-      | .unobserved | .otherExisting | .unavailable => false
+      -- an existing file, so it fails closed.  Containment is judged first:
+      -- an effective target outside the project root never admits.
+      if !signal.withinRoot then false
+      else match signal.fileTargetState with
+        | .missing => true
+        | .regularExisting => matchedDecision spec signal
+        | .unobserved | .otherExisting | .unavailable => false
 
 def postDecision (spec : RuleSpec) (signal : PostSignal) : Bool :=
   if !targetMatchesPre spec signal.pre then true
@@ -265,9 +280,10 @@ theorem denied_existing_file_blocks_regular (spec : RuleSpec) (signal : PreSigna
 theorem existing_file_scope_allows_missing (spec : RuleSpec) (signal : PreSignal)
     (target : spec.target = .tool signal.tool)
     (scope : spec.targetScope = .existingFile)
-    (state : signal.fileTargetState = .missing) :
+    (state : signal.fileTargetState = .missing)
+    (within : signal.withinRoot = true) :
     preDecision spec signal = true := by
-  simp [preDecision, targetMatchesPre, target, scope, state]
+  simp [preDecision, targetMatchesPre, target, scope, state, within]
 
 theorem existing_file_scope_fails_closed_without_regular_observation
     (spec : RuleSpec) (signal : PreSignal)
@@ -319,11 +335,40 @@ theorem effect_class_ignores_opaque_tools (spec : RuleSpec) (signal : PostSignal
 theorem effect_class_allows_proven_new_file (spec : RuleSpec)
     (signal : PreSignal)
     (target : spec.target = .effectClass .existingFileRewrite)
-    (state : signal.fileTargetState = .missing) :
+    (state : signal.fileTargetState = .missing)
+    (within : signal.withinRoot = true) :
     preDecision spec signal = true := by
   cases hm : signal.fileMutating with
   | false => simp [preDecision, targetMatchesPre, target, hm]
-  | true => simp [preDecision, targetMatchesPre, target, hm, state]
+  | true => simp [preDecision, targetMatchesPre, target, hm, state, within]
+
+/-- Containment is judged before anything else: an effective target outside
+the project root never admits, whatever its resolved state or evidence.  The
+original symlink-escape protection, now an explicit theorem. -/
+theorem escaping_resolution_fails_closed (spec : RuleSpec)
+    (signal : PreSignal)
+    (target : spec.target = .effectClass .existingFileRewrite)
+    (mutating : signal.fileMutating = true)
+    (escape : signal.withinRoot = false) :
+    preDecision spec signal = false := by
+  simp [preDecision, targetMatchesPre, target, mutating, escape]
+
+/-- The adjudicated false intervention as a proven positive: a mutating tool
+whose EFFECTIVE target resolves to a regular file inside the project root
+admits under a verify-only rule.  A symlink handle to such a file is exactly
+this signal, so the mkdocs `docs/index.md -> README.md` read-then-edit can
+never be blocked again by a rule this kernel checks. -/
+theorem resolved_regular_within_root_admits (spec : RuleSpec)
+    (signal : PreSignal)
+    (target : spec.target = .effectClass .existingFileRewrite)
+    (mutating : signal.fileMutating = true)
+    (state : signal.fileTargetState = .regularExisting)
+    (within : signal.withinRoot = true)
+    (verify_only : spec.denyTarget = false)
+    (trusted : spec.authoritativeOnly = false) :
+    preDecision spec signal = true := by
+  simp [preDecision, targetMatchesPre, matchedDecision, target, mutating,
+    state, within, verify_only, trusted]
 
 theorem effect_class_fails_closed_on_ambiguous_target (spec : RuleSpec)
     (signal : PreSignal)

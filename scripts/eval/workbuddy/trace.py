@@ -46,6 +46,7 @@ FORMAL_DECISION_SCHEMAS = {
     "metacodes-project-formal-decision-batch-v3",
     "metacodes-project-formal-decision-batch-v4",
     "metacodes-project-formal-decision-batch-v5",
+    "metacodes-project-formal-decision-batch-v6",
 }
 CURRENT_FORMAL_BATCH_SCHEMA = "metacodes-project-formal-decision-batch-v5"
 OBSERVATION_FILENAME = "metacodes-tool-observations.jsonl"

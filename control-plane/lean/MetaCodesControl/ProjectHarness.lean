@@ -348,6 +348,8 @@ def parsePreSignal (cursor : Cursor) : Except String (PreSignal × Cursor) := do
     parseBoolField cursor "exact_recovery_material_ready"
   let cursor ← expectLiteral cursor ","
   let (fileMutating, cursor) ← parseBoolField cursor "file_mutating"
+  let cursor ← expectLiteral cursor ","
+  let (withinRoot, cursor) ← parseBoolField cursor "within_root"
   let cursor ← expectLiteral cursor "}"
   let signal : PreSignal := {
     tool := tool
@@ -355,6 +357,7 @@ def parsePreSignal (cursor : Cursor) : Except String (PreSignal × Cursor) := do
     agentDepth := agentDepth
     authoritative := authoritative
     fileTargetState := fileTargetState
+    withinRoot := withinRoot
     exactRecoveryMaterialReady := exactRecoveryMaterialReady
     fileMutating := fileMutating
   }

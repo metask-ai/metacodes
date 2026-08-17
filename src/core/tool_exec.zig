@@ -537,7 +537,7 @@ pub fn executeOne(
             &job_ctx,
             dispatched_name,
             input,
-        );
+        ).state;
     }
     if (job_ctx.project_rule_gate) |gate| {
         switch (gate.pre(project_pre_signal.?)) {
