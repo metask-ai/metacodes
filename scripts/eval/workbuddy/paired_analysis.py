@@ -148,10 +148,12 @@ def _receipt(
         if (
             not isinstance(resumes, list)
             or not resumes
+            # 与 launch_gate.MAX_RESUMED_TRIALS 锁步(测试断言相等,勿单改)
             or len(resumes) > 3
             or "resume_audit" not in receipt
         ):
             raise LaunchError("paired WorkBuddy resumes disclosure is invalid")
+        resumed_names: set = set()
         for row in resumes:
             if (
                 not isinstance(row, dict)
@@ -160,15 +162,38 @@ def _receipt(
                     "task",
                     "reason",
                     "result_sha256",
+                    "requests_sha256",
                     "original_dir_rel",
                     "tainted_dir_rel",
+                    "attempt1_usage",
                 }
                 or row["task"] not in selected_for_resume
+                or row["task"] in resumed_names
+                or not isinstance(row["reason"], str)
+                or len(row["reason"]) > 2000
+                or row["tainted_dir_rel"]
+                != str(row["original_dir_rel"]) + ".tainted-a1"
             ):
                 raise LaunchError(
                     "paired WorkBuddy resumes disclosure is invalid"
                 )
+            resumed_names.add(row["task"])
             _sha256(row["result_sha256"], "resumed trial evidence")
+            _sha256(row["requests_sha256"], "resumed trial ledger")
+        resumed_usage = (receipt.get("usage") or {}).get("resumed_attempts")
+        if (
+            not isinstance(resumed_usage, dict)
+            or set(resumed_usage) != resumed_names
+        ):
+            raise LaunchError(
+                "paired WorkBuddy resumes disclosure does not match the "
+                "resumed-attempt usage"
+            )
+    elif "resumed_attempts" in (receipt.get("usage") or {}):
+        raise LaunchError(
+            "paired WorkBuddy receipt carries resumed-attempt usage without "
+            "a resumes disclosure"
+        )
     if (
         receipt.get("launch_manifest_content_sha256") != manifest["content_sha256"]
         or receipt.get("run_id") != manifest["run_id"]
@@ -208,10 +233,20 @@ def _receipt(
         != manifest["model"]["provider_identity"]
         or transaction.get("harness_fingerprint")
         != manifest["harness_fingerprint"]
+        # 提交额 = 计分 trial 之和 + attempt-1 真实花费(2026-08-18 对抗
+        # 审查 F4:染污 attempt 的钱是真钱,不入账即自欺)。
         or _integer(transaction.get("actual_cost_microusd"), "actual cost")
         != _integer(usage.get("cost_microusd"), "usage cost")
+        + sum(
+            row.get("cost_microusd") or 0
+            for row in (usage.get("resumed_attempts") or {}).values()
+        )
         or _integer(transaction.get("actual_metered_tokens"), "actual tokens")
         != _integer(usage.get("metered_tokens"), "usage tokens")
+        + sum(
+            row.get("metered_tokens") or 0
+            for row in (usage.get("resumed_attempts") or {}).values()
+        )
         or _integer(transaction.get("max_cost_microusd"), "maximum cost", minimum=1)
         != manifest["budget"]["max_cost_microusd"]
         or _integer(transaction.get("max_metered_tokens"), "maximum tokens", minimum=1)
@@ -225,8 +260,14 @@ def _receipt(
         != journal.get("journal_id")
         or _integer(transaction.get("reservation_revision"), "reservation revision", minimum=1) != 1
         or _integer(transaction.get("authorization_revision"), "authorization revision", minimum=1) != 2
-        or _integer(transaction.get("commit_revision"), "commit revision", minimum=1) != 3
-        or _integer(transaction.get("journal_revision"), "journal revision", minimum=1) != 3
+        # revision-gap 绑定(2026-08-18 对抗审查 J3):授权与提交之间的账本
+        # 事件恰为 trial-resume 授权(0 或 1 个)。藏匿 resumes 块 → gap=2
+        # 与期望 3 不符;伪造 → gap=1 与期望 4 不符。字节重放已绑账本,
+        # 这一算式把披露块也钉进同一条链。
+        or _integer(transaction.get("commit_revision"), "commit revision", minimum=1)
+        != 3 + (1 if "resumes" in receipt else 0)
+        or _integer(transaction.get("journal_revision"), "journal revision", minimum=1)
+        != 3 + (1 if "resumes" in receipt else 0)
         or _sha256(transaction.get("transaction_id"), "transaction id")
         != _canonical_sha256(
             {

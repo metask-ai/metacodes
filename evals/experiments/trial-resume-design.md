@@ -14,20 +14,41 @@
 产生相同首请求 sha → 检查原样通过。缓存温度本就逐 trial 不同(顺序执行),无新增不对称。
 
 **墙 3:反择优**。resume 资格是**机械谓词,fail-closed**,不是操作者口味:
-- 资格 = result.json.exception_info 非空(agent 进程失败)**且** 该 trial requests.jsonl 尾部 M=6 条内
+- 资格 = result.json.exception_info 非空(agent 进程失败)**且** 异常类型在允许列表
+  (`RESUMABLE_EXCEPTION_TYPES`,现仅 NonZeroAgentExitCodeError;harness 缺陷类 RuntimeError
+  即使与 5xx 尾部同现也拒绝,扩类=代码变更+review)**且** 该 trial requests.jsonl 尾部 M=6 条内
   存在 ≥1 网络类失败(status≥500 或 error 含 Connect/Timeout/RemoteProtocol/断流)。
 - 干净跑完但分数难看的 trial:exception_info==null → **拒绝**,无例外通道。
-- 上界:每 trial 最多 2 次 attempt;每臂最多 resume 3 个 trial(超过 = 系统性故障,整臂烧毁照旧)。
-- 留痕:attempt-1 工件全量哈希入收据 `resumes` 块(tainted_reason=异常类+provider 尾部状态);
+- 归属:trial 必须经 staged 路径(内嵌 instance id)+ trial_uri 归属到本 run
+  (2026-08-18 审查 F7:同 slug 多 run 共享 result root,mtime 窗口会误伤别的 run)。
+- 上界:每 trial 最多 2 次 attempt;每臂最多 resume 3 个 trial(超过 = 系统性故障,整臂烧毁照旧);
+  **每事务恰 1 个 resume 授权事件**(2026-08-18 审查定案:崩溃恢复走 continuation 复用事件,
+  attempt≥3 设计禁止,>1 的预算只会被禁止路径消费)。
+- 留痕:attempt-1 的 result.json **与 requests.jsonl** 哈希入 journal 证据与收据 `resumes` 块;
   resume 决定在花费**之前**作为 journal 事件落账(可审计的事前授权)。
 
 ## 州机与账本
 
 新 journal 事件 `trial_resume_authorized`(schema 演进,roster 扩展,旧账本重放不受影响):
-`{trials:[task], attempt:2, evidence_sha256(每 trial 的 attempt-1 result.json 哈希), receipt_sha256(失败收据)}`。
-资金语义:**不新增授权**——原 max_cost 上界继续约束跨 attempt 总花费;事件只记录恢复决定与证据绑定。
+`{trials:[task], attempt:2, evidence_sha256(行集哈希), receipt_sha256(失败收据)}`。
+资金语义:**不新增授权**——原 max_cost 上界继续约束跨 attempt 总花费(提交额 = 计分 trial 之和 +
+attempt-1 真实花费,attempt-1 轨迹缺失时显式披露不可得,2026-08-18 审查 F4);事件只记录恢复决定与证据绑定。
 状态流:request_authorized --(runner exit / audit fail, 失败收据)--> [resume-trials 资格验证]
---(trial_resume_authorized 落账)--> 重跑指定 trial --(全量审计,taint-aware)--> committed。
+--(trial_resume_authorized 落账)--> 染污改名 --> 重跑指定 trial(独立 instance `<run_id>-a2`)
+--(全量审计,taint-aware)--> committed。
+
+**崩溃恢复(2026-08-18 审查 F3 定案)**:落账之后任一窗口(改名/凭证/runner/审计)崩溃,
+重新调用 resume-trials 进入 **continuation**——从磁盘(原名或已染污名皆可)重建行集,
+逐字节对上事件的 evidence_sha256,复用同一授权继续,绝不追加第二个事件。改名逐 trial 幂等。
+
+**失败收据 ↔ 活账本(2026-08-18 审查 J1)**:resume 落账后活账本必然长过收据 pin 的 checkpoint。
+账本是原子重写的单 JSON 文档,"前缀"按结构重建:截断事件链到 pin 的 revision、用账本自己的
+确定性序列化重建当时文档,字节必须复现 pin 的长度+哈希;截断点之后只允许同事务的 resume 事件。
+仅 resume 流开启此接受法,其余漂移照旧 fail-closed。
+
+**重跑实例隔离(2026-08-18 审查 F1/F2 根治)**:重跑 INSTANCE_ID=`<run_id>-a2`,原 instance 的
+shard 日志/proxy.yaml/instance manifest 保持冻结字节;审计端按 task 精确绑定 -a2 staged 路径与
+从原路由确定性派生的 -a2 model_route(不读取、不信任重跑生成的 instance manifest)。
 
 ## 审计改造(taint-aware _collect_usage)
 
@@ -39,9 +60,13 @@
 
 ## paired_analysis
 
-校验 resumes 块(上界/证据形/attempt-2 清洁),报告披露 resumed 任务清单与 taint 原因;
-H5 reward 绑定用 attempt-2 的 result.json。跨臂:resume 与否不要求对称(它是基础设施
-事件,不是 treatment;但报告必须并排披露两臂 resume 计数,供解读者判断)。
+校验 resumes 块(上界/证据形/attempt-2 清洁/行 schema 含 requests_sha256+attempt1_usage),
+报告披露 resumed 任务清单与 taint 原因;H5 reward 绑定用 attempt-2 的 result.json。
+**revision-gap 绑定(2026-08-18 审查 J3)**:commit_revision − authorization_revision − 1 恰等于
+resume 事件数(有 resumes 块=1,无=0)——藏匿或伪造披露块都会撞已被字节重放钉死的账本 revision。
+审计端另有硬绑定:resume_post_run_audit 只信账本 resume_events,收据行必须逐字节复现
+journaled evidence_sha256。跨臂:resume 与否不要求对称(它是基础设施事件,不是 treatment;
+但报告必须并排披露两臂 resume 计数,供解读者判断)。
 
 ## 部署位置
 

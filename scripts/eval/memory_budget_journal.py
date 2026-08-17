@@ -475,7 +475,11 @@ def _replay_document(document: Mapping[str, Any]) -> Mapping[str, Any]:
                     resume["failure_receipt_sha256"],
                     f"{where}.resume.failure_receipt_sha256",
                 )
-                if len(current["resume_events"]) >= 2:
+                # 预算 = 1 次/事务(2026-08-18 对抗审查 F5 定案):崩溃恢复
+                # 走 continuation(复用未消费事件,不追加);attempt-2 重跑再
+                # 失败即 attempt≥3,设计禁止,臂照旧烧毁。>1 的预算只会在
+                # "同 trial 二次授权"里被消费,而那恰是被禁止的路径。
+                if len(current["resume_events"]) >= 1:
                     _fail(where, "trial resume budget is exhausted")
                 current["resume_events"].append(
                     {
@@ -996,6 +1000,29 @@ class BudgetJournal:
         self._transaction(transaction_id)
         assert self._state is not None
         return _transaction_receipt_from_state(self._state, transaction_id)
+
+    def resume_events(self, transaction_id: str) -> Tuple[Mapping[str, Any], ...]:
+        """Return the replayed trial-resume authorizations for one transaction.
+
+        The receipt projection deliberately omits resume events (their byte
+        shape predates the feature); auditors that must bind disk artifacts
+        to journaled resume authorizations read them through this accessor
+        instead of trusting caller arguments (harness review 2026-08-18 F8).
+        """
+
+        self._transaction(transaction_id)
+        assert self._state is not None
+        current = self._state["transactions"][str(transaction_id)]
+        return tuple(
+            {
+                "revision": int(event["revision"]),
+                "head_sha256": str(event["head_sha256"]),
+                "trials": tuple(str(trial) for trial in event["trials"]),
+                "evidence_sha256": str(event["evidence_sha256"]),
+                "failure_receipt_sha256": str(event["failure_receipt_sha256"]),
+            }
+            for event in current.get("resume_events", [])
+        )
 
     def transaction_receipts(self) -> Tuple[Mapping[str, Any], ...]:
         """Return every transaction in durable reservation order.

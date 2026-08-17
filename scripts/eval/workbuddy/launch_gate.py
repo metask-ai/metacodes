@@ -1702,6 +1702,8 @@ def _official_task_identity(
     manifest: Mapping[str, Any],
     selected: Sequence[str],
     expected_model_route: str,
+    staged_run_ids: Mapping[str, str] | None = None,
+    route_overrides: Mapping[str, str] | None = None,
 ) -> tuple[str, Path, Dict[str, Any]]:
     """Bind a trajectory through Harbor's authoritative trial result.
 
@@ -1718,6 +1720,9 @@ def _official_task_identity(
     model_info = agent_info.get("model_info") or {}
     raw_task_path = task_id.get("path") if isinstance(task_id, dict) else None
     dataset_root = Path(str(manifest["cohort"]["dataset"])).parent.name
+    # Trial-resume:重跑走带后缀的 instance id(<run_id>-a2),staged 路径随
+    # 之变化——staged_run_ids 精确指定每个 task 允许的唯一 instance id(重跑
+    # 任务必须来自 attempt-2 staging,其余必须来自原始 staging;不是宽集合)。
     matches = [
         task
         for task in selected
@@ -1725,7 +1730,10 @@ def _official_task_identity(
         and raw_task_path
         == str(
             Path(".workspace/tmp/staged")
-            / str(manifest["run_id"])
+            / (
+                (staged_run_ids or {}).get(task)
+                or str(manifest["run_id"])
+            )
             / dataset_root
             / "tasks"
             / task
@@ -1738,7 +1746,12 @@ def _official_task_identity(
         or result.get("trial_uri") != trial_dir.as_uri()
         or result.get("exception_info") is not None
         or agent_info.get("name") != "metacodes"
-        or model_info.get("name") != expected_model_route
+        or model_info.get("name")
+        != (
+            (route_overrides or {}).get(matches[0])
+            if matches and matches[0] in (route_overrides or {})
+            else expected_model_route
+        )
         or not isinstance(checksum, str)
         or not re.fullmatch(r"[0-9a-f]{64}", checksum)
     ):
@@ -2089,6 +2102,12 @@ def _collect_usage(
     resumed_tasks = (
         {str(row["task"]) for row in resumes} if resumes is not None else set()
     )
+    # 重跑任务的计分 trial 必须来自 attempt-2 staging(<run_id>-a2);其余
+    # 任务必须来自原始 staging。精确到 task 的一对一绑定,防串 instance。
+    resumed_staged_run_ids = {
+        task: f"{manifest['run_id']}-a2" for task in resumed_tasks
+    }
+    resumed_route_overrides: Dict[str, str] = {}
     total_reward = 0.0
     full_passes = 0
     expected_model_route = ""
@@ -2102,6 +2121,23 @@ def _collect_usage(
         expected_model_route = str(_json(resolved_path).get("model_route") or "")
         if not expected_model_route or "__" in expected_model_route:
             raise LaunchError("official WorkBuddy model route is missing or Harbor-unsafe")
+        if resumed_tasks:
+            # 重跑 instance 是 <run_id>-a2,而 model_route = <instance>--<slug>
+            # (resolve_manifest 构造)。从已验证的原路由确定性推导 attempt-2
+            # 路由,不读取、不信任重跑生成的 instance manifest。
+            route_prefix = f"{manifest['run_id']}--"
+            if not expected_model_route.startswith(route_prefix):
+                raise LaunchError(
+                    "official WorkBuddy model route does not carry the run id; "
+                    "cannot derive the resumed-attempt route"
+                )
+            resumed_route = (
+                f"{manifest['run_id']}-a2--"
+                + expected_model_route[len(route_prefix):]
+            )
+            resumed_route_overrides = {
+                task: resumed_route for task in resumed_tasks
+            }
     # The journal's formal identities were shape-checked but never bound to
     # the STAGED project-control artifacts: "which rules actually ran" was
     # matched by eye, not by mechanism (2026-08-17 global review, L1 gap).
@@ -2136,6 +2172,8 @@ def _collect_usage(
                 manifest,
                 selected,
                 expected_model_route,
+                staged_run_ids=resumed_staged_run_ids,
+                route_overrides=resumed_route_overrides,
             )
             _validate_trial_project_control(trajectory_path.parent.parent, manifest)
         else:
@@ -2394,10 +2432,16 @@ def _collect_usage(
         # attempt-1 干净 trial 的流量 ∪ 被染污 trial 的流量(披露不丢弃),
         # 必须连续覆盖 1..N;wave2 = 重跑 trial 的流量,自 1 连续。
         # "所有流量有账,无一隐藏"性质在两段上分别成立。
+        resumed_attempts: Dict[str, Dict[str, object]] = {}
         for row in resumes:
-            if str(row["task"]) not in rows:
+            task_name = str(row["task"])
+            if task_name not in rows:
                 raise LaunchError(
                     f"resumed trial is not bound in the audit: {row['task']}"
+                )
+            if task_name in resumed_attempts:
+                raise LaunchError(
+                    f"resumed trial appears twice in the resume rows: {task_name}"
                 )
             tainted_dir = result_root / str(row["tainted_dir_rel"])
             tainted_result = tainted_dir / "result.json"
@@ -2414,26 +2458,96 @@ def _collect_usage(
                     f"tainted attempt-1 evidence drifted for {row['task']}"
                 )
             tainted_requests = tainted_dir / "agent" / "requests.jsonl"
+            # 染污账本是 wave-1 计数的输入,必须与授权时钉下的哈希逐字节
+            # 一致(2026-08-18 对抗审查 F9:此前只有冻结面兜底,行本身不
+            # pin,冻结截断即可伪造)。
             try:
-                tainted_lines = [
-                    line
-                    for line in _read_regular(
-                        tainted_requests, maximum=MAX_REQUEST_LOG_BYTES
-                    ).splitlines()
-                    if line.strip()
-                ]
-                for line in tainted_lines:
+                tainted_ledger_sha = _identity(
+                    tainted_requests, maximum=MAX_REQUEST_LOG_BYTES
+                )["sha256"]
+            except (LaunchError, OSError) as exc:
+                raise LaunchError(
+                    f"tainted attempt-1 ledger is unreadable for {row['task']}"
+                ) from exc
+            if tainted_ledger_sha != str(row.get("requests_sha256")):
+                raise LaunchError(
+                    f"tainted attempt-1 ledger drifted for {row['task']}"
+                )
+            tainted_sequences: list[int] = []
+            try:
+                for line in _read_regular(
+                    tainted_requests, maximum=MAX_REQUEST_LOG_BYTES
+                ).splitlines():
+                    if not line.strip():
+                        continue
                     record = json.loads(line.decode("utf-8"))
                     sequence = record.get("seq")
                     if not isinstance(sequence, int) or isinstance(sequence, bool):
                         raise LaunchError(
                             f"tainted attempt-1 ledger is malformed for {row['task']}"
                         )
-                    request_sequences.append(sequence)
+                    tainted_sequences.append(sequence)
             except (OSError, UnicodeError, json.JSONDecodeError) as exc:
                 raise LaunchError(
                     f"tainted attempt-1 ledger is unreadable for {row['task']}"
                 ) from exc
+            if tainted_sequences != sorted(tainted_sequences) or len(
+                set(tainted_sequences)
+            ) != len(tainted_sequences):
+                raise LaunchError(
+                    f"tainted attempt-1 ledger is out of order for {row['task']}"
+                )
+            request_sequences.extend(tainted_sequences)
+            # attempt-1 真实花掉了 provider 的钱;能从染污轨迹取到就计入
+            # 提交额,取不到(agent 死在轨迹落盘前)就显式披露不可得——
+            # 沉默漏记是自欺(2026-08-18 对抗审查 F4)。
+            attempt_usage: Dict[str, object] = {
+                "provider_requests": len(tainted_sequences),
+                "requests_sha256": tainted_ledger_sha,
+            }
+            tainted_trajectory = tainted_dir / "agent" / "trajectory.json"
+            if tainted_trajectory.is_file():
+                tainted_final = (
+                    _json(tainted_trajectory).get("final_metrics") or {}
+                )
+                t_cost = tainted_final.get("total_cost_usd") or 0.0
+                t_prompt = tainted_final.get("total_prompt_tokens") or 0
+                t_completion = tainted_final.get("total_completion_tokens") or 0
+                t_cached = tainted_final.get("total_cached_tokens") or 0
+                t_extra = tainted_final.get("extra") or {}
+                t_cache_create = (
+                    t_extra.get("cache_creation_input_tokens") or 0
+                )
+                if (
+                    not isinstance(t_cost, (int, float))
+                    or isinstance(t_cost, bool)
+                    or t_cost < 0
+                    or any(
+                        not isinstance(value, int)
+                        or isinstance(value, bool)
+                        or value < 0
+                        for value in (
+                            t_prompt,
+                            t_completion,
+                            t_cached,
+                            t_cache_create,
+                        )
+                    )
+                ):
+                    raise LaunchError(
+                        f"tainted attempt-1 trajectory usage is malformed for {row['task']}"
+                    )
+                attempt_usage["cost_microusd"] = usd_to_microusd_ceiling(
+                    float(t_cost)
+                )
+                attempt_usage["metered_tokens"] = (
+                    t_prompt + t_completion + t_cached + t_cache_create
+                )
+            else:
+                attempt_usage["cost_microusd"] = None
+                attempt_usage["metered_tokens"] = None
+                attempt_usage["usage_unavailable"] = True
+            resumed_attempts[task_name] = attempt_usage
         if manifest.get("schema_version") == SCHEMA_VERSION:
             if sorted(request_sequences) != list(
                 range(1, len(request_sequences) + 1)
@@ -2456,6 +2570,10 @@ def _collect_usage(
         "cache_creation_input_tokens": total_cache_create,
         "control_metrics": _aggregate_control_metrics(control_rows),
     }
+    if resumes is not None:
+        # cost_microusd/metered_tokens 保持"计分 trial 之和"的行级恒等式;
+        # attempt-1 的真实花费单列,提交额 = 两者之和(commit 侧相加)。
+        result["resumed_attempts"] = resumed_attempts
     if official_runner:
         result["quality"] = {
             "mean_verifier_reward": total_reward / len(selected),
@@ -2850,7 +2968,10 @@ def _validated_failure_transaction(
 
 
 def validate_authorized_failure_receipt(
-    path: Path, *, journal_path: Path | None = None
+    path: Path,
+    *,
+    journal_path: Path | None = None,
+    allow_trailing_resume_events: bool = False,
 ) -> Dict[str, Any]:
     receipt = _json(path)
     schema_version = receipt.get("schema_version")
@@ -3017,12 +3138,74 @@ def validate_authorized_failure_receipt(
         if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
             raise LaunchError(f"authorized failure receipt {label} is invalid")
     if journal_path is not None:
-        checkpoint = _read_regular(journal_path, maximum=8 * 1024 * 1024)
+        live = _read_regular(journal_path, maximum=8 * 1024 * 1024)
+        checkpoint_bytes = journal.get("checkpoint_bytes")
+        checkpoint = live
         if (
-            len(checkpoint) != journal.get("checkpoint_bytes")
-            or _sha256_bytes(checkpoint) != journal.get("checkpoint_sha256")
+            len(live) != checkpoint_bytes
+            or _sha256_bytes(live) != journal.get("checkpoint_sha256")
         ):
-            raise LaunchError("authorized failure receipt journal checkpoint drifted")
+            # Trial-resume(2026-08-18 对抗审查 J1):resume-trials 自己落账
+            # 的授权事件会让活账本长过冻结 checkpoint——若照旧按整文件等值
+            # 拒绝,resume 路径一次都无法成功(先花钱再拒收)。账本是原子重
+            # 写的单 JSON 文档(非 append-only),因此"前缀"按结构重建:把
+            # 活文档的事件链截断到收据 pin 的 revision,用账本自己的确定性
+            # 序列化(stable_json)重建当时的完整文档,其字节必须逐位复现
+            # 收据 pin 的 checkpoint(长度+哈希)——伪造的历史造不出这个哈希。
+            # 截断点之后的事件必须全部是同一事务的 trial_resume_authorized;
+            # 活账本整体仍过完整重放校验。其余任何漂移照旧 fail-closed。
+            frozen_revision = journal.get("revision")
+            candidate = b""
+            suffix_events: list = []
+            if (
+                allow_trailing_resume_events
+                and isinstance(frozen_revision, int)
+                and frozen_revision > 0
+            ):
+                try:
+                    document = json.loads(live.decode("utf-8"))
+                except (UnicodeError, json.JSONDecodeError):
+                    document = None
+                events = (
+                    document.get("events")
+                    if isinstance(document, dict)
+                    else None
+                )
+                if (
+                    isinstance(events, list)
+                    and len(events) > frozen_revision
+                    and all(isinstance(event, dict) for event in events)
+                ):
+                    truncated = {
+                        **document,
+                        "revision": frozen_revision,
+                        "head_sha256": events[frozen_revision - 1].get(
+                            "event_sha256"
+                        ),
+                        "events": events[:frozen_revision],
+                    }
+                    candidate = (stable_json(truncated) + "\n").encode(
+                        "utf-8"
+                    )
+                    suffix_events = events[frozen_revision:]
+            acceptable = (
+                len(candidate) > 0
+                and len(candidate) == checkpoint_bytes
+                and _sha256_bytes(candidate) == journal.get("checkpoint_sha256")
+                and bool(suffix_events)
+                and all(
+                    event.get("action") == "trial_resume_authorized"
+                    and event.get("transaction_id")
+                    == transaction.get("transaction_id")
+                    for event in suffix_events
+                )
+            )
+            if not acceptable:
+                raise LaunchError(
+                    "authorized failure receipt journal checkpoint drifted"
+                )
+            validate_checkpoint_payload(live)
+            checkpoint = candidate
         reopened = validate_checkpoint_payload(checkpoint)
         reopened_transaction = _validated_failure_transaction(
             checkpoint, str(transaction["transaction_id"])
@@ -3187,6 +3370,9 @@ NETWORK_FAILURE_MARKERS = (
 )
 RESUME_TAIL_WINDOW = 6
 MAX_RESUMED_TRIALS = 3
+# Harbor 异常类型允许列表:agent 进程死亡是网络瞬态的表现形;harness 缺陷
+# (RuntimeError 等)即使与 5xx 尾部同现也不可续。扩类=代码变更+review。
+RESUMABLE_EXCEPTION_TYPES = ("NonZeroAgentExitCodeError",)
 
 
 def trial_resume_eligibility(
@@ -3209,6 +3395,15 @@ def trial_resume_eligibility(
     exception = result.get("exception_info")
     if not isinstance(exception, Mapping) or not exception:
         return False, "trial completed without an agent exception"
+    # 类型门(2026-08-18 对抗审查):harness 自身缺陷(如 ATIF 构建
+    # RuntimeError)可能与被重试的 5xx 尾部同现——合取谓词会误判可续。
+    # 只有 agent 进程死亡这一类(网络瞬态的真实表现形)可续;扩类走代码
+    # review,不走运行时豁免。
+    if exception.get("exception_type") not in RESUMABLE_EXCEPTION_TYPES:
+        return False, (
+            "agent exception type is not a resumable class: "
+            + str(exception.get("exception_type"))
+        )
     tail = list(request_records)[-RESUME_TAIL_WINDOW:]
     if not tail:
         return False, "trial has no provider ledger to prove a transient"
@@ -3298,7 +3493,9 @@ def resume_post_run_audit(
     _reject_journal_receipt_collision(receipt_path, journal_path)
     manifest = validate_launch_manifest(manifest_path)
     failure = validate_authorized_failure_receipt(
-        failure_receipt_path, journal_path=journal_path
+        failure_receipt_path,
+        journal_path=journal_path,
+        allow_trailing_resume_events=resumes is not None,
     )
     if (
         failure.get("failure_stage") != "post_run_evidence_audit"
@@ -3354,7 +3551,11 @@ def resume_post_run_audit(
     frozen_shas = set()
     for relative, row in sorted(frozen.items()):
         for original_prefix, tainted_prefix in taint_remap.items():
-            if relative.startswith(original_prefix):
+            # 组件级匹配:目录名互为字符串前缀时裸 startswith 会错配
+            # (2026-08-18 对抗审查 F10)。
+            if relative == original_prefix or relative.startswith(
+                original_prefix + "/"
+            ):
                 relative = tainted_prefix + relative[len(original_prefix):]
                 break
         candidate = Path(relative)
@@ -3451,10 +3652,47 @@ def resume_post_run_audit(
                     "audit resumption requires the exact authorized transaction "
                     "from the failure receipt"
                 )
+            # Trial-resume:收据披露的 resumes 必须与账本里的授权事件精确
+            # 对应——审计只信账本,不信调用者参数(2026-08-18 对抗审查
+            # F8/J3:此前直接调用本函数可携任意 resumes 块拿到合法收据)。
+            journaled_resumes = journal.resume_events(
+                str(matches[0]["transaction_id"])
+            )
+            if resumes is None:
+                if journaled_resumes:
+                    raise LaunchError(
+                        "journal records a trial-resume authorization but the "
+                        "audit was invoked without resume rows"
+                    )
+            else:
+                if len(journaled_resumes) != 1:
+                    raise LaunchError(
+                        "trial-resume audit requires exactly one journaled "
+                        "resume authorization"
+                    )
+                event = journaled_resumes[0]
+                plain_rows = [
+                    {key: str(value) for key, value in sorted(row.items())}
+                    for row in resumes
+                ]
+                if (
+                    sorted(event["trials"])
+                    != sorted(row["task"] for row in plain_rows)
+                    or _canonical_sha256({"rows": plain_rows})
+                    != event["evidence_sha256"]
+                ):
+                    raise LaunchError(
+                        "resume rows do not match the journaled authorization"
+                    )
+            resumed_cost = 0
+            resumed_tokens = 0
+            for attempt_row in (usage.get("resumed_attempts") or {}).values():
+                resumed_cost += attempt_row.get("cost_microusd") or 0
+                resumed_tokens += attempt_row.get("metered_tokens") or 0
             committed = journal.commit(
                 str(matches[0]["transaction_id"]),
-                actual_cost_microusd=usage["cost_microusd"],
-                actual_metered_tokens=usage["metered_tokens"],
+                actual_cost_microusd=usage["cost_microusd"] + resumed_cost,
+                actual_metered_tokens=usage["metered_tokens"] + resumed_tokens,
             )
             snapshot = journal.snapshot()
             receipt = {
@@ -3491,13 +3729,20 @@ def resume_post_run_audit(
                 },
             }
             if resumes is not None:
+                resumed_attempt_usage = usage.get("resumed_attempts") or {}
                 receipt["resumes"] = [
                     {
                         "task": str(resume_row["task"]),
-                        "reason": str(resume_row["reason"])[:240],
+                        # 完整保留(cap 只防失控):截到 240 字符曾让 reason
+                        # 与授权证据哈希无法对账(2026-08-18 对抗审查 F8)。
+                        "reason": str(resume_row["reason"])[:2000],
                         "result_sha256": str(resume_row["result_sha256"]),
+                        "requests_sha256": str(resume_row["requests_sha256"]),
                         "original_dir_rel": str(resume_row["original_dir_rel"]),
                         "tainted_dir_rel": str(resume_row["tainted_dir_rel"]),
+                        "attempt1_usage": resumed_attempt_usage.get(
+                            str(resume_row["task"])
+                        ),
                     }
                     for resume_row in resumes
                 ]
@@ -3533,22 +3778,34 @@ def resume_trials(
     audit refused one or more trials for a PROVEN infrastructure failure.
 
     Anti-cherry-picking is mechanical (trial-resume design, wall 3): every
-    exception trial must pass trial_resume_eligibility or the whole resume is
-    refused; a clean trial can never be rerun; bounds are hard
-    (<=MAX_RESUMED_TRIALS per resume, <=2 resumes per transaction, enforced
-    again by the journal on replay). The resume decision and its evidence
-    hashes are journaled BEFORE any retry spend. The rerun invocation itself
-    is untrusted: the audit enforces that attempt-2 artifacts cover exactly
-    the journaled trials, that tainted attempt-1 artifacts survive
-    byte-identically, and that both waves' provider ledgers are contiguous.
-    ``runner_argv`` exists for the L2 harness; production uses the manifest's
-    pinned official runner and the audit judges the artifacts either way.
+    exception trial attributable to this run must pass
+    trial_resume_eligibility or the whole resume is refused; a clean trial
+    can never be rerun; bounds are hard (<=MAX_RESUMED_TRIALS per resume,
+    exactly 1 resume authorization per transaction, enforced again by the
+    journal on replay). The resume decision and its evidence hashes are
+    journaled BEFORE any retry spend; a crash in ANY later window (rename,
+    credential, runner, audit) is recovered by re-invoking this command —
+    the continuation branch reconstructs the journaled rows from disk,
+    verifies them against the journaled evidence hash, and reuses the same
+    authorization instead of appending a second one. The rerun runs under
+    its own instance id (<run_id>-a2) so every artifact the failure receipt
+    froze stays byte-identical. The rerun invocation itself is untrusted:
+    resume_post_run_audit re-reads the journal and enforces that the resume
+    rows match the journaled authorization exactly, that tainted attempt-1
+    artifacts survive byte-identically, and that both waves' provider
+    ledgers are contiguous. ``runner_argv`` exists for the L2 harness;
+    production uses the manifest's pinned official runner and the audit
+    judges the artifacts either way.
     """
 
     _reject_journal_receipt_collision(receipt_path, journal_path)
     manifest = validate_launch_manifest(manifest_path)
     failure = validate_authorized_failure_receipt(
-        failure_receipt_path, journal_path=journal_path
+        failure_receipt_path,
+        journal_path=journal_path,
+        # Continuation 重入时账本已含本事务的 resume 授权事件;前缀接受法
+        # 仍强制 checkpoint 字节前缀 + 后缀仅限同事务 resume 事件。
+        allow_trailing_resume_events=True,
     )
     if (
         failure.get("failure_stage") != "post_run_evidence_audit"
@@ -3575,68 +3832,119 @@ def resume_trials(
     workbuddy = Path(manifest["workbuddy"]["checkout"]).resolve(strict=True)
     result_root = workbuddy / "results" / str(manifest["job"]["slug"])
     selected = {str(task) for task in manifest["cohort"]["selected_tasks"]}
-    resume_rows: list[Dict[str, str]] = []
+    run_id = str(manifest["run_id"])
+    dataset_root = Path(str(manifest["cohort"]["dataset"])).parent.name
+
+    def _owned_task(
+        result: Mapping[str, Any], original_dir: Path
+    ) -> str | None:
+        """Attribute a trial result to THIS run, or return None.
+
+        Result roots are shared across runs of the same slug, and cohorts
+        repeat task names, so an mtime window alone will happily pick up —
+        and then destructively rename — another run's evidence (2026-08-18
+        对抗审查 F7)。归属靠 staged 路径(内嵌 instance id)+ trial_uri,
+        不靠时间;attempt-2 的 staging 是 <run_id>-a2,因此重跑自身的失败
+        永远不会被再次判为可 resume(attempt≥3 设计禁止)。"""
+        task_name = str(result.get("task_name") or "")
+        if not task_name.startswith("workbuddy/"):
+            return None
+        task = task_name.removeprefix("workbuddy/")
+        task_id = result.get("task_id") or {}
+        raw_path = task_id.get("path") if isinstance(task_id, dict) else None
+        if raw_path != str(
+            Path(".workspace/tmp/staged")
+            / run_id
+            / dataset_root
+            / "tasks"
+            / task
+        ):
+            return None
+        if result.get("trial_uri") != original_dir.as_uri():
+            return None
+        return task
+
+    def _resume_row(trial_dir: Path) -> Dict[str, str]:
+        """Build (and eligibility-gate) the resume row for one exception
+        trial, whether it sits at its original path or was already renamed
+        to *.tainted-a1 by an interrupted earlier invocation. Rows are pure
+        functions of the artifacts, so crash-recovery reconstruction
+        reproduces the journaled evidence hash byte-for-byte."""
+        dir_rel = str(trial_dir.relative_to(result_root))
+        original_rel = (
+            dir_rel[: -len(".tainted-a1")]
+            if dir_rel.endswith(".tainted-a1")
+            else dir_rel
+        )
+        result_path = trial_dir / "result.json"
+        result = _json(result_path)
+        task = _owned_task(result, result_root / original_rel)
+        if task is None or not result.get("exception_info"):
+            raise LaunchError(
+                f"trial is not resumable evidence for this run: {trial_dir}"
+            )
+        if task not in selected:
+            raise LaunchError(
+                f"exception trial is outside the frozen selection: {task}"
+            )
+        request_log = trial_dir / "agent" / "requests.jsonl"
+        try:
+            records = [
+                json.loads(line.decode("utf-8"))
+                for line in _read_regular(
+                    request_log, maximum=MAX_REQUEST_LOG_BYTES
+                ).splitlines()
+                if line.strip()
+            ]
+        except (OSError, UnicodeError, json.JSONDecodeError, LaunchError):
+            records = []
+        eligible, reason = trial_resume_eligibility(result, records)
+        if not eligible:
+            raise LaunchError(
+                f"arm is not resumable — trial {task} failed without a "
+                f"provable infrastructure transient: {reason}"
+            )
+        return {
+            "task": task,
+            "original_dir_rel": original_rel,
+            "tainted_dir_rel": original_rel + ".tainted-a1",
+            "result_sha256": _identity(
+                result_path, maximum=MAX_FAILURE_ARTIFACT_BYTES
+            )["sha256"],
+            "requests_sha256": _identity(
+                request_log, maximum=MAX_REQUEST_LOG_BYTES
+            )["sha256"],
+            "reason": reason,
+        }
+
+    # Candidate discovery: every exception trial attributable to this run,
+    # at its original path or already tainted (crash recovery).
+    exception_dirs: Dict[str, list[Path]] = {}
     if result_root.exists():
         for result_path in sorted(result_root.rglob("result.json")):
             trial_dir = result_path.parent
-            if trial_dir == result_root or ".tainted-a1" in str(trial_dir):
-                continue
-            if trial_dir.parent == result_root:
+            if trial_dir == result_root or trial_dir.parent == result_root:
                 # run-level aggregate result.json, not a trial
                 continue
-            if result_path.stat().st_mtime_ns < started_ns:
+            dir_rel = str(trial_dir.relative_to(result_root))
+            is_tainted = dir_rel.endswith(".tainted-a1")
+            if ".tainted-a1" in dir_rel and not is_tainted:
+                continue  # nested artifact inside a tainted dir
+            if not is_tainted and result_path.stat().st_mtime_ns < started_ns:
                 continue
             try:
                 result = _json(result_path)
             except LaunchError:
                 continue
-            exception = result.get("exception_info")
-            if not exception:
+            if not result.get("exception_info"):
                 continue
-            task_name = str(result.get("task_name") or "")
-            task = task_name.removeprefix("workbuddy/")
-            if task not in selected:
-                raise LaunchError(
-                    f"exception trial is outside the frozen selection: {task_name}"
-                )
-            request_log = trial_dir / "agent" / "requests.jsonl"
-            try:
-                records = [
-                    json.loads(line.decode("utf-8"))
-                    for line in _read_regular(
-                        request_log, maximum=MAX_REQUEST_LOG_BYTES
-                    ).splitlines()
-                    if line.strip()
-                ]
-            except (OSError, UnicodeError, json.JSONDecodeError, LaunchError):
-                records = []
-            eligible, reason = trial_resume_eligibility(result, records)
-            if not eligible:
-                raise LaunchError(
-                    f"arm is not resumable — trial {task} failed without a "
-                    f"provable infrastructure transient: {reason}"
-                )
-            resume_rows.append(
-                {
-                    "task": task,
-                    "original_dir_rel": str(trial_dir.relative_to(result_root)),
-                    "tainted_dir_rel": str(trial_dir.relative_to(result_root))
-                    + ".tainted-a1",
-                    "result_sha256": _identity(
-                        result_path, maximum=MAX_FAILURE_ARTIFACT_BYTES
-                    )["sha256"],
-                    "reason": reason,
-                }
+            original_rel = (
+                dir_rel[: -len(".tainted-a1")] if is_tainted else dir_rel
             )
-    if not resume_rows:
-        raise LaunchError("trial resume found no eligible exception trials")
-    if len(resume_rows) > MAX_RESUMED_TRIALS:
-        raise LaunchError(
-            f"arm has {len(resume_rows)} broken trials — beyond the resume "
-            f"bound of {MAX_RESUMED_TRIALS}, the arm stays burned"
-        )
-    resume_rows.sort(key=lambda row: row["task"])
-    evidence_sha = _canonical_sha256({"rows": resume_rows})
+            task = _owned_task(result, result_root / original_rel)
+            if task is None:
+                continue
+            exception_dirs.setdefault(task, []).append(trial_dir)
     failure_receipt_sha = _identity(failure_receipt_path)["sha256"]
 
     budget = manifest["budget"]
@@ -3665,29 +3973,102 @@ def resume_trials(
                 "trial resume requires the exact authorized transaction from "
                 "the failure receipt"
             )
-        snapshot = journal.snapshot()
-        journal.authorize_trial_resume(
-            str(matches[0]["transaction_id"]),
-            trials=[row["task"] for row in resume_rows],
-            evidence_sha256=evidence_sha,
-            failure_receipt_sha256=failure_receipt_sha,
-            expected_revision=snapshot["revision"],
-            expected_head_sha256=snapshot["head_sha256"],
-        )
+        transaction_id = str(matches[0]["transaction_id"])
+        journaled_resumes = journal.resume_events(transaction_id)
+        if journaled_resumes:
+            # Continuation(2026-08-18 对抗审查 F3):此前某次调用已落账授
+            # 权,随后在改名/凭证/runner 任一窗口崩溃。账本是意图的持久记
+            # 录——从磁盘(原名或已染污名皆可)重建行集,逐字节对上授权时
+            # 的证据哈希,复用同一事件继续,绝不追加第二个事件。
+            event = journaled_resumes[0]
+            if event["failure_receipt_sha256"] != failure_receipt_sha:
+                raise LaunchError(
+                    "journaled resume authorization is bound to a different "
+                    "failure receipt"
+                )
+            resume_rows = []
+            for trial in sorted(event["trials"]):
+                candidates = exception_dirs.get(trial, [])
+                if len(candidates) != 1:
+                    raise LaunchError(
+                        f"trial resume recovery found {len(candidates)} "
+                        f"candidate directories for {trial}"
+                    )
+                resume_rows.append(_resume_row(candidates[0]))
+            resume_rows.sort(key=lambda row: row["task"])
+            if _canonical_sha256({"rows": resume_rows}) != event[
+                "evidence_sha256"
+            ]:
+                raise LaunchError(
+                    "trial resume recovery evidence does not match the "
+                    "journaled authorization"
+                )
+        else:
+            tainted_leftovers = [
+                str(trial_dir)
+                for candidates in exception_dirs.values()
+                for trial_dir in candidates
+                if str(trial_dir).endswith(".tainted-a1")
+            ]
+            if tainted_leftovers:
+                raise LaunchError(
+                    "tainted trial directories exist without a journaled "
+                    f"resume authorization: {sorted(tainted_leftovers)}"
+                )
+            resume_rows = []
+            for task in sorted(exception_dirs):
+                candidates = exception_dirs[task]
+                if len(candidates) != 1:
+                    raise LaunchError(
+                        f"trial resume found {len(candidates)} exception "
+                        f"directories for {task}"
+                    )
+                resume_rows.append(_resume_row(candidates[0]))
+            if not resume_rows:
+                raise LaunchError(
+                    "trial resume found no eligible exception trials"
+                )
+            if len(resume_rows) > MAX_RESUMED_TRIALS:
+                raise LaunchError(
+                    f"arm has {len(resume_rows)} broken trials — beyond the "
+                    f"resume bound of {MAX_RESUMED_TRIALS}, the arm stays "
+                    "burned"
+                )
+            resume_rows.sort(key=lambda row: row["task"])
+            snapshot = journal.snapshot()
+            journal.authorize_trial_resume(
+                transaction_id,
+                trials=[row["task"] for row in resume_rows],
+                evidence_sha256=_canonical_sha256({"rows": resume_rows}),
+                failure_receipt_sha256=failure_receipt_sha,
+                expected_revision=snapshot["revision"],
+                expected_head_sha256=snapshot["head_sha256"],
+            )
 
-    # Taint AFTER the durable authorization: a crash between the two leaves
-    # an authorized-but-untainted state, and rerunning resume-trials is
-    # idempotent up to the journal's resume budget.
+    # Taint AFTER the durable authorization. Renames are idempotent per
+    # trial: a crash anywhere in this loop (or later) is recovered by the
+    # continuation branch above, which reuses the journaled event and
+    # tolerates either name for each trial.
     for row in resume_rows:
         original = result_root / row["original_dir_rel"]
         tainted = result_root / row["tainted_dir_rel"]
-        if tainted.exists():
+        if original.exists() and tainted.exists():
             raise LaunchError(
-                f"tainted destination already exists for {row['task']}"
+                f"both original and tainted directories exist for "
+                f"{row['task']}"
             )
-        os.rename(original, tainted)
+        if original.exists():
+            os.rename(original, tainted)
+        elif not tainted.exists():
+            raise LaunchError(
+                f"resumable trial directory is missing for {row['task']}"
+            )
 
     credential = _read_credential(credential_fd)
+    try:
+        os.close(credential_fd)
+    except OSError:
+        pass
     read_fd, write_fd = os.pipe()
     try:
         offset = 0
@@ -3719,7 +4100,12 @@ def resume_trials(
                 "SHARD_CONCURRENCY": "1",
                 "PROXY_MAX_CONCURRENT": "1",
                 "SHARED_PROXY": "0",
-                "INSTANCE_ID": str(manifest["run_id"]),
+                # attempt-2 跑在独立 instance 下(2026-08-18 对抗审查
+                # F1/F2 根治):原 instance 的 shard 日志/proxy.yaml/
+                # instance manifest 全部保持冻结时的字节,重跑只新建
+                # <run_id>-a2 的实例状态;审计端按 task 精确绑定 -a2 的
+                # staged 路径与派生路由。
+                "INSTANCE_ID": f"{manifest['run_id']}-a2",
                 "DOCKER_DEFAULT_PLATFORM": TARGET_PLATFORM,
                 "NO_FORCE_BUILD": "1",
                 "METACODES_WB_RESUME_TASKS": ",".join(
@@ -3740,8 +4126,9 @@ def resume_trials(
     if completed.returncode != 0:
         raise LaunchError(
             f"trial resume runner exited {completed.returncode}; the journal "
-            "retains the resume authorization — a second resume-trials "
-            "invocation may retry within the resume budget"
+            "retains the resume authorization — re-invoking resume-trials "
+            "continues it (crash-recovery reconstruction), no new "
+            "authorization is spent"
         )
 
     return resume_post_run_audit(
@@ -3950,6 +4337,15 @@ def execute_launch(
                     os.close(write_fd)
                     write_fd = -1
 
+                if os.environ.get("METACODES_WB_RESUME_TASKS"):
+                    # 残留的 resume 子集 export 会让正常付费臂静默只跑部分
+                    # 任务,审计 fail-closed 时钱已花掉(2026-08-18 对抗审查
+                    # F6)。正常 launch 里它的存在只能是事故——拒绝启动。
+                    raise LaunchError(
+                        "METACODES_WB_RESUME_TASKS is set in the environment; "
+                        "a normal paid launch must never run a task subset — "
+                        "unset it and relaunch"
+                    )
                 environment = dict(os.environ)
                 for name in (
                     "ANTHROPIC_API_KEY",
@@ -3959,6 +4355,7 @@ def execute_launch(
                     "TINYKG_REMOTE_URL",
                     "TINYKG_REMOTE_CONFIG",
                     "TINYKG_REMOTE_EXPECTED_BUILD_ID",
+                    "METACODES_WB_RESUME_TASKS",
                 ):
                     environment.pop(name, None)
                 environment.update(
@@ -4209,14 +4606,20 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.command == "resume-trials":
-            receipt = resume_trials(
-                manifest_path=args.manifest,
-                journal_path=args.budget_journal,
-                failure_receipt_path=args.failure_receipt,
-                receipt_path=args.receipt,
-                credential_fd=args.credential_fd,
-                started_ns=args.started_ns,
-            )
+            try:
+                receipt = resume_trials(
+                    manifest_path=args.manifest,
+                    journal_path=args.budget_journal,
+                    failure_receipt_path=args.failure_receipt,
+                    receipt_path=args.receipt,
+                    credential_fd=args.credential_fd,
+                    started_ns=args.started_ns,
+                )
+            finally:
+                try:
+                    os.close(args.credential_fd)
+                except OSError:
+                    pass
             print(
                 json.dumps(
                     {

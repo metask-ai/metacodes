@@ -171,6 +171,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
         manifest: dict,
         *,
         study: str = "project_control",
+        resumed: bool = False,
     ) -> tuple[Path, dict, Path]:
         rewards = {"baseline": (0.0, 1.0), "treatment": (1.0, 1.0)}[arm]
         tasks = {}
@@ -263,10 +264,21 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                 expected_revision=int(reserved["journal_revision"]),
                 expected_head_sha256=str(reserved["journal_head_sha256"]),
             )
+            if resumed:
+                budget.authorize_trial_resume(
+                    str(authorized["transaction_id"]),
+                    trials=["task-a"],
+                    evidence_sha256=digest("resume-evidence"),
+                    failure_receipt_sha256=digest("resume-failure-receipt"),
+                    expected_revision=int(authorized["journal_revision"]),
+                    expected_head_sha256=str(
+                        authorized["journal_head_sha256"]
+                    ),
+                )
             committed = budget.commit(
                 str(authorized["transaction_id"]),
-                actual_cost_microusd=30_000,
-                actual_metered_tokens=201,
+                actual_cost_microusd=35_000 if resumed else 30_000,
+                actual_metered_tokens=241 if resumed else 201,
             )
             snapshot = budget.snapshot()
         value = {
@@ -302,6 +314,28 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
             "evaluation_treatment": manifest["evaluation_treatment"],
             "comparison": manifest["comparison"],
         }
+        if resumed:
+            value["resume_audit"] = {}
+            value["resumes"] = [
+                {
+                    "task": "task-a",
+                    "reason": "agent exception NonZeroAgentExitCodeError "
+                    "with provider tail failure status=502 error=None",
+                    "result_sha256": digest("resume-result"),
+                    "requests_sha256": digest("resume-ledger"),
+                    "original_dir_rel": "run/task-a__1",
+                    "tainted_dir_rel": "run/task-a__1.tainted-a1",
+                    "attempt1_usage": {
+                        "provider_requests": 2,
+                        "requests_sha256": digest("resume-ledger"),
+                        "cost_microusd": 5_000,
+                        "metered_tokens": 40,
+                    },
+                }
+            ]
+            value["usage"]["resumed_attempts"] = {
+                "task-a": dict(value["resumes"][0]["attempt1_usage"])
+            }
         return self._write(root / f"{arm}-receipt.json", value), value, journal_path
 
     def _pair(self, root: Path, *, study: str = "project_control"):
@@ -334,6 +368,89 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 LaunchError, "trial result artifact is missing"
+            ):
+                build_report(
+                    baseline_manifest_path=bm,
+                    baseline_receipt_path=br,
+                    baseline_journal_path=bj,
+                    treatment_manifest_path=tm,
+                    treatment_receipt_path=tr,
+                    treatment_journal_path=tj,
+                )
+
+    def test_resumed_arm_report_disclosure_and_revision_binding(self):
+        # resumed 收据:披露块 + revision-gap + 花费恒等式(计分和 +
+        # attempt-1)全链通过,报告并排披露两臂 resumed 清单。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bm, bmv = self._manifest(root, "baseline")
+            tm, tmv = self._manifest(root, "treatment")
+            br, brv, bj = self._receipt(root, "baseline", bmv, resumed=True)
+            tr, trv, tj = self._receipt(root, "treatment", tmv)
+            report = build_report(
+                baseline_manifest_path=bm,
+                baseline_receipt_path=br,
+                baseline_journal_path=bj,
+                treatment_manifest_path=tm,
+                treatment_receipt_path=tr,
+                treatment_journal_path=tj,
+            )
+            self.assertEqual(
+                report["arms"]["baseline"]["resumed_trials"], ["task-a"]
+            )
+            self.assertEqual(
+                report["arms"]["treatment"]["resumed_trials"], []
+            )
+
+    def test_hidden_resumes_disclosure_fails_revision_binding(self):
+        # 藏匿:journal 里有 resume 事件(commit_revision=4),收据剥掉
+        # resumes 块 → revision-gap 必须抓到(2026-08-18 对抗审查 J3)。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bm, bmv = self._manifest(root, "baseline")
+            tm, tmv = self._manifest(root, "treatment")
+            br, brv, bj = self._receipt(root, "baseline", bmv, resumed=True)
+            tr, trv, tj = self._receipt(root, "treatment", tmv)
+            stripped = dict(brv)
+            stripped.pop("resumes")
+            stripped.pop("resume_audit")
+            stripped["usage"] = {
+                key: value
+                for key, value in brv["usage"].items()
+                if key != "resumed_attempts"
+            }
+            self._write(br, stripped)
+            with self.assertRaisesRegex(
+                LaunchError, "budget identity is inconsistent"
+            ):
+                build_report(
+                    baseline_manifest_path=bm,
+                    baseline_receipt_path=br,
+                    baseline_journal_path=bj,
+                    treatment_manifest_path=tm,
+                    treatment_receipt_path=tr,
+                    treatment_journal_path=tj,
+                )
+
+    def test_fabricated_resumes_disclosure_fails_revision_binding(self):
+        # 伪造:journal 无 resume 事件(commit_revision=3),收据硬塞
+        # resumes 块 → 同一 gap 算式反向抓到。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bm, bmv = self._manifest(root, "baseline")
+            tm, tmv = self._manifest(root, "treatment")
+            br, brv, bj = self._receipt(root, "baseline", bmv, resumed=True)
+            tr, trv, tj = self._receipt(root, "treatment", tmv)
+            forged = dict(trv)
+            forged["resume_audit"] = {}
+            forged["resumes"] = list(brv["resumes"])
+            forged["usage"] = dict(trv["usage"])
+            forged["usage"]["resumed_attempts"] = dict(
+                brv["usage"]["resumed_attempts"]
+            )
+            self._write(tr, forged)
+            with self.assertRaisesRegex(
+                LaunchError, "budget identity is inconsistent"
             ):
                 build_report(
                     baseline_manifest_path=bm,

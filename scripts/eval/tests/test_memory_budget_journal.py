@@ -425,15 +425,38 @@ class TrialResumeAuthorizationTest(MemoryBudgetJournalTest):
                 self.assertEqual(len(receipts), 1)
                 self.assertEqual(receipts[0]["state"], "committed")
 
-    def test_second_resume_allowed_third_refused(self):
+    def test_second_resume_refused(self):
+        # 预算 = 1 次/事务(2026-08-18 定案):崩溃恢复走 continuation 复用
+        # 首个事件;第二个授权只可能是被禁止的 attempt>=3 路径。
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "budget.json"
             with BudgetJournal(path, self.authority()) as journal:
                 authorized = self.authorize(journal, self.transaction())
                 first = self._resume(journal, authorized, ["task-a"])
-                second = self._resume(journal, first, ["task-b"], evidence="e2")
                 with self.assertRaisesRegex(ValidationError, "resume budget"):
-                    self._resume(journal, second, ["task-c"], evidence="e3")
+                    self._resume(journal, first, ["task-b"], evidence="e2")
+
+    def test_resume_events_accessor_exposes_replayed_authorizations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "budget.json"
+            with BudgetJournal(path, self.authority()) as journal:
+                authorized = self.authorize(journal, self.transaction())
+                self.assertEqual(
+                    journal.resume_events(authorized["transaction_id"]), ()
+                )
+                self._resume(journal, authorized, ["task-a"])
+                events = journal.resume_events(authorized["transaction_id"])
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["trials"], ("task-a",))
+                self.assertEqual(events[0]["evidence_sha256"], digest("evidence"))
+            # 重放路径同样看得到(收据投影仍不含 resume_events)。
+            with BudgetJournal(path, self.authority()) as journal:
+                events = journal.resume_events(authorized["transaction_id"])
+                self.assertEqual(len(events), 1)
+                receipt = journal.transaction_receipt(
+                    authorized["transaction_id"]
+                )
+                self.assertNotIn("resume_events", receipt)
 
     def test_resume_requires_authorized_state_and_bounded_trials(self):
         with tempfile.TemporaryDirectory() as directory:

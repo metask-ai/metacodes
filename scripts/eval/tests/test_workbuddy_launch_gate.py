@@ -818,6 +818,29 @@ with urllib.request.urlopen(
             with self.assertRaisesRegex(LaunchError, "stage contradicts"):
                 validate_authorized_failure_receipt(contradictory_path)
 
+    def test_stale_resume_subset_env_refuses_normal_launch(self):
+        # 残留的 resume 子集 export 会让正常付费臂静默跑部分任务,审计
+        # fail-closed 时钱已花掉(2026-08-18 对抗审查 F6)——启动前拒绝。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest = self._manifest(root)
+            with mock.patch.dict(
+                os.environ, {"METACODES_WB_RESUME_TASKS": "code-task-a"}
+            ):
+                with self.assertRaisesRegex(
+                    LaunchError, "METACODES_WB_RESUME_TASKS"
+                ):
+                    execute_launch(
+                        manifest_path=manifest,
+                        journal_path=root / "budget.json",
+                        receipt_path=root / "receipt.json",
+                        credential_fd=self._credential_fd(),
+                        runner_argv=[
+                            sys.executable, "-c", "raise SystemExit(0)"
+                        ],
+                    )
+
     def test_offline_failure_recovery_reopens_authorized_without_provider(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2976,10 +2999,21 @@ class TrialResumeEligibilityTest(unittest.TestCase):
 
     def test_empty_ledger_is_refused(self):
         eligible, reason = launch_gate.trial_resume_eligibility(
-            {"exception_info": {"exception_type": "X"}}, []
+            {"exception_info": {"exception_type": "NonZeroAgentExitCodeError"}},
+            [],
         )
         self.assertFalse(eligible)
         self.assertIn("no provider ledger", reason)
+
+    def test_harness_defect_exception_type_is_refused(self):
+        # RuntimeError(如 ATIF 构建缺陷)即使与被重试的 502 尾部同现也不可
+        # 续——类型门先于尾部判定(2026-08-18 对抗审查)。
+        eligible, reason = launch_gate.trial_resume_eligibility(
+            {"exception_info": {"exception_type": "RuntimeError"}},
+            [{"seq": 1, "response": {"status": 502}, "error": None}],
+        )
+        self.assertFalse(eligible)
+        self.assertIn("not a resumable class", reason)
 
 
 class TrialResumeAuditTest(WorkBuddyRequestAuditRetryTest):
@@ -3020,6 +3054,7 @@ class TrialResumeAuditTest(WorkBuddyRequestAuditRetryTest):
         result["exception_info"] = {"exception_type": "NonZeroAgentExitCodeError"}
         result_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
         result_sha = hashlib.sha256(result_path.read_bytes()).hexdigest()
+        requests_sha = hashlib.sha256(request_log.read_bytes()).hexdigest()
         tainted_dir = trial_dir.with_name(trial_dir.name + ".tainted-a1")
         # attempt-2 = a fresh clean copy of the whole trial, ledger seqs 1..N.
         attempt2 = trial_dir.with_name(trial_dir.name.replace("__1", "__2"))
@@ -3051,6 +3086,14 @@ class TrialResumeAuditTest(WorkBuddyRequestAuditRetryTest):
         a2_result = json.loads((attempt2 / "result.json").read_text(encoding="utf-8"))
         a2_result["exception_info"] = None
         a2_result["trial_uri"] = attempt2.resolve().as_uri()
+        # attempt-2 跑在 <run_id>-a2 实例下:staged 路径与派生路由随之带后缀。
+        run_id = str(manifest["run_id"])
+        a2_result["task_id"]["path"] = a2_result["task_id"]["path"].replace(
+            f"staged/{run_id}/", f"staged/{run_id}-a2/"
+        )
+        a2_result["agent_info"]["model_info"]["name"] = a2_result["agent_info"][
+            "model_info"
+        ]["name"].replace(f"{run_id}--", f"{run_id}-a2--")
         (attempt2 / "result.json").write_text(
             json.dumps(a2_result) + "\n", encoding="utf-8"
         )
@@ -3065,6 +3108,7 @@ class TrialResumeAuditTest(WorkBuddyRequestAuditRetryTest):
                 "original_dir_rel": str(trial_dir.relative_to(result_root)),
                 "tainted_dir_rel": str(tainted_dir.relative_to(result_root)),
                 "result_sha256": result_sha,
+                "requests_sha256": requests_sha,
                 "reason": "test transient",
             }
         ]
@@ -3077,6 +3121,55 @@ class TrialResumeAuditTest(WorkBuddyRequestAuditRetryTest):
                 manifest, started_ns=0, official_runner=True, resumes=resumes
             )
             self.assertEqual(usage["quality"]["task_count"], 1)
+            # attempt-1 的真实花费单列披露(2026-08-18 对抗审查 F4)。
+            attempt1 = usage["resumed_attempts"]["code-task-a"]
+            self.assertEqual(attempt1["provider_requests"], 2)
+            self.assertEqual(
+                attempt1["requests_sha256"], resumes[0]["requests_sha256"]
+            )
+            # 反空转:同一 fixture 不带 resumes 必须拒绝——攻击面是"resumes
+            # 被静默忽略仍通过"(2026-08-18 对抗审查 J4:旧断言两态皆真)。
+            with self.assertRaises(LaunchError):
+                _collect_usage(
+                    manifest, started_ns=0, official_runner=True, resumes=None
+                )
+
+    def test_tainted_ledger_missing_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest, resumes = self._resumed_fixture(Path(directory))
+            workbuddy = Path(manifest["workbuddy"]["checkout"])
+            result_root = workbuddy / "results" / str(manifest["job"]["slug"])
+            (result_root / resumes[0]["tainted_dir_rel"] / "agent" /
+             "requests.jsonl").unlink()
+            with self.assertRaisesRegex(LaunchError, "unreadable"):
+                _collect_usage(
+                    manifest, started_ns=0, official_runner=True, resumes=resumes
+                )
+
+    def test_tainted_ledger_overlapping_wave1_seqs_fail_closed(self):
+        # 染污账本与干净 trial 的 seq 重叠 = wave-1 全域检查必须抓到
+        # (全局 sorted==1..N 是唯一防线,固定成 shipped 测试)。
+        with tempfile.TemporaryDirectory() as directory:
+            manifest, resumes = self._resumed_fixture(Path(directory))
+            workbuddy = Path(manifest["workbuddy"]["checkout"])
+            result_root = workbuddy / "results" / str(manifest["job"]["slug"])
+            ledger = (result_root / resumes[0]["tainted_dir_rel"] / "agent" /
+                      "requests.jsonl")
+            rows = [json.loads(line) for line in
+                    ledger.read_text(encoding="utf-8").splitlines() if line.strip()]
+            rows[1]["seq"] = 50
+            ledger.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            resumes = [dict(resumes[0])]
+            resumes[0]["requests_sha256"] = hashlib.sha256(
+                ledger.read_bytes()
+            ).hexdigest()
+            with self.assertRaisesRegex(LaunchError, "wave-1 sequence"):
+                _collect_usage(
+                    manifest, started_ns=0, official_runner=True, resumes=resumes
+                )
 
     def test_tainted_evidence_drift_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3096,4 +3189,341 @@ class TrialResumeAuditTest(WorkBuddyRequestAuditRetryTest):
             with self.assertRaisesRegex(LaunchError, "wave-2 sequence"):
                 _collect_usage(
                     manifest, started_ns=0, official_runner=True, resumes=resumes
+                )
+
+
+class TrialResumeOrchestrationTest(unittest.TestCase):
+    """resume_trials end to end, offline: real manifest file, real journal,
+    real failure receipt (recover path hardcodes the official identity
+    scope), real taint renames, fake attempt-2 runner, real taint-aware
+    audit, real commit. The single mock is _reobserve_launch_inputs —
+    identity reobservation needs the production checkout by design; every
+    other statement on the path is the shipped code. This is the L2 tier
+    that would have caught the 2026-08-18 review's J1 (receipt checkpoint
+    drift after the resume journal event) and F2/F1 (rerun clobbering
+    frozen run-level state) before production."""
+
+    RUN_ID = "workbuddy-l2-run-1"
+    SLUG = "metacodes-code-l2"
+    TASK = "code-task-a"
+    ROUTE = "workbuddy-l2-run-1--test-model"
+
+    _manifest = WorkBuddyPaidLaunchGateL2Test.__dict__["_manifest"]
+    _credential_fd = staticmethod(
+        WorkBuddyPaidLaunchGateL2Test.__dict__["_credential_fd"].__func__
+    )
+
+    def _exception_trial(self, workbuddy):
+        trial = workbuddy / "results" / self.SLUG / "run" / (self.TASK + "__1")
+        agent = trial / "agent"
+        agent.mkdir(parents=True)
+        records = [
+            {
+                "seq": 1,
+                "request": {
+                    "body": {
+                        "model": self.ROUTE,
+                        "system": "stable",
+                        "messages": [{"role": "user", "content": "task"}],
+                    }
+                },
+                "tools": [{"name": "Read"}],
+                "response": {"status": 200},
+                "error": None,
+            },
+            {
+                "seq": 2,
+                "request": {"body": {}},
+                "tools": [{"name": "Read"}],
+                "response": {"status": 502},
+                "error": "ConnectTimeout after 1 attempts",
+            },
+        ]
+        (agent / "requests.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in records),
+            encoding="utf-8",
+        )
+        result = {
+            "task_name": f"workbuddy/{self.TASK}",
+            "task_id": {
+                "path": str(
+                    Path(".workspace/tmp/staged")
+                    / self.RUN_ID
+                    / "wb-bench-code-v1.0/tasks"
+                    / self.TASK
+                )
+            },
+            "source": "tasks",
+            "trial_uri": trial.resolve().as_uri(),
+            "task_checksum": digest("official-task-checksum"),
+            "exception_info": {
+                "exception_type": "NonZeroAgentExitCodeError",
+                "exception_message": "Command failed (exit 89)",
+            },
+            "agent_info": {
+                "name": "metacodes",
+                "model_info": {"name": self.ROUTE},
+            },
+        }
+        (trial / "result.json").write_text(
+            json.dumps(result, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return trial
+
+    def _instance_fixture(self, workbuddy):
+        instance = workbuddy / "scripts/logs/instances" / self.RUN_ID
+        runtime_jobs = workbuddy / ".workspace/data/generated/jobs"
+        instance.mkdir(parents=True)
+        runtime_jobs.mkdir(parents=True)
+        (instance / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "selected_tasks": [self.TASK],
+                    "model_connection": "local_proxy",
+                    "record_full_io": True,
+                    "harness_resolved_slug": "metacodes/0.1.0",
+                    "model_slug": "test-model",
+                    "model_route": self.ROUTE,
+                    "backend_model_name": "glm-5.2",
+                    "harness_runtime_config": {
+                        "project_control_staged": False,
+                        "project_control_mode": "absent",
+                        "project_control_configured": False,
+                        "transport_model_is_route": True,
+                        "actor_model_identity": "glm-5.2",
+                        "translated_env": {},
+                    },
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (instance / "proxy.yaml").write_text(
+            "proxy:\n  backend_retries: 0\n  routes: []\n", encoding="utf-8"
+        )
+        (runtime_jobs / f"{self.SLUG}.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "agents": [
+                        {
+                            "kwargs": {
+                                "METACODES_MODEL_DISPLAY_NAME": "glm-5.2"
+                            }
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _attempt2_runner_code():
+        return r'''
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from scripts.eval.workbuddy.trace import OBSERVATION_JOURNAL_SCHEMA, load_control_metrics
+assert os.environ["INSTANCE_ID"] == "workbuddy-l2-run-1-a2", os.environ["INSTANCE_ID"]
+assert os.environ["METACODES_WB_RESUME_TASKS"] == "code-task-a"
+trial = Path(sys.argv[2]) / "results/metacodes-code-l2/run2/code-task-a__2"
+agent = trial / "agent"
+agent.mkdir(parents=True)
+transcript = agent / "metacodes-transcript.jsonl"
+transcript.write_text(json.dumps({"role": "user", "blocks": [{"type": "text", "text": "task"}]}) + "\n")
+observation = agent / "metacodes-tool-observations.jsonl"
+observation.write_text(
+    json.dumps({"schema_version": OBSERVATION_JOURNAL_SCHEMA, "sequence": 0,
+                "session_id": "session-a2", "run_id": "run-a2",
+                "monotonic_elapsed_ns": 0, "event": {"run_started": {}}}) + "\n"
+    + json.dumps({"schema_version": OBSERVATION_JOURNAL_SCHEMA, "sequence": 1,
+                  "session_id": "session-a2", "run_id": "run-a2",
+                  "monotonic_elapsed_ns": 1, "event": {"run_finished": {}}}) + "\n"
+)
+control = load_control_metrics(transcript, observation)
+route = "workbuddy-l2-run-1-a2--test-model"
+trajectory = {
+  "final_metrics": {
+    "total_prompt_tokens": 10,
+    "total_completion_tokens": 2,
+    "total_cached_tokens": 3,
+    "total_cost_usd": 0.002,
+    "extra": {"cache_creation_input_tokens": 4, "control_metrics": control,
+              "metacodes_turns": 1}
+  }
+}
+(agent / "trajectory.json").write_text(json.dumps(trajectory) + "\n")
+record = {"seq": 1, "request": {"body": {"model": route, "system": "stable",
+          "messages": [{"role": "user", "content": "task"}]}},
+          "tools": [{"name": "Read"}], "response": {"status": 200}, "error": None}
+(agent / "requests.jsonl").write_text(json.dumps(record) + "\n")
+(trial / "config.json").write_text(json.dumps(
+    {"agent": {"kwargs": {"METACODES_MODEL_DISPLAY_NAME": "glm-5.2"}}}) + "\n")
+(agent / "metacodes-runtime-contract.json").write_text(json.dumps(
+    {"project_control": {"staged": False, "mode": "absent", "configured": False,
+                         "project_state_hash": None, "artifacts_verified": False,
+                         "runtime_active_bundle_absent": True},
+     "transport_model_is_route": True,
+     "actor_model_identity": "glm-5.2"}) + "\n")
+result = {
+    "task_name": "workbuddy/code-task-a",
+    "task_id": {"path": str(Path(".workspace/tmp/staged") / "workbuddy-l2-run-1-a2" / "wb-bench-code-v1.0/tasks" / "code-task-a")},
+    "source": "tasks",
+    "trial_uri": trial.resolve().as_uri(),
+    "task_checksum": "%s",
+    "exception_info": None,
+    "agent_info": {"name": "metacodes", "model_info": {"name": route}},
+    "verifier_result": {"rewards": {"reward": 1.0}},
+}
+(trial / "result.json").write_text(json.dumps(result, sort_keys=True) + "\n")
+''' % digest("official-task-checksum")
+
+    def _armed(self, root):
+        os.chmod(root, 0o700)
+        manifest_path = self._manifest(root)
+        manifest = validate_launch_manifest(manifest_path)
+        workbuddy = root / "workbuddy"
+        started_ns = time.time_ns() - 1_000_000
+        self._exception_trial(workbuddy)
+        self._instance_fixture(workbuddy)
+        journal_path = root / "budget.json"
+        budget = manifest["budget"]
+        model = manifest["model"]
+        authority = BudgetAuthority(
+            manifest_sha256=manifest["content_sha256"],
+            model_fingerprint=model["fingerprint"],
+            provider_identity=model["provider_identity"],
+            total_cost_microusd=budget["total_cost_microusd"],
+            total_metered_tokens=budget["total_metered_tokens"],
+        )
+        transaction = BudgetTransaction(
+            run_id=manifest["run_id"],
+            manifest_sha256=manifest["content_sha256"],
+            model_fingerprint=model["fingerprint"],
+            harness_fingerprint=manifest["harness_fingerprint"],
+            provider_identity=model["provider_identity"],
+            max_cost_microusd=budget["max_cost_microusd"],
+            max_metered_tokens=budget["max_metered_tokens"],
+        )
+        with BudgetJournal(journal_path, authority) as journal:
+            reserved = journal.reserve(transaction)
+            journal.authorize_request(
+                reserved["transaction_id"],
+                expected_revision=reserved["journal_revision"],
+                expected_head_sha256=reserved["journal_head_sha256"],
+            )
+        failure_receipt = root / "audit-failure.json"
+        recover_authorized_failure_receipt(
+            manifest_path=manifest_path,
+            journal_path=journal_path,
+            receipt_path=failure_receipt,
+            runner_returncode=0,
+            failure_stage="post_run_evidence_audit",
+            started_ns=started_ns,
+        )
+        return manifest_path, journal_path, failure_receipt, started_ns, authority
+
+    def _resume(self, root, manifest_path, journal_path, failure_receipt,
+                started_ns, runner_argv):
+        repo = Path(__file__).resolve().parents[3]
+        with mock.patch.object(launch_gate, "_reobserve_launch_inputs"):
+            return launch_gate.resume_trials(
+                manifest_path=manifest_path,
+                journal_path=journal_path,
+                failure_receipt_path=failure_receipt,
+                receipt_path=root / "receipt.json",
+                credential_fd=self._credential_fd(),
+                started_ns=started_ns,
+                runner_argv=runner_argv,
+            )
+
+    def test_resume_trials_commits_end_to_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (manifest_path, journal_path, failure_receipt,
+             started_ns, authority) = self._armed(root)
+            repo = Path(__file__).resolve().parents[3]
+            receipt = self._resume(
+                root, manifest_path, journal_path, failure_receipt,
+                started_ns,
+                [sys.executable, "-c", self._attempt2_runner_code(),
+                 str(repo), str(root / "workbuddy")],
+            )
+            self.assertEqual(receipt["budget_transaction"]["state"], "committed")
+            self.assertEqual(len(receipt["resumes"]), 1)
+            row = receipt["resumes"][0]
+            self.assertEqual(row["task"], self.TASK)
+            self.assertEqual(
+                row["tainted_dir_rel"], row["original_dir_rel"] + ".tainted-a1"
+            )
+            # attempt-1 无轨迹(真实事故形):花费不可得必须显式披露。
+            self.assertTrue(row["attempt1_usage"]["usage_unavailable"])
+            self.assertEqual(row["attempt1_usage"]["provider_requests"], 2)
+            # revision-gap:authorize(2) -> resume(3) -> commit(4)。
+            transaction = receipt["budget_transaction"]
+            self.assertEqual(
+                transaction["commit_revision"]
+                - transaction["authorization_revision"],
+                2,
+            )
+            tainted = (root / "workbuddy" / "results" / self.SLUG / "run"
+                       / (self.TASK + "__1.tainted-a1"))
+            self.assertTrue(tainted.is_dir())
+            with BudgetJournal(journal_path, authority) as journal:
+                events = journal.resume_events(
+                    str(transaction["transaction_id"])
+                )
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["trials"], (self.TASK,))
+
+    def test_resume_trials_runner_crash_then_continuation_succeeds(self):
+        # rename 之后 runner 崩溃曾是永久卡死态(2026-08-18 对抗审查 F3):
+        # 再入必须复用账本里的授权(不追加第二个事件)并跑通。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (manifest_path, journal_path, failure_receipt,
+             started_ns, authority) = self._armed(root)
+            repo = Path(__file__).resolve().parents[3]
+            with self.assertRaisesRegex(LaunchError, "continues it"):
+                self._resume(
+                    root, manifest_path, journal_path, failure_receipt,
+                    started_ns,
+                    [sys.executable, "-c", "raise SystemExit(7)"],
+                )
+            tainted = (root / "workbuddy" / "results" / self.SLUG / "run"
+                       / (self.TASK + "__1.tainted-a1"))
+            self.assertTrue(tainted.is_dir())
+            receipt = self._resume(
+                root, manifest_path, journal_path, failure_receipt,
+                started_ns,
+                [sys.executable, "-c", self._attempt2_runner_code(),
+                 str(repo), str(root / "workbuddy")],
+            )
+            self.assertEqual(receipt["budget_transaction"]["state"], "committed")
+            with BudgetJournal(journal_path, authority) as journal:
+                events = journal.resume_events(
+                    str(receipt["budget_transaction"]["transaction_id"])
+                )
+                self.assertEqual(len(events), 1)
+
+    def test_clean_trial_is_never_resumable(self):
+        # 干净但低分的 trial:exception_info == null → 整个 resume 拒绝。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (manifest_path, journal_path, failure_receipt,
+             started_ns, authority) = self._armed(root)
+            trial = (root / "workbuddy" / "results" / self.SLUG / "run"
+                     / (self.TASK + "__1"))
+            result = json.loads(
+                (trial / "result.json").read_text(encoding="utf-8")
+            )
+            result["exception_info"] = None
+            (trial / "result.json").write_text(
+                json.dumps(result, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(LaunchError, "no eligible exception"):
+                self._resume(
+                    root, manifest_path, journal_path, failure_receipt,
+                    started_ns,
+                    [sys.executable, "-c", "raise SystemExit(0)"],
                 )

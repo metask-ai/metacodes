@@ -515,6 +515,11 @@ _RESUME_SUBSET_OLD = """    try:
 _RESUME_SUBSET_NEW = _RESUME_SUBSET_OLD + """
     resume_subset_raw = os.environ.get("METACODES_WB_RESUME_TASKS")
     if resume_subset_raw:
+        if not selected_tasks:
+            raise ValueError(
+                f"{job_config_path}: resume subset requires a name-mode "
+                "task selection; mode-all jobs cannot be resumed"
+            )
         resume_subset = [name for name in resume_subset_raw.split(",") if name]
         unknown = sorted(set(resume_subset) - set(selected_tasks))
         if unknown:
