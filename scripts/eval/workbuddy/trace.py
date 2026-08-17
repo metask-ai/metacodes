@@ -1367,6 +1367,30 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                     ):
                         raise TraceError(f"requirement ledger {where} is invalid")
                     formal["requirement_ledger_" + key] = value
+            elif observation_kind == "test_weakening_candidate":
+                # PO-V2 M2 observe-only candidate: a realized edit to a
+                # test-classified file. Schema pinned; counters split by the
+                # hot combination (assert tokens touched while the latest
+                # verification attempt had FAILED) so the observe wave can
+                # measure base rate and precision before any obligation.
+                if (
+                    observation.get("schema_version")
+                    != "metacodes-test-weakening-candidate-v1"
+                    or not isinstance(observation.get("assert_tokens_touched"), bool)
+                    or not isinstance(
+                        observation.get("last_verification_failed"), bool
+                    )
+                ):
+                    raise TraceError("test weakening candidate record is invalid")
+                formal["test_weakening_candidates"] = (
+                    formal.get("test_weakening_candidates", 0) + 1
+                )
+                if observation["assert_tokens_touched"] and observation[
+                    "last_verification_failed"
+                ]:
+                    formal["test_weakening_hot_candidates"] = (
+                        formal.get("test_weakening_hot_candidates", 0) + 1
+                    )
             elif observation_kind in {"rule_coverage_gap", "rule_bounds_overflow"}:
                 # Diagnostic-only signals: no identity to cross-check here,
                 # but count them so silence stays distinguishable from absence.

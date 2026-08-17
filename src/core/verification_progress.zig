@@ -90,6 +90,9 @@ pub const State = struct {
     /// verified state. Observational counter for the shadow phase of any
     /// future formal rule.
     reopened_after_verification: u32 = 0,
+    /// 最近一次验证尝试(tier1/tier2 形状)的结局是失败(PO-V2 M2 信号位:
+    /// 失败之后的测试文件编辑是"弱化候选")。成功验证清零。
+    last_verification_failed: bool = false,
     churn_caution_pending: bool = false,
     churn_caution_emitted: bool = false,
     /// Basenames of files with realized mutations this session (bounded;
@@ -149,6 +152,13 @@ pub const State = struct {
             self.known_failing = false;
         } else if (failed_attempt and self.unverified_mutation) {
             self.known_failing = true;
+        }
+        // M2 信号位与义务无关,单独维护:本轮出现成功验证 → 清;
+        // 只有失败尝试 → 置。两者皆无 → 保持。
+        if (tier1 or tier2) {
+            self.last_verification_failed = false;
+        } else if (failed_attempt) {
+            self.last_verification_failed = true;
         }
         const checkpoint = mutation_preceded_turn and
             !self.checkpoint_emitted and tier1;
@@ -342,7 +352,7 @@ fn heredocPrefix(command: []const u8) []const u8 {
     return command;
 }
 
-fn isRealizedMutation(effect: ?observation.Effect, effect_valid: bool) bool {
+pub fn isRealizedMutation(effect: ?observation.Effect, effect_valid: bool) bool {
     if (!effect_valid) return false;
     const value = effect orelse return false;
     return switch (value) {
@@ -352,6 +362,37 @@ fn isRealizedMutation(effect: ?observation.Effect, effect_valid: bool) bool {
         .file_mutation_v2 => |mutation| mutation.mutation.change == .changed and
             mutation.reobservation.state == .matched,
     };
+}
+
+/// 测试分类文件的任务无关启发:basename 以 test_/test. 开头、以 _test.<ext>
+/// 结尾、或路径含 /tests//test/ 目录段。PO-V2 M2 候选信号用;观察期启发,
+/// 精度由观察数据校准。
+pub fn isTestFilePath(path: []const u8) bool {
+    const base = std.fs.path.basename(path);
+    if (std.mem.startsWith(u8, base, "test_") or std.mem.startsWith(u8, base, "test.")) return true;
+    if (std.mem.indexOf(u8, base, "_test.") != null or std.mem.indexOf(u8, base, ".test.") != null) return true;
+    if (std.mem.indexOf(u8, path, "/tests/") != null or std.mem.indexOf(u8, path, "/test/") != null) return true;
+    return false;
+}
+
+/// 编辑输入是否触碰断言类 token(assert/expect;大小写不敏感,扫原始 JSON
+/// 字节即可——转义不影响 ASCII 子串)。观察期启发。
+pub fn editTouchesAssertTokens(input: []const u8) bool {
+    var i: usize = 0;
+    while (i + 6 <= input.len) : (i += 1) {
+        const window6 = input[i .. i + 6];
+        var lower6: [6]u8 = undefined;
+        for (window6, 0..) |c, j| lower6[j] = std.ascii.toLower(c);
+        if (std.mem.eql(u8, &lower6, "assert") or std.mem.eql(u8, &lower6, "expect")) return true;
+    }
+    return false;
+}
+
+/// 从 Edit/Write/NotebookEdit 输入提取目标路径(unescape 后 owned)。
+pub fn slotFilePath(allocator: std.mem.Allocator, input: []const u8) ?[]u8 {
+    const encoded = common.extractJsonArg(input, "file_path") orelse
+        common.extractJsonArg(input, "notebook_path") orelse return null;
+    return util_json.unescapeString(encoded, allocator) catch null;
 }
 
 fn isSuccessfulVerification(allocator: std.mem.Allocator, slot: tool_exec.Slot) bool {
@@ -853,4 +894,21 @@ test "same-turn mutation plus probe keeps the obligation open" {
     const probe = "{\"command\":\"python3 -m py_compile tornado_like/headers.py\"}";
     _ = state.observeTurn(a, &.{ testEditSlot(EDIT_HEADERS), testBashSlot(probe, OK) });
     try std.testing.expect(state.unverified_mutation);
+}
+
+test "M2: test file path heuristic" {
+    try std.testing.expect(isTestFilePath("/w/tests/test_a.py"));
+    try std.testing.expect(isTestFilePath("/w/pkg/foo_test.go"));
+    try std.testing.expect(isTestFilePath("/w/src/app.test.ts"));
+    try std.testing.expect(isTestFilePath("/w/test/headers.py"));
+    try std.testing.expect(!isTestFilePath("/w/src/app.py"));
+    try std.testing.expect(!isTestFilePath("/w/contest/entry.py"));
+    try std.testing.expect(!isTestFilePath("/w/src/protester.py"));
+}
+
+test "M2: assert token heuristic scans raw escaped input" {
+    try std.testing.expect(editTouchesAssertTokens("{\"content\":\"    assert x == 1\\n\"}"));
+    try std.testing.expect(editTouchesAssertTokens("{\"new_string\":\"expectEqual(a,b)\"}"));
+    try std.testing.expect(editTouchesAssertTokens("{\"content\":\"ASSERT_TRUE(ok)\"}"));
+    try std.testing.expect(!editTouchesAssertTokens("{\"content\":\"print(1)\\n\"}"));
 }

@@ -883,6 +883,49 @@ class WorkBuddyTraceTest(unittest.TestCase):
                 load_control_metrics(transcript, observation)
         self.assertIn("bypassed its formal batch", str(caught.exception))
 
+    def test_weakening_candidate_counted_and_schema_pinned(self):
+        # PO-V2 M2 observe-only signal: counters split plain vs hot
+        # (assert tokens touched while the latest verification had failed);
+        # unknown schema versions fail closed like every journal kind.
+        def candidate(assert_tokens, last_failed, schema="metacodes-test-weakening-candidate-v1"):
+            return {"tool_observation": {"test_weakening_candidate": {
+                "schema_version": schema,
+                "dispatch_id": "d-1",
+                "path_sha256": "a" * 64,
+                "tool": "Write",
+                "assert_tokens_touched": assert_tokens,
+                "last_verification_failed": last_failed,
+            }}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(transcript, [{"role": "user", "blocks": []}])
+            self._write_jsonl(
+                observation,
+                self._journal(
+                    candidate(True, True),
+                    candidate(True, False),
+                    candidate(False, True),
+                ),
+            )
+            metrics = load_control_metrics(transcript, observation)
+        self.assertEqual(metrics["lean"]["test_weakening_candidates"], 3)
+        self.assertEqual(metrics["lean"]["test_weakening_hot_candidates"], 1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(transcript, [{"role": "user", "blocks": []}])
+            self._write_jsonl(
+                observation,
+                self._journal(candidate(True, True, schema="metacodes-test-weakening-candidate-v2")),
+            )
+            with self.assertRaisesRegex(TraceError, "weakening candidate"):
+                load_control_metrics(transcript, observation)
+
     def test_control_metrics_count_tinykg_routing_trust_and_task_commit(self):
         calls = [
             ("recall-hit", "KgRecall", {

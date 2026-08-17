@@ -1757,9 +1757,34 @@ pub fn run(
         const observe_verification = opts.verification_checkpoint or
             opts.verification_final_gate or opts.verification_final_observe or
             opts.requirement_ledger or opts.requirement_ledger_observe;
+        // PO-V2 M2(observe-only):候选信号要的是"编辑发生时,最近验证是否
+        // 失败"——必须取 observeTurn 之前的位;本轮自己的验证结果属于下一轮。
+        const pre_turn_verification_failed = verification_progress.last_verification_failed;
         const inject_verification_checkpoint = observe_verification and
             verification_progress.observeTurn(allocator, slots.items) and
             opts.verification_checkpoint;
+        if (observe_verification) {
+            if (opts.tool_observer) |observer| {
+                for (slots.items) |slot| {
+                    if (slot.decision != .run or slot.is_error) continue;
+                    const is_file_edit = std.mem.eql(u8, slot.name, "Edit") or
+                        std.mem.eql(u8, slot.name, "Write") or
+                        std.mem.eql(u8, slot.name, "NotebookEdit");
+                    if (!is_file_edit) continue;
+                    if (!verification_progress_mod.isRealizedMutation(slot.effect, slot.effect_valid)) continue;
+                    const edit_path = verification_progress_mod.slotFilePath(allocator, slot.input) orelse continue;
+                    defer allocator.free(edit_path);
+                    if (!verification_progress_mod.isTestFilePath(edit_path)) continue;
+                    _ = observer.emit(.{ .test_weakening_candidate = .{
+                        .dispatch_id = slot.id,
+                        .path_sha256 = tools_mod.tool_observation.sha256Hex(edit_path),
+                        .tool = slot.name,
+                        .assert_tokens_touched = verification_progress_mod.editTouchesAssertTokens(slot.input),
+                        .last_verification_failed = pre_turn_verification_failed,
+                    } });
+                }
+            }
+        }
 
         // 6d. 按原顺序回填 result_blocks。
         // P0.2 PostToolUse:执行后 hook 产出的 additionalContext,拼成一段注入本轮 user 消息(下轮模型可见)。

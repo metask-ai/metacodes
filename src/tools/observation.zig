@@ -24,6 +24,7 @@ pub const RULE_COVERAGE_GAP_SCHEMA_VERSION = "metacodes-project-rule-coverage-ga
 pub const RULE_BOUNDS_OVERFLOW_SCHEMA_VERSION = "metacodes-project-rule-bounds-overflow-v1";
 pub const VERIFICATION_FINAL_GATE_SCHEMA_VERSION = "metacodes-verification-final-gate-v2";
 pub const REQUIREMENT_LEDGER_SCHEMA_VERSION = "metacodes-requirement-ledger-v1";
+pub const TEST_WEAKENING_SCHEMA_VERSION = "metacodes-test-weakening-candidate-v1";
 
 pub const Origin = enum {
     authoritative,
@@ -263,6 +264,18 @@ pub const Event = union(enum) {
         project_sha256: [64]u8,
         bundle_sha256: [64]u8,
         bundle_revision: u64,
+    },
+    /// PO-V2 M2(observe-only):最近一次验证尝试失败之后,对测试分类文件的
+    /// 已实现编辑。候选信号——不判定、不拦截;观察期先测底率与误报率
+    /// (fstack-r2 两起同向事件:改断言迁就 bug 代码/迁就自己输出)。
+    /// 隐私:只发路径哈希与布尔,不发原文。
+    test_weakening_candidate: struct {
+        schema_version: []const u8 = TEST_WEAKENING_SCHEMA_VERSION,
+        dispatch_id: []const u8,
+        path_sha256: [64]u8,
+        tool: []const u8,
+        assert_tokens_touched: bool,
+        last_verification_failed: bool,
     },
     rule_coverage_gap: struct {
         schema_version: []const u8 = RULE_COVERAGE_GAP_SCHEMA_VERSION,

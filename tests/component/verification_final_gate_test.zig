@@ -526,3 +526,110 @@ test "L2 churn after a verified state injects one freshness caution and counts t
     try std.testing.expectEqual(@as(u8, 0), run.record.nudges);
     try std.testing.expect(run.caution_request != null);
 }
+
+// ── PO-V2 M2:测试弱化候选信号(observe-only)────────────────────────────
+// fstack-r2 两起同向事件:失败自测后把断言改弱迁就代码/自己输出。信号 =
+// 失败验证之后、对测试分类文件的已实现编辑;只发候选事件,不判定不拦截。
+
+const WeakeningSink = struct {
+    candidates: usize = 0,
+    hot: usize = 0, // assert_tokens_touched && last_verification_failed
+    last_failed_flags: [8]bool = undefined,
+
+    fn emit(raw: *anyopaque, event: cc.tools.tool_observation.Event) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        switch (event) {
+            .test_weakening_candidate => |record| {
+                if (self.candidates < self.last_failed_flags.len)
+                    self.last_failed_flags[self.candidates] = record.last_verification_failed;
+                self.candidates += 1;
+                if (record.assert_tokens_touched and record.last_verification_failed)
+                    self.hot += 1;
+            },
+            else => {},
+        }
+        return true;
+    }
+
+    fn sink(self: *@This()) cc.tools.tool_observation.Sink {
+        return .{ .ctx = @ptrCast(self), .emitFn = emit };
+    }
+};
+
+test "L2 a test-file edit after a failed verification emits a hot weakening candidate" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const tests_dir = try std.fmt.allocPrint(a, "{s}/tests", .{root});
+    defer a.free(tests_dir);
+    try cc.util_fs.mkdirParents(tests_dir);
+
+    const test_path = try std.fmt.allocPrint(a, "{s}/tests/test_sample.py", .{root});
+    defer a.free(test_path);
+    const write_input = try std.fmt.allocPrint(
+        a,
+        "{{\"file_path\":\"{s}\",\"content\":\"def test_a():\\n    assert 1 == 1\\n\"}}",
+        .{test_path},
+    );
+    defer a.free(write_input);
+    const write_test = try toolSse(a, "w1", "Write", write_input);
+    defer a.free(write_test);
+    const fail_verify = try bashSse(a, "pytest");
+    defer a.free(fail_verify);
+    const weaken_input = try std.fmt.allocPrint(
+        a,
+        "{{\"file_path\":\"{s}\",\"content\":\"def test_a():\\n    assert True\\n\"}}",
+        .{test_path},
+    );
+    defer a.free(weaken_input);
+    const weaken = try toolSse(a, "w2", "Write", weaken_input);
+    defer a.free(weaken);
+
+    var server = try harness.MockServer.startCassette(
+        &.{ write_test, fail_verify, weaken, END_TURN },
+        0,
+    );
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "key", "model", url);
+    defer client.deinit();
+    var conversation = cc.conversation.Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "repair the repository");
+    var permission = cc.permission.createContext(.bypass_permissions, a);
+    permission.no_interactive_prompt = true;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    var record = WeakeningSink{};
+    const result = try cc.agent_loop.run(
+        &conversation,
+        client.provider(),
+        defs,
+        &permission,
+        .{
+            .max_turns = 8,
+            .system_prompt = "STABLE-PREFIX",
+            .verification_final_observe = true,
+            .tool_observer = record.sink(),
+            .cwd_abs = root,
+            .home_dir = root,
+            .auto_compact_threshold = std.math.maxInt(usize),
+        },
+        &backend,
+        a,
+    );
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    // 两次测试文件写:第一次在任何验证之前(last_failed=false),第二次在
+    // 失败的 pytest 之后(last_failed=true 且触碰 assert → hot)。
+    try std.testing.expectEqual(@as(usize, 2), record.candidates);
+    try std.testing.expectEqual(@as(usize, 1), record.hot);
+    try std.testing.expect(!record.last_failed_flags[0]);
+    try std.testing.expect(record.last_failed_flags[1]);
+}
