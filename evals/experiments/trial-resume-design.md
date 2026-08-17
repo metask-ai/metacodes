@@ -82,7 +82,8 @@ journaled evidence_sha256。跨臂:resume 与否不要求对称(它是基础设�
 - **残余(登记非修)**:资格谓词常量/文案在授权与 continuation 之间变更会令在途 resume
   以"证据不匹配"死亡(罕见,fail-closed);started_ns 由操作者提供,共享 result root 的
   错值两个方向都 fail-closed 但报错不指向根因;>1 resumed trial 的全编排路径待生产首用
-  (账本/审计逐行逻辑已各自有测)。
+  (账本/审计逐行逻辑已各自有测);**原失败收据文件在 resume 落账后不可替代**(账本 pin
+  其 sha,重铸因 elapsed_seconds 变字节)——它与 journal 同级珍贵,操作纪律:落账后勿动。
 
 ## 部署位置
 
