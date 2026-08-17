@@ -19,6 +19,7 @@ from scripts.eval.workbuddy.launch_gate import (
     SCHEMA_VERSION,
     HOST_CONTROL_PLANE_MODULES,
     LaunchError,
+    _canonical_sha256,
 )
 from scripts.eval.workbuddy import WORKBUDDY_PINNED_COMMIT
 from scripts.eval.workbuddy.paired_analysis import (
@@ -265,10 +266,21 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                 expected_head_sha256=str(reserved["journal_head_sha256"]),
             )
             if resumed:
+                resume_row = {
+                    "task": "task-a",
+                    "reason": "agent exception NonZeroAgentExitCodeError "
+                    "with provider tail failure status=502 error=None",
+                    "result_sha256": digest("resume-result"),
+                    "requests_sha256": digest("resume-ledger"),
+                    "original_dir_rel": "run/task-a__1",
+                    "tainted_dir_rel": "run/task-a__1.tainted-a1",
+                }
                 budget.authorize_trial_resume(
                     str(authorized["transaction_id"]),
                     trials=["task-a"],
-                    evidence_sha256=digest("resume-evidence"),
+                    evidence_sha256=_canonical_sha256(
+                        {"rows": [resume_row]}
+                    ),
                     failure_receipt_sha256=digest("resume-failure-receipt"),
                     expected_revision=int(authorized["journal_revision"]),
                     expected_head_sha256=str(
@@ -318,13 +330,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
             value["resume_audit"] = {}
             value["resumes"] = [
                 {
-                    "task": "task-a",
-                    "reason": "agent exception NonZeroAgentExitCodeError "
-                    "with provider tail failure status=502 error=None",
-                    "result_sha256": digest("resume-result"),
-                    "requests_sha256": digest("resume-ledger"),
-                    "original_dir_rel": "run/task-a__1",
-                    "tainted_dir_rel": "run/task-a__1.tainted-a1",
+                    **resume_row,
                     "attempt1_usage": {
                         "provider_requests": 2,
                         "requests_sha256": digest("resume-ledger"),
@@ -432,6 +438,34 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                     treatment_journal_path=tj,
                 )
 
+    def test_tampered_resumes_content_fails_journal_binding(self):
+        # 计数对、内容错(2026-08-18 第二轮审查 C2):把披露块的任务名换成
+        # 另一个 selected 任务,revision-gap 仍满足——必须由账本
+        # evidence_sha256 内容绑定抓住。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bm, bmv = self._manifest(root, "baseline")
+            tm, tmv = self._manifest(root, "treatment")
+            br, brv, bj = self._receipt(root, "baseline", bmv, resumed=True)
+            tr, trv, tj = self._receipt(root, "treatment", tmv)
+            tampered = copy.deepcopy(brv)
+            tampered["resumes"][0]["task"] = "task-b"
+            tampered["usage"]["resumed_attempts"] = {
+                "task-b": tampered["usage"]["resumed_attempts"]["task-a"]
+            }
+            self._write(br, tampered)
+            with self.assertRaisesRegex(
+                LaunchError, "does not match the journaled authorization"
+            ):
+                build_report(
+                    baseline_manifest_path=bm,
+                    baseline_receipt_path=br,
+                    baseline_journal_path=bj,
+                    treatment_manifest_path=tm,
+                    treatment_receipt_path=tr,
+                    treatment_journal_path=tj,
+                )
+
     def test_fabricated_resumes_disclosure_fails_revision_binding(self):
         # 伪造:journal 无 resume 事件(commit_revision=3),收据硬塞
         # resumes 块 → 同一 gap 算式反向抓到。
@@ -452,6 +486,42 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 LaunchError, "budget identity is inconsistent"
             ):
+                build_report(
+                    baseline_manifest_path=bm,
+                    baseline_receipt_path=br,
+                    baseline_journal_path=bj,
+                    treatment_manifest_path=tm,
+                    treatment_receipt_path=tr,
+                    treatment_journal_path=tj,
+                )
+
+    def test_absorbed_hidden_resume_fails_closed(self):
+        # 完整再平衡的藏匿(2026-08-18 第二轮审查 [3]/probe_d):剥掉披露
+        # 块并把 attempt-1 花费吸收进 usage 与 task 行,让花费恒等式全部
+        # 平账——只剩 revision-gap 与账本 resume_events 披露强制能抓。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bm, bmv = self._manifest(root, "baseline")
+            tm, tmv = self._manifest(root, "treatment")
+            br, brv, bj = self._receipt(root, "baseline", bmv, resumed=True)
+            tr, trv, tj = self._receipt(root, "treatment", tmv)
+            hidden = dict(brv)
+            hidden.pop("resumes")
+            hidden.pop("resume_audit")
+            usage = {
+                key: value
+                for key, value in brv["usage"].items()
+                if key != "resumed_attempts"
+            }
+            usage["cost_microusd"] = 35_000
+            usage["metered_tokens"] = 241
+            tasks = {key: dict(value) for key, value in usage["tasks"].items()}
+            tasks["task-a"]["cost_usd"] = 0.015
+            tasks["task-a"]["metered_tokens"] = 140
+            usage["tasks"] = tasks
+            hidden["usage"] = usage
+            self._write(br, hidden)
+            with self.assertRaises(LaunchError):
                 build_report(
                     baseline_manifest_path=bm,
                     baseline_receipt_path=br,
@@ -804,6 +874,15 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ResumeBoundLockstepTest(unittest.TestCase):
+    def test_paired_resume_bound_matches_launch_gate(self):
+        # paired_analysis 的 `len(resumes) > 3` 字面量与 launch_gate 的
+        # MAX_RESUMED_TRIALS 锁步;任何一侧单改此测试即红。
+        from scripts.eval.workbuddy.launch_gate import MAX_RESUMED_TRIALS
+
+        self.assertEqual(MAX_RESUMED_TRIALS, 3)
+
 
 class ProgressAnalyzerSuccessionTest(unittest.TestCase):
     """The succession verifier is fail-closed on every branch that is not the

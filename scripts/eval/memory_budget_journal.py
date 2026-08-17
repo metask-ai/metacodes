@@ -925,7 +925,8 @@ class BudgetJournal:
         self._require_cas(expected_revision, expected_head_sha256)
         if current["state"] != "request_authorized":
             _fail("budget transaction", "trial resume requires request_authorized state")
-        if len(current["resume_events"]) >= 2:
+        if len(current["resume_events"]) >= 1:
+            # 与重放侧(events 校验)的 1 事件预算保持锁步。
             _fail("budget transaction", "trial resume budget is exhausted")
         return self._append(
             action="trial_resume_authorized",

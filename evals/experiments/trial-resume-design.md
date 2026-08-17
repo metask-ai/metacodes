@@ -68,6 +68,22 @@ resume 事件数(有 resumes 块=1,无=0)——藏匿或伪造披露块都会撞
 journaled evidence_sha256。跨臂:resume 与否不要求对称(它是基础设施事件,不是 treatment;
 但报告必须并排披露两臂 resume 计数,供解读者判断)。
 
+## 第二轮审查落定(2026-08-18)
+
+- **余量预检**:授权前汇总本 run 已观测花费(干净 trial + attempt-1 轨迹,缺失按 0 低估),
+  已达事务上限即拒绝——重跑注定无法 commit 的臂现在烧毁,而不是花两次钱后卡死。
+- **半成品拒绝**:trajectory 有、result 无的目录(runner 死在 verifier 期,真实窗口 ~13s)
+  前置拒绝并报路径;它对 pending 检测不可见、对审计轨迹计数可见。
+- **pending 子集**:continuation 只重跑仍缺干净 attempt-2 的任务;全齐则零花费直进审计
+  (此路径不要求 provider 凭证,--credential-fd 改为可选)。attempt-2 自身异常 = 烧臂。
+- **终端性资格**:账本连续失败尾段才算瞬态;5xx 后有成功记录 = 已恢复,agent 之死另有原因,拒绝。
+- **双层披露防御**:paired 的 revision-gap 管存在性(藏匿/伪造),账本 resume_events 内容绑定管
+  篡改(换任务名/哈希/理由);变异验证两层各有击杀测试。
+- **残余(登记非修)**:资格谓词常量/文案在授权与 continuation 之间变更会令在途 resume
+  以"证据不匹配"死亡(罕见,fail-closed);started_ns 由操作者提供,共享 result root 的
+  错值两个方向都 fail-closed 但报错不指向根因;>1 resumed trial 的全编排路径待生产首用
+  (账本/审计逐行逻辑已各自有测)。
+
 ## 部署位置
 
 恢复工具,不改模型面(treatment 语义零变化;launch_gate/journal 属 host control plane)。

@@ -314,6 +314,47 @@ def _receipt(
         != journal["transaction_states"]
     ):
         raise LaunchError("paired WorkBuddy receipt disagrees with its budget journal")
+    # resumes 内容绑定(2026-08-18 第二轮审查 C2):revision-gap 只绑事件
+    # 计数;披露块的任务名/证据哈希/理由必须逐字节复现账本授权的
+    # evidence_sha256——否则报告可以宣称一个从未被重跑的 trial 被重跑了。
+    replayed_transaction = (replayed.get("transactions") or {}).get(
+        str(transaction["transaction_id"])
+    ) or {}
+    journaled_resume_events = list(
+        replayed_transaction.get("resume_events") or []
+    )
+    if "resumes" in receipt:
+        if len(journaled_resume_events) != 1:
+            raise LaunchError(
+                "paired WorkBuddy resumes disclosure has no journaled "
+                "authorization"
+            )
+        event = journaled_resume_events[0]
+        plain_rows = sorted(
+            (
+                {
+                    key: str(value)
+                    for key, value in row.items()
+                    if key != "attempt1_usage"
+                }
+                for row in receipt["resumes"]
+            ),
+            key=lambda row: row["task"],
+        )
+        if sorted(event.get("trials") or []) != [
+            row["task"] for row in plain_rows
+        ] or _canonical_sha256({"rows": plain_rows}) != event.get(
+            "evidence_sha256"
+        ):
+            raise LaunchError(
+                "paired WorkBuddy resumes disclosure does not match the "
+                "journaled authorization"
+            )
+    elif journaled_resume_events:
+        raise LaunchError(
+            "paired WorkBuddy journal records a resume authorization the "
+            "receipt does not disclose"
+        )
     _number(receipt.get("elapsed_seconds"), "elapsed time")
     selected = manifest["cohort"]["selected_tasks"]
     if set(usage["tasks"]) != set(selected):

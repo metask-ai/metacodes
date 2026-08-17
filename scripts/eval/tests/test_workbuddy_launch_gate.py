@@ -2986,7 +2986,7 @@ class TrialResumeEligibilityTest(unittest.TestCase):
             self._records((200, None), (200, None)),
         )
         self.assertFalse(eligible)
-        self.assertIn("without a network-class provider failure", reason)
+        self.assertIn("recovered provider transient", reason)
 
     def test_old_network_failure_outside_tail_window_is_refused(self):
         records = self._records(
@@ -3004,6 +3004,20 @@ class TrialResumeEligibilityTest(unittest.TestCase):
         )
         self.assertFalse(eligible)
         self.assertIn("no provider ledger", reason)
+
+    def test_recovered_transient_is_refused(self):
+        # 5xx 后有成功记录 = 瞬态已被内部重试恢复,agent 之死另有原因
+        # (2026-08-18 第二轮审查 [7])。
+        eligible, reason = launch_gate.trial_resume_eligibility(
+            {"exception_info": {"exception_type": "NonZeroAgentExitCodeError"}},
+            [
+                {"seq": 1, "response": {"status": 503},
+                 "error": "ConnectTimeout after 1 attempts"},
+                {"seq": 2, "response": {"status": 200}, "error": None},
+            ],
+        )
+        self.assertFalse(eligible)
+        self.assertIn("recovered", reason)
 
     def test_harness_defect_exception_type_is_refused(self):
         # RuntimeError(如 ATIF 构建缺陷)即使与被重试的 502 尾部同现也不可
@@ -3213,10 +3227,28 @@ class TrialResumeOrchestrationTest(unittest.TestCase):
         WorkBuddyPaidLaunchGateL2Test.__dict__["_credential_fd"].__func__
     )
 
-    def _exception_trial(self, workbuddy):
+    def _exception_trial(self, workbuddy, *, with_trajectory=False):
         trial = workbuddy / "results" / self.SLUG / "run" / (self.TASK + "__1")
         agent = trial / "agent"
         agent.mkdir(parents=True)
+        if with_trajectory:
+            # attempt-1 死前已写出部分轨迹:真实花费必须进提交额
+            # (2026-08-18 第二轮审查 [2]:F4 修复此前无测试牙齿)。
+            (agent / "trajectory.json").write_text(
+                json.dumps(
+                    {
+                        "final_metrics": {
+                            "total_prompt_tokens": 100,
+                            "total_completion_tokens": 20,
+                            "total_cached_tokens": 30,
+                            "total_cost_usd": 0.004,
+                            "extra": {"cache_creation_input_tokens": 40},
+                        }
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
         records = [
             {
                 "seq": 1,
@@ -3378,13 +3410,13 @@ result = {
 (trial / "result.json").write_text(json.dumps(result, sort_keys=True) + "\n")
 ''' % digest("official-task-checksum")
 
-    def _armed(self, root):
+    def _armed(self, root, *, attempt1_trajectory=False):
         os.chmod(root, 0o700)
         manifest_path = self._manifest(root)
         manifest = validate_launch_manifest(manifest_path)
         workbuddy = root / "workbuddy"
         started_ns = time.time_ns() - 1_000_000
-        self._exception_trial(workbuddy)
+        self._exception_trial(workbuddy, with_trajectory=attempt1_trajectory)
         self._instance_fixture(workbuddy)
         journal_path = root / "budget.json"
         budget = manifest["budget"]
@@ -3505,6 +3537,286 @@ result = {
                     str(receipt["budget_transaction"]["transaction_id"])
                 )
                 self.assertEqual(len(events), 1)
+
+    def test_continuation_after_completed_rerun_skips_runner(self):
+        # runner 成功后、commit 前崩溃(2026-08-18 第二轮审查):再入若无
+        # 条件重跑会写出第二个干净 attempt-2 目录 → 审计双绑定死局 + 双花
+        # 钱。pending 为空必须跳过 runner(传一个必炸的 runner 证明)。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (manifest_path, journal_path, failure_receipt,
+             started_ns, authority) = self._armed(root)
+            repo = Path(__file__).resolve().parents[3]
+            good = [sys.executable, "-c", self._attempt2_runner_code(),
+                    str(repo), str(root / "workbuddy")]
+            with mock.patch.object(
+                launch_gate,
+                "resume_post_run_audit",
+                side_effect=RuntimeError("crash before commit"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    self._resume(
+                        root, manifest_path, journal_path, failure_receipt,
+                        started_ns, good,
+                    )
+            receipt = self._resume(
+                root, manifest_path, journal_path, failure_receipt,
+                started_ns, [sys.executable, "-c", "raise SystemExit(9)"],
+            )
+            self.assertEqual(
+                receipt["budget_transaction"]["state"], "committed"
+            )
+            with BudgetJournal(journal_path, authority) as journal:
+                events = journal.resume_events(
+                    str(receipt["budget_transaction"]["transaction_id"])
+                )
+                self.assertEqual(len(events), 1)
+
+    def test_failed_attempt2_burns_the_arm(self):
+        # attempt-2 自己异常 = attempt>=3,设计禁止;再入必须拒绝而不是
+        # 第三次花钱。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (manifest_path, journal_path, failure_receipt,
+             started_ns, authority) = self._armed(root)
+            failed_a2 = r"""
+import json, sys
+from pathlib import Path
+trial = Path(sys.argv[1]) / "results/metacodes-code-l2/run2/code-task-a__2"
+trial.mkdir(parents=True)
+result = {
+    "task_name": "workbuddy/code-task-a",
+    "task_id": {"path": ".workspace/tmp/staged/workbuddy-l2-run-1-a2/wb-bench-code-v1.0/tasks/code-task-a"},
+    "source": "tasks",
+    "trial_uri": trial.resolve().as_uri(),
+    "task_checksum": "0" * 64,
+    "exception_info": {"exception_type": "NonZeroAgentExitCodeError"},
+    "agent_info": {"name": "metacodes",
+                   "model_info": {"name": "workbuddy-l2-run-1-a2--test-model"}},
+}
+(trial / "result.json").write_text(json.dumps(result, sort_keys=True) + chr(10))
+"""
+            with self.assertRaises(LaunchError):
+                self._resume(
+                    root, manifest_path, journal_path, failure_receipt,
+                    started_ns,
+                    [sys.executable, "-c", failed_a2, str(root / "workbuddy")],
+                )
+            with self.assertRaisesRegex(LaunchError, "forbidden by design"):
+                self._resume(
+                    root, manifest_path, journal_path, failure_receipt,
+                    started_ns,
+                    [sys.executable, "-c", "raise SystemExit(0)"],
+                )
+
+    def test_attempt1_spend_reaches_committed_actuals(self):
+        # F4 的钱路端到端:attempt-1 轨迹 $0.004/190 tokens + attempt-2
+        # $0.002/19 tokens → 提交额必须是两者之和(2026-08-18 第二轮审查
+        # [2]:此前只测了 usage_unavailable 分支,静默丢钱不破任何测试)。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (manifest_path, journal_path, failure_receipt,
+             started_ns, authority) = self._armed(
+                root, attempt1_trajectory=True
+            )
+            repo = Path(__file__).resolve().parents[3]
+            receipt = self._resume(
+                root, manifest_path, journal_path, failure_receipt,
+                started_ns,
+                [sys.executable, "-c", self._attempt2_runner_code(),
+                 str(repo), str(root / "workbuddy")],
+            )
+            transaction = receipt["budget_transaction"]
+            self.assertEqual(transaction["actual_cost_microusd"], 6_000)
+            self.assertEqual(transaction["actual_metered_tokens"], 209)
+            row = receipt["resumes"][0]
+            self.assertEqual(row["attempt1_usage"]["cost_microusd"], 4_000)
+            self.assertEqual(row["attempt1_usage"]["metered_tokens"], 190)
+            self.assertNotIn("usage_unavailable", row["attempt1_usage"])
+
+    def test_no_headroom_refuses_before_any_spend(self):
+        # C1:attempt-1 已烧到上限,重跑注定无法 commit——授权前拒绝。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (manifest_path, journal_path, failure_receipt,
+             started_ns, authority) = self._armed(root)
+            trial = (root / "workbuddy" / "results" / self.SLUG / "run"
+                     / (self.TASK + "__1"))
+            (trial / "agent" / "trajectory.json").write_text(
+                json.dumps(
+                    {
+                        "final_metrics": {
+                            "total_prompt_tokens": 1,
+                            "total_completion_tokens": 1,
+                            "total_cached_tokens": 0,
+                            "total_cost_usd": 0.6,
+                            "extra": {"cache_creation_input_tokens": 0},
+                        }
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(LaunchError, "no budget headroom"):
+                self._resume(
+                    root, manifest_path, journal_path, failure_receipt,
+                    started_ns, [sys.executable, "-c", "raise SystemExit(0)"],
+                )
+            with BudgetJournal(journal_path, authority) as journal:
+                matches = journal.transaction_receipts()
+                self.assertEqual(matches[0]["state"], "request_authorized")
+                self.assertEqual(
+                    journal.resume_events(str(matches[0]["transaction_id"])),
+                    (),
+                )
+
+    def test_stale_partial_attempt2_refuses_with_path(self):
+        # [1]:trajectory 有、result 无的半成品目录若不前置拦截,重跑再花
+        # 一次钱后审计永久拒绝。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (manifest_path, journal_path, failure_receipt,
+             started_ns, authority) = self._armed(root)
+            partial = (root / "workbuddy" / "results" / self.SLUG / "run2"
+                       / (self.TASK + "__2") / "agent")
+            partial.mkdir(parents=True)
+            (partial / "trajectory.json").write_text(
+                json.dumps({"final_metrics": {}}) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(LaunchError, "stale partial"):
+                self._resume(
+                    root, manifest_path, journal_path, failure_receipt,
+                    started_ns, [sys.executable, "-c", "raise SystemExit(0)"],
+                )
+
+    def test_audit_rejects_rows_not_matching_journal(self):
+        # F8 的牙齿:直接调用 resume_post_run_audit 携形状正确但 reason
+        # 被改的行——磁盘校验全过,必须死在账本 evidence 绑定上。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (manifest_path, journal_path, failure_receipt,
+             started_ns, authority) = self._armed(root)
+            repo = Path(__file__).resolve().parents[3]
+            with mock.patch.object(
+                launch_gate,
+                "resume_post_run_audit",
+                side_effect=RuntimeError("crash before commit"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    self._resume(
+                        root, manifest_path, journal_path, failure_receipt,
+                        started_ns,
+                        [sys.executable, "-c", self._attempt2_runner_code(),
+                         str(repo), str(root / "workbuddy")],
+                    )
+            tainted = (root / "workbuddy" / "results" / self.SLUG / "run"
+                       / (self.TASK + "__1.tainted-a1"))
+            rows = [
+                {
+                    "task": self.TASK,
+                    "original_dir_rel": "run/" + self.TASK + "__1",
+                    "tainted_dir_rel": "run/" + self.TASK + "__1.tainted-a1",
+                    "result_sha256": hashlib.sha256(
+                        (tainted / "result.json").read_bytes()
+                    ).hexdigest(),
+                    "requests_sha256": hashlib.sha256(
+                        (tainted / "agent" / "requests.jsonl").read_bytes()
+                    ).hexdigest(),
+                    "reason": "tampered reason",
+                }
+            ]
+            with mock.patch.object(launch_gate, "_reobserve_launch_inputs"):
+                with self.assertRaisesRegex(
+                    LaunchError, "do not match the journaled authorization"
+                ):
+                    launch_gate.resume_post_run_audit(
+                        manifest_path=manifest_path,
+                        journal_path=journal_path,
+                        failure_receipt_path=failure_receipt,
+                        receipt_path=root / "receipt.json",
+                        started_ns=started_ns,
+                        resumes=rows,
+                    )
+
+    def test_audit_refuses_resumed_journal_without_rows(self):
+        # [5] 相邻性质:journal 已有 resume 事件时,不带行的审计调用必须
+        # fail-closed(收据 checkpoint 漂移拦在最前)。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (manifest_path, journal_path, failure_receipt,
+             started_ns, authority) = self._armed(root)
+            with self.assertRaisesRegex(LaunchError, "continues it"):
+                self._resume(
+                    root, manifest_path, journal_path, failure_receipt,
+                    started_ns, [sys.executable, "-c", "raise SystemExit(7)"],
+                )
+            with mock.patch.object(launch_gate, "_reobserve_launch_inputs"):
+                with self.assertRaises(LaunchError):
+                    launch_gate.resume_post_run_audit(
+                        manifest_path=manifest_path,
+                        journal_path=journal_path,
+                        failure_receipt_path=failure_receipt,
+                        receipt_path=root / "receipt.json",
+                        started_ns=started_ns,
+                        resumes=None,
+                    )
+
+    def test_foreign_run_evidence_is_never_touched(self):
+        # F7 的牙齿(probe_e):共享 result root 里同名任务、别的 run 的
+        # exception trial——resume 必须无视它(不改名、不资格判定)。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (manifest_path, journal_path, failure_receipt,
+             started_ns, authority) = self._armed(root)
+            foreign = (root / "workbuddy" / "results" / self.SLUG
+                       / "other-run" / (self.TASK + "__1"))
+            (foreign / "agent").mkdir(parents=True)
+            foreign_result = {
+                "task_name": f"workbuddy/{self.TASK}",
+                "task_id": {
+                    "path": ".workspace/tmp/staged/SOME-OTHER-RUN/"
+                    "wb-bench-code-v1.0/tasks/" + self.TASK
+                },
+                "source": "tasks",
+                "trial_uri": foreign.resolve().as_uri(),
+                "task_checksum": "1" * 64,
+                "exception_info": {"exception_type": "RuntimeError"},
+                "agent_info": {
+                    "name": "metacodes",
+                    "model_info": {"name": "SOME-OTHER-RUN--test-model"},
+                },
+            }
+            (foreign / "result.json").write_text(
+                json.dumps(foreign_result, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            # 同 run 复制目录(staged 路径对、trial_uri 错):只有
+            # trial_uri 归属能把它排除——没有它就是双候选拒绝(M4 牙齿)。
+            original = (root / "workbuddy" / "results" / self.SLUG / "run"
+                        / (self.TASK + "__1"))
+            duplicate = (root / "workbuddy" / "results" / self.SLUG
+                         / "copied" / (self.TASK + "__1"))
+            shutil.copytree(original, duplicate)
+            repo = Path(__file__).resolve().parents[3]
+            receipt = self._resume(
+                root, manifest_path, journal_path, failure_receipt,
+                started_ns,
+                [sys.executable, "-c", self._attempt2_runner_code(),
+                 str(repo), str(root / "workbuddy")],
+            )
+            self.assertEqual(
+                receipt["budget_transaction"]["state"], "committed"
+            )
+            self.assertTrue(foreign.is_dir())
+            self.assertFalse(
+                foreign.with_name(foreign.name + ".tainted-a1").exists()
+            )
+            self.assertTrue(duplicate.is_dir())
+            self.assertFalse(
+                duplicate.with_name(
+                    duplicate.name + ".tainted-a1"
+                ).exists()
+            )
 
     def test_clean_trial_is_never_resumable(self):
         # 干净但低分的 trial:exception_info == null → 整个 resume 拒绝。
