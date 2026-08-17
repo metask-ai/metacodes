@@ -322,3 +322,57 @@ test "C3/缓存: usage 与 content 同 chunk 时 usage 不丢(E 修复)" {
     try std.testing.expect(saw_usage);
     try std.testing.expectEqual(@as(u64, 3000), cache_read);
 }
+
+// 发射侧审查 2026-08-17 #1:GeminiStream 每请求新建,fc_counter 每轮归零,
+// 裸 call_N 会跨轮碰撞——dispatch_id 是观察日志/规则门/审计的全局身份,
+// 重复 id = trace fail-closed + journal 封死。修法 = id 掺本请求 RequestId。
+test "Gemini functionCall id 跨请求唯一(掺 RequestId,防跨轮碰撞)" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(
+        &[_][]const u8{ GEMINI_TOOLCALL_SSE, GEMINI_TOOLCALL_SSE },
+        0,
+    );
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-2.5-flash", url);
+    defer client.deinit();
+
+    const p = client.provider();
+    const msgs = [_]cc.types_mod.ApiMessage{
+        .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
+    };
+
+    var ids: [2][]const u8 = undefined;
+    var got: usize = 0;
+    defer for (ids[0..got]) |id| a.free(id);
+
+    for (0..2) |_| {
+        var handle = p.sendStream(&msgs, null, null, null, null, null, "") catch |e| {
+            std.debug.print("gemini sendStream failed: {s}\n", .{@errorName(e)});
+            return error.SkipZigTest;
+        };
+        defer handle.deinit();
+        while (try handle.next()) |ev| switch (ev) {
+            .text => |t| a.free(t),
+            .tool_use_start => |tu| {
+                if (got < 2) {
+                    ids[got] = tu.id;
+                    got += 1;
+                } else a.free(tu.id);
+                a.free(tu.name);
+                a.free(tu.input_json);
+            },
+            else => {},
+        };
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), got);
+    try std.testing.expect(std.mem.startsWith(u8, ids[0], "call_"));
+    try std.testing.expect(std.mem.startsWith(u8, ids[1], "call_"));
+    // 两个请求各自的首个 functionCall:旧实现同为 "call_1",新实现必须不同。
+    try std.testing.expect(!std.mem.eql(u8, ids[0], ids[1]));
+}

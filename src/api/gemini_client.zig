@@ -412,8 +412,17 @@ const GeminiStream = struct {
                 const name = util_json.extractStringField(obj, "name") orelse continue;
                 const args = extractArgsObject(obj) orelse "{}";
                 self.fc_counter += 1;
-                var id_buf: [32]u8 = undefined;
-                const id_str = std.fmt.bufPrint(&id_buf, "call_{d}", .{self.fc_counter}) catch "call_1";
+                // id 必须掺入本请求的 RequestId:GeminiStream 每请求新建,
+                // fc_counter 每轮归零,裸 call_N 会跨轮碰撞——而 dispatch_id
+                // 是观察日志/规则门/审计的全局身份,重复 = trace fail-closed
+                // + journal 封死(2026-08-17 harness review 发射侧 #1)。
+                var id_buf: [40]u8 = undefined;
+                const id_str = std.fmt.bufPrint(
+                    &id_buf,
+                    "call_{s}_{d}",
+                    .{ self.id.asSlice(), self.fc_counter },
+                ) catch unreachable; // 5+12+1+10 < 40,编译期可证
+
                 // 逐段 dupe + 逐段 errdefer:任一 dupe/append 失败都释放本迭代已 owned 的段(无泄漏)。
                 const id_dup = try self.allocator.dupe(u8, id_str);
                 errdefer self.allocator.free(id_dup);

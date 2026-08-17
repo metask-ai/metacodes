@@ -323,8 +323,14 @@ pub const Journal = struct {
         defer std.heap.c_allocator.free(line);
         if (line.len + 1 > MAX_ARTIFACT_BYTES -| self.file_bytes)
             return error.ArtifactTooLarge;
-        try writeAll(self.fd, line);
-        try writeAll(self.fd, "\n");
+        // 单次 write:record+换行分两次 write 会在中间被 kill/ENOSPC 撕裂,
+        // 留下无终止符的尾行——审计侧对撕裂尾行 fail-closed(整 trial 作废)。
+        // 单缓冲一次提交把撕裂窗口收敛到单次 write 内部(O_APPEND 语义)。
+        const record = try std.heap.c_allocator.alloc(u8, line.len + 1);
+        defer std.heap.c_allocator.free(record);
+        @memcpy(record[0..line.len], line);
+        record[line.len] = '\n';
+        try writeAll(self.fd, record);
         try pfs.fsyncChecked(self.fd);
         self.file_bytes += line.len + 1;
         self.sequence += 1;
