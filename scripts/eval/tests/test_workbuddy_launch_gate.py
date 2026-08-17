@@ -2463,10 +2463,31 @@ class WorkBuddyRequestAuditRetryTest(unittest.TestCase):
     runtime retried; the REAL _collect_usage predicate must accept them,
     keep exact success accounting, and bound failures by the retry budget."""
 
-    def _with_extra_records(self, extra_records, turns=None):
+    def _with_extra_records(self, extra_records, turns=None, websearch_steps=0):
         with tempfile.TemporaryDirectory() as directory:
             manifest = self._fixture(Path(directory))
             workbuddy = Path(manifest["workbuddy"]["checkout"])
+            if websearch_steps:
+                trajectory_path = next(workbuddy.rglob("agent/trajectory.json"))
+                trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+                trajectory.setdefault("steps", []).extend(
+                    {
+                        "step_id": f"ws-{index}",
+                        "source": "agent",
+                        "message": "",
+                        "tool_calls": [
+                            {
+                                "tool_call_id": f"ws-call-{index}",
+                                "function_name": "WebSearch",
+                                "arguments": {"query": "q"},
+                            }
+                        ],
+                    }
+                    for index in range(websearch_steps)
+                )
+                trajectory_path.write_text(
+                    json.dumps(trajectory) + "\n", encoding="utf-8"
+                )
             request_log = next(workbuddy.rglob("agent/requests.jsonl"))
             rows = [
                 json.loads(line)
@@ -2517,6 +2538,41 @@ class WorkBuddyRequestAuditRetryTest(unittest.TestCase):
         records = [self._failed_record() for _ in range(3)]
         with self.assertRaisesRegex(LaunchError, "incomplete or out of order"):
             self._with_extra_records(records, turns=1)
+
+    @staticmethod
+    def _websearch_record():
+        # The isolated WebSearch sub-request shape: one message, exactly one
+        # tool named web_search. Real provider traffic, not an agent turn.
+        return {
+            "request": {"body": {}},
+            "response": {"status": 200, "raw_bytes": 9},
+            "error": None,
+            "duration_ms": 5.0,
+            "tools": [{"name": "web_search"}],
+            "messages": [{"role": "user", "content": "Perform a web search"}],
+        }
+
+    def test_websearch_subrequest_with_dispatch_is_legal(self):
+        # Regression lock for the fstack-baseline r2 audit failure
+        # (2026-08-17): 107 turns + 2 WebSearch sub-requests must audit
+        # clean when the trajectory records the matching dispatches.
+        usage = self._with_extra_records(
+            [self._websearch_record()], turns=1, websearch_steps=1
+        )
+        self.assertEqual(usage["quality"]["mean_verifier_reward"], 1.0)
+
+    def test_websearch_subrequest_without_dispatch_is_rejected(self):
+        # A web_search-shaped provider call with no WebSearch tool call in
+        # the trajectory is unexplained traffic: fail closed.
+        with self.assertRaisesRegex(LaunchError, "incomplete or out of order"):
+            self._with_extra_records([self._websearch_record()], turns=1)
+
+    def test_websearch_subrequest_never_counts_as_a_turn(self):
+        # One turn request + one ws sub-request cannot satisfy turns=2.
+        with self.assertRaisesRegex(LaunchError, "incomplete or out of order"):
+            self._with_extra_records(
+                [self._websearch_record()], turns=2, websearch_steps=1
+            )
 
 
 class WorkBuddyRipgrepRosterTest(unittest.TestCase):

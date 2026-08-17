@@ -2172,25 +2172,65 @@ def _collect_usage(
         if manifest.get("schema_version") == SCHEMA_VERSION:
             sequences = [record.get("seq") for record in request_records]
             metacodes_turns = extra.get("metacodes_turns")
+            # WebSearch executes as an ISOLATED provider sub-request (a single
+            # message carrying exactly one tool named "web_search" — the shape
+            # that keeps server-tool entries out of the main tools array).
+            # Those records are real, audited provider traffic but are NOT
+            # agent-loop turns, so they get their own ledger column instead of
+            # silently breaking the turn equation.  Known open gap, kept loud:
+            # subagent (Task-spawned) provider requests would likewise fall
+            # outside `metacodes_turns`; no selected WorkBuddy task exercises
+            # them today, and this audit will fail closed — not miscount —
+            # if one ever does.
+            def _is_websearch_subrequest(record: Mapping[str, Any]) -> bool:
+                tools = record.get("tools")
+                if not isinstance(tools, list) or len(tools) != 1:
+                    return False
+                sole = tools[0]
+                return isinstance(sole, Mapping) and sole.get("name") == "web_search"
+
+            websearch_dispatches = sum(
+                1
+                for step in trajectory.get("steps") or []
+                for call in (step.get("tool_calls") or [] if isinstance(step, Mapping) else [])
+                if isinstance(call, Mapping) and call.get("function_name") == "WebSearch"
+            )
             response_states = [
                 (
                     (record.get("response") or {}).get("status"),
                     record.get("error"),
+                    _is_websearch_subrequest(record),
                 )
                 for record in request_records
             ]
             # The runtime retries a failed provider attempt up to
             # MAX_STREAM_TURN_RETRIES(=2) times per turn (headless), so the
             # audit ledger legitimately contains failed attempts beside the
-            # successful ones. Accounting stays exact: successful responses
-            # must number exactly the committed turns, failures are bounded
-            # by the retry budget, and ordering/uniqueness never relax.
+            # successful ones. Accounting stays exact: successful turn
+            # responses must number exactly the committed turns, successful
+            # WebSearch sub-requests are bounded by the WebSearch dispatches
+            # recorded in the trajectory, failures are bounded by the retry
+            # budget, and ordering/uniqueness never relax.
             failed_attempts = sum(
                 1
-                for status, error in response_states
-                if status != 200 or error is not None
+                for status, error, is_ws in response_states
+                if not is_ws and (status != 200 or error is not None)
             )
-            successful_responses = len(response_states) - failed_attempts
+            successful_responses = sum(
+                1
+                for status, error, is_ws in response_states
+                if not is_ws and status == 200 and error is None
+            )
+            websearch_successes = sum(
+                1
+                for status, error, is_ws in response_states
+                if is_ws and status == 200 and error is None
+            )
+            websearch_failures = sum(
+                1
+                for status, error, is_ws in response_states
+                if is_ws and (status != 200 or error is not None)
+            )
             if (
                 any(
                     not isinstance(sequence, int) or isinstance(sequence, bool)
@@ -2203,6 +2243,8 @@ def _collect_usage(
                 or metacodes_turns <= 0
                 or successful_responses != metacodes_turns
                 or failed_attempts > 2 * metacodes_turns
+                or websearch_successes > websearch_dispatches
+                or websearch_failures > 2 * websearch_dispatches
             ):
                 raise LaunchError(
                     f"provider request audit is incomplete or out of order: {trajectory_path}"
