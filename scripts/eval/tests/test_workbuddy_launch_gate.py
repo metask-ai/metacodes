@@ -2919,3 +2919,64 @@ class RequirementLedgerTreatmentContractTest(unittest.TestCase):
         treatment["requirement_ledger_extra"] = True
         with self.assertRaisesRegex(LaunchError, "treatment contract is incomplete"):
             _validate_launch_manifest(self._manifest(treatment))
+
+
+class TrialResumeEligibilityTest(unittest.TestCase):
+    """The resume predicate is mechanical and fail-closed: agent exception
+    AND network-class provider tail, nothing else. Validated directly
+    against the real pov2-r1 incident shape (NonZeroAgentExitCodeError +
+    502 RemoteProtocolError/ConnectError/ConnectTimeout tail)."""
+
+    @staticmethod
+    def _records(*states):
+        return [
+            {"response": {"status": status}, "error": error}
+            for status, error in states
+        ]
+
+    def test_real_incident_shape_is_eligible(self):
+        eligible, reason = launch_gate.trial_resume_eligibility(
+            {"exception_info": {"exception_type": "NonZeroAgentExitCodeError"}},
+            self._records(
+                (200, None), (200, None), (200, None),
+                (502, "RemoteProtocolError mid-stream after partial body"),
+                (502, "ConnectError after 1 attempts"),
+                (502, "ConnectTimeout after 1 attempts"),
+            ),
+        )
+        self.assertTrue(eligible)
+        self.assertIn("NonZeroAgentExitCodeError", reason)
+
+    def test_clean_trial_with_bad_score_is_refused(self):
+        eligible, reason = launch_gate.trial_resume_eligibility(
+            {"exception_info": None, "verifier_result": {"rewards": {"reward": 0.1}}},
+            self._records((200, None)),
+        )
+        self.assertFalse(eligible)
+        self.assertIn("without an agent exception", reason)
+
+    def test_agent_exception_without_network_failure_is_refused(self):
+        # e.g. the model's command genuinely exited nonzero on its own —
+        # not an infrastructure transient, not resumable.
+        eligible, reason = launch_gate.trial_resume_eligibility(
+            {"exception_info": {"exception_type": "NonZeroAgentExitCodeError"}},
+            self._records((200, None), (200, None)),
+        )
+        self.assertFalse(eligible)
+        self.assertIn("without a network-class provider failure", reason)
+
+    def test_old_network_failure_outside_tail_window_is_refused(self):
+        records = self._records(
+            (502, "ConnectError early"),
+        ) + self._records(*[(200, None)] * 8)
+        eligible, _ = launch_gate.trial_resume_eligibility(
+            {"exception_info": {"exception_type": "X"}}, records
+        )
+        self.assertFalse(eligible)
+
+    def test_empty_ledger_is_refused(self):
+        eligible, reason = launch_gate.trial_resume_eligibility(
+            {"exception_info": {"exception_type": "X"}}, []
+        )
+        self.assertFalse(eligible)
+        self.assertIn("no provider ledger", reason)

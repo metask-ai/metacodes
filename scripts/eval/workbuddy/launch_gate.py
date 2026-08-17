@@ -3104,6 +3104,58 @@ def _persist_authorized_failure_receipt(
     )
 
 
+NETWORK_FAILURE_MARKERS = (
+    "Connect",
+    "Timeout",
+    "RemoteProtocol",
+    "ReadError",
+    "peer closed",
+)
+RESUME_TAIL_WINDOW = 6
+MAX_RESUMED_TRIALS = 3
+
+
+def trial_resume_eligibility(
+    result: Mapping[str, Any],
+    request_records: Sequence[Mapping[str, Any]],
+) -> tuple[bool, str]:
+    """Mechanical, fail-closed eligibility for a per-trial resume.
+
+    A trial may be rerun ONLY when its own artifacts prove an
+    infrastructure failure: the agent process died (exception_info
+    non-null) AND the tail of its provider ledger shows a network-class
+    failure. A clean trial with a disappointing score has
+    exception_info == null and is refused — there is no operator
+    override, which is what keeps per-trial reruns from becoming a
+    cherry-picking surface (trial-resume design, wall 3).
+    Returns (eligible, reason) where reason is the disclosure string
+    hashed into the journal's resume evidence.
+    """
+
+    exception = result.get("exception_info")
+    if not isinstance(exception, Mapping) or not exception:
+        return False, "trial completed without an agent exception"
+    tail = list(request_records)[-RESUME_TAIL_WINDOW:]
+    if not tail:
+        return False, "trial has no provider ledger to prove a transient"
+    for record in reversed(tail):
+        status = (record.get("response") or {}).get("status")
+        error = record.get("error")
+        network_error = isinstance(error, str) and any(
+            marker in error for marker in NETWORK_FAILURE_MARKERS
+        )
+        if (isinstance(status, int) and status >= 500) or network_error:
+            return True, (
+                "agent exception "
+                + str(exception.get("exception_type"))
+                + " with provider tail failure status="
+                + str(status)
+                + " error="
+                + str(error)[:120]
+            )
+    return False, "agent exception without a network-class provider failure"
+
+
 def _reject_journal_receipt_collision(receipt_path: Path, journal_path: Path) -> None:
     """A receipt written into the journal's own namespace (j.json.tmp,
     j.json.lock) permanently bricks the journal: BudgetJournal.__enter__
