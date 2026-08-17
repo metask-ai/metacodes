@@ -10,3 +10,4 @@ import MetaCodesControl.RuleImpactAggregateGovernance
 import MetaCodesControl.ArtifactVerification
 import MetaCodesControl.VerificationGate
 import MetaCodesControl.RequirementLedger
+import MetaCodesControl.RuleMetaGovernance

@@ -1,5 +1,6 @@
 import MetaCodesControl.VerificationGate
 import MetaCodesControl.RequirementLedger
+import MetaCodesControl.RuleMetaGovernance
 
 -- Build automation treats this output as part of the shipped trust boundary:
 -- the gate-safety theorems must not acquire `sorryAx` or any other axiom
@@ -16,3 +17,17 @@ import MetaCodesControl.RequirementLedger
 #print axioms MetaCodesControl.RequirementLedger.nudges_bounded
 #print axioms MetaCodesControl.RequirementLedger.closure_disarms_open_items
 #print axioms MetaCodesControl.RequirementLedger.coverage_is_one_shot
+#print axioms MetaCodesControl.RuleMetaGovernance.llm_cannot_promote_deny
+#print axioms MetaCodesControl.RuleMetaGovernance.unanchored_cannot_promote
+#print axioms MetaCodesControl.RuleMetaGovernance.evidence_unanchored_cannot_promote
+#print axioms MetaCodesControl.RuleMetaGovernance.widening_requires_adjudicated_false_intervention
+#print axioms MetaCodesControl.RuleMetaGovernance.narrowing_requires_shadow_window
+#print axioms MetaCodesControl.RuleMetaGovernance.no_promotion_without_counterfactual
+#print axioms MetaCodesControl.RuleMetaGovernance.unbound_instrument_cannot_promote
+#print axioms MetaCodesControl.RuleMetaGovernance.unattested_auditor_cannot_promote
+#print axioms MetaCodesControl.RuleMetaGovernance.overlapping_window_cannot_promote
+#print axioms MetaCodesControl.RuleMetaGovernance.bare_block_cannot_promote
+#print axioms MetaCodesControl.RuleMetaGovernance.unpinned_predecessor_cannot_promote
+#print axioms MetaCodesControl.RuleMetaGovernance.tripwire_always_demotes
+#print axioms MetaCodesControl.RuleMetaGovernance.quiet_rules_stay_promoted
+#print axioms MetaCodesControl.RuleMetaGovernance.evidenced_widening_may_expedite
