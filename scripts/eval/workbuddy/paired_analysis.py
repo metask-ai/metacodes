@@ -290,6 +290,68 @@ def _receipt(
         != task_requests
     ):
         raise LaunchError("paired WorkBuddy usage aggregate disagrees with task evidence")
+    # Rewards are the primary outcome variable, and until now the only
+    # receipt numbers with no cross-artifact binding: cost and tokens are
+    # pinned to the journal-authenticated transaction above, while
+    # verifier_reward had only intra-receipt consistency (harness review
+    # 2026-08-17 finding: a post-processing bug touching cost is caught,
+    # the same bug touching reward was invisible). Every current-era task
+    # row names its trial result by content hash; re-read the artifact and
+    # require the committed reward to match it exactly.
+    reward_bound_rows = {
+        task: row
+        for task, row in usage["tasks"].items()
+        if "trial_result_sha256" in row
+    }
+    if manifest.get("schema_version") == SCHEMA_VERSION and set(
+        reward_bound_rows
+    ) != set(usage["tasks"]):
+        raise LaunchError(
+            "paired WorkBuddy receipt lacks trial-result bindings for some tasks"
+        )
+    if reward_bound_rows:
+        checkout_raw = (manifest.get("workbuddy") or {}).get("checkout")
+        if not isinstance(checkout_raw, str) or not checkout_raw:
+            raise LaunchError(
+                "paired WorkBuddy manifest lacks its checkout path for reward binding"
+            )
+        result_root = (
+            Path(checkout_raw) / "results" / str(manifest["job"]["slug"])
+        )
+        by_sha: Dict[str, Path] = {}
+        if result_root.exists():
+            for candidate in result_root.rglob("result.json"):
+                if candidate.is_file():
+                    digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+                    by_sha[digest] = candidate
+        for task, row in reward_bound_rows.items():
+            artifact_path = by_sha.get(str(row.get("trial_result_sha256")))
+            if artifact_path is None:
+                raise LaunchError(
+                    f"paired WorkBuddy trial result artifact is missing: {task}"
+                )
+            try:
+                artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise LaunchError(
+                    f"paired WorkBuddy trial result artifact is unreadable: {task}"
+                ) from exc
+            verifier = artifact.get("verifier_result")
+            rewards = (
+                verifier.get("rewards") if isinstance(verifier, dict) else None
+            )
+            artifact_reward = (
+                rewards.get("reward") if isinstance(rewards, dict) else None
+            )
+            if (
+                not isinstance(artifact_reward, (int, float))
+                or isinstance(artifact_reward, bool)
+                or not math.isfinite(float(artifact_reward))
+                or float(artifact_reward) != row.get("verifier_reward")
+            ):
+                raise LaunchError(
+                    f"paired WorkBuddy committed reward disagrees with its trial artifact: {task}"
+                )
     journal_identity = {
         "path": journal_locator,
         "bytes": len(checkpoint),

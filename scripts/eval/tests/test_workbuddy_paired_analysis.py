@@ -79,6 +79,7 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
             "workbuddy": {
                 "commit": WORKBUDDY_PINNED_COMMIT,
                 "overlay_content_sha256": digest("overlay"),
+                "checkout": str(root / "checkout"),
             },
             "cohort": {
                 "selected_tasks": ["task-a", "task-b"],
@@ -181,9 +182,17 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                 "transcript_sha256": digest(f"{arm}-{task}-transcript"),
                 "observation_journal_sha256": digest(f"{arm}-{task}-observation"),
             }
+            artifact_dir = root / "checkout" / "results" / f"job-{arm}" / task
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            artifact_bytes = (
+                json.dumps({"verifier_result": {"rewards": {"reward": reward}}})
+                + "\n"
+            ).encode("utf-8")
+            (artifact_dir / "result.json").write_bytes(artifact_bytes)
             tasks[task] = {
                 "task_checksum": digest(task),
                 "cacheable_first_request_sha256": digest(f"prefix-{task}"),
+                "trial_result_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
                 "verifier_reward": reward,
                 "full_pass": reward == 1.0,
                 "cost_usd": 0.01 + index / 100,
@@ -301,6 +310,39 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
         br, brv, bj = self._receipt(root, "baseline", bmv, study=study)
         tr, trv, tj = self._receipt(root, "treatment", tmv, study=study)
         return bm, br, bj, tm, tr, tj, bmv, brv, tmv, trv
+
+    def test_replaced_trial_result_artifact_fails_closed(self):
+        # The committed reward is bound to the trial artifact by content
+        # hash; replacing (or deleting) the artifact after commit orphans
+        # the binding and the analysis must refuse, not report the
+        # receipt's number as if it were still evidence-backed.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bm, br, bj, tm, tr, tj, *_ = self._pair(root)
+            # baseline task-a (reward 0.0) is the only artifact with these
+            # bytes; the 1.0-reward artifacts alias each other by content,
+            # which is semantically fine for a content-addressed equality
+            # witness but would mask this tamper.
+            artifact = (
+                root / "checkout" / "results" / "job-baseline"
+                / "task-a" / "result.json"
+            )
+            artifact.write_text(
+                json.dumps({"verifier_result": {"rewards": {"reward": 0.25}}})
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                LaunchError, "trial result artifact is missing"
+            ):
+                build_report(
+                    baseline_manifest_path=bm,
+                    baseline_receipt_path=br,
+                    baseline_journal_path=bj,
+                    treatment_manifest_path=tm,
+                    treatment_receipt_path=tr,
+                    treatment_journal_path=tj,
+                )
 
     def test_report_binds_equal_cache_prefix_and_quality_cost_time_deltas(self):
         with tempfile.TemporaryDirectory() as directory:
