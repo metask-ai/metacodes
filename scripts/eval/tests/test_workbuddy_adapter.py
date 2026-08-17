@@ -33,6 +33,8 @@ from scripts.eval.workbuddy.key_fd import (
 )
 from scripts.eval.workbuddy.trace import (
     CONTROL_METRICS_SCHEMA,
+    CURRENT_FORMAL_BATCH_SCHEMA,
+    FILTER_BINDING_BATCH_SCHEMAS,
     RULE_FILTER_PROOFS,
     OBSERVATION_JOURNAL_SCHEMA,
     TOOL_OBSERVATION_SCHEMA,
@@ -702,6 +704,118 @@ class WorkBuddyTraceTest(unittest.TestCase):
         self.assertEqual(metrics["lean"]["active_rule_phases"], 4)
         self.assertEqual(metrics["lean"]["checker_rule_phases"], 0)
         self.assertEqual(metrics["lean"]["statically_pruned_rule_phases"], 4)
+
+    def test_current_batch_schema_matches_zig_emitter(self):
+        # The strict filter-binding invariant only consumes batches whose
+        # schema equals CURRENT_FORMAL_BATCH_SCHEMA, so a binary emitting a
+        # newer version than this constant turns every checker-backed rule
+        # filter into a fatal "bypassed its formal batch" TraceError at
+        # runtime while every fixture-driven test stays green.  Pin the
+        # constant to the schema the Zig emitter actually ships.
+        zig = (
+            Path(__file__).resolve().parents[3] / "src" / "tools" / "observation.zig"
+        ).read_text(encoding="utf-8")
+        emitted = None
+        for line in zig.splitlines():
+            if line.startswith("pub const FORMAL_BATCH_SCHEMA_VERSION ="):
+                emitted = line.split('"')[1]
+        self.assertEqual(CURRENT_FORMAL_BATCH_SCHEMA, emitted)
+        self.assertIn(CURRENT_FORMAL_BATCH_SCHEMA, FILTER_BINDING_BATCH_SCHEMAS)
+
+    @staticmethod
+    def _checker_backed_filter_events(*, include_batch: bool):
+        identity = {
+            "project_sha256": "1" * 64,
+            "bundle_sha256": "2" * 64,
+            "bundle_revision": 1,
+            "kernel_sha256": "3" * 64,
+        }
+        def rule_filter(phase):
+            return {
+                "schema_version": "metacodes-project-rule-filter-v1",
+                "dispatch_id": "checker-read",
+                "phase": phase,
+                "operation": "ordinary",
+                **identity,
+                "active_rule_count": 1,
+                "checker_rule_count": 1,
+                "statically_pruned_rule_count": 0,
+                "proof": sorted(RULE_FILTER_PROOFS)[0],
+            }
+
+        def batch(phase, call_sha):
+            return {
+                "schema_version": CURRENT_FORMAL_BATCH_SCHEMA,
+                "dispatch_id": "checker-read",
+                "phase": phase,
+                "actuation": "enforced",
+                **identity,
+                "checker_call_sha256": call_sha,
+                "checker_batch_size": 1,
+                "checker_elapsed_ns": 7000,
+                "checker_bytes": 4096,
+                "decisions": [
+                    {
+                        "operation": f"{phase}_decision",
+                        "result": "admit",
+                        "recovery_action": "none",
+                    },
+                ],
+            }
+
+        start = {
+            "schema_version": TOOL_OBSERVATION_SCHEMA,
+            "id": "checker-read",
+            "requested_name": "Read",
+            "dispatched_name": "Read",
+            "origin": "authoritative",
+            "agent_depth": 0,
+        }
+        events = [{"tool_observation": {"rule_filter": rule_filter("pre")}}]
+        if include_batch:
+            events.append(
+                {"tool_observation": {"formal_decision_batch": batch("pre", "4" * 64)}}
+            )
+        events.append({"tool_observation": {"dispatch_started": start}})
+        events.append({"tool_observation": {"rule_filter": rule_filter("post")}})
+        if include_batch:
+            events.append(
+                {"tool_observation": {"formal_decision_batch": batch("post", "5" * 64)}}
+            )
+        events.append(
+            {"tool_observation": {"dispatch_finished": {**start, "outcome": "succeeded"}}}
+        )
+        return events
+
+    def test_control_metrics_bind_checker_backed_filter_to_current_batch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(transcript, [{"role": "user", "blocks": []}])
+            self._write_jsonl(
+                observation,
+                self._journal(*self._checker_backed_filter_events(include_batch=True)),
+            )
+            metrics = load_control_metrics(transcript, observation)
+        self.assertTrue(metrics["lean"]["used"])
+        self.assertEqual(metrics["lean"]["checker_calls"], 2)
+        self.assertEqual(metrics["lean"]["admit"], 2)
+        self.assertEqual(metrics["lean"]["checker_rule_phases"], 2)
+
+    def test_control_metrics_reject_checker_backed_filter_without_batch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            self._write_jsonl(transcript, [{"role": "user", "blocks": []}])
+            self._write_jsonl(
+                observation,
+                self._journal(*self._checker_backed_filter_events(include_batch=False)),
+            )
+            with self.assertRaises(TraceError) as caught:
+                load_control_metrics(transcript, observation)
+        self.assertIn("bypassed its formal batch", str(caught.exception))
 
     def test_control_metrics_count_tinykg_routing_trust_and_task_commit(self):
         calls = [

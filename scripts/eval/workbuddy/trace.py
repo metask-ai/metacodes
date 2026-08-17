@@ -48,7 +48,16 @@ FORMAL_DECISION_SCHEMAS = {
     "metacodes-project-formal-decision-batch-v5",
     "metacodes-project-formal-decision-batch-v6",
 }
-CURRENT_FORMAL_BATCH_SCHEMA = "metacodes-project-formal-decision-batch-v5"
+CURRENT_FORMAL_BATCH_SCHEMA = "metacodes-project-formal-decision-batch-v6"
+# Every batch schema of the rule-filter era binds filters to formal batches
+# (dispatch_id + phase + identity fields exist in all of them).  The strict
+# "checker-backed filter must meet its batch" invariant applies to this whole
+# set, not only to CURRENT: replaying a v5-era journal under a v6-era auditor
+# must not turn its (then-valid) bindings into fatal bypass errors.
+FILTER_BINDING_BATCH_SCHEMAS = {
+    "metacodes-project-formal-decision-batch-v5",
+    CURRENT_FORMAL_BATCH_SCHEMA,
+}
 OBSERVATION_FILENAME = "metacodes-tool-observations.jsonl"
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _KG_TOOLS = {"KgRemember", "KgRecall", "KgContext"}
@@ -1184,7 +1193,7 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
             elif observation_kind in {"formal_decision", "formal_decision_batch"}:
                 if (
                     observation_kind == "formal_decision_batch"
-                    and observation.get("schema_version") == CURRENT_FORMAL_BATCH_SCHEMA
+                    and observation.get("schema_version") in FILTER_BINDING_BATCH_SCHEMAS
                 ):
                     filter_key = (str(observation.get("dispatch_id")), str(observation.get("phase")))
                     filter_item = rule_filters.pop(filter_key, None)
@@ -1207,7 +1216,7 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                 )
                 if observation_kind == "formal_decision_batch" and observation.get(
                     "schema_version"
-                ) == CURRENT_FORMAL_BATCH_SCHEMA:
+                ) in FILTER_BINDING_BATCH_SCHEMAS:
                     saw_recovery = (
                         item["operations"]["recovery_pre_decision"]
                         + item["operations"]["recovery_post_decision"]
