@@ -720,8 +720,66 @@ class ProgressAnalyzerSuccessionTest(unittest.TestCase):
             receipt.write_text(json_mod.dumps({
                 "usage": {"tasks": {"task-a": {"progress_metrics": drifted}}}
             }))
-            with self.assertRaisesRegex(pa.LaunchError, "changed baseline progress_metrics"):
+            with self.assertRaisesRegex(paired_analysis.LaunchError, "changed baseline progress_metrics"):
                 pa._verify_instrument_succession(
                     base, treatment, manifests, receipt
                 )
 
+
+
+class MemoryStudyValidationTest(unittest.TestCase):
+    """memory_accumulation arm validation + memory leakage into other
+    studies is rejected."""
+
+    @staticmethod
+    def _manifests(**treatments):
+        base = {
+            "project_control": "disabled",
+            "verification_checkpoint": False,
+            "verification_final_gate": False,
+            "verification_final_observe": False,
+            "memory_accumulation": False,
+        }
+        out = {}
+        for arm in ("baseline", "treatment"):
+            merged = dict(base)
+            merged.update(treatments.get(arm, {}))
+            out[arm] = {"evaluation_treatment": merged}
+        return out
+
+    def test_correct_memory_arms_pass(self):
+        paired_analysis._validate_study_treatment(
+            self._manifests(treatment={"memory_accumulation": True}),
+            paired_analysis.MEMORY_ACCUMULATION,
+        )
+
+    def test_memory_study_rejects_an_unaccumulating_treatment_arm(self):
+        with self.assertRaisesRegex(paired_analysis.LaunchError, "memory-accumulation"):
+            paired_analysis._validate_study_treatment(
+                self._manifests(), paired_analysis.MEMORY_ACCUMULATION
+            )
+
+    def test_memory_study_rejects_gate_confounding(self):
+        with self.assertRaisesRegex(paired_analysis.LaunchError, "memory-accumulation"):
+            paired_analysis._validate_study_treatment(
+                self._manifests(
+                    treatment={
+                        "memory_accumulation": True,
+                        "verification_final_gate": True,
+                    }
+                ),
+                paired_analysis.MEMORY_ACCUMULATION,
+            )
+
+    def test_memory_leaking_into_the_gate_study_is_rejected(self):
+        with self.assertRaisesRegex(paired_analysis.LaunchError, "final-gate"):
+            paired_analysis._validate_study_treatment(
+                self._manifests(
+                    baseline={"verification_final_observe": True},
+                    treatment={
+                        "verification_final_gate": True,
+                        "memory_accumulation": True,
+                    },
+                ),
+                paired_analysis.VERIFICATION_FINAL_GATE,
+            )

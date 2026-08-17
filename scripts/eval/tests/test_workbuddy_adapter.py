@@ -3011,3 +3011,62 @@ class WorkBuddyProgressRejectionTest(unittest.TestCase):
                 "error": {"code": "other", "category": "system_error",
                           "detail": "x", "recoverable": True},
             }))
+
+
+class WorkBuddyRequirementLedgerRecordTest(unittest.TestCase):
+    """Field-level contract for the requirement-ledger journal record (the
+    union-roster probe only proves the KIND is known)."""
+
+    def _metrics(self, ledger):
+        rows = [
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 0, "monotonic_elapsed_ns": 1,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_started": {}}},
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 1, "monotonic_elapsed_ns": 2,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"tool_observation": {"requirement_ledger": ledger}}},
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 2, "monotonic_elapsed_ns": 3,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_finished": {}}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "t.jsonl"
+            observation = root / "o.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            observation.write_text(
+                "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8"
+            )
+            return load_control_metrics(transcript, observation)
+
+    def _valid(self):
+        return {
+            "schema_version": "metacodes-requirement-ledger-v1",
+            "enforced": True, "prompt_emitted": True,
+            "items_total": 3, "items_open_at_final": 1,
+            "mutations_occurred": True, "nudges": 2, "max_nudges": 2,
+        }
+
+    def test_valid_record_exports_counters(self):
+        lean = self._metrics(self._valid())["lean"]
+        self.assertEqual(lean["requirement_ledger_records"], 1)
+        self.assertEqual(lean["requirement_ledger_enforced"], 1)
+        self.assertEqual(lean["requirement_ledger_prompted"], 1)
+        self.assertEqual(lean["requirement_ledger_items_total"], 3)
+        self.assertEqual(lean["requirement_ledger_items_open_at_final"], 1)
+        self.assertEqual(lean["requirement_ledger_nudges"], 2)
+
+    def test_malformed_count_fails_loudly(self):
+        bad = self._valid()
+        bad["items_open_at_final"] = "one"
+        with self.assertRaisesRegex(TraceError, "ledger open count"):
+            self._metrics(bad)
+
+    def test_wrong_schema_fails_loudly(self):
+        bad = self._valid()
+        bad["schema_version"] = "metacodes-requirement-ledger-v0"
+        with self.assertRaisesRegex(TraceError, "requirement ledger record"):
+            self._metrics(bad)

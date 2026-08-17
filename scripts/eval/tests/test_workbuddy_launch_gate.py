@@ -2517,3 +2517,97 @@ class WorkBuddyRequestAuditRetryTest(unittest.TestCase):
         records = [self._failed_record() for _ in range(3)]
         with self.assertRaisesRegex(LaunchError, "incomplete or out of order"):
             self._with_extra_records(records, turns=1)
+
+
+class WorkBuddyRipgrepRosterTest(unittest.TestCase):
+    """The executable set is a two-era roster: pre-restoration manifests
+    (no ripgrep) stay readable, rg-bearing manifests are validated at
+    bin/rg, and a manifest claiming rg without the staged file fails."""
+
+    @staticmethod
+    def _fixture_elf(root: Path) -> Path:
+        elf = root / "fixture-elf"
+        header = bytearray(20)
+        header[:7] = b"\x7fELF\x02\x01\x01"
+        header[18:20] = (62).to_bytes(2, "little")
+        elf.write_bytes(header + b"fixture\n")
+        elf.chmod(0o755)
+        return elf
+
+    def _stage(self, root: Path, with_rg: bool) -> Path:
+        elf = self._fixture_elf(root)
+        license_file = root / "LICENSE"
+        license_file.write_text("fixture license\n", encoding="utf-8")
+        output = root / "stage"
+        stage(
+            output=output,
+            metacodes=elf,
+            tinykg=elf,
+            formal_kernel=elf,
+            ripgrep=elf if with_rg else None,
+            metacodes_commit="0" * 40,
+            tinykg_commit="1" * 40,
+            licenses=(
+                ("metacodes", "NOASSERTION", license_file),
+                ("tinykg", "Apache-2.0", license_file),
+                ("lean4", "Apache-2.0", license_file),
+            ),
+        )
+        return output / "share/metacodes/artifact-manifest.json"
+
+    def test_pre_restoration_manifest_stays_readable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self._stage(Path(directory), with_rg=False)
+            observed = _artifact_contract(manifest)
+            self.assertNotIn("ripgrep", observed["executables"])
+
+    def test_rg_bearing_manifest_is_validated_at_bin_rg(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self._stage(Path(directory), with_rg=True)
+            observed = _artifact_contract(manifest)
+            self.assertIn("ripgrep", observed["executables"])
+            self.assertTrue(
+                observed["executables"]["ripgrep"]["path"].endswith("bin/rg")
+            )
+
+    def test_claimed_rg_with_missing_file_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self._stage(Path(directory), with_rg=True)
+            (manifest.parents[2] / "bin/rg").unlink()
+            with self.assertRaises(LaunchError):
+                _artifact_contract(manifest)
+
+
+class WorkBuddyMemoryTreatmentValidationTest(unittest.TestCase):
+    """launch_gate's memory-accumulation treatment plumbing."""
+
+    def test_expected_memory_accumulation_roster(self):
+        from scripts.eval.workbuddy.launch_gate import (
+            _expected_memory_accumulation,
+        )
+        self.assertIsNone(
+            _expected_memory_accumulation({"evaluation_treatment": {}})
+        )
+        self.assertTrue(_expected_memory_accumulation(
+            {"evaluation_treatment": {"memory_accumulation": True}}
+        ))
+        with self.assertRaisesRegex(LaunchError, "memory accumulation"):
+            _expected_memory_accumulation(
+                {"evaluation_treatment": {"memory_accumulation": "yes"}}
+            )
+
+    def test_memory_kwargs_must_match_the_declared_treatment(self):
+        from scripts.eval.workbuddy.launch_gate import (
+            _validate_memory_accumulation_kwargs,
+        )
+        declared = {"evaluation_treatment": {"memory_accumulation": True}}
+        _validate_memory_accumulation_kwargs(
+            {"METACODES_MEMORY_ACCUMULATION": True}, declared, label="t"
+        )
+        with self.assertRaisesRegex(LaunchError, "drifted"):
+            _validate_memory_accumulation_kwargs({}, declared, label="t")
+        undeclared = {"evaluation_treatment": {}}
+        with self.assertRaisesRegex(LaunchError, "unexpectedly"):
+            _validate_memory_accumulation_kwargs(
+                {"METACODES_MEMORY_ACCUMULATION": True}, undeclared, label="t"
+            )
