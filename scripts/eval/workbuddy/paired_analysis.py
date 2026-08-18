@@ -12,6 +12,7 @@ import argparse
 import json
 import hashlib
 import math
+import re
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
@@ -27,12 +28,22 @@ from .launch_gate import (
     RECEIPT_SCHEMA_VERSION,
     SCHEMA_VERSION,
     LaunchError,
+    _cacheable_first_request_sha256,
     _canonical_sha256,
     _observed_json,
     _read_regular,
     _sha256_bytes,
     _validate_launch_manifest,
     _write_private_new,
+)
+
+# 跨 UTC 午夜的配对轮:actor 系统上下文里的日期行(harness 注入的
+# currentDate)在两臂间相差一天,缓存前缀哈希因此不等(2026-08-18
+# pov2-r2 实例)。豁免必须证据驱动:从 record_full_io 保留的 trial 工件
+# 加载两臂真实首请求,先验证字节确与收据 pin 的前缀哈希一致,再把日期行
+# 归一化后要求逐字节相等——只有"恰好差一天"这一种形状可被接受并披露。
+_DATED_PREFIX_PATTERN = re.compile(
+    r"Today's date is \d{4}/\d{2}/\d{2}"
 )
 
 
@@ -862,6 +873,96 @@ def _verify_instrument_succession(
     }
 
 
+def _first_request_body(
+    manifest: Mapping[str, Any],
+    row: Mapping[str, Any],
+    task: str,
+    results_root: Path | None,
+) -> Mapping[str, Any]:
+    """Load one arm's audited first request body for a task, bound by the
+    receipt's own content hashes (trial result sha locates the directory,
+    the cacheable prefix sha must recompute from the loaded bytes)."""
+    if results_root is not None:
+        result_root = results_root / str(manifest["job"]["slug"])
+    else:
+        result_root = (
+            Path(str((manifest.get("workbuddy") or {}).get("checkout")))
+            / "results"
+            / str(manifest["job"]["slug"])
+        )
+    wanted = str(row.get("trial_result_sha256"))
+    located = None
+    if result_root.exists():
+        for candidate in result_root.rglob("result.json"):
+            if not candidate.is_file():
+                continue
+            if hashlib.sha256(candidate.read_bytes()).hexdigest() == wanted:
+                located = candidate
+                break
+    if located is None:
+        raise LaunchError(
+            f"dated cache-prefix exemption cannot locate the trial artifact: {task}"
+        )
+    request_log = located.parent / "agent" / "requests.jsonl"
+    try:
+        first_line = next(
+            line
+            for line in _read_regular(
+                request_log, maximum=64 * 1024 * 1024
+            ).splitlines()
+            if line.strip()
+        )
+        body = json.loads(first_line.decode("utf-8"))["request"]["body"]
+    except (
+        OSError,
+        UnicodeError,
+        StopIteration,
+        KeyError,
+        TypeError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise LaunchError(
+            f"dated cache-prefix exemption cannot read the first request: {task}"
+        ) from exc
+    if not isinstance(body, Mapping) or _cacheable_first_request_sha256(
+        body
+    ) != str(row.get("cacheable_first_request_sha256")):
+        raise LaunchError(
+            "dated cache-prefix exemption first request does not match the "
+            f"audited prefix hash: {task}"
+        )
+    return body
+
+
+def _verify_dated_prefix_drift(
+    task: str,
+    manifests: Mapping[str, Mapping[str, Any]],
+    b_row: Mapping[str, Any],
+    t_row: Mapping[str, Any],
+    results_root: Path | None,
+) -> None:
+    normalized = {}
+    for arm, row in (("baseline", b_row), ("treatment", t_row)):
+        body = dict(
+            _first_request_body(manifests[arm], row, task, results_root)
+        )
+        body.pop("model", None)
+        text = stable_json(body)
+        if not _DATED_PREFIX_PATTERN.search(text):
+            raise LaunchError(
+                "dated cache-prefix exemption found no date line in the "
+                f"{arm} first request: {task}"
+            )
+        normalized[arm] = _DATED_PREFIX_PATTERN.sub(
+            "Today's date is 0000/00/00", text
+        )
+    if normalized["baseline"] != normalized["treatment"]:
+        raise LaunchError(
+            "dated cache-prefix exemption refused: the first requests "
+            f"differ beyond the date line for {task}"
+        )
+
+
 def build_report(
     *,
     study: str = PROJECT_CONTROL,
@@ -873,6 +974,7 @@ def build_report(
     treatment_journal_path: Path,
     accept_progress_analyzer_succession: bool = False,
     results_root: Path | None = None,
+    accept_dated_cache_prefix: Sequence[str] = (),
 ) -> Dict[str, object]:
     manifest_observations = {
         "baseline": _observed_json(baseline_manifest_path),
@@ -954,17 +1056,26 @@ def build_report(
     t_usage = receipts["treatment"]["usage"]
     tasks: Dict[str, object] = {}
     improved = regressed = unchanged = 0
+    accepted_dated = {str(name) for name in accept_dated_cache_prefix}
+    dated_drift_tasks: list = []
     for task in manifests["baseline"]["cohort"]["selected_tasks"]:
         baseline = b_usage["tasks"][task]
         treatment = t_usage["tasks"][task]
-        if (
-            baseline.get("task_checksum") != treatment.get("task_checksum")
-            or baseline.get("cacheable_first_request_sha256")
-            != treatment.get("cacheable_first_request_sha256")
-        ):
+        if baseline.get("task_checksum") != treatment.get("task_checksum"):
             raise LaunchError(
                 f"paired WorkBuddy task/cache-prefix identity drifted for {task}"
             )
+        if baseline.get("cacheable_first_request_sha256") != treatment.get(
+            "cacheable_first_request_sha256"
+        ):
+            if task not in accepted_dated:
+                raise LaunchError(
+                    f"paired WorkBuddy task/cache-prefix identity drifted for {task}"
+                )
+            _verify_dated_prefix_drift(
+                task, manifests, baseline, treatment, results_root
+            )
+            dated_drift_tasks.append(task)
         b_reward = _number(baseline.get("verifier_reward"), f"{task} baseline reward")
         t_reward = _number(treatment.get("verifier_reward"), f"{task} treatment reward")
         if max(b_reward, t_reward) > 1.0:
@@ -1053,6 +1164,14 @@ def build_report(
         receipts["baseline"]["quality_evidence"] is True
         and receipts["treatment"]["quality_evidence"] is True
     )
+    # 陈旧豁免即拒:操作者点名的任务必须真的漂移,防止 flag 常驻脚本里
+    # 静默吞掉未来其它任务的前缀漂移。
+    unused_dated = accepted_dated - set(dated_drift_tasks)
+    if unused_dated:
+        raise LaunchError(
+            "dated cache-prefix exemption named tasks that did not drift: "
+            f"{sorted(unused_dated)}"
+        )
     report: Dict[str, object] = {
         "schema_version": (
             REPORT_SCHEMA_VERSION
@@ -1128,7 +1247,8 @@ def build_report(
         - _integer(b_usage.get("provider_requests"), "baseline total requests"),
         "elapsed_seconds_delta": float(receipts["treatment"]["elapsed_seconds"])
         - float(receipts["baseline"]["elapsed_seconds"]),
-        "cache_prefix_equal_for_every_task": True,
+        "cache_prefix_equal_for_every_task": not dated_drift_tasks,
+        "cache_prefix_dated_drift_tasks": sorted(dated_drift_tasks),
         "tasks": tasks,
         "claim_boundary": (
             "observed paired difference for this frozen task cohort and project-rule "
@@ -1176,11 +1296,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             "reproduces every committed baseline progress metric exactly."
         ),
     )
+    parser.add_argument(
+        "--accept-dated-cache-prefix",
+        action="append",
+        default=[],
+        metavar="TASK",
+        help=(
+            "Accept a cross-arm cache-prefix mismatch for TASK only after "
+            "loading both arms' audited first requests and proving they "
+            "differ solely in the injected current-date line (UTC-midnight "
+            "rollover between arms). Disclosed in the report; a named task "
+            "that did not drift fails closed."
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         report = build_report(
             accept_progress_analyzer_succession=args.accept_progress_analyzer_succession,
             results_root=args.results_root,
+            accept_dated_cache_prefix=args.accept_dated_cache_prefix,
             study=args.study,
             baseline_manifest_path=args.baseline_manifest,
             baseline_receipt_path=args.baseline_receipt,

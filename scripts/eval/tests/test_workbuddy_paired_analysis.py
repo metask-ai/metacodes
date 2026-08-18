@@ -531,6 +531,104 @@ class WorkBuddyPairedAnalysisTest(unittest.TestCase):
                     treatment_journal_path=tj,
                 )
 
+    def _dated_drift_pair(self, root):
+        from scripts.eval.workbuddy.launch_gate import (
+            _cacheable_first_request_sha256,
+        )
+
+        bm, bmv = self._manifest(root, "baseline")
+        tm, tmv = self._manifest(root, "treatment")
+        br, brv, bj = self._receipt(root, "baseline", bmv)
+        tr, trv, tj = self._receipt(root, "treatment", tmv)
+        for arm, receipt_path, value, date in (
+            ("baseline", br, brv, "2026/08/17"),
+            ("treatment", tr, trv, "2026/08/18"),
+        ):
+            body = {
+                "model": f"route-{arm}",
+                "system": f"You are helpful. Today's date is {date}.",
+                "messages": [{"role": "user", "content": "task"}],
+            }
+            agent = (root / "checkout" / "results" / f"job-{arm}"
+                     / "task-a" / "agent")
+            agent.mkdir(parents=True, exist_ok=True)
+            (agent / "requests.jsonl").write_text(
+                json.dumps({"request": {"body": body}}) + "\n",
+                encoding="utf-8",
+            )
+            value["usage"]["tasks"]["task-a"][
+                "cacheable_first_request_sha256"
+            ] = _cacheable_first_request_sha256(body)
+            self._write(receipt_path, value)
+        return bm, br, bj, tm, tr, tj
+
+    def test_dated_cache_prefix_drift_needs_flag_and_is_disclosed(self):
+        # 跨 UTC 午夜的日期行漂移(pov2-r2 实例):无 flag 拒绝;有 flag 时
+        # 从真实工件验证"仅日期行不同"后接受并披露。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bm, br, bj, tm, tr, tj = self._dated_drift_pair(root)
+            kwargs = dict(
+                baseline_manifest_path=bm, baseline_receipt_path=br,
+                baseline_journal_path=bj, treatment_manifest_path=tm,
+                treatment_receipt_path=tr, treatment_journal_path=tj,
+            )
+            with self.assertRaisesRegex(LaunchError, "identity drifted"):
+                build_report(**kwargs)
+            report = build_report(
+                **kwargs, accept_dated_cache_prefix=["task-a"]
+            )
+            self.assertFalse(report["cache_prefix_equal_for_every_task"])
+            self.assertEqual(
+                report["cache_prefix_dated_drift_tasks"], ["task-a"]
+            )
+
+    def test_dated_cache_prefix_flag_refuses_non_date_differences(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bm, br, bj, tm, tr, tj = self._dated_drift_pair(root)
+            agent = (root / "checkout" / "results" / "job-treatment"
+                     / "task-a" / "agent")
+            body = {
+                "model": "route-treatment",
+                "system": "You are DIFFERENT. Today's date is 2026/08/18.",
+                "messages": [{"role": "user", "content": "task"}],
+            }
+            (agent / "requests.jsonl").write_text(
+                json.dumps({"request": {"body": body}}) + "\n",
+                encoding="utf-8",
+            )
+            trv = json.loads(tr.read_text(encoding="utf-8"))
+            from scripts.eval.workbuddy.launch_gate import (
+                _cacheable_first_request_sha256,
+            )
+            trv["usage"]["tasks"]["task-a"][
+                "cacheable_first_request_sha256"
+            ] = _cacheable_first_request_sha256(body)
+            self._write(tr, trv)
+            with self.assertRaisesRegex(LaunchError, "beyond the date line"):
+                build_report(
+                    baseline_manifest_path=bm, baseline_receipt_path=br,
+                    baseline_journal_path=bj, treatment_manifest_path=tm,
+                    treatment_receipt_path=tr, treatment_journal_path=tj,
+                    accept_dated_cache_prefix=["task-a"],
+                )
+
+    def test_dated_cache_prefix_stale_flag_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bm, bmv = self._manifest(root, "baseline")
+            tm, tmv = self._manifest(root, "treatment")
+            br, brv, bj = self._receipt(root, "baseline", bmv)
+            tr, trv, tj = self._receipt(root, "treatment", tmv)
+            with self.assertRaisesRegex(LaunchError, "did not drift"):
+                build_report(
+                    baseline_manifest_path=bm, baseline_receipt_path=br,
+                    baseline_journal_path=bj, treatment_manifest_path=tm,
+                    treatment_receipt_path=tr, treatment_journal_path=tj,
+                    accept_dated_cache_prefix=["task-a"],
+                )
+
     def test_results_root_override_survives_checkout_relocation(self):
         # The manifest pins the checkout's absolute path; after archival the
         # same receipts must stay analyzable via --results-root (global
