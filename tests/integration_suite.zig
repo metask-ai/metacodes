@@ -43,6 +43,7 @@ test {
     _ = @import("component/tool_observation_test.zig");
     _ = @import("component/project_rule_gate_test.zig");
     _ = @import("component/rule_author_test.zig");
+    _ = @import("component/self_evolution_test.zig");
     _ = @import("component/rule_impact_governance_test.zig");
     _ = @import("component/rule_impact_operational_observation_test.zig");
     _ = @import("component/tool_result_storage_test.zig");

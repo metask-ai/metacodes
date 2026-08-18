@@ -165,6 +165,11 @@ class MetacodesAgent(BaseInstalledAgent):
                 "outcome feedback requires memory accumulation: outcome "
                 "nodes ride the store continuity chain"
             )
+        if outcome_feedback and not self_evolution:
+            raise ValueError(
+                "outcome feedback requires self evolution: ingestion runs "
+                "inside the self-evolution runtime gate"
+            )
         self._outcome_feedback = outcome_feedback
         outcome_roots = kwargs.pop("METACODES_OUTCOME_ROOTS", None)
         if outcome_roots is not None and (
@@ -602,6 +607,8 @@ class MetacodesAgent(BaseInstalledAgent):
             "export METACODES_KG_TRANSPORT=cli-exclusive; "
             + (
                 "export METACODES_SELF_EVOLUTION=1; "
+                "export METACODES_SELF_EVOLUTION_REPORT="
+                "/logs/agent/self-evolution-report.json; "
                 if self._self_evolution
                 else ""
             )

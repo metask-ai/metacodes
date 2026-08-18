@@ -124,13 +124,15 @@ pub fn run(
     // 自演化 S2:store 里有临时规则 → 以固定 kernel 合并进(或独立构成)
     // 项目规则 gate。装载失败/降级一律回退到普通 gate,绝不放倒 Run。
     const self_evo_enabled = self_evolution_mod.enabledFromEnv();
+    var self_evo_ingested: usize = 0;
     var provisional_gate: ?*self_evolution_mod.ProvisionalGate = null;
     defer if (provisional_gate) |pg| pg.deinit();
     if (self_evo_enabled) {
         if (app.kg) |*known_graph| {
             // 结局回灌先于 provisional 装载与 scoped recall:本 Run 一开始
             // 就把 host 提供的已完成 trial 结局写进 KG,召回面立即可见。
-            _ = self_evolution_mod.ingestOutcomes(allocator, known_graph);
+            const ingested = self_evolution_mod.ingestOutcomes(allocator, known_graph);
+            self_evo_ingested = ingested;
             if (run_control) |control| {
                 provisional_gate = self_evolution_mod.loadProvisionalGate(
                     allocator,
@@ -250,6 +252,7 @@ pub fn run(
             .now_ns = @import("../util/time.zig").nowWallNs(),
             .stop_reason = @tagName(result.stop_reason),
             .provisional_active_count = if (provisional_gate) |pg| pg.provisional_count else 0,
+            .outcomes_ingested = self_evo_ingested,
             .provisional_candidate_ids = if (provisional_gate) |pg| pg.provisional_candidate_ids else &.{},
             .provisional_bundle_sha256 = if (provisional_gate) |pg| pg.active.bundle_sha256 else null,
             .abort = &app.abort,

@@ -370,7 +370,7 @@ fn parseSource(
         document.max_items != projection.MAX_ONTOLOGY_ITEMS or
         document.max_chars == 0 or document.max_chars > 200_000 or
         document.used_chars > document.max_chars or
-        document.ontology.len == 0 or document.ontology.len > document.max_items)
+        document.ontology.len > document.max_items)
         return error.InvalidOntologySource;
     const project = parseHex(document.project_sha256) orelse return error.InvalidOntologySource;
     const revision = parseHex(document.revision) orelse return error.InvalidOntologySource;

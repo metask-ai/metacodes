@@ -184,6 +184,7 @@ def _comparison_covariates(
         overrides.pop("METACODES_SELF_EVOLUTION", None)
         overrides.pop("METACODES_OUTCOME_FEEDBACK", None)
         overrides.pop("METACODES_CONTINUITY_SEED_SHA256", None)
+        overrides.pop("METACODES_OUTCOME_ROOTS", None)
     stable_artifacts = json.loads(json.dumps(artifacts))
     # Absolute staging paths describe where identical bytes were observed, not
     # an experimental variable.  Keep every digest/size/architecture field.
@@ -738,6 +739,11 @@ def build_launch_manifest(
     if outcome_feedback and not memory_accumulation:
         raise LaunchError(
             "WorkBuddy outcome feedback requires memory accumulation"
+        )
+    if outcome_feedback and not self_evolution:
+        raise LaunchError(
+            "WorkBuddy outcome feedback requires self evolution — ingestion "
+            "runs inside the self-evolution runtime gate"
         )
     continuity_seed = project_overrides.get(
         "METACODES_CONTINUITY_SEED_SHA256", None

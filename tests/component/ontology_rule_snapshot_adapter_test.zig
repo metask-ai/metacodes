@@ -821,7 +821,9 @@ test "L2 KgClient requires exactly one LF of CLI framing and rejects any other s
         // wrapper serves the same suffixed payload to each.
         const script = try std.fmt.allocPrint(
             a,
-            "#!/bin/sh\ncase \"$1\" in ontology-rule-snapshot|task-snapshot) printf '%s{s}' '{s}'; exit 0;; esac\nexec '{s}' \"$@\"\n",
+            // set-node-property:身份首次绑定前奏(真 store 未 init,转发
+            // 会撞 FileNotFound;绑定输出不被 client 解析,exit 0 即可)。
+            "#!/bin/sh\ncase \"$1\" in ontology-rule-snapshot|task-snapshot) printf '%s{s}' '{s}'; exit 0;; set-node-property) exit 0;; esac\nexec '{s}' \"$@\"\n",
             .{ case.suffix, canonical, real_bin },
         );
         defer a.free(script);

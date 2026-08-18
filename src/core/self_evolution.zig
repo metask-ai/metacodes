@@ -37,7 +37,10 @@ const log = @import("../util/log.zig");
 pub const ENV_FLAG = "METACODES_SELF_EVOLUTION";
 pub const SCHEMA_TYPE = "provisional_rule";
 pub const RETRACT_SCHEMA_TYPE = "provisional_rule_retracted";
-pub const IMPACT_SCHEMA_TYPE = "provisional_rule_impact";
+// impact 记录直接以受治理 proposition 落库(rememberOntologyItem),不再有
+// 专用 schema_type——schema_type 在 tinykg 不可事后翻转,必须建节点时就定。
+/// impact 行正文前缀,滚动窗口按它召回旧行。
+pub const IMPACT_MARKER = "provisional-rule-impact-v1";
 pub const MARKER = "metacodes-provisional-rule-v1";
 pub const RETRACT_MARKER = "metacodes-provisional-rule-retract-v1";
 pub const MAX_PROVISIONAL_RULES: usize = 8;
@@ -346,7 +349,11 @@ pub fn loadProvisionalGate(
 pub const OUTCOME_SCHEMA_TYPE = "task_outcome";
 pub const OUTCOME_MARKER = "task-outcome-v1";
 pub const OUTCOMES_ENV = "METACODES_TASK_OUTCOMES";
-pub const MAX_OUTCOME_ROWS: usize = 64;
+pub const REPORT_ENV = "METACODES_SELF_EVOLUTION_REPORT";
+/// 上限受 tinykg search --limit 约束:KgClient 超采 = 2L+4,tinykg HEAD
+/// 上限 100 → L ≤ 48。40 留余量;静态测试钉死这笔账(2026-08-18 审查 B1:
+/// 128→超采 260→InvalidLimit→去重全灭→重复节点毒化召回槽)。
+pub const MAX_OUTCOME_ROWS: usize = 40;
 pub const MAX_OUTCOME_BYTES: usize = 256 * 1024;
 
 const OutcomeRow = struct {
@@ -393,12 +400,18 @@ pub fn ingestOutcomes(
 
     // 幂等:已在库的 (task, attempt_key) 不重写。
     var seen = std.StringHashMapUnmanaged(void){};
-    if (kg.recallTyped(OUTCOME_MARKER, MAX_OUTCOME_ROWS * 2, false, OUTCOME_SCHEMA_TYPE)) |hits| {
+    if (kg.recallTyped(OUTCOME_MARKER, MAX_OUTCOME_ROWS, false, OUTCOME_SCHEMA_TYPE)) |hits| {
         defer {
             for (hits) |*hit| hit.deinit(kg.allocator);
             kg.allocator.free(hits);
         }
         for (hits) |hit| {
+            // key 在文本前 ~60 字节;hit.text 已带前 800 字节,避免逐 hit
+            // spawn get(2026-08-18 审查 R4)。
+            if (extractOutcomeKey(hit.text)) |key| {
+                seen.put(arena.allocator(), arena.allocator().dupe(u8, key) catch continue, {}) catch continue;
+                continue;
+            }
             const full = kg.fetchNodeText(hit.node_id) catch continue;
             defer kg.allocator.free(full);
             if (extractOutcomeKey(full)) |key|
@@ -458,12 +471,42 @@ pub const EndOfRunDeps = struct {
     provisional_active_count: usize,
     provisional_candidate_ids: []const []const u8 = &.{},
     provisional_bundle_sha256: ?[64]u8 = null,
+    outcomes_ingested: usize = 0,
     abort: ?*const AbortSignal,
 };
 
 /// 单 Run 内规则阻断数达到此阈值 = 规则风暴(几乎必然是一条把自己
 /// 砖住的坏规则):熔断——写撤回信封,下一 Run 不再装载。
 pub const RETRACT_BLOCK_STORM_THRESHOLD: u64 = 8;
+
+/// 诊断报告:结局/错误名/剂量计数落到 host 可见的文件(/logs/agent 挂载),
+/// 让"零剂量"永远可归因(2026-08-18 审查 B4:r2 全臂 degraded 无迹可查)。
+pub fn writeReport(
+    allocator: std.mem.Allocator,
+    outcome: []const u8,
+    detail: []const u8,
+    ingested: usize,
+    provisional_loaded: usize,
+) void {
+    const raw_path = std.c.getenv(REPORT_ENV) orelse return;
+    const text = std.fmt.allocPrint(
+        allocator,
+        "{{\"schema_version\":\"self-evolution-report-v1\",\"outcome\":\"{s}\"," ++
+            "\"detail\":\"{s}\",\"outcomes_ingested\":{d},\"provisional_loaded\":{d}}}\n",
+        .{ outcome, detail, ingested, provisional_loaded },
+    ) catch return;
+    defer allocator.free(text);
+    const pfs = @import("platform").fs;
+    const fd = pfs.open(raw_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    if (fd < 0) return;
+    defer _ = pfs.close(fd);
+    var offset: usize = 0;
+    while (offset < text.len) {
+        const n = pfs.write(fd, text[offset..]);
+        if (n <= 0) return;
+        offset += @intCast(n);
+    }
+}
 
 pub const Outcome = enum {
     disabled,
@@ -475,11 +518,28 @@ pub const Outcome = enum {
 };
 
 /// S1+S3 入口。一切错误路径降级返回,不向宿主传播。
+fn finish(
+    allocator: std.mem.Allocator,
+    deps: EndOfRunDeps,
+    outcome: Outcome,
+    detail: []const u8,
+) Outcome {
+    writeReport(
+        allocator,
+        @tagName(outcome),
+        detail,
+        deps.outcomes_ingested,
+        deps.provisional_active_count,
+    );
+    return outcome;
+}
+
 pub fn endOfRun(allocator: std.mem.Allocator, deps: EndOfRunDeps) Outcome {
-    // S3:临时规则效果写回本体(为下一轮投影提供 prescription 战绩)。
-    if (deps.provisional_active_count > 0) {
-        writeImpactObservation(allocator, deps);
-    }
+    // S3:每 Run 过程战绩写回本体(规则效果计数 + formal_faults 等过程
+    // 信号)。不 gate 在 provisional_active_count 上:无规则时计数照样是
+    // host 观测的过程事实,也是 author 冷启动仅有的本体内容;每 run 恰好
+    // 1 节点,有界。
+    writeImpactObservation(allocator, deps);
 
     const actor_sha = observation.sha256Hex(deps.actor_identity);
     var role_buffer: [512]u8 = undefined;
@@ -487,28 +547,74 @@ pub fn endOfRun(allocator: std.mem.Allocator, deps: EndOfRunDeps) Outcome {
         &role_buffer,
         "{s}#self-evolution-rule-author-v1",
         .{deps.actor_identity},
-    ) catch return .degraded;
+    ) catch return finish(allocator, deps, .degraded, "unspecified");
     const author_sha = observation.sha256Hex(role_identity);
     var budget_buffer: [256]u8 = undefined;
     const budget_seed = std.fmt.bufPrint(
         &budget_buffer,
         "self-evolution-inline-budget-v1:{s}",
         .{deps.run_binding.run_id.asSlice()},
-    ) catch return .degraded;
+    ) catch return finish(allocator, deps, .degraded, "unspecified");
 
-    const rules_root = std.fs.path.dirname(deps.session_dir) orelse return .degraded;
+    const rules_root = std.fs.path.dirname(deps.session_dir) orelse return finish(allocator, deps, .degraded, "unspecified");
     var rules_dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const rules_dir = std.fmt.bufPrint(
         &rules_dir_buffer,
         "{s}/project-rules",
         .{rules_root},
-    ) catch return .degraded;
+    ) catch return finish(allocator, deps, .degraded, "unspecified");
 
     var source = evolution.KgClientSource.init(deps.kg);
     const kernel_config: ?kernel.Config = switch (kernel.loadConfigFromEnv()) {
         .configured => |value| value,
         else => null,
     };
+
+    // 防泄漏框架的臂内实例化:生成窗 = 本 Run 的认证 journal 区间
+    // (host_observation);held-out = 本任务尚未揭晓的 verifier 结局承诺。
+    // 两个 window member 前缀不同,恰好互斥。
+    const projection = @import("ontology_rule_projection.zig");
+    var gen_member_buffer: [256]u8 = undefined;
+    const gen_member_seed = std.fmt.bufPrint(
+        &gen_member_buffer,
+        "self-evolution-generation:{s}",
+        .{deps.run_binding.run_id.asSlice()},
+    ) catch return finish(allocator, deps, .degraded, "unspecified");
+    var generation = projection.deriveRunObservationEvidence(
+        allocator,
+        deps.session_dir,
+        bundle_mod.projectIdentity(deps.project_root),
+        deps.run_binding,
+        observation.sha256Hex(gen_member_seed),
+    ) catch |err| {
+        log.warn("self-evolution", "generation evidence degraded: {s}", .{@errorName(err)});
+        return finish(allocator, deps, .degraded, @errorName(err));
+    };
+    defer generation.deinit();
+    var held_member_buffer: [256]u8 = undefined;
+    const held_member_seed = std.fmt.bufPrint(
+        &held_member_buffer,
+        "self-evolution-held-out-verifier:{s}",
+        .{deps.run_binding.run_id.asSlice()},
+    ) catch return finish(allocator, deps, .degraded, "unspecified");
+    const held_member = observation.sha256Hex(held_member_seed);
+    const held_members = [_][]const u8{held_member[0..]};
+    const held_suite = observation.sha256Hex("workbuddy-held-out-verifier-suite-v1");
+    const held_commitment = projection.heldOutCommitmentSha256(
+        allocator,
+        held_suite,
+        &held_members,
+    ) catch |err| {
+        log.warn("self-evolution", "held-out commitment degraded: {s}", .{@errorName(err)});
+        return finish(allocator, deps, .degraded, @errorName(err));
+    };
+    const held = [_]projection.HeldOutCommitment{.{
+        .commitment_sha256 = held_commitment[0..],
+        .suite_sha256 = held_suite[0..],
+        .case_count = held_members.len,
+        .member_sha256 = &held_members,
+        .sealed = true,
+    }};
 
     // 触发链:先过程信号轴(测试弱化/假闭合/终验失败——selflearn-r1
     // 判读确认本 cohort 的死法是"安静做错",不是工具失败风暴),不满足
@@ -540,20 +646,20 @@ pub fn endOfRun(allocator: std.mem.Allocator, deps: EndOfRunDeps) Outcome {
                 .max_output_tokens = AUTHOR_MAX_OUTPUT_TOKENS,
             },
             .pricing = authorPricing(),
-            .generation_evidence = &.{},
-            .held_out_commitments = &.{},
+            .generation_evidence = &.{generation.value},
+            .held_out_commitments = &held,
         }) catch |err| switch (err) {
             error.TriggerNotSatisfied => continue,
-            error.ProjectOntologyMissing => return .ontology_missing,
+            error.ProjectOntologyMissing => return finish(allocator, deps, .ontology_missing, @errorName(err)),
             else => {
                 log.warn("self-evolution", "prepare degraded: {s}", .{@errorName(err)});
-                return .degraded;
+                return finish(allocator, deps, .degraded, @errorName(err));
             },
         };
         prepared_ready = true;
         break;
     }
-    if (!prepared_ready) return .no_trigger;
+    if (!prepared_ready) return finish(allocator, deps, .no_trigger, "");
     defer prepared.deinit();
 
     const permit = rule_author.authorize(&prepared.author_request, .{
@@ -566,7 +672,7 @@ pub fn endOfRun(allocator: std.mem.Allocator, deps: EndOfRunDeps) Outcome {
         .remaining_output_tokens = AUTHOR_MAX_OUTPUT_TOKENS,
     }) catch |err| {
         log.warn("self-evolution", "authorize degraded: {s}", .{@errorName(err)});
-        return .degraded;
+        return finish(allocator, deps, .degraded, @errorName(err));
     };
 
     const outcome = evolution.authorOnce(&prepared, .{
@@ -574,17 +680,17 @@ pub fn endOfRun(allocator: std.mem.Allocator, deps: EndOfRunDeps) Outcome {
         .provider_sha256 = author_sha,
     }, permit, deps.abort) catch |err| {
         log.warn("self-evolution", "author degraded: {s}", .{@errorName(err)});
-        return .degraded;
+        return finish(allocator, deps, .degraded, @errorName(err));
     };
 
     if (outcome.decision != .propose or outcome.candidate_id == null)
-        return .abstained;
+        return finish(allocator, deps, .abstained, "");
 
     var loaded = rule_candidate.load(
         allocator,
         deps.session_dir,
         outcome.candidate_id.?,
-    ) catch return .degraded;
+    ) catch return finish(allocator, deps, .degraded, "unspecified");
     defer loaded.deinit();
 
     const envelope = Envelope{
@@ -593,10 +699,33 @@ pub fn endOfRun(allocator: std.mem.Allocator, deps: EndOfRunDeps) Outcome {
         .lean_source_sha256 = loaded.lean_source_sha256[0..],
         .rule = spec_mod.toWire(loaded.rule_spec),
     };
-    const text = encodeEnvelope(allocator, envelope) catch return .degraded;
+    const text = encodeEnvelope(allocator, envelope) catch return finish(allocator, deps, .degraded, "unspecified");
     defer allocator.free(text);
-    _ = deps.kg.remember(.observation, text, SCHEMA_TYPE, false) catch return .degraded;
-    return .proposed;
+    _ = deps.kg.remember(.observation, text, SCHEMA_TYPE, false) catch |err|
+        return finish(allocator, deps, .degraded, @errorName(err));
+    return finish(allocator, deps, .proposed, "");
+}
+
+/// 把 marker 开头的旧本体行(keep_id 除外)标记 deprecated_by → keep_id,
+/// 返回成功打边数。best-effort:召回或打边失败只缩小窗口效果,不报错——
+/// 快照条目上限的硬保护由每 run 必执行的本函数收敛(漏网行下 run 再收)。
+pub fn deprecateStaleOntologyRows(kg: *kg_client_mod.KgClient, marker: []const u8, keep_id: u64) usize {
+    var deprecated: usize = 0;
+    if (kg.recallTyped(marker, 40, false, "proposition")) |hits| {
+        defer {
+            for (hits) |*hit| hit.deinit(kg.allocator);
+            kg.allocator.free(hits);
+        }
+        for (hits) |hit| {
+            if (hit.node_id == keep_id) continue;
+            // BM25 是词法邻近,可能捎带非 impact 的 proposition——按正文
+            // 前缀二次确认,绝不误伤其它本体条目。
+            if (!std.mem.startsWith(u8, hit.text, marker)) continue;
+            kg.addEdge(hit.node_id, "deprecated_by", keep_id) catch continue;
+            deprecated += 1;
+        }
+    } else |_| {}
+    return deprecated;
 }
 
 fn writeImpactObservation(allocator: std.mem.Allocator, deps: EndOfRunDeps) void {
@@ -628,7 +757,34 @@ fn writeImpactObservation(allocator: std.mem.Allocator, deps: EndOfRunDeps) void
         },
     ) catch return;
     defer allocator.free(text);
-    _ = deps.kg.remember(.observation, text, IMPACT_SCHEMA_TYPE, false) catch return;
+    // 受治理本体命题(F1):快照只导出带 authority/falsifier/provenance 的
+    // 四类 schema_type,普通记忆永不投影——这是 r2 零剂量的第三层根因。
+    // impact 记录是 host 观测、任务无关、每 run 一条,恰是 author 该看到的
+    // 过程级战绩。best-effort:失败不影响主流程(client 侧 forget 保证不留
+    // 半成品毒化快照)。
+    const impact_sha = observation.sha256Hex(text);
+    const new_id = deps.kg.rememberOntologyItem(
+        text,
+        "proposition",
+        "host_observed",
+        "a run journal interval whose dispatch counters contradict this record",
+        &impact_sha,
+    ) catch |err| {
+        log.warn(
+            "self-evolution",
+            "impact ontology write degraded: {s}",
+            .{@errorName(err)},
+        );
+        return;
+    };
+    // 滚动窗口:快照对 >48 条可见条目是整体报错(OntologySnapshotTooLarge,
+    // 数据面 :272),每 run +1 条不清理会在第 49 个 run 永久毒化投影。旧
+    // impact 行的信息已被最新行取代(跨 run 趋势由熔断器独立承担),全部
+    // deprecate——投影按 deprecated_by 出边**静默跳过**("v1 exports only
+    // current candidates"),这是设计内出口;schema_type/retrieval_excluded
+    // 均不可经 CLI 改写(实测 InvalidRecord)。召回上限 40 = 去重召回同款
+    // tinykg --limit 安全值,覆盖两遍法全部 32 个 run。
+    _ = deprecateStaleOntologyRows(deps.kg, IMPACT_MARKER, new_id);
 
     // 熔断器(2026-08-18 审查 P1-2c):坏规则的唯一带内逃生通道。阻断
     // 风暴 → 撤回全部临时规则;author 之后可以基于战绩重新提案更好的。

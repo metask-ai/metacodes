@@ -25,6 +25,7 @@ const pfs = @import("platform").fs;
 const observation = @import("../tools/observation.zig");
 const source_receipt = @import("rule_source_receipt.zig");
 const impact_receipt = @import("rule_impact_receipt.zig");
+const journal_mod = @import("tool_observation_journal.zig");
 
 pub const SNAPSHOT_SCHEMA_VERSION = "tinykg-ontology-rule-projection-v2";
 pub const PACKET_SCHEMA_VERSION = "metacodes-ontology-to-rule-packet-v2";
@@ -66,6 +67,10 @@ pub const EvidenceKind = enum {
     user_correction,
     runtime_counterexample,
     rule_impact,
+    /// 臂内自演化:生成窗 = 本 Run 的 hash-bound 观察日志区间本身。
+    /// 不引用外部回执——subject/interval 都是经 validateRunBinding 认证的
+    /// 区间哈希;摘要只含计数,不搬运任何 actor 文本。
+    host_observation,
 };
 
 pub const ActiveRules = struct {
@@ -391,20 +396,57 @@ pub fn deriveGenerationEvidence(
             interval = authenticated.snapshot.source_interval_sha256;
             summary = try renderRuleImpactSummary(a, authenticated.snapshot);
         },
+        // host_observation 没有外部回执:它由 deriveRunObservationEvidence
+        // 直接从已认证 Run 区间派生,走不到本函数。
+        .host_observation => return error.HostObservationHasNoReceipt,
     }
     const summary_sha = observation.sha256Hex(summary);
-    return .{
-        .arena = arena,
-        .value = .{
-            .receipt_sha256 = try a.dupe(u8, receipt_id[0..]),
-            .kind = kind,
-            .subject_sha256 = try a.dupe(u8, subject[0..]),
-            .interval_sha256 = if (interval) |value| try a.dupe(u8, value[0..]) else null,
-            .window_member_sha256 = try a.dupe(u8, window_member_sha256[0..]),
-            .summary = summary,
-            .summary_sha256 = try a.dupe(u8, summary_sha[0..]),
-        },
+    // 同 deriveRunObservationEvidence:分配完成后再拷贝 arena 状态。
+    const value: GenerationEvidence = .{
+        .receipt_sha256 = try a.dupe(u8, receipt_id[0..]),
+        .kind = kind,
+        .subject_sha256 = try a.dupe(u8, subject[0..]),
+        .interval_sha256 = if (interval) |value| try a.dupe(u8, value[0..]) else null,
+        .window_member_sha256 = try a.dupe(u8, window_member_sha256[0..]),
+        .summary = summary,
+        .summary_sha256 = try a.dupe(u8, summary_sha[0..]),
     };
+    return .{ .arena = arena, .value = value };
+}
+
+/// 臂内路径:直接从已认证的 Run 区间派生生成证据(无外部回执)。
+pub fn deriveRunObservationEvidence(
+    allocator: std.mem.Allocator,
+    session_dir: []const u8,
+    project_sha256: [64]u8,
+    binding: journal_mod.RunBinding,
+    window_member_sha256: [64]u8,
+) !DerivedGenerationEvidence {
+    try requireNonzeroHex(project_sha256);
+    try requireNonzeroHex(window_member_sha256);
+    const validated = try journal_mod.validateRunBinding(session_dir, binding);
+    if (!validated.summary.complete) return error.ObservationJournalIncomplete;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const summary = try std.fmt.allocPrint(
+        a,
+        "host observation window: sequences {d}..{d}",
+        .{ binding.first_sequence, binding.last_sequence },
+    );
+    const summary_sha = observation.sha256Hex(summary);
+    // 全部分配完成后再按值拷贝 arena:return 字面量字段求值顺序不定,
+    // 若 .arena 先拷贝,之后 dupe 新增的 chunk 不在拷贝态里,deinit 漏释放。
+    const value: GenerationEvidence = .{
+        .receipt_sha256 = try a.dupe(u8, validated.interval_sha256[0..]),
+        .kind = .host_observation,
+        .subject_sha256 = try a.dupe(u8, validated.interval_sha256[0..]),
+        .interval_sha256 = try a.dupe(u8, validated.interval_sha256[0..]),
+        .window_member_sha256 = try a.dupe(u8, window_member_sha256[0..]),
+        .summary = summary,
+        .summary_sha256 = try a.dupe(u8, summary_sha[0..]),
+    };
+    return .{ .arena = arena, .value = value };
 }
 
 pub fn renderSnapshot(allocator: std.mem.Allocator, input: SnapshotInput) !RenderedSnapshot {
@@ -503,7 +545,8 @@ pub fn project(
     if (!std.mem.eql(u8, parsed.schema_version, SNAPSHOT_SCHEMA_VERSION) or
         !parsed.bounded or parsed.truncated or
         !validText(parsed.project_key, MAX_PROJECT_KEY_BYTES) or
-        parsed.ontology.len == 0 or
+        // ontology may be empty: a cold store has no governed items yet and the
+        // author still works from generation evidence + trigger signals alone.
         parsed.generation_evidence.len == 0 or
         parsed.held_out_commitments.len == 0 or
         parsed.ontology.len > MAX_ONTOLOGY_ITEMS or
@@ -921,6 +964,25 @@ fn validateGenerationEvidence(
                 } else if (receipt.observation_interval_sha256 != null) {
                     return error.GenerationEvidenceBindingMismatch;
                 }
+            },
+            .host_observation => {
+                // 臂内生成窗:行是自洽三元组(receipt==subject==interval=
+                // 认证过的区间哈希)+ 固定形状摘要。行内不携 run ids,
+                // 完整再认证在 derive 时已做;此处钉住不可变形状,防止
+                // 任何 actor 文本借道该行进入 author 包。
+                const raw_interval = item.interval_sha256 orelse
+                    return error.InvalidGenerationEvidence;
+                const interval = parseHex(raw_interval) orelse
+                    return error.InvalidGenerationEvidence;
+                if (!std.mem.eql(u8, &receipt_id, &subject) or
+                    !std.mem.eql(u8, &receipt_id, &interval))
+                    return error.GenerationEvidenceBindingMismatch;
+                if (!std.mem.startsWith(u8, item.summary, "host observation window: sequences "))
+                    return error.GenerationEvidenceSummaryMismatch;
+                for (item.summary["host observation window: sequences ".len..]) |c| switch (c) {
+                    '0'...'9', '.' => {},
+                    else => return error.GenerationEvidenceSummaryMismatch,
+                };
             },
             .rule_impact => {
                 var authenticated = try impact_receipt.deriveImpact(allocator, session_dir, receipt_id);

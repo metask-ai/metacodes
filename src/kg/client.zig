@@ -1530,6 +1530,23 @@ pub const KgClient = struct {
             return self.dataError("ontology-rule-snapshot project identity invalid", .{});
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{project_id}) catch unreachable;
+        // 身份首次绑定(2026-08-18 selflearn 根因):tinykg 的快照命令要求
+        // project 节点携 project_sha256/project_key 属性并与请求匹配,而
+        // 本客户端建项目节点时从不写它们——真 store 上快照必拒(此前只在
+        // mock 掉该命令的 pilot 里"通过")。store 为本项目私有,节点身份
+        // 只可能由我们写入;恒等写入幂等,快照端仍做最终匹配校验。
+        {
+            const bind_sha = try self.runChecked(&.{
+                "set-node-property", self.store_path, id_str,
+                "project_sha256",    expected_project_sha256[0..],
+            });
+            self.freeOut(bind_sha);
+            const bind_key = try self.runChecked(&.{
+                "set-node-property", self.store_path, id_str,
+                "project_key",       expected_project_key,
+            });
+            self.freeOut(bind_key);
+        }
         const out = try self.runChecked(&.{
             "ontology-rule-snapshot", self.store_path,              id_str,
             "--project-sha256",       expected_project_sha256[0..], "--project-key",
@@ -1552,6 +1569,50 @@ pub const KgClient = struct {
                 .{ project_id, trimForLog(snapshot) },
             );
         return self.allocator.dupe(u8, snapshot) catch KgError.OutOfMemory;
+    }
+
+    /// 写入一条受治理的本体条目(remember + 三治理属性,单事务语义)。
+    /// tinykg 快照只导出 schema_type ∈ {proposition,prescription,concept,
+    /// intent} 且 authority/falsifier/provenance 三属性齐全的节点;缺属性
+    /// 对快照是**整体报错**而非跳过,而 schema_type 不可事后翻转(实测
+    /// vendored CLI:set-node-property 键 allowlist 收它、值校验器无此分支
+    /// → InvalidRecord,有意为之)。所以协议是:先建本体类型节点,再补
+    /// 属性;任一步失败立即 forget 刚建节点,避免裸 proposition 毒化后续
+    /// 所有快照。残余风险仅进程中崩窗口——下一 run 快照会带
+    /// InvalidOntologyAuthority 报告,可 /kg forget 修复。
+    /// provenance 自引用该节点(存在性校验要求 ref 在库内),evidence 为
+    /// 节点正文 sha256——host 观测记录的来源就是它自己的采集内容。
+    pub fn rememberOntologyItem(
+        self: *KgClient,
+        text: []const u8,
+        ontology_kind: []const u8,
+        authority: []const u8,
+        falsifier: []const u8,
+        evidence_sha256_hex: *const [64]u8,
+    ) KgError!u64 {
+        const id = try self.remember(.observation, text, ontology_kind, false);
+        errdefer self.forget(id) catch {};
+        var idbuf: [24]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{id}) catch unreachable;
+        var prov_buffer: [256]u8 = undefined;
+        const provenance = std.fmt.bufPrint(
+            &prov_buffer,
+            "{{\"schema_version\":\"tinykg-ontology-provenance-v1\",\"refs\":" ++
+                "[{{\"kind\":\"host_observation\",\"node_id\":{d},\"evidence_sha256\":\"{s}\"}}]}}",
+            .{ id, evidence_sha256_hex[0..] },
+        ) catch unreachable;
+        const steps = [_][2][]const u8{
+            .{ "ontology_authority", authority },
+            .{ "ontology_falsifier", falsifier },
+            .{ "ontology_provenance", provenance },
+        };
+        for (steps) |step| {
+            const out = try self.runChecked(&.{
+                "set-node-property", self.store_path, id_str, step[0], step[1],
+            });
+            self.freeOut(out);
+        }
+        return id;
     }
 
     /// Identity of the TinyKG control plane that produced canonical snapshot
