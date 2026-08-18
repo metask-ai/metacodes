@@ -25,6 +25,7 @@ const source_receipt = @import("rule_source_receipt.zig");
 const project_rule_spec = @import("project_rule_spec.zig");
 const rule_candidate = @import("rule_candidate.zig");
 const ontology_projection = @import("ontology_rule_projection.zig");
+const log = @import("../util/log.zig");
 
 pub const SYSTEM_PROMPT = @embedFile("templates/rule_author/prompt.md");
 pub const SYSTEM_PROMPT_V2 = @embedFile("templates/rule_author/prompt-v2.md");
@@ -736,7 +737,18 @@ pub fn author(
         usage.output_tokens > prepared.caps.max_output_tokens)
         return error.ProviderUsageExceededPermit;
 
-    var result = try parseResponse(allocator, response.items);
+    var result = parseResponse(allocator, response.items) catch |err| {
+        // 诊断留痕(生产 etag 教训:report 只有 errName,响应内容黑箱)。
+        // 单行有界前缀 + sha 供与 receipt 对账;METACODES_LOG=warn 可见,
+        // trial 的 stderr 由 Harbor 收进 trial.log。
+        const digest = observation.sha256Hex(response.items);
+        var head = response.items[0..@min(response.items.len, 200)];
+        if (std.mem.indexOfScalar(u8, head, '\n')) |newline| head = head[0..newline];
+        log.warn("rule-author", "response parse failed ({s}) sha256={s} head={s}", .{
+            @errorName(err), digest[0..16], head,
+        });
+        return err;
+    };
     errdefer result.deinit();
     result.project_sha256 = prepared.project_sha256;
     result.observation = prepared.observation;
@@ -815,21 +827,22 @@ fn parseResponse(allocator: std.mem.Allocator, bytes: []const u8) !AuthorResult 
             const invariant = response.invariant orelse return error.InvalidAuthorResponse;
             const falsifier = response.falsifier orelse return error.InvalidAuthorResponse;
             const wire_spec = response.rule_spec orelse return error.InvalidAuthorResponse;
-            const lean_source = response.lean_source orelse return error.InvalidAuthorResponse;
             if (!validText(invariant, rule_candidate.MAX_INVARIANT_BYTES) or
-                !validText(falsifier, rule_candidate.MAX_FALSIFIER_BYTES) or
-                !validText(lean_source, rule_candidate.MAX_LEAN_SOURCE_BYTES))
+                !validText(falsifier, rule_candidate.MAX_FALSIFIER_BYTES))
                 return error.InvalidAuthorResponse;
             const spec = project_rule_spec.fromWire(wire_spec) catch
                 return error.InvalidAuthorResponse;
+            // lean 由 host 从 spec 确定性派生——按构造 canonical。要求真模型
+            // 逐字节复现模板是纯失败面(无安全收益:lean 本就是 spec 的
+            // 确定性投影);模型若回传 lean_source,视为废弃字段忽略。
             const canonical_lean = try renderCanonicalLean(a, spec);
-            if (!std.mem.eql(u8, lean_source, canonical_lean))
-                return error.LeanSourceRuleSpecMismatch;
+            if (canonical_lean.len > rule_candidate.MAX_LEAN_SOURCE_BYTES)
+                return error.InvalidAuthorResponse;
             proposal = .{
                 .invariant = invariant,
                 .falsifier = falsifier,
                 .rule_spec = spec,
-                .lean_source = lean_source,
+                .lean_source = canonical_lean,
             };
         },
     }
@@ -1870,6 +1883,33 @@ test "rule author response parser strips one markdown fence layer" {
         error.InvalidAuthorResponse,
         parseResponse(std.testing.allocator, "```json\n{\"nope\":1}\n```"),
     );
+}
+
+test "rule author derives canonical lean host-side and ignores model lean" {
+    const spec_json =
+        "{\"schema_version\":\"metacodes-project-rule-spec-v3\",\"target_kind\":\"tool\",\"target\":\"NotebookEdit\",\"target_scope\":\"all\",\"deny_target\":false,\"max_input_bytes\":1048576,\"max_agent_depth\":4,\"authoritative_only\":true,\"effect_requirement\":\"none\"}";
+    const head =
+        "{\"schema_version\":\"metacodes-rule-author-response-v1\",\"decision\":\"propose\",\"reason\":\"weakening without reobservation\",\"invariant\":\"authoritative rewrites must be reobserved\",\"falsifier\":\"an unobserved rewrite\",\"rule_spec\":" ++ spec_json;
+    const expected_spec = try project_rule_spec.fromWire(.{
+        .target_kind = .tool,
+        .target = "NotebookEdit",
+        .deny_target = false,
+        .max_input_bytes = 1_048_576,
+        .max_agent_depth = 4,
+        .authoritative_only = true,
+        .effect_requirement = .none,
+    });
+    const canonical = try renderCanonicalLean(std.testing.allocator, expected_spec);
+    defer std.testing.allocator.free(canonical);
+    // 模型不回传 lean:host 派生。
+    var absent = try parseResponse(std.testing.allocator, head ++ ",\"lean_source\":null}");
+    defer absent.deinit();
+    try std.testing.expectEqualStrings(canonical, absent.proposal.?.lean_source);
+    // 模型回传了错的 lean:忽略,仍用 host 派生(此前是 LeanSourceRuleSpecMismatch
+    // 硬拒——生产 etag 首开火即中此类)。
+    var wrong = try parseResponse(std.testing.allocator, head ++ ",\"lean_source\":\"-- whatever\"}");
+    defer wrong.deinit();
+    try std.testing.expectEqualStrings(canonical, wrong.proposal.?.lean_source);
 }
 
 test "worst-case author cost uses integer ceiling and the most expensive input class" {

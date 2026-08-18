@@ -70,7 +70,90 @@ pub fn build(
     return result.text;
 }
 
+/// 结局行正文前缀(与 core/self_evolution.OUTCOME_MARKER comptime 锁定一致)。
+pub const OUTCOME_NOTE_MARKER = "task-outcome-v1";
+const TASK_HINT_ENV = "METACODES_TASK_HINT";
+
+/// 确定性同题结局注入:host 经 env 声明本 run 的任务名,把该任务上一次
+/// 尝试的判定结局(reward/计数/错题名)钉进注入尾。**独立于 BM25 相关性
+/// 门**——两遍法生产取证:被动召回 16 trial 仅 4 次命中且全是别题的成绩
+/// 单,同题行从未到达,反馈等于没发。best-effort:无 hint/无匹配 → null。
+/// 返回 `allocator` 所有。
+fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClient) ?[]u8 {
+    const hint_c = std.c.getenv(TASK_HINT_ENV) orelse return null;
+    const hint = std.mem.span(hint_c);
+    if (hint.len == 0 or hint.len > 200) return null;
+    var needle_buffer: [232]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buffer, " task={s} ", .{hint}) catch return null;
+    var query_buffer: [280]u8 = undefined;
+    const query = std.fmt.bufPrint(&query_buffer, OUTCOME_NOTE_MARKER ++ " {s}", .{hint}) catch return null;
+    const hits = kg.recallTyped(query, 40, false, "task_outcome") catch return null;
+    defer {
+        for (hits) |*h| h.deinit(kg.allocator);
+        kg.allocator.free(hits);
+    }
+    // 同题可能多条(多次尝试):取 node_id 最大 = 最近一次。
+    var best_id: u64 = 0;
+    var best_text: ?[]const u8 = null;
+    var best_truncated = false;
+    for (hits) |h| {
+        if (std.mem.indexOf(u8, h.text, needle) == null) continue;
+        if (best_text != null and h.node_id <= best_id) continue;
+        best_id = h.node_id;
+        best_text = h.text;
+        best_truncated = h.text_truncated;
+    }
+    var body: []const u8 = best_text orelse return null;
+    // 错题名在行尾,截断摘录会砍掉 payload → 补取全文。
+    var full_owned: ?[]u8 = null;
+    defer if (full_owned) |full| kg.allocator.free(full);
+    if (best_truncated) {
+        if (kg.fetchNodeText(best_id)) |full| {
+            full_owned = full;
+            body = full;
+        } else |_| {}
+    }
+    // 框架语对冲"按笔记写不自测"的过度自信模式(schema_drift 验尸)。
+    return std.fmt.allocPrint(
+        allocator,
+        "<system-reminder>\n# 本任务上一次尝试的判定结局(host 声明,确定性注入)\n" ++
+            "{s}\n" ++
+            "先按当前工作区重新推导实现;上述失败点只用于对照校验与自测清单,不要当作规格照抄,也不要因此跳过验证。\n" ++
+            "</system-reminder>\n",
+        .{body},
+    ) catch null;
+}
+
 pub fn buildWithReceipt(
+    allocator: std.mem.Allocator,
+    kg: *client_mod.KgClient,
+    conversation: *const conv_mod.Conversation,
+    abort: *const AbortSignal,
+) !BuildResult {
+    var scored = try buildScoredReceipt(allocator, kg, conversation, abort);
+    if (disabled() or !kg.ready) return scored;
+    const note = sameTaskOutcomeNote(allocator, kg) orelse return scored;
+    defer allocator.free(note);
+    // 合并:确定性段在前,BM25 段在后;回执如实覆盖合并后全文(注入审计
+    // 面不得旁路)。
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, note);
+    if (scored.text) |scored_text| {
+        try out.appendSlice(allocator, scored_text);
+        allocator.free(scored_text);
+        scored.text = null;
+    }
+    const text = try out.toOwnedSlice(allocator);
+    var receipt = scored.receipt;
+    receipt.status = "injected";
+    receipt.injected_count += 1;
+    receipt.injected_bytes = text.len;
+    receipt.injection_sha256 = sha256Hex(text);
+    return .{ .text = text, .receipt = receipt };
+}
+
+fn buildScoredReceipt(
     allocator: std.mem.Allocator,
     kg: *client_mod.KgClient,
     conversation: *const conv_mod.Conversation,

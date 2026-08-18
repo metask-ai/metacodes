@@ -311,4 +311,25 @@ test "L2: outcome ingestion is idempotent through the real recall path" {
 
     try std.testing.expectEqual(@as(usize, 2), self_evolution.ingestOutcomes(a, &kg));
     try std.testing.expectEqual(@as(usize, 0), self_evolution.ingestOutcomes(a, &kg));
+
+    // 确定性同题注入(到达层修复的 L2 锚):host 声明 task hint 后,
+    // 该题结局行必须钉进注入尾——**独立于 BM25 相关性门**(空对话=
+    // 无 query,被动召回路径整个短路,只剩确定性段)。两遍法生产取证:
+    // 被动召回 16 trial 仅 4 次命中且全是别题成绩单。
+    var hint_buffer: [8:0]u8 = undefined;
+    @memcpy(hint_buffer[0..4], "etag");
+    hint_buffer[4] = 0;
+    ppaths.setEnv("METACODES_TASK_HINT", @as([*:0]const u8, @ptrCast(&hint_buffer)));
+    defer ppaths.unsetEnv("METACODES_TASK_HINT");
+    var conversation = cc.conversation.Conversation.init(a);
+    defer conversation.deinit();
+    var abort_signal = cc.util_abort.AbortSignal.init();
+    var built = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    defer built.deinit(a);
+    const injected_text = built.text orelse return error.TestExpectedInjection;
+    try std.testing.expect(std.mem.indexOf(u8, injected_text, "task=etag") != null);
+    try std.testing.expect(std.mem.indexOf(u8, injected_text, "t::b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, injected_text, "task=bugfix") == null);
+    try std.testing.expectEqualStrings("injected", built.receipt.status);
+    try std.testing.expect(built.receipt.injected_count >= 1);
 }

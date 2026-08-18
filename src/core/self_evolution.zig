@@ -348,6 +348,11 @@ pub fn loadProvisionalGate(
 /// pass 2 重做任务 X 时,"上一遍 X 挂了哪些测试"就在召回面里。
 pub const OUTCOME_SCHEMA_TYPE = "task_outcome";
 pub const OUTCOME_MARKER = "task-outcome-v1";
+comptime {
+    // 确定性同题注入(kg/scoped_recall)按同一前缀识别结局行——漂移即断链。
+    if (!std.mem.eql(u8, OUTCOME_MARKER, @import("../kg/scoped_recall.zig").OUTCOME_NOTE_MARKER))
+        @compileError("outcome marker drift between self_evolution and scoped_recall");
+}
 pub const OUTCOMES_ENV = "METACODES_TASK_OUTCOMES";
 pub const REPORT_ENV = "METACODES_SELF_EVOLUTION_REPORT";
 /// 上限受 tinykg search --limit 约束:KgClient 超采 = 2L+4,tinykg HEAD

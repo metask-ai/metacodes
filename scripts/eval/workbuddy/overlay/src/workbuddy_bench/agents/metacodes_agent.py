@@ -328,16 +328,34 @@ class MetacodesAgent(BaseInstalledAgent):
                     continue
                 seen.add(dedupe)
                 failing = []
-                try:
-                    for line in (trial_dir / "verifier" / "test_output.txt").read_text(
-                        encoding="utf-8", errors="replace"
-                    ).splitlines():
-                        if line.startswith("FAILED "):
-                            failing.append(line[len("FAILED "):][:160])
+                # 结构化优先:WorkBuddy 自定义 verifier 把逐测名字放在
+                # judges[].metadata.raw.tests[](两遍法取证:pytest FAILED 行
+                # 只覆盖 1/16 任务,其余 15 题错题名全丢)。pytest 行回退。
+                structured = None
+                for judge in score.get("judges") or []:
+                    raw_meta = (judge.get("metadata") or {}).get("raw") or {}
+                    if isinstance(raw_meta.get("tests"), list):
+                        structured = raw_meta["tests"]
+                        break
+                if structured is not None:
+                    for test in structured:
+                        if isinstance(test, dict) and test.get("passed") is False:
+                            name = str(test.get("name") or "")[:160]
+                            if name:
+                                failing.append(name)
                         if len(failing) >= 20:
                             break
-                except OSError:
-                    pass
+                else:
+                    try:
+                        for line in (trial_dir / "verifier" / "test_output.txt").read_text(
+                            encoding="utf-8", errors="replace"
+                        ).splitlines():
+                            if line.startswith("FAILED "):
+                                failing.append(line[len("FAILED "):][:160])
+                            if len(failing) >= 20:
+                                break
+                    except OSError:
+                        pass
                 rows.append(
                     {
                         "task": task,
@@ -525,6 +543,21 @@ class MetacodesAgent(BaseInstalledAgent):
                 import_host.write_bytes(tar_bytes)
         outcomes_env = ""
         if self._outcome_feedback:
+            # 确定性同题注入的 host 侧:把本 trial 的任务全名交给 runtime
+            # (trial 目录名被 harbor 截断,不可用;config.json task.path 的
+            # basename 是权威全名)。两遍法取证:被动 BM25 召回 4/16 命中
+            # 且全是别题成绩单——同题结局必须由 host 定向声明。
+            try:
+                trial_config = json.loads(
+                    (self.logs_dir.parent / "config.json").read_text(encoding="utf-8")
+                )
+                task_hint = str(trial_config["task"]["path"]).rstrip("/").rpartition("/")[2]
+            except (OSError, json.JSONDecodeError, KeyError, TypeError):
+                task_hint = ""
+            if task_hint and len(task_hint) <= 200:
+                outcomes_env += (
+                    "export METACODES_TASK_HINT=" + shlex.quote(task_hint) + "; "
+                )
             outcome_rows = self._collect_outcomes()
             if outcome_rows:
                 (self.logs_dir / "task-outcomes.json").write_text(
@@ -605,6 +638,9 @@ class MetacodesAgent(BaseInstalledAgent):
             "unset METACODES_PROJECT_KERNEL_PATH METACODES_PROJECT_KERNEL_SHA256; "
             f"{project_setup}"
             "export METACODES_KG_TRANSPORT=cli-exclusive; "
+            # warn 级诊断上 Harbor stderr(r1/r2 教训:自演化静默降级三层,
+            # 零日志可判;stdout 是 NDJSON 机器协议,不受影响)。
+            "export METACODES_LOG=warn; "
             + (
                 "export METACODES_SELF_EVOLUTION=1; "
                 "export METACODES_SELF_EVOLUTION_REPORT="
