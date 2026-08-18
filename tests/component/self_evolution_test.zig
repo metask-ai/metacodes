@@ -229,6 +229,10 @@ test "L2: end-of-run evolution proposes and the next run arms the provisional ru
         kg.allocator.free(impact_hits);
     }
     try std.testing.expect(impact_hits.len >= 1);
+    // 唯一文本接线锚:正文必须带 run id——tinykg 召回按文本重合折叠近
+    // 重复,同文本的多 run 行会折叠成 1 条,滚动窗口就永远打不出边
+    // (selflearn 两遍法生产取证)。
+    try std.testing.expect(std.mem.indexOf(u8, impact_hits[0].text, "run=") != null);
 
     // 滚动窗口实锚:第二条 impact 行落库后,窗口函数把 endOfRun 写的第一
     // 条真打上 deprecated_by 边(快照 >48 条是整体报错,窗口是硬保护)。

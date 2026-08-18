@@ -742,12 +742,18 @@ fn writeImpactObservation(allocator: std.mem.Allocator, deps: EndOfRunDeps) void
         sha[0..]
     else
         "none";
+    // run_id 必须进正文:tinykg 召回按文本重合折叠近重复,多个 run 的
+    // 计数全零时文本逐字节相同 → search 只返回 1 条代表(常为新行自身)
+    // → 滚动窗口永远打不出 deprecated_by 边(selflearn 两遍法生产取证:
+    // 32 条全可见零边,再 16 run 撞快照 48 上限)。唯一文本同时让 author
+    // packet 的本体行可区分。
     const text = std.fmt.allocPrint(
         allocator,
-        "provisional-rule-impact-v1: active_rules={d} pre_dispatch_blocks={d} " ++
+        "provisional-rule-impact-v1: run={s} active_rules={d} pre_dispatch_blocks={d} " ++
             "formal_faults={d} authoritative_non_successes={d} stop_reason={s} " ++
             "provisional_bundle_sha256={s}",
         .{
+            deps.run_binding.run_id.asSlice(),
             deps.provisional_active_count,
             snapshot.enforced_pre_blocks_before_dispatch,
             snapshot.formal_faults,

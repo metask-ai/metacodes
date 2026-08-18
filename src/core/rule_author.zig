@@ -783,7 +783,18 @@ fn parseResponse(allocator: std.mem.Allocator, bytes: []const u8) !AuthorResult 
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const a = arena.allocator();
-    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
+    var trimmed = std.mem.trim(u8, bytes, " \t\r\n");
+    // 真模型常把 JSON 包进 markdown fence(```json … ```)——selflearn p1
+    // 生产首开火即中 InvalidAuthorResponse。剥一层外围 fence 再解析;内容
+    // 里的 ``` 都在 JSON 字符串内被转义,只有真正的收尾 fence 落在末尾。
+    if (std.mem.startsWith(u8, trimmed, "```")) {
+        if (std.mem.indexOfScalar(u8, trimmed, '\n')) |first_newline| {
+            var inner = std.mem.trim(u8, trimmed[first_newline + 1 ..], " \t\r\n");
+            if (std.mem.endsWith(u8, inner, "```"))
+                inner = std.mem.trimEnd(u8, inner[0 .. inner.len - 3], " \t\r\n");
+            trimmed = inner;
+        }
+    }
     const response = std.json.parseFromSliceLeaky(ResponseWire, a, trimmed, .{
         .ignore_unknown_fields = false,
         .allocate = .alloc_always,
@@ -1841,6 +1852,23 @@ test "rule author response parser rejects unknown and duplicate fields" {
     try std.testing.expectError(
         error.InvalidAuthorResponse,
         parseResponse(std.testing.allocator, duplicate),
+    );
+}
+
+test "rule author response parser strips one markdown fence layer" {
+    const body =
+        "{\"schema_version\":\"metacodes-rule-author-response-v1\",\"decision\":\"abstain\",\"reason\":\"insufficient evidence\",\"invariant\":null,\"falsifier\":null,\"rule_spec\":null,\"lean_source\":null}";
+    const fenced = "```json\n" ++ body ++ "\n```";
+    var parsed = try parseResponse(std.testing.allocator, fenced);
+    parsed.deinit();
+    // 无语言标注的 fence 同样容忍。
+    const bare_fence = "```\n" ++ body ++ "\n```\n";
+    var parsed2 = try parseResponse(std.testing.allocator, bare_fence);
+    parsed2.deinit();
+    // fence 内不是合法响应仍然拒绝——剥壳不放宽内容校验。
+    try std.testing.expectError(
+        error.InvalidAuthorResponse,
+        parseResponse(std.testing.allocator, "```json\n{\"nope\":1}\n```"),
     );
 }
 
