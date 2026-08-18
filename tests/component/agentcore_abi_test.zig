@@ -106,9 +106,12 @@ const OPENAI_FINAL_SSE =
 
 const CONTINUATION_HEAD_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"cont_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n" ++
-    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
-    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"head\"}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"private reasoning\"}}\n\n" ++
     "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"head\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n" ++
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":2}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
@@ -127,6 +130,8 @@ const ReconstructionProbe = struct {
     current_len: usize = 0,
     answer: [256]u8 = undefined,
     answer_len: usize = 0,
+    thinking: [128]u8 = undefined,
+    thinking_len: usize = 0,
     stream_done_count: usize = 0,
     usage: sdk.protocol.UsageDelta = .{},
 
@@ -149,6 +154,11 @@ const ReconstructionProbe = struct {
                 if (text.len > self.current.len - self.current_len) return wire.EVENT_FATAL;
                 @memcpy(self.current[self.current_len..][0..text.len], text);
                 self.current_len += text.len;
+            },
+            .thinking_chunk => |text| {
+                if (text.len > self.thinking.len - self.thinking_len) return wire.EVENT_FATAL;
+                @memcpy(self.thinking[self.thinking_len..][0..text.len], text);
+                self.thinking_len += text.len;
             },
             .stream_done => {
                 if (self.current_len > self.answer.len - self.answer_len) return wire.EVENT_FATAL;
@@ -3011,6 +3021,7 @@ test "L2 public events reconstruct continuation output and observable run usage"
     );
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expectEqualStrings("headtail", probe.answer[0..probe.answer_len]);
+    try std.testing.expectEqualStrings("private reasoning", probe.thinking[0..probe.thinking_len]);
     try std.testing.expectEqual(@as(usize, 2), probe.stream_done_count);
     try std.testing.expectEqual(@as(u64, 11), probe.usage.input_tokens);
     try std.testing.expectEqual(@as(u64, 5), probe.usage.output_tokens);
@@ -5080,6 +5091,7 @@ fn expectMappedEventEquals(event: core.protocol.ui_event.CoreEvent, expected: sd
 
 test "L2 every public AgentCoreEventV1 mapping preserves its complete payload" {
     try expectMappedEventEquals(.{ .text_chunk = "text-sentinel" }, .{ .text_chunk = "text-sentinel" });
+    try expectMappedEventEquals(.{ .thinking_chunk = "thinking-sentinel" }, .{ .thinking_chunk = "thinking-sentinel" });
     try expectMappedEventEquals(
         .{ .tool_start = .{ .id = "tool-id", .name = "ToolName", .input = "input-json" } },
         .{ .tool_start = .{ .id = "tool-id", .name = "ToolName", .input = "input-json" } },

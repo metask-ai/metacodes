@@ -244,6 +244,7 @@ The v1 observation set is:
 | Event | Meaning |
 |---|---|
 | `text_chunk` | Assistant text delta |
+| `thinking_chunk` | Model reasoning delta, separate from visible assistant text and final-output reconstruction |
 | `stream_done` | One provider stream completed |
 | `tool_start` | Tool invocation identity, name, and input |
 | `tool_progress` | Incremental progress text for one tool call |
@@ -269,10 +270,16 @@ output, a Host accumulates only closed segments: `text_chunk` appends to the
 current segment and `stream_done` closes it. `tool_start` and `tool_result` are
 semantic boundaries that discard any unclosed segment and all previously
 closed accumulated segments; consecutive boundaries are idempotent and
-`tool_progress` is not a boundary. The final output is the concatenation of
-all closed segments after the last boundary, or all closed segments when no
-boundary occurred. This preserves max-token continuations while excluding
-pre-tool drafts. Usage events are exact deltas and must use checked arithmetic.
+`tool_progress` and `thinking_chunk` are not boundaries. The final output is
+the concatenation of all closed segments after the last boundary, or all closed
+segments when no boundary occurred. This preserves max-token continuations
+while excluding pre-tool drafts. `thinking_chunk` never contributes to the
+current segment or final output. Usage events are exact deltas and must use
+checked arithmetic.
+
+`thinking_chunk` is an additive ABI-v1 observation event. An older Host may
+decode it through the `unknown` observation path and ignore or retain it in
+accordance with the forward-compatibility rules above.
 
 `tool_result.file_refs` is an optional Revision 8 observation field. It is
 present only for successful selected built-in file-tool executions and contains
