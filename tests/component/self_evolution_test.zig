@@ -312,6 +312,29 @@ test "L2: outcome ingestion is idempotent through the real recall path" {
     try std.testing.expectEqual(@as(usize, 2), self_evolution.ingestOutcomes(a, &kg));
     try std.testing.expectEqual(@as(usize, 0), self_evolution.ingestOutcomes(a, &kg));
 
+    // 升级写(p3 取证抓的真 bug 的回归钉):存量 bugfix 行 failing=[],新
+    // 文件同 key 但带错题名 → 必须升级写 1 条;etag 存量已带名 → 跳过;
+    // 升级后再摄取回到幂等 0。
+    {
+        const upgraded_payload = "{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+            "{\"task\":\"etag\",\"attempt_key\":\"a1\",\"reward\":0.27,\"tests_passed\":3,\"tests_total\":11,\"failing_tests\":[\"t::a\",\"t::b\"]}," ++
+            "{\"task\":\"bugfix\",\"attempt_key\":\"a1\",\"reward\":0.5,\"tests_passed\":2,\"tests_total\":4,\"failing_tests\":[\"named now\"]}]}";
+        const pfs = @import("platform").fs;
+        const outcomes_z2 = try a.dupeZ(u8, outcomes_path);
+        defer a.free(outcomes_z2);
+        const fd = pfs.open(outcomes_z2.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = pfs.close(fd);
+        var off: usize = 0;
+        while (off < upgraded_payload.len) {
+            const n = pfs.write(fd, upgraded_payload[off..]);
+            try std.testing.expect(n > 0);
+            off += @intCast(n);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
+    try std.testing.expectEqual(@as(usize, 0), self_evolution.ingestOutcomes(a, &kg));
+
     // 确定性同题注入(到达层修复的 L2 锚):host 声明 task hint 后,
     // 该题结局行必须钉进注入尾——**独立于 BM25 相关性门**(空对话=
     // 无 query,被动召回路径整个短路,只剩确定性段)。两遍法生产取证:

@@ -403,8 +403,11 @@ pub fn ingestOutcomes(
     }) catch return 0;
     if (!std.mem.eql(u8, parsed.schema_version, OUTCOME_MARKER)) return 0;
 
-    // 幂等:已在库的 (task, attempt_key) 不重写。
-    var seen = std.StringHashMapUnmanaged(void){};
+    // 幂等 + 升级:已在库的 (task, attempt_key) 默认不重写;但存量行无错题
+    // 名(旧提取器只认 pytest,15/16 任务 failing=[])而新行有名时**升级写**
+    // ——注入选择器按 node_id 取最新,升级行自动生效。无名行都很短
+    // (~150B),不会被召回摘录截断,"failing=[]" 判定可靠。
+    var seen = std.StringHashMapUnmanaged(bool){};
     if (kg.recallTyped(OUTCOME_MARKER, MAX_OUTCOME_ROWS, false, OUTCOME_SCHEMA_TYPE)) |hits| {
         defer {
             for (hits) |*hit| hit.deinit(kg.allocator);
@@ -413,14 +416,18 @@ pub fn ingestOutcomes(
         for (hits) |hit| {
             // key 在文本前 ~60 字节;hit.text 已带前 800 字节,避免逐 hit
             // spawn get(2026-08-18 审查 R4)。
+            const stored_has_names = std.mem.indexOf(u8, hit.text, "failing=[]") == null;
             if (extractOutcomeKey(hit.text)) |key| {
-                seen.put(arena.allocator(), arena.allocator().dupe(u8, key) catch continue, {}) catch continue;
+                const entry = seen.getOrPut(arena.allocator(), arena.allocator().dupe(u8, key) catch continue) catch continue;
+                if (!entry.found_existing or stored_has_names) entry.value_ptr.* = stored_has_names;
                 continue;
             }
             const full = kg.fetchNodeText(hit.node_id) catch continue;
             defer kg.allocator.free(full);
-            if (extractOutcomeKey(full)) |key|
-                seen.put(arena.allocator(), arena.allocator().dupe(u8, key) catch continue, {}) catch continue;
+            if (extractOutcomeKey(full)) |key| {
+                const entry = seen.getOrPut(arena.allocator(), arena.allocator().dupe(u8, key) catch continue) catch continue;
+                if (!entry.found_existing or stored_has_names) entry.value_ptr.* = stored_has_names;
+            }
         }
     } else |_| {}
 
@@ -431,7 +438,10 @@ pub fn ingestOutcomes(
         if (row.attempt_key.len == 0 or row.attempt_key.len > 200) continue;
         var key_buffer: [512]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buffer, "{s}#{s}", .{ row.task, row.attempt_key }) catch continue;
-        if (seen.contains(key)) continue;
+        if (seen.get(key)) |stored_has_names| {
+            // 已在库:仅当"存量无名 + 新行有名"时升级写,否则跳过。
+            if (stored_has_names or row.failing_tests.len == 0) continue;
+        }
         var failing = std.array_list.Managed(u8).init(allocator);
         defer failing.deinit();
         for (row.failing_tests, 0..) |name, i| {

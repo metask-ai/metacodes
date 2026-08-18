@@ -150,6 +150,13 @@ pub fn buildWithReceipt(
     receipt.injected_count += 1;
     receipt.injected_bytes = text.len;
     receipt.injection_sha256 = sha256Hex(text);
+    // warn 级:host 定向注入是显著干预,必须在生产可审计(trial 的 stderr
+    // 由 Harbor 收进 trial.log;p3 取证时无任何面能证明注入到达,只能靠
+    // 行为侧写间接推断——不再允许这种盲区)。
+    const note_sha = sha256Hex(note);
+    log.warn("kg", "deterministic outcome note injected bytes={d} sha256={s}", .{
+        note.len, note_sha[0..16],
+    });
     return .{ .text = text, .receipt = receipt };
 }
 
