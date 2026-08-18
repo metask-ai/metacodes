@@ -53,6 +53,10 @@ pub const Trigger = enum {
     runtime_counterexample,
     drift_detected,
     stable_threshold,
+    /// 过程信号轴(2026-08-18 selflearn-r1 判读:本 cohort 的死法是安静
+    /// 做错——测试弱化/假闭合/终验失败,不是工具失败风暴)。全部由
+    /// hash-bound journal 推导,拒绝调用者散文。
+    process_signal,
 };
 
 pub const EvidenceKind = enum {
@@ -424,6 +428,31 @@ fn buildEvidence(
 ) ![]const WireEvidence {
     switch (input.trigger) {
         .drift_detected, .stable_threshold => return error.UnsupportedTriggerSource,
+        .process_signal => {
+            if (input.evidence.len != 0) return error.UnsupportedEvidenceSource;
+            const summary = try std.fmt.allocPrint(
+                allocator,
+                "test_weakening_candidates={}; weakening_with_failed_verification={}; " ++
+                    "final_closure_tier0_with_mutations={}; known_failing={}; " ++
+                    "authoritative_non_successes={}",
+                .{
+                    snapshot.test_weakening_candidates,
+                    snapshot.weakening_with_failed_verification,
+                    snapshot.final_closure_tier0_with_mutations,
+                    snapshot.known_failing,
+                    snapshot.authoritative_non_successes,
+                },
+            );
+            const summary_sha256 = observation.sha256Hex(summary);
+            const rows = try allocator.alloc(WireEvidence, 1);
+            rows[0] = .{
+                .kind = .typed_failure_summary,
+                .artifact_sha256 = try allocator.dupe(u8, interval_sha256[0..]),
+                .summary_sha256 = try allocator.dupe(u8, summary_sha256[0..]),
+                .summary = summary,
+            };
+            return rows;
+        },
         .repeated_typed_failure => {
             // This trigger is derived entirely from the hash-bound journal.
             // Reject caller prose so an evaluation case that occurred after
@@ -476,6 +505,15 @@ fn hasEvidence(evidence: []const EvidenceItem, kind: EvidenceKind) bool {
     return false;
 }
 
+/// 测试钩子:触发谓词是自演化剂量的第一因,必须可单测。
+pub fn testTriggerSatisfied(
+    trigger: Trigger,
+    snapshot: impact_stats.Snapshot,
+    evidence: []const EvidenceItem,
+) bool {
+    return triggerSatisfied(trigger, snapshot, evidence);
+}
+
 fn triggerSatisfied(
     trigger: Trigger,
     snapshot: impact_stats.Snapshot,
@@ -485,6 +523,11 @@ fn triggerSatisfied(
         .user_correction => hasEvidence(evidence, .user_correction),
         .repeated_typed_failure => evidence.len == 0 and
             snapshot.authoritative_non_successes >= 3,
+        .process_signal => evidence.len == 0 and
+            (snapshot.test_weakening_candidates >= 2 or
+                snapshot.weakening_with_failed_verification >= 1 or
+                snapshot.final_closure_tier0_with_mutations or
+                snapshot.known_failing),
         .runtime_counterexample => hasEvidence(evidence, .runtime_counterexample) and
             (snapshot.enforced_pre_blocks_before_dispatch > 0 or snapshot.formal_faults > 0),
         .drift_detected, .stable_threshold => false,

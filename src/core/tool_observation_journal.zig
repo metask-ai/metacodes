@@ -125,6 +125,18 @@ pub const BlockedVerdictBinding = struct {
     bundle_revision: u64,
 };
 
+/// 过程信号聚合(PO-V2 M2/M4 传感器,self-evolution 触发轴):
+/// 与 dispatch 配对无关的观察事件,折叠成整数充分统计。
+pub const ProcessSignals = struct {
+    test_weakening_candidates: u64 = 0,
+    weakening_with_failed_verification: u64 = 0,
+    /// verification_final_gate 是 run 末единственная总结事件;最后一条为准。
+    final_closure_tier: ?u8 = null,
+    final_gate_mutations_occurred: bool = false,
+    known_failing: bool = false,
+    redundant_verifications: u64 = 0,
+};
+
 pub const LoadedRunDispatches = struct {
     arena: std.heap.ArenaAllocator,
     interval_sha256: [64]u8,
@@ -132,6 +144,7 @@ pub const LoadedRunDispatches = struct {
     dispatches: []const RunDispatch,
     formal_decisions: []const RunFormalDecision,
     rule_filters: []const RunRuleFilter,
+    process_signals: ProcessSignals = .{},
 
     pub fn deinit(self: *LoadedRunDispatches) void {
         self.arena.deinit();
@@ -430,6 +443,7 @@ pub fn loadRunDispatches(
     var interval_hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var records: std.ArrayList(RunDispatch) = .empty;
     var formal_decisions: std.ArrayList(RunFormalDecision) = .empty;
+    var process_signals = ProcessSignals{};
     var rule_filters: std.ArrayList(RunRuleFilter) = .empty;
     var stop_reason: ?[]const u8 = null;
     var open = std.AutoHashMap([32]u8, usize).init(a);
@@ -460,7 +474,18 @@ pub fn loadRunDispatches(
                 // Diagnostic-only: a coverage gap binds no rule identity and
                 // no checker call, so replay has nothing to validate. It must
                 // still never be silently dropped from the hashed interval.
-                .rule_coverage_gap, .rule_bounds_overflow, .verification_final_gate, .requirement_ledger, .test_weakening_candidate => {},
+                .rule_coverage_gap, .rule_bounds_overflow, .requirement_ledger => {},
+                .test_weakening_candidate => |weakening| {
+                    process_signals.test_weakening_candidates += 1;
+                    if (weakening.last_verification_failed)
+                        process_signals.weakening_with_failed_verification += 1;
+                },
+                .verification_final_gate => |gate| {
+                    process_signals.final_closure_tier = gate.final_closure_tier;
+                    process_signals.final_gate_mutations_occurred = gate.mutations_occurred;
+                    process_signals.known_failing = gate.known_failing;
+                    process_signals.redundant_verifications += gate.redundant_verifications;
+                },
                 .rule_filter => |filter| try rule_filters.append(a, .{
                     .sequence = envelope.sequence,
                     .dispatch_id = filter.dispatch_id,
@@ -581,6 +606,7 @@ pub fn loadRunDispatches(
         .dispatches = try records.toOwnedSlice(a),
         .formal_decisions = try formal_decisions.toOwnedSlice(a),
         .rule_filters = try rule_filters.toOwnedSlice(a),
+        .process_signals = process_signals,
     };
 }
 

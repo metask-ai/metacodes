@@ -405,36 +405,50 @@ pub fn endOfRun(allocator: std.mem.Allocator, deps: EndOfRunDeps) Outcome {
         else => null,
     };
 
-    var prepared = evolution.prepare(allocator, .{
-        .session_dir = deps.session_dir,
-        .project_root = deps.project_root,
-        .project_rules_dir = rules_dir,
-        .ontology_source = source.source(),
-        .kernel_config = kernel_config,
-        .author_sha256 = author_sha,
-        .actor_provider_sha256 = actor_sha,
-        .provider_sha256 = author_sha,
-        .budget_authorization_sha256 = observation.sha256Hex(budget_seed),
-        .model = deps.model,
-        .observation = deps.run_binding,
-        .trigger = .repeated_typed_failure,
-        .evidence = &.{},
-        .caps = .{
-            .max_cost_microusd = AUTHOR_MAX_COST_MICROUSD,
-            .max_input_tokens = AUTHOR_MAX_INPUT_TOKENS,
-            .max_output_tokens = AUTHOR_MAX_OUTPUT_TOKENS,
-        },
-        .pricing = authorPricing(),
-        .generation_evidence = &.{},
-        .held_out_commitments = &.{},
-    }) catch |err| return switch (err) {
-        error.TriggerNotSatisfied => .no_trigger,
-        error.ProjectOntologyMissing => .ontology_missing,
-        else => blk: {
-            log.warn("self-evolution", "prepare degraded: {s}", .{@errorName(err)});
-            break :blk .degraded;
-        },
+    // 触发链:先过程信号轴(测试弱化/假闭合/终验失败——selflearn-r1
+    // 判读确认本 cohort 的死法是"安静做错",不是工具失败风暴),不满足
+    // 再退回 repeated_typed_failure。两次 prepare 都是离线零花费。
+    const triggers = [_]rule_author.Trigger{
+        .process_signal,
+        .repeated_typed_failure,
     };
+    var prepared: evolution.Prepared = undefined;
+    var prepared_ready = false;
+    for (triggers) |trigger| {
+        prepared = evolution.prepare(allocator, .{
+            .session_dir = deps.session_dir,
+            .project_root = deps.project_root,
+            .project_rules_dir = rules_dir,
+            .ontology_source = source.source(),
+            .kernel_config = kernel_config,
+            .author_sha256 = author_sha,
+            .actor_provider_sha256 = actor_sha,
+            .provider_sha256 = author_sha,
+            .budget_authorization_sha256 = observation.sha256Hex(budget_seed),
+            .model = deps.model,
+            .observation = deps.run_binding,
+            .trigger = trigger,
+            .evidence = &.{},
+            .caps = .{
+                .max_cost_microusd = AUTHOR_MAX_COST_MICROUSD,
+                .max_input_tokens = AUTHOR_MAX_INPUT_TOKENS,
+                .max_output_tokens = AUTHOR_MAX_OUTPUT_TOKENS,
+            },
+            .pricing = authorPricing(),
+            .generation_evidence = &.{},
+            .held_out_commitments = &.{},
+        }) catch |err| switch (err) {
+            error.TriggerNotSatisfied => continue,
+            error.ProjectOntologyMissing => return .ontology_missing,
+            else => {
+                log.warn("self-evolution", "prepare degraded: {s}", .{@errorName(err)});
+                return .degraded;
+            },
+        };
+        prepared_ready = true;
+        break;
+    }
+    if (!prepared_ready) return .no_trigger;
     defer prepared.deinit();
 
     const permit = rule_author.authorize(&prepared.author_request, .{
@@ -548,6 +562,36 @@ test "author caps cover the worst-case cost and the actor output setting" {
     try std.testing.expect(AUTHOR_MAX_COST_MICROUSD >= worst);
     const util_model = @import("../util/model.zig");
     try std.testing.expect(AUTHOR_MAX_OUTPUT_TOKENS >= util_model.DEFAULT_MAX_TOKENS);
+}
+
+test "process-signal trigger fires on weakening, tier0-with-mutations, or known-failing" {
+    // selflearn-r1 剂量为零的根因是触发轴错位;新轴按真实死法设计,
+    // 单测钉住谓词语义。
+    const ta = @import("rule_author.zig");
+    const stats = @import("rule_impact_stats.zig");
+    var snapshot = std.mem.zeroInit(stats.Snapshot, .{
+        .source_interval_sha256 = [_]u8{'0'} ** 64,
+        .labels = stats.RunLabels{},
+        .rules = &[_]stats.RuleStats{},
+    });
+    const sat = struct {
+        fn check(s2: stats.Snapshot) bool {
+            return ta.testTriggerSatisfied(.process_signal, s2, &.{});
+        }
+    }.check;
+    try std.testing.expect(!sat(snapshot));
+    snapshot.test_weakening_candidates = 2;
+    try std.testing.expect(sat(snapshot));
+    snapshot.test_weakening_candidates = 1;
+    try std.testing.expect(!sat(snapshot));
+    snapshot.weakening_with_failed_verification = 1;
+    try std.testing.expect(sat(snapshot));
+    snapshot.weakening_with_failed_verification = 0;
+    snapshot.final_closure_tier0_with_mutations = true;
+    try std.testing.expect(sat(snapshot));
+    snapshot.final_closure_tier0_with_mutations = false;
+    snapshot.known_failing = true;
+    try std.testing.expect(sat(snapshot));
 }
 
 test "envelope round-trips through encode/parse with spec validation" {

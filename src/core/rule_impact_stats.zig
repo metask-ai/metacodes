@@ -122,6 +122,11 @@ pub const Snapshot = struct {
     shadow_pre_blocks_followed_by_dispatch: u64 = 0,
     shadow_pre_faults_followed_by_dispatch: u64 = 0,
     subsequent_authoritative_successes: u64 = 0,
+    // 过程信号(M2/M4 传感器折叠;self-evolution process_signal 触发轴)。
+    test_weakening_candidates: u64 = 0,
+    weakening_with_failed_verification: u64 = 0,
+    final_closure_tier0_with_mutations: bool = false,
+    known_failing: bool = false,
     labels: RunLabels,
     evidence: EvidenceBinding = .{},
     rules: []RuleStats,
@@ -200,6 +205,11 @@ pub fn deriveBound(
         .labels = labels,
         .evidence = evidence,
         .rules = &.{},
+        .test_weakening_candidates = run.process_signals.test_weakening_candidates,
+        .weakening_with_failed_verification = run.process_signals.weakening_with_failed_verification,
+        .final_closure_tier0_with_mutations = run.process_signals.final_closure_tier == 0 and
+            run.process_signals.final_gate_mutations_occurred,
+        .known_failing = run.process_signals.known_failing,
     };
     errdefer if (snapshot.rules.len != 0) allocator.free(snapshot.rules);
 
