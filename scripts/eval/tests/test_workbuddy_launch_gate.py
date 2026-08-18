@@ -3137,6 +3137,32 @@ class TrialResumeEligibilityTest(unittest.TestCase):
         self.assertFalse(eligible)
         self.assertIn("recovered", reason)
 
+    def test_terminal_404_after_in_ledger_success_is_eligible(self):
+        # selflearn-r2 生产首例:上游路由抖动表现为"先 200 后终态 404"。
+        eligible, reason = launch_gate.trial_resume_eligibility(
+            {"exception_info": {"exception_type": "NonZeroAgentExitCodeError"}},
+            [
+                {"seq": 1, "response": {"status": 200}, "error": None},
+                {"seq": 2, "response": {"status": 404},
+                 "error": "Backend returned 404"},
+            ],
+        )
+        self.assertTrue(eligible)
+        self.assertIn("404", reason)
+
+    def test_all_404_ledger_is_refused(self):
+        # 从未成功过的 404 = 常驻错配,不是瞬态。
+        eligible, reason = launch_gate.trial_resume_eligibility(
+            {"exception_info": {"exception_type": "NonZeroAgentExitCodeError"}},
+            [
+                {"seq": 1, "response": {"status": 404},
+                 "error": "Backend returned 404"},
+                {"seq": 2, "response": {"status": 404},
+                 "error": "Backend returned 404"},
+            ],
+        )
+        self.assertFalse(eligible)
+
     def test_harness_defect_exception_type_is_refused(self):
         # RuntimeError(如 ATIF 构建缺陷)即使与被重试的 502 尾部同现也不可
         # 续——类型门先于尾部判定(2026-08-18 对抗审查)。

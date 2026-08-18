@@ -3619,13 +3619,24 @@ def trial_resume_eligibility(
     # 尾段里——最后一条是成功说明瞬态已被内部重试恢复,agent 之死另有
     # 原因,重跑=给崩溃的 trial 白送第二次机会。真实事故 7/7 的 5xx 都
     # 是最后一条。
+    # 窄 404 条款(2026-08-18 selflearn-r2 生产首例):路由 token 由
+    # proxy 注入,agent 永远碰不到 URL——同一账本先前有成功响应而终态
+    # 突然 404,只能是上游路由抖动。无先前 200 的 404(常驻错配)不算。
+    had_success = any(
+        (record.get("response") or {}).get("status") == 200
+        for record in request_records
+    )
     for record in reversed(tail):
         status = (record.get("response") or {}).get("status")
         error = record.get("error")
         network_error = isinstance(error, str) and any(
             marker in error for marker in NETWORK_FAILURE_MARKERS
         )
-        if (isinstance(status, int) and status >= 500) or network_error:
+        if (
+            (isinstance(status, int) and status >= 500)
+            or network_error
+            or (status == 404 and had_success)
+        ):
             return True, (
                 "agent exception "
                 + str(exception.get("exception_type"))
