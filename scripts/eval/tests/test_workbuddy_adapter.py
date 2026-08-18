@@ -3272,6 +3272,64 @@ with tempfile.TemporaryDirectory() as directory:
         raise AssertionError("broken continuity chain was accepted")
 ''')
 
+    def test_outcome_feedback_exports_task_hint_and_outcomes_together(self):
+        """p3/p4 生产事故回归钉:TASK_OUTCOMES 的 `outcomes_env = (...)` 赋值
+        把先前追加的 METACODES_TASK_HINT 导出整个覆盖,确定性同题注入从未
+        发生。两个导出必须共存,且 hint 取 config.json task.path 的 basename,
+        结局文件带结构化错题名。"""
+        self._run_program(r'''
+import asyncio, json, tempfile
+from pathlib import Path
+from workbuddy_bench.agents.metacodes_agent import MetacodesAgent
+
+class StubEnvironment:
+    pass
+
+with tempfile.TemporaryDirectory() as directory:
+    jobs = Path(directory) / "results" / "arm-slug"
+    # 已完成的兄弟 trial:_collect_outcomes 的素材(结构化 tests[] 名字)。
+    done = jobs / "batch-1" / "etag_task__prev1"
+    (done / "verifier").mkdir(parents=True)
+    (done / "result.json").write_text(json.dumps({"task_name": "workbuddy/feature-medium-etag_header_for_static"}))
+    (done / "verifier" / "score.json").write_text(json.dumps({
+        "reward": 0.27, "tests_passed": 3, "tests_total": 11,
+        "judges": [{"metadata": {"raw": {"tests": [
+            {"name": "etag present", "passed": False},
+            {"name": "cache hit 304", "passed": False},
+            {"name": "cli exits", "passed": True},
+        ]}}}],
+    }))
+    # 当前 trial:config.json 是任务全名的权威来源。
+    trial = jobs / "batch-1" / "etag_task__now1"
+    logs = trial / "agent"
+    logs.mkdir(parents=True)
+    (trial / "config.json").write_text(json.dumps({
+        "task": {"path": ".workspace/staged/wb/tasks/feature-medium-etag_header_for_static", "source": "tasks"},
+    }))
+    captured = {}
+    async def fake_exec(environment, command, env, cwd):
+        captured["command"] = command
+        (logs / "kg-export.tar").write_bytes(b"")
+    agent = MetacodesAgent(
+        logs, model_name="route-l2", model_params={},
+        METACODES_MODEL_DISPLAY_NAME="glm-5.2",
+        connection={"mode": "local_proxy", "proxy_url": "http://127.0.0.1:1"},
+        METACODES_MEMORY_ACCUMULATION=True,
+        METACODES_SELF_EVOLUTION=True,
+        METACODES_OUTCOME_FEEDBACK=True,
+        METACODES_PROJECT_CONTROL_MODE="enforced",
+        METACODES_PROJECT_RULES_RELATIVE="share/metacodes/workbuddy-w05/project-rules",
+        METACODES_PROJECT_KERNEL_RELATIVE="libexec/metacodes-project-kernel",
+    )
+    agent.exec_as_agent = fake_exec
+    asyncio.run(agent.run("instruction", StubEnvironment(), None))
+    command = captured["command"]
+    assert "export METACODES_TASK_HINT=feature-medium-etag_header_for_static; " in command, command[:2000]
+    assert "export METACODES_TASK_OUTCOMES=/logs/agent/task-outcomes.json; " in command
+    rows = json.loads((logs / "task-outcomes.json").read_text())["outcomes"]
+    assert len(rows) == 1 and rows[0]["failing_tests"] == ["etag present", "cache hit 304"], rows
+''')
+
     def test_accumulation_off_keeps_the_original_contract(self):
         self._run_program(r'''
 import asyncio, json, tempfile

@@ -571,7 +571,10 @@ class MetacodesAgent(BaseInstalledAgent):
                     + "\n",
                     encoding="utf-8",
                 )
-                outcomes_env = (
+                # += 而非 =:hint 导出已在前面追加,赋值会整个覆盖(p3/p4
+                # 生产事故:METACODES_TASK_HINT 被此行蒸发,确定性注入从未
+                # 发生,p3 的到达层归因因此作废)。
+                outcomes_env += (
                     "export METACODES_TASK_OUTCOMES="
                     "/logs/agent/task-outcomes.json; "
                 )
