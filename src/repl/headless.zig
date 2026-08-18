@@ -17,6 +17,7 @@ const agent_loop = @import("../core/agent_loop.zig");
 const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
 const permission_mod = @import("../permission.zig");
 const project_activation = @import("../core/project_rule_activation.zig");
+const self_evolution_mod = @import("../core/self_evolution.zig");
 const request_gate_mod = @import("../core/request_gate.zig");
 const tee_backend_mod = @import("../core/tee_backend.zig");
 const tool_context_mod = @import("../tools/context.zig");
@@ -120,6 +121,26 @@ pub fn run(
         try control.finishRun(@errorName(err));
         return err;
     };
+    // 自演化 S2:store 里有临时规则 → 以固定 kernel 合并进(或独立构成)
+    // 项目规则 gate。装载失败/降级一律回退到普通 gate,绝不放倒 Run。
+    const self_evo_enabled = self_evolution_mod.enabledFromEnv();
+    var provisional_gate: ?*self_evolution_mod.ProvisionalGate = null;
+    defer if (provisional_gate) |pg| pg.deinit();
+    if (self_evo_enabled) {
+        if (app.kg) |*known_graph| {
+            if (run_control) |control| {
+                provisional_gate = self_evolution_mod.loadProvisionalGate(
+                    allocator,
+                    known_graph,
+                    if (control.project_gate) |base_gate| &base_gate.active else null,
+                    if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
+                    control.session_dir,
+                    &app.abort,
+                    control.observer(),
+                );
+            }
+        }
+    }
     var eval_be: ?evaluation_backend_mod.EvaluationBackend = if (eval_runtime) |*runtime| blk: {
         const active_provider = app.provider();
         runtime.configureBudgetReserve(
@@ -182,7 +203,12 @@ pub fn run(
             effective_execution_policy,
             eval_be != null,
             if (run_control) |control| control.observer() else null,
-            if (run_control) |control| control.formalGate() else null,
+            if (provisional_gate) |pg|
+                pg.gate()
+            else if (run_control) |control|
+                control.formalGate()
+            else
+                null,
         ),
         effective_be,
         allocator,
@@ -192,6 +218,40 @@ pub fn run(
         return 1;
     };
     if (run_control) |control| try control.finishRun(@tagName(result.stop_reason));
+
+    // 自演化 S1+S3:Run 完结(观察日志封口)后,规则效果回灌本体 +
+    // 满足稀疏触发时经隔离单次 provider 调用起草临时规则并写回 store。
+    // 一切结果(含降级)静默——自演化永不影响 Run 的退出语义。
+    if (self_evo_enabled) evolve: {
+        const known_graph = if (app.kg) |*k| k else break :evolve;
+        const control = run_control orelse break :evolve;
+        const binding = control.journal.runBinding() catch break :evolve;
+        var identity_buffer: [512]u8 = undefined;
+        const base_url: []const u8 = if (std.c.getenv("METACODES_BASE_URL")) |raw|
+            std.mem.span(raw)
+        else
+            "unknown-endpoint";
+        const actor_identity = std.fmt.bufPrint(
+            &identity_buffer,
+            "{s}|{s}",
+            .{ base_url, app.activeModel() },
+        ) catch break :evolve;
+        const evo_outcome = self_evolution_mod.endOfRun(allocator, .{
+            .kg = known_graph,
+            .session_dir = control.session_dir,
+            .project_root = if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
+            .provider = app.provider(),
+            .actor_identity = actor_identity,
+            .model = app.activeModel(),
+            .run_binding = binding,
+            .now_ns = @import("../util/time.zig").nowWallNs(),
+            .stop_reason = @tagName(result.stop_reason),
+            .provisional_active_count = if (provisional_gate) |pg| pg.provisional_count else 0,
+            .abort = &app.abort,
+        });
+        const log = @import("../util/log.zig");
+        log.info("self-evolution", "outcome={s}", .{@tagName(evo_outcome)});
+    }
 
     // Streaming writes every complete event as it is emitted; the final flush
     // is still mandatory so a short write or transient sink error cannot leave

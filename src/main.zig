@@ -152,6 +152,7 @@ pub const rule_impact_aggregate_receipt = @import("core/rule_impact_aggregate_re
 pub const ontology_rule_projection = @import("core/ontology_rule_projection.zig");
 pub const rule_author = @import("core/rule_author.zig");
 pub const project_rule_evolution = @import("core/project_rule_evolution.zig");
+pub const self_evolution = @import("core/self_evolution.zig");
 pub const rule_source_receipt = @import("core/rule_source_receipt.zig");
 pub const project_rule_spec = @import("core/project_rule_spec.zig");
 pub const rule_candidate = @import("core/rule_candidate.zig");

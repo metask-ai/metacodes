@@ -1,0 +1,541 @@
+//! 臂内自演化(self-learning S1-S3):记忆连续性链上的临时规则闭环。
+//!
+//! 一次 headless Run 结束后,若本 Run 的观察日志满足稀疏触发条件
+//! (repeated_typed_failure:≥3 次权威非成功),host 以隔离的单次
+//! provider 调用走既有 evolution 管线(TinyKG 本体投影 → rule author →
+//! RuleCandidate),把提案落成 KG store 里的 provisional_rule 节点——
+//! 节点随 memory-accumulation 连续性链跨 trial 存活。下一个 Run 启动时,
+//! 把 provisional 规则并入(或在无活跃束时单独构成)项目规则 gate,由
+//! 固定 kernel 以 enforced 模式裁决。
+//!
+//! 临时规则不经 Lean 晋升管线;它的表达力被 project_rule_spec 的封闭
+//! 枚举 IR 限死在任务无关的过程义务上,且每条都带 candidate 回执可反查。
+//! 规则效果(命中/阻断计数)在 Run 末写回 KG 观察节点,进入下一轮
+//! 本体投影——ontology→rules→behavior→observations→ontology 闭环。
+//!
+//! 铁律:本模块绝不触碰 actor Conversation/工具目录;author 调用只在
+//! Run 结束后发生,不影响可缓存首请求;一切失败静默降级为"无规则/
+//! 不提案",绝不让自演化故障放倒宿主 Run。
+
+const std = @import("std");
+const kg_client_mod = @import("../kg/client.zig");
+const evolution = @import("project_rule_evolution.zig");
+const rule_author = @import("rule_author.zig");
+const rule_candidate = @import("rule_candidate.zig");
+const spec_mod = @import("project_rule_spec.zig");
+const bundle_mod = @import("project_rule_bundle.zig");
+const runtime_gate_mod = @import("project_rule_gate.zig");
+const kernel = @import("../formal/project_harness_runtime.zig");
+const journal_mod = @import("tool_observation_journal.zig");
+const observation = @import("../tools/observation.zig");
+const protocol = @import("../tools/project_rule_gate.zig");
+const provider_mod = @import("../api/provider.zig");
+const AbortSignal = @import("../util/abort.zig").AbortSignal;
+
+pub const ENV_FLAG = "METACODES_SELF_EVOLUTION";
+pub const SCHEMA_TYPE = "provisional_rule";
+pub const RETRACT_SCHEMA_TYPE = "provisional_rule_retracted";
+pub const IMPACT_SCHEMA_TYPE = "provisional_rule_impact";
+pub const MARKER = "metacodes-provisional-rule-v1";
+pub const RETRACT_MARKER = "metacodes-provisional-rule-retract-v1";
+pub const MAX_PROVISIONAL_RULES: usize = 8;
+/// 与真实晋升 revision 空间隔开的哨兵位移,журnal 事件里一眼可辨临时束。
+pub const PROVISIONAL_REVISION_BASE: u64 = 1_000_000;
+
+/// 每次 author 调用的硬上限(单价来源=保守常数,与 caps 一起保证
+/// worst-case 成本可被 cost cap 覆盖;真实计费由 provider 侧结算)。
+pub const AUTHOR_MAX_INPUT_TOKENS: u64 = 48_000;
+pub const AUTHOR_MAX_OUTPUT_TOKENS: u64 = 4_000;
+pub const AUTHOR_MAX_COST_MICROUSD: u64 = 120_000; // $0.12/次上限
+fn authorPricing() rule_author.PricingAuthority {
+    return .{
+        .provenance_sha256 = observation.sha256Hex("metacodes-self-evolution-pricing-v1"),
+        .input_microusd_per_mtok = 2_000_000,
+        .output_microusd_per_mtok = 6_000_000,
+        .cache_read_microusd_per_mtok = 200_000,
+        .cache_write_microusd_per_mtok = 2_500_000,
+    };
+}
+
+pub fn enabledFromEnv() bool {
+    const raw = std.c.getenv(ENV_FLAG) orelse return false;
+    const value = std.mem.span(raw);
+    return std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true");
+}
+
+/// KG 节点文本信封。字段顺序即规范序;marker 字段兼作 recallTyped 的
+/// 词法检索锚(TinyKG 无向量检索,固定 token 保证可召回)。
+pub const Envelope = struct {
+    schema_version: []const u8 = MARKER,
+    candidate_id: []const u8,
+    invariant_sha256: []const u8,
+    lean_source_sha256: []const u8,
+    rule: spec_mod.Wire,
+};
+
+pub const RetractEnvelope = struct {
+    schema_version: []const u8 = RETRACT_MARKER,
+    candidate_id: []const u8,
+    reason: []const u8,
+};
+
+pub fn encodeEnvelope(allocator: std.mem.Allocator, envelope: Envelope) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, envelope, .{});
+}
+
+pub fn parseEnvelope(arena: std.mem.Allocator, text: []const u8) !Envelope {
+    const parsed = try std.json.parseFromSliceLeaky(Envelope, arena, text, .{
+        .ignore_unknown_fields = false,
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    if (!std.mem.eql(u8, parsed.schema_version, MARKER)) return error.UnknownEnvelope;
+    if (parsed.candidate_id.len != 64) return error.InvalidCandidateId;
+    for (parsed.candidate_id) |c| switch (c) {
+        '0'...'9', 'a'...'f' => {},
+        else => return error.InvalidCandidateId,
+    };
+    // spec 必须能过封闭枚举校验——坏信封在装载期拒绝,不进 gate。
+    const spec = try spec_mod.fromWire(parsed.rule);
+    try spec_mod.validate(spec);
+    return parsed;
+}
+
+fn parseRetraction(arena: std.mem.Allocator, text: []const u8) ?[]const u8 {
+    const parsed = std.json.parseFromSliceLeaky(RetractEnvelope, arena, text, .{
+        .ignore_unknown_fields = false,
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    }) catch return null;
+    if (!std.mem.eql(u8, parsed.schema_version, RETRACT_MARKER)) return null;
+    if (parsed.candidate_id.len != 64) return null;
+    return parsed.candidate_id;
+}
+
+/// 装载结果:合并(或独立)的临时规则运行时。持有自己的 LoadedActive,
+/// 生命周期与 Run 等长;宿主在 Run 结束后 deinit。
+pub const ProvisionalGate = struct {
+    allocator: std.mem.Allocator,
+    active: *bundle_mod.LoadedActive,
+    runtime: runtime_gate_mod.RuntimeGate,
+    provisional_count: usize,
+
+    pub fn gate(self: *ProvisionalGate) protocol.Gate {
+        return self.runtime.protocolGate();
+    }
+
+    pub fn deinit(self: *ProvisionalGate) void {
+        const allocator = self.allocator;
+        self.active.deinit();
+        allocator.destroy(self.active);
+        allocator.destroy(self);
+    }
+};
+
+/// 从 KG store 收集有效临时规则信封(去重、去撤回、封顶)。
+/// 返回的切片与其内容都挂在 arena 上。
+pub fn collectEnvelopes(
+    arena: std.mem.Allocator,
+    kg: *kg_client_mod.KgClient,
+) ![]Envelope {
+    var retracted = std.StringHashMapUnmanaged(void){};
+    const retract_hits = kg.recallTyped(RETRACT_MARKER, MAX_PROVISIONAL_RULES * 4, false, RETRACT_SCHEMA_TYPE) catch
+        &[_]kg_client_mod.RecallHit{};
+    for (retract_hits) |hit| {
+        const full = kg.fetchNodeText(hit.node_id) catch continue;
+        defer kg.allocator.free(full);
+        if (parseRetraction(arena, full)) |cid|
+            try retracted.put(arena, try arena.dupe(u8, cid), {});
+    }
+
+    var out = std.array_list.Managed(Envelope).init(arena);
+    var seen = std.StringHashMapUnmanaged(void){};
+    const hits = kg.recallTyped(MARKER, MAX_PROVISIONAL_RULES * 4, false, SCHEMA_TYPE) catch
+        return out.items;
+    for (hits) |hit| {
+        if (out.items.len >= MAX_PROVISIONAL_RULES) break;
+        const full = kg.fetchNodeText(hit.node_id) catch continue;
+        defer kg.allocator.free(full);
+        const envelope = parseEnvelope(arena, full) catch continue;
+        if (retracted.contains(envelope.candidate_id)) continue;
+        if (seen.contains(envelope.candidate_id)) continue;
+        try seen.put(arena, envelope.candidate_id, {});
+        try out.append(envelope);
+    }
+    return out.items;
+}
+
+/// 由(可选的)活跃束 + 临时信封构造合并 LoadedActive。哨兵 revision 与
+/// 内容寻址 bundle_sha 让 journal 事件里的临时束身份可辨、可披露。
+pub fn buildMergedActive(
+    allocator: std.mem.Allocator,
+    base: ?*const bundle_mod.LoadedActive,
+    project_sha256: [64]u8,
+    kernel_sha256: [64]u8,
+    envelopes: []const Envelope,
+) !*bundle_mod.LoadedActive {
+    if (envelopes.len == 0) return error.NoProvisionalRules;
+    const self = try allocator.create(bundle_mod.LoadedActive);
+    errdefer allocator.destroy(self);
+    self.* = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .project_sha256 = project_sha256,
+        .bundle_sha256 = undefined,
+        .revision = PROVISIONAL_REVISION_BASE +
+            (if (base) |b| b.revision else 0) + envelopes.len,
+        .kernel_sha256 = kernel_sha256,
+        .promotion_receipt_id = [_]u8{'0'} ** 64,
+        .promotion_request_sha256 = [_]u8{'0'} ** 64,
+        .promotion_verdict_sha256 = [_]u8{'0'} ** 64,
+        .active_pointer_sha256 = [_]u8{'0'} ** 64,
+        .rules = &.{},
+    };
+    errdefer self.arena.deinit();
+    const a = self.arena.allocator();
+
+    const base_len: usize = if (base) |b| b.rules.len else 0;
+    var rules = try a.alloc(bundle_mod.RuleEntry, base_len + envelopes.len);
+    if (base) |b| for (b.rules, 0..) |entry, i| {
+        rules[i] = .{
+            .candidate_id = try a.dupe(u8, entry.candidate_id),
+            .rule_spec = try dupeWire(a, entry.rule_spec),
+        };
+    };
+    for (envelopes, 0..) |envelope, i| {
+        rules[base_len + i] = .{
+            .candidate_id = try a.dupe(u8, envelope.candidate_id),
+            .rule_spec = try dupeWire(a, envelope.rule),
+        };
+    }
+    self.rules = rules;
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("metacodes-provisional-bundle-v1\x00");
+    if (base) |b| hasher.update(&b.bundle_sha256);
+    for (envelopes) |envelope| {
+        hasher.update(envelope.candidate_id);
+        const canonical = try std.json.Stringify.valueAlloc(a, envelope.rule, .{});
+        hasher.update(canonical);
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    self.bundle_sha256 = std.fmt.bytesToHex(digest, .lower);
+    return self;
+}
+
+fn dupeWire(a: std.mem.Allocator, wire: spec_mod.Wire) !spec_mod.Wire {
+    var out = wire;
+    out.schema_version = try a.dupe(u8, wire.schema_version);
+    out.target = try a.dupe(u8, wire.target);
+    return out;
+}
+
+/// S2 入口:KG 里有有效临时规则 → 构造(合并)gate;没有 → null。
+/// 任何 KG/解析失败都降级为 null(store 降级不放倒 Run)。
+pub fn loadProvisionalGate(
+    allocator: std.mem.Allocator,
+    kg: *kg_client_mod.KgClient,
+    base: ?*const bundle_mod.LoadedActive,
+    project_root: []const u8,
+    session_dir: []const u8,
+    abort: ?*const AbortSignal,
+    observation_sink: ?observation.Sink,
+) ?*ProvisionalGate {
+    if (observation_sink == null) return null;
+    const config = switch (kernel.loadConfigFromEnv()) {
+        .configured => |value| value,
+        else => return null, // 无 kernel 身份 = 无法裁决 = 不装临时规则
+    };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const envelopes = collectEnvelopes(arena.allocator(), kg) catch return null;
+    if (envelopes.len == 0) return null;
+    const project_sha = if (base) |b| b.project_sha256 else bundle_mod.projectIdentity(project_root);
+    const active = buildMergedActive(
+        allocator,
+        base,
+        project_sha,
+        config.expected_sha256,
+        envelopes,
+    ) catch return null;
+    const self = allocator.create(ProvisionalGate) catch {
+        active.deinit();
+        allocator.destroy(active);
+        return null;
+    };
+    self.* = .{
+        .allocator = allocator,
+        .active = active,
+        .runtime = .{
+            .allocator = allocator,
+            .active = active,
+            .config = config,
+            .abort = abort,
+            .actuation = .enforced,
+            .evidence_dir = session_dir,
+            .observation_sink = observation_sink,
+            .auto_exact_edit_recovery = true,
+        },
+        .provisional_count = envelopes.len,
+    };
+    return self;
+}
+
+pub const EndOfRunDeps = struct {
+    kg: *kg_client_mod.KgClient,
+    session_dir: []const u8,
+    project_root: []const u8,
+    provider: provider_mod.Provider,
+    /// actor provider 的身份串(base_url+model 即可);author 身份由它
+    /// 加角色后缀派生——这是防同角色误配的辨识,不是端点来源证明。
+    actor_identity: []const u8,
+    model: []const u8,
+    run_binding: journal_mod.RunBinding,
+    now_ns: i128,
+    stop_reason: []const u8,
+    provisional_active_count: usize,
+    abort: ?*const AbortSignal,
+};
+
+pub const Outcome = enum {
+    disabled,
+    no_trigger,
+    ontology_missing,
+    abstained,
+    proposed,
+    degraded,
+};
+
+/// S1+S3 入口。一切错误路径降级返回,不向宿主传播。
+pub fn endOfRun(allocator: std.mem.Allocator, deps: EndOfRunDeps) Outcome {
+    // S3:临时规则效果写回本体(为下一轮投影提供 prescription 战绩)。
+    if (deps.provisional_active_count > 0) {
+        writeImpactObservation(allocator, deps);
+    }
+
+    const actor_sha = observation.sha256Hex(deps.actor_identity);
+    var role_buffer: [512]u8 = undefined;
+    const role_identity = std.fmt.bufPrint(
+        &role_buffer,
+        "{s}#self-evolution-rule-author-v1",
+        .{deps.actor_identity},
+    ) catch return .degraded;
+    const author_sha = observation.sha256Hex(role_identity);
+    var budget_buffer: [256]u8 = undefined;
+    const budget_seed = std.fmt.bufPrint(
+        &budget_buffer,
+        "self-evolution-inline-budget-v1:{s}",
+        .{deps.run_binding.run_id.asSlice()},
+    ) catch return .degraded;
+
+    const rules_root = std.fs.path.dirname(deps.session_dir) orelse return .degraded;
+    var rules_dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const rules_dir = std.fmt.bufPrint(
+        &rules_dir_buffer,
+        "{s}/project-rules",
+        .{rules_root},
+    ) catch return .degraded;
+
+    var source = evolution.KgClientSource.init(deps.kg);
+    const kernel_config: ?kernel.Config = switch (kernel.loadConfigFromEnv()) {
+        .configured => |value| value,
+        else => null,
+    };
+
+    var prepared = evolution.prepare(allocator, .{
+        .session_dir = deps.session_dir,
+        .project_root = deps.project_root,
+        .project_rules_dir = rules_dir,
+        .ontology_source = source.source(),
+        .kernel_config = kernel_config,
+        .author_sha256 = author_sha,
+        .actor_provider_sha256 = actor_sha,
+        .provider_sha256 = author_sha,
+        .budget_authorization_sha256 = observation.sha256Hex(budget_seed),
+        .model = deps.model,
+        .observation = deps.run_binding,
+        .trigger = .repeated_typed_failure,
+        .evidence = &.{},
+        .caps = .{
+            .max_cost_microusd = AUTHOR_MAX_COST_MICROUSD,
+            .max_input_tokens = AUTHOR_MAX_INPUT_TOKENS,
+            .max_output_tokens = AUTHOR_MAX_OUTPUT_TOKENS,
+        },
+        .pricing = authorPricing(),
+        .generation_evidence = &.{},
+        .held_out_commitments = &.{},
+    }) catch |err| return switch (err) {
+        error.TriggerNotSatisfied => .no_trigger,
+        error.ProjectOntologyMissing => .ontology_missing,
+        else => .degraded,
+    };
+    defer prepared.deinit();
+
+    const permit = rule_author.authorize(&prepared.author_request, .{
+        .enabled = true,
+        .now_ns = deps.now_ns,
+        .cooldown_ns = 0,
+        .remaining_requests = 1,
+        .remaining_cost_microusd = AUTHOR_MAX_COST_MICROUSD,
+        .remaining_input_tokens = AUTHOR_MAX_INPUT_TOKENS,
+        .remaining_output_tokens = AUTHOR_MAX_OUTPUT_TOKENS,
+    }) catch return .degraded;
+
+    const outcome = evolution.authorOnce(&prepared, .{
+        .provider = deps.provider,
+        .provider_sha256 = author_sha,
+    }, permit, deps.abort) catch return .degraded;
+
+    if (outcome.decision != .propose or outcome.candidate_id == null)
+        return .abstained;
+
+    var loaded = rule_candidate.load(
+        allocator,
+        deps.session_dir,
+        outcome.candidate_id.?,
+    ) catch return .degraded;
+    defer loaded.deinit();
+
+    const envelope = Envelope{
+        .candidate_id = outcome.candidate_id.?[0..],
+        .invariant_sha256 = loaded.invariant_sha256[0..],
+        .lean_source_sha256 = loaded.lean_source_sha256[0..],
+        .rule = spec_mod.toWire(loaded.rule_spec),
+    };
+    const text = encodeEnvelope(allocator, envelope) catch return .degraded;
+    defer allocator.free(text);
+    _ = deps.kg.remember(.observation, text, SCHEMA_TYPE, false) catch return .degraded;
+    return .proposed;
+}
+
+fn writeImpactObservation(allocator: std.mem.Allocator, deps: EndOfRunDeps) void {
+    var run = journal_mod.loadRunDispatches(
+        allocator,
+        deps.session_dir,
+        deps.run_binding,
+    ) catch return;
+    defer run.deinit();
+    const impact_stats = @import("rule_impact_stats.zig");
+    var snapshot = impact_stats.derive(allocator, &run, .{}) catch return;
+    defer snapshot.deinit(allocator);
+    const text = std.fmt.allocPrint(
+        allocator,
+        "provisional-rule-impact-v1: active_rules={d} pre_dispatch_blocks={d} " ++
+            "formal_faults={d} authoritative_non_successes={d} stop_reason={s}",
+        .{
+            deps.provisional_active_count,
+            snapshot.enforced_pre_blocks_before_dispatch,
+            snapshot.formal_faults,
+            snapshot.authoritative_non_successes,
+            deps.stop_reason,
+        },
+    ) catch return;
+    defer allocator.free(text);
+    _ = deps.kg.remember(.observation, text, IMPACT_SCHEMA_TYPE, false) catch return;
+}
+
+// ---------------------------------------------------------------------------
+
+test "envelope round-trips through encode/parse with spec validation" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const envelope = Envelope{
+        .candidate_id = &([_]u8{'a'} ** 64),
+        .invariant_sha256 = &([_]u8{'c'} ** 64),
+        .lean_source_sha256 = &([_]u8{'d'} ** 64),
+        .rule = .{
+            .target_kind = .effect_class,
+            .target = "existing_file_rewrite",
+            .target_scope = .existing_file,
+            .deny_target = false,
+            .max_input_bytes = 1024 * 1024,
+            .max_agent_depth = 4,
+            .authoritative_only = true,
+            .effect_requirement = .file_mutation_v1_reobserved,
+        },
+    };
+    const text = try encodeEnvelope(a, envelope);
+    defer a.free(text);
+    const parsed = try parseEnvelope(arena.allocator(), text);
+    try std.testing.expectEqualStrings(envelope.invariant_sha256, parsed.invariant_sha256);
+    try std.testing.expectEqual(spec_mod.TargetKind.effect_class, parsed.rule.target_kind);
+}
+
+test "parseEnvelope rejects wrong marker, bad candidate id and invalid spec" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectError(
+        error.UnknownEnvelope,
+        parseEnvelope(a, "{\"schema_version\":\"other\",\"candidate_id\":\"" ++ ("a" ** 64) ++ "\",\"invariant_sha256\":\"x\",\"lean_source_sha256\":\"y\",\"rule\":{\"schema_version\":\"metacodes-project-rule-spec-v3\",\"target_kind\":\"tool\",\"target\":\"Write\",\"target_scope\":\"all\",\"deny_target\":true,\"max_input_bytes\":1,\"max_agent_depth\":1,\"authoritative_only\":false,\"effect_requirement\":\"none\"}}"),
+    );
+    try std.testing.expectError(
+        error.InvalidCandidateId,
+        parseEnvelope(a, "{\"schema_version\":\"" ++ MARKER ++ "\",\"candidate_id\":\"short\",\"invariant_sha256\":\"x\",\"lean_source_sha256\":\"y\",\"rule\":{\"schema_version\":\"metacodes-project-rule-spec-v3\",\"target_kind\":\"tool\",\"target\":\"Write\",\"target_scope\":\"all\",\"deny_target\":true,\"max_input_bytes\":1,\"max_agent_depth\":1,\"authoritative_only\":false,\"effect_requirement\":\"none\"}}"),
+    );
+}
+
+test "buildMergedActive appends provisional entries behind base rules" {
+    const a = std.testing.allocator;
+    var base = bundle_mod.LoadedActive{
+        .arena = std.heap.ArenaAllocator.init(a),
+        .project_sha256 = [_]u8{'1'} ** 64,
+        .bundle_sha256 = [_]u8{'2'} ** 64,
+        .revision = 7,
+        .kernel_sha256 = [_]u8{'3'} ** 64,
+        .promotion_receipt_id = [_]u8{'0'} ** 64,
+        .promotion_request_sha256 = [_]u8{'0'} ** 64,
+        .promotion_verdict_sha256 = [_]u8{'0'} ** 64,
+        .active_pointer_sha256 = [_]u8{'0'} ** 64,
+        .rules = &.{.{
+            .candidate_id = "base-rule",
+            .rule_spec = .{
+                .target_kind = .tool,
+                .target = "Write",
+                .deny_target = true,
+                .max_input_bytes = 1,
+                .max_agent_depth = 1,
+                .authoritative_only = false,
+                .effect_requirement = .none,
+            },
+        }},
+    };
+    defer base.arena.deinit();
+    const envelopes = [_]Envelope{.{
+        .candidate_id = &([_]u8{'b'} ** 64),
+        .invariant_sha256 = &([_]u8{'e'} ** 64),
+        .lean_source_sha256 = &([_]u8{'f'} ** 64),
+        .rule = .{
+            .target_kind = .tool,
+            .target = "Edit",
+            .deny_target = false,
+            .max_input_bytes = 2048,
+            .max_agent_depth = 2,
+            .authoritative_only = true,
+            .effect_requirement = .none,
+        },
+    }};
+    const merged = try buildMergedActive(
+        a,
+        &base,
+        base.project_sha256,
+        [_]u8{'9'} ** 64,
+        &envelopes,
+    );
+    defer {
+        merged.deinit();
+        a.destroy(merged);
+    }
+    try std.testing.expectEqual(@as(usize, 2), merged.rules.len);
+    try std.testing.expectEqualStrings("base-rule", merged.rules[0].candidate_id);
+    try std.testing.expectEqualStrings("Edit", merged.rules[1].rule_spec.target);
+    try std.testing.expectEqual(PROVISIONAL_REVISION_BASE + 7 + 1, merged.revision);
+    // bundle sha 是内容寻址且非全零
+    try std.testing.expect(!std.mem.eql(u8, &merged.bundle_sha256, &([_]u8{'0'} ** 64)));
+    // 无信封 = 明确错误,不产生空束
+    try std.testing.expectError(
+        error.NoProvisionalRules,
+        buildMergedActive(a, &base, base.project_sha256, [_]u8{'9'} ** 64, &.{}),
+    );
+}
