@@ -155,6 +155,40 @@ class MetacodesAgent(BaseInstalledAgent):
                 "rules ride the store continuity chain"
             )
         self._self_evolution = self_evolution
+        outcome_feedback = kwargs.pop("METACODES_OUTCOME_FEEDBACK", False)
+        if not isinstance(outcome_feedback, bool):
+            raise ValueError(
+                "METACODES_OUTCOME_FEEDBACK must be an explicit boolean"
+            )
+        if outcome_feedback and not memory_accumulation:
+            raise ValueError(
+                "outcome feedback requires memory accumulation: outcome "
+                "nodes ride the store continuity chain"
+            )
+        self._outcome_feedback = outcome_feedback
+        outcome_roots = kwargs.pop("METACODES_OUTCOME_ROOTS", None)
+        if outcome_roots is not None and (
+            not isinstance(outcome_roots, list)
+            or any(not isinstance(row, str) or not row for row in outcome_roots)
+        ):
+            raise ValueError(
+                "METACODES_OUTCOME_ROOTS must be a list of directory paths"
+            )
+        self._outcome_roots = list(outcome_roots or [])
+        continuity_seed = kwargs.pop("METACODES_CONTINUITY_SEED_SHA256", None)
+        if continuity_seed is not None and (
+            not isinstance(continuity_seed, str)
+            or len(continuity_seed) != 64
+            or any(c not in "0123456789abcdef" for c in continuity_seed)
+        ):
+            raise ValueError(
+                "METACODES_CONTINUITY_SEED_SHA256 must be a 64-hex sha or null"
+            )
+        if continuity_seed is not None and not memory_accumulation:
+            raise ValueError(
+                "a continuity seed requires memory accumulation"
+            )
+        self._continuity_seed_sha256 = continuity_seed
         project_rules = kwargs.pop("METACODES_PROJECT_RULES_RELATIVE", None)
         project_kernel = kwargs.pop("METACODES_PROJECT_KERNEL_RELATIVE", None)
         project_control_mode = kwargs.pop("METACODES_PROJECT_CONTROL_MODE", None)
@@ -252,6 +286,64 @@ class MetacodesAgent(BaseInstalledAgent):
             ),
         )
         await ensure_agent_user(self, environment)
+
+    def _collect_outcomes(self):
+        """已完成 trial 的 verifier 结局(本 run 的兄弟 trial + 声明的
+        额外根,如 pass 1 的 jobs_dir)。有界、只读、失败静默。"""
+        rows = []
+        roots = [str(_continuity_root(self.logs_dir).parent)]
+        roots.extend(self._outcome_roots)
+        seen = set()
+        for root in roots[:4]:
+            root_path = Path(root)
+            if not root_path.is_dir():
+                continue
+            for result_path in sorted(root_path.glob("*/*/result.json"))[:128]:
+                if len(rows) >= 64:
+                    return rows
+                trial_dir = result_path.parent
+                try:
+                    result = json.loads(result_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                task = str(result.get("task_name") or "").rpartition("/")[2]
+                if not task or result.get("exception_info") is not None:
+                    continue
+                score_path = trial_dir / "verifier" / "score.json"
+                try:
+                    score = json.loads(score_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                reward = score.get("reward")
+                if not isinstance(reward, (int, float)):
+                    continue
+                attempt_key = trial_dir.name[-24:]
+                dedupe = f"{task}#{attempt_key}"
+                if dedupe in seen:
+                    continue
+                seen.add(dedupe)
+                failing = []
+                try:
+                    for line in (trial_dir / "verifier" / "test_output.txt").read_text(
+                        encoding="utf-8", errors="replace"
+                    ).splitlines():
+                        if line.startswith("FAILED "):
+                            failing.append(line[len("FAILED "):][:160])
+                        if len(failing) >= 20:
+                            break
+                except OSError:
+                    pass
+                rows.append(
+                    {
+                        "task": task,
+                        "attempt_key": attempt_key,
+                        "reward": float(reward),
+                        "tests_passed": int(score.get("tests_passed") or 0),
+                        "tests_total": int(score.get("tests_total") or 0),
+                        "failing_tests": failing,
+                    }
+                )
+        return rows
 
     async def run(
         self, instruction: str, environment: BaseEnvironment, context: AgentContext
@@ -389,6 +481,23 @@ class MetacodesAgent(BaseInstalledAgent):
             continuity_root.mkdir(parents=True, exist_ok=True)
             continuity_tar = continuity_root / _CONTINUITY_TAR
             continuity_ledger = continuity_root / _CONTINUITY_LEDGER
+            # 两遍法种子:声明的 sha 必须是本链 export 历史的一员(pass 1
+            # 的终态 tar 由 driver 预置为链头;后续 trial 延长链,声明值
+            # 恒在历史里)。声明了但根空/历史无此 sha = fail loud。
+            if self._continuity_seed_sha256 is not None:
+                seed_rows = _read_continuity_ledger(continuity_ledger)
+                seed_history = {
+                    row.get("export_sha256") for row in seed_rows
+                }
+                if (
+                    not continuity_tar.exists()
+                    or self._continuity_seed_sha256 not in seed_history
+                ):
+                    raise ValueError(
+                        "declared continuity seed is not part of this "
+                        "arm's export history — the driver must pre-populate "
+                        "the continuity root with the seeded ledger and tar"
+                    )
             if continuity_tar.exists():
                 tar_bytes = continuity_tar.read_bytes()
                 if len(tar_bytes) > _MAX_CONTINUITY_TAR_BYTES:
@@ -409,6 +518,25 @@ class MetacodesAgent(BaseInstalledAgent):
                 # /tmp is not shared across Harbor exec containers.
                 import_host = self.logs_dir / "kg-import.tar"
                 import_host.write_bytes(tar_bytes)
+        outcomes_env = ""
+        if self._outcome_feedback:
+            outcome_rows = self._collect_outcomes()
+            if outcome_rows:
+                (self.logs_dir / "task-outcomes.json").write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "task-outcome-v1",
+                            "outcomes": outcome_rows,
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                outcomes_env = (
+                    "export METACODES_TASK_OUTCOMES="
+                    "/logs/agent/task-outcomes.json; "
+                )
         runtime_contract = json.dumps(
             {
                 "schema_version": "metacodes-workbuddy-runtime-contract-v2",
@@ -419,6 +547,8 @@ class MetacodesAgent(BaseInstalledAgent):
                 "tinykg_store_absent_before_first_provider_request": store_import_sha is None,
                 "memory_accumulation": self._memory_accumulation,
                 "self_evolution": self._self_evolution,
+                "outcome_feedback": self._outcome_feedback,
+                "continuity_seed_sha256": self._continuity_seed_sha256,
                 "store_import_sha256": store_import_sha,
                 "credential_delivery": "anonymous-fd-route-token",
                 "transport_model_is_route": True,
@@ -475,6 +605,7 @@ class MetacodesAgent(BaseInstalledAgent):
                 if self._self_evolution
                 else ""
             )
+            + outcomes_env
             + f'export METACODES_KG_BIN={shlex.quote(mount + "/bin/tinykg")}; '
             'export METACODES_KG_STORE="$HOME/.local/share/tinykg/store"; '
             f'export METACODES_FORMAL_KERNEL_PATH={shlex.quote(mount + "/libexec/metacodes-formal-kernel")}; '

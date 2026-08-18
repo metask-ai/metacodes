@@ -375,7 +375,9 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
                             "METACODES_REQUIREMENT_LEDGER": False,
                             "METACODES_REQUIREMENT_LEDGER_OBSERVE": False,
                             "METACODES_MEMORY_ACCUMULATION": False,
-                            "METACODES_SELF_EVOLUTION": False
+                            "METACODES_SELF_EVOLUTION": False,
+                            "METACODES_OUTCOME_FEEDBACK": False,
+                            "METACODES_CONTINUITY_SEED_SHA256": None
                         },
                         "task_selection": {"mode": "name", "names": ["task-a"]},
                         "orchestrator_override": {"n_concurrent_trials": 1},

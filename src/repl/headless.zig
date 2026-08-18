@@ -128,6 +128,9 @@ pub fn run(
     defer if (provisional_gate) |pg| pg.deinit();
     if (self_evo_enabled) {
         if (app.kg) |*known_graph| {
+            // 结局回灌先于 provisional 装载与 scoped recall:本 Run 一开始
+            // 就把 host 提供的已完成 trial 结局写进 KG,召回面立即可见。
+            _ = self_evolution_mod.ingestOutcomes(allocator, known_graph);
             if (run_control) |control| {
                 provisional_gate = self_evolution_mod.loadProvisionalGate(
                     allocator,

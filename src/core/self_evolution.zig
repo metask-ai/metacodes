@@ -338,6 +338,111 @@ pub fn loadProvisionalGate(
     return self;
 }
 
+/// 结局回灌(两遍法基座):host 把已完成 trial 的 verifier 结局写成
+/// /logs/agent/task-outcomes.json,binary 在 Run 开始时摄取为 KG 观察
+/// 节点(schema_type=task_outcome)。同任务同 attempt 幂等;节点随
+/// 连续性链跨 trial/跨遍存活,scoped recall 与本体投影自然可见——
+/// pass 2 重做任务 X 时,"上一遍 X 挂了哪些测试"就在召回面里。
+pub const OUTCOME_SCHEMA_TYPE = "task_outcome";
+pub const OUTCOME_MARKER = "task-outcome-v1";
+pub const OUTCOMES_ENV = "METACODES_TASK_OUTCOMES";
+pub const MAX_OUTCOME_ROWS: usize = 64;
+pub const MAX_OUTCOME_BYTES: usize = 256 * 1024;
+
+const OutcomeRow = struct {
+    task: []const u8,
+    attempt_key: []const u8,
+    reward: f64,
+    tests_passed: u32 = 0,
+    tests_total: u32 = 0,
+    failing_tests: []const []const u8 = &.{},
+};
+
+const OutcomeFile = struct {
+    schema_version: []const u8,
+    outcomes: []const OutcomeRow,
+};
+
+/// 摄取入口:失败静默(回灌是增强不是依赖),返回新写入节点数。
+pub fn ingestOutcomes(
+    allocator: std.mem.Allocator,
+    kg: *kg_client_mod.KgClient,
+) usize {
+    const raw_path = std.c.getenv(OUTCOMES_ENV) orelse return 0;
+    const pfs = @import("platform").fs;
+    const fd = pfs.open(raw_path, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, @as(std.c.mode_t, 0));
+    if (fd < 0) return 0;
+    defer _ = pfs.close(fd);
+    const info = pfs.fileInfo(fd) catch return 0;
+    if (!info.is_regular or info.size == 0 or info.size > MAX_OUTCOME_BYTES) return 0;
+    const bytes = allocator.alloc(u8, @intCast(info.size)) catch return 0;
+    defer allocator.free(bytes);
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const n = pfs.read(fd, bytes[offset..]);
+        if (n <= 0) return 0;
+        offset += @intCast(n);
+    }
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSliceLeaky(OutcomeFile, arena.allocator(), bytes, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return 0;
+    if (!std.mem.eql(u8, parsed.schema_version, OUTCOME_MARKER)) return 0;
+
+    // 幂等:已在库的 (task, attempt_key) 不重写。
+    var seen = std.StringHashMapUnmanaged(void){};
+    if (kg.recallTyped(OUTCOME_MARKER, MAX_OUTCOME_ROWS * 2, false, OUTCOME_SCHEMA_TYPE)) |hits| {
+        defer {
+            for (hits) |*hit| hit.deinit(kg.allocator);
+            kg.allocator.free(hits);
+        }
+        for (hits) |hit| {
+            const full = kg.fetchNodeText(hit.node_id) catch continue;
+            defer kg.allocator.free(full);
+            if (extractOutcomeKey(full)) |key|
+                seen.put(arena.allocator(), arena.allocator().dupe(u8, key) catch continue, {}) catch continue;
+        }
+    } else |_| {}
+
+    var written: usize = 0;
+    for (parsed.outcomes, 0..) |row, index| {
+        if (index >= MAX_OUTCOME_ROWS) break;
+        if (row.task.len == 0 or row.task.len > 200) continue;
+        if (row.attempt_key.len == 0 or row.attempt_key.len > 200) continue;
+        var key_buffer: [512]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buffer, "{s}#{s}", .{ row.task, row.attempt_key }) catch continue;
+        if (seen.contains(key)) continue;
+        var failing = std.array_list.Managed(u8).init(allocator);
+        defer failing.deinit();
+        for (row.failing_tests, 0..) |name, i| {
+            if (i >= 20) break;
+            if (i > 0) failing.appendSlice(", ") catch break;
+            failing.appendSlice(if (name.len > 160) name[0..160] else name) catch break;
+        }
+        const text = std.fmt.allocPrint(
+            allocator,
+            OUTCOME_MARKER ++ ": key={s} task={s} reward={d:.4} tests={d}/{d} failing=[{s}]",
+            .{ key, row.task, row.reward, row.tests_passed, row.tests_total, failing.items },
+        ) catch continue;
+        defer allocator.free(text);
+        _ = kg.remember(.observation, text, OUTCOME_SCHEMA_TYPE, false) catch continue;
+        written += 1;
+    }
+    if (written > 0)
+        log.info("self-evolution", "ingested {d} task outcomes", .{written});
+    return written;
+}
+
+fn extractOutcomeKey(text: []const u8) ?[]const u8 {
+    const prefix = OUTCOME_MARKER ++ ": key=";
+    if (!std.mem.startsWith(u8, text, prefix)) return null;
+    const rest = text[prefix.len..];
+    const end = std.mem.indexOfScalar(u8, rest, ' ') orelse return null;
+    return rest[0..end];
+}
+
 pub const EndOfRunDeps = struct {
     kg: *kg_client_mod.KgClient,
     session_dir: []const u8,
@@ -562,6 +667,12 @@ test "author caps cover the worst-case cost and the actor output setting" {
     try std.testing.expect(AUTHOR_MAX_COST_MICROUSD >= worst);
     const util_model = @import("../util/model.zig");
     try std.testing.expect(AUTHOR_MAX_OUTPUT_TOKENS >= util_model.DEFAULT_MAX_TOKENS);
+}
+
+test "outcome key extraction round-trips through the node text shape" {
+    const text = OUTCOME_MARKER ++ ": key=etag#a1 task=etag reward=0.2727 tests=3/11 failing=[t1, t2]";
+    try std.testing.expectEqualStrings("etag#a1", extractOutcomeKey(text).?);
+    try std.testing.expect(extractOutcomeKey("other text") == null);
 }
 
 test "process-signal trigger fires on weakening, tier0-with-mutations, or known-failing" {

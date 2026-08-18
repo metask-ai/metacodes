@@ -182,6 +182,8 @@ def _comparison_covariates(
         overrides.pop("METACODES_REQUIREMENT_LEDGER_OBSERVE", None)
         overrides.pop("METACODES_MEMORY_ACCUMULATION", None)
         overrides.pop("METACODES_SELF_EVOLUTION", None)
+        overrides.pop("METACODES_OUTCOME_FEEDBACK", None)
+        overrides.pop("METACODES_CONTINUITY_SEED_SHA256", None)
     stable_artifacts = json.loads(json.dumps(artifacts))
     # Absolute staging paths describe where identical bytes were observed, not
     # an experimental variable.  Keep every digest/size/architecture field.
@@ -666,6 +668,8 @@ def build_launch_manifest(
         "METACODES_REQUIREMENT_LEDGER_OBSERVE",
         "METACODES_MEMORY_ACCUMULATION",
         "METACODES_SELF_EVOLUTION",
+        "METACODES_OUTCOME_FEEDBACK",
+        "METACODES_CONTINUITY_SEED_SHA256",
     )
     _missing_treatment_keys = [
         key for key in _required_treatment_keys if key not in project_overrides
@@ -725,6 +729,29 @@ def build_launch_manifest(
     if not isinstance(self_evolution, bool):
         raise LaunchError(
             "WorkBuddy self evolution treatment must be an explicit boolean"
+        )
+    outcome_feedback = project_overrides.get("METACODES_OUTCOME_FEEDBACK", False)
+    if not isinstance(outcome_feedback, bool):
+        raise LaunchError(
+            "WorkBuddy outcome feedback treatment must be an explicit boolean"
+        )
+    if outcome_feedback and not memory_accumulation:
+        raise LaunchError(
+            "WorkBuddy outcome feedback requires memory accumulation"
+        )
+    continuity_seed = project_overrides.get(
+        "METACODES_CONTINUITY_SEED_SHA256", None
+    )
+    if continuity_seed is not None and (
+        not isinstance(continuity_seed, str)
+        or re.fullmatch(r"[0-9a-f]{64}", continuity_seed) is None
+    ):
+        raise LaunchError(
+            "WorkBuddy continuity seed must be a 64-hex sha256 or null"
+        )
+    if continuity_seed is not None and not memory_accumulation:
+        raise LaunchError(
+            "WorkBuddy continuity seed requires memory accumulation"
         )
     if self_evolution and not memory_accumulation:
         raise LaunchError(
@@ -878,6 +905,8 @@ def build_launch_manifest(
             "verification_final_gate": verification_final_gate,
             "memory_accumulation": memory_accumulation,
             "self_evolution": self_evolution,
+            "outcome_feedback": outcome_feedback,
+            "continuity_seed_sha256": continuity_seed,
             "verification_final_observe": verification_final_observe,
             "requirement_ledger": requirement_ledger,
             "requirement_ledger_observe": requirement_ledger_observe,
@@ -1016,6 +1045,20 @@ def _validate_launch_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
                     else {}
                 ),
                 **(
+                    {"outcome_feedback": treatment.get("outcome_feedback")}
+                    if "outcome_feedback" in treatment
+                    else {}
+                ),
+                **(
+                    {
+                        "continuity_seed_sha256": treatment.get(
+                            "continuity_seed_sha256"
+                        )
+                    }
+                    if "continuity_seed_sha256" in treatment
+                    else {}
+                ),
+                **(
                     {
                         "requirement_ledger": treatment.get("requirement_ledger"),
                         "requirement_ledger_observe": treatment.get(
@@ -1042,6 +1085,21 @@ def _validate_launch_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
             or (
                 "self_evolution" in treatment
                 and not isinstance(treatment.get("self_evolution"), bool)
+            )
+            or (
+                "outcome_feedback" in treatment
+                and not isinstance(treatment.get("outcome_feedback"), bool)
+            )
+            or (
+                "continuity_seed_sha256" in treatment
+                and treatment.get("continuity_seed_sha256") is not None
+                and not (
+                    isinstance(treatment.get("continuity_seed_sha256"), str)
+                    and re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        treatment.get("continuity_seed_sha256"),
+                    )
+                )
             )
             or (
                 "requirement_ledger" in treatment
@@ -1960,6 +2018,26 @@ def _validate_self_evolution_kwargs(
         raise LaunchError(f"{label} self evolution treatment drifted")
 
 
+def _validate_outcome_feedback_kwargs(
+    kwargs: object, manifest: Mapping[str, Any], *, label: str
+) -> None:
+    if not isinstance(kwargs, dict):
+        raise LaunchError(f"{label} has no agent kwargs")
+    treatment = manifest.get("evaluation_treatment")
+    if not isinstance(treatment, dict) or "outcome_feedback" not in treatment:
+        if "METACODES_OUTCOME_FEEDBACK" in kwargs:
+            raise LaunchError(f"{label} unexpectedly enables outcome feedback")
+        return
+    if kwargs.get("METACODES_OUTCOME_FEEDBACK", False) is not treatment.get(
+        "outcome_feedback"
+    ):
+        raise LaunchError(f"{label} outcome feedback treatment drifted")
+    if kwargs.get("METACODES_CONTINUITY_SEED_SHA256") != treatment.get(
+        "continuity_seed_sha256"
+    ):
+        raise LaunchError(f"{label} continuity seed treatment drifted")
+
+
 def _expected_self_evolution(manifest: Mapping[str, Any]) -> bool | None:
     treatment = manifest.get("evaluation_treatment")
     if not isinstance(treatment, dict) or "self_evolution" not in treatment:
@@ -2015,6 +2093,9 @@ def _validate_trial_project_control(
     _validate_self_evolution_kwargs(
         agent.get("kwargs"), manifest, label="official WorkBuddy trial"
     )
+    _validate_outcome_feedback_kwargs(
+        agent.get("kwargs"), manifest, label="official WorkBuddy trial"
+    )
     runtime = _json(trial_dir / "agent/metacodes-runtime-contract.json")
     backend_model_name = str(manifest.get("model", {}).get("backend_model_name") or "")
     if (
@@ -2035,6 +2116,16 @@ def _validate_trial_project_control(
         runtime.get("self_evolution") is not expected_evolution
     ):
         raise LaunchError("official WorkBuddy runtime self-evolution treatment drifted")
+    treatment_block = manifest.get("evaluation_treatment")
+    if isinstance(treatment_block, dict) and "outcome_feedback" in treatment_block:
+        if runtime.get("outcome_feedback") is not treatment_block.get(
+            "outcome_feedback"
+        ) or runtime.get("continuity_seed_sha256") != treatment_block.get(
+            "continuity_seed_sha256"
+        ):
+            raise LaunchError(
+                "official WorkBuddy runtime outcome-feedback treatment drifted"
+            )
     project = runtime.get("project_control")
     if not isinstance(project, dict) or project != {
         "staged": expected["staged"],
