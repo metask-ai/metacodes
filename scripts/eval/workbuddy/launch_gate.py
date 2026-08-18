@@ -2268,9 +2268,18 @@ def _collect_usage(
             # 寻址 sha,随 trial 演化),束 sha 恒等检查按声明放行——但
             # kernel 身份永远必须恰等于 staged(裁决者不可自改)。束的
             # 审计轨迹在连续性链导出的 store(provisional_rule 节点)里。
+            # 收紧(2026-08-18 发射前审查):首 trial(store_import 为
+            # null,连续性链尚未开始)不可能有临时规则,束轴不放行——
+            # 首 trial 出现非 staged 束 = 真漂移。
             self_evolution_declared = (
                 _expected_self_evolution(manifest) is True
             )
+            if self_evolution_declared:
+                first_trial_contract = _json(
+                    trajectory_path.parent / "metacodes-runtime-contract.json"
+                )
+                if first_trial_contract.get("store_import_sha256") is None:
+                    self_evolution_declared = False
             if (
                 expected_kernel_sha is None
                 or observed_kernels - {expected_kernel_sha}
