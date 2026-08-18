@@ -1571,15 +1571,15 @@ pub const KgClient = struct {
         return self.allocator.dupe(u8, snapshot) catch KgError.OutOfMemory;
     }
 
-    /// 写入一条受治理的本体条目(remember + 三治理属性,单事务语义)。
-    /// tinykg 快照只导出 schema_type ∈ {proposition,prescription,concept,
-    /// intent} 且 authority/falsifier/provenance 三属性齐全的节点;缺属性
-    /// 对快照是**整体报错**而非跳过,而 schema_type 不可事后翻转(实测
-    /// vendored CLI:set-node-property 键 allowlist 收它、值校验器无此分支
-    /// → InvalidRecord,有意为之)。所以协议是:先建本体类型节点,再补
-    /// 属性;任一步失败立即 forget 刚建节点,避免裸 proposition 毒化后续
-    /// 所有快照。残余风险仅进程中崩窗口——下一 run 快照会带
-    /// InvalidOntologyAuthority 报告,可 /kg forget 修复。
+    /// 写入一条受治理的本体条目(add-node + 三治理属性 + attach,单事务
+    /// 语义)。tinykg 快照只导出 schema_type ∈ {proposition,prescription,
+    /// concept,intent} 且 authority/falsifier/provenance 三属性齐全的节点;
+    /// 缺属性对快照是**整体报错**而非跳过,而 schema_type 不可事后翻转
+    /// (实测:set-node-property 值校验器无此分支,有意为之)。
+    /// **attach 必须最后做(commit point)**:快照候选集=项目子树,未挂接
+    /// 节点对投影不可见——进程在属性写完前被 SIGKILL(harness 超时杀)
+    /// 只会留下一个不可见孤儿,而不是随 continuity 链传播、毒化所有后续
+    /// 快照的裸 proposition。errdefer forget 兜其余失败路径。
     /// provenance 自引用该节点(存在性校验要求 ref 在库内),evidence 为
     /// 节点正文 sha256——host 观测记录的来源就是它自己的采集内容。
     pub fn rememberOntologyItem(
@@ -1590,7 +1590,14 @@ pub const KgClient = struct {
         falsifier: []const u8,
         evidence_sha256_hex: *const [64]u8,
     ) KgError!u64 {
-        const id = try self.remember(.observation, text, ontology_kind, false);
+        const add_out = try self.runCheckedWrite(&.{
+            "add-node", self.store_path, MemoryKind.observation.label(), text, "--schema-type", ontology_kind,
+        });
+        const id = parseNodeIdLine(add_out.stdout) orelse {
+            self.freeOut(add_out);
+            return self.dataError("add-node 输出不可解析(本体条目)", .{});
+        };
+        self.freeOut(add_out);
         errdefer self.forget(id) catch {};
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{id}) catch unreachable;
@@ -1612,6 +1619,8 @@ pub const KgClient = struct {
             });
             self.freeOut(out);
         }
+        // commit point:挂进项目子树,条目自此对快照可见(且三属性已齐)。
+        try self.attachToProject(id, ontology_kind, false);
         return id;
     }
 
