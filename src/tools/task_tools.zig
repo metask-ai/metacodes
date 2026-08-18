@@ -363,7 +363,7 @@ fn createKgTask(ctx: *const ToolContext, subject: []const u8, description: []con
         ctx.allocator.dupe(u8, subject) catch return null;
     defer ctx.allocator.free(text);
 
-    // 子任务原语:todo 挂 inbox root(contains),不直挂 project(inbox root 已挂 task 锚,
+    // 子任务原语:todo 挂 inbox root(canonical contain),不直挂 project(inbox root 已挂 task 锚,
     // 归属经下钻可达;旧 createTask+addEdge 是双挂拍平)。
     const node = kg.createChildTask(inbox, text, "todo") catch return null;
 

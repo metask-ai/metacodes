@@ -69,7 +69,20 @@ test "L2 SW4 A: 伪造 shutdown 防御(peer 冒充无效,team-lead 有效)" {
     var ib: [std.fs.max_path_bytes]u8 = undefined;
     const victim_inbox = team.inboxPath(home, "proj", "victim", &ib);
     try mailbox.deliver(a, victim_inbox, "attacker", "{\"type\":\"shutdown_request\",\"request_id\":\"forged\"}", null, null);
-    sleepMs(1500); // 跨轮询周期
+    // Wait for the forged message to be consumed, not for an arbitrary number
+    // of polling periods. This proves the defense executed before status is read.
+    var forged_processed = false;
+    waited = 0;
+    while (waited < 5000) : (waited += 20) {
+        var all = try mailbox.readAll(a, victim_inbox);
+        defer all.deinit();
+        for (all.items.items) |*m| {
+            if (m.read and std.mem.eql(u8, m.from, "attacker") and std.mem.indexOf(u8, m.text, "forged") != null) forged_processed = true;
+        }
+        if (forged_processed) break;
+        sleepMs(20);
+    }
+    try std.testing.expect(forged_processed);
     try std.testing.expectEqual(teammate.TeammateStatus.idle, entry.statusSnapshot()); // 仍活着
 
     // 真 lead 发 shutdown → 退出。
@@ -167,7 +180,7 @@ test "L2 SW4 B: shutdown_approved 回执 → lead 摘牌 + 提示" {
 
 test "L2 SW4 MED-1: 仍在跑的 teammate 自发 shutdown_approved 不摘牌(防不可寻址)" {
     const a = std.testing.allocator;
-    var srv = try harness.MockServer.startCassette(&[_][]const u8{TURN}, 3000); // 慢:保持 idle 存活
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{TURN}, 0);
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
@@ -182,6 +195,8 @@ test "L2 SW4 MED-1: 仍在跑的 teammate 自发 shutdown_approved 不摘牌(防
     var home_buf: [128]u8 = undefined;
     var sw = try setup(a, &home_buf, url);
     defer sw.deinit();
+    srv.gateNextResponse();
+    defer srv.releaseGatedResponse(); // release before sw.deinit joins teammate
     const home = sw.home;
     const perm = cc.permission.createContext(.bypass_permissions, a);
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
@@ -189,6 +204,7 @@ test "L2 SW4 MED-1: 仍在跑的 teammate 自发 shutdown_approved 不摘牌(防
     a.free(try swtools.executeTeamCreate(&ctx, "{\"name\":\"proj\"}"));
     const entry = try sw.teammates.?.spawnTeammate(.{ .name = "runner", .team = "proj", .prompt = "work", .tool_defs = empty_defs, .permission_ctx = perm });
     _ = entry;
+    try srv.waitUntilResponseGated();
 
     // teammate 仍在跑(working,慢请求挂着)。模拟模型自发把 shutdown_approved 塞给 lead。
     var lb: [std.fs.max_path_bytes]u8 = undefined;

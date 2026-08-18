@@ -200,10 +200,10 @@ test "L2 后台并发: 多 job 各得不同 id 且都可查;MAX_BG_JOBS 上限�
     const a = std.testing.allocator;
 
     const bodies = [_][]const u8{BG_DONE_SSE};
-    // 每个 BG_DONE 响应有 6 个 SSE chunk；500ms/chunk 让首个 job 至少保持
-    // running 3s，足以完成 8 个非阻塞 spawn，同时避免单线程 cassette server
-    // 把最坏清理时间放大成 8 * 6 * 3s = 144s。
-    var srv = try harness.MockServer.startCassette(&bodies, 500);
+    // Gate the first response instead of sleeping per SSE chunk. The server is
+    // intentionally serial, so one gated connection keeps every registered job
+    // in-flight until the assertion releases it.
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
@@ -220,6 +220,8 @@ test "L2 后台并发: 多 job 各得不同 id 且都可查;MAX_BG_JOBS 上限�
     const perm = cc.permission.createContext(.bypass_permissions, a);
     var reg = try cc.agent_job_registry.AgentJobRegistry.init(a, "k", url, "claude-sonnet-4-20250514", .anthropic);
     defer reg.deinit(); // 多 running job 一起 abort+join
+    srv.gateNextResponse();
+    defer srv.releaseGatedResponse(); // must run before reg.deinit joins workers
 
     const ctx = makeCtx(a, &client, &agents, &perm, &reg);
 
@@ -240,16 +242,10 @@ test "L2 后台并发: 多 job 各得不同 id 且都可查;MAX_BG_JOBS 上限�
         try std.testing.expect(reg.get(id) != null);
         try ids.append(a, id);
     }
+    try srv.waitUntilResponseGated();
 
-    // 第 MAX+1 个:只要还有 running job 占满,应被上限拒绝。为避免与"早完成"竞态,
-    // 这里断言"要么被拒,要么(极少数早完成情形)返回有效 job"——核心是不崩不泄漏 +
-    // 上限逻辑存在。多数情况下命中 TooManyBackgroundJobs。
-    if (cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"general-purpose\",\"prompt\":\"hi\",\"run_in_background\":true}")) |extra| {
-        // 早完成腾出名额 → 返回成功;释放避免泄漏。
-        a.free(extra);
-    } else |err| {
-        try std.testing.expectEqual(error.TooManyBackgroundJobs, err);
-    }
+    // 第 MAX+1 个确定性被拒；gate 消除了“也许早完成”的弱断言。
+    try std.testing.expectError(error.TooManyBackgroundJobs, cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"general-purpose\",\"prompt\":\"hi\",\"run_in_background\":true}"));
 }
 
 // 回归(本次修复核心):subagent 第一轮单轮内发 3 个 TaskCreate。

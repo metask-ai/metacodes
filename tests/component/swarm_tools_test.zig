@@ -240,7 +240,7 @@ test "L2 SW2 F6: SendMessage 广播送达两 teammate" {
 
     // 两 teammate 各跑一轮 end_turn 后 idle(不消费广播,广播只需送达 inbox)。
     const bodies = [_][]const u8{ T1, T1 };
-    var srv = try harness.MockServer.startCassette(&bodies, 2000); // 慢:保持存活
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
@@ -261,6 +261,8 @@ test "L2 SW2 F6: SendMessage 广播送达两 teammate" {
 
     var sw = swctx.SwarmContext{ .allocator = a, .home = home, .api_key = "k", .base_url = url, .model = "claude-sonnet-4-20250514", .provider_kind = .anthropic };
     defer sw.deinit();
+    srv.gateNextResponse();
+    defer srv.releaseGatedResponse(); // release before sw.deinit joins teammates
 
     const perm = cc.permission.createContext(.bypass_permissions, a);
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
@@ -276,6 +278,7 @@ test "L2 SW2 F6: SendMessage 广播送达两 teammate" {
     a.free(try cc.swarm_tools.executeTeamCreate(&ctx, "{\"name\":\"proj\"}"));
     a.free(try cc.agent_tool.execute(&ctx, "{\"prompt\":\"a\",\"name\":\"alice\"}"));
     a.free(try cc.agent_tool.execute(&ctx, "{\"prompt\":\"b\",\"name\":\"bob\"}"));
+    try srv.waitUntilResponseGated();
 
     // 广播。
     const rb = try cc.swarm_tools.executeSendMessage(&ctx, "{\"to\":\"*\",\"message\":\"standup now\",\"summary\":\"broadcast\"}");
