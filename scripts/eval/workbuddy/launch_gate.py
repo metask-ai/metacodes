@@ -655,13 +655,30 @@ def build_launch_manifest(
     if not isinstance(project_overrides, dict):
         raise LaunchError("WorkBuddy harness_params_override must be a mapping")
     project_control_mode = project_overrides.get("METACODES_PROJECT_CONTROL_MODE")
+    # 全部 treatment 键必须显式在场(2026-08-18 发射前审查:子集语义下
+    # 拼错键名会静默降级为 False——花 16 个任务的钱拿到贴错标签的臂,
+    # 任何地方不报错)。presence-required 把拼写错误变成 create 期拒绝。
+    _required_treatment_keys = (
+        "METACODES_VERIFICATION_CHECKPOINT",
+        "METACODES_VERIFICATION_FINAL_GATE",
+        "METACODES_VERIFICATION_FINAL_OBSERVE",
+        "METACODES_REQUIREMENT_LEDGER",
+        "METACODES_REQUIREMENT_LEDGER_OBSERVE",
+        "METACODES_MEMORY_ACCUMULATION",
+        "METACODES_SELF_EVOLUTION",
+    )
+    _missing_treatment_keys = [
+        key for key in _required_treatment_keys if key not in project_overrides
+    ]
+    if _missing_treatment_keys:
+        raise LaunchError(
+            "WorkBuddy job must declare every treatment key explicitly; "
+            f"missing: {_missing_treatment_keys}"
+        )
     verification_checkpoint = project_overrides.get(
         "METACODES_VERIFICATION_CHECKPOINT", False
     )
-    if (
-        "METACODES_VERIFICATION_CHECKPOINT" not in project_overrides
-        or not isinstance(verification_checkpoint, bool)
-    ):
+    if not isinstance(verification_checkpoint, bool):
         raise LaunchError(
             "WorkBuddy verification checkpoint treatment must be an explicit boolean"
         )

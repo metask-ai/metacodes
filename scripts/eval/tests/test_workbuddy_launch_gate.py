@@ -369,7 +369,13 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
                         "record_full_io": True,
                         "n_attempts": 1,
                         "harness_params_override": {
-                            "METACODES_VERIFICATION_CHECKPOINT": False
+                            "METACODES_VERIFICATION_CHECKPOINT": False,
+                            "METACODES_VERIFICATION_FINAL_GATE": False,
+                            "METACODES_VERIFICATION_FINAL_OBSERVE": False,
+                            "METACODES_REQUIREMENT_LEDGER": False,
+                            "METACODES_REQUIREMENT_LEDGER_OBSERVE": False,
+                            "METACODES_MEMORY_ACCUMULATION": False,
+                            "METACODES_SELF_EVOLUTION": False
                         },
                         "task_selection": {"mode": "name", "names": ["task-a"]},
                         "orchestrator_override": {"n_concurrent_trials": 1},
