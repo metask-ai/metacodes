@@ -181,6 +181,7 @@ def _comparison_covariates(
         overrides.pop("METACODES_REQUIREMENT_LEDGER", None)
         overrides.pop("METACODES_REQUIREMENT_LEDGER_OBSERVE", None)
         overrides.pop("METACODES_MEMORY_ACCUMULATION", None)
+        overrides.pop("METACODES_SELF_EVOLUTION", None)
     stable_artifacts = json.loads(json.dumps(artifacts))
     # Absolute staging paths describe where identical bytes were observed, not
     # an experimental variable.  Keep every digest/size/architecture field.
@@ -703,6 +704,21 @@ def build_launch_manifest(
         raise LaunchError(
             "WorkBuddy memory accumulation treatment must be an explicit boolean"
         )
+    self_evolution = project_overrides.get("METACODES_SELF_EVOLUTION", False)
+    if not isinstance(self_evolution, bool):
+        raise LaunchError(
+            "WorkBuddy self evolution treatment must be an explicit boolean"
+        )
+    if self_evolution and not memory_accumulation:
+        raise LaunchError(
+            "WorkBuddy self evolution requires memory accumulation — "
+            "provisional rules ride the store continuity chain"
+        )
+    if self_evolution and project_control_mode != "enforced":
+        raise LaunchError(
+            "WorkBuddy self evolution requires enforced project control — "
+            "the fixed kernel identity comes from the staged bundle env"
+        )
     expected_project_overrides = (
         {
             "METACODES_PROJECT_CONTROL_MODE": project_control_mode,
@@ -844,6 +860,7 @@ def build_launch_manifest(
             "verification_checkpoint": verification_checkpoint,
             "verification_final_gate": verification_final_gate,
             "memory_accumulation": memory_accumulation,
+            "self_evolution": self_evolution,
             "verification_final_observe": verification_final_observe,
             "requirement_ledger": requirement_ledger,
             "requirement_ledger_observe": requirement_ledger_observe,
@@ -977,6 +994,11 @@ def _validate_launch_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
                     else {}
                 ),
                 **(
+                    {"self_evolution": treatment.get("self_evolution")}
+                    if "self_evolution" in treatment
+                    else {}
+                ),
+                **(
                     {
                         "requirement_ledger": treatment.get("requirement_ledger"),
                         "requirement_ledger_observe": treatment.get(
@@ -999,6 +1021,10 @@ def _validate_launch_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
             or (
                 "memory_accumulation" in treatment
                 and not isinstance(treatment.get("memory_accumulation"), bool)
+            )
+            or (
+                "self_evolution" in treatment
+                and not isinstance(treatment.get("self_evolution"), bool)
             )
             or (
                 "requirement_ledger" in treatment
@@ -1903,6 +1929,30 @@ def _validate_memory_accumulation_kwargs(
         raise LaunchError(f"{label} memory accumulation treatment drifted")
 
 
+def _validate_self_evolution_kwargs(
+    kwargs: object, manifest: Mapping[str, Any], *, label: str
+) -> None:
+    if not isinstance(kwargs, dict):
+        raise LaunchError(f"{label} has no agent kwargs")
+    expected = _expected_self_evolution(manifest)
+    if expected is None:
+        if "METACODES_SELF_EVOLUTION" in kwargs:
+            raise LaunchError(f"{label} unexpectedly enables self evolution")
+        return
+    if kwargs.get("METACODES_SELF_EVOLUTION", False) is not expected:
+        raise LaunchError(f"{label} self evolution treatment drifted")
+
+
+def _expected_self_evolution(manifest: Mapping[str, Any]) -> bool | None:
+    treatment = manifest.get("evaluation_treatment")
+    if not isinstance(treatment, dict) or "self_evolution" not in treatment:
+        return None
+    value = treatment.get("self_evolution")
+    if not isinstance(value, bool):
+        raise LaunchError("paid launch self evolution treatment is invalid")
+    return value
+
+
 def _expected_memory_accumulation(manifest: Mapping[str, Any]) -> bool | None:
     treatment = manifest.get("evaluation_treatment")
     if not isinstance(treatment, dict) or "memory_accumulation" not in treatment:
@@ -1945,6 +1995,9 @@ def _validate_trial_project_control(
     _validate_memory_accumulation_kwargs(
         agent.get("kwargs"), manifest, label="official WorkBuddy trial"
     )
+    _validate_self_evolution_kwargs(
+        agent.get("kwargs"), manifest, label="official WorkBuddy trial"
+    )
     runtime = _json(trial_dir / "agent/metacodes-runtime-contract.json")
     backend_model_name = str(manifest.get("model", {}).get("backend_model_name") or "")
     if (
@@ -1960,6 +2013,11 @@ def _validate_trial_project_control(
         runtime.get("memory_accumulation") is not expected_memory
     ):
         raise LaunchError("official WorkBuddy runtime memory treatment drifted")
+    expected_evolution = _expected_self_evolution(manifest)
+    if expected_evolution is not None and (
+        runtime.get("self_evolution") is not expected_evolution
+    ):
+        raise LaunchError("official WorkBuddy runtime self-evolution treatment drifted")
     project = runtime.get("project_control")
     if not isinstance(project, dict) or project != {
         "staged": expected["staged"],
@@ -2206,12 +2264,24 @@ def _collect_usage(
         observed_kernels = set(lean_metrics.get("kernel_sha256s") or [])
         observed_bundles = set(lean_metrics.get("bundle_sha256s") or [])
         if observed_kernels or observed_bundles:
+            # 自演化 treatment:临时规则束是自改的(哨兵 revision + 内容
+            # 寻址 sha,随 trial 演化),束 sha 恒等检查按声明放行——但
+            # kernel 身份永远必须恰等于 staged(裁决者不可自改)。束的
+            # 审计轨迹在连续性链导出的 store(provisional_rule 节点)里。
+            self_evolution_declared = (
+                _expected_self_evolution(manifest) is True
+            )
             if (
                 expected_kernel_sha is None
                 or observed_kernels - {expected_kernel_sha}
-                or (expected_bundle_sha is None and observed_bundles)
                 or (
-                    expected_bundle_sha is not None
+                    not self_evolution_declared
+                    and expected_bundle_sha is None
+                    and observed_bundles
+                )
+                or (
+                    not self_evolution_declared
+                    and expected_bundle_sha is not None
                     and observed_bundles - {expected_bundle_sha}
                 )
             ):

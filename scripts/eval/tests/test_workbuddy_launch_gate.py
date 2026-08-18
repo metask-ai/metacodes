@@ -2656,6 +2656,202 @@ class WorkBuddyRequestAuditRetryTest(unittest.TestCase):
         with self.assertRaisesRegex(LaunchError, "incomplete or out of order"):
             self._with_extra_records([self._compact_record()], turns=2)
 
+    def test_self_evolution_treatment_binds_kwargs_and_contract(self):
+        # 声明=接线=测试:self_evolution 声明必须端到端穿透 job kwargs 与
+        # trial 运行时契约;漂移(声明了没接/接了没声明)fail-closed。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            manifest = {
+                "run_id": "workbuddy-selfevo-l2",
+                "workbuddy": {"checkout": str(root / "workbuddy")},
+                "cohort": {"selected_tasks": ["code-task-a"]},
+                "job": {"slug": "metacodes-code-l2"},
+                "model": {"slug": "test-model", "backend_model_name": "glm-5.2"},
+                "evaluation_treatment": {
+                    "project_control": "absent",
+                    "self_evolution": True,
+                    "memory_accumulation": True,
+                },
+                "artifacts": {},
+            }
+            kwargs = {
+                "METACODES_MODEL_DISPLAY_NAME": "glm-5.2",
+                "METACODES_MEMORY_ACCUMULATION": True,
+                "METACODES_SELF_EVOLUTION": True,
+            }
+            trial = root / "trial"
+            (trial / "agent").mkdir(parents=True)
+            (trial / "config.json").write_text(
+                json.dumps({"agent": {"kwargs": kwargs}}) + "\n",
+                encoding="utf-8",
+            )
+            contract = {
+                "project_control": {
+                    "staged": False,
+                    "mode": "absent",
+                    "configured": False,
+                    "project_state_hash": None,
+                    "artifacts_verified": False,
+                    "runtime_active_bundle_absent": True,
+                },
+                "transport_model_is_route": True,
+                "actor_model_identity": "glm-5.2",
+                "memory_accumulation": True,
+                "self_evolution": True,
+            }
+            contract_path = trial / "agent/metacodes-runtime-contract.json"
+            contract_path.write_text(
+                json.dumps(contract) + "\n", encoding="utf-8"
+            )
+            _validate_trial_project_control(trial, manifest)
+            # 契约侧漂移:声明 true、运行时 false → 拒绝。
+            drifted = dict(contract)
+            drifted["self_evolution"] = False
+            contract_path.write_text(
+                json.dumps(drifted) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                LaunchError, "self-evolution treatment drifted"
+            ):
+                _validate_trial_project_control(trial, manifest)
+            contract_path.write_text(
+                json.dumps(contract) + "\n", encoding="utf-8"
+            )
+            # kwargs 侧漂移:未声明 treatment 的 manifest 撞开启的 kwargs。
+            undeclared = dict(manifest)
+            undeclared["evaluation_treatment"] = {
+                "project_control": "absent",
+                "memory_accumulation": True,
+            }
+            with self.assertRaisesRegex(
+                LaunchError, "unexpectedly enables self evolution"
+            ):
+                _validate_trial_project_control(trial, undeclared)
+
+    def test_self_evolution_never_waives_kernel_staging(self):
+        # 自演化放行的只是"束可自改";kernel 身份必须仍来自 staged 工件。
+        # 无 staged kernel 的 manifest + journal 出现形式活动 → 即便声明了
+        # self_evolution 也 fail-closed。
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self._formal_identity_fixture(Path(directory))
+            # memory 声明保持 False:本测试只关心审计端的 kernel 语义,
+            # 而 fixture trial 的 kwargs 里没有 memory 接线。
+            manifest["evaluation_treatment"] = {
+                "project_control": "absent",
+                "self_evolution": True,
+                "memory_accumulation": False,
+            }
+            workbuddy = Path(manifest["workbuddy"]["checkout"])
+            trial_dir = next(workbuddy.rglob("agent/trajectory.json")).parent.parent
+            config_path = trial_dir / "config.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["agent"]["kwargs"]["METACODES_SELF_EVOLUTION"] = True
+            config_path.write_text(
+                json.dumps(config) + "\n", encoding="utf-8"
+            )
+            contract_path = trial_dir / "agent/metacodes-runtime-contract.json"
+            contract = json.loads(contract_path.read_text(encoding="utf-8"))
+            contract["self_evolution"] = True
+            contract["memory_accumulation"] = False
+            contract_path.write_text(
+                json.dumps(contract) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                LaunchError, "not the staged project-control artifacts"
+            ):
+                _collect_usage(manifest, started_ns=0, official_runner=True)
+
+    def _formal_identity_fixture(self, directory):
+        manifest = self._fixture(Path(directory))
+        workbuddy = Path(manifest["workbuddy"]["checkout"])
+        observation = next(workbuddy.rglob("agent/" + OBSERVATION_FILENAME))
+        identity = {
+            "project_sha256": "1" * 64,
+            "bundle_sha256": "2" * 64,
+            "bundle_revision": 1,
+            "kernel_sha256": "3" * 64,
+        }
+        def rule_filter(phase):
+            return {"tool_observation": {"rule_filter": {
+                "schema_version": "metacodes-project-rule-filter-v1",
+                "dispatch_id": "formal-1", "phase": phase,
+                "operation": "ordinary", **identity,
+                "active_rule_count": 1, "checker_rule_count": 1,
+                "statically_pruned_rule_count": 0,
+                "proof": sorted(RULE_FILTER_PROOFS)[0],
+            }}}
+        def batch(phase, token):
+            return {"tool_observation": {"formal_decision_batch": {
+                "schema_version": CURRENT_FORMAL_BATCH_SCHEMA,
+                "dispatch_id": "formal-1", "phase": phase,
+                "actuation": "enforced", **identity,
+                "checker_call_sha256": token * 64,
+                "checker_batch_size": 1, "checker_elapsed_ns": 1,
+                "checker_bytes": 1,
+                "decisions": [{
+                    "operation": f"{phase}_decision", "result": "admit",
+                    "recovery_action": "none",
+                }],
+            }}}
+        start = {
+            "schema_version": "metacodes-tool-observation-v1",
+            "id": "formal-1", "requested_name": "Read",
+            "dispatched_name": "Read", "origin": "authoritative",
+            "agent_depth": 0,
+        }
+        events = [
+            {"run_started": {}},
+            rule_filter("pre"), batch("pre", "4"),
+            {"tool_observation": {"dispatch_started": start}},
+            rule_filter("post"), batch("post", "5"),
+            {"tool_observation": {"dispatch_finished": {
+                **start, "outcome": "succeeded"}}},
+            {"run_finished": {}},
+        ]
+        observation.write_text(
+            "".join(
+                json.dumps({
+                    "schema_version": "metacodes-tool-observation-journal-v1",
+                    "sequence": seq, "monotonic_elapsed_ns": seq,
+                    "session_id": "session-official-reward-l2",
+                    "run_id": "run-official-reward-l2",
+                    "event": payload,
+                }) + "\n"
+                for seq, payload in enumerate(events)
+            ),
+            encoding="utf-8",
+        )
+        # The progress analyzer cross-checks transcript tool_use ids
+        # against journal dispatch ids; give the dispatch its transcript
+        # counterpart.
+        observation.with_name("metacodes-transcript.jsonl").write_text(
+            json.dumps({"role": "assistant", "blocks": [{
+                "type": "tool_use", "id": "formal-1", "name": "Read",
+                "input": {"file_path": "README.md"},
+            }]}) + "\n"
+            + json.dumps({"role": "user", "blocks": [{
+                "type": "tool_result", "tool_use_id": "formal-1",
+                "content": "ok", "is_error": False,
+            }]}) + "\n",
+            encoding="utf-8",
+        )
+        # Re-derive the embedded control metrics so the trajectory stays
+        # byte-consistent with the rewritten journal.
+        trajectory_path = observation.with_name("trajectory.json")
+        trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+        trajectory["final_metrics"]["extra"]["control_metrics"] = (
+            load_control_metrics(
+                observation.with_name("metacodes-transcript.jsonl"),
+                observation,
+            )
+        )
+        trajectory["final_metrics"]["extra"]["metacodes_turns"] = 1
+        trajectory_path.write_text(
+            json.dumps(trajectory) + "\n", encoding="utf-8"
+        )
+
+        return manifest
+
     def test_journal_formal_identities_must_match_staged_artifacts(self):
         # Global review 2026-08-17 (trust topology, L1 gap): the journal's
         # kernel/bundle sha256s were shape-checked but never bound to the
@@ -2665,93 +2861,7 @@ class WorkBuddyRequestAuditRetryTest(unittest.TestCase):
         # fail closed. (The positive direction — matching identities pass —
         # is exercised by every real enforced wave at commit time.)
         with tempfile.TemporaryDirectory() as directory:
-            manifest = self._fixture(Path(directory))
-            workbuddy = Path(manifest["workbuddy"]["checkout"])
-            observation = next(workbuddy.rglob("agent/" + OBSERVATION_FILENAME))
-            identity = {
-                "project_sha256": "1" * 64,
-                "bundle_sha256": "2" * 64,
-                "bundle_revision": 1,
-                "kernel_sha256": "3" * 64,
-            }
-            def rule_filter(phase):
-                return {"tool_observation": {"rule_filter": {
-                    "schema_version": "metacodes-project-rule-filter-v1",
-                    "dispatch_id": "formal-1", "phase": phase,
-                    "operation": "ordinary", **identity,
-                    "active_rule_count": 1, "checker_rule_count": 1,
-                    "statically_pruned_rule_count": 0,
-                    "proof": sorted(RULE_FILTER_PROOFS)[0],
-                }}}
-            def batch(phase, token):
-                return {"tool_observation": {"formal_decision_batch": {
-                    "schema_version": CURRENT_FORMAL_BATCH_SCHEMA,
-                    "dispatch_id": "formal-1", "phase": phase,
-                    "actuation": "enforced", **identity,
-                    "checker_call_sha256": token * 64,
-                    "checker_batch_size": 1, "checker_elapsed_ns": 1,
-                    "checker_bytes": 1,
-                    "decisions": [{
-                        "operation": f"{phase}_decision", "result": "admit",
-                        "recovery_action": "none",
-                    }],
-                }}}
-            start = {
-                "schema_version": "metacodes-tool-observation-v1",
-                "id": "formal-1", "requested_name": "Read",
-                "dispatched_name": "Read", "origin": "authoritative",
-                "agent_depth": 0,
-            }
-            events = [
-                {"run_started": {}},
-                rule_filter("pre"), batch("pre", "4"),
-                {"tool_observation": {"dispatch_started": start}},
-                rule_filter("post"), batch("post", "5"),
-                {"tool_observation": {"dispatch_finished": {
-                    **start, "outcome": "succeeded"}}},
-                {"run_finished": {}},
-            ]
-            observation.write_text(
-                "".join(
-                    json.dumps({
-                        "schema_version": "metacodes-tool-observation-journal-v1",
-                        "sequence": seq, "monotonic_elapsed_ns": seq,
-                        "session_id": "session-official-reward-l2",
-                        "run_id": "run-official-reward-l2",
-                        "event": payload,
-                    }) + "\n"
-                    for seq, payload in enumerate(events)
-                ),
-                encoding="utf-8",
-            )
-            # The progress analyzer cross-checks transcript tool_use ids
-            # against journal dispatch ids; give the dispatch its transcript
-            # counterpart.
-            observation.with_name("metacodes-transcript.jsonl").write_text(
-                json.dumps({"role": "assistant", "blocks": [{
-                    "type": "tool_use", "id": "formal-1", "name": "Read",
-                    "input": {"file_path": "README.md"},
-                }]}) + "\n"
-                + json.dumps({"role": "user", "blocks": [{
-                    "type": "tool_result", "tool_use_id": "formal-1",
-                    "content": "ok", "is_error": False,
-                }]}) + "\n",
-                encoding="utf-8",
-            )
-            # Re-derive the embedded control metrics so the trajectory stays
-            # byte-consistent with the rewritten journal.
-            trajectory_path = observation.with_name("trajectory.json")
-            trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
-            trajectory["final_metrics"]["extra"]["control_metrics"] = (
-                load_control_metrics(
-                    observation.with_name("metacodes-transcript.jsonl"),
-                    observation,
-                )
-            )
-            trajectory["final_metrics"]["extra"]["metacodes_turns"] = 1
-            trajectory_path.write_text(
-                json.dumps(trajectory) + "\n", encoding="utf-8"
-            )
+            manifest = self._formal_identity_fixture(Path(directory))
             with self.assertRaisesRegex(
                 LaunchError, "not the staged project-control artifacts"
             ):

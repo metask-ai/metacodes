@@ -144,6 +144,17 @@ class MetacodesAgent(BaseInstalledAgent):
                 "METACODES_MEMORY_ACCUMULATION must be an explicit boolean"
             )
         self._memory_accumulation = memory_accumulation
+        self_evolution = kwargs.pop("METACODES_SELF_EVOLUTION", False)
+        if not isinstance(self_evolution, bool):
+            raise ValueError(
+                "METACODES_SELF_EVOLUTION must be an explicit boolean"
+            )
+        if self_evolution and not memory_accumulation:
+            raise ValueError(
+                "self evolution requires memory accumulation: provisional "
+                "rules ride the store continuity chain"
+            )
+        self._self_evolution = self_evolution
         project_rules = kwargs.pop("METACODES_PROJECT_RULES_RELATIVE", None)
         project_kernel = kwargs.pop("METACODES_PROJECT_KERNEL_RELATIVE", None)
         project_control_mode = kwargs.pop("METACODES_PROJECT_CONTROL_MODE", None)
@@ -162,6 +173,11 @@ class MetacodesAgent(BaseInstalledAgent):
                 "metacodes staged project control requires explicit disabled/enforced mode"
             )
         self._project_control_mode = str(project_control_mode)
+        if self._self_evolution and self._project_control_mode != "enforced":
+            raise ValueError(
+                "self evolution requires enforced project control: the fixed "
+                "kernel identity comes from the staged bundle environment"
+            )
         self._project_rules_relative = (
             _relative_mount_path(project_rules, "project rules")
             if project_rules is not None
@@ -402,6 +418,7 @@ class MetacodesAgent(BaseInstalledAgent):
                 "remote_tinykg_env_absent": remote_tinykg_env_absent,
                 "tinykg_store_absent_before_first_provider_request": store_import_sha is None,
                 "memory_accumulation": self._memory_accumulation,
+                "self_evolution": self._self_evolution,
                 "store_import_sha256": store_import_sha,
                 "credential_delivery": "anonymous-fd-route-token",
                 "transport_model_is_route": True,
@@ -453,7 +470,12 @@ class MetacodesAgent(BaseInstalledAgent):
             "unset METACODES_PROJECT_KERNEL_PATH METACODES_PROJECT_KERNEL_SHA256; "
             f"{project_setup}"
             "export METACODES_KG_TRANSPORT=cli-exclusive; "
-            f'export METACODES_KG_BIN={shlex.quote(mount + "/bin/tinykg")}; '
+            + (
+                "export METACODES_SELF_EVOLUTION=1; "
+                if self._self_evolution
+                else ""
+            )
+            + f'export METACODES_KG_BIN={shlex.quote(mount + "/bin/tinykg")}; '
             'export METACODES_KG_STORE="$HOME/.local/share/tinykg/store"; '
             f'export METACODES_FORMAL_KERNEL_PATH={shlex.quote(mount + "/libexec/metacodes-formal-kernel")}; '
             'kernel_sha="$(sha256sum "$METACODES_FORMAL_KERNEL_PATH" | cut -d" " -f1)"; '
