@@ -38,7 +38,7 @@ comptime {
 pub fn event(value: InternalEvent) ?public.CoreEvent {
     return switch (value) {
         .text_chunk => |v| .{ .text_chunk = v },
-        .thinking_chunk => |v| .{ .text_chunk = v }, // thinking 复用 text_chunk wire(ABI v1 无独立 thinking 事件;UI 可在端侧区分)
+        .thinking_chunk => |v| .{ .thinking_chunk = v },
         .tool_start => |v| .{ .tool_start = .{ .id = v.id, .name = v.name, .input = v.input } },
         .tool_progress => |v| .{ .tool_progress = .{ .id = v.id, .text = v.text } },
         .progress => |v| .{ .progress = .{

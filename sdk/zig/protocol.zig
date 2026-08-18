@@ -171,6 +171,7 @@ pub const MAX_FILE_REF_KIND_BYTES_V1: usize = 64;
 
 pub const CoreEvent = union(enum) {
     text_chunk: []const u8,
+    thinking_chunk: []const u8,
     tool_start: struct {
         id: []const u8,
         name: []const u8,
@@ -1181,6 +1182,7 @@ fn testPermissionRequest() PermissionRequest {
 test "CoreEvent decoder covers every ABI v1 tag" {
     const cases = [_][]const u8{
         "{\"text_chunk\":\"hello\"}",
+        "{\"thinking_chunk\":\"private reasoning\"}",
         "{\"tool_start\":{\"id\":\"t1\",\"name\":\"Read\",\"input\":\"{}\"}}",
         "{\"tool_progress\":{\"id\":\"t1\",\"text\":\"working\"}}",
         "{\"progress\":{\"turn\":1,\"tool_name\":\"Read\",\"tool_input\":\"{}\",\"tool_calls\":2}}",
