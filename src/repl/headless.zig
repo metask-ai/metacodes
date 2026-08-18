@@ -247,6 +247,8 @@ pub fn run(
             .now_ns = @import("../util/time.zig").nowWallNs(),
             .stop_reason = @tagName(result.stop_reason),
             .provisional_active_count = if (provisional_gate) |pg| pg.provisional_count else 0,
+            .provisional_candidate_ids = if (provisional_gate) |pg| pg.provisional_candidate_ids else &.{},
+            .provisional_bundle_sha256 = if (provisional_gate) |pg| pg.active.bundle_sha256 else null,
             .abort = &app.abort,
         });
         const log = @import("../util/log.zig");

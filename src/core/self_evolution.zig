@@ -30,7 +30,9 @@ const journal_mod = @import("tool_observation_journal.zig");
 const observation = @import("../tools/observation.zig");
 const protocol = @import("../tools/project_rule_gate.zig");
 const provider_mod = @import("../api/provider.zig");
+const activation_mod = @import("project_rule_activation.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const log = @import("../util/log.zig");
 
 pub const ENV_FLAG = "METACODES_SELF_EVOLUTION";
 pub const SCHEMA_TYPE = "provisional_rule";
@@ -45,8 +47,14 @@ pub const PROVISIONAL_REVISION_BASE: u64 = 1_000_000;
 /// 每次 author 调用的硬上限(单价来源=保守常数,与 caps 一起保证
 /// worst-case 成本可被 cost cap 覆盖;真实计费由 provider 侧结算)。
 pub const AUTHOR_MAX_INPUT_TOKENS: u64 = 48_000;
-pub const AUTHOR_MAX_OUTPUT_TOKENS: u64 = 4_000;
-pub const AUTHOR_MAX_COST_MICROUSD: u64 = 120_000; // $0.12/次上限
+/// 必须 ≥ actor provider 的 max_tokens 设置(rule_author.author 拒绝
+/// provider.maxTokens() > cap;eval 里 actor 用 16384,非 eval 默认 32k)。
+pub const AUTHOR_MAX_OUTPUT_TOKENS: u64 = 40_000;
+/// 必须 ≥ rule_author.worstCaseCost(caps, pricing):输入按
+/// max(input, cache_read, cache_write)=2.5µ$/Ktok 计 48k→120k,输出
+/// 6µ$/Ktok 计 40k→240k,worst=360k。上限是许可天花板不是预期花费;
+/// 实际 author 输出是一小段 JSON。有静态测试钉住这笔账。
+pub const AUTHOR_MAX_COST_MICROUSD: u64 = 400_000;
 fn authorPricing() rule_author.PricingAuthority {
     return .{
         .provenance_sha256 = observation.sha256Hex("metacodes-self-evolution-pricing-v1"),
@@ -98,6 +106,20 @@ pub fn parseEnvelope(arena: std.mem.Allocator, text: []const u8) !Envelope {
     // spec 必须能过封闭枚举校验——坏信封在装载期拒绝,不进 gate。
     const spec = try spec_mod.fromWire(parsed.rule);
     try spec_mod.validate(spec);
+    // 无差别封禁核心工具没有任何合法过程义务读法,只会砖掉后续所有
+    // trial(过程义务=边界/复观测/权威性要求,不是"禁用 Edit")。
+    if (spec.deny_target and spec.target_scope == .all) {
+        switch (spec.target) {
+            .tool => |tool_name| {
+                const core = [_][]const u8{ "Read", "Edit", "Write", "Bash" };
+                for (core) |name| {
+                    if (std.mem.eql(u8, tool_name, name))
+                        return error.CoreToolBlanketDeny;
+                }
+            },
+            .effect_class => {},
+        }
+    }
     return parsed;
 }
 
@@ -119,6 +141,9 @@ pub const ProvisionalGate = struct {
     active: *bundle_mod.LoadedActive,
     runtime: runtime_gate_mod.RuntimeGate,
     provisional_count: usize,
+    /// 临时规则的 candidate id 清单(borrow 自 active 的 arena;与 gate
+    /// 同生命周期)。熔断器用它写撤回信封。
+    provisional_candidate_ids: []const []const u8,
 
     pub fn gate(self: *ProvisionalGate) protocol.Gate {
         return self.runtime.protocolGate();
@@ -139,29 +164,49 @@ pub fn collectEnvelopes(
     kg: *kg_client_mod.KgClient,
 ) ![]Envelope {
     var retracted = std.StringHashMapUnmanaged(void){};
-    const retract_hits = kg.recallTyped(RETRACT_MARKER, MAX_PROVISIONAL_RULES * 4, false, RETRACT_SCHEMA_TYPE) catch
-        &[_]kg_client_mod.RecallHit{};
-    for (retract_hits) |hit| {
-        const full = kg.fetchNodeText(hit.node_id) catch continue;
-        defer kg.allocator.free(full);
-        if (parseRetraction(arena, full)) |cid|
-            try retracted.put(arena, try arena.dupe(u8, cid), {});
-    }
+    if (kg.recallTyped(
+        RETRACT_MARKER,
+        MAX_PROVISIONAL_RULES * 4,
+        false,
+        RETRACT_SCHEMA_TYPE,
+    )) |retract_hits| {
+        // recallTyped 返回 owned slice:逐项 deinit + free(kg_tools 同款
+        // 惯用法;绝不对 catch 出来的静态空哨兵调 free)。
+        defer {
+            for (retract_hits) |*hit| hit.deinit(kg.allocator);
+            kg.allocator.free(retract_hits);
+        }
+        for (retract_hits) |hit| {
+            const full = kg.fetchNodeText(hit.node_id) catch continue;
+            defer kg.allocator.free(full);
+            if (parseRetraction(arena, full)) |cid|
+                try retracted.put(arena, try arena.dupe(u8, cid), {});
+        }
+    } else |_| {}
 
     var out = std.array_list.Managed(Envelope).init(arena);
     var seen = std.StringHashMapUnmanaged(void){};
-    const hits = kg.recallTyped(MARKER, MAX_PROVISIONAL_RULES * 4, false, SCHEMA_TYPE) catch
-        return out.items;
-    for (hits) |hit| {
-        if (out.items.len >= MAX_PROVISIONAL_RULES) break;
-        const full = kg.fetchNodeText(hit.node_id) catch continue;
-        defer kg.allocator.free(full);
-        const envelope = parseEnvelope(arena, full) catch continue;
-        if (retracted.contains(envelope.candidate_id)) continue;
-        if (seen.contains(envelope.candidate_id)) continue;
-        try seen.put(arena, envelope.candidate_id, {});
-        try out.append(envelope);
-    }
+    if (kg.recallTyped(
+        MARKER,
+        MAX_PROVISIONAL_RULES * 4,
+        false,
+        SCHEMA_TYPE,
+    )) |hits| {
+        defer {
+            for (hits) |*hit| hit.deinit(kg.allocator);
+            kg.allocator.free(hits);
+        }
+        for (hits) |hit| {
+            if (out.items.len >= MAX_PROVISIONAL_RULES) break;
+            const full = kg.fetchNodeText(hit.node_id) catch continue;
+            defer kg.allocator.free(full);
+            const envelope = parseEnvelope(arena, full) catch continue;
+            if (retracted.contains(envelope.candidate_id)) continue;
+            if (seen.contains(envelope.candidate_id)) continue;
+            try seen.put(arena, envelope.candidate_id, {});
+            try out.append(envelope);
+        }
+    } else |_| {}
     return out.items;
 }
 
@@ -263,15 +308,27 @@ pub fn loadProvisionalGate(
         allocator.destroy(active);
         return null;
     };
+    const base_len: usize = if (base) |b| b.rules.len else 0;
+    const provisional_ids = blk: {
+        const ids = active.arena.allocator().alloc(
+            []const u8,
+            active.rules.len - base_len,
+        ) catch break :blk &[_][]const u8{};
+        for (active.rules[base_len..], 0..) |entry, i| ids[i] = entry.candidate_id;
+        break :blk ids;
+    };
     self.* = .{
         .allocator = allocator,
         .active = active,
+        .provisional_candidate_ids = provisional_ids,
         .runtime = .{
             .allocator = allocator,
             .active = active,
             .config = config,
             .abort = abort,
-            .actuation = .enforced,
+            // 尊重编译期 actuation 边界(shadow 评估构建里临时规则也
+            // 必须是 shadow,绝不能让模型自写规则在 shadow 臂改变轨迹)。
+            .actuation = activation_mod.artifact_actuation,
             .evidence_dir = session_dir,
             .observation_sink = observation_sink,
             .auto_exact_edit_recovery = true,
@@ -294,8 +351,14 @@ pub const EndOfRunDeps = struct {
     now_ns: i128,
     stop_reason: []const u8,
     provisional_active_count: usize,
+    provisional_candidate_ids: []const []const u8 = &.{},
+    provisional_bundle_sha256: ?[64]u8 = null,
     abort: ?*const AbortSignal,
 };
+
+/// 单 Run 内规则阻断数达到此阈值 = 规则风暴(几乎必然是一条把自己
+/// 砖住的坏规则):熔断——写撤回信封,下一 Run 不再装载。
+pub const RETRACT_BLOCK_STORM_THRESHOLD: u64 = 8;
 
 pub const Outcome = enum {
     disabled,
@@ -367,7 +430,10 @@ pub fn endOfRun(allocator: std.mem.Allocator, deps: EndOfRunDeps) Outcome {
     }) catch |err| return switch (err) {
         error.TriggerNotSatisfied => .no_trigger,
         error.ProjectOntologyMissing => .ontology_missing,
-        else => .degraded,
+        else => blk: {
+            log.warn("self-evolution", "prepare degraded: {s}", .{@errorName(err)});
+            break :blk .degraded;
+        },
     };
     defer prepared.deinit();
 
@@ -379,12 +445,18 @@ pub fn endOfRun(allocator: std.mem.Allocator, deps: EndOfRunDeps) Outcome {
         .remaining_cost_microusd = AUTHOR_MAX_COST_MICROUSD,
         .remaining_input_tokens = AUTHOR_MAX_INPUT_TOKENS,
         .remaining_output_tokens = AUTHOR_MAX_OUTPUT_TOKENS,
-    }) catch return .degraded;
+    }) catch |err| {
+        log.warn("self-evolution", "authorize degraded: {s}", .{@errorName(err)});
+        return .degraded;
+    };
 
     const outcome = evolution.authorOnce(&prepared, .{
         .provider = deps.provider,
         .provider_sha256 = author_sha,
-    }, permit, deps.abort) catch return .degraded;
+    }, permit, deps.abort) catch |err| {
+        log.warn("self-evolution", "author degraded: {s}", .{@errorName(err)});
+        return .degraded;
+    };
 
     if (outcome.decision != .propose or outcome.candidate_id == null)
         return .abstained;
@@ -418,23 +490,65 @@ fn writeImpactObservation(allocator: std.mem.Allocator, deps: EndOfRunDeps) void
     const impact_stats = @import("rule_impact_stats.zig");
     var snapshot = impact_stats.derive(allocator, &run, .{}) catch return;
     defer snapshot.deinit(allocator);
+    const bundle_hex: []const u8 = if (deps.provisional_bundle_sha256) |*sha|
+        sha[0..]
+    else
+        "none";
     const text = std.fmt.allocPrint(
         allocator,
         "provisional-rule-impact-v1: active_rules={d} pre_dispatch_blocks={d} " ++
-            "formal_faults={d} authoritative_non_successes={d} stop_reason={s}",
+            "formal_faults={d} authoritative_non_successes={d} stop_reason={s} " ++
+            "provisional_bundle_sha256={s}",
         .{
             deps.provisional_active_count,
             snapshot.enforced_pre_blocks_before_dispatch,
             snapshot.formal_faults,
             snapshot.authoritative_non_successes,
             deps.stop_reason,
+            bundle_hex,
         },
     ) catch return;
     defer allocator.free(text);
     _ = deps.kg.remember(.observation, text, IMPACT_SCHEMA_TYPE, false) catch return;
+
+    // 熔断器(2026-08-18 审查 P1-2c):坏规则的唯一带内逃生通道。阻断
+    // 风暴 → 撤回全部临时规则;author 之后可以基于战绩重新提案更好的。
+    if (snapshot.enforced_pre_blocks_before_dispatch >= RETRACT_BLOCK_STORM_THRESHOLD) {
+        for (deps.provisional_candidate_ids) |cid| {
+            const retract = std.json.Stringify.valueAlloc(allocator, RetractEnvelope{
+                .candidate_id = cid,
+                .reason = "block-storm circuit breaker",
+            }, .{}) catch continue;
+            defer allocator.free(retract);
+            _ = deps.kg.remember(
+                .observation,
+                retract,
+                RETRACT_SCHEMA_TYPE,
+                false,
+            ) catch continue;
+        }
+        log.warn(
+            "self-evolution",
+            "block storm ({d} blocks) — retracted {d} provisional rules",
+            .{ snapshot.enforced_pre_blocks_before_dispatch, deps.provisional_candidate_ids.len },
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
+
+test "author caps cover the worst-case cost and the actor output setting" {
+    // P0 回归钉(2026-08-18 审查):这两条算不平,自演化在任何 Run 上都
+    // 会在 prepare 第一行静默降级——一个测试就能拦住的静默空转。
+    const worst = try rule_author.worstCaseCost(.{
+        .max_cost_microusd = AUTHOR_MAX_COST_MICROUSD,
+        .max_input_tokens = AUTHOR_MAX_INPUT_TOKENS,
+        .max_output_tokens = AUTHOR_MAX_OUTPUT_TOKENS,
+    }, authorPricing());
+    try std.testing.expect(AUTHOR_MAX_COST_MICROUSD >= worst);
+    const util_model = @import("../util/model.zig");
+    try std.testing.expect(AUTHOR_MAX_OUTPUT_TOKENS >= util_model.DEFAULT_MAX_TOKENS);
+}
 
 test "envelope round-trips through encode/parse with spec validation" {
     const a = std.testing.allocator;
