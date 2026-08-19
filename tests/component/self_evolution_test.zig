@@ -933,6 +933,22 @@ test "forensic replay: deterministic note against real store" {
     defer a.free(kg_bin);
     @import("platform").paths.setEnv("METACODES_TASK_HINT", "feature-medium-etag_header_for_static");
     @import("platform").paths.setEnv("METACODES_KG_TRANSPORT", "cli-exclusive");
+    // 可选:先重放 ingest(METACODES_REPLAY_OUTCOMES=<file>)再看注入。
+    if (std.c.getenv("METACODES_REPLAY_OUTCOMES")) |of| {
+        @import("platform").paths.setEnv("METACODES_TASK_OUTCOMES", of);
+        var kg0 = try cc.kg_client.KgClient.init(a, .{
+            .home = "/tmp/replay-home",
+            .domain = "workspace-5807156e",
+            .config_bin = kg_bin,
+            .config_store = store,
+            .env_bin = "",
+            .env_store = "",
+        });
+        defer kg0.deinit();
+        kg0.ensureReady();
+        const n = cc.self_evolution.ingestOutcomes(a, &kg0);
+        std.debug.print("REPLAY ingest wrote {d} rows\n", .{n});
+    }
     const domains = [_][]const u8{ "workspace-5807156e", "workspace", "global" };
     for (domains) |domain| {
         var kg = try cc.kg_client.KgClient.init(a, .{

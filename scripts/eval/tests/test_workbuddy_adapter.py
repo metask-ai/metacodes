@@ -3318,7 +3318,9 @@ with tempfile.TemporaryDirectory() as directory:
     (done / "verifier" / "results.xml").write_text(
         '<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite>'
         '<testcase classname="suite" name="etag present">'
-        '<failure message="assert 66 == 18, shape"/></testcase>'
+        '<failure message="assert 66 == 18, shape">'
+        'self = x\n&gt;           etag = calc(Path(f.name))\nE  TypeError'
+        '</failure></testcase>'
         '</testsuite></testsuites>'
     )
     # pytest 面兄弟 trial:无结构化 tests[],走 FAILED/SKIPPED 行回退
@@ -3385,7 +3387,7 @@ with tempfile.TemporaryDirectory() as directory:
     by_task = {r["task"]: r for r in rows}
     assert set(by_task) == {"feature-medium-etag_header_for_static", "bugfix-pytest-task"}, rows
     assert by_task["feature-medium-etag_header_for_static"]["failing_tests"] == [
-        "etag present (failed: assert 66 == 18; shape)",
+        "etag present (failed: assert 66 == 18; shape AT test code: etag = calc(Path(f.name)))",
         "cache hit 304",
     ], rows
     assert by_task["bugfix-pytest-task"]["failing_tests"] == [

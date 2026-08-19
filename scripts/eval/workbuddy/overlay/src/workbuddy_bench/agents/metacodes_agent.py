@@ -112,7 +112,19 @@ def _verifier_reasons(trial_dir: Path) -> dict:
             child = case.find(kind)
             if child is not None:
                 label = "skipped" if kind == "skipped" else "failed"
-                verdict = (label, str(child.get("message") or ""))
+                msg = str(child.get("message") or "")
+                # p26 取证:裸错误消息方向模糊("buffer API required"被因果
+                # 倒置成"path 签名导致")。pytest longrepr 的 '>' 标记行 =
+                # 失败语句原文(测试侧调用现场),方向零歧义,机械附加。
+                body = child.text or ""
+                callsite = ""
+                for line in body.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith(">"):
+                        callsite = stripped.lstrip("> ").strip()
+                if callsite:
+                    msg = f"{msg[:90]} AT test code: {callsite[:80]}"
+                verdict = (label, msg)
                 break
         if verdict is None:
             continue
