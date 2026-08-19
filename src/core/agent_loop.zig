@@ -1315,8 +1315,7 @@ pub fn run(
                     .context => &kg_context_repair_attempts,
                     .none => unreachable,
                 };
-                if (repair_attempts.* == 0 and host_injection_meter.remaining() > 0) {
-                    _ = host_injection_meter.tryConsume();
+                if (repair_attempts.* == 0) {
                     repair_attempts.* = 1;
                     // A rejected batch-final may still need batch + context +
                     // final; a rejected context-final needs context + final.
