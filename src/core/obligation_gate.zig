@@ -33,6 +33,10 @@ pub const Runtime = struct {
     envelopes: []self_evolution.ObligationEnvelope,
     met: []bool,
     nudged: []bool,
+    /// 每义务一个待验证 dispatch id 槽(后发覆盖先发;同批多命中最坏丢
+    /// 一次早成功 → 义务保持未满足 → 至多多一次 nudge,有界)。
+    pending_ids: [][64]u8,
+    pending_lens: []usize,
     nudges_used: u8 = 0,
 
     pub fn deinit(self: *Runtime) void {
@@ -44,12 +48,28 @@ pub const Runtime = struct {
         return self.envelopes.len;
     }
 
-    /// Bash dispatch 观察:任一义务的 needle 是命令子串 → met。
-    pub fn observeCommand(self: *Runtime, command: []const u8) void {
+    /// 成功条件义务 2.0(p7-p9 取证:失败的 pytest 收集被当作履约):
+    /// dispatch 只记账,met 由 observeResult 在该命令**成功**时置位。
+    pub fn observeDispatch(self: *Runtime, id: []const u8, command: []const u8) void {
         for (self.envelopes, 0..) |envelope, index| {
             if (self.met[index]) continue;
-            if (std.mem.indexOf(u8, command, envelope.command_needle) != null)
-                self.met[index] = true;
+            if (std.mem.indexOf(u8, command, envelope.command_needle) == null) continue;
+            if (id.len == 0 or id.len > self.pending_ids[index].len) continue;
+            @memcpy(self.pending_ids[index][0..id.len], id);
+            self.pending_lens[index] = id.len;
+        }
+    }
+
+    /// 结果观察:待验证 id 的执行成功 → met(单调:met 永不撤销——
+    /// Lean 镜面 met_monotone)。失败结果不满足也不清账(同 id 不复用)。
+    pub fn observeResult(self: *Runtime, id: []const u8, success: bool) void {
+        if (!success) return;
+        for (self.envelopes, 0..) |_, index| {
+            if (self.met[index]) continue;
+            const len = self.pending_lens[index];
+            if (len == 0 or len != id.len) continue;
+            if (!std.mem.eql(u8, self.pending_ids[index][0..len], id)) continue;
+            self.met[index] = true;
         }
     }
 
@@ -163,13 +183,29 @@ pub fn load(
         arena.deinit();
         return null;
     };
+    const pending_ids = a.alloc([64]u8, envelopes.len) catch {
+        arena.deinit();
+        return null;
+    };
+    const pending_lens = a.alloc(usize, envelopes.len) catch {
+        arena.deinit();
+        return null;
+    };
     @memset(met, false);
     @memset(nudged, false);
+    @memset(pending_lens, 0);
     const runtime = gpa.create(Runtime) catch {
         arena.deinit();
         return null;
     };
-    runtime.* = .{ .arena = arena, .envelopes = envelopes, .met = met, .nudged = nudged };
+    runtime.* = .{
+        .arena = arena,
+        .envelopes = envelopes,
+        .met = met,
+        .nudged = nudged,
+        .pending_ids = pending_ids,
+        .pending_lens = pending_lens,
+    };
     return runtime;
 }
 
@@ -187,9 +223,19 @@ fn testRuntime(envelope_count: usize) Runtime {
     }
     const met = a.alloc(bool, envelope_count) catch unreachable;
     const nudged = a.alloc(bool, envelope_count) catch unreachable;
+    const pending_ids = a.alloc([64]u8, envelope_count) catch unreachable;
+    const pending_lens = a.alloc(usize, envelope_count) catch unreachable;
     @memset(met, false);
     @memset(nudged, false);
-    return .{ .arena = arena, .envelopes = envelopes, .met = met, .nudged = nudged };
+    @memset(pending_lens, 0);
+    return .{
+        .arena = arena,
+        .envelopes = envelopes,
+        .met = met,
+        .nudged = nudged,
+        .pending_ids = pending_ids,
+        .pending_lens = pending_lens,
+    };
 }
 
 test "GIGO derivation parses failing names, strips skip suffix, dedupes" {
@@ -207,11 +253,20 @@ test "GIGO derivation parses failing names, strips skip suffix, dedupes" {
     try std.testing.expectEqualStrings(GIGO_REASON, list.items[0].reason);
 }
 
-test "observed command satisfies the obligation and disarms the nudge" {
+test "only a successful execution satisfies the obligation" {
+    // 2.0 回归钉:p7-p9 里"跑了但收集失败"的 pytest 被当作履约。
     var runtime = testRuntime(1);
     defer runtime.arena.deinit();
     try std.testing.expectEqual(@as(?usize, 0), runtime.decide().index);
-    runtime.observeCommand("cd /workspace && pytest test_a.py -q");
+    runtime.observeDispatch("call_1", "cd /workspace && pytest test_a.py -q");
+    runtime.observeResult("call_1", false);
+    try std.testing.expectEqual(@as(?usize, 0), runtime.decide().index);
+    runtime.observeDispatch("call_2", "pytest test_a.py -q");
+    runtime.observeResult("call_2", true);
+    try std.testing.expectEqual(@as(?usize, null), runtime.decide().index);
+    // met 单调:后续失败不撤销(Lean 镜面 met_monotone)。
+    runtime.observeDispatch("call_3", "pytest test_a.py -q");
+    runtime.observeResult("call_3", false);
     try std.testing.expectEqual(@as(?usize, null), runtime.decide().index);
 }
 
@@ -232,6 +287,7 @@ test "each obligation nudges at most once and the budget is global" {
 test "unmatched command leaves the obligation open" {
     var runtime = testRuntime(1);
     defer runtime.arena.deinit();
-    runtime.observeCommand("ls -la");
+    runtime.observeDispatch("call_x", "ls -la");
+    runtime.observeResult("call_x", true);
     try std.testing.expectEqual(@as(?usize, 0), runtime.decide().index);
 }

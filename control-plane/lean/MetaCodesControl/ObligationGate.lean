@@ -69,4 +69,26 @@ theorem nudge_then_never_again (item : Item) (nudges : Nat) :
     decide { item with nudged := true } (nudges + 1) = false := by
   exact per_obligation_one_shot _ _ rfl
 
+/-- Success-conditioned satisfaction (v2): a result event can only set
+`met`, never clear it — once an obligation is satisfied by an observed
+successful execution it stays satisfied, whatever later events arrive.
+Zig mirror: "only a successful execution satisfies the obligation"
+(tail assertion). -/
+def afterResult (item : Item) (matched success : Bool) : Item :=
+  { item with met := item.met || (matched && success) }
+
+theorem met_monotone (item : Item) (matched success : Bool)
+    (h : item.met = true) : (afterResult item matched success).met = true := by
+  unfold afterResult
+  simp [h]
+
+/-- A failed execution never satisfies: with `met` clear and success false,
+the item stays unsatisfied — running the command is not compliance,
+succeeding is. -/
+theorem failure_never_satisfies (item : Item) (matched : Bool)
+    (h : item.met = false) :
+    (afterResult item matched false).met = false := by
+  unfold afterResult
+  simp [h]
+
 end MetaCodesControl.ObligationGate

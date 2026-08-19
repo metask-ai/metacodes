@@ -435,7 +435,12 @@ test "L2: task obligation rides the store and arms the gate for the same task on
         a.destroy(runtime);
     }
     try std.testing.expectEqual(@as(?usize, 0), runtime.decide().index);
-    runtime.observeCommand("cd /workspace && pytest testing/test_warnings.py::TestDeprecationWarningsByDefault -x");
+    // 2.0:执行成功才算履约(失败的 dispatch 不清账)。
+    runtime.observeDispatch("call_a", "cd /workspace && pytest testing/test_warnings.py::TestDeprecationWarningsByDefault -x");
+    runtime.observeResult("call_a", false);
+    try std.testing.expectEqual(@as(?usize, 0), runtime.decide().index);
+    runtime.observeDispatch("call_b", "pytest testing/test_warnings.py::TestDeprecationWarningsByDefault -x");
+    runtime.observeResult("call_b", true);
     try std.testing.expectEqual(@as(?usize, null), runtime.decide().index);
 }
 

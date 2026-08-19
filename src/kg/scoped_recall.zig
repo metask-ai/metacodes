@@ -200,10 +200,13 @@ fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClient) ?
         // 说教稀释关键指令——只留判决+模式+三行硬约束,短促命令式。
         out.appendSlice(allocator,
             "ESCALATED. The mandated modes above are orders, not suggestions — execute them " ++
-                "literally this attempt. Constraints: the verifier runs OUTSIDE this workspace, " ++
-                "absent referenced files are expected and their names remain requirements; " ++
-                "one verdict per attempt — an unchanged approach is a wasted attempt; " ++
-                "re-run your whole check suite before closing.\n" ++
+                "literally this attempt. Constraints: the verifier runs OUTSIDE this workspace " ++
+                "and scores ONLY its own tests — equivalent checks you write yourself do not " ++
+                "score, so \"conceptually verified\" is worth zero. A referenced-but-absent " ++
+                "artifact (module, file, function) is something the verifier expects YOU to " ++
+                "have created; creating it at the location its name implies is compliance, " ++
+                "not gaming. One verdict per attempt — an unchanged approach is a wasted " ++
+                "attempt. Re-run your whole check suite before closing.\n" ++
                 "</system-reminder>\n") catch return null;
         return out.toOwnedSlice(allocator) catch null;
     }

@@ -1541,7 +1541,7 @@ pub fn run(
             if (opts.obligations) |obligation_runtime| {
                 if (slot.decision == .run and std.mem.eql(u8, slot.name, "Bash")) {
                     if (@import("../util/json.zig").extractStringField(slot.input, "command")) |command|
-                        obligation_runtime.observeCommand(command);
+                        obligation_runtime.observeDispatch(slot.id, command);
                 }
             }
         }
@@ -1705,6 +1705,18 @@ pub fn run(
         // Host 工具 fatal → 直接上抛:不组装 tool_result(errdefer 释放 result_blocks,
         // slot payload 由上方 defer 回收),AgentSession.runLoop 捕获后 poisonRun。
         try tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
+        // 成功条件义务 2.0:结果侧回填 met——只有执行成功(!is_error 且
+        // exit_code=0,bash.zig 序列化以 `"exit_code":N}` 收尾)才算履约。
+        if (opts.obligations) |obligation_runtime| {
+            for (slots.items) |*result_slot| {
+                if (result_slot.decision != .run) continue;
+                if (!std.mem.eql(u8, result_slot.name, "Bash")) continue;
+                const body = result_slot.content orelse continue;
+                const ok = !result_slot.is_error and
+                    std.mem.indexOf(u8, body, "\"exit_code\":0}") != null;
+                obligation_runtime.observeResult(result_slot.id, ok);
+            }
+        }
         backend.emitEvent(sess, .{ .diag_tool_stage = .{
             .trace_id = trace_id,
             .depth = depth,
