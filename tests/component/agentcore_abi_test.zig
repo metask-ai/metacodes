@@ -104,6 +104,10 @@ const OPENAI_FINAL_SSE =
     "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
     "data: [DONE]\n\n";
 
+const GEMINI_FINAL_SSE =
+    "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"gemini done\"}]},\"finishReason\":\"STOP\"}]," ++
+    "\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":3,\"cachedContentTokenCount\":1}}\n\n";
+
 const CONTINUATION_HEAD_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"cont_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n" ++
@@ -2416,6 +2420,11 @@ test "L2 Revision 7 public MCP checkpoint restore facade preserves Conversation 
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
+    try std.testing.expectEqual(@as(u32, 9), wire.ABI_REVISION);
+    try std.testing.expectEqual(
+        @as(u32, 8),
+        std.mem.readInt(u32, &abi_revision_bytes, .little),
+    );
     std.mem.writeInt(u32, checkpoint.bytes.items[20..24], 6, .little);
     source = checkpoint.source();
     restore_config.source = &source;
@@ -3416,7 +3425,7 @@ test "L2 Revision 7 catalog and explicit selection bind before Session" {
 
     var query = wire.SkillCatalogQueryV1{
         .struct_size = @sizeOf(wire.SkillCatalogQueryV1),
-        .reserved0 = 0,
+        .scope_code = wire.SKILL_CATALOG_SCOPE_WORKSPACE_EFFECTIVE,
         .workspace_root = sdk.bytesView(root),
         .workspace_home = sdk.bytesView(root),
         .workspace_epoch = sdk.bytesView("epoch-1"),
@@ -3651,6 +3660,500 @@ test "L2 Revision 7 catalog and explicit selection bind before Session" {
     try std.testing.expect(!server.captureOverflowed());
 }
 
+test "L2 Revision 9 catalog scope is explicit and workspace effective merges personal and project" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try rootPath(&tmp, &base_buf);
+    const home = try std.fs.path.join(a, &.{ base, "home" });
+    defer a.free(home);
+    const project = try std.fs.path.join(a, &.{ base, "project" });
+    defer a.free(project);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, home);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, project);
+    try writeSkillFixture(
+        a,
+        home,
+        "personal-only",
+        "---\nname: Personal Only\n---\nPERSONAL_ONLY_SENTINEL",
+    );
+    try writeSkillFixture(
+        a,
+        home,
+        "shared",
+        "---\nname: Personal Shared\n---\nPERSONAL_SHARED_SENTINEL",
+    );
+    try writeSkillFixture(
+        a,
+        project,
+        "project-only",
+        "---\nname: Project Only\n---\nPROJECT_ONLY_SENTINEL",
+    );
+    try writeSkillFixture(
+        a,
+        project,
+        "shared",
+        "---\nname: Project Shared\n---\nPROJECT_SHARED_SENTINEL",
+    );
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+    );
+    defer if (runtime) |handle| {
+        _ = api.runtimeDestroy()(handle, &diagnostic);
+    };
+
+    var query = wire.SkillCatalogQueryV1{
+        .struct_size = @sizeOf(wire.SkillCatalogQueryV1),
+        .scope_code = 0,
+        .workspace_root = sdk.bytesView(project),
+        .workspace_home = sdk.bytesView(home),
+        .workspace_epoch = sdk.bytesView("scope-epoch"),
+        .reserved = [_]u64{0} ** 3,
+    };
+    var catalog: ?*wire.SkillCatalogHandle = null;
+    var descriptor = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&descriptor);
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        api.runtimeQuerySkillCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
+    );
+    api.bufferRelease()(&diagnostic);
+
+    query.scope_code = wire.SKILL_CATALOG_SCOPE_PERSONAL_ONLY;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeQuerySkillCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
+    );
+    const personal_bytes = try sdk.borrowedBytes(.{ .ptr = descriptor.ptr, .len = descriptor.len });
+    try std.testing.expect(std.mem.indexOf(u8, personal_bytes, "\"invocation_name\":\"personal-only\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, personal_bytes, "\"invocation_name\":\"project-only\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, personal_bytes, "Personal Shared") != null);
+    try std.testing.expectEqual(wire.STATUS_OK, api.skillCatalogRelease()(catalog, &diagnostic));
+    catalog = null;
+    api.bufferRelease()(&descriptor);
+
+    query.scope_code = wire.SKILL_CATALOG_SCOPE_WORKSPACE_EFFECTIVE;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeQuerySkillCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
+    );
+    defer if (catalog) |handle| {
+        _ = api.skillCatalogRelease()(handle, &diagnostic);
+    };
+    const effective_bytes = try sdk.borrowedBytes(.{ .ptr = descriptor.ptr, .len = descriptor.len });
+    try std.testing.expect(std.mem.indexOf(u8, effective_bytes, "\"invocation_name\":\"personal-only\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, effective_bytes, "\"invocation_name\":\"project-only\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, effective_bytes, "Project Shared") != null);
+    try std.testing.expect(std.mem.indexOf(u8, effective_bytes, "Personal Shared") == null);
+}
+
+test "L2 Revision 9 Completion complete owns config and uses all three provider streams" {
+    const Exercise = struct {
+        fn run(
+            api: sdk.Api,
+            provider_kind: u32,
+            response: []const u8,
+            model_literal: []const u8,
+            expected_text: []const u8,
+        ) !void {
+            const a = std.testing.allocator;
+            var server = try harness.MockServer.start(response, 0);
+            defer server.stop();
+            const url = try server.urlOwned(a);
+            const key = try a.dupe(u8, "temporary-completion-key");
+            const model = try a.dupe(u8, model_literal);
+
+            var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+            defer api.bufferRelease()(&diagnostic);
+            var config = wire.CompletionConfigV1{
+                .struct_size = @sizeOf(wire.CompletionConfigV1),
+                .provider_kind_code = provider_kind,
+                .api_key = sdk.bytesView(key),
+                .base_url = sdk.bytesView(url),
+                .model = sdk.bytesView(model),
+                .reserved = [_]u64{0} ** 4,
+            };
+            var completion: ?*wire.CompletionHandle = null;
+            try std.testing.expectEqual(
+                wire.STATUS_OK,
+                api.completionCreate()(&config, &completion, &diagnostic),
+            );
+            @memset(key, 0xa5);
+            @memset(model, 0xa5);
+            @memset(url, 0xa5);
+            a.free(key);
+            a.free(model);
+            a.free(url);
+            defer if (completion) |handle| {
+                _ = api.completionDestroy()(handle, &diagnostic);
+            };
+
+            var info = std.mem.zeroes(wire.CompletionInfoV1);
+            try std.testing.expectEqual(
+                wire.STATUS_OK,
+                api.completionDescribe()(completion, &info, &diagnostic),
+            );
+            defer api.bufferRelease()(&info.model);
+            try std.testing.expectEqual(provider_kind, info.provider_kind_code);
+            try std.testing.expectEqualStrings(
+                model_literal,
+                try sdk.borrowedBytes(.{ .ptr = info.model.ptr, .len = info.model.len }),
+            );
+
+            var messages = [_]wire.CompletionMessageV1{
+                .{
+                    .struct_size = @sizeOf(wire.CompletionMessageV1),
+                    .role_code = wire.COMPLETION_ROLE_USER,
+                    .text = sdk.bytesView("completion-user-marker"),
+                    .reserved = [_]u64{0} ** 2,
+                },
+                .{
+                    .struct_size = @sizeOf(wire.CompletionMessageV1),
+                    .role_code = wire.COMPLETION_ROLE_ASSISTANT,
+                    .text = sdk.bytesView("completion-assistant-marker"),
+                    .reserved = [_]u64{0} ** 2,
+                },
+            };
+            var request = wire.CompletionRequestV1{
+                .struct_size = @sizeOf(wire.CompletionRequestV1),
+                .reserved0 = 0,
+                .messages = messages[0..].ptr,
+                .message_count = messages.len,
+                .system = sdk.bytesView("completion-system-marker"),
+                .reserved = [_]u64{0} ** 4,
+            };
+            var result = std.mem.zeroes(wire.CompletionResultV1);
+            try std.testing.expectEqual(
+                wire.STATUS_OK,
+                api.completionComplete()(completion, &request, &result, &diagnostic),
+            );
+            defer api.bufferRelease()(&result.text);
+            try std.testing.expectEqual(
+                wire.COMPLETION_STOP_END_TURN,
+                result.stop_reason_code,
+            );
+            try std.testing.expectEqualStrings(
+                expected_text,
+                try sdk.borrowedBytes(.{ .ptr = result.text.ptr, .len = result.text.len }),
+            );
+            const captured = server.lastRequest() orelse return error.NoRequestCaptured;
+            try std.testing.expect(std.mem.indexOf(u8, captured.body(), "completion-user-marker") != null);
+            try std.testing.expect(std.mem.indexOf(u8, captured.body(), "completion-assistant-marker") != null);
+            try std.testing.expect(std.mem.indexOf(u8, captured.body(), "completion-system-marker") != null);
+            try std.testing.expect(std.mem.indexOf(u8, captured.body(), "\"tools\"") == null);
+        }
+    };
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    try Exercise.run(api, wire.PROVIDER_ANTHROPIC, FINAL_SSE, "completion-anthropic", "done");
+    try Exercise.run(api, wire.PROVIDER_OPENAI, OPENAI_FINAL_SSE, "completion-openai", "openai skill done");
+    try Exercise.run(api, wire.PROVIDER_GEMINI, GEMINI_FINAL_SSE, "completion-gemini", "gemini done");
+}
+
+test "L2 Revision 9 Completion stream owns request buffers and projects typed events" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.start(CONTINUATION_HEAD_SSE, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var config = wire.CompletionConfigV1{
+        .struct_size = @sizeOf(wire.CompletionConfigV1),
+        .provider_kind_code = wire.PROVIDER_ANTHROPIC,
+        .api_key = sdk.bytesView("test-key"),
+        .base_url = sdk.bytesView(url),
+        .model = sdk.bytesView("stream-model"),
+        .reserved = [_]u64{0} ** 4,
+    };
+    var completion: ?*wire.CompletionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.completionCreate()(&config, &completion, &diagnostic),
+    );
+    defer if (completion) |handle| {
+        _ = api.completionDestroy()(handle, &diagnostic);
+    };
+
+    const user = try a.dupe(u8, "stream-user-lifetime-marker");
+    const system = try a.dupe(u8, "stream-system-lifetime-marker");
+    var messages = [_]wire.CompletionMessageV1{.{
+        .struct_size = @sizeOf(wire.CompletionMessageV1),
+        .role_code = wire.COMPLETION_ROLE_USER,
+        .text = sdk.bytesView(user),
+        .reserved = [_]u64{0} ** 2,
+    }};
+    var request = wire.CompletionRequestV1{
+        .struct_size = @sizeOf(wire.CompletionRequestV1),
+        .reserved0 = 0,
+        .messages = messages[0..].ptr,
+        .message_count = messages.len,
+        .system = sdk.bytesView(system),
+        .reserved = [_]u64{0} ** 4,
+    };
+    var stream: ?*wire.CompletionStreamHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.completionStreamStart()(completion, &request, &stream, &diagnostic),
+    );
+    @memset(user, 0xa5);
+    @memset(system, 0xa5);
+    a.free(user);
+    a.free(system);
+    defer if (stream) |handle| {
+        _ = api.completionStreamDestroy()(handle, &diagnostic);
+    };
+    try std.testing.expectEqual(
+        wire.STATUS_BUSY,
+        api.completionDestroy()(completion, &diagnostic),
+    );
+    api.bufferRelease()(&diagnostic);
+
+    var saw_thinking = false;
+    var saw_text = false;
+    var saw_usage = false;
+    var saw_done = false;
+    while (!saw_done) {
+        var event = std.mem.zeroes(wire.CompletionEventV1);
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.completionStreamNext()(stream, &event, &diagnostic),
+        );
+        defer api.bufferRelease()(&event.payload);
+        switch (event.kind_code) {
+            wire.COMPLETION_EVENT_THINKING => {
+                saw_thinking = true;
+                try std.testing.expectEqualStrings(
+                    "private reasoning",
+                    try sdk.borrowedBytes(.{ .ptr = event.payload.ptr, .len = event.payload.len }),
+                );
+            },
+            wire.COMPLETION_EVENT_TEXT => {
+                saw_text = true;
+                try std.testing.expectEqualStrings(
+                    "head",
+                    try sdk.borrowedBytes(.{ .ptr = event.payload.ptr, .len = event.payload.len }),
+                );
+            },
+            wire.COMPLETION_EVENT_USAGE => saw_usage = true,
+            wire.COMPLETION_EVENT_DONE => {
+                saw_done = true;
+                try std.testing.expectEqual(wire.COMPLETION_STOP_MAX_TOKENS, event.stop_reason_code);
+            },
+            else => return error.UnexpectedCompletionEvent,
+        }
+    }
+    try std.testing.expect(saw_thinking and saw_text and saw_usage);
+    const captured = server.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, captured.body(), "stream-user-lifetime-marker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.body(), "stream-system-lifetime-marker") != null);
+    var after_done = std.mem.zeroes(wire.CompletionEventV1);
+    try std.testing.expectEqual(
+        wire.STATUS_TOO_LATE,
+        api.completionStreamNext()(stream, &after_done, &diagnostic),
+    );
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.completionStreamDestroy()(stream, &diagnostic),
+    );
+    stream = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.completionDestroy()(completion, &diagnostic),
+    );
+    completion = null;
+}
+
+test "L2 Revision 9 Completion abort concurrently interrupts blocking next" {
+    const NextWorker = struct {
+        api: sdk.Api,
+        stream: *wire.CompletionStreamHandle,
+        status: u32 = std.math.maxInt(u32),
+        event: wire.CompletionEventV1 = std.mem.zeroes(wire.CompletionEventV1),
+        diagnostic: wire.OwnedBytesV1 = .{ .ptr = null, .len = 0 },
+
+        fn run(self: *@This()) void {
+            self.status = self.api.completionStreamNext()(
+                self.stream,
+                &self.event,
+                &self.diagnostic,
+            );
+        }
+    };
+
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.start(FINAL_SSE, 0);
+    defer server.stop();
+    server.gateNextResponse();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var config = wire.CompletionConfigV1{
+        .struct_size = @sizeOf(wire.CompletionConfigV1),
+        .provider_kind_code = wire.PROVIDER_ANTHROPIC,
+        .api_key = sdk.bytesView("test-key"),
+        .base_url = sdk.bytesView(url),
+        .model = sdk.bytesView("abort-model"),
+        .reserved = [_]u64{0} ** 4,
+    };
+    var completion: ?*wire.CompletionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.completionCreate()(&config, &completion, &diagnostic),
+    );
+    defer if (completion) |handle| {
+        _ = api.completionDestroy()(handle, &diagnostic);
+    };
+    var message = wire.CompletionMessageV1{
+        .struct_size = @sizeOf(wire.CompletionMessageV1),
+        .role_code = wire.COMPLETION_ROLE_USER,
+        .text = sdk.bytesView("wait for abort"),
+        .reserved = [_]u64{0} ** 2,
+    };
+    var request = wire.CompletionRequestV1{
+        .struct_size = @sizeOf(wire.CompletionRequestV1),
+        .reserved0 = 0,
+        .messages = @ptrCast(&message),
+        .message_count = 1,
+        .system = sdk.bytesView(""),
+        .reserved = [_]u64{0} ** 4,
+    };
+    var stream: ?*wire.CompletionStreamHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.completionStreamStart()(completion, &request, &stream, &diagnostic),
+    );
+    defer if (stream) |handle| {
+        _ = api.completionStreamDestroy()(handle, &diagnostic);
+    };
+    try server.waitUntilResponseGated();
+
+    var worker = NextWorker{ .api = api, .stream = stream.? };
+    const next_thread = try std.Thread.spawn(.{}, NextWorker.run, .{&worker});
+    var joined = false;
+    defer if (!joined) {
+        server.releaseGatedResponse();
+        next_thread.join();
+    };
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.completionStreamAbort()(stream, wire.ABORT_USER_REQUEST, &diagnostic),
+    );
+    next_thread.join();
+    joined = true;
+    server.releaseGatedResponse();
+    defer api.bufferRelease()(&worker.diagnostic);
+    defer api.bufferRelease()(&worker.event.payload);
+    try std.testing.expectEqual(wire.STATUS_OK, worker.status);
+    try std.testing.expectEqual(wire.COMPLETION_EVENT_DONE, worker.event.kind_code);
+    try std.testing.expectEqual(
+        wire.COMPLETION_STOP_ABORTED,
+        worker.event.stop_reason_code,
+    );
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.completionStreamDestroy()(stream, &diagnostic),
+    );
+    stream = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.completionDestroy()(completion, &diagnostic),
+    );
+    completion = null;
+}
+
+test "L2 Revision 9 Completion rejects invalid requests and tool responses explicitly" {
+    const a = std.testing.allocator;
+    var server = try harness.MockServer.start(HOST_SSE, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var config = wire.CompletionConfigV1{
+        .struct_size = @sizeOf(wire.CompletionConfigV1),
+        .provider_kind_code = wire.PROVIDER_ANTHROPIC,
+        .api_key = sdk.bytesView("test-key"),
+        .base_url = sdk.bytesView(url),
+        .model = sdk.bytesView("validation-model"),
+        .reserved = [_]u64{0} ** 4,
+    };
+    var completion: ?*wire.CompletionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.completionCreate()(&config, &completion, &diagnostic),
+    );
+    defer if (completion) |handle| {
+        _ = api.completionDestroy()(handle, &diagnostic);
+    };
+    var message = wire.CompletionMessageV1{
+        .struct_size = @sizeOf(wire.CompletionMessageV1),
+        .role_code = 0,
+        .text = sdk.bytesView("invalid role"),
+        .reserved = [_]u64{0} ** 2,
+    };
+    var request = wire.CompletionRequestV1{
+        .struct_size = @sizeOf(wire.CompletionRequestV1),
+        .reserved0 = 0,
+        .messages = @ptrCast(&message),
+        .message_count = 1,
+        .system = sdk.bytesView(""),
+        .reserved = [_]u64{0} ** 4,
+    };
+    var result = std.mem.zeroes(wire.CompletionResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        api.completionComplete()(completion, &request, &result, &diagnostic),
+    );
+    api.bufferRelease()(&diagnostic);
+    request.message_count = 0;
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        api.completionComplete()(completion, &request, &result, &diagnostic),
+    );
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+
+    message.role_code = wire.COMPLETION_ROLE_USER;
+    message.text = sdk.bytesView("trigger unsupported tool response");
+    request.message_count = 1;
+    try std.testing.expectEqual(
+        wire.STATUS_COMPLETION_UNSUPPORTED_RESPONSE,
+        api.completionComplete()(completion, &request, &result, &diagnostic),
+    );
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.completionDestroy()(completion, &diagnostic),
+    );
+    completion = null;
+}
+
 test "L2 AgentCore Skill forks cannot override the Session model" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3698,7 +4201,7 @@ test "L2 AgentCore Skill forks cannot override the Session model" {
 
     var query = wire.SkillCatalogQueryV1{
         .struct_size = @sizeOf(wire.SkillCatalogQueryV1),
-        .reserved0 = 0,
+        .scope_code = wire.SKILL_CATALOG_SCOPE_WORKSPACE_EFFECTIVE,
         .workspace_root = sdk.bytesView(root),
         .workspace_home = sdk.bytesView(root),
         .workspace_epoch = sdk.bytesView("model-binding-epoch"),
@@ -4009,7 +4512,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
 
     var query = wire.SkillCatalogQueryV1{
         .struct_size = @sizeOf(wire.SkillCatalogQueryV1),
-        .reserved0 = 0,
+        .scope_code = wire.SKILL_CATALOG_SCOPE_WORKSPACE_EFFECTIVE,
         .workspace_root = sdk.bytesView(root),
         .workspace_home = sdk.bytesView(root),
         .workspace_epoch = sdk.bytesView("model-tool-epoch"),

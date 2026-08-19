@@ -4,7 +4,7 @@ const wire = sdk.types;
 const Server = @import("mock_server.zig").Server;
 
 comptime {
-    if (wire.ABI_REVISION != 8 or
+    if (wire.ABI_REVISION != 9 or
         wire.MCP_NEGOTIATION_AUTO != 1 or
         wire.MCP_NEGOTIATION_MODERN_ONLY != 2 or
         wire.MCP_NEGOTIATION_LEGACY_ONLY != 3 or
@@ -15,10 +15,10 @@ comptime {
         wire.MCP_APPLY_APPLIED != 1 or
         wire.MCP_APPLY_SUPERSEDED != 2 or
         wire.MCP_APPLY_REJECTED != 3)
-        @compileError("source-free Revision 8 MCP codes must match the public contract");
+        @compileError("source-free Revision 9 MCP codes must match the public contract");
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
-        @compileError("revision 8 must not expose the removed catalog refresh entry");
+        @compileError("revision 9 must not expose the removed catalog refresh entry");
     if (wire.MAX_SKILL_FILE_CONTENT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.MAX_SKILL_CONTENT_BYTES_V1 != 32 * 1024 * 1024 or
         wire.MAX_SKILL_FILES_V1 != 1024 or
@@ -384,7 +384,7 @@ pub fn main(init: std.process.Init) !void {
 
     var query = wire.SkillCatalogQueryV1{
         .struct_size = @sizeOf(wire.SkillCatalogQueryV1),
-        .reserved0 = 0,
+        .scope_code = wire.SKILL_CATALOG_SCOPE_PERSONAL_ONLY,
         .workspace_root = sdk.bytesView(workspace),
         .workspace_home = sdk.bytesView(workspace),
         .workspace_epoch = sdk.bytesView("fixture-epoch"),
@@ -396,6 +396,19 @@ pub fn main(init: std.process.Init) !void {
     };
     var descriptor = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
     defer api.bufferRelease()(&descriptor);
+    try expectStatus(.ok, api.runtimeQuerySkillCatalog()(
+        runtime,
+        &query,
+        &catalog,
+        &descriptor,
+        &diagnostic,
+    ), diagnostic);
+    if (catalog == null or descriptor.ptr == null or descriptor.len == 0)
+        return error.MissingPersonalSkillCatalog;
+    try expectStatus(.ok, api.skillCatalogRelease()(catalog, &diagnostic), diagnostic);
+    catalog = null;
+    api.bufferRelease()(&descriptor);
+    query.scope_code = wire.SKILL_CATALOG_SCOPE_WORKSPACE_EFFECTIVE;
     try expectStatus(.ok, api.runtimeQuerySkillCatalog()(
         runtime,
         &query,
@@ -637,7 +650,63 @@ pub fn main(init: std.process.Init) !void {
     session = null;
     try expectStatus(.ok, api.runtimeDestroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
-    std.debug.print("AgentCore source-free consumer: Revision 8 tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+
+    const completion_bodies = [_][]const u8{FINAL_SSE};
+    const completion_server = try Server.start(init.io, &completion_bodies);
+    defer completion_server.stop();
+    const completion_url = try completion_server.url(a);
+    var completion_config = wire.CompletionConfigV1{
+        .struct_size = @sizeOf(wire.CompletionConfigV1),
+        .provider_kind_code = wire.PROVIDER_ANTHROPIC,
+        .api_key = sdk.bytesView("artifact-completion-key"),
+        .base_url = sdk.bytesView(completion_url),
+        .model = sdk.bytesView("artifact-completion-model"),
+        .reserved = [_]u64{0} ** 4,
+    };
+    var completion: ?*wire.CompletionHandle = null;
+    try expectStatus(.ok, api.completionCreate()(
+        &completion_config,
+        &completion,
+        &diagnostic,
+    ), diagnostic);
+    defer if (completion) |handle| {
+        _ = api.completionDestroy()(handle, &diagnostic);
+    };
+    var completion_message = wire.CompletionMessageV1{
+        .struct_size = @sizeOf(wire.CompletionMessageV1),
+        .role_code = wire.COMPLETION_ROLE_USER,
+        .text = sdk.bytesView("source-free completion"),
+        .reserved = [_]u64{0} ** 2,
+    };
+    var completion_request = wire.CompletionRequestV1{
+        .struct_size = @sizeOf(wire.CompletionRequestV1),
+        .reserved0 = 0,
+        .messages = @ptrCast(&completion_message),
+        .message_count = 1,
+        .system = sdk.bytesView("artifact completion system"),
+        .reserved = [_]u64{0} ** 4,
+    };
+    var completion_result = std.mem.zeroes(wire.CompletionResultV1);
+    try expectStatus(.ok, api.completionComplete()(
+        completion,
+        &completion_request,
+        &completion_result,
+        &diagnostic,
+    ), diagnostic);
+    if (!std.mem.eql(
+        u8,
+        try sdk.borrowedBytes(.{
+            .ptr = completion_result.text.ptr,
+            .len = completion_result.text.len,
+        }),
+        "artifact done",
+    ) or completion_result.stop_reason_code != wire.COMPLETION_STOP_END_TURN)
+        return error.InvalidCompletionResult;
+    api.bufferRelease()(&completion_result.text);
+    try expectStatus(.ok, api.completionDestroy()(completion, &diagnostic), diagnostic);
+    completion = null;
+
+    std.debug.print("AgentCore source-free consumer: Revision 9 Catalog scopes, Completion, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 const CatalogIdentities = struct {

@@ -16,7 +16,7 @@ pub enum AbiError {
     LengthOverflow,
 }
 
-/// Validated Revision 8 function table. Discovery rejects every earlier
+/// Validated Revision 9 function table. Discovery rejects every earlier
 /// revision; there is no legacy probe or alternate layout.
 #[derive(Clone, Copy)]
 pub struct Api {
@@ -64,6 +64,14 @@ impl Api {
             || table.session_compact.is_none()
             || table.session_abort_compact.is_none()
             || table.session_export_checkpoint.is_none()
+            || table.completion_create.is_none()
+            || table.completion_destroy.is_none()
+            || table.completion_describe.is_none()
+            || table.completion_complete.is_none()
+            || table.completion_stream_start.is_none()
+            || table.completion_stream_next.is_none()
+            || table.completion_stream_abort.is_none()
+            || table.completion_stream_destroy.is_none()
             || table.buffer_release.is_none()
         {
             return Err(AbiError::UnsupportedAbi);
@@ -216,6 +224,88 @@ impl Drop for Session<'_> {
     }
 }
 
+/// Unique independent Completion ownership guard. It does not borrow a
+/// Runtime or Session. The Host must quiesce any direct FFI calls before drop.
+pub struct Completion {
+    api: Api,
+    raw: NonNull<raw::metask_agentcore_completion>,
+}
+
+impl Completion {
+    pub unsafe fn from_owned_raw(
+        api: Api,
+        raw: *mut raw::metask_agentcore_completion,
+    ) -> Result<Self, AbiError> {
+        Ok(Self {
+            api,
+            raw: NonNull::new(raw).ok_or(AbiError::UnsupportedAbi)?,
+        })
+    }
+
+    pub fn as_raw(&self) -> *mut raw::metask_agentcore_completion {
+        self.raw.as_ptr()
+    }
+
+    pub fn into_raw(self) -> *mut raw::metask_agentcore_completion {
+        let this = ManuallyDrop::new(self);
+        this.raw.as_ptr()
+    }
+}
+
+impl Drop for Completion {
+    fn drop(&mut self) {
+        let mut diagnostic = self.api.owned_buffer();
+        unsafe {
+            (self.api.table().completion_destroy.unwrap())(
+                self.raw.as_ptr(),
+                diagnostic.as_mut_ptr(),
+            );
+        }
+    }
+}
+
+/// Unique stream guard tied to its Completion. A caller may invoke abort from
+/// another thread through the raw API, but must not drop while next is active.
+pub struct CompletionStream<'completion> {
+    api: Api,
+    raw: NonNull<raw::metask_agentcore_completion_stream>,
+    _completion: PhantomData<&'completion Completion>,
+}
+
+impl<'completion> CompletionStream<'completion> {
+    pub unsafe fn from_owned_raw(
+        completion: &'completion Completion,
+        raw: *mut raw::metask_agentcore_completion_stream,
+    ) -> Result<Self, AbiError> {
+        Ok(Self {
+            api: completion.api,
+            raw: NonNull::new(raw).ok_or(AbiError::UnsupportedAbi)?,
+            _completion: PhantomData,
+        })
+    }
+
+    pub fn as_raw(&self) -> *mut raw::metask_agentcore_completion_stream {
+        self.raw.as_ptr()
+    }
+
+    pub fn into_raw(self) -> *mut raw::metask_agentcore_completion_stream {
+        let this = ManuallyDrop::new(self);
+        this.raw.as_ptr()
+    }
+}
+
+impl Drop for CompletionStream<'_> {
+    fn drop(&mut self) {
+        let mut diagnostic = self.api.owned_buffer();
+        unsafe {
+            (self.api.table().completion_stream_destroy.unwrap())(
+                self.raw.as_ptr(),
+                diagnostic.as_mut_ptr(),
+            );
+        }
+    }
+}
+
 pub fn bytes_view(bytes: &[u8]) -> raw::metask_agentcore_bytes_view_v1 {
     raw::metask_agentcore_bytes_view_v1 {
         ptr: if bytes.is_empty() {
@@ -364,26 +454,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn revision_seven_layout_codes_and_host_buffer_helpers_are_exact() {
-        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 8);
+    fn revision_nine_layout_codes_and_host_buffer_helpers_are_exact() {
+        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 9);
         assert_eq!(raw::METASK_AGENTCORE_MCP_NEGOTIATION_AUTO, 1);
         assert_eq!(raw::METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY, 2);
         assert_eq!(raw::METASK_AGENTCORE_MCP_NEGOTIATION_LEGACY_ONLY, 3);
-        assert_eq!(
-            raw::METASK_AGENTCORE_MCP_NEGOTIATION_LEGACY_2025_06_ONLY,
-            4
-        );
+        assert_eq!(raw::METASK_AGENTCORE_MCP_NEGOTIATION_LEGACY_2025_06_ONLY, 4);
         assert_eq!(raw::METASK_AGENTCORE_MCP_ERA_2026_07_28, 1);
         assert_eq!(raw::METASK_AGENTCORE_MCP_ERA_2025_11_25, 2);
         assert_eq!(raw::METASK_AGENTCORE_MCP_ERA_2025_06_18, 3);
         assert_eq!(raw::METASK_AGENTCORE_MCP_APPLY_APPLIED, 1);
         assert_eq!(raw::METASK_AGENTCORE_MCP_APPLY_SUPERSEDED, 2);
         assert_eq!(raw::METASK_AGENTCORE_MCP_APPLY_REJECTED, 3);
-        assert_eq!(size_of::<raw::metask_agentcore_api_v1>(), 216);
-        assert_eq!(
-            size_of::<raw::metask_agentcore_mcp_configuration_v1>(),
-            64
-        );
+        assert_eq!(size_of::<raw::metask_agentcore_api_v1>(), 280);
+        assert_eq!(size_of::<raw::metask_agentcore_completion_config_v1>(), 88);
+        assert_eq!(size_of::<raw::metask_agentcore_completion_event_v1>(), 80);
+        assert_eq!(size_of::<raw::metask_agentcore_mcp_configuration_v1>(), 64);
         assert_eq!(size_of::<raw::metask_agentcore_mcp_apply_report_v1>(), 64);
         assert_eq!(
             size_of::<raw::metask_agentcore_session_host_config_v1>(),

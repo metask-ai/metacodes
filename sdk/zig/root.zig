@@ -131,6 +131,10 @@ pub const Api = struct {
             raw.session_run_input == null or
             raw.session_abort == null or raw.session_compact == null or
             raw.session_abort_compact == null or raw.session_export_checkpoint == null or
+            raw.completion_create == null or raw.completion_destroy == null or
+            raw.completion_describe == null or raw.completion_complete == null or
+            raw.completion_stream_start == null or raw.completion_stream_next == null or
+            raw.completion_stream_abort == null or raw.completion_stream_destroy == null or
             raw.buffer_release == null)
             return error.UnsupportedAbi;
         return .{ .raw = raw };
@@ -252,6 +256,30 @@ pub const Api = struct {
     pub fn sessionExportCheckpoint(self: Api) types.SessionExportCheckpointFnV1 {
         return self.raw.session_export_checkpoint.?;
     }
+    pub fn completionCreate(self: Api) types.CompletionCreateFnV1 {
+        return self.raw.completion_create.?;
+    }
+    pub fn completionDestroy(self: Api) types.CompletionDestroyFnV1 {
+        return self.raw.completion_destroy.?;
+    }
+    pub fn completionDescribe(self: Api) types.CompletionDescribeFnV1 {
+        return self.raw.completion_describe.?;
+    }
+    pub fn completionComplete(self: Api) types.CompletionCompleteFnV1 {
+        return self.raw.completion_complete.?;
+    }
+    pub fn completionStreamStart(self: Api) types.CompletionStreamStartFnV1 {
+        return self.raw.completion_stream_start.?;
+    }
+    pub fn completionStreamNext(self: Api) types.CompletionStreamNextFnV1 {
+        return self.raw.completion_stream_next.?;
+    }
+    pub fn completionStreamAbort(self: Api) types.CompletionStreamAbortFnV1 {
+        return self.raw.completion_stream_abort.?;
+    }
+    pub fn completionStreamDestroy(self: Api) types.CompletionStreamDestroyFnV1 {
+        return self.raw.completion_stream_destroy.?;
+    }
     pub fn bufferRelease(self: Api) types.BufferReleaseFnV1 {
         return self.raw.buffer_release.?;
     }
@@ -286,7 +314,7 @@ test "RunContext validator bounds length before pointer slicing" {
     try std.testing.expectEqualStrings(id, valid.session_id);
 }
 
-test "Revision 8 SDK rejects the Revision 7 table from the stable prefix" {
+test "Revision 9 SDK rejects an earlier table from the stable prefix" {
     const Revision5Api = extern struct {
         struct_size: u32,
         abi_version: u32,

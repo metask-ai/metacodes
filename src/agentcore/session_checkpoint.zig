@@ -1,4 +1,4 @@
-//! AgentCore-owned Revision 8 Session checkpoint envelope and streaming codec.
+//! AgentCore-owned Session checkpoint envelope and streaming codec.
 //!
 //! Persistence media, encryption, authenticity and retention remain Host
 //! responsibilities. This module owns only the bounded canonical envelope.
@@ -10,7 +10,9 @@ const message = core.message;
 const SessionId = core.session_id.SessionId;
 
 pub const STATE_SCHEMA_REVISION: u32 = 1;
-pub const AGENTCORE_ABI_REVISION: u32 = 8;
+/// Persisted compatibility marker for the current checkpoint envelope. This is
+/// intentionally independent from the public AgentCore API table revision.
+pub const CHECKPOINT_COMPATIBILITY_MARKER: u32 = 8;
 pub const HEADER_BYTES: usize = 192;
 pub const DIGEST_BYTES: usize = 32;
 pub const MIN_CHECKPOINT_BUDGET: u64 = HEADER_BYTES + DIGEST_BYTES + 1;
@@ -434,7 +436,7 @@ fn encodeHeader(snapshot: Snapshot, measured: Measurement) [HEADER_BYTES]u8 {
     var out = [_]u8{0} ** HEADER_BYTES;
     @memcpy(out[0..magic.len], magic);
     putInt(&out, 16, u32, STATE_SCHEMA_REVISION);
-    putInt(&out, 20, u32, AGENTCORE_ABI_REVISION);
+    putInt(&out, 20, u32, CHECKPOINT_COMPATIBILITY_MARKER);
     putInt(&out, 24, u32, measured.flags);
     putInt(&out, 28, u32, section_count);
     putInt(&out, 32, u64, snapshot.checkpoint_generation);
@@ -468,7 +470,7 @@ fn parseHeader(header: *const [HEADER_BYTES]u8, limits: Limits) Error!ParsedHead
     if (!std.mem.eql(u8, header[0..magic.len], magic)) return error.Corrupt;
     if (getInt(header, 16, u32) != STATE_SCHEMA_REVISION)
         return error.UnsupportedSchema;
-    if (getInt(header, 20, u32) != AGENTCORE_ABI_REVISION)
+    if (getInt(header, 20, u32) != CHECKPOINT_COMPATIBILITY_MARKER)
         return error.IncompatibleAbi;
     const flags = getInt(header, 24, u32);
     if ((flags & ~flag_has_compact_summary) != 0 or

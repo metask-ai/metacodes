@@ -265,7 +265,33 @@ pub const RuntimeCatalogs = struct {
         defer call.deinit();
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
-        const sources = try agentCoreDefaultSources(scratch.allocator(), workspace);
+        const sources = try agentCoreSources(
+            scratch.allocator(),
+            workspace,
+            .workspace_effective,
+        );
+        return self.queryUnderGuard(
+            io,
+            workspace,
+            workspace_epoch,
+            sources,
+            limits,
+        );
+    }
+
+    pub fn queryScope(
+        self: *RuntimeCatalogs,
+        io: std.Io,
+        workspace: *const CanonicalWorkspace,
+        workspace_epoch: []const u8,
+        scope: QueryScope,
+        limits: catalog.Limits,
+    ) (Error || catalog.BuildError)!*HostCatalog {
+        var call = try self.enterCall();
+        defer call.deinit();
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const sources = try agentCoreSources(scratch.allocator(), workspace, scope);
         return self.queryUnderGuard(
             io,
             workspace,
@@ -331,13 +357,28 @@ pub const RuntimeCatalogs = struct {
 const PERSONAL_AGENTS_PRIORITY: u32 = 1;
 const PROJECT_AGENTS_PRIORITY: u32 = 2;
 
+pub const QueryScope = enum {
+    personal_only,
+    workspace_effective,
+};
+
 /// AgentCore owns only the cross-Agent neutral discovery convention. Product
 /// adapters may opt into additional roots through the shared catalog engine,
 /// but those roots must never become implicit AgentCore filesystem authority.
-fn agentCoreDefaultSources(
+fn agentCoreSources(
     arena: std.mem.Allocator,
     workspace: *const CanonicalWorkspace,
+    scope: QueryScope,
 ) error{OutOfMemory}![]const catalog.Source {
+    if (scope == .personal_only) {
+        const sources = try arena.alloc(catalog.Source, 1);
+        sources[0] = .{
+            .root = try std.fs.path.join(arena, &.{ workspace.home, ".agents", "skills" }),
+            .scope = .personal,
+            .priority = PERSONAL_AGENTS_PRIORITY,
+        };
+        return sources;
+    }
     const shared_root = std.mem.eql(u8, workspace.home, workspace.root);
     const sources = try arena.alloc(catalog.Source, if (shared_root) 1 else 2);
     var next: usize = 0;
@@ -579,13 +620,47 @@ test "AgentCore default sources collapse identical canonical home and root" {
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
 
-    const sources = try agentCoreDefaultSources(scratch.allocator(), &workspace);
+    const sources = try agentCoreSources(
+        scratch.allocator(),
+        &workspace,
+        .workspace_effective,
+    );
     try std.testing.expectEqual(@as(usize, 1), sources.len);
     try std.testing.expectEqual(catalog.SourceScope.project, sources[0].scope);
     try std.testing.expectEqual(PROJECT_AGENTS_PRIORITY, sources[0].priority);
     const expected = try std.fs.path.join(
         scratch.allocator(),
         &.{ workspace.root, ".agents", "skills" },
+    );
+    try std.testing.expectEqualStrings(expected, sources[0].root);
+}
+
+test "AgentCore personal-only source remains personal when home falls back to root" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    var workspace = try CanonicalWorkspace.init(
+        allocator,
+        root_buffer[0..root_len],
+        "",
+    );
+    defer workspace.deinit();
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+
+    const sources = try agentCoreSources(
+        scratch.allocator(),
+        &workspace,
+        .personal_only,
+    );
+    try std.testing.expectEqual(@as(usize, 1), sources.len);
+    try std.testing.expectEqual(catalog.SourceScope.personal, sources[0].scope);
+    try std.testing.expectEqual(PERSONAL_AGENTS_PRIORITY, sources[0].priority);
+    const expected = try std.fs.path.join(
+        scratch.allocator(),
+        &.{ workspace.home, ".agents", "skills" },
     );
     try std.testing.expectEqualStrings(expected, sources[0].root);
 }

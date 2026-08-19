@@ -61,7 +61,7 @@ pub const PermissionCandidate = struct {
     scope: PermissionCandidateScope,
 };
 
-/// Exact Revision 8 Permission callback request. Unlike AskUserQuestion this
+/// Exact Revision 9 Permission callback request. Unlike AskUserQuestion this
 /// is a flat typed object, identified by `type == "permission"`.
 pub const PermissionRequest = struct {
     type: []const u8,
@@ -1253,7 +1253,8 @@ test "CoreEvent decoder preserves unknown observation tags" {
 }
 
 test "CoreEvent decoder accepts bounded file references and rejects oversized ones" {
-    var parsed = try decodeCoreEvent(std.testing.allocator,
+    var parsed = try decodeCoreEvent(
+        std.testing.allocator,
         "{\"tool_result\":{\"id\":\"t1\",\"name\":\"Read\",\"input\":\"{}\",\"content\":\"ok\",\"is_error\":false,\"file_refs\":[{\"locator\":{\"workspace_path\":\"src/main.zig\"},\"title\":\"main.zig\",\"kind\":\"read\",\"range\":{\"start\":{\"line\":1,\"column\":1},\"end\":{\"line\":2,\"column\":1}}}]}}",
     );
     defer parsed.deinit();
@@ -1280,7 +1281,8 @@ test "CoreEvent decoder accepts bounded file references and rejects oversized on
     }
     try oversized.appendSlice(std.testing.allocator, "]}}");
     try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(std.testing.allocator, oversized.items));
-    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(std.testing.allocator,
+    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(
+        std.testing.allocator,
         "{\"tool_result\":{\"id\":\"t1\",\"name\":\"Read\",\"input\":\"{}\",\"content\":\"ok\",\"is_error\":false,\"file_refs\":[{\"locator\":{\"workspace_path\":\"x\"},\"title\":\"x\",\"kind\":\"read\",\"range\":{\"start\":{\"line\":3,\"column\":1},\"end\":{\"line\":2,\"column\":1}}}]}}",
     ));
 }
