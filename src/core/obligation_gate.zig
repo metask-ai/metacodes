@@ -105,6 +105,51 @@ pub const GIGO_REASON =
     "check itself collect and succeed; if what it names is missing, " ++
     "creating it at the named location is the work, not grounds to skip";
 
+pub const ARTIFACT_FIRST_REASON =
+    "your history note quotes the best attempt's artifact for this exact " ++
+    "path VERBATIM. Write that quoted content to this path UNCHANGED as " ++
+    "your FIRST edit, then apply only the expected-side fixes the reports " ++
+    "demand — every free-hand rewrite so far has regressed an already " ++
+    "solved facet. Touch the file (cat/write it) so a command containing " ++
+    "this path succeeds";
+
+/// 最佳工件路径义务(p30 取证:剂量完备后模型仍每轮重写实现,三约束
+/// 同调概率 ~10%/轮。逐字复制指令经全勤通道递送,针=工件路径)。
+fn appendArtifactFirst(
+    a: std.mem.Allocator,
+    list: *std.array_list.Managed(self_evolution.ObligationEnvelope),
+    task_sha: [64]u8,
+    history: []const []u8,
+    newest: []const u8,
+) usize {
+    const scoped_recall_mod = @import("../kg/scoped_recall.zig");
+    const best = scoped_recall_mod.bestHistoryRow(history, newest) orelse blk: {
+        // 最新行自己就是最佳(或无更优):工件也可能在最新行上。
+        break :blk newest;
+    };
+    const marker = std.mem.indexOf(u8, best, "best-attempt artifact") orelse return 0;
+    const path_open = std.mem.indexOfPos(u8, best, marker, "--- ") orelse return 0;
+    const path_close = std.mem.indexOfPos(u8, best, path_open + 4, " ---") orelse return 0;
+    const path = best[path_open + 4 .. path_close];
+    if (path.len < self_evolution.MIN_NEEDLE_LEN or
+        path.len > self_evolution.MAX_NEEDLE_LEN) return 0;
+    if (std.mem.indexOfScalar(u8, path, '\n') != null) return 0;
+    for (list.items) |existing| {
+        if (std.mem.eql(u8, existing.command_needle, path)) return 0;
+    }
+    const owned_needle = a.dupe(u8, path) catch return 0;
+    const cid = self_evolution.obligationCandidateId(task_sha[0..], owned_needle, ARTIFACT_FIRST_REASON);
+    const owned_cid = a.dupe(u8, cid[0..]) catch return 0;
+    const owned_task = a.dupe(u8, task_sha[0..]) catch return 0;
+    list.append(.{
+        .candidate_id = owned_cid,
+        .task_sha256 = owned_task,
+        .command_needle = owned_needle,
+        .reason = ARTIFACT_FIRST_REASON,
+    }) catch return 0;
+    return 1;
+}
+
 pub const REASON_IMPORT_REASON =
     "a verifier reason reports this exact import path as unavailable in " ++
     "its run: the module does not exist yet and creating it at exactly " ++
@@ -335,6 +380,10 @@ pub fn load(
                 history.deinit();
             }
             scoped_recall.collectHistory(a, kg, task_hint, &history);
+            if (scoped_recall.sameTaskOutcomeRow(a, kg, task_hint)) |newest_row| {
+                defer a.free(newest_row);
+                _ = appendArtifactFirst(a, &combined, self_evolution.taskIdentity(task_hint), history.items, newest_row);
+            }
             var back = history.items.len;
             while (back > 0) {
                 back -= 1;

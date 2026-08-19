@@ -846,13 +846,16 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     // 最佳工件随最佳锚进注入(升级写的 r3 带工件,reward 0.5 仍为最佳)。
     try std.testing.expect(std.mem.indexOf(u8, text_r4, "best-attempt artifact (host-extracted, verbatim):") != null);
     try std.testing.expect(std.mem.indexOf(u8, text_r4, "digest(path)[:16]") != null);
-    // 工件里的括号/代码不得污染 GIGO 针(首 ']' 定界回归钉)。
+    // 工件里的括号/代码不得污染 GIGO 针(首 ']' 定界回归钉);且 v30
+    // 工件路径义务居首(逐字优先命令走全勤通道)。
     {
         const runtime_a = cc.obligation_gate.load(a, &kg, "reason-task") orelse return error.TestExpectedRuntime;
         defer {
             runtime_a.deinit();
             a.destroy(runtime_a);
         }
+        try std.testing.expectEqualStrings("widget/_helpers.py", runtime_a.envelopes[0].command_needle);
+        try std.testing.expect(std.mem.indexOf(u8, runtime_a.envelopes[0].reason, "UNCHANGED as your FIRST edit") != null);
         for (runtime_a.envelopes) |envelope| {
             try std.testing.expect(std.mem.indexOf(u8, envelope.command_needle, "digest") == null);
             try std.testing.expect(std.mem.indexOf(u8, envelope.command_needle, "data = ") == null);
@@ -880,15 +883,18 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     }
     // 理由派生义务居首(p13 取证:nudge 预算优先给"创建缺失工件"的
     // import 针——自建测试满足不了 import,名字针可以被自建测试绕过)。
-    // 棘轮:最新行(r3)无点分 token,import 义务只能来自历史行(r2)。
-    try std.testing.expectEqual(@as(usize, 2), runtime_r.count());
-    try std.testing.expectEqualStrings("import widget._helpers", runtime_r.envelopes[0].command_needle);
-    try std.testing.expectEqualStrings("tests/t.py::TestR::test_module_exists", runtime_r.envelopes[1].command_needle);
+    // 队列全序(v30):工件路径居首→import 棘轮→名字义务;
+    // 棘轮:最新行(r4)无点分 token,import 义务只能来自历史行(r2)。
+    try std.testing.expectEqual(@as(usize, 3), runtime_r.count());
+    try std.testing.expectEqualStrings("widget/_helpers.py", runtime_r.envelopes[0].command_needle);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_r.envelopes[0].reason, "UNCHANGED as your FIRST edit") != null);
+    try std.testing.expectEqualStrings("import widget._helpers", runtime_r.envelopes[1].command_needle);
+    try std.testing.expectEqualStrings("tests/t.py::TestR::test_module_exists", runtime_r.envelopes[2].command_needle);
     // v22:名字义务的 reason 携带验证器报告原文(nudge 通道递送形状指令)。
     // v27:reason 累积历史全部去重报告并要求同时满足(整合失败的解药)。
-    try std.testing.expect(std.mem.indexOf(u8, runtime_r.envelopes[1].reason, "the verifier reported: failed: assert ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, runtime_r.envelopes[1].reason, "  PLUS  ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, runtime_r.envelopes[1].reason, "Satisfy EVERY one of these simultaneously") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_r.envelopes[2].reason, "the verifier reported: failed: assert ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_r.envelopes[2].reason, "  PLUS  ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_r.envelopes[2].reason, "Satisfy EVERY one of these simultaneously") != null);
     ppaths.setEnv("METACODES_TASK_HINT", "wall-task");
 
     // UTF-8 截断安全(p10 现场雷):中文 note >300 字节,裸字节截断切码点

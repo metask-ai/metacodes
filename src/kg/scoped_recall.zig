@@ -255,7 +255,7 @@ fn rowReward(row: []const u8) f64 {
     return std.fmt.parseFloat(f64, row[start..end]) catch -1;
 }
 
-fn bestHistoryRow(history: []const []u8, newest: []const u8) ?[]const u8 {
+pub fn bestHistoryRow(history: []const []u8, newest: []const u8) ?[]const u8 {
     const newest_reward = rowReward(newest);
     var best: ?[]const u8 = null;
     var best_reward: f64 = newest_reward;
