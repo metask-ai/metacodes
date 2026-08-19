@@ -215,7 +215,10 @@ pub fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClien
                 "artifact (module, file, function) is something the verifier expects YOU to " ++
                 "have created; creating it at the location its name implies is compliance, " ++
                 "not gaming. One verdict per attempt — an unchanged approach is a wasted " ++
-                "attempt. Re-run your whole check suite before closing.\n" ++
+                "attempt. The quoted note above is a FAILING attempt's own words: where " ++
+                "it claims completion or success, the reward on the same line refutes " ++
+                "it — never inherit its claims. " ++
+                "Re-run your whole check suite before closing.\n" ++
                 "</system-reminder>\n") catch return null;
         return out.toOwnedSlice(allocator) catch null;
     }

@@ -771,8 +771,11 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         runtime_r.deinit();
         a.destroy(runtime_r);
     }
-    try std.testing.expectEqual(@as(usize, 1), runtime_r.count());
-    try std.testing.expectEqualStrings("tests/t.py::TestR::test_module_exists", runtime_r.envelopes[0].command_needle);
+    // 理由派生义务居首(p13 取证:nudge 预算优先给"创建缺失工件"的
+    // import 针——自建测试满足不了 import,名字针可以被自建测试绕过)。
+    try std.testing.expectEqual(@as(usize, 2), runtime_r.count());
+    try std.testing.expectEqualStrings("import widget._helpers", runtime_r.envelopes[0].command_needle);
+    try std.testing.expectEqualStrings("tests/t.py::TestR::test_module_exists", runtime_r.envelopes[1].command_needle);
     ppaths.setEnv("METACODES_TASK_HINT", "wall-task");
 
     // UTF-8 截断安全(p10 现场雷):中文 note >300 字节,裸字节截断切码点

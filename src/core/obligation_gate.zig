@@ -105,6 +105,90 @@ pub const GIGO_REASON =
     "check itself collect and succeed; if what it names is missing, " ++
     "creating it at the named location is the work, not grounds to skip";
 
+pub const REASON_IMPORT_REASON =
+    "a verifier reason reports this exact import path as unavailable in " ++
+    "its run: the module does not exist yet and creating it at exactly " ++
+    "this dotted path is the deliverable. Run `python -c \"import ...\"` " ++
+    "for it and it must succeed; a test file of your own does not " ++
+    "substitute for the module itself";
+
+/// 理由派生义务(p13 取证:三轮 turn-1 都推出'需创建模块'而行动层从未
+/// 执行;唯一每轮都被执行的绑定形态=晚期 user-turn 祈使+具体路径,即
+/// nudge 通道——但名字针指向测试路径,可被自建测试满足)。从注解理由
+/// "(skipped: <reason>)" 里机械提取**点分 import 路径 token**,义务针=
+/// "import <token>":不创建该模块,任何包含此针的命令都无法成功。
+/// 通用启发式:合法标识符 + ≥1 个点 + 不含 '/' 不以 .py 结尾。
+fn appendReasonDerived(
+    a: std.mem.Allocator,
+    list: *std.array_list.Managed(self_evolution.ObligationEnvelope),
+    task_sha: [64]u8,
+    row_text: []const u8,
+) usize {
+    var appended: usize = 0;
+    var search: usize = 0;
+    while (appended < 1) {
+        const tag = std.mem.indexOfPos(u8, row_text, search, ": ") orelse break;
+        // 只在注解段内找(前面必须出现过 "(skipped" 或 "(failed")。
+        search = tag + 2;
+        const before = row_text[0..tag];
+        const in_skip = std.mem.lastIndexOf(u8, before, "(skipped") != null or
+            std.mem.lastIndexOf(u8, before, "(failed") != null;
+        if (!in_skip) continue;
+        // 扫描该理由片段里的点分模块 token。
+        const seg_end = std.mem.indexOfScalarPos(u8, row_text, search, ')') orelse row_text.len;
+        var i: usize = search;
+        while (i < seg_end) {
+            // token 起点:标识符首字符。
+            const c = row_text[i];
+            const is_ident_start = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
+            if (!is_ident_start) {
+                i += 1;
+                continue;
+            }
+            var j = i;
+            var dots: usize = 0;
+            while (j < seg_end) {
+                const d = row_text[j];
+                const ok = (d >= 'a' and d <= 'z') or (d >= 'A' and d <= 'Z') or
+                    (d >= '0' and d <= '9') or d == '_' or d == '.';
+                if (!ok) break;
+                if (d == '.') dots += 1;
+                j += 1;
+            }
+            const token = std.mem.trimEnd(u8, row_text[i..j], ".");
+            i = j + 1;
+            if (dots == 0) continue;
+            if (std.mem.endsWith(u8, token, ".py")) continue;
+            if (std.mem.indexOfScalar(u8, token, '.') == null) continue;
+            var needle_buffer: [172]u8 = undefined;
+            const needle = std.fmt.bufPrint(&needle_buffer, "import {s}", .{token}) catch continue;
+            if (needle.len < self_evolution.MIN_NEEDLE_LEN or
+                needle.len > self_evolution.MAX_NEEDLE_LEN) continue;
+            var duplicate = false;
+            for (list.items) |existing| {
+                if (std.mem.eql(u8, existing.command_needle, needle)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            const owned_needle = a.dupe(u8, needle) catch continue;
+            const cid = self_evolution.obligationCandidateId(task_sha[0..], owned_needle, REASON_IMPORT_REASON);
+            const owned_cid = a.dupe(u8, cid[0..]) catch continue;
+            const owned_task = a.dupe(u8, task_sha[0..]) catch continue;
+            list.append(.{
+                .candidate_id = owned_cid,
+                .task_sha256 = owned_task,
+                .command_needle = owned_needle,
+                .reason = REASON_IMPORT_REASON,
+            }) catch continue;
+            appended += 1;
+            break;
+        }
+    }
+    return appended;
+}
+
 /// 从结局行文本("… failing=[a, b, c]")解析派生义务,追加进 list(去重、
 /// 截 " (skipped)" 后缀、边界过滤)。返回追加条数。
 fn appendDerived(
@@ -172,6 +256,8 @@ pub fn load(
     if (task_hint.len > 0 and task_hint.len <= 200) {
         const scoped_recall = @import("../kg/scoped_recall.zig");
         if (scoped_recall.sameTaskOutcomeRow(a, kg, task_hint)) |row| {
+            // 理由派生(模块 import)在前:nudge 预算优先给"创建缺失工件"。
+            _ = appendReasonDerived(a, &combined, self_evolution.taskIdentity(task_hint), row);
             _ = appendDerived(a, &combined, self_evolution.taskIdentity(task_hint), row);
         }
     }
