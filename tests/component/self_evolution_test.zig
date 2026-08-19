@@ -356,3 +356,63 @@ test "L2: outcome ingestion is idempotent through the real recall path" {
     try std.testing.expectEqualStrings("injected", built.receipt.status);
     try std.testing.expect(built.receipt.injected_count >= 1);
 }
+
+test "L2: task obligation rides the store and arms the gate for the same task only" {
+    // 动态层"合法过拟合"的存取链:义务信封(任务绑定+内容寻址)落真
+    // store → 同任务收集命中 / 异任务隔离 → 执行门装载 → 命令观察满足。
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const kg_bin = findKgBin(a) orelse return error.SkipZigTest;
+    defer a.free(kg_bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var store_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const store_dir = try std.fmt.bufPrint(&store_buffer, "{s}/store", .{root});
+    var kg = try cc.kg_client.KgClient.init(a, .{
+        .home = root,
+        .domain = "selfevo-l2c",
+        .config_bin = kg_bin,
+        .config_store = store_dir,
+        .env_bin = "",
+        .env_store = "",
+    });
+    defer kg.deinit();
+    kg.ensureReady();
+
+    const hint = "bug_fix-easy-invalid_filterwarnings_regex_error";
+    const task_sha = self_evolution.taskIdentity(hint);
+    const needle = "pytest testing/test_warnings.py::TestDeprecationWarningsByDefault";
+    const reason = "the named failing tests were never executed before finishing";
+    const cid = self_evolution.obligationCandidateId(task_sha[0..], needle, reason);
+    const envelope_text = try self_evolution.encodeObligation(a, .{
+        .candidate_id = cid[0..],
+        .task_sha256 = task_sha[0..],
+        .command_needle = needle,
+        .reason = reason,
+    });
+    defer a.free(envelope_text);
+    _ = kg.remember(.observation, envelope_text, self_evolution.OBLIGATION_SCHEMA_TYPE, false) catch
+        return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const same = try self_evolution.collectObligations(arena.allocator(), &kg, hint);
+    try std.testing.expectEqual(@as(usize, 1), same.len);
+    try std.testing.expectEqualStrings(needle, same[0].command_needle);
+    const other = try self_evolution.collectObligations(arena.allocator(), &kg, "some-other-task");
+    try std.testing.expectEqual(@as(usize, 0), other.len);
+
+    // 执行门:未命中 → 索引 0;观察到含 needle 的命令 → 无动作。
+    const obligation_gate = cc.obligation_gate;
+    const runtime = obligation_gate.load(a, &kg, hint) orelse return error.TestExpectedRuntime;
+    defer {
+        runtime.deinit();
+        a.destroy(runtime);
+    }
+    try std.testing.expectEqual(@as(?usize, 0), runtime.decide().index);
+    runtime.observeCommand("cd /workspace && pytest testing/test_warnings.py::TestDeprecationWarningsByDefault -x");
+    try std.testing.expectEqual(@as(?usize, null), runtime.decide().index);
+}

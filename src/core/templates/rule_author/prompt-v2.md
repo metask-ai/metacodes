@@ -21,7 +21,7 @@ and no Markdown, using the response schema below:
 
 {
   "schema_version": "metacodes-rule-author-response-v1",
-  "decision": "abstain" | "propose",
+  "decision": "abstain" | "propose" | "propose_obligation",
   "reason": "short explanation",
   "invariant": null | "precise project invariant",
   "falsifier": null | "concrete replay condition that rejects the invariant",
@@ -36,7 +36,9 @@ and no Markdown, using the response schema below:
     "authoritative_only": true | false,
     "effect_requirement": "none" | "file_mutation_v1_reobserved"
   },
-  "lean_source": null | "Lean source"
+  "lean_source": null | "Lean source",
+  "obligation_needle": null | "4..160 printable chars",
+  "obligation_reason": null | "8..300 chars"
 }
 
 Target kinds: `tool` scopes the rule to one tool by name. `effect_class`
@@ -46,8 +48,19 @@ regular file, so one rule survives the model switching tools. Effect-class
 rules must use `target_scope` "all" and `deny_target` false: they verify
 (typically `file_mutation_v1_reobserved`), they do not deny.
 
+A "propose_obligation" decision records a task-scoped closure obligation
+instead of a RuleSpec: before finishing this same task on a later attempt,
+the actor must have executed a command containing `obligation_needle`
+verbatim. Use it only when the typed failure evidence identifies a concrete
+runnable check (a test identifier, a script, a build target) that the actor
+demonstrably did not execute before finishing. The needle must be something
+that would appear inside that command line; the reason is shown to the actor
+verbatim. For an obligation, invariant, falsifier, rule_spec, and
+lean_source must all be null. Its actuation is one bounded reminder, never a
+denial.
+
 Use "abstain" unless the authenticated generation evidence plus non-authorizing
-ontology context support one narrow RuleSpec v2. For abstention, reason must be
+ontology context support one narrow RuleSpec v2 or one task-scoped obligation. For abstention, reason must be
 non-empty and invariant, falsifier, rule_spec, and lean_source must all be null.
 
 For a proposal, every non-reason field must be present and non-null. The

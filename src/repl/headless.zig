@@ -127,12 +127,27 @@ pub fn run(
     var self_evo_ingested: usize = 0;
     var provisional_gate: ?*self_evolution_mod.ProvisionalGate = null;
     defer if (provisional_gate) |pg| pg.deinit();
+    // 任务范围收尾义务:上一轮 author 为本任务学得的环境规则(hint 绑定,
+    // 有界 nudge)。装载失败 → null,不影响 Run。
+    const obligation_gate_mod = @import("../core/obligation_gate.zig");
+    var obligation_runtime: ?*obligation_gate_mod.Runtime = null;
+    defer if (obligation_runtime) |runtime| {
+        runtime.deinit();
+        allocator.destroy(runtime);
+    };
     if (self_evo_enabled) {
         if (app.kg) |*known_graph| {
             // 结局回灌先于 provisional 装载与 scoped recall:本 Run 一开始
             // 就把 host 提供的已完成 trial 结局写进 KG,召回面立即可见。
             const ingested = self_evolution_mod.ingestOutcomes(allocator, known_graph);
             self_evo_ingested = ingested;
+            if (std.c.getenv("METACODES_TASK_HINT")) |hint_c| {
+                obligation_runtime = obligation_gate_mod.load(
+                    allocator,
+                    known_graph,
+                    std.mem.span(hint_c),
+                );
+            }
             if (run_control) |control| {
                 provisional_gate = self_evolution_mod.loadProvisionalGate(
                     allocator,
@@ -196,25 +211,27 @@ pub fn run(
         });
     };
     const scoped_recall = if (scoped_recall_result) |result| result.text else null;
+    var run_options = buildOptions(
+        app,
+        scoped_recall,
+        eval_request_gate,
+        effective_execution_policy,
+        eval_be != null,
+        if (run_control) |control| control.observer() else null,
+        if (provisional_gate) |pg|
+            pg.gate()
+        else if (run_control) |control|
+            control.formalGate()
+        else
+            null,
+    );
+    run_options.obligations = obligation_runtime;
     const result = agent_loop.run(
         &app.conversation,
         app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        buildOptions(
-            app,
-            scoped_recall,
-            eval_request_gate,
-            effective_execution_policy,
-            eval_be != null,
-            if (run_control) |control| control.observer() else null,
-            if (provisional_gate) |pg|
-                pg.gate()
-            else if (run_control) |control|
-                control.formalGate()
-            else
-                null,
-        ),
+        run_options,
         effective_be,
         allocator,
     ) catch |err| {

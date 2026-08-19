@@ -363,6 +363,9 @@ pub const Options = struct {
     requirement_ledger: bool = false,
     /// Record-only twin for measurement symmetry in control arms.
     requirement_ledger_observe: bool = false,
+    /// 任务范围收尾义务(运行期 author 学得的环境规则,ledger 同款有界
+    /// nudge 哲学)。null = 无义务/关闭。
+    obligations: ?*@import("obligation_gate.zig").Runtime = null,
     /// Bounded same-turn retries after a mid-stream provider failure. The
     /// stream-error path already discards the partial turn (nothing was
     /// committed to the conversation), so re-issuing the identical request is
@@ -1396,6 +1399,24 @@ pub fn run(
                     },
                 }
             }
+            // 任务义务门:author 上一轮为本任务学得的收尾义务未满足 →
+            // 有界 nudge(每义务一次,全局 ≤2,纯注入绝不硬拒)。
+            if (opts.obligations) |obligation_runtime| {
+                if (obligation_runtime.decide().index) |obligation_index| {
+                    const envelope = obligation_runtime.envelopes[obligation_index];
+                    obligation_runtime.noteNudged(obligation_index);
+                    log.warnId("agent", rid, "task obligation nudge {d}/{d} needle={s}", .{ obligation_runtime.nudges_used, @import("obligation_gate.zig").MAX_OBLIGATION_NUDGES, envelope.command_needle });
+                    backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                    const nudge = try std.fmt.allocPrint(
+                        allocator,
+                        @import("obligation_gate.zig").NUDGE_FMT,
+                        .{ envelope.reason, envelope.command_needle },
+                    );
+                    defer allocator.free(nudge);
+                    try conversation.appendText(.user, nudge);
+                    continue;
+                }
+            }
             // L4 诊断:本轮无 tool_use → turn 结束(span 平衡:每个 turn_begin 都配一个
             // turn_end,无论有无工具)。紧接 run_end(end_turn)收口。
             backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
@@ -1501,6 +1522,14 @@ pub fn run(
                 .allowed = policy_allowed,
             } });
             try slots.append(allocator, slot);
+            // 任务义务观察:获准执行的 Bash 命令喂给义务运行时(needle 子串
+            // 命中即 met)。denied 的调用不算——义务要的是"真的跑过"。
+            if (opts.obligations) |obligation_runtime| {
+                if (slot.decision == .run and std.mem.eql(u8, slot.name, "Bash")) {
+                    if (@import("../util/json.zig").extractStringField(slot.input, "command")) |command|
+                        obligation_runtime.observeCommand(command);
+                }
+            }
         }
 
         // AgentDef/skill execution ceilings are a distinct, final policy

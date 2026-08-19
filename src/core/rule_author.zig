@@ -26,6 +26,9 @@ const project_rule_spec = @import("project_rule_spec.zig");
 const rule_candidate = @import("rule_candidate.zig");
 const ontology_projection = @import("ontology_rule_projection.zig");
 const log = @import("../util/log.zig");
+// 仅取义务字段的边界常量(文件级互相 import 在 Zig 合法;单一真理源在
+// self_evolution)。
+const self_evolution_bounds = @import("self_evolution.zig");
 
 pub const SYSTEM_PROMPT = @embedFile("templates/rule_author/prompt.md");
 pub const SYSTEM_PROMPT_V2 = @embedFile("templates/rule_author/prompt-v2.md");
@@ -602,13 +605,20 @@ pub const BoundProvider = struct {
     provider_sha256: [64]u8,
 };
 
-pub const Decision = enum { abstain, propose };
+pub const Decision = enum { abstain, propose, propose_obligation };
 
 pub const Proposal = struct {
     invariant: []const u8,
     falsifier: []const u8,
     rule_spec: project_rule_spec.Spec,
     lean_source: []const u8,
+};
+
+/// 任务范围收尾义务提案(动态层"合法过拟合":author 在现场,环境是它
+/// 合法观察到的;义务绑定单任务、执行面只是有界 nudge)。
+pub const ObligationProposal = struct {
+    command_needle: []const u8,
+    reason: []const u8,
 };
 
 pub const Usage = struct {
@@ -627,6 +637,7 @@ pub const AuthorResult = struct {
     decision: Decision,
     reason: []const u8,
     proposal: ?Proposal,
+    obligation: ?ObligationProposal,
     usage: Usage,
     provider_elapsed_ns: u64,
     protocol: Protocol = .v1,
@@ -645,6 +656,8 @@ const ResponseWire = struct {
     falsifier: ?[]const u8,
     rule_spec: ?project_rule_spec.Wire,
     lean_source: ?[]const u8,
+    obligation_needle: ?[]const u8 = null,
+    obligation_reason: ?[]const u8 = null,
 };
 
 /// Execute one admitted no-tools author request and durably persist its
@@ -819,10 +832,29 @@ fn parseResponse(allocator: std.mem.Allocator, bytes: []const u8) !AuthorResult 
         !validText(response.reason, MAX_REASON_BYTES))
         return error.InvalidAuthorResponse;
     var proposal: ?Proposal = null;
+    var obligation: ?ObligationProposal = null;
     switch (response.decision) {
         .abstain => if (response.invariant != null or response.falsifier != null or
-            response.rule_spec != null or response.lean_source != null)
+            response.rule_spec != null or response.lean_source != null or
+            response.obligation_needle != null or response.obligation_reason != null)
             return error.InvalidAuthorResponse,
+        .propose_obligation => {
+            // 义务提案:spec 系字段必须全 null(两种提案不混装)。
+            if (response.invariant != null or response.falsifier != null or
+                response.rule_spec != null or response.lean_source != null)
+                return error.InvalidAuthorResponse;
+            const needle = response.obligation_needle orelse return error.InvalidAuthorResponse;
+            const obligation_reason = response.obligation_reason orelse return error.InvalidAuthorResponse;
+            if (needle.len < self_evolution_bounds.MIN_NEEDLE_LEN or
+                needle.len > self_evolution_bounds.MAX_NEEDLE_LEN or
+                obligation_reason.len < self_evolution_bounds.MIN_OBLIGATION_REASON or
+                obligation_reason.len > self_evolution_bounds.MAX_OBLIGATION_REASON or
+                !std.unicode.utf8ValidateSlice(needle) or
+                !std.unicode.utf8ValidateSlice(obligation_reason))
+                return error.InvalidAuthorResponse;
+            for (needle) |c| if (c < 0x20 or c == 0x7f) return error.InvalidAuthorResponse;
+            obligation = .{ .command_needle = needle, .reason = obligation_reason };
+        },
         .propose => {
             const invariant = response.invariant orelse return error.InvalidAuthorResponse;
             const falsifier = response.falsifier orelse return error.InvalidAuthorResponse;
@@ -837,6 +869,8 @@ fn parseResponse(allocator: std.mem.Allocator, bytes: []const u8) !AuthorResult 
             // 确定性投影);模型若回传 lean_source,视为废弃字段忽略。
             const canonical_lean = try renderCanonicalLean(a, spec);
             if (canonical_lean.len > rule_candidate.MAX_LEAN_SOURCE_BYTES)
+                return error.InvalidAuthorResponse;
+            if (response.obligation_needle != null or response.obligation_reason != null)
                 return error.InvalidAuthorResponse;
             proposal = .{
                 .invariant = invariant,
@@ -855,6 +889,7 @@ fn parseResponse(allocator: std.mem.Allocator, bytes: []const u8) !AuthorResult 
         .decision = response.decision,
         .reason = response.reason,
         .proposal = proposal,
+        .obligation = obligation,
         .usage = .{},
         .provider_elapsed_ns = 0,
         .protocol = .v1,
@@ -1910,6 +1945,23 @@ test "rule author derives canonical lean host-side and ignores model lean" {
     var wrong = try parseResponse(std.testing.allocator, head ++ ",\"lean_source\":\"-- whatever\"}");
     defer wrong.deinit();
     try std.testing.expectEqualStrings(canonical, wrong.proposal.?.lean_source);
+}
+
+test "rule author parses a task-scoped obligation proposal" {
+    const valid =
+        "{\"schema_version\":\"metacodes-rule-author-response-v1\",\"decision\":\"propose_obligation\",\"reason\":\"named failing test never executed\",\"invariant\":null,\"falsifier\":null,\"rule_spec\":null,\"lean_source\":null,\"obligation_needle\":\"pytest testing/test_warnings.py\",\"obligation_reason\":\"run the named failing test before finishing\"}";
+    var parsed = try parseResponse(std.testing.allocator, valid);
+    defer parsed.deinit();
+    try std.testing.expectEqual(Decision.propose_obligation, parsed.decision);
+    try std.testing.expectEqualStrings("pytest testing/test_warnings.py", parsed.obligation.?.command_needle);
+    // 义务与 spec 提案不混装:带 rule_spec 的 obligation 拒绝。
+    const mixed =
+        "{\"schema_version\":\"metacodes-rule-author-response-v1\",\"decision\":\"propose_obligation\",\"reason\":\"x\",\"invariant\":\"i\",\"falsifier\":null,\"rule_spec\":null,\"lean_source\":null,\"obligation_needle\":\"pytest -q\",\"obligation_reason\":\"run tests before finishing\"}";
+    try std.testing.expectError(error.InvalidAuthorResponse, parseResponse(std.testing.allocator, mixed));
+    // needle 过短拒绝(边界与信封一致)。
+    const short =
+        "{\"schema_version\":\"metacodes-rule-author-response-v1\",\"decision\":\"propose_obligation\",\"reason\":\"named failing test never executed\",\"invariant\":null,\"falsifier\":null,\"rule_spec\":null,\"lean_source\":null,\"obligation_needle\":\"ab\",\"obligation_reason\":\"run the named failing test\"}";
+    try std.testing.expectError(error.InvalidAuthorResponse, parseResponse(std.testing.allocator, short));
 }
 
 test "worst-case author cost uses integer ceiling and the most expensive input class" {

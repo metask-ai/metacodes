@@ -213,6 +213,137 @@ pub fn collectEnvelopes(
     return out.items;
 }
 
+// ── 任务范围收尾义务(动态层"合法过拟合") ────────────────────────
+// 静态层(提示词/固定规则)任务无关且冻结;运行期 author 面对的是它合法
+// 观察到的环境,针对性是学习本身:义务规则绑定单个任务(task_sha256),
+// 随店走、全披露、可撤回,执行面只是有界 nudge(ledger 同款哲学),
+// 不碰 fixed kernel。
+pub const OBLIGATION_MARKER = "metacodes-provisional-obligation-v1";
+pub const OBLIGATION_SCHEMA_TYPE = "provisional_obligation";
+pub const MAX_OBLIGATIONS_PER_TASK: usize = 4;
+pub const MIN_NEEDLE_LEN: usize = 4;
+pub const MAX_NEEDLE_LEN: usize = 160;
+pub const MIN_OBLIGATION_REASON: usize = 8;
+pub const MAX_OBLIGATION_REASON: usize = 300;
+
+pub const ObligationEnvelope = struct {
+    schema_version: []const u8 = OBLIGATION_MARKER,
+    candidate_id: []const u8,
+    task_sha256: []const u8,
+    command_needle: []const u8,
+    reason: []const u8,
+};
+
+fn validHex64(text: []const u8) bool {
+    if (text.len != 64) return false;
+    for (text) |c| switch (c) {
+        '0'...'9', 'a'...'f' => {},
+        else => return false,
+    };
+    return true;
+}
+
+/// needle 只允许可打印单行(进 nudge 文本 + 子串匹配 Bash 命令;控制字符
+/// 既无匹配意义又会污染注入面)。
+fn validNeedle(text: []const u8) bool {
+    if (text.len < MIN_NEEDLE_LEN or text.len > MAX_NEEDLE_LEN) return false;
+    for (text) |c| if (c < 0x20 or c == 0x7f) return false;
+    return true;
+}
+
+pub fn obligationCandidateId(
+    task_sha256: []const u8,
+    command_needle: []const u8,
+    reason: []const u8,
+) [64]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("metacodes-obligation-id-v1\x00");
+    hasher.update(task_sha256);
+    hasher.update("\x00");
+    hasher.update(command_needle);
+    hasher.update("\x00");
+    hasher.update(reason);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+pub fn encodeObligation(allocator: std.mem.Allocator, envelope: ObligationEnvelope) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, envelope, .{});
+}
+
+pub fn parseObligation(arena: std.mem.Allocator, text: []const u8) !ObligationEnvelope {
+    const parsed = try std.json.parseFromSliceLeaky(ObligationEnvelope, arena, text, .{
+        .ignore_unknown_fields = false,
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    if (!std.mem.eql(u8, parsed.schema_version, OBLIGATION_MARKER)) return error.UnknownEnvelope;
+    if (!validHex64(parsed.candidate_id)) return error.InvalidCandidateId;
+    if (!validHex64(parsed.task_sha256)) return error.InvalidTaskBinding;
+    if (!validNeedle(parsed.command_needle)) return error.InvalidObligationNeedle;
+    if (parsed.reason.len < MIN_OBLIGATION_REASON or parsed.reason.len > MAX_OBLIGATION_REASON or
+        !std.unicode.utf8ValidateSlice(parsed.reason)) return error.InvalidObligationReason;
+    // 内容寻址必须自洽:身份即内容,防同 id 换里子。
+    const expected = obligationCandidateId(parsed.task_sha256, parsed.command_needle, parsed.reason);
+    if (!std.mem.eql(u8, parsed.candidate_id, expected[0..])) return error.InvalidCandidateId;
+    return parsed;
+}
+
+pub fn taskIdentity(task_hint: []const u8) [64]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("metacodes-task-identity-v1\x00");
+    hasher.update(task_hint);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+/// 收集当前任务的义务信封(撤回复用 rule 通道的 RETRACT_MARKER 语义:
+/// retract 信封的 candidate_id 同样适用)。
+pub fn collectObligations(
+    arena: std.mem.Allocator,
+    kg: *kg_client_mod.KgClient,
+    task_hint: []const u8,
+) ![]ObligationEnvelope {
+    if (task_hint.len == 0 or task_hint.len > 200) return &.{};
+    const task_sha = taskIdentity(task_hint);
+    var retracted = std.StringHashMapUnmanaged(void){};
+    if (kg.recallTyped(RETRACT_MARKER, MAX_PROVISIONAL_RULES * 4, false, RETRACT_SCHEMA_TYPE)) |retract_hits| {
+        defer {
+            for (retract_hits) |*hit| hit.deinit(kg.allocator);
+            kg.allocator.free(retract_hits);
+        }
+        for (retract_hits) |hit| {
+            const full = kg.fetchNodeText(hit.node_id) catch continue;
+            defer kg.allocator.free(full);
+            if (parseRetraction(arena, full)) |cid|
+                try retracted.put(arena, try arena.dupe(u8, cid), {});
+        }
+    } else |_| {}
+
+    var out = std.array_list.Managed(ObligationEnvelope).init(arena);
+    var seen = std.StringHashMapUnmanaged(void){};
+    if (kg.recallTyped(OBLIGATION_MARKER, 40, false, OBLIGATION_SCHEMA_TYPE)) |hits| {
+        defer {
+            for (hits) |*hit| hit.deinit(kg.allocator);
+            kg.allocator.free(hits);
+        }
+        for (hits) |hit| {
+            if (out.items.len >= MAX_OBLIGATIONS_PER_TASK) break;
+            const full = kg.fetchNodeText(hit.node_id) catch continue;
+            defer kg.allocator.free(full);
+            const envelope = parseObligation(arena, full) catch continue;
+            if (!std.mem.eql(u8, envelope.task_sha256, task_sha[0..])) continue;
+            if (retracted.contains(envelope.candidate_id)) continue;
+            if (seen.contains(envelope.candidate_id)) continue;
+            try seen.put(arena, envelope.candidate_id, {});
+            try out.append(envelope);
+        }
+    } else |_| {}
+    return out.items;
+}
+
 /// 由(可选的)活跃束 + 临时信封构造合并 LoadedActive。哨兵 revision 与
 /// 内容寻址 bundle_sha 让 journal 事件里的临时束身份可辨、可披露。
 pub fn buildMergedActive(
@@ -698,6 +829,31 @@ pub fn endOfRun(allocator: std.mem.Allocator, deps: EndOfRunDeps) Outcome {
         return finish(allocator, deps, .degraded, @errorName(err));
     };
 
+    if (outcome.decision == .propose_obligation) {
+        // 义务提案:绑定当前任务(hint 由 host 声明),不经 rule_candidate/
+        // kernel——执行面只是下一轮的有界 nudge。
+        const hint_c = std.c.getenv("METACODES_TASK_HINT") orelse
+            return finish(allocator, deps, .degraded, "ObligationWithoutTaskHint");
+        const hint = std.mem.span(hint_c);
+        if (hint.len == 0 or hint.len > 200)
+            return finish(allocator, deps, .degraded, "ObligationWithoutTaskHint");
+        const needle = outcome.obligationNeedle() orelse
+            return finish(allocator, deps, .degraded, "ObligationMissingFields");
+        const obligation_reason = outcome.obligationReason() orelse
+            return finish(allocator, deps, .degraded, "ObligationMissingFields");
+        const task_sha = taskIdentity(hint);
+        const cid = obligationCandidateId(task_sha[0..], needle, obligation_reason);
+        const envelope_text = encodeObligation(allocator, .{
+            .candidate_id = cid[0..],
+            .task_sha256 = task_sha[0..],
+            .command_needle = needle,
+            .reason = obligation_reason,
+        }) catch return finish(allocator, deps, .degraded, "unspecified");
+        defer allocator.free(envelope_text);
+        _ = deps.kg.remember(.observation, envelope_text, OBLIGATION_SCHEMA_TYPE, false) catch |err|
+            return finish(allocator, deps, .degraded, @errorName(err));
+        return finish(allocator, deps, .proposed, "obligation");
+    }
     if (outcome.decision != .propose or outcome.candidate_id == null)
         return finish(allocator, deps, .abstained, "");
 
@@ -893,7 +1049,9 @@ test "envelope round-trips through encode/parse with spec validation" {
         .rule = .{
             .target_kind = .effect_class,
             .target = "existing_file_rewrite",
-            .target_scope = .existing_file,
+            // effect_class 规则必须 scope .all(validate :147)。此测试曾因
+            // 不在任何测试根而休眠,obligation 链首次把它拉进 roster。
+            .target_scope = .all,
             .deny_target = false,
             .max_input_bytes = 1024 * 1024,
             .max_agent_depth = 4,

@@ -165,6 +165,21 @@ pub const Outcome = struct {
     candidate_created: bool,
     usage: rule_author.Usage,
     provider_elapsed_ns: u64,
+    // 义务提案按值携带(authored 的 arena 在 authorOnce 内就释放;
+    // 上限来自 self_evolution 的信封边界)。
+    obligation_needle_buffer: [160]u8 = undefined,
+    obligation_needle_len: usize = 0,
+    obligation_reason_buffer: [300]u8 = undefined,
+    obligation_reason_len: usize = 0,
+
+    pub fn obligationNeedle(self: *const Outcome) ?[]const u8 {
+        if (self.obligation_needle_len == 0) return null;
+        return self.obligation_needle_buffer[0..self.obligation_needle_len];
+    }
+    pub fn obligationReason(self: *const Outcome) ?[]const u8 {
+        if (self.obligation_reason_len == 0) return null;
+        return self.obligation_reason_buffer[0..self.obligation_reason_len];
+    }
 };
 
 /// Prepare the complete provider-free half of one evolution attempt.
@@ -326,7 +341,7 @@ pub fn authorOnce(
         candidate_id = candidate.candidate_id;
         candidate_created = candidate.created;
     }
-    return .{
+    var outcome: Outcome = .{
         .author_receipt_id = authored.receipt_id,
         .decision = authored.decision,
         .candidate_id = candidate_id,
@@ -334,6 +349,17 @@ pub fn authorOnce(
         .usage = authored.usage,
         .provider_elapsed_ns = authored.provider_elapsed_ns,
     };
+    if (authored.decision == .propose_obligation) {
+        const proposal = authored.obligation orelse return error.InvalidAuthorResponse;
+        if (proposal.command_needle.len > outcome.obligation_needle_buffer.len or
+            proposal.reason.len > outcome.obligation_reason_buffer.len)
+            return error.InvalidAuthorResponse;
+        @memcpy(outcome.obligation_needle_buffer[0..proposal.command_needle.len], proposal.command_needle);
+        outcome.obligation_needle_len = proposal.command_needle.len;
+        @memcpy(outcome.obligation_reason_buffer[0..proposal.reason.len], proposal.reason);
+        outcome.obligation_reason_len = proposal.reason.len;
+    }
+    return outcome;
 }
 
 fn reobserveBindings(prepared: *Prepared, abort: ?*const AbortSignal) !void {
