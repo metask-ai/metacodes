@@ -12,7 +12,7 @@ const std = @import("std");
 const self_evolution = @import("self_evolution.zig");
 const kg_client_mod = @import("../kg/client.zig");
 
-pub const MAX_OBLIGATION_NUDGES: u8 = 2;
+pub const MAX_OBLIGATION_NUDGES: u8 = 3;
 
 pub const NUDGE_FMT =
     "[task obligation]\n" ++
@@ -273,10 +273,6 @@ pub fn load(
         return null;
     };
     var combined = std.array_list.Managed(self_evolution.ObligationEnvelope).init(a);
-    combined.appendSlice(stored) catch {
-        arena.deinit();
-        return null;
-    };
     if (task_hint.len > 0 and task_hint.len <= 200) {
         const scoped_recall = @import("../kg/scoped_recall.zig");
         // 理由派生(模块 import)在前且**扫全部历史行**(p15 取证:棘轮缺失
@@ -299,6 +295,23 @@ pub fn load(
         if (scoped_recall.sameTaskOutcomeRow(a, kg, task_hint)) |row| {
             _ = appendDerived(a, &combined, self_evolution.taskIdentity(task_hint), row);
         }
+    }
+    // stored(author 陈年义务)排在派生之后(p17 取证:预算被裸针 stored
+    // 义务吃光,携带验证器报告的新鲜形状义务永远轮不到);且被任一派生
+    // 针**包含**的 stored 针退役(如裸 "pkg._mod" ⊂ "import pkg._mod",
+    // 精确+带报告的派生版胜出)。
+    for (stored) |envelope| {
+        var superseded = false;
+        for (combined.items) |existing| {
+            if (std.mem.indexOf(u8, existing.command_needle, envelope.command_needle) != null) {
+                superseded = true;
+                break;
+            }
+        }
+        if (superseded) continue;
+        combined.append(envelope) catch continue;
+    }
+    {
     }
     const envelopes = combined.items;
     if (envelopes.len == 0) {

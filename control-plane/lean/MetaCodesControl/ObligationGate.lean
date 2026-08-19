@@ -18,7 +18,7 @@ Each theorem names the mirroring Zig test. -/
 
 namespace MetaCodesControl.ObligationGate
 
-def maxNudges : Nat := 2
+def maxNudges : Nat := 3
 
 structure Item where
   met : Bool
