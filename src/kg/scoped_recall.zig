@@ -150,7 +150,13 @@ fn appendModeSection(
     var it = std.mem.splitSequence(u8, newest_failing, ", ");
     while (it.next()) |raw_name| {
         if (rendered >= MAX_MODE_POINTS) break;
-        const name = std.mem.trim(u8, raw_name, " ");
+        const annotated = std.mem.trim(u8, raw_name, " ");
+        // 身份=裸 node id(截首个 " ("):理由注解逐轮变化,拿全串匹配会把
+        // streak 归零;旧行 "(skipped)"/新行 "(skipped: reason)" 都含裸名。
+        const name = if (std.mem.indexOf(u8, annotated, " (")) |cut|
+            annotated[0..cut]
+        else
+            annotated;
         if (name.len < 4) continue;
         var streak: usize = 1;
         var back = history_ascending.len - 1;

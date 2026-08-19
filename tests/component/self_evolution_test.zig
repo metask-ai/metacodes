@@ -730,6 +730,48 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     try std.testing.expect(std.mem.indexOf(u8, text_long, "scores nothing") != null);
     ppaths.setEnv("METACODES_TASK_HINT", "wall-task");
 
+    // 理由通道(p11 取证):adapter 把验证器 results.xml 的 skip/失败
+    // message 注解进错题名——"(skipped: reason)"。断言:① 裸名身份让
+    // streak 跨"无注解→有注解"行保持连续;② mode 行渲染裸名;③ 注解
+    // 文本到达注入面;④ GIGO 派生针剥掉整个括号注解。
+    {
+        const payload_r = "{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+            "{\"task\":\"reason-task\",\"attempt_key\":\"r1\",\"reward\":0.2,\"tests_passed\":1,\"tests_total\":3," ++
+            "\"failing_tests\":[\"tests/t.py::TestR::test_module_exists (skipped)\"]}," ++
+            "{\"task\":\"reason-task\",\"attempt_key\":\"r2\",\"reward\":0.2,\"tests_passed\":1,\"tests_total\":3," ++
+            "\"failing_tests\":[\"tests/t.py::TestR::test_module_exists (skipped: widget._helpers not available; create it)\"]}]}";
+        const pfs = @import("platform").fs;
+        const zr = try a.dupeZ(u8, outcomes_path);
+        defer a.free(zr);
+        const fd = pfs.open(zr.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = pfs.close(fd);
+        var off: usize = 0;
+        while (off < payload_r.len) {
+            const n = pfs.write(fd, payload_r[off..]);
+            try std.testing.expect(n > 0);
+            off += @intCast(n);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), self_evolution.ingestOutcomes(a, &kg));
+    ppaths.setEnv("METACODES_TASK_HINT", "reason-task");
+    var built_r = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    defer built_r.deinit(a);
+    const text_r = built_r.text orelse return error.TestExpectedInjection;
+    // 注解到达注入面(newest 行原文含理由)。
+    try std.testing.expect(std.mem.indexOf(u8, text_r, "(skipped: widget._helpers not available; create it)") != null);
+    // streak 跨注解变化连续:裸名身份 → failed 2。
+    try std.testing.expect(std.mem.indexOf(u8, text_r, "- tests/t.py::TestR::test_module_exists — failed 2 consecutive attempt(s)") != null);
+    // GIGO 派生针 = 裸 node id(括号注解整体剥离)。
+    const runtime_r = cc.obligation_gate.load(a, &kg, "reason-task") orelse return error.TestExpectedRuntime;
+    defer {
+        runtime_r.deinit();
+        a.destroy(runtime_r);
+    }
+    try std.testing.expectEqual(@as(usize, 1), runtime_r.count());
+    try std.testing.expectEqualStrings("tests/t.py::TestR::test_module_exists", runtime_r.envelopes[0].command_needle);
+    ppaths.setEnv("METACODES_TASK_HINT", "wall-task");
+
     // UTF-8 截断安全(p10 现场雷):中文 note >300 字节,裸字节截断切码点
     // 中间 → tinykg InvalidRecord 整行丢失。必须退到码点边界后成功入店。
     {

@@ -122,8 +122,9 @@ fn appendDerived(
     while (it.next()) |raw_name| {
         if (appended >= MAX_DERIVED) break;
         var needle = std.mem.trim(u8, raw_name, " ");
-        if (std.mem.endsWith(u8, needle, " (skipped)"))
-            needle = needle[0 .. needle.len - " (skipped)".len];
+        // 注解剥离:" (skipped)" / " (skipped: reason)" / " (failed: reason)"
+        // 都截到首个 " ("——针是裸 node id,理由只进注入文本不进针。
+        if (std.mem.indexOf(u8, needle, " (")) |cut| needle = needle[0..cut];
         if (needle.len < self_evolution.MIN_NEEDLE_LEN or
             needle.len > self_evolution.MAX_NEEDLE_LEN) continue;
         var duplicate = false;

@@ -85,6 +85,70 @@ def _continuity_root(logs_dir: Path) -> Path:
     return logs_dir.resolve().parents[2] / _CONTINUITY_DIRNAME
 
 
+def _verifier_reasons(trial_dir: Path) -> dict:
+    """JUnit results.xml -> {(Class, test_name): (kind, message)}.
+
+    The verifier has been shipping per-test skip/failure REASONS in
+    results.xml since day one; only the names were extracted.  Reasons are
+    the same artifact class as names (one report, one channel), and for
+    location-sensitive tasks the skip message routinely states exactly which
+    artifact the suite could not import — signal the bare name cannot carry.
+    Mechanical, task-agnostic extraction; empty dict on any parse trouble.
+    """
+    import xml.etree.ElementTree as ET
+
+    reasons: dict = {}
+    try:
+        root = ET.parse(trial_dir / "verifier" / "results.xml").getroot()
+    except Exception:
+        return reasons
+    for case in root.iter("testcase"):
+        classname = str(case.get("classname") or "")
+        name = str(case.get("name") or "")
+        if not name:
+            continue
+        verdict = None
+        for kind in ("skipped", "failure", "error"):
+            child = case.find(kind)
+            if child is not None:
+                label = "skipped" if kind == "skipped" else "failed"
+                verdict = (label, str(child.get("message") or ""))
+                break
+        if verdict is None:
+            continue
+        cls = classname.rpartition(".")[2]
+        reasons.setdefault((cls, name), verdict)
+        reasons.setdefault(("", name), verdict)
+    return reasons
+
+
+def _annotate_failing(name: str, reasons: dict) -> str:
+    """Append the verifier's own reason to a failing/skipped test name.
+
+    `name` may already carry a bare " (skipped)" marker; the reason replaces
+    it.  Brackets are stripped from the message because the outcome row's
+    failing=[...] section is bracket-delimited downstream.
+    """
+    bare = name.split(" (")[0].strip()
+    parts = bare.split("::")
+    key = (parts[-2] if len(parts) >= 3 else "", parts[-1] if parts else "")
+    hit = reasons.get(key) or reasons.get(("", key[1]))
+    if not hit:
+        return name
+    kind, msg = hit
+    # 列表定界完整性:失败行以 ", " 连接、下游以 ", " 分割,消息里的逗号
+    # 会把条目劈碎产生垃圾针 → 逗号换分号;方括号换圆括号(failing=[...]
+    # 括号定界)。
+    msg = " ".join(
+        msg.replace("[", "(").replace("]", ")").replace(",", ";").split()
+    )[:120].strip()
+    if not msg:
+        return name
+    if name.endswith(" (skipped)") and kind != "skipped":
+        kind = "skipped"
+    return f"{bare} ({kind}: {msg})"[:280]
+
+
 def _read_continuity_ledger(path: Path) -> list:
     if not path.exists():
         return []
@@ -339,12 +403,13 @@ class MetacodesAgent(BaseInstalledAgent):
                     if isinstance(raw_meta.get("tests"), list):
                         structured = raw_meta["tests"]
                         break
+                reasons = _verifier_reasons(trial_dir)
                 if structured is not None:
                     for test in structured:
                         if isinstance(test, dict) and test.get("passed") is False:
                             name = str(test.get("name") or "")[:160]
                             if name:
-                                failing.append(name)
+                                failing.append(_annotate_failing(name, reasons))
                         if len(failing) >= 20:
                             break
                 else:
@@ -353,7 +418,7 @@ class MetacodesAgent(BaseInstalledAgent):
                             encoding="utf-8", errors="replace"
                         ).splitlines():
                             if line.startswith("FAILED "):
-                                failing.append(line[len("FAILED "):][:160])
+                                failing.append(_annotate_failing(line[len("FAILED "):][:160], reasons))
                             elif "::" in line and " SKIPPED" in line:
                                 # pytest -v 的 SKIPPED 行同样是未满足的面
                                 # (p4 etag 取证:8/11 SKIPPED=实现不在验证
@@ -361,7 +426,7 @@ class MetacodesAgent(BaseInstalledAgent):
                                 # 而该信号此前被当"无名"整体丢弃)。
                                 name = line.split(" SKIPPED")[0].strip()
                                 if name:
-                                    failing.append((name + " (skipped)")[:160])
+                                    failing.append(_annotate_failing((name + " (skipped)")[:160], reasons))
                             if len(failing) >= 20:
                                 break
                     except OSError:

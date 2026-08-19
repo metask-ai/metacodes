@@ -3314,6 +3314,13 @@ with tempfile.TemporaryDirectory() as directory:
             {"name": "cli exits", "passed": True},
         ]}}}],
     }))
+    # 结构化名是散文名(非 node id):理由匹配走 ("", name) 回退键。
+    (done / "verifier" / "results.xml").write_text(
+        '<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite>'
+        '<testcase classname="suite" name="etag present">'
+        '<failure message="assert 66 == 18, shape"/></testcase>'
+        '</testsuite></testsuites>'
+    )
     # pytest 面兄弟 trial:无结构化 tests[],走 FAILED/SKIPPED 行回退
     # (p4 etag 取证:SKIPPED=实现不在预期位置,此前被当无名丢弃)。
     done2 = jobs / "batch-1" / "pytest_task__prev2"
@@ -3325,6 +3332,15 @@ with tempfile.TemporaryDirectory() as directory:
     (done2 / "verifier" / "test_output.txt").write_text(
         "FAILED testing/test_x.py::test_a\n"
         "tests/test_y.py::TestM::test_module_exists SKIPPED [  9%]\n"
+    )
+    # 理由通道(p11 取证:skip message 携带名字推不出的模块路径;失败
+    # message 携带断言形状)。消息里的方括号/逗号必须被清洗(failing=[...]
+    # 括号定界 + ", " 列表分割)。
+    (done2 / "verifier" / "results.xml").write_text(
+        '<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite>'
+        '<testcase classname="tests.test_y.TestM" name="test_module_exists">'
+        '<skipped type="pytest.skip" message="widget._helpers not available, create [it] first"/></testcase>'
+        '</testsuite></testsuites>'
     )
     # 自我历史对质:上次 transcript 的收尾结论进结局行(单行化+剥方括号)。
     (done2 / "agent").mkdir()
@@ -3368,10 +3384,13 @@ with tempfile.TemporaryDirectory() as directory:
     rows = json.loads((logs / "task-outcomes.json").read_text())["outcomes"]
     by_task = {r["task"]: r for r in rows}
     assert set(by_task) == {"feature-medium-etag_header_for_static", "bugfix-pytest-task"}, rows
-    assert by_task["feature-medium-etag_header_for_static"]["failing_tests"] == ["etag present", "cache hit 304"], rows
+    assert by_task["feature-medium-etag_header_for_static"]["failing_tests"] == [
+        "etag present (failed: assert 66 == 18; shape)",
+        "cache hit 304",
+    ], rows
     assert by_task["bugfix-pytest-task"]["failing_tests"] == [
         "testing/test_x.py::test_a",
-        "tests/test_y.py::TestM::test_module_exists (skipped)",
+        "tests/test_y.py::TestM::test_module_exists (skipped: widget._helpers not available; create (it) first)",
     ], rows
     note = by_task["bugfix-pytest-task"]["final_note"]
     assert "(skipped) file was stale and kept my approach" in note and "[" not in note, note
