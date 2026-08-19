@@ -510,6 +510,15 @@ const OutcomeFile = struct {
 };
 
 /// 摄取入口:失败静默(回灌是增强不是依赖),返回新写入节点数。
+/// 截断到 max 字节并退到 UTF-8 码点边界(切点落在序列中间 ⇔ 首个被排除的
+/// 字节是续字节)。凡是要写进 tinykg 的文本截断必须走这里——裸字节截断切
+/// 码点 → add-node InvalidRecord 整行丢失(p10 现场,p9 结局行因此蒸发)。
+fn boundedUtf8(s: []const u8, max: usize) []const u8 {
+    var end: usize = @min(s.len, max);
+    while (end > 0 and end < s.len and (s[end] & 0xC0) == 0x80) end -= 1;
+    return s[0..end];
+}
+
 pub fn ingestOutcomes(
     allocator: std.mem.Allocator,
     kg: *kg_client_mod.KgClient,
@@ -581,18 +590,14 @@ pub fn ingestOutcomes(
         for (row.failing_tests, 0..) |name, i| {
             if (i >= 20) break;
             if (i > 0) failing.appendSlice(", ") catch break;
-            failing.appendSlice(if (name.len > 160) name[0..160] else name) catch break;
+            failing.appendSlice(boundedUtf8(name, 160)) catch break;
         }
         // note 放在 failing=[...] 之后:adapter 侧已剥方括号,GIGO 派生的
         // lastIndexOf(']') 定界不受影响;越界截到 300 **字节且退到 UTF-8
         // 码点边界**——p10 现场取证:中文 note 300 字符≈900 字节,裸字节
         // 截断切在码点中间 → tinykg add-node InvalidRecord → 整行丢失 →
         // 自我对质引用两代前的旧结论。
-        var note_end: usize = @min(row.final_note.len, 300);
-        // 切点落在序列中间 ⇔ 首个被排除的字节是续字节;回退到码点边界。
-        while (note_end > 0 and note_end < row.final_note.len and
-            (row.final_note[note_end] & 0xC0) == 0x80) note_end -= 1;
-        var note_bounded = row.final_note[0..note_end];
+        var note_bounded = boundedUtf8(row.final_note, 300);
         if (!std.unicode.utf8ValidateSlice(note_bounded)) note_bounded = "";
         const text = if (note_bounded.len > 0)
             std.fmt.allocPrint(
