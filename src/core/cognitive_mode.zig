@@ -18,6 +18,7 @@ pub const Mode = enum {
     construct,
     union_all,
     invert,
+    obey_report,
 
     pub fn directive(self: Mode) []const u8 {
         return switch (self) {
@@ -29,6 +30,13 @@ pub const Mode = enum {
                 "beats another single guess against a delayed verdict)",
             .invert => "repetition has refuted your standing interpretation — assume " ++
                 "it is wrong, argue the strongest alternative reading, and implement that",
+            // p20 取证:数值报告(assert 66 == 18)连续在场仍被自身"先例
+            // 决策"+自建测试假确认压制。第五档终止解读权。
+            .obey_report => "interpretation is over for this point — the verifier's " ++
+                "report above quotes expected vs actual verbatim: make your output " ++
+                "equal the EXPECTED side exactly, even where that contradicts " ++
+                "repository convention, your own recorded decisions, or a passing " ++
+                "self-test — none of those score; the comparison does",
         };
     }
 };
@@ -41,7 +49,8 @@ pub fn schedule(streak: usize) Mode {
         0, 1 => .verify,
         2 => .construct,
         3 => .union_all,
-        else => .invert,
+        4, 5 => .invert,
+        else => .obey_report,
     };
 }
 
@@ -52,7 +61,9 @@ test "schedule is total, monotone, defaults to verify, reaches union by three" {
     try std.testing.expectEqual(Mode.construct, schedule(2));
     try std.testing.expectEqual(Mode.union_all, schedule(3));
     try std.testing.expectEqual(Mode.invert, schedule(4));
-    try std.testing.expectEqual(Mode.invert, schedule(100));
+    try std.testing.expectEqual(Mode.invert, schedule(5));
+    try std.testing.expectEqual(Mode.obey_report, schedule(6));
+    try std.testing.expectEqual(Mode.obey_report, schedule(100));
     var previous: usize = 0;
     for (0..12) |streak| {
         const rank = @intFromEnum(schedule(streak));
