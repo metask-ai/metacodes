@@ -1,6 +1,6 @@
 # AgentCore Completion Runtime 设计方案
 
-状态：库内实现已落地，尚未进入 ABI（Revision 8 保持不变）
+状态：库内实现已落地；最小文本 Completion 已由 ABI v1 Revision 9 公开
 
 本文只定义 AgentCore 可提供的通用模型调用能力，不定义标题、摘要、会话或任何具体产品业务。
 
@@ -10,7 +10,7 @@
 
 消费方可能需要一次独立的模型生成能力，例如标题、摘要、分类或上下文摘要。这类能力不应进入 AgentLoop，但可以复用 AgentCore 已有的 Provider、模型配置、鉴权、取消、错误和 usage 基础设施。
 
-本提案的目标是先在库内定义并落地一个通用的 `CompletionRuntime`，让真实内部消费者磨合接口形状。当前没有已核实的外部消费者需求，因此本提案不推动 ABI revision。
+本提案最初用于先在库内定义并落地通用 `CompletionRuntime`。后续经过真实消费需求与 AgentCore 边界审计，Revision 9 只公开其中已被现有 Provider 可靠支撑的无工具文本 complete/stream 子集；本文件中的库内扩展形状不自动构成公共 ABI 承诺。
 
 ## 2. 架构边界
 
@@ -84,18 +84,16 @@ pub const CompletionRequest = struct {
 };
 
 // 当前库内实现直接复用现有 api_stream.ApiResponse。
-// 未来 ABI 才定义独立的 CompletionResult(text/usage/stop_reason)。
+    // Revision 9 公共投影定义独立的 CompletionResult(text/usage/stop_reason)。
 ```
 
-当前库内实现使用现有 `AbortSignal` 借用指针完成取消适配；这是库内形状，且只对
-`stream()` 生效。`complete()` 经过的 Provider 非流式 vtable 没有取消槽位，收到
-`abort` 或非空 `user_query` 时返回明确的不支持错误，不静默丢弃请求意图。未来如果
-进入 C ABI，该内部指针才由宿主分配的 opaque `cancel_token` 替代，并在 Runtime 内
-完成绑定和注销；这不是本次库内迁移要求新增的 HTTP 或 Session 取消协议。
+当前库内实现使用现有 `AbortSignal` 借用指针完成取消适配；这是库内形状。Revision 9
+不暴露该内部指针或 `user_query`，而由 opaque stream handle 的 `completion_stream_abort`
+打断阻塞中的 `next`。公共 `complete()` 内部消费同一 stream 路径，但不宣称可取消。
 
-当前库内 `complete()` 返回现有 `ApiResponse`，其 `content` 所有权和释放方式
-沿用 Provider 已有契约，不新增第二套 response/deinit 层。未来进入 C ABI 时，
-再将结果收敛为 library-owned `CompletionResult.text`，并提供明确的 release 函数。
+库内 `complete()` 返回现有 `ApiResponse`，其 `content` 所有权和释放方式沿用 Provider
+已有契约。Revision 9 公共投影将结果收敛为 library-owned `CompletionResult.text`，
+并使用公共 `buffer_release` 配对释放。
 
 库内入口：
 
@@ -142,8 +140,8 @@ providerInfo().supports(capability)
 ### 契约约束
 
 - `tools` 和 `tool_choice` 不属于第一版 CompletionRequest；
-- 当前库内接口使用借用的 `AbortSignal*`；未来 ABI 不传递内部指针，才改用由调用方或宿主分配的 `u64 cancel_token`，并由 Runtime 负责绑定和注销；
-- 当前库内沿用 `ApiResponse.content` 的 Provider 所有权契约；未来 ABI 的 `CompletionResult.text` 才采用 library-owned + 配对释放；
+- 当前库内接口使用借用的 `AbortSignal*`；Revision 9 ABI 不传递内部指针，也不引入 `cancel_token`，而通过 opaque stream handle 取消；
+- 当前库内沿用 `ApiResponse.content` 的 Provider 所有权契约；Revision 9 ABI 的 `CompletionResult.text` 采用 library-owned + 配对释放；
 - `stream()` 返回的 handle 由调用方创建并负责一次性 `deinit`；同一 handle 只允许一个读取者，不允许跨线程并发 `next()`；
 - abort 后，未消费完的 stream 的 `next()` 返回明确的 `Aborted`，随后仍由调用方负责 `deinit`；
 - AgentRuntime 的 run 结束不会隐式销毁消费方持有的 handle；
@@ -182,29 +180,13 @@ AgentRuntime ───────┘
 
 ## 8. ABI 影响与 revision 门槛
 
-当前 AgentCore 基线是 ABI v1 Revision 8。Revision 8 是 hard cut，函数表、结构体布局、table size 和 capability 集合必须精确匹配。
-
-本提案当前不修改 ABI，也不升 revision：
-
-```text
-Revision 8 → 保持不变
-```
-
-只有同时满足以下条件，才启动 Revision 9：
-
-1. 存在已确认的真实外部消费者；
-2. 消费者明确需要 `complete`、`stream` 或 `structured` 中的哪些能力；
-3. 对应请求、响应、取消、stream handle、所有权和错误契约已经闭合；
-4. 至少一个非库作者的真实消费者跑通声明的 capability matrix；
-5. ABI 文档、头文件、SDK、manifest 和 conformance tests 可以原子更新。
-
-届时如果把 CompletionRuntime 加入 C ABI，才执行：
+上述门槛已由 Revision 9 的范围审计和验收矩阵满足，因此公共 ABI 执行：
 
 ```text
 ABI v1 Revision 8 → Revision 9
 ```
 
-不提供 Revision 8 的隐式兼容、双表 shim 或旧表回退。
+Revision 9 只公开 user/assistant 文本消息、可选 system、文本结果、typed stream event、usage、stop reason 和并发 abort。它不公开库内 `model_override`、`user_query`、tool/server-tool、structured output 或通用 capability 查询；遇到 tool/server-tool 响应返回明确的不支持状态。Revision 9 是 exact hard cut，不提供 Revision 8 的隐式兼容、双表 shim 或旧表回退。规范以 `AGENTCORE_BINARY_ABI.md` 为准。
 
 ## 9. AgentLoop 改造边界
 
@@ -222,9 +204,9 @@ AgentLoop → CompletionRuntime.stream()
 
 除非未来能够单独证明 CompletionRuntime 提供了 Provider 无法提供的能力，并给出针对重试、continuation、abort、usage、诊断和性能的回归证据。
 
-## 10. 内部验收测试
+## 10. 验收测试
 
-在不修改 ABI 的前提下，库内测试覆盖：
+库内回归继续覆盖 `CompletionRuntime`；Revision 9 额外用公共 ABI 和 source-free consumer 覆盖：
 
 - CompletionRuntime.complete 的非流式请求和结果；
 - CompletionRuntime.stream 的打开、读取、结束和释放；
@@ -241,14 +223,14 @@ AgentLoop → CompletionRuntime.stream()
 ## 11. 最终决策
 
 ```text
-当前：AgentCore ABI v1 Revision 8
+当前：AgentCore ABI v1 Revision 9
   ├── AgentRuntime
   │   └── run() → api.Provider
-  └── CompletionRuntime（库内新增，暂不进 ABI）
-      ├── complete()
-      └── stream()
+  └── Completion（独立公共 handle，投影库内 CompletionRuntime）
+      ├── complete()（内部消费同一 stream 路径）
+      └── stream() / abort()
 ```
 
 `structured()` 作为待定 capability，不得提前画入已承诺的 ABI 能力表。
 
-先用真实内部消费者把 CompletionRuntime 做实；等真实外部消费者和能力矩阵出现后，再单独进行 Revision 9 设计和冻结评审。
+公共 R9 只承诺已闭合的最小文本能力；后续能力必须重新证明底层支持并通过独立 revision 评审，不能从库内接口存在推导为公共承诺。

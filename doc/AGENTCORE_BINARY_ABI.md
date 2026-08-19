@@ -10,31 +10,36 @@ stateful AgentSession execution. It does not expose or define a host product
 model.
 
 **Status: experimental.** The premature 2026-07-17 freeze was retracted after
-consumer feedback exposed a dangling callback-identity contract. Revision 8
+consumer feedback exposed a dangling callback-identity contract. Revision 9
 now defines one exact hard-cut wire shape after Permission authority,
-checkpoint/restore, durable budget, and MCP Runtime/Session seams were
-implemented and tested; this is not a general v1 stability promise.
+checkpoint/restore, durable budget, MCP Runtime/Session seams, explicit Skill
+catalog query scope, and independent text Completion were implemented and
+tested; this is not a general v1 stability promise.
 
 Consumers must pin an exact bundle (the manifest records the source commit)
 and treat a different revision as incompatible. Layouts, numeric values,
 function-table order, and semantics may change only through another explicit
 revision cut while v1 remains experimental.
 
-The current experimental bundle is **ABI v1 revision 8**. Revision 8 is a
+The current experimental bundle is **ABI v1 revision 9**. Revision 9 is a
 hard-cut replacement for every earlier revision. In addition to the Revision
-6 Session surface, it completes the Runtime/Session MCP protocol boundary:
+8 surface, it adds explicit Skill catalog query scope and an independent,
+no-tools text Completion surface:
 
-- `metask_agentcore_api_v1` is 216 bytes and requires `abi_revision == 8`;
+- `metask_agentcore_api_v1` is 280 bytes and requires `abi_revision == 9`;
 - `RuntimeConfigV1`, `SessionHostConfigV1`, `SessionCreateConfigV1`,
   `SessionRestoreConfigV1`, `RunInputV1`, and `RunResultV1` are respectively
   96, 168, 64, 64, 104, and 72 bytes on the required 64-bit ABI;
 - checkpoint, restore, describe, MCP refresh/describe/apply/selection,
-  Permission rule update, compact, and abort entries are mandatory;
-- the exact required capability set is `0xfffff`;
-- `manifest.json` records revision 8, table size 216, and that exact capability
+  Permission rule update, compact, abort, and all eight Completion entries are mandatory;
+- `SkillCatalogQueryV1`, `CompletionConfigV1`, `CompletionMessageV1`,
+  `CompletionRequestV1`, `CompletionResultV1`, `CompletionInfoV1`, and
+  `CompletionEventV1` are respectively 80, 88, 40, 72, 72, 48, and 80 bytes;
+- the exact required capability set is `0x3fffff`;
+- `manifest.json` records revision 9, table size 280, and that exact capability
   set.
 
-Revision 8 provides no earlier AgentCore revision compatibility, shim, dual dispatch, or old
+Revision 9 provides no earlier AgentCore revision compatibility, shim, dual dispatch, or old
 table layout. Consumers update the header, SDK, manifest, and library
 atomically, validate the stable
 `struct_size`/`abi_version` prefix before reading later fields, then require
@@ -261,7 +266,7 @@ Events describe observations, not commands. A Host may render, aggregate,
 persist, or ignore them; consuming an event never drives the core execution
 loop.
 
-`on_event` is mandatory in Revision 8. `run_state` is emitted for admitted-run
+`on_event` is mandatory in Revision 9. `run_state` is emitted for admitted-run
 start, phase/tool-set/turn/tool-call changes, and terminal closure; it is not a
 mirror of text or usage deltas. Its `transition_seq` starts at 1 for each Run
 and advances only for emitted RunState snapshots. Usage remains authoritative
@@ -281,7 +286,7 @@ checked arithmetic.
 decode it through the `unknown` observation path and ignore or retain it in
 accordance with the forward-compatibility rules above.
 
-`tool_result.file_refs` is an optional Revision 8 observation field. It is
+`tool_result.file_refs` is an optional Revision 9 observation field. It is
 present only for successful selected built-in file-tool executions and contains
 at most 32 entries. Each entry has one locator union (`workspace_path`,
 `absolute_path`, or `uri`), an open-ended bounded `kind` string, a bounded
@@ -390,7 +395,7 @@ not define status precedence when multiple other input or admission errors are
 present in the same call.
 
 ABI v1 provides no in-place recovery or mutation of a poisoned Session. The
-Host must destroy that physical handle. Revision 8 checkpoint/restore creates
+Host must destroy that physical handle. Revision 9 checkpoint/restore creates
 a new handle from a previously exported committed checkpoint; it does not
 reconstruct state that was never successfully exported or resume an active
 Run.
@@ -398,7 +403,7 @@ Run.
 When facade poison occurs after Core has returned to an inspectable idle state,
 `session_describe` succeeds and reports lifecycle `poisoned`; it must not report
 `idle`. An active ordinary Session activity makes `session_describe` return
-`METASK_AGENTCORE_STATUS_BUSY`, so a successful Revision 8 description does not
+`METASK_AGENTCORE_STATUS_BUSY`, so a successful Revision 9 description does not
 emit lifecycle `busy`.
 
 A checkpoint is resumable model state, not a raw transcript archive. Before
@@ -423,7 +428,7 @@ requests cooperative abort and any other value returns
 ### Manual compact
 
 `session_compact` runs the canonical default compact policy as a best-effort
-Conversation maintenance operation. Revision 8 has no Host-supplied target
+Conversation maintenance operation. Revision 9 has no Host-supplied target
 token budget and does not guarantee that the result fits the context window of
 the current or a future model. `session_set_model` and `session_compact` are
 independent primitives, not a compound model-migration transaction.
@@ -432,7 +437,7 @@ On `METASK_AGENTCORE_STATUS_OK`, `CompactResultV1.before_context_tokens` and
 `after_context_tokens` are context-size estimates for UI and policy decisions;
 they are not provider billing values. The four provider usage-delta fields are
 semantically separate. `METASK_AGENTCORE_COMPACT_DEGRADED` exposes no structured
-reason in Revision 8, and a Host must not infer one by parsing diagnostics.
+reason in Revision 9, and a Host must not infer one by parsing diagnostics.
 
 Assistant text and other execution output are delivered through `on_event`.
 `RunResultV1` is a terminal summary containing stop reason, turns, and tool
@@ -476,6 +481,19 @@ is a failed candidate: it remains subject to normal
 invocation-name precedence and, if selected, produces a local resource issue.
 An uncertain higher-priority candidate therefore never silently exposes a
 lower-priority Skill with the same invocation name.
+
+Revision 9 requires `SkillCatalogQueryV1.scope_code` to be exactly one of:
+
+- `METASK_AGENTCORE_SKILL_CATALOG_SCOPE_PERSONAL_ONLY`: scan only
+  `<workspace_home>/.agents/skills` as the personal source;
+- `METASK_AGENTCORE_SKILL_CATALOG_SCOPE_WORKSPACE_EFFECTIVE`: merge that
+  personal source with `<workspace_root>/.agents/skills`, with the project
+  source taking precedence.
+
+Zero and unknown scope codes are invalid. Scope is never inferred from empty
+fields or from `workspace_root == workspace_home`. If the two canonical paths
+are equal, `workspace_effective` scans the physical directory once and treats
+it as the project contribution, avoiding a synthetic self-conflict.
 
 Resource accounting includes every regular file below the selected Skill root,
 including `SKILL.md` and hidden files; no ignore file is applied. Every regular
@@ -599,7 +617,7 @@ synchronous within the same Host Run and projects its public text and usage
 through the ordinary event stream. The provider tool name `Skill` is reserved:
 Runtime creation rejects a Host tool with that name.
 
-Fork children cannot suspend for Host UI interaction in Revision 8. Their UI
+Fork children cannot suspend for Host UI interaction in Revision 9. Their UI
 requester is unavailable, so a child question or permission request fails
 closed as an ordinary fork/tool failure attributed to the outer Run. Inline
 execution may use the outer Run's synchronous UI callback.
@@ -611,7 +629,7 @@ product decision.
 
 ### MCP Runtime catalog and Session view
 
-Revision 8 supports exact MCP `2026-07-28`, `2025-11-25`, and `2025-06-18`
+Revision 9 supports exact MCP `2026-07-28`, `2025-11-25`, and `2025-06-18`
 connections. Public negotiation codes preserve Revision 6 meanings:
 `auto=1`, `modern_only=2`, and exact `legacy_only=3`; exact
 `legacy_2025_06_only=4` is appended. Runtime owns negotiation,
@@ -665,7 +683,7 @@ Modern `tools/list` cache metadata is required; `server/discover` may omit both
 cache fields. Each server TTL starts when that server's discovery completes,
 not when the multi-server refresh began.
 
-Canonical MCP schemas are retained losslessly, but Revision 8 advertises only
+Canonical MCP schemas are retained losslessly, but Revision 9 advertises only
 a bounded local validation profile. References, header projection,
 `uniqueItems: true`, numeric constraints, and numeric or structural
 `enum`/`const` are unavailable rather than approximately validated. Container,
@@ -684,13 +702,13 @@ provider `PreparedTool` only for selected admitted entries; a non-allocation
 disagreement with the recorded admission is an invariant violation. View
 destruction releases materialized tools before releasing the retained
 Snapshot. MCP Tasks, notification pumping, and automatic request replay remain
-outside Revision 8.
+outside Revision 9.
 
 The value-only MCP checkpoint section writes `R7MCP` state revision 2. Its
 decoder accepts only the exact `R6MCP`/revision 1 and `R7MCP`/revision 2 pairs;
 the new 2025-06 era value is appended and era remains provenance rather than a
 selection fingerprint input. This does not make AgentCore ABI Revision 6
-checkpoints loadable through Revision 8 discovery—the outer ABI remains a hard
+checkpoints loadable through Revision 9 discovery—the outer ABI remains a hard
 cut.
 
 ### Model-visible MCP diagnostics
@@ -734,13 +752,48 @@ outcomes to the model as the same ordinary deny Tool result; consumers that
 need the distinction must use `permission_provenance` until a shared typed
 prompt-outcome contract replaces that seam.
 
+### Independent text Completion
+
+Revision 9 exposes Completion as an opaque handle independent of Runtime,
+Session, Conversation, AgentLoop, Host tools, and MCP. `completion_create`
+copies provider kind, API key, base URL, and model before returning; the Host
+may release or overwrite every configuration buffer immediately afterward.
+`completion_describe` reports only the configured provider kind and a
+library-owned copy of the handle model. There is no request-level model
+override, token-limit promise, or general Provider capability projection.
+
+A request contains one or more user/assistant UTF-8 text messages and an
+optional system string. It has no tools, tool choice, attachments, structured
+output, deadline, or product semantics. `completion_complete` consumes the
+same internal stream path as public streaming and returns library-owned text,
+usage counters, and a typed stop reason. Tool-use or server-tool output is not
+concatenated into text; it returns
+`METASK_AGENTCORE_STATUS_COMPLETION_UNSUPPORTED_RESPONSE`.
+
+`completion_stream_start` borrows request descriptors and bytes only during
+that synchronous call. Before success returns, AgentCore has serialized and
+sent the complete request body; the Host may then poison or release the
+request buffers while continuing to read the stream. Each successful
+`completion_stream_next` returns one typed event: text, thinking, usage, or
+done. Text/thinking payloads are library-owned and released with
+`buffer_release`; usage and done use canonical empty payloads. Done is the
+single terminal observation. A subsequent `next` returns `TOO_LATE`.
+
+One Completion handle admits only one active complete or stream operation;
+overlap and destroy while active return `BUSY`. A stream has one reader:
+concurrent `next` calls are invalid. `completion_stream_abort` may be called
+from another thread while `next` is blocked and causes that reader to return
+an aborted terminal observation. `completion_stream_destroy` must not run
+concurrently with `next` or abort. After stream destroy releases the owning
+Completion gate, that Completion may be reused or destroyed.
+
 ABI v1 has three ownership classes:
 
 | Value | Owner and lifetime | Release |
 |---|---|---|
 | `metask_agentcore_bytes_view_v1` inputs and event/request views | Borrowed for the current synchronous call or callback | Never released |
 | Host tool results and UI responses | Host-owned callback output | Canonical `{NULL,0}` is never released; every other descriptor is passed to its paired Host release callback exactly once, independent of status |
-| AgentCore catalog descriptors and API diagnostics | Library-owned output | Released only with the discovered `buffer_release` function |
+| AgentCore catalog descriptors, Completion model/text/event payloads, and API diagnostics | Library-owned output | Released only with the discovered `buffer_release` function |
 
 Status controls whether callback output is consumed, not whether it is
 released. `METASK_AGENTCORE_HOST_OK` consumes success text. `METASK_AGENTCORE_HOST_FAILED` and
@@ -772,6 +825,9 @@ not remain valid after the callback returns.
 | release callbacks | Exactly once for every accepted Host-owned buffer; no thread affinity | Must not re-enter Run or destroy |
 | `session_abort` | May run concurrently with the matching synchronous Run, including from a callback | Cooperative; callback or provider code that blocks can delay completion |
 | `session_abort_compact` | May run concurrently only with the matching synchronous compact | Cancellation propagates to in-flight provider I/O |
+| `completion_complete` / `completion_stream_start` | Mutually exclusive per Completion handle | Overlap or destroy while active returns `BUSY` |
+| `completion_stream_next` | One blocking reader per stream | After the terminal done observation, later reads return `TOO_LATE` |
+| `completion_stream_abort` | May run from another thread concurrently with the one blocking `next` | Produces an aborted terminal observation; destroy is not concurrent-safe |
 
 Callbacks may request abort. A callback attempt to re-enter Run or destroy on
 the same handle returns `METASK_AGENTCORE_STATUS_BUSY`; callers must not spin or wait for that
@@ -905,21 +961,21 @@ reliable automatic classification.
 ### ABI evolution
 
 All v1 POD descriptors and the API table require their exact documented
-`struct_size`; every reserved field must be zero. Revision 8 freezes one exact
+`struct_size`; every reserved field must be zero. Revision 9 freezes one exact
 experimental cut. A later breaking v1 bundle must increment `abi_revision`,
 and consumers accept only the exact revision they were built against.
 Reserved storage is not permission to infer compatibility. After v1 is
 genuinely stabilized, later layout, function-table, or control-message
 extensions require `metask_agentcore_get_api(2)` and v2 types.
-In particular, assigning a meaning or non-zero value to a Revision 8 reserved
+In particular, assigning a meaning or non-zero value to a Revision 9 reserved
 field is a new wire contract and requires another explicit revision cut.
 
-Revision 8's published POD offsets and sizes require a 64-bit pointer ABI.
+Revision 9's published POD offsets and sizes require a 64-bit pointer ABI.
 The header rejects 32-bit consumers at compile time; a future 32-bit contract
 would need separately specified layouts and consumer gates.
 
 `capabilities` reports the API surface implemented by the returned library
-table. Revision 8 consumers require exact equality with
+table. Revision 9 consumers require exact equality with
 `METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1`; it is not an extensible superset
 check. It is not per-Runtime or per-Session negotiation; concrete Runtime and
 Session configuration still determines which tools and callbacks are active.
