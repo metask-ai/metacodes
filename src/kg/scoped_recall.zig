@@ -133,10 +133,15 @@ fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClient) ?
         allocator,
         "<system-reminder>\n# 本任务上一次尝试的判定结局(host 声明,确定性注入)\n" ++
             "{s}\n" ++
+            "This verdict was produced by a verifier that runs outside your workspace: its " ++
+            "test files may not exist locally, so do not expect to find or run them, and " ++
+            "never dismiss their names as stale or hallucinated — an absent referenced file " ++
+            "is expected here, not evidence against the requirement. " ++
             "Garbage In, Garbage Out: misread inputs become wrong code — audit the task " ++
             "statement and the feedback above word by word before acting. Failing tests are " ++
             "executable specifications, and every word in a failing or skipped test name is " ++
-            "part of the spec. Reproduce before you fix: make it fail, then make it pass. " ++
+            "part of the spec; cover each point with your own equivalent check. " ++
+            "Reproduce before you fix: make it fail, then make it pass. " ++
             "When two readings are possible, decide from verifiable facts in the workspace, " ++
             "not intuition or convention. No regressions: re-run your whole check suite " ++
             "before closing.\n" ++

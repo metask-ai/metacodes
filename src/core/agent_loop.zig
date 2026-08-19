@@ -601,6 +601,10 @@ pub fn run(
     const MAX_VERIFICATION_NUDGES: u8 = 2;
     var stream_turn_retries: u8 = 0;
     var requirement_ledger_state = requirement_ledger_mod.State{};
+    // 元规则①:全部 host 注入共享一个计量器——各门自证有界不蕴含合成
+    // 有界(Lean HostInjectionMeter.consumed_never_exceeds_cap 对任意门
+    // 序列量化)。
+    var host_injection_meter = @import("host_injection_meter.zig").Meter{};
     defer if (opts.requirement_ledger or opts.requirement_ledger_observe) {
         if (opts.tool_observer) |observer| {
             const counts = if (opts.tasks) |store|
@@ -1357,7 +1361,7 @@ pub fn run(
             // prompt) gets one bounded nudge per premature final. The
             // verification gate keeps priority — at most one injection per
             // round. Formal model: RequirementLedger.lean.
-            if (opts.requirement_ledger) {
+            if (opts.requirement_ledger and host_injection_meter.remaining() > 0) {
                 const counts = if (opts.tasks) |store|
                     store.ledgerCounts()
                 else
@@ -1369,6 +1373,7 @@ pub fn run(
                 )) {
                     .none => {},
                     .open_items => {
+                        _ = host_injection_meter.tryConsume();
                         requirement_ledger_state.nudges += 1;
                         log.infoId("agent", rid, "requirement ledger nudge {d}/{d} open={d}", .{ requirement_ledger_state.nudges, requirement_ledger_mod.MAX_LEDGER_NUDGES, counts.open });
                         backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
@@ -1382,6 +1387,7 @@ pub fn run(
                         continue;
                     },
                     .coverage => {
+                        _ = host_injection_meter.tryConsume();
                         requirement_ledger_state.nudges += 1;
                         requirement_ledger_state.coverage_nudge_used = true;
                         log.infoId("agent", rid, "requirement ledger coverage nudge {d}/{d}", .{ requirement_ledger_state.nudges, requirement_ledger_mod.MAX_LEDGER_NUDGES });
@@ -1390,6 +1396,7 @@ pub fn run(
                         continue;
                     },
                     .shallow => {
+                        _ = host_injection_meter.tryConsume();
                         requirement_ledger_state.nudges += 1;
                         requirement_ledger_state.shallow_nudge_used = true;
                         log.infoId("agent", rid, "requirement ledger shallow nudge {d}/{d} total={d}", .{ requirement_ledger_state.nudges, requirement_ledger_mod.MAX_LEDGER_NUDGES, counts.total });
@@ -1402,8 +1409,13 @@ pub fn run(
             // 任务义务门:author 上一轮为本任务学得的收尾义务未满足 →
             // 有界 nudge(每义务一次,全局 ≤2,纯注入绝不硬拒)。
             if (opts.obligations) |obligation_runtime| {
-                if (obligation_runtime.decide().index) |obligation_index| {
+                const obligation_decision: ?usize = if (host_injection_meter.remaining() > 0)
+                    obligation_runtime.decide().index
+                else
+                    null;
+                if (obligation_decision) |obligation_index| {
                     const envelope = obligation_runtime.envelopes[obligation_index];
+                    _ = host_injection_meter.tryConsume();
                     obligation_runtime.noteNudged(obligation_index);
                     log.warnId("agent", rid, "task obligation nudge {d}/{d} needle={s}", .{ obligation_runtime.nudges_used, @import("obligation_gate.zig").MAX_OBLIGATION_NUDGES, envelope.command_needle });
                     backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
