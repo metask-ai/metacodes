@@ -3981,6 +3981,117 @@ test "L2 Revision 9 Completion stream owns request buffers and projects typed ev
     completion = null;
 }
 
+test "L2 Revision 9 Completion stream start releases request buffers for every provider" {
+    const Exercise = struct {
+        fn run(api: sdk.Api, provider_kind: u32, response: []const u8, model: []const u8) !void {
+            const a = std.testing.allocator;
+            var server = try harness.MockServer.start(response, 0);
+            defer server.stop();
+            const url = try server.urlOwned(a);
+            defer a.free(url);
+
+            var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+            defer api.bufferRelease()(&diagnostic);
+            var config = wire.CompletionConfigV1{
+                .struct_size = @sizeOf(wire.CompletionConfigV1),
+                .provider_kind_code = provider_kind,
+                .api_key = sdk.bytesView("test-key"),
+                .base_url = sdk.bytesView(url),
+                .model = sdk.bytesView(model),
+                .reserved = [_]u64{0} ** 4,
+            };
+            var completion: ?*wire.CompletionHandle = null;
+            try std.testing.expectEqual(
+                wire.STATUS_OK,
+                api.completionCreate()(&config, &completion, &diagnostic),
+            );
+            defer if (completion) |handle| {
+                _ = api.completionDestroy()(handle, &diagnostic);
+            };
+
+            const user_marker = "all-provider-stream-user-lifetime-marker";
+            const system_marker = "all-provider-stream-system-lifetime-marker";
+            const user = try a.dupe(u8, user_marker);
+            const system = try a.dupe(u8, system_marker);
+            const messages = try a.alloc(wire.CompletionMessageV1, 1);
+            messages[0] = .{
+                .struct_size = @sizeOf(wire.CompletionMessageV1),
+                .role_code = wire.COMPLETION_ROLE_USER,
+                .text = sdk.bytesView(user),
+                .reserved = [_]u64{0} ** 2,
+            };
+            var request = wire.CompletionRequestV1{
+                .struct_size = @sizeOf(wire.CompletionRequestV1),
+                .reserved0 = 0,
+                .messages = messages.ptr,
+                .message_count = messages.len,
+                .system = sdk.bytesView(system),
+                .reserved = [_]u64{0} ** 4,
+            };
+            var stream: ?*wire.CompletionStreamHandle = null;
+            try std.testing.expectEqual(
+                wire.STATUS_OK,
+                api.completionStreamStart()(completion, &request, &stream, &diagnostic),
+            );
+            @memset(user, 0xa5);
+            @memset(system, 0xa5);
+            @memset(std.mem.sliceAsBytes(messages), 0xa5);
+            @memset(std.mem.asBytes(&request), 0xa5);
+            a.free(user);
+            a.free(system);
+            a.free(messages);
+            defer if (stream) |handle| {
+                _ = api.completionStreamDestroy()(handle, &diagnostic);
+            };
+
+            var saw_text = false;
+            var saw_done = false;
+            while (!saw_done) {
+                var event = std.mem.zeroes(wire.CompletionEventV1);
+                try std.testing.expectEqual(
+                    wire.STATUS_OK,
+                    api.completionStreamNext()(stream, &event, &diagnostic),
+                );
+                defer api.bufferRelease()(&event.payload);
+                switch (event.kind_code) {
+                    wire.COMPLETION_EVENT_TEXT => saw_text = true,
+                    wire.COMPLETION_EVENT_THINKING, wire.COMPLETION_EVENT_USAGE => {},
+                    wire.COMPLETION_EVENT_DONE => {
+                        saw_done = true;
+                        try std.testing.expectEqual(
+                            wire.COMPLETION_STOP_END_TURN,
+                            event.stop_reason_code,
+                        );
+                    },
+                    else => return error.UnexpectedCompletionEvent,
+                }
+            }
+            try std.testing.expect(saw_text);
+            const captured = server.lastRequest() orelse return error.NoRequestCaptured;
+            try std.testing.expect(std.mem.indexOf(u8, captured.body(), user_marker) != null);
+            try std.testing.expect(std.mem.indexOf(u8, captured.body(), system_marker) != null);
+
+            try std.testing.expectEqual(
+                wire.STATUS_OK,
+                api.completionStreamDestroy()(stream, &diagnostic),
+            );
+            stream = null;
+            try std.testing.expectEqual(
+                wire.STATUS_OK,
+                api.completionDestroy()(completion, &diagnostic),
+            );
+            completion = null;
+        }
+    };
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    try Exercise.run(api, wire.PROVIDER_ANTHROPIC, FINAL_SSE, "lifetime-anthropic");
+    try Exercise.run(api, wire.PROVIDER_OPENAI, OPENAI_FINAL_SSE, "lifetime-openai");
+    try Exercise.run(api, wire.PROVIDER_GEMINI, GEMINI_FINAL_SSE, "lifetime-gemini");
+}
+
 test "L2 Revision 9 Completion abort concurrently interrupts blocking next" {
     const NextWorker = struct {
         api: sdk.Api,
