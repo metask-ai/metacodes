@@ -176,7 +176,7 @@ fn appendModeSection(
     return max_streak;
 }
 
-fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClient) ?[]u8 {
+pub fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClient) ?[]u8 {
     const hint_c = std.c.getenv(TASK_HINT_ENV) orelse return null;
     const hint = std.mem.span(hint_c);
     const body = sameTaskOutcomeRow(allocator, kg, hint) orelse return null;
@@ -211,14 +211,20 @@ fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClient) ?
         return out.toOwnedSlice(allocator) catch null;
     }
     out.appendSlice(allocator,
-        "This verdict was produced by a verifier that runs outside your workspace: its " ++
-            "test files may not exist locally, so do not expect to find or run them, and " ++
-            "never dismiss their names as stale or hallucinated — an absent referenced file " ++
-            "is expected here, not evidence against the requirement. " ++
+        // p10 教训:旧句"cover each point with your own equivalent check"
+        // 字面授权了等价替代(agent 最终自辩逐字执行它)。计分语义是
+        // 字面制:只有被点名的测试本身可收集、可通过才得分。
+        "This verdict was produced by a verifier that runs outside your workspace and " ++
+            "scores only its own named tests: never dismiss their names as stale or " ++
+            "hallucinated — an absent referenced file is a requirement you have not built " ++
+            "yet, not evidence against the requirement. " ++
             "Garbage In, Garbage Out: misread inputs become wrong code — audit the task " ++
             "statement and the feedback above word by word before acting. Failing tests are " ++
             "executable specifications, and every word in a failing or skipped test name is " ++
-            "part of the spec; cover each point with your own equivalent check. " ++
+            "part of the spec: each name references concrete artifacts (a file, a module, " ++
+            "a class, a function) — build exactly those artifacts at the locations the name " ++
+            "implies so the named test itself could collect and pass; a private equivalent " ++
+            "check of your own scores nothing. " ++
             "Reproduce before you fix: make it fail, then make it pass. " ++
             "A failing requirement is a goal to make true, not a claim to falsify — when the " ++
             "thing it names does not exist, creating it is usually the requirement itself. " ++
@@ -251,7 +257,20 @@ fn collectHistory(
     defer entries.deinit();
     for (hits) |h| {
         if (std.mem.indexOf(u8, h.text, needle) == null) continue;
-        const copy = allocator.dupe(u8, h.text) catch continue;
+        // p10 取证:召回摘录 800 字符封顶,8 个长 pytest 名的 failing 列表
+        // 必被截断在闭括号前 → failingSection=null → mode 段/升级态整体
+        // 静默失效(任务越难列表越长越必然)。与 sameTaskOutcomeRow 同款
+        // 补取全文;补取失败保留摘录(streak 宁可低估不虚增)。
+        var text_src: []const u8 = h.text;
+        var full_owned: ?[]u8 = null;
+        defer if (full_owned) |full| kg.allocator.free(full);
+        if (h.text_truncated) {
+            if (kg.fetchNodeText(h.node_id)) |full| {
+                full_owned = full;
+                text_src = full;
+            } else |_| {}
+        }
+        const copy = allocator.dupe(u8, text_src) catch continue;
         entries.append(.{ .id = h.node_id, .text = copy }) catch {
             allocator.free(copy);
             continue;

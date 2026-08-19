@@ -70,6 +70,7 @@ pub const recorder = @import("core/recorder.zig");
 pub const context_pressure = @import("core/context_pressure.zig");
 pub const kg_task_projection = @import("kg/task_projection.zig"); // pure TinyKG snapshot/Markdown contract
 pub const kg_client = @import("kg/client.zig"); // local daemon/exclusive-store control-plane client
+pub const scoped_recall = @import("kg/scoped_recall.zig"); // deterministic outcome-note + scored recall
 pub const kg_transport = @import("kg/transport.zig"); // authenticated tinykgd HTTP transport
 pub const kg_experience_packet = @import("kg/experience_packet.zig"); // prior execution feedback at claim boundary
 pub const kg_lexical_query_plan = @import("kg/lexical_query_plan.zig"); // governed vector-free query plans + host ledger

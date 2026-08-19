@@ -51,6 +51,7 @@ pub const task_output_tool = @import("tools/task_output.zig");
 pub const agent_tool = @import("tools/agent.zig");
 pub const core_task_store = @import("core/task_store.zig");
 pub const kg_client = @import("kg/client.zig");
+pub const scoped_recall = @import("kg/scoped_recall.zig");
 pub const kg_transport = @import("kg/transport.zig");
 pub const swarm_team = @import("swarm/team.zig");
 pub const swarm_mailbox = @import("swarm/mailbox.zig");

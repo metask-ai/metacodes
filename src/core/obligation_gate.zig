@@ -19,9 +19,12 @@ pub const NUDGE_FMT =
     "A rule you authored for this task in a previous attempt is not yet " ++
     "satisfied: {s}\n" ++
     "It requires that, before finishing, you execute a command containing " ++
-    "`{s}` and act on its result. Run it now and show the outcome; if it is " ++
-    "genuinely inapplicable in this workspace, say so explicitly with the " ++
-    "reason.";
+    "`{s}` and it must SUCCEED. Run it now and show the outcome. If the " ++
+    "reference names a file, module, class or function that does not exist, " ++
+    "that absence is the unfinished work itself — create the named artifact " ++
+    "at exactly the location the reference implies, then run the command " ++
+    "again until it succeeds. Absence is never inapplicability, and a " ++
+    "substitute check of your own does not satisfy this rule.";
 
 pub const Decision = struct {
     /// 需要 nudge 的义务下标;null = 无动作。
@@ -98,8 +101,9 @@ pub const Runtime = struct {
 pub const MAX_DERIVED: usize = 3;
 pub const GIGO_REASON =
     "input-audit (Garbage In, Garbage Out): a previous attempt failed " ++
-    "exactly this point. Reproduce before you fix — execute a check covering " ++
-    "it, or state explicitly why it does not apply in this workspace";
+    "exactly this point. Reproduce before you fix — make the referenced " ++
+    "check itself collect and succeed; if what it names is missing, " ++
+    "creating it at the named location is the work, not grounds to skip";
 
 /// 从结局行文本("… failing=[a, b, c]")解析派生义务,追加进 list(去重、
 /// 截 " (skipped)" 后缀、边界过滤)。返回追加条数。

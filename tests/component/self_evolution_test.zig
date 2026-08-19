@@ -667,4 +667,144 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     try std.testing.expect(std.mem.indexOf(u8, text3, "UNION") != null);
     try std.testing.expect(std.mem.indexOf(u8, text3, "ESCALATED") != null);
     try std.testing.expect(std.mem.indexOf(u8, text3, "Garbage In, Garbage Out") == null);
+
+    // 召回摘录 800 字符截断(p10 取证雷):8 个长 pytest 名的 failing 列表
+    // 超 800 → 摘录无闭括号 → failingSection=null → mode 段静默消失,
+    // 升级态/正名条款永不触发(任务越难越必然)。修复=collectHistory 对
+    // truncated 命中补取全文;此 stanza 若无补取必失败。
+    {
+        var rows = std.array_list.Managed(u8).init(a);
+        defer rows.deinit();
+        var attempt: usize = 0;
+        while (attempt < 2) : (attempt += 1) {
+            if (attempt > 0) try rows.appendSlice(",");
+            const head = try std.fmt.allocPrint(a,
+                "{{\"task\":\"long-wall-task\",\"attempt_key\":\"la{d}\",\"reward\":0.27,\"tests_passed\":3,\"tests_total\":11,\"failing_tests\":[",
+                .{attempt});
+            defer a.free(head);
+            try rows.appendSlice(head);
+            var i: usize = 0;
+            while (i < 8) : (i += 1) {
+                if (i > 0) try rows.appendSlice(",");
+                const name = try std.fmt.allocPrint(a,
+                    "\"tests/test_static_utils_prehistoric_standalone_verification.py::TestExtremelyDescriptiveEtagClassName::test_case_number_{d}_with_a_very_long_descriptive_behavior_suffix (skipped)\"",
+                    .{i});
+                defer a.free(name);
+                try rows.appendSlice(name);
+            }
+            // 生产杀伤条件:note 足够长把 failing 的闭括号推出头尾摘录窗
+            // (p10 现场 = 300B 中文 note + 8 长名)。无 note 的行闭括号在
+            // 尾窗存活,mode 段照常渲染——测不出这颗雷。
+            try rows.appendSlice("],\"final_note\":\"");
+            var pad: usize = 0;
+            while (pad < 30) : (pad += 1)
+                try rows.appendSlice("conceptually verified ");
+            try rows.appendSlice("\"}");
+        }
+        const payload_long = try std.fmt.allocPrint(a,
+            "{{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[{s}]}}",
+            .{rows.items});
+        defer a.free(payload_long);
+        const pfs = @import("platform").fs;
+        const zl = try a.dupeZ(u8, outcomes_path);
+        defer a.free(zl);
+        const fd = pfs.open(zl.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = pfs.close(fd);
+        var off: usize = 0;
+        while (off < payload_long.len) {
+            const n = pfs.write(fd, payload_long[off..]);
+            try std.testing.expect(n > 0);
+            off += @intCast(n);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), self_evolution.ingestOutcomes(a, &kg));
+    ppaths.setEnv("METACODES_TASK_HINT", "long-wall-task");
+    var built_long = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    defer built_long.deinit(a);
+    const text_long = built_long.text orelse return error.TestExpectedInjection;
+    try std.testing.expect(std.mem.indexOf(u8, text_long, "Per-point reading mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_long, "failed 2 consecutive attempt(s)") != null);
+    // 新框架:等价替代授权句已铲除,字面制计分语义在场。
+    try std.testing.expect(std.mem.indexOf(u8, text_long, "with your own equivalent check") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text_long, "scores nothing") != null);
+    ppaths.setEnv("METACODES_TASK_HINT", "wall-task");
+
+    // UTF-8 截断安全(p10 现场雷):中文 note >300 字节,裸字节截断切码点
+    // 中间 → tinykg InvalidRecord 整行丢失。必须退到码点边界后成功入店。
+    {
+        var long_note = std.array_list.Managed(u8).init(a);
+        defer long_note.deinit();
+        var i: usize = 0;
+        while (i < 120) : (i += 1) try long_note.appendSlice("判定结论");
+        const payload4 = try std.fmt.allocPrint(a,
+            "{{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+                "{{\"task\":\"utf8-task\",\"attempt_key\":\"a1\",\"reward\":0.1,\"tests_passed\":1,\"tests_total\":2," ++
+                "\"failing_tests\":[\"some named check\"],\"final_note\":\"{s}\"}}]}}",
+            .{long_note.items});
+        defer a.free(payload4);
+        const pfs = @import("platform").fs;
+        const z4 = try a.dupeZ(u8, outcomes_path);
+        defer a.free(z4);
+        const fd = pfs.open(z4.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = pfs.close(fd);
+        var off: usize = 0;
+        while (off < payload4.len) {
+            const n = pfs.write(fd, payload4[off..]);
+            try std.testing.expect(n > 0);
+            off += @intCast(n);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
+}
+
+// 取证重放(环境门控,CI 永不跑):对真实导出 store 跑 v15 note 构造器,
+// 对拍生产 stderr 里的 bytes/sha。METACODES_REPLAY_STORE=<store dir> 激活。
+test "forensic replay: deterministic note against real store" {
+    const a = std.testing.allocator;
+    const store_c = std.c.getenv("METACODES_REPLAY_STORE") orelse return error.SkipZigTest;
+    const store = std.mem.span(store_c);
+    const kg_bin = if (std.c.getenv("METACODES_REPLAY_KG_BIN")) |b|
+        try a.dupe(u8, std.mem.span(b))
+    else
+        findKgBin(a) orelse return error.SkipZigTest;
+    defer a.free(kg_bin);
+    @import("platform").paths.setEnv("METACODES_TASK_HINT", "feature-medium-etag_header_for_static");
+    @import("platform").paths.setEnv("METACODES_KG_TRANSPORT", "cli-exclusive");
+    const domains = [_][]const u8{ "workspace-5807156e", "workspace", "global" };
+    for (domains) |domain| {
+        var kg = try cc.kg_client.KgClient.init(a, .{
+            .home = "/tmp/replay-home",
+            .domain = domain,
+            .config_bin = kg_bin,
+            .config_store = store,
+            .env_bin = "",
+            .env_store = "",
+        });
+        defer kg.deinit();
+        kg.ensureReady();
+        std.debug.print("domain={s} ready={}\n", .{ domain, kg.ready });
+        {
+            const hits = kg.recallTyped("metacodes-outcome-note-v1 feature-medium-etag_header_for_static", 40, false, "task_outcome") catch &.{};
+            defer {
+                for (hits) |*h| h.deinit(kg.allocator);
+                kg.allocator.free(hits);
+            }
+            std.debug.print("  recall hits={d}\n", .{hits.len});
+            for (hits) |h| if (std.mem.indexOf(u8, h.text, "etag_header") != null) {
+                std.debug.print("  hit id={d} trunc={} len={d}\n", .{ h.node_id, h.text_truncated, h.text.len });
+            };
+        }
+        const note = cc.scoped_recall.sameTaskOutcomeNote(a, &kg) orelse {
+            std.debug.print("domain={s}: note=null\n", .{domain});
+            continue;
+        };
+        defer a.free(note);
+        var sha_buf: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(note, &sha_buf, .{});
+        std.debug.print("domain={s} bytes={d} sha={x}\n", .{ domain, note.len, sha_buf[0..8] });
+        std.debug.print("---- note ----\n{s}\n---- end ----\n", .{note});
+        break;
+    }
 }
