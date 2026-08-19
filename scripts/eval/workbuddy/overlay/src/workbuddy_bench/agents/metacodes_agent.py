@@ -151,9 +151,11 @@ def _annotate_failing(name: str, reasons: dict) -> str:
     # 列表定界完整性:失败行以 ", " 连接、下游以 ", " 分割,消息里的逗号
     # 会把条目劈碎产生垃圾针 → 逗号换分号;方括号换圆括号(failing=[...]
     # 括号定界)。
+    # 200 帽:AT 子句(≈90 消息 + 16 前缀 + 80 现场)在 120 帽下被截没
+    # (p28 取证:6 条 TypeError 只有 1 条保住方向线索)。
     msg = " ".join(
         msg.replace("[", "(").replace("]", ")").replace(",", ";").split()
-    )[:120].strip()
+    )[:200].strip()
     if not msg:
         return name
     if name.endswith(" (skipped)") and kind != "skipped":
