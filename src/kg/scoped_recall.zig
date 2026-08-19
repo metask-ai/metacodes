@@ -142,9 +142,13 @@ fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClient) ?
             "executable specifications, and every word in a failing or skipped test name is " ++
             "part of the spec; cover each point with your own equivalent check. " ++
             "Reproduce before you fix: make it fail, then make it pass. " ++
+            "A failing requirement is a goal to make true, not a claim to falsify — when the " ++
+            "thing it names does not exist, creating it is usually the requirement itself. " ++
             "When two readings are possible, decide from verifiable facts in the workspace, " ++
-            "not intuition or convention. No regressions: re-run your whole check suite " ++
-            "before closing.\n" ++
+            "not intuition or convention. You get exactly one verdict per attempt: never " ++
+            "resubmit an approach whose verdict you already know (your own previous " ++
+            "conclusion is quoted above when available) — change something material. " ++
+            "No regressions: re-run your whole check suite before closing.\n" ++
             "</system-reminder>\n",
         .{body},
     ) catch null;

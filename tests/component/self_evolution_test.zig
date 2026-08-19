@@ -339,7 +339,7 @@ test "L2: outcome ingestion is idempotent through the real recall path" {
     {
         const upgraded_payload = "{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
             "{\"task\":\"etag\",\"attempt_key\":\"a1\",\"reward\":0.27,\"tests_passed\":3,\"tests_total\":11,\"failing_tests\":[\"t::a\",\"t::b\"]}," ++
-            "{\"task\":\"bugfix\",\"attempt_key\":\"a1\",\"reward\":0.5,\"tests_passed\":2,\"tests_total\":4,\"failing_tests\":[\"named now\"]}]}";
+            "{\"task\":\"bugfix\",\"attempt_key\":\"a1\",\"reward\":0.5,\"tests_passed\":2,\"tests_total\":4,\"failing_tests\":[\"named now\"],\"final_note\":\"kept my approach unchanged last time\"}]}";
         const pfs = @import("platform").fs;
         const outcomes_z2 = try a.dupeZ(u8, outcomes_path);
         defer a.free(outcomes_z2);
@@ -372,6 +372,7 @@ test "L2: outcome ingestion is idempotent through the real recall path" {
     defer built.deinit(a);
     const injected_text = built.text orelse return error.TestExpectedInjection;
     try std.testing.expect(std.mem.indexOf(u8, injected_text, "task=etag") != null);
+    // 自我历史对质:etag 行升级前无 note;换 hint 验 bugfix 行的 note 贯通。
     try std.testing.expect(std.mem.indexOf(u8, injected_text, "t::b") != null);
     try std.testing.expect(std.mem.indexOf(u8, injected_text, "task=bugfix") == null);
     try std.testing.expectEqualStrings("injected", built.receipt.status);
@@ -536,4 +537,74 @@ test "L2: author obligation proposal lands as an envelope the same task collects
     const obligations = try self_evolution.collectObligations(arena.allocator(), &kg, "obl-task");
     try std.testing.expectEqual(@as(usize, 1), obligations.len);
     try std.testing.expectEqualStrings("pytest testing/test_x.py::test_a", obligations[0].command_needle);
+}
+
+test "L2: final_note rides the outcome row into note and GIGO stays intact" {
+    // 自我历史对质贯通:带 final_note 的行入店 → 同题 note 含 note=;
+    // GIGO 派生仍按 failing=[...] 定界(note 在括号之后,adapter 已剥括号)。
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const kg_bin = findKgBin(a) orelse return error.SkipZigTest;
+    defer a.free(kg_bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var store_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const store_dir = try std.fmt.bufPrint(&store_buffer, "{s}/store", .{root});
+    var kg = try cc.kg_client.KgClient.init(a, .{
+        .home = root,
+        .domain = "selfevo-l2e",
+        .config_bin = kg_bin,
+        .config_store = store_dir,
+        .env_bin = "",
+        .env_store = "",
+    });
+    defer kg.deinit();
+    kg.ensureReady();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const outcomes_path = try std.fmt.bufPrint(&path_buffer, "{s}/o.json", .{root});
+    {
+        const payload = "{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+            "{\"task\":\"wall-task\",\"attempt_key\":\"a1\",\"reward\":0.27,\"tests_passed\":3,\"tests_total\":11," ++
+            "\"failing_tests\":[\"tests/t.py::TestX::test_uses_sha256 (skipped)\"]," ++
+            "\"final_note\":\"I concluded the (skipped) file was stale and changed nothing\"}]}";
+        const pfs = @import("platform").fs;
+        const z = try a.dupeZ(u8, outcomes_path);
+        defer a.free(z);
+        const fd = pfs.open(z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = pfs.close(fd);
+        var off: usize = 0;
+        while (off < payload.len) {
+            const n = pfs.write(fd, payload[off..]);
+            try std.testing.expect(n > 0);
+            off += @intCast(n);
+        }
+    }
+    var value_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const value_z = try std.fmt.bufPrintZ(&value_buffer, "{s}", .{outcomes_path});
+    const ppaths = @import("platform").paths;
+    ppaths.setEnv(self_evolution.OUTCOMES_ENV, value_z.ptr);
+    defer ppaths.unsetEnv(self_evolution.OUTCOMES_ENV);
+    try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
+
+    ppaths.setEnv("METACODES_TASK_HINT", "wall-task");
+    defer ppaths.unsetEnv("METACODES_TASK_HINT");
+    var conversation = cc.conversation.Conversation.init(a);
+    defer conversation.deinit();
+    var abort_signal = cc.util_abort.AbortSignal.init();
+    var built = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    defer built.deinit(a);
+    const text = built.text orelse return error.TestExpectedInjection;
+    try std.testing.expect(std.mem.indexOf(u8, text, "note=I concluded the (skipped) file was stale") != null);
+    // GIGO 派生不受 note 污染:needle = skip 名(剥后缀),非 note 内容。
+    const runtime = cc.obligation_gate.load(a, &kg, "wall-task") orelse return error.TestExpectedRuntime;
+    defer {
+        runtime.deinit();
+        a.destroy(runtime);
+    }
+    try std.testing.expectEqual(@as(usize, 1), runtime.count());
+    try std.testing.expectEqualStrings("tests/t.py::TestX::test_uses_sha256", runtime.envelopes[0].command_needle);
 }

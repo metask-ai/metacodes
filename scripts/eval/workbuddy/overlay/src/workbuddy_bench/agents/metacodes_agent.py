@@ -364,16 +364,43 @@ class MetacodesAgent(BaseInstalledAgent):
                                 break
                     except OSError:
                         pass
-                rows.append(
-                    {
-                        "task": task,
-                        "attempt_key": attempt_key,
-                        "reward": float(reward),
-                        "tests_passed": int(score.get("tests_passed") or 0),
-                        "tests_total": int(score.get("tests_total") or 0),
-                        "failing_tests": failing,
-                    }
-                )
+                # 自我历史对质(p7 etag 取证):agent 上次的收尾结论是最强的
+                # 反重复/反理性化材料——"这些名字是幻觉"会撞上它自己上次写
+                # 下的话。取上次 transcript 的最后一段 assistant 文本,单行化
+                # 并剥方括号(结局行的 failing=[...] 解析按括号定界)。
+                final_note = ""
+                try:
+                    transcript = trial_dir / "agent" / "metacodes-transcript.jsonl"
+                    for line in reversed(
+                        transcript.read_text(encoding="utf-8", errors="replace").splitlines()
+                    ):
+                        entry = json.loads(line)
+                        if entry.get("role") != "assistant":
+                            continue
+                        for block in entry.get("blocks", []):
+                            if block.get("type") == "text" and len(block.get("text", "")) > 40:
+                                final_note = (
+                                    block["text"][:300]
+                                    .replace("\n", " ")
+                                    .replace("[", "(")
+                                    .replace("]", ")")
+                                )
+                                break
+                        if final_note:
+                            break
+                except (OSError, json.JSONDecodeError):
+                    pass
+                row = {
+                    "task": task,
+                    "attempt_key": attempt_key,
+                    "reward": float(reward),
+                    "tests_passed": int(score.get("tests_passed") or 0),
+                    "tests_total": int(score.get("tests_total") or 0),
+                    "failing_tests": failing,
+                }
+                if final_note:
+                    row["final_note"] = final_note
+                rows.append(row)
         return rows
 
     async def run(

@@ -3314,6 +3314,12 @@ with tempfile.TemporaryDirectory() as directory:
         "FAILED testing/test_x.py::test_a\n"
         "tests/test_y.py::TestM::test_module_exists SKIPPED [  9%]\n"
     )
+    # 自我历史对质:上次 transcript 的收尾结论进结局行(单行化+剥方括号)。
+    (done2 / "agent").mkdir()
+    (done2 / "agent" / "metacodes-transcript.jsonl").write_text(
+        json.dumps({"role": "assistant", "blocks": [{"type": "text",
+            "text": "Done. I concluded the [skipped] file was stale\nand kept my approach unchanged for now, see summary."}]}) + "\n"
+    )
     # 当前 trial:config.json 是任务全名的权威来源。
     trial = jobs / "batch-1" / "etag_task__now1"
     logs = trial / "agent"
@@ -3351,6 +3357,9 @@ with tempfile.TemporaryDirectory() as directory:
         "testing/test_x.py::test_a",
         "tests/test_y.py::TestM::test_module_exists (skipped)",
     ], rows
+    note = by_task["bugfix-pytest-task"]["final_note"]
+    assert "(skipped) file was stale and kept my approach" in note and "[" not in note, note
+    assert "final_note" not in by_task["feature-medium-etag_header_for_static"], rows
 ''')
 
     def test_accumulation_off_keeps_the_original_contract(self):

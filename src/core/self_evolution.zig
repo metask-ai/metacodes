@@ -499,6 +499,9 @@ const OutcomeRow = struct {
     tests_passed: u32 = 0,
     tests_total: u32 = 0,
     failing_tests: []const []const u8 = &.{},
+    /// agent 上次的收尾结论(host 采集,≤300B,已单行化+剥方括号)。
+    /// 自我历史对质:反重复/反理性化的第一手材料。
+    final_note: []const u8 = "",
 };
 
 const OutcomeFile = struct {
@@ -580,11 +583,21 @@ pub fn ingestOutcomes(
             if (i > 0) failing.appendSlice(", ") catch break;
             failing.appendSlice(if (name.len > 160) name[0..160] else name) catch break;
         }
-        const text = std.fmt.allocPrint(
-            allocator,
-            OUTCOME_MARKER ++ ": key={s} task={s} reward={d:.4} tests={d}/{d} failing=[{s}]",
-            .{ key, row.task, row.reward, row.tests_passed, row.tests_total, failing.items },
-        ) catch continue;
+        // note 放在 failing=[...] 之后:adapter 侧已剥方括号,GIGO 派生的
+        // lastIndexOf(']') 定界不受影响;越界截到 300。
+        const note_bounded = if (row.final_note.len > 300) row.final_note[0..300] else row.final_note;
+        const text = if (note_bounded.len > 0)
+            std.fmt.allocPrint(
+                allocator,
+                OUTCOME_MARKER ++ ": key={s} task={s} reward={d:.4} tests={d}/{d} failing=[{s}] note={s}",
+                .{ key, row.task, row.reward, row.tests_passed, row.tests_total, failing.items, note_bounded },
+            ) catch continue
+        else
+            std.fmt.allocPrint(
+                allocator,
+                OUTCOME_MARKER ++ ": key={s} task={s} reward={d:.4} tests={d}/{d} failing=[{s}]",
+                .{ key, row.task, row.reward, row.tests_passed, row.tests_total, failing.items },
+            ) catch continue;
         defer allocator.free(text);
         _ = kg.remember(.observation, text, OUTCOME_SCHEMA_TYPE, false) catch continue;
         written += 1;
