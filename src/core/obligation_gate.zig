@@ -207,8 +207,19 @@ fn appendDerived(
         if (appended >= MAX_DERIVED) break;
         var needle = std.mem.trim(u8, raw_name, " ");
         // 注解剥离:" (skipped)" / " (skipped: reason)" / " (failed: reason)"
-        // 都截到首个 " ("——针是裸 node id,理由只进注入文本不进针。
-        if (std.mem.indexOf(u8, needle, " (")) |cut| needle = needle[0..cut];
+        // 都截到首个 " ("——针是裸 node id,理由进义务 reason(nudge 通道
+        // 是本模型 16 轮里唯一每轮执行的绑定形态;p16 取证:mode 行的
+        // previously 提示对形状失败无效,验证器报告必须以祈使句抵达)。
+        const entry_full = needle;
+        var annotation: ?[]const u8 = null;
+        if (std.mem.indexOf(u8, needle, " (")) |cut| {
+            if (std.mem.endsWith(u8, entry_full, ")") and entry_full.len > cut + 3) {
+                const inner = entry_full[cut + 2 .. entry_full.len - 1];
+                // 裸 "(skipped)" 不是报告;只有 "kind: message" 形态才携带。
+                if (std.mem.indexOf(u8, inner, ": ") != null) annotation = inner;
+            }
+            needle = needle[0..cut];
+        }
         if (needle.len < self_evolution.MIN_NEEDLE_LEN or
             needle.len > self_evolution.MAX_NEEDLE_LEN) continue;
         var duplicate = false;
@@ -220,14 +231,27 @@ fn appendDerived(
         }
         if (duplicate) continue;
         const owned_needle = a.dupe(u8, needle) catch continue;
-        const cid = self_evolution.obligationCandidateId(task_sha[0..], owned_needle, GIGO_REASON);
+        // 有验证器报告 → reason 携带原文(紧凑框架语;nudge 打印 reason,
+        // 报告以祈使上下文抵达)。无报告 → 通用 GIGO 理由。
+        const reason: []const u8 = if (annotation) |ann| blk: {
+            var end: usize = @min(ann.len, 160);
+            while (end > 0 and end < ann.len and (ann[end] & 0xC0) == 0x80) end -= 1;
+            break :blk std.fmt.allocPrint(
+                a,
+                "this exact point failed before; the verifier reported: {s}. " ++
+                    "Fix what the report names — its call convention and expected " ++
+                    "value are the spec, not suggestions",
+                .{ann[0..end]},
+            ) catch GIGO_REASON;
+        } else GIGO_REASON;
+        const cid = self_evolution.obligationCandidateId(task_sha[0..], owned_needle, reason);
         const owned_cid = a.dupe(u8, cid[0..]) catch continue;
         const owned_task = a.dupe(u8, task_sha[0..]) catch continue;
         list.append(.{
             .candidate_id = owned_cid,
             .task_sha256 = owned_task,
             .command_needle = owned_needle,
-            .reason = GIGO_REASON,
+            .reason = reason,
         }) catch continue;
         appended += 1;
     }

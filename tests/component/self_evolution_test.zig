@@ -802,6 +802,8 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     try std.testing.expectEqual(@as(usize, 2), runtime_r.count());
     try std.testing.expectEqualStrings("import widget._helpers", runtime_r.envelopes[0].command_needle);
     try std.testing.expectEqualStrings("tests/t.py::TestR::test_module_exists", runtime_r.envelopes[1].command_needle);
+    // v22:名字义务的 reason 携带验证器报告原文(nudge 通道递送形状指令)。
+    try std.testing.expect(std.mem.indexOf(u8, runtime_r.envelopes[1].reason, "the verifier reported: failed: AttributeError; coroutine has no attribute startswith") != null);
     ppaths.setEnv("METACODES_TASK_HINT", "wall-task");
 
     // UTF-8 截断安全(p10 现场雷):中文 note >300 字节,裸字节截断切码点
