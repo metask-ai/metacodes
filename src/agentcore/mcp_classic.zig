@@ -8,6 +8,7 @@ const canonical = @import("mcp_canonical.zig");
 const wire = @import("mcp_wire.zig");
 
 const EmptyCapabilities = struct {};
+const EmptyParamsDto = struct {};
 const ImplementationDto = struct {
     name: []const u8,
     version: []const u8,
@@ -70,7 +71,7 @@ pub fn encodeInitializedNotification(allocator: std.mem.Allocator) error{OutOfMe
     return std.json.Stringify.valueAlloc(allocator, .{
         .jsonrpc = wire.JSON_RPC_VERSION,
         .method = "notifications/initialized",
-        .params = .{},
+        .params = EmptyParamsDto{},
     }, .{}) catch return error.OutOfMemory;
 }
 
@@ -93,7 +94,7 @@ pub fn encodeListToolsRequest(
         .jsonrpc = wire.JSON_RPC_VERSION,
         .id = id,
         .method = "tools/list",
-        .params = .{},
+        .params = EmptyParamsDto{},
     });
 }
 
@@ -414,8 +415,30 @@ test "Classic lifecycle encodes the selected exact initialize then initialized" 
     try std.testing.expect(parsed.value.object.get("params").?.object.get("_meta") == null);
     const notification = try encodeInitializedNotification(allocator);
     defer allocator.free(notification);
-    try std.testing.expect(std.mem.indexOf(u8, notification, "notifications/initialized") != null);
-    try std.testing.expect(std.mem.indexOf(u8, notification, "\"id\"") == null);
+    var parsed_notification = try std.json.parseFromSlice(std.json.Value, allocator, notification, .{});
+    defer parsed_notification.deinit();
+    try std.testing.expectEqualStrings(
+        "notifications/initialized",
+        parsed_notification.value.object.get("method").?.string,
+    );
+    try std.testing.expect(parsed_notification.value.object.get("id") == null);
+    try std.testing.expect(parsed_notification.value.object.get("params").? == .object);
+}
+
+test "Classic tools list shared by both supported eras encodes empty params as an object" {
+    inline for (.{
+        canonical.Era.classic_2025_11_25,
+        canonical.Era.classic_2025_06_18,
+    }) |era|
+        try std.testing.expect(ClassicProfile.forEra(era) != null);
+
+    const request = try encodeListToolsRequest(std.testing.allocator, 3, null, .{});
+    defer std.testing.allocator.free(request);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request, .{});
+    defer parsed.deinit();
+    const params = parsed.value.object.get("params").?;
+    try std.testing.expect(params == .object);
+    try std.testing.expectEqual(@as(usize, 0), params.object.count());
 }
 
 test "Classic initialize parser reports the selected known era without enforcing the request" {
