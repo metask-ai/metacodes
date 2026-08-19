@@ -12,4 +12,5 @@ import MetaCodesControl.VerificationGate
 import MetaCodesControl.RequirementLedger
 import MetaCodesControl.ObligationGate
 import MetaCodesControl.HostInjectionMeter
+import MetaCodesControl.CognitiveMode
 import MetaCodesControl.RuleMetaGovernance

@@ -607,4 +607,30 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     }
     try std.testing.expectEqual(@as(usize, 1), runtime.count());
     try std.testing.expectEqualStrings("tests/t.py::TestX::test_uses_sha256", runtime.envelopes[0].command_needle);
+
+    // 认知模式调度:同名第二次失败 → streak=2 → construct 指令进 note。
+    {
+        const payload2 = "{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+            "{\"task\":\"wall-task\",\"attempt_key\":\"a2\",\"reward\":0.27,\"tests_passed\":3,\"tests_total\":11," ++
+            "\"failing_tests\":[\"tests/t.py::TestX::test_uses_sha256 (skipped)\"]}]}";
+        const pfs = @import("platform").fs;
+        const z2 = try a.dupeZ(u8, outcomes_path);
+        defer a.free(z2);
+        const fd = pfs.open(z2.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = pfs.close(fd);
+        var off: usize = 0;
+        while (off < payload2.len) {
+            const n = pfs.write(fd, payload2[off..]);
+            try std.testing.expect(n > 0);
+            off += @intCast(n);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
+    var built2 = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    defer built2.deinit(a);
+    const text2 = built2.text orelse return error.TestExpectedInjection;
+    try std.testing.expect(std.mem.indexOf(u8, text2, "Per-point reading mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text2, "failed 2 consecutive attempt(s)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text2, "read it constructively") != null);
 }

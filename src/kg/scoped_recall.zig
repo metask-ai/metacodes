@@ -120,20 +120,80 @@ pub fn sameTaskOutcomeRow(
     return allocator.dupe(u8, body) catch null;
 }
 
+/// 行内 failing=[...] 段(与 obligation_gate.appendDerived 同一定界契约:
+/// note 字段在括号之后且 adapter 已剥方括号)。
+fn failingSection(row_text: []const u8) ?[]const u8 {
+    const open = std.mem.indexOf(u8, row_text, "failing=[") orelse return null;
+    const start = open + "failing=[".len;
+    const close = std.mem.lastIndexOfScalar(u8, row_text, ']') orelse return null;
+    if (close <= start) return null;
+    return row_text[start..close];
+}
+
+const MAX_MODE_POINTS: usize = 5;
+const MAX_HISTORY_ROWS: usize = 8;
+
+/// 认知模式段:对最新失败名逐点计算**连续末尾败次**(仅在 failing 段内
+/// 匹配,不受 note 字段污染),按 cognitive_mode.schedule 渲染强制读法。
+/// 调度纯函数 Lean 已证(全函数/单调/默认 verify);此处只是渲染。
+fn appendModeSection(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    history_ascending: []const []const u8,
+) !void {
+    if (history_ascending.len == 0) return;
+    const cognitive_mode = @import("../core/cognitive_mode.zig");
+    const newest = history_ascending[history_ascending.len - 1];
+    const newest_failing = failingSection(newest) orelse return;
+    var rendered: usize = 0;
+    var it = std.mem.splitSequence(u8, newest_failing, ", ");
+    while (it.next()) |raw_name| {
+        if (rendered >= MAX_MODE_POINTS) break;
+        const name = std.mem.trim(u8, raw_name, " ");
+        if (name.len < 4) continue;
+        var streak: usize = 1;
+        var back = history_ascending.len - 1;
+        while (back > 0) {
+            back -= 1;
+            const section = failingSection(history_ascending[back]) orelse break;
+            if (std.mem.indexOf(u8, section, name) == null) break;
+            streak += 1;
+        }
+        if (rendered == 0)
+            try out.appendSlice(allocator, "Per-point reading mode (host-computed from your attempt history):\n");
+        const mode = cognitive_mode.schedule(streak);
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "- {s} — failed {d} consecutive attempt(s): {s}\n",
+            .{ name, streak, mode.directive() },
+        );
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
+        rendered += 1;
+    }
+}
+
 fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClient) ?[]u8 {
     const hint_c = std.c.getenv(TASK_HINT_ENV) orelse return null;
     const hint = std.mem.span(hint_c);
     const body = sameTaskOutcomeRow(allocator, kg, hint) orelse return null;
     defer allocator.free(body);
-    // 框架语对冲"按笔记写不自测"的过度自信模式(schema_drift 验尸),并
-    // 要求把每个失败名转成可执行检查(p4 取证:名字送达后仍原样重败同
-    // 4 测——缺的是"名字→在工作区复现它的检查"这一步);带路径/模块名的
-    // 失败(pytest id、skipped 模块)指向可直接阅读的真实文件。
-    return std.fmt.allocPrint(
-        allocator,
-        "<system-reminder>\n# 本任务上一次尝试的判定结局(host 声明,确定性注入)\n" ++
-            "{s}\n" ++
-            "This verdict was produced by a verifier that runs outside your workspace: its " ++
+    // 尝试历史(升序 node_id,cap 8):失败名 streak 的数据面。
+    var history = std.array_list.Managed([]u8).init(allocator);
+    defer {
+        for (history.items) |row| allocator.free(row);
+        history.deinit();
+    }
+    collectHistory(allocator, kg, hint, &history);
+    // 框架语:输入审计(GIGO)+ 目标读法 + 前沿推进 + 认知模式调度段。
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    out.appendSlice(allocator, "<system-reminder>\n# 本任务上一次尝试的判定结局(host 声明,确定性注入)\n") catch return null;
+    out.appendSlice(allocator, body) catch return null;
+    out.appendSlice(allocator, "\n") catch return null;
+    appendModeSection(&out, allocator, history.items) catch {};
+    out.appendSlice(allocator,
+        "This verdict was produced by a verifier that runs outside your workspace: its " ++
             "test files may not exist locally, so do not expect to find or run them, and " ++
             "never dismiss their names as stale or hallucinated — an absent referenced file " ++
             "is expected here, not evidence against the requirement. " ++
@@ -149,9 +209,49 @@ fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClient) ?
             "resubmit an approach whose verdict you already know (your own previous " ++
             "conclusion is quoted above when available) — change something material. " ++
             "No regressions: re-run your whole check suite before closing.\n" ++
-            "</system-reminder>\n",
-        .{body},
-    ) catch null;
+            "</system-reminder>\n") catch return null;
+    return out.toOwnedSlice(allocator) catch null;
+}
+
+fn collectHistory(
+    allocator: std.mem.Allocator,
+    kg: *client_mod.KgClient,
+    hint: []const u8,
+    out: *std.array_list.Managed([]u8),
+) void {
+    var needle_buffer: [232]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buffer, " task={s} ", .{hint}) catch return;
+    var query_buffer: [280]u8 = undefined;
+    const query = std.fmt.bufPrint(&query_buffer, OUTCOME_NOTE_MARKER ++ " {s}", .{hint}) catch return;
+    const hits = kg.recallTyped(query, 40, false, "task_outcome") catch return;
+    defer {
+        for (hits) |*h| h.deinit(kg.allocator);
+        kg.allocator.free(hits);
+    }
+    const Entry = struct { id: u64, text: []u8 };
+    var entries = std.array_list.Managed(Entry).init(allocator);
+    defer entries.deinit();
+    for (hits) |h| {
+        if (std.mem.indexOf(u8, h.text, needle) == null) continue;
+        const copy = allocator.dupe(u8, h.text) catch continue;
+        entries.append(.{ .id = h.node_id, .text = copy }) catch {
+            allocator.free(copy);
+            continue;
+        };
+    }
+    std.sort.pdq(Entry, entries.items, {}, struct {
+        fn lessThan(_: void, x: Entry, y: Entry) bool {
+            return x.id < y.id;
+        }
+    }.lessThan);
+    const start = if (entries.items.len > MAX_HISTORY_ROWS) entries.items.len - MAX_HISTORY_ROWS else 0;
+    for (entries.items, 0..) |entry, index| {
+        if (index < start) {
+            allocator.free(entry.text);
+            continue;
+        }
+        out.append(entry.text) catch allocator.free(entry.text);
+    }
 }
 
 pub fn buildWithReceipt(
