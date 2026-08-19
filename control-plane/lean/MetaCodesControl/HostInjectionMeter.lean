@@ -14,7 +14,7 @@ Each theorem names the mirroring Zig test. -/
 
 namespace MetaCodesControl.HostInjectionMeter
 
-def cap : Nat := 4
+def cap : Nat := 8
 
 /-- One meter step: a gate asks for an injection; the request is granted
 iff budget remains. Returns (granted?, next used). -/

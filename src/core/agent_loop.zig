@@ -1315,7 +1315,8 @@ pub fn run(
                     .context => &kg_context_repair_attempts,
                     .none => unreachable,
                 };
-                if (repair_attempts.* == 0) {
+                if (repair_attempts.* == 0 and host_injection_meter.remaining() > 0) {
+                    _ = host_injection_meter.tryConsume();
                     repair_attempts.* = 1;
                     // A rejected batch-final may still need batch + context +
                     // final; a rejected context-final needs context + final.
@@ -1345,8 +1346,10 @@ pub fn run(
             // and record obligation_unmet; never block indefinitely.
             if (opts.verification_final_gate and
                 verification_progress.unverified_mutation and
-                verification_nudges < MAX_VERIFICATION_NUDGES)
+                verification_nudges < MAX_VERIFICATION_NUDGES and
+                host_injection_meter.remaining() > 0)
             {
+                _ = host_injection_meter.tryConsume();
                 verification_nudges += 1;
                 log.infoId("agent", rid, "verification final gate nudge {d}/{d}", .{ verification_nudges, MAX_VERIFICATION_NUDGES });
                 backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
