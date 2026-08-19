@@ -160,6 +160,17 @@ fn appendReasonDerived(
             if (dots == 0) continue;
             if (std.mem.endsWith(u8, token, ".py")) continue;
             if (std.mem.indexOfScalar(u8, token, '.') == null) continue;
+            // p19 误火:pytest 断言 diff 的省略号截断值("ba3b6208...18d68c…")
+            // 被当模块路径。每个点分段必须是合法标识符(非空、非数字开头)。
+            var segments_valid = true;
+            var seg_it = std.mem.splitScalar(u8, token, '.');
+            while (seg_it.next()) |seg| {
+                if (seg.len == 0 or (seg[0] >= '0' and seg[0] <= '9')) {
+                    segments_valid = false;
+                    break;
+                }
+            }
+            if (!segments_valid) continue;
             var needle_buffer: [172]u8 = undefined;
             const needle = std.fmt.bufPrint(&needle_buffer, "import {s}", .{token}) catch continue;
             if (needle.len < self_evolution.MIN_NEEDLE_LEN or

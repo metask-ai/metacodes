@@ -790,6 +790,42 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     // 累积规格:最新行是形状失败,mode 行回携上一轮的结构理由。
     try std.testing.expect(std.mem.indexOf(u8, text_r3, "| previously: skipped: widget._helpers not available; create it") != null);
 
+    // 第四次尝试:回归(reward 跌回)+ 注解含省略号截断哈希(p19 误火源)。
+    {
+        const payload_r4 = "{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+            "{\"task\":\"reason-task\",\"attempt_key\":\"r4\",\"reward\":0.4,\"tests_passed\":1,\"tests_total\":3," ++
+            "\"failing_tests\":[\"tests/t.py::TestR::test_module_exists (failed: assert '(376ba3b6208...18d68c49644d)' == '(376ba3b62082d25e)')\"]}]}";
+        const pfs = @import("platform").fs;
+        const zr4 = try a.dupeZ(u8, outcomes_path);
+        defer a.free(zr4);
+        const fd = pfs.open(zr4.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = pfs.close(fd);
+        var off: usize = 0;
+        while (off < payload_r4.len) {
+            const n = pfs.write(fd, payload_r4[off..]);
+            try std.testing.expect(n > 0);
+            off += @intCast(n);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
+    var built_r4 = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    defer built_r4.deinit(a);
+    const text_r4 = built_r4.text orelse return error.TestExpectedInjection;
+    // 最佳尝试锚:newest=r4(0.4) < best=r3(0.5) → r3 整行进注入。
+    try std.testing.expect(std.mem.indexOf(u8, text_r4, "历史最佳尝试") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_r4, "#r3 ") != null or std.mem.indexOf(u8, text_r4, "reward=0.5000") != null);
+    // 省略号截断哈希绝不能成为 import 义务(p19 垃圾针回归钉)。
+    const runtime_r4 = cc.obligation_gate.load(a, &kg, "reason-task") orelse return error.TestExpectedRuntime;
+    defer {
+        runtime_r4.deinit();
+        a.destroy(runtime_r4);
+    }
+    for (runtime_r4.envelopes) |envelope| {
+        try std.testing.expect(std.mem.indexOf(u8, envelope.command_needle, "...") == null);
+        try std.testing.expect(std.mem.indexOf(u8, envelope.command_needle, "376ba") == null);
+    }
+
     // GIGO 派生针 = 裸 node id(括号注解整体剥离)。
     const runtime_r = cc.obligation_gate.load(a, &kg, "reason-task") orelse return error.TestExpectedRuntime;
     defer {
@@ -803,7 +839,8 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     try std.testing.expectEqualStrings("import widget._helpers", runtime_r.envelopes[0].command_needle);
     try std.testing.expectEqualStrings("tests/t.py::TestR::test_module_exists", runtime_r.envelopes[1].command_needle);
     // v22:名字义务的 reason 携带验证器报告原文(nudge 通道递送形状指令)。
-    try std.testing.expect(std.mem.indexOf(u8, runtime_r.envelopes[1].reason, "the verifier reported: failed: AttributeError; coroutine has no attribute startswith") != null);
+    // reason 携带**最新行**的报告(r4 的断言 diff;r3 时代是 coroutine 消息)。
+    try std.testing.expect(std.mem.indexOf(u8, runtime_r.envelopes[1].reason, "the verifier reported: failed: assert ") != null);
     ppaths.setEnv("METACODES_TASK_HINT", "wall-task");
 
     // UTF-8 截断安全(p10 现场雷):中文 note >300 字节,裸字节截断切码点

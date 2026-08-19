@@ -216,6 +216,31 @@ fn appendModeSection(
     return max_streak;
 }
 
+/// 历史里 reward 严格高于 newest 的最高行(同分不注,避免冗余)。
+/// reward 解析失败按 -1 处理(绝不虚报最佳)。
+fn rowReward(row: []const u8) f64 {
+    const tag = std.mem.indexOf(u8, row, " reward=") orelse return -1;
+    const start = tag + " reward=".len;
+    var end = start;
+    while (end < row.len and (row[end] == '.' or (row[end] >= '0' and row[end] <= '9'))) end += 1;
+    return std.fmt.parseFloat(f64, row[start..end]) catch -1;
+}
+
+fn bestHistoryRow(history: []const []u8, newest: []const u8) ?[]const u8 {
+    const newest_reward = rowReward(newest);
+    var best: ?[]const u8 = null;
+    var best_reward: f64 = newest_reward;
+    for (history) |row| {
+        if (std.mem.eql(u8, row, newest)) continue;
+        const r = rowReward(row);
+        if (r > best_reward) {
+            best_reward = r;
+            best = row;
+        }
+    }
+    return best;
+}
+
 pub fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClient) ?[]u8 {
     const hint_c = std.c.getenv(TASK_HINT_ENV) orelse return null;
     const hint = std.mem.span(hint_c);
@@ -234,6 +259,14 @@ pub fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClien
     out.appendSlice(allocator, "<system-reminder>\n# 本任务上一次尝试的判定结局(host 声明,确定性注入)\n") catch return null;
     out.appendSlice(allocator, body) catch return null;
     out.appendSlice(allocator, "\n") catch return null;
+    // 最佳尝试锚(p19 取证:攻克的面在失败反馈里零痕迹——p18 的 sync 胜利
+    // 随工作区重置蒸发。历史最高 reward 行=已验证可达的最优配置,其剩余
+    // 败点=最短路径)。仅当最佳行严格优于最新行时注入,避免冗余。
+    if (bestHistoryRow(history.items, body)) |best| {
+        out.appendSlice(allocator, "# 历史最佳尝试(host 声明;先复现它的构型,再只修它剩下的败点)\n") catch return null;
+        out.appendSlice(allocator, best) catch return null;
+        out.appendSlice(allocator, "\n") catch return null;
+    }
     const max_streak = appendModeSection(&out, allocator, history.items) catch 0;
     if (max_streak >= 3) {
         // 升级态瘦身(提示饱和对策):union/invert 级别的点在场时,九层
