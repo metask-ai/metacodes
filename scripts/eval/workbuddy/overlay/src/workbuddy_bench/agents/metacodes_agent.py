@@ -651,7 +651,7 @@ class MetacodesAgent(BaseInstalledAgent):
             "export METACODES_KG_TRANSPORT=cli-exclusive; "
             # warn 级诊断上 Harbor stderr(r1/r2 教训:自演化静默降级三层,
             # 零日志可判;stdout 是 NDJSON 机器协议,不受影响)。
-            "export METACODES_LOG=warn; "
+            "export METACODES_LOG='*:warn'; "
             + (
                 "export METACODES_SELF_EVOLUTION=1; "
                 "export METACODES_SELF_EVOLUTION_REPORT="

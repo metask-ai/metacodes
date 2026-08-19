@@ -177,6 +177,14 @@ pub fn restoreForTest(previous: TestState) void {
 }
 
 /// 解析 "stream:debug,agent:info,*:warn" 这种字符串
+fn levelFromName(name: []const u8) ?Level {
+    if (std.mem.eql(u8, name, "debug")) return .debug;
+    if (std.mem.eql(u8, name, "info")) return .info;
+    if (std.mem.eql(u8, name, "warn")) return .warn;
+    if (std.mem.eql(u8, name, "error")) return .err;
+    return null;
+}
+
 fn parseLogSpec(spec: []const u8) !void {
     // 简化：最多 16 个 filter
     var buf: [16]ModuleFilter = undefined;
@@ -185,19 +193,16 @@ fn parseLogSpec(spec: []const u8) !void {
     while (it.next()) |entry| {
         if (n >= buf.len) break;
         const trimmed = std.mem.trim(u8, entry, " \t");
-        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
+        // 裸级别 token(METACODES_LOG=warn)= 全局默认级别。此前无冒号被
+        // 静默跳过,默认停在 .err → 三轮评估的 warn 诊断链全部被抑制
+        // (p5 取证:stderr 文件 0 字节)。"配置被静默忽略"是最坏的失败面。
+        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse {
+            if (levelFromName(trimmed)) |bare| g_default_level = bare;
+            continue;
+        };
         const name = trimmed[0..colon];
         const lvl_str = trimmed[colon + 1 ..];
-        const lvl: Level = if (std.mem.eql(u8, lvl_str, "debug"))
-            .debug
-        else if (std.mem.eql(u8, lvl_str, "info"))
-            .info
-        else if (std.mem.eql(u8, lvl_str, "warn"))
-            .warn
-        else if (std.mem.eql(u8, lvl_str, "error"))
-            .err
-        else
-            continue;
+        const lvl: Level = levelFromName(lvl_str) orelse continue;
 
         if (std.mem.eql(u8, name, "*")) {
             g_default_level = lvl;
@@ -351,6 +356,21 @@ pub fn genRequestId() RequestId {
 // ============================================================================
 
 const testing = std.testing;
+
+test "parseLogSpec accepts a bare level token as the global default" {
+    // p5 生产取证:METACODES_LOG=warn 无冒号被静默跳过,默认停在 .err,
+    // 三轮评估的 warn 诊断全部被抑制(stderr 文件 0 字节)。
+    const previous = snapshotForTest();
+    defer restoreForTest(previous);
+    try parseLogSpec("warn");
+    try std.testing.expectEqual(Level.warn, g_default_level);
+    try parseLogSpec("kg:debug,info");
+    try std.testing.expectEqual(Level.info, g_default_level);
+    try std.testing.expectEqual(Level.debug, effectiveLevel("kg"));
+    // 无效裸 token 不动默认级别。
+    try parseLogSpec("bogus");
+    try std.testing.expectEqual(Level.info, g_default_level);
+}
 
 test "Level ordering" {
     try testing.expect(@intFromEnum(Level.debug) < @intFromEnum(Level.info));
