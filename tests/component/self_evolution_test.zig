@@ -787,8 +787,9 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     var built_r3 = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
     defer built_r3.deinit(a);
     const text_r3 = built_r3.text orelse return error.TestExpectedInjection;
-    // 累积规格:最新行是形状失败,mode 行回携上一轮的结构理由。
-    try std.testing.expect(std.mem.indexOf(u8, text_r3, "| previously: skipped: widget._helpers not available; create it") != null);
+    // 累积规格(v26 起为全量去重列表):历史结构理由仍在行上。
+    try std.testing.expect(std.mem.indexOf(u8, text_r3, "every past report for this point: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_r3, "skipped: widget._helpers not available; create it") != null);
 
     // 第四次尝试:回归(reward 跌回)+ 注解含省略号截断哈希(p19 误火源)。
     {
@@ -812,6 +813,11 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     var built_r4 = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
     defer built_r4.deinit(a);
     const text_r4 = built_r4.text orelse return error.TestExpectedInjection;
+    // 约束累积:r4 为 newest,mode 行须同时携带 r3(AttributeError)与
+    // r2(not available)两代历史报告——整合失败的解药是 harness 代记。
+    try std.testing.expect(std.mem.indexOf(u8, text_r4, "every past report for this point: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_r4, "AttributeError; coroutine has no attribute startswith") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_r4, "widget._helpers not available") != null);
     // 最佳尝试锚:newest=r4(0.4) < best=r3(0.5) → r3 整行进注入。
     try std.testing.expect(std.mem.indexOf(u8, text_r4, "历史最佳尝试") != null);
     try std.testing.expect(std.mem.indexOf(u8, text_r4, "#r3 ") != null or std.mem.indexOf(u8, text_r4, "reward=0.5000") != null);

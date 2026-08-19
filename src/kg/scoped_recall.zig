@@ -151,6 +151,14 @@ fn entryAnnotation(section: []const u8, bare: []const u8) ?[]const u8 {
     return null;
 }
 
+/// 有界追加(容量满则静默截断——mode 行是提示不是账本)。
+fn appendBounded(buffer: []u8, used: *usize, bytes: []const u8) void {
+    const room = buffer.len - used.*;
+    const n = @min(room, bytes.len);
+    @memcpy(buffer[used.* .. used.* + n], bytes[0..n]);
+    used.* += n;
+}
+
 fn appendModeSection(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -188,22 +196,41 @@ fn appendModeSection(
         // 累积规格回携(p15 取证:结构信号与形状信号住在相邻两行,body
         // 只引最新行 → 振荡遗忘)。每点附历史中最近一次**更早的**注解理由,
         // 与最新行的注解在同屏共存。
-        var previous_reason: ?[]const u8 = null;
+        // 约束累积(p22 取证:模型每轮最多整合一条修正,sync/len/签名轮流
+        // 丢。历史所有**去重**报告同行呈现——harness 替它记,它只需同时
+        // 满足)。newest 自己的注解已在 body,排除;每点至多 3 条。
+        const newest_ann = entryAnnotation(newest_failing, name);
+        var distinct: [3][]const u8 = undefined;
+        var distinct_n: usize = 0;
         var pback = history_ascending.len - 1;
-        while (pback > 0 and previous_reason == null) {
+        while (pback > 0 and distinct_n < distinct.len) {
             pback -= 1;
             const psec = failingSection(history_ascending[pback]) orelse continue;
-            previous_reason = entryAnnotation(psec, name);
+            const ann = entryAnnotation(psec, name) orelse continue;
+            if (newest_ann != null and std.mem.eql(u8, ann, newest_ann.?)) continue;
+            var dup = false;
+            for (distinct[0..distinct_n]) |seen| {
+                if (std.mem.eql(u8, seen, ann)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            distinct[distinct_n] = ann;
+            distinct_n += 1;
         }
-        const newest_ann = entryAnnotation(newest_failing, name);
-        if (previous_reason != null and newest_ann != null and
-            std.mem.eql(u8, previous_reason.?, newest_ann.?)) previous_reason = null;
-        var reason_buffer: [128]u8 = undefined;
-        const prev_part = if (previous_reason) |r| blk: {
-            var end: usize = @min(r.len, 110);
-            while (end > 0 and end < r.len and (r[end] & 0xC0) == 0x80) end -= 1;
-            break :blk std.fmt.bufPrint(&reason_buffer, " | previously: {s}", .{r[0..end]}) catch "";
-        } else "";
+        var reason_buffer: [420]u8 = undefined;
+        var reason_used: usize = 0;
+        if (distinct_n > 0) {
+            appendBounded(&reason_buffer, &reason_used, " | every past report for this point: ");
+            for (distinct[0..distinct_n], 0..) |r, ri| {
+                if (ri > 0) appendBounded(&reason_buffer, &reason_used, "  PLUS  ");
+                var end: usize = @min(r.len, 110);
+                while (end > 0 and end < r.len and (r[end] & 0xC0) == 0x80) end -= 1;
+                appendBounded(&reason_buffer, &reason_used, r[0..end]);
+            }
+        }
+        const prev_part: []const u8 = reason_buffer[0..reason_used];
         const line = try std.fmt.allocPrint(
             allocator,
             "- {s} — failed {d} consecutive attempt(s): {s}{s}\n",
