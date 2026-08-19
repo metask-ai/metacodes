@@ -263,14 +263,20 @@ test "kg mirror closure keeps the lifetime ledger total" {
     try std.testing.expectEqual(@as(usize, 1), counts.open);
     try std.testing.expectEqual(@as(usize, 2), counts.total);
 
-    // 全部闭合:open 归零,total 保持——coverage nudge 的 decide(0, 2, true)
-    // 必须是 none(修复前这里是 decide(0, 0, true) → 假 coverage nudge)。
+    // 全部闭合:open 归零,total 保持——绝不能出**假 coverage**(修复前
+    // 这里是 decide(0, 0, true) → 假 coverage nudge)。新政策下闭合且极短
+    // (total=2 ≤ SHALLOW_FLOOR)的账本得到一次 shallow 重扫,消耗后归 none。
     try store.updateStatus("kg-102", .deleted);
     store.noteKgMirrorClosed();
     counts = store.ledgerCounts();
     try std.testing.expectEqual(@as(usize, 0), counts.open);
     try std.testing.expectEqual(@as(usize, 2), counts.total);
     var state = cc.requirement_ledger.State{ .prompt_emitted = true };
+    try std.testing.expectEqual(
+        cc.requirement_ledger.Decision.shallow,
+        state.decide(counts.open, counts.total, true),
+    );
+    state.shallow_nudge_used = true;
     try std.testing.expectEqual(
         cc.requirement_ledger.Decision.none,
         state.decide(counts.open, counts.total, true),

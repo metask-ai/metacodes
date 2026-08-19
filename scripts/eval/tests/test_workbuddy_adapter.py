@@ -2409,14 +2409,17 @@ assert failed, "enforced run without rule_filter events must fail loudly"
             Path(__file__).parents[1]
             / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
         ).read_text(encoding="utf-8")
+        # stderr 落 /logs/agent 自己的文件并透传 fd2(p3 取证:Harbor stderr
+        # 流不进任何导出物,warn 诊断链进虚空)——但绝不许并进 NDJSON stdout。
         self.assertIn(
-            'f"</dev/null | tee {shlex.quote(output_path)}; "',
+            '"</dev/null 2> >(tee /logs/agent/metacodes-stderr.log >&2) "',
             source,
         )
-        self.assertNotIn(
-            'f"2>&1 </dev/null | tee {shlex.quote(output_path)}; "',
+        self.assertIn(
+            'f"| tee {shlex.quote(output_path)}; "',
             source,
         )
+        self.assertNotIn("2>&1", source)
 
     def test_adapter_remote_environment_assertion_is_one_shell_operand(self):
         source = (
@@ -3299,6 +3302,18 @@ with tempfile.TemporaryDirectory() as directory:
             {"name": "cli exits", "passed": True},
         ]}}}],
     }))
+    # pytest 面兄弟 trial:无结构化 tests[],走 FAILED/SKIPPED 行回退
+    # (p4 etag 取证:SKIPPED=实现不在预期位置,此前被当无名丢弃)。
+    done2 = jobs / "batch-1" / "pytest_task__prev2"
+    (done2 / "verifier").mkdir(parents=True)
+    (done2 / "result.json").write_text(json.dumps({"task_name": "workbuddy/bugfix-pytest-task"}))
+    (done2 / "verifier" / "score.json").write_text(json.dumps({
+        "reward": 0.27, "tests_passed": 3, "tests_total": 11, "judges": [],
+    }))
+    (done2 / "verifier" / "test_output.txt").write_text(
+        "FAILED testing/test_x.py::test_a\n"
+        "tests/test_y.py::TestM::test_module_exists SKIPPED [  9%]\n"
+    )
     # 当前 trial:config.json 是任务全名的权威来源。
     trial = jobs / "batch-1" / "etag_task__now1"
     logs = trial / "agent"
@@ -3326,8 +3341,16 @@ with tempfile.TemporaryDirectory() as directory:
     command = captured["command"]
     assert "export METACODES_TASK_HINT=feature-medium-etag_header_for_static; " in command, command[:2000]
     assert "export METACODES_TASK_OUTCOMES=/logs/agent/task-outcomes.json; " in command
+    # stderr 必须落到 trial 导出的 bind mount(p3 取证:warn 诊断链进虚空)。
+    assert "2> >(tee /logs/agent/metacodes-stderr.log >&2)" in command
     rows = json.loads((logs / "task-outcomes.json").read_text())["outcomes"]
-    assert len(rows) == 1 and rows[0]["failing_tests"] == ["etag present", "cache hit 304"], rows
+    by_task = {r["task"]: r for r in rows}
+    assert set(by_task) == {"feature-medium-etag_header_for_static", "bugfix-pytest-task"}, rows
+    assert by_task["feature-medium-etag_header_for_static"]["failing_tests"] == ["etag present", "cache hit 304"], rows
+    assert by_task["bugfix-pytest-task"]["failing_tests"] == [
+        "testing/test_x.py::test_a",
+        "tests/test_y.py::TestM::test_module_exists (skipped)",
+    ], rows
 ''')
 
     def test_accumulation_off_keeps_the_original_contract(self):

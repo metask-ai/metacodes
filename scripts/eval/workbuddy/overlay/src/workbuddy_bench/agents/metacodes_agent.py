@@ -352,6 +352,14 @@ class MetacodesAgent(BaseInstalledAgent):
                         ).splitlines():
                             if line.startswith("FAILED "):
                                 failing.append(line[len("FAILED "):][:160])
+                            elif "::" in line and " SKIPPED" in line:
+                                # pytest -v 的 SKIPPED 行同样是未满足的面
+                                # (p4 etag 取证:8/11 SKIPPED=实现不在验证
+                                # 器预期的模块位置,行为测试全过仍 0.27,
+                                # 而该信号此前被当"无名"整体丢弃)。
+                                name = line.split(" SKIPPED")[0].strip()
+                                if name:
+                                    failing.append((name + " (skipped)")[:160])
                             if len(failing) >= 20:
                                 break
                     except OSError:
@@ -674,10 +682,15 @@ class MetacodesAgent(BaseInstalledAgent):
             'exec 9<<<"$METACODES_ROUTE_TOKEN"; unset METACODES_ROUTE_TOKEN; '
             "export METACODES_API_KEY_FD=9; "
             f"metacodes {' '.join(flags)} -p {escaped_instruction} --json "
-            # NDJSON stdout is a machine protocol.  Keep diagnostics on the
-            # Harbor-owned stderr stream so a permission warning or other host
-            # message can never merge with the exactly-once result event.
-            f"</dev/null | tee {shlex.quote(output_path)}; "
+            # NDJSON stdout is a machine protocol; stderr must never merge
+            # with the exactly-once result event.  It also must not vanish:
+            # p3 forensics found the "Harbor-owned stderr stream" reaches no
+            # exported artifact, so every METACODES_LOG=warn diagnostic
+            # (self-evolution degradations, author parse failures, injection
+            # receipts) fell into a void.  Tee it onto the /logs/agent bind
+            # mount the trial already exports.
+            "</dev/null 2> >(tee /logs/agent/metacodes-stderr.log >&2) "
+            f"| tee {shlex.quote(output_path)}; "
             "agent_status=${PIPESTATUS[0]}; "
             f"{project_postcheck}"
             'mapfile -t transcripts < <(find "$HOME/.metacodes/projects" '

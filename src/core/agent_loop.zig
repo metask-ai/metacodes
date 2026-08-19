@@ -1386,6 +1386,14 @@ pub fn run(
                         try conversation.appendText(.user, requirement_ledger_mod.COVERAGE_NUDGE_TEXT);
                         continue;
                     },
+                    .shallow => {
+                        requirement_ledger_state.nudges += 1;
+                        requirement_ledger_state.shallow_nudge_used = true;
+                        log.infoId("agent", rid, "requirement ledger shallow nudge {d}/{d} total={d}", .{ requirement_ledger_state.nudges, requirement_ledger_mod.MAX_LEDGER_NUDGES, counts.total });
+                        backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                        try conversation.appendText(.user, requirement_ledger_mod.SHALLOW_NUDGE_TEXT);
+                        continue;
+                    },
                 }
             }
             // L4 诊断:本轮无 tool_use → turn 结束(span 平衡:每个 turn_begin 都配一个

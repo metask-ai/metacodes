@@ -113,12 +113,17 @@ fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClient) ?
             body = full;
         } else |_| {}
     }
-    // 框架语对冲"按笔记写不自测"的过度自信模式(schema_drift 验尸)。
+    // 框架语对冲"按笔记写不自测"的过度自信模式(schema_drift 验尸),并
+    // 要求把每个失败名转成可执行检查(p4 取证:名字送达后仍原样重败同
+    // 4 测——缺的是"名字→在工作区复现它的检查"这一步);带路径/模块名的
+    // 失败(pytest id、skipped 模块)指向可直接阅读的真实文件。
     return std.fmt.allocPrint(
         allocator,
         "<system-reminder>\n# 本任务上一次尝试的判定结局(host 声明,确定性注入)\n" ++
             "{s}\n" ++
-            "先按当前工作区重新推导实现;上述失败点只用于对照校验与自测清单,不要当作规格照抄,也不要因此跳过验证。\n" ++
+            "先按当前工作区重新推导实现。对上面每个失败/跳过的测试名:若它含仓库路径或模块名,先读那个文件;" ++
+            "然后在工作区构造并运行一个能复现该失败面的检查,再动手改。失败名只用于对照校验与自测清单," ++
+            "不要当作规格照抄,也不要因此跳过验证。\n" ++
             "</system-reminder>\n",
         .{body},
     ) catch null;
