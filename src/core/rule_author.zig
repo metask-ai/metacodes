@@ -1747,7 +1747,16 @@ fn receiptMatchesResult(
         !std.meta.eql(receipt.protocol, result.protocol) or
         !std.mem.eql(u8, &receipt.reason_sha256, &observation.sha256Hex(result.reason)))
         return false;
-    const proposal = result.proposal orelse return receipt.decision == .abstain;
+    const proposal = result.proposal orelse switch (receipt.decision) {
+        // 无 spec 提案的两种决策:abstain 与义务提案。四个 spec 哈希必须
+        // 全空;义务的 needle/reason 由 response_sha256 绑定(原文回执)。
+        // p5 生产命中:此处曾写死 `== .abstain`,propose_obligation 恒判
+        // 不匹配 → AuthorReceiptResultMismatch,首个真义务提案被丢弃。
+        .abstain, .propose_obligation => return receipt.invariant_sha256 == null and
+            receipt.falsifier_sha256 == null and receipt.rule_spec_sha256 == null and
+            receipt.lean_source_sha256 == null,
+        .propose => return false,
+    };
     if (receipt.invariant_sha256 == null or receipt.falsifier_sha256 == null or
         receipt.rule_spec_sha256 == null or receipt.lean_source_sha256 == null)
         return false;

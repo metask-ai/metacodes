@@ -437,3 +437,103 @@ test "L2: task obligation rides the store and arms the gate for the same task on
     runtime.observeCommand("cd /workspace && pytest testing/test_warnings.py::TestDeprecationWarningsByDefault -x");
     try std.testing.expectEqual(@as(?usize, null), runtime.decide().index);
 }
+
+test "L2: author obligation proposal lands as an envelope the same task collects" {
+    // p5 生产命中的回归钉:propose_obligation 曾在 receiptMatchesResult 被
+    // 写死 `== .abstain` 恒判不匹配 → AuthorReceiptResultMismatch,首个真
+    // 义务提案被丢弃。本测走全链:真 store + hint + MockServer 义务响应 →
+    // endOfRun proposed("obligation")→ collectObligations 命中。
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const kg_bin = findKgBin(a) orelse return error.SkipZigTest;
+    defer a.free(kg_bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const state_dir = try std.fmt.bufPrint(&path_buffer, "{s}/state", .{root});
+    var session_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const session_dir = try std.fmt.bufPrint(&session_buffer, "{s}/state/session-1", .{root});
+    var rules_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const rules_dir = try std.fmt.bufPrint(&rules_buffer, "{s}/state/project-rules", .{root});
+    var store_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const store_dir = try std.fmt.bufPrint(&store_buffer, "{s}/store", .{root});
+    var project_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const project_root = try std.fmt.bufPrint(&project_buffer, "{s}/project", .{root});
+    for ([_][]const u8{ state_dir, session_dir, rules_dir, project_root }) |dir|
+        cc.util_fs.mkdirParents(dir) catch {};
+    var kg = try cc.kg_client.KgClient.init(a, .{
+        .home = root,
+        .domain = "selfevo-l2d",
+        .config_bin = kg_bin,
+        .config_store = store_dir,
+        .env_bin = "",
+        .env_store = "",
+    });
+    defer kg.deinit();
+    kg.ensureReady();
+    _ = kg.remember(.observation, "prior memory: baseline", "observation", false) catch
+        return error.SkipZigTest;
+    _ = kg.remember(
+        .observation,
+        "task-outcome-v1: key=obl-task#a1 task=obl-task reward=0.5000 tests=2/4 failing=[pytest testing/test_x.py::test_a]",
+        "task_outcome",
+        false,
+    ) catch return error.SkipZigTest;
+    const ppaths = @import("platform").paths;
+    ppaths.setEnv("METACODES_TASK_HINT", "obl-task");
+    defer ppaths.unsetEnv("METACODES_TASK_HINT");
+
+    const binding = try completedWeakeningRun(session_dir);
+    const proposal =
+        "{\"schema_version\":\"metacodes-rule-author-response-v1\",\"decision\":\"propose_obligation\"," ++
+        "\"reason\":\"named failing test never executed\",\"invariant\":null,\"falsifier\":null," ++
+        "\"rule_spec\":null,\"lean_source\":null," ++
+        "\"obligation_needle\":\"pytest testing/test_x.py::test_a\"," ++
+        "\"obligation_reason\":\"run the named failing test before finishing\"}";
+    const escaped = try std.json.Stringify.valueAlloc(a, proposal, .{});
+    defer a.free(escaped);
+    const sse = try std.fmt.allocPrint(
+        a,
+        "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":{s}}}}}\n\n" ++
+            "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"input_tokens\":10,\"output_tokens\":5}}}}\n\n" ++
+            "event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+        .{escaped},
+    );
+    defer a.free(sse);
+    var server = try harness.MockServer.start(sse, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "author-key", "test-model", url);
+    defer client.deinit();
+    client.setMaxTokensOverride(256);
+
+    const outcome = self_evolution.endOfRun(a, .{
+        .kg = &kg,
+        .session_dir = session_dir,
+        .project_root = project_root,
+        .provider = client.provider(),
+        .actor_identity = "mock|test-model",
+        .model = "test-model",
+        .run_binding = binding,
+        .now_ns = 1_000_000_000,
+        .stop_reason = "end_turn",
+        .provisional_active_count = 0,
+        .outcomes_ingested = 0,
+        .provisional_candidate_ids = &.{},
+        .provisional_bundle_sha256 = null,
+        .abort = null,
+    });
+    try std.testing.expectEqual(self_evolution.Outcome.proposed, outcome);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const obligations = try self_evolution.collectObligations(arena.allocator(), &kg, "obl-task");
+    try std.testing.expectEqual(@as(usize, 1), obligations.len);
+    try std.testing.expectEqualStrings("pytest testing/test_x.py::test_a", obligations[0].command_needle);
+}
