@@ -78,8 +78,8 @@ pub const Runtime = struct {
 pub const MAX_DERIVED: usize = 3;
 pub const GIGO_REASON =
     "input-audit (Garbage In, Garbage Out): a previous attempt failed " ++
-    "exactly this point; execute a check covering it, or state explicitly " ++
-    "why it does not apply in this workspace";
+    "exactly this point. Reproduce before you fix — execute a check covering " ++
+    "it, or state explicitly why it does not apply in this workspace";
 
 /// 从结局行文本("… failing=[a, b, c]")解析派生义务,追加进 list(去重、
 /// 截 " (skipped)" 后缀、边界过滤)。返回追加条数。

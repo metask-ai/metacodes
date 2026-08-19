@@ -133,10 +133,13 @@ fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClient) ?
         allocator,
         "<system-reminder>\n# 本任务上一次尝试的判定结局(host 声明,确定性注入)\n" ++
             "{s}\n" ++
-            "动手前先审题:任务陈述和上面的反馈都是输入证据,逐字审读——Garbage In, Garbage Out:" ++
-            "你对输入的每一处误读都会原样变成错误的实现。对每条证据自问:它到底断言了什么?" ++
-            "我的理解有没有第二种读法?有歧义就用工作区里可查证的事实裁决,不用直觉或惯例代替。" ++
-            "实现后逐条验证证据点(能运行的就运行),收尾前把整套检查重跑一遍,确认没有为修新账破旧账。\n" ++
+            "Garbage In, Garbage Out: misread inputs become wrong code — audit the task " ++
+            "statement and the feedback above word by word before acting. Failing tests are " ++
+            "executable specifications, and every word in a failing or skipped test name is " ++
+            "part of the spec. Reproduce before you fix: make it fail, then make it pass. " ++
+            "When two readings are possible, decide from verifiable facts in the workspace, " ++
+            "not intuition or convention. No regressions: re-run your whole check suite " ++
+            "before closing.\n" ++
             "</system-reminder>\n",
         .{body},
     ) catch null;

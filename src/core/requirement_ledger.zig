@@ -19,15 +19,16 @@ const std = @import("std");
 pub const LEDGER_PROMPT_TEXT =
     "[requirement ledger]\n" ++
     "Before going further: decompose the task statement into your task list " ++
-    "(TaskCreate) — one item per explicitly requested behavior or " ++
-    "requirement, including edge conditions the statement names. Every " ++
-    "conditional clause, named boundary (empty/zero/duplicate/ordering/" ++
-    "case), and requested output artifact is a candidate item — a statement " ++
-    "with many clauses deserves many items. Close each item " ++
-    "(status=completed) only after a check you actually executed in this " ++
-    "session (a command, a test, an observed output) — asserting it works " ++
-    "without running anything is not verification. Close inapplicable items " ++
-    "with a short reason. Keep the ledger current as you work.\n" ++
+    "(TaskCreate) — these are your acceptance criteria, one item per " ++
+    "explicitly requested behavior or requirement, including edge conditions " ++
+    "the statement names. Every conditional clause, named boundary (empty/" ++
+    "zero/duplicate/ordering/case), and requested output artifact is a " ++
+    "candidate item — a statement with many clauses deserves many items. " ++
+    "Your Definition of Done: every acceptance criterion verified by a check " ++
+    "you actually executed in this session (a command, a test, an observed " ++
+    "output) — asserting it works without running anything is not " ++
+    "verification. Close inapplicable items with a short reason. Keep the " ++
+    "ledger current as you work.\n" ++
     // PO-V2 M3(prompt 协议,任务无关):计划期钉下的具体选择要落成可核对
     // 的 decision;fstack-r2 的 dotenv 死法 = 计划两次决定 debug 级,下一个
     // Edit 写成 info,自测把漂移钉死——typed 决策 + 收尾核对是它的直接猎物。
