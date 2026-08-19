@@ -40,10 +40,10 @@ pub const LEDGER_PROMPT_TEXT =
     "stated by the task (accepted input values, an output field's exact " ++
     "shape, an argv form), search the repository for prior art before " ++
     "inventing one — existing tests, caches, and sibling call sites usually " ++
-    "already pin it. But prior art only fills gaps: an explicit signal from " ++
-    "the task statement or from verifier feedback (including a test name " ++
-    "that names a module, an algorithm, or a behavior) outranks repository " ++
-    "convention when they conflict.";
+    "already pin it. Prior art only fills gaps: when any explicit signal in " ++
+    "your inputs conflicts with repository convention, the input wins — " ++
+    "garbage in, garbage out, so audit what your inputs actually say before " ++
+    "reaching for convention.";
 
 /// Premature final answer with open ledger items. `{d}` = open count.
 pub const OPEN_NUDGE_FMT =
