@@ -71,7 +71,62 @@ pub const Runtime = struct {
     }
 };
 
-/// 从 KG 装载当前任务的义务运行时。义务缺失/店不可用 → null(零开销)。
+/// GIGO 门:host 从同题上次结局行机械派生证据 token(失败/跳过名),构造
+/// 会话本地义务——不落库、不等 author 两轮学习。"什么算 token"是工程
+/// 分类器;策略与 author 义务共用同一 Runtime,Lean ObligationGate 定理
+/// (met/nudged 永不再选、预算封顶、纯注入)原样覆盖。
+pub const MAX_DERIVED: usize = 3;
+pub const GIGO_REASON =
+    "input-audit (Garbage In, Garbage Out): a previous attempt failed " ++
+    "exactly this point; execute a check covering it, or state explicitly " ++
+    "why it does not apply in this workspace";
+
+/// 从结局行文本("… failing=[a, b, c]")解析派生义务,追加进 list(去重、
+/// 截 " (skipped)" 后缀、边界过滤)。返回追加条数。
+fn appendDerived(
+    a: std.mem.Allocator,
+    list: *std.array_list.Managed(self_evolution.ObligationEnvelope),
+    task_sha: [64]u8,
+    row_text: []const u8,
+) usize {
+    const open = std.mem.indexOf(u8, row_text, "failing=[") orelse return 0;
+    const body_start = open + "failing=[".len;
+    const close = std.mem.lastIndexOfScalar(u8, row_text, ']') orelse return 0;
+    if (close <= body_start) return 0;
+    var appended: usize = 0;
+    var it = std.mem.splitSequence(u8, row_text[body_start..close], ", ");
+    while (it.next()) |raw_name| {
+        if (appended >= MAX_DERIVED) break;
+        var needle = std.mem.trim(u8, raw_name, " ");
+        if (std.mem.endsWith(u8, needle, " (skipped)"))
+            needle = needle[0 .. needle.len - " (skipped)".len];
+        if (needle.len < self_evolution.MIN_NEEDLE_LEN or
+            needle.len > self_evolution.MAX_NEEDLE_LEN) continue;
+        var duplicate = false;
+        for (list.items) |existing| {
+            if (std.mem.eql(u8, existing.command_needle, needle)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        const owned_needle = a.dupe(u8, needle) catch continue;
+        const cid = self_evolution.obligationCandidateId(task_sha[0..], owned_needle, GIGO_REASON);
+        const owned_cid = a.dupe(u8, cid[0..]) catch continue;
+        const owned_task = a.dupe(u8, task_sha[0..]) catch continue;
+        list.append(.{
+            .candidate_id = owned_cid,
+            .task_sha256 = owned_task,
+            .command_needle = owned_needle,
+            .reason = GIGO_REASON,
+        }) catch continue;
+        appended += 1;
+    }
+    return appended;
+}
+
+/// 从 KG 装载当前任务的义务运行时(author 学得的 + GIGO 派生的)。
+/// 两路皆空/店不可用 → null(零开销)。
 pub fn load(
     gpa: std.mem.Allocator,
     kg: *kg_client_mod.KgClient,
@@ -80,10 +135,22 @@ pub fn load(
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
-    const envelopes = self_evolution.collectObligations(a, kg, task_hint) catch {
+    const stored = self_evolution.collectObligations(a, kg, task_hint) catch {
         arena.deinit();
         return null;
     };
+    var combined = std.array_list.Managed(self_evolution.ObligationEnvelope).init(a);
+    combined.appendSlice(stored) catch {
+        arena.deinit();
+        return null;
+    };
+    if (task_hint.len > 0 and task_hint.len <= 200) {
+        const scoped_recall = @import("../kg/scoped_recall.zig");
+        if (scoped_recall.sameTaskOutcomeRow(a, kg, task_hint)) |row| {
+            _ = appendDerived(a, &combined, self_evolution.taskIdentity(task_hint), row);
+        }
+    }
+    const envelopes = combined.items;
     if (envelopes.len == 0) {
         arena.deinit();
         return null;
@@ -123,6 +190,21 @@ fn testRuntime(envelope_count: usize) Runtime {
     @memset(met, false);
     @memset(nudged, false);
     return .{ .arena = arena, .envelopes = envelopes, .met = met, .nudged = nudged };
+}
+
+test "GIGO derivation parses failing names, strips skip suffix, dedupes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var list = std.array_list.Managed(self_evolution.ObligationEnvelope).init(a);
+    const task_sha = self_evolution.taskIdentity("etag-task");
+    const row = "task-outcome-v1: key=etag-task#a1 task=etag-task reward=0.27 tests=3/11 " ++
+        "failing=[tests/t.py::TestX::test_uses_sha256 (skipped), etag present, etag present, ab]";
+    const n = appendDerived(a, &list, task_sha, row);
+    try std.testing.expectEqual(@as(usize, 2), n); // 重复去重 + "ab" 过短被滤
+    try std.testing.expectEqualStrings("tests/t.py::TestX::test_uses_sha256", list.items[0].command_needle);
+    try std.testing.expectEqualStrings("etag present", list.items[1].command_needle);
+    try std.testing.expectEqualStrings(GIGO_REASON, list.items[0].reason);
 }
 
 test "observed command satisfies the obligation and disarms the nudge" {

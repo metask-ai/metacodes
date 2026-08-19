@@ -42,7 +42,7 @@ pub const LEDGER_PROMPT_TEXT =
     "inventing one — existing tests, caches, and sibling call sites usually " ++
     "already pin it. Prior art only fills gaps: when any explicit signal in " ++
     "your inputs conflicts with repository convention, the input wins — " ++
-    "garbage in, garbage out, so audit what your inputs actually say before " ++
+    "Garbage In, Garbage Out — so audit what your inputs actually say before " ++
     "reaching for convention.";
 
 /// Premature final answer with open ledger items. `{d}` = open count.
