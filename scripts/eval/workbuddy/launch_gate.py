@@ -4886,7 +4886,7 @@ def main(argv: list[str] | None = None) -> int:
     create.add_argument("--workbuddy-checkout", type=Path, required=True)
     create.add_argument("--cohort-manifest", type=Path, required=True)
     create.add_argument("--subset", choices=("code", "web", "office", "security"), required=True)
-    create.add_argument("--cohort", choices=("dev", "promotion_a", "promotion_b", "sealed"), required=True)
+    create.add_argument("--cohort", choices=("dev", "dev_etag", "promotion_a", "promotion_b", "sealed"), required=True)
     create.add_argument("--take", type=int, default=0)
     create.add_argument("--split-mount-manifest", type=Path, required=True)
     create.add_argument("--environment-preflight-receipt", type=Path, required=True)
