@@ -299,7 +299,9 @@ class MetacodesAgent(BaseInstalledAgent):
         roots = [str(_continuity_root(self.logs_dir).parent)]
         roots.extend(self._outcome_roots)
         seen = set()
-        for root in roots[:4]:
+        if len(roots) > 8:
+            print(f"metacodes adapter: truncating outcome roots {len(roots)} -> 8", flush=True)
+        for root in roots[:8]:
             root_path = Path(root)
             if not root_path.is_dir():
                 continue

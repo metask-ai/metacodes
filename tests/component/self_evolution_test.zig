@@ -633,4 +633,33 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     try std.testing.expect(std.mem.indexOf(u8, text2, "Per-point reading mode") != null);
     try std.testing.expect(std.mem.indexOf(u8, text2, "failed 2 consecutive attempt(s)") != null);
     try std.testing.expect(std.mem.indexOf(u8, text2, "read it constructively") != null);
+    // streak=2 时仍是完整框架(未升级)。
+    try std.testing.expect(std.mem.indexOf(u8, text2, "Garbage In, Garbage Out") != null);
+
+    // 第三次同名失败 → streak=3 → union 指令 + 升级态瘦身(说教消失)。
+    {
+        const payload3 = "{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+            "{\"task\":\"wall-task\",\"attempt_key\":\"a3\",\"reward\":0.27,\"tests_passed\":3,\"tests_total\":11," ++
+            "\"failing_tests\":[\"tests/t.py::TestX::test_uses_sha256 (skipped)\"]}]}";
+        const pfs = @import("platform").fs;
+        const z3 = try a.dupeZ(u8, outcomes_path);
+        defer a.free(z3);
+        const fd = pfs.open(z3.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = pfs.close(fd);
+        var off: usize = 0;
+        while (off < payload3.len) {
+            const n = pfs.write(fd, payload3[off..]);
+            try std.testing.expect(n > 0);
+            off += @intCast(n);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
+    var built3 = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    defer built3.deinit(a);
+    const text3 = built3.text orelse return error.TestExpectedInjection;
+    try std.testing.expect(std.mem.indexOf(u8, text3, "failed 3 consecutive attempt(s)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text3, "UNION") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text3, "ESCALATED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text3, "Garbage In, Garbage Out") == null);
 }

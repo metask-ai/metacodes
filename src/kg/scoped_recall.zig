@@ -140,11 +140,12 @@ fn appendModeSection(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     history_ascending: []const []const u8,
-) !void {
-    if (history_ascending.len == 0) return;
+) !usize {
+    var max_streak: usize = 0;
+    if (history_ascending.len == 0) return 0;
     const cognitive_mode = @import("../core/cognitive_mode.zig");
     const newest = history_ascending[history_ascending.len - 1];
-    const newest_failing = failingSection(newest) orelse return;
+    const newest_failing = failingSection(newest) orelse return 0;
     var rendered: usize = 0;
     var it = std.mem.splitSequence(u8, newest_failing, ", ");
     while (it.next()) |raw_name| {
@@ -159,6 +160,7 @@ fn appendModeSection(
             if (std.mem.indexOf(u8, section, name) == null) break;
             streak += 1;
         }
+        if (streak > max_streak) max_streak = streak;
         if (rendered == 0)
             try out.appendSlice(allocator, "Per-point reading mode (host-computed from your attempt history):\n");
         const mode = cognitive_mode.schedule(streak);
@@ -171,6 +173,7 @@ fn appendModeSection(
         try out.appendSlice(allocator, line);
         rendered += 1;
     }
+    return max_streak;
 }
 
 fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClient) ?[]u8 {
@@ -191,7 +194,19 @@ fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClient) ?
     out.appendSlice(allocator, "<system-reminder>\n# 本任务上一次尝试的判定结局(host 声明,确定性注入)\n") catch return null;
     out.appendSlice(allocator, body) catch return null;
     out.appendSlice(allocator, "\n") catch return null;
-    appendModeSection(&out, allocator, history.items) catch {};
+    const max_streak = appendModeSection(&out, allocator, history.items) catch 0;
+    if (max_streak >= 3) {
+        // 升级态瘦身(提示饱和对策):union/invert 级别的点在场时,九层
+        // 说教稀释关键指令——只留判决+模式+三行硬约束,短促命令式。
+        out.appendSlice(allocator,
+            "ESCALATED. The mandated modes above are orders, not suggestions — execute them " ++
+                "literally this attempt. Constraints: the verifier runs OUTSIDE this workspace, " ++
+                "absent referenced files are expected and their names remain requirements; " ++
+                "one verdict per attempt — an unchanged approach is a wasted attempt; " ++
+                "re-run your whole check suite before closing.\n" ++
+                "</system-reminder>\n") catch return null;
+        return out.toOwnedSlice(allocator) catch null;
+    }
     out.appendSlice(allocator,
         "This verdict was produced by a verifier that runs outside your workspace: its " ++
             "test files may not exist locally, so do not expect to find or run them, and " ++
