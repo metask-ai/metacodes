@@ -255,9 +255,24 @@ pub fn load(
     };
     if (task_hint.len > 0 and task_hint.len <= 200) {
         const scoped_recall = @import("../kg/scoped_recall.zig");
+        // 理由派生(模块 import)在前且**扫全部历史行**(p15 取证:棘轮缺失
+        // ——p14 结构成功后其行不再含 "not available",单看最新行义务消失,
+        // 工作区重置后模块无人重建 → 8 skip 回归。内容寻址+去重保证一次
+        // 暴露跨轮存续)。
+        {
+            var history = std.array_list.Managed([]u8).init(a);
+            defer {
+                for (history.items) |row| a.free(row);
+                history.deinit();
+            }
+            scoped_recall.collectHistory(a, kg, task_hint, &history);
+            var back = history.items.len;
+            while (back > 0) {
+                back -= 1;
+                _ = appendReasonDerived(a, &combined, self_evolution.taskIdentity(task_hint), history.items[back]);
+            }
+        }
         if (scoped_recall.sameTaskOutcomeRow(a, kg, task_hint)) |row| {
-            // 理由派生(模块 import)在前:nudge 预算优先给"创建缺失工件"。
-            _ = appendReasonDerived(a, &combined, self_evolution.taskIdentity(task_hint), row);
             _ = appendDerived(a, &combined, self_evolution.taskIdentity(task_hint), row);
         }
     }

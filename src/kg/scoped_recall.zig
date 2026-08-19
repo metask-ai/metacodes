@@ -136,6 +136,21 @@ const MAX_HISTORY_ROWS: usize = 8;
 /// 认知模式段:对最新失败名逐点计算**连续末尾败次**(仅在 failing 段内
 /// 匹配,不受 note 字段污染),按 cognitive_mode.schedule 渲染强制读法。
 /// 调度纯函数 Lean 已证(全函数/单调/默认 verify);此处只是渲染。
+/// 在 failing 段里找 bare 名对应条目的括号注解内容("skipped: …"/"failed: …")。
+/// 条目以 ", " 分隔且理由无逗号(adapter 逗号→分号纪律),尾括号即条目末尾。
+fn entryAnnotation(section: []const u8, bare: []const u8) ?[]const u8 {
+    var it = std.mem.splitSequence(u8, section, ", ");
+    while (it.next()) |raw| {
+        const entry = std.mem.trim(u8, raw, " ");
+        if (!std.mem.startsWith(u8, entry, bare)) continue;
+        const rest = entry[bare.len..];
+        if (!std.mem.startsWith(u8, rest, " (")) continue;
+        if (!std.mem.endsWith(u8, rest, ")")) continue;
+        return rest[2 .. rest.len - 1];
+    }
+    return null;
+}
+
 fn appendModeSection(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -170,10 +185,29 @@ fn appendModeSection(
         if (rendered == 0)
             try out.appendSlice(allocator, "Per-point reading mode (host-computed from your attempt history):\n");
         const mode = cognitive_mode.schedule(streak);
+        // 累积规格回携(p15 取证:结构信号与形状信号住在相邻两行,body
+        // 只引最新行 → 振荡遗忘)。每点附历史中最近一次**更早的**注解理由,
+        // 与最新行的注解在同屏共存。
+        var previous_reason: ?[]const u8 = null;
+        var pback = history_ascending.len - 1;
+        while (pback > 0 and previous_reason == null) {
+            pback -= 1;
+            const psec = failingSection(history_ascending[pback]) orelse continue;
+            previous_reason = entryAnnotation(psec, name);
+        }
+        const newest_ann = entryAnnotation(newest_failing, name);
+        if (previous_reason != null and newest_ann != null and
+            std.mem.eql(u8, previous_reason.?, newest_ann.?)) previous_reason = null;
+        var reason_buffer: [128]u8 = undefined;
+        const prev_part = if (previous_reason) |r| blk: {
+            var end: usize = @min(r.len, 110);
+            while (end > 0 and end < r.len and (r[end] & 0xC0) == 0x80) end -= 1;
+            break :blk std.fmt.bufPrint(&reason_buffer, " | previously: {s}", .{r[0..end]}) catch "";
+        } else "";
         const line = try std.fmt.allocPrint(
             allocator,
-            "- {s} — failed {d} consecutive attempt(s): {s}\n",
-            .{ name, streak, mode.directive() },
+            "- {s} — failed {d} consecutive attempt(s): {s}{s}\n",
+            .{ name, streak, mode.directive(), prev_part },
         );
         defer allocator.free(line);
         try out.appendSlice(allocator, line);
@@ -251,7 +285,7 @@ pub fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClien
     return out.toOwnedSlice(allocator) catch null;
 }
 
-fn collectHistory(
+pub fn collectHistory(
     allocator: std.mem.Allocator,
     kg: *client_mod.KgClient,
     hint: []const u8,

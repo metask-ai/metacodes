@@ -765,6 +765,31 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     try std.testing.expect(std.mem.indexOf(u8, text_r, "(skipped: widget._helpers not available; create it)") != null);
     // streak 跨注解变化连续:裸名身份 → failed 2。
     try std.testing.expect(std.mem.indexOf(u8, text_r, "- tests/t.py::TestR::test_module_exists — failed 2 consecutive attempt(s)") != null);
+    // 第三次尝试:新注解无点分 token(形状类失败)——棘轮断言的前提。
+    {
+        const payload_r3 = "{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+            "{\"task\":\"reason-task\",\"attempt_key\":\"r3\",\"reward\":0.5,\"tests_passed\":2,\"tests_total\":3," ++
+            "\"failing_tests\":[\"tests/t.py::TestR::test_module_exists (failed: AttributeError; coroutine has no attribute startswith)\"]}]}";
+        const pfs = @import("platform").fs;
+        const zr3 = try a.dupeZ(u8, outcomes_path);
+        defer a.free(zr3);
+        const fd = pfs.open(zr3.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = pfs.close(fd);
+        var off: usize = 0;
+        while (off < payload_r3.len) {
+            const n = pfs.write(fd, payload_r3[off..]);
+            try std.testing.expect(n > 0);
+            off += @intCast(n);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
+    var built_r3 = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    defer built_r3.deinit(a);
+    const text_r3 = built_r3.text orelse return error.TestExpectedInjection;
+    // 累积规格:最新行是形状失败,mode 行回携上一轮的结构理由。
+    try std.testing.expect(std.mem.indexOf(u8, text_r3, "| previously: skipped: widget._helpers not available; create it") != null);
+
     // GIGO 派生针 = 裸 node id(括号注解整体剥离)。
     const runtime_r = cc.obligation_gate.load(a, &kg, "reason-task") orelse return error.TestExpectedRuntime;
     defer {
@@ -773,6 +798,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     }
     // 理由派生义务居首(p13 取证:nudge 预算优先给"创建缺失工件"的
     // import 针——自建测试满足不了 import,名字针可以被自建测试绕过)。
+    // 棘轮:最新行(r3)无点分 token,import 义务只能来自历史行(r2)。
     try std.testing.expectEqual(@as(usize, 2), runtime_r.count());
     try std.testing.expectEqualStrings("import widget._helpers", runtime_r.envelopes[0].command_needle);
     try std.testing.expectEqualStrings("tests/t.py::TestR::test_module_exists", runtime_r.envelopes[1].command_needle);
