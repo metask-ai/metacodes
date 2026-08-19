@@ -138,7 +138,7 @@ const MAX_HISTORY_ROWS: usize = 8;
 /// 调度纯函数 Lean 已证(全函数/单调/默认 verify);此处只是渲染。
 /// 在 failing 段里找 bare 名对应条目的括号注解内容("skipped: …"/"failed: …")。
 /// 条目以 ", " 分隔且理由无逗号(adapter 逗号→分号纪律),尾括号即条目末尾。
-fn entryAnnotation(section: []const u8, bare: []const u8) ?[]const u8 {
+pub fn entryAnnotation(section: []const u8, bare: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, section, ", ");
     while (it.next()) |raw| {
         const entry = std.mem.trim(u8, raw, " ");

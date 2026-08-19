@@ -207,6 +207,7 @@ fn appendDerived(
     list: *std.array_list.Managed(self_evolution.ObligationEnvelope),
     task_sha: [64]u8,
     row_text: []const u8,
+    history: []const []u8,
 ) usize {
     const open = std.mem.indexOf(u8, row_text, "failing=[") orelse return 0;
     const body_start = open + "failing=[".len;
@@ -244,15 +245,51 @@ fn appendDerived(
         const owned_needle = a.dupe(u8, needle) catch continue;
         // 有验证器报告 → reason 携带原文(紧凑框架语;nudge 打印 reason,
         // 报告以祈使上下文抵达)。无报告 → 通用 GIGO 理由。
-        const reason: []const u8 = if (annotation) |ann| blk: {
-            var end: usize = @min(ann.len, 160);
-            while (end > 0 and end < ann.len and (ann[end] & 0xC0) == 0x80) end -= 1;
+        // 约束累积进 nudge(p23 取证:mode 行三条同呈仍只取一条;全勤通道
+        // 里逐字要求"同时满足"。历史所有去重报告 + 最新的,cap 3)。
+        const scoped_recall_mod = @import("../kg/scoped_recall.zig");
+        var acc: [3][]const u8 = undefined;
+        var acc_n: usize = 0;
+        if (annotation) |ann| {
+            acc[0] = ann;
+            acc_n = 1;
+        }
+        var hback = history.len;
+        while (hback > 0 and acc_n < acc.len) {
+            hback -= 1;
+            const hrow = history[hback];
+            const hopen = std.mem.indexOf(u8, hrow, "failing=[") orelse continue;
+            const hclose = std.mem.indexOfScalarPos(u8, hrow, hopen, ']') orelse continue;
+            if (hclose <= hopen + "failing=[".len) continue;
+            const hsec = hrow[hopen + "failing=[".len .. hclose];
+            const hann = scoped_recall_mod.entryAnnotation(hsec, needle) orelse continue;
+            var dup = false;
+            for (acc[0..acc_n]) |seen| {
+                if (std.mem.eql(u8, seen, hann)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            acc[acc_n] = hann;
+            acc_n += 1;
+        }
+        const reason: []const u8 = if (acc_n > 0) blk: {
+            var joined = std.array_list.Managed(u8).init(a);
+            defer joined.deinit();
+            for (acc[0..acc_n], 0..) |r, ri| {
+                if (ri > 0) joined.appendSlice("  PLUS  ") catch break;
+                var end: usize = @min(r.len, 110);
+                while (end > 0 and end < r.len and (r[end] & 0xC0) == 0x80) end -= 1;
+                joined.appendSlice(r[0..end]) catch break;
+            }
             break :blk std.fmt.allocPrint(
                 a,
-                "this exact point failed before; the verifier reported: {s}. " ++
-                    "Fix what the report names — its call convention and expected " ++
-                    "value are the spec, not suggestions",
-                .{ann[0..end]},
+                "this exact point has failed across attempts; the verifier reported: " ++
+                    "{s}. Satisfy EVERY one of these simultaneously — each past round " ++
+                    "fixed one while regressing another; the call convention, argument " ++
+                    "type and expected value are all the spec at once",
+                .{joined.items},
             ) catch GIGO_REASON;
         } else GIGO_REASON;
         const cid = self_evolution.obligationCandidateId(task_sha[0..], owned_needle, reason);
@@ -304,7 +341,13 @@ pub fn load(
             }
         }
         if (scoped_recall.sameTaskOutcomeRow(a, kg, task_hint)) |row| {
-            _ = appendDerived(a, &combined, self_evolution.taskIdentity(task_hint), row);
+            var history2 = std.array_list.Managed([]u8).init(a);
+            defer {
+                for (history2.items) |h| a.free(h);
+                history2.deinit();
+            }
+            scoped_recall.collectHistory(a, kg, task_hint, &history2);
+            _ = appendDerived(a, &combined, self_evolution.taskIdentity(task_hint), row, history2.items);
         }
     }
     // stored(author 陈年义务)排在派生之后(p17 取证:预算被裸针 stored
@@ -400,7 +443,7 @@ test "GIGO derivation parses failing names, strips skip suffix, dedupes" {
     const task_sha = self_evolution.taskIdentity("etag-task");
     const row = "task-outcome-v1: key=etag-task#a1 task=etag-task reward=0.27 tests=3/11 " ++
         "failing=[tests/t.py::TestX::test_uses_sha256 (skipped), etag present, etag present, ab]";
-    const n = appendDerived(a, &list, task_sha, row);
+    const n = appendDerived(a, &list, task_sha, row, &.{});
     try std.testing.expectEqual(@as(usize, 2), n); // 重复去重 + "ab" 过短被滤
     try std.testing.expectEqualStrings("tests/t.py::TestX::test_uses_sha256", list.items[0].command_needle);
     try std.testing.expectEqualStrings("etag present", list.items[1].command_needle);

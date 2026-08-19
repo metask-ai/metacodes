@@ -845,8 +845,10 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     try std.testing.expectEqualStrings("import widget._helpers", runtime_r.envelopes[0].command_needle);
     try std.testing.expectEqualStrings("tests/t.py::TestR::test_module_exists", runtime_r.envelopes[1].command_needle);
     // v22:名字义务的 reason 携带验证器报告原文(nudge 通道递送形状指令)。
-    // reason 携带**最新行**的报告(r4 的断言 diff;r3 时代是 coroutine 消息)。
+    // v27:reason 累积历史全部去重报告并要求同时满足(整合失败的解药)。
     try std.testing.expect(std.mem.indexOf(u8, runtime_r.envelopes[1].reason, "the verifier reported: failed: assert ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_r.envelopes[1].reason, "  PLUS  ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_r.envelopes[1].reason, "Satisfy EVERY one of these simultaneously") != null);
     ppaths.setEnv("METACODES_TASK_HINT", "wall-task");
 
     // UTF-8 截断安全(p10 现场雷):中文 note >300 字节,裸字节截断切码点
