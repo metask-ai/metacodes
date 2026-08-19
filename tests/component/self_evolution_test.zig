@@ -791,6 +791,31 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     try std.testing.expect(std.mem.indexOf(u8, text_r3, "every past report for this point: ") != null);
     try std.testing.expect(std.mem.indexOf(u8, text_r3, "skipped: widget._helpers not available; create it") != null);
 
+    // 最佳工件重放(v28):r3(最佳 0.5)重发并携带 best_artifact(含括号/
+    // 逗号的真实代码)→ 工件升级写;newest=r4 时最佳锚整行引用,工件随行
+    // 进注入;行文法(首个 ']' 定界)不被代码括号劫持,GIGO 针保持干净。
+    {
+        const payload_a = "{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+            "{\"task\":\"reason-task\",\"attempt_key\":\"r3\",\"reward\":0.5,\"tests_passed\":2,\"tests_total\":3," ++
+            "\"failing_tests\":[\"tests/t.py::TestR::test_module_exists (failed: AttributeError; coroutine has no attribute startswith)\"]," ++
+            "\"best_artifact\":\"--- widget/_helpers.py ---\\ndef calc(path, size=4096):\\n    data = [1, 2]\\n    return chr(34) + digest(path)[:16] + chr(34)\"}]}";
+        const pfs = @import("platform").fs;
+        const za = try a.dupeZ(u8, outcomes_path);
+        defer a.free(za);
+        const fd = pfs.open(za.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = pfs.close(fd);
+        var off: usize = 0;
+        while (off < payload_a.len) {
+            const n = pfs.write(fd, payload_a[off..]);
+            try std.testing.expect(n > 0);
+            off += @intCast(n);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
+    // 幂等:同工件重发不再升级写。
+    try std.testing.expectEqual(@as(usize, 0), self_evolution.ingestOutcomes(a, &kg));
+
     // 第四次尝试:回归(reward 跌回)+ 注解含省略号截断哈希(p19 误火源)。
     {
         const payload_r4 = "{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
@@ -818,6 +843,21 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     try std.testing.expect(std.mem.indexOf(u8, text_r4, "every past report for this point: ") != null);
     try std.testing.expect(std.mem.indexOf(u8, text_r4, "AttributeError; coroutine has no attribute startswith") != null);
     try std.testing.expect(std.mem.indexOf(u8, text_r4, "widget._helpers not available") != null);
+    // 最佳工件随最佳锚进注入(升级写的 r3 带工件,reward 0.5 仍为最佳)。
+    try std.testing.expect(std.mem.indexOf(u8, text_r4, "best-attempt artifact (host-extracted, verbatim):") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_r4, "digest(path)[:16]") != null);
+    // 工件里的括号/代码不得污染 GIGO 针(首 ']' 定界回归钉)。
+    {
+        const runtime_a = cc.obligation_gate.load(a, &kg, "reason-task") orelse return error.TestExpectedRuntime;
+        defer {
+            runtime_a.deinit();
+            a.destroy(runtime_a);
+        }
+        for (runtime_a.envelopes) |envelope| {
+            try std.testing.expect(std.mem.indexOf(u8, envelope.command_needle, "digest") == null);
+            try std.testing.expect(std.mem.indexOf(u8, envelope.command_needle, "data = ") == null);
+        }
+    }
     // 最佳尝试锚:newest=r4(0.4) < best=r3(0.5) → r3 整行进注入。
     try std.testing.expect(std.mem.indexOf(u8, text_r4, "历史最佳尝试") != null);
     try std.testing.expect(std.mem.indexOf(u8, text_r4, "#r3 ") != null or std.mem.indexOf(u8, text_r4, "reward=0.5000") != null);

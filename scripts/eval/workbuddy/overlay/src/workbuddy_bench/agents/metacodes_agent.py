@@ -149,6 +149,43 @@ def _annotate_failing(name: str, reasons: dict) -> str:
     return f"{bare} ({kind}: {msg})"[:280]
 
 
+def _best_artifact(trial_dir: Path) -> str:
+    """Best attempt's newly created non-test files, verbatim from agent.patch.
+
+    Copy-and-patch beats re-derivation: across p18-p23 the model re-derived
+    the implementation every round and never integrated more than one
+    correction at a time.  Quoting the best attempt's actual artifact removes
+    the degrees of freedom where its priors (async, full-hash) re-enter.
+    Mechanical and task-agnostic; 1600-byte cap, at most two files.
+    """
+    try:
+        patch = (trial_dir / "verifier" / "agent.patch").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return ""
+    pieces = []
+    total = 0
+    for chunk in patch.split("diff --git ")[1:]:
+        if "\nnew file mode" not in chunk:
+            continue
+        header = chunk.splitlines()[0]
+        path = header.split(" b/")[-1].strip()
+        if path.startswith("tests/") or total >= 1600 or len(pieces) >= 2:
+            continue
+        added = [
+            line[1:]
+            for line in chunk.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        ]
+        content = "\n".join(added)[: 1600 - total]
+        if not content.strip():
+            continue
+        pieces.append(f"--- {path} ---\n{content}")
+        total += len(content)
+    return "\n".join(pieces)
+
+
 def _read_continuity_ledger(path: Path) -> list:
     if not path.exists():
         return []
@@ -464,6 +501,7 @@ class MetacodesAgent(BaseInstalledAgent):
                     "tests_passed": int(score.get("tests_passed") or 0),
                     "tests_total": int(score.get("tests_total") or 0),
                     "failing_tests": failing,
+                    "_trial_dir": str(trial_dir),
                 }
                 if final_note:
                     row["final_note"] = final_note
@@ -661,6 +699,20 @@ class MetacodesAgent(BaseInstalledAgent):
                     "export METACODES_TASK_HINT=" + shlex.quote(task_hint) + "; "
                 )
             outcome_rows = self._collect_outcomes()
+            best_by_task = {}
+            for row in outcome_rows:
+                task_name = row["task"]
+                if (
+                    task_name not in best_by_task
+                    or row["reward"] > best_by_task[task_name]["reward"]
+                ):
+                    best_by_task[task_name] = row
+            for row in best_by_task.values():
+                artifact = _best_artifact(Path(row["_trial_dir"]))
+                if artifact:
+                    row["best_artifact"] = artifact
+            for row in outcome_rows:
+                row.pop("_trial_dir", None)
             if outcome_rows:
                 (self.logs_dir / "task-outcomes.json").write_text(
                     json.dumps(

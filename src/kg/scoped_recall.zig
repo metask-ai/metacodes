@@ -125,7 +125,9 @@ pub fn sameTaskOutcomeRow(
 fn failingSection(row_text: []const u8) ?[]const u8 {
     const open = std.mem.indexOf(u8, row_text, "failing=[") orelse return null;
     const start = open + "failing=[".len;
-    const close = std.mem.lastIndexOfScalar(u8, row_text, ']') orelse return null;
+    // 首个 ']' 定界(名字是 node id、理由已剥括号 → 段内无 ']';行尾可能
+    // 追加含任意括号的 artifact 块,last-index 定界会被它劫持)。
+    const close = std.mem.indexOfScalarPos(u8, row_text, start, ']') orelse return null;
     if (close <= start) return null;
     return row_text[start..close];
 }
@@ -262,6 +264,10 @@ fn bestHistoryRow(history: []const []u8, newest: []const u8) ?[]const u8 {
         const r = rowReward(row);
         if (r > best_reward) {
             best_reward = r;
+            best = row;
+        } else if (best != null and r == best_reward) {
+            // 同分取更新的行:工件升级写会产生同 attempt 的复本,后写的带
+            // 最佳工件(history 升序,越靠后 node_id 越大)。
             best = row;
         }
     }

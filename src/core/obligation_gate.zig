@@ -211,7 +211,8 @@ fn appendDerived(
 ) usize {
     const open = std.mem.indexOf(u8, row_text, "failing=[") orelse return 0;
     const body_start = open + "failing=[".len;
-    const close = std.mem.lastIndexOfScalar(u8, row_text, ']') orelse return 0;
+    // 首个 ']' 定界(同 failingSection:行尾 artifact 块可含任意括号)。
+    const close = std.mem.indexOfScalarPos(u8, row_text, body_start, ']') orelse return 0;
     if (close <= body_start) return 0;
     var appended: usize = 0;
     var it = std.mem.splitSequence(u8, row_text[body_start..close], ", ");

@@ -502,6 +502,10 @@ const OutcomeRow = struct {
     /// agent 上次的收尾结论(host 采集,≤300B,已单行化+剥方括号)。
     /// 自我历史对质:反重复/反理性化的第一手材料。
     final_note: []const u8 = "",
+    /// 最佳尝试的新建工件原文(host 从 agent.patch 机械提取,仅最佳行携带,
+    /// ≤1800B)。复制+打补丁替代重新推导——p22/p23 取证:模型每轮重推实现,
+    /// 多约束整合必丢面;给它能工作的代码,自由度即消失。
+    best_artifact: []const u8 = "",
 };
 
 const OutcomeFile = struct {
@@ -550,26 +554,37 @@ pub fn ingestOutcomes(
     // 名(旧提取器只认 pytest,15/16 任务 failing=[])而新行有名时**升级写**
     // ——注入选择器按 node_id 取最新,升级行自动生效。无名行都很短
     // (~150B),不会被召回摘录截断,"failing=[]" 判定可靠。
-    var seen = std.StringHashMapUnmanaged(bool){};
+    const StoredState = struct { names: bool, artifact: bool };
+    var seen = std.StringHashMapUnmanaged(StoredState){};
     if (kg.recallTyped(OUTCOME_MARKER, MAX_OUTCOME_ROWS, false, OUTCOME_SCHEMA_TYPE)) |hits| {
         defer {
             for (hits) |*hit| hit.deinit(kg.allocator);
             kg.allocator.free(hits);
         }
         for (hits) |hit| {
-            // key 在文本前 ~60 字节;hit.text 已带前 800 字节,避免逐 hit
-            // spawn get(2026-08-18 审查 R4)。
-            const stored_has_names = std.mem.indexOf(u8, hit.text, "failing=[]") == null;
-            if (extractOutcomeKey(hit.text)) |key| {
-                const entry = seen.getOrPut(arena.allocator(), arena.allocator().dupe(u8, key) catch continue) catch continue;
-                if (!entry.found_existing or stored_has_names) entry.value_ptr.* = stored_has_names;
-                continue;
+            // artifact 标记在行尾,摘录中缝会吞掉 → truncated 命中必须取全
+            // 文再判(误判"无工件"会每轮重写,重复 attempt-key 行污染 streak)。
+            var text_src: []const u8 = hit.text;
+            var full_owned: ?[]u8 = null;
+            defer if (full_owned) |full| kg.allocator.free(full);
+            if (hit.text_truncated) {
+                if (kg.fetchNodeText(hit.node_id)) |full| {
+                    full_owned = full;
+                    text_src = full;
+                } else |_| {}
             }
-            const full = kg.fetchNodeText(hit.node_id) catch continue;
-            defer kg.allocator.free(full);
-            if (extractOutcomeKey(full)) |key| {
+            const state = StoredState{
+                .names = std.mem.indexOf(u8, text_src, "failing=[]") == null,
+                .artifact = std.mem.indexOf(u8, text_src, "best-attempt artifact") != null,
+            };
+            if (extractOutcomeKey(text_src)) |key| {
                 const entry = seen.getOrPut(arena.allocator(), arena.allocator().dupe(u8, key) catch continue) catch continue;
-                if (!entry.found_existing or stored_has_names) entry.value_ptr.* = stored_has_names;
+                if (!entry.found_existing) {
+                    entry.value_ptr.* = state;
+                } else {
+                    entry.value_ptr.names = entry.value_ptr.names or state.names;
+                    entry.value_ptr.artifact = entry.value_ptr.artifact or state.artifact;
+                }
             }
         }
     } else |_| {}
@@ -581,9 +596,12 @@ pub fn ingestOutcomes(
         if (row.attempt_key.len == 0 or row.attempt_key.len > 200) continue;
         var key_buffer: [512]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buffer, "{s}#{s}", .{ row.task, row.attempt_key }) catch continue;
-        if (seen.get(key)) |stored_has_names| {
-            // 已在库:仅当"存量无名 + 新行有名"时升级写,否则跳过。
-            if (stored_has_names or row.failing_tests.len == 0) continue;
+        if (seen.get(key)) |state| {
+            // 已在库:升级写仅两种——存量无名+新行有名;存量无工件+新行带
+            // 最佳工件(工件只挂最佳行,升级一次后 state.artifact 恒真)。
+            const name_upgrade = !state.names and row.failing_tests.len > 0;
+            const artifact_upgrade = !state.artifact and row.best_artifact.len > 0;
+            if (!name_upgrade and !artifact_upgrade) continue;
         }
         var failing = std.array_list.Managed(u8).init(allocator);
         defer failing.deinit();
@@ -599,17 +617,24 @@ pub fn ingestOutcomes(
         // 自我对质引用两代前的旧结论。
         var note_bounded = boundedUtf8(row.final_note, 300);
         if (!std.unicode.utf8ValidateSlice(note_bounded)) note_bounded = "";
+        var artifact_bounded = boundedUtf8(row.best_artifact, 1800);
+        if (!std.unicode.utf8ValidateSlice(artifact_bounded)) artifact_bounded = "";
+        const artifact_part = if (artifact_bounded.len > 0)
+            std.fmt.allocPrint(allocator, "\nbest-attempt artifact (host-extracted, verbatim):\n{s}", .{artifact_bounded}) catch ""
+        else
+            "";
+        defer if (artifact_part.len > 0) allocator.free(artifact_part);
         const text = if (note_bounded.len > 0)
             std.fmt.allocPrint(
                 allocator,
-                OUTCOME_MARKER ++ ": key={s} task={s} reward={d:.4} tests={d}/{d} failing=[{s}] note={s}",
-                .{ key, row.task, row.reward, row.tests_passed, row.tests_total, failing.items, note_bounded },
+                OUTCOME_MARKER ++ ": key={s} task={s} reward={d:.4} tests={d}/{d} failing=[{s}] note={s}{s}",
+                .{ key, row.task, row.reward, row.tests_passed, row.tests_total, failing.items, note_bounded, artifact_part },
             ) catch continue
         else
             std.fmt.allocPrint(
                 allocator,
-                OUTCOME_MARKER ++ ": key={s} task={s} reward={d:.4} tests={d}/{d} failing=[{s}]",
-                .{ key, row.task, row.reward, row.tests_passed, row.tests_total, failing.items },
+                OUTCOME_MARKER ++ ": key={s} task={s} reward={d:.4} tests={d}/{d} failing=[{s}]{s}",
+                .{ key, row.task, row.reward, row.tests_passed, row.tests_total, failing.items, artifact_part },
             ) catch continue;
         defer allocator.free(text);
         _ = kg.remember(.observation, text, OUTCOME_SCHEMA_TYPE, false) catch continue;
