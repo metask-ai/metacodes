@@ -765,6 +765,24 @@ pub fn endOfRun(allocator: std.mem.Allocator, deps: EndOfRunDeps) Outcome {
     // 触发链:先过程信号轴(测试弱化/假闭合/终验失败——selflearn-r1
     // 判读确认本 cohort 的死法是"安静做错",不是工具失败风暴),不满足
     // 再退回 repeated_typed_failure。两次 prepare 都是离线零花费。
+    // 任务上下文:host 声明的任务名 + 该任务上一次尝试的结局行(义务提案
+    // 的主要素材;与确定性注入共用取数路径)。缺席 → author 只有触发概要。
+    const scoped_recall_mod = @import("../kg/scoped_recall.zig");
+    var task_context: ?rule_author.TaskContext = null;
+    var task_outcome_row: ?[]u8 = null;
+    defer if (task_outcome_row) |row| allocator.free(row);
+    if (std.c.getenv("METACODES_TASK_HINT")) |hint_c| {
+        const hint = std.mem.span(hint_c);
+        if (hint.len > 0 and hint.len <= rule_author.MAX_TASK_HINT_BYTES) {
+            if (scoped_recall_mod.sameTaskOutcomeRow(allocator, deps.kg, hint)) |row| {
+                task_outcome_row = row;
+                const bounded = row[0..@min(row.len, rule_author.MAX_TASK_OUTCOME_BYTES)];
+                if (std.unicode.utf8ValidateSlice(bounded))
+                    task_context = .{ .task_hint = hint, .last_outcome = bounded };
+            }
+        }
+    }
+
     const triggers = [_]rule_author.Trigger{
         .process_signal,
         .repeated_typed_failure,
@@ -794,6 +812,7 @@ pub fn endOfRun(allocator: std.mem.Allocator, deps: EndOfRunDeps) Outcome {
             .pricing = authorPricing(),
             .generation_evidence = &.{generation.value},
             .held_out_commitments = &held,
+            .task_context = task_context,
         }) catch |err| switch (err) {
             error.TriggerNotSatisfied => continue,
             error.ProjectOntologyMissing => return finish(allocator, deps, .ontology_missing, @errorName(err)),

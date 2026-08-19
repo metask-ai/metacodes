@@ -170,6 +170,18 @@ test "L2: end-of-run evolution proposes and the next run arms the provisional ru
 
     const binding = try completedWeakeningRun(session_dir);
 
+    // 任务上下文素材:host 声明 hint + 店内该任务的带名结局行 → author
+    // packet 必须携带(义务提案的素材面)。
+    _ = kg.remember(
+        .observation,
+        "task-outcome-v1: key=demo-task#a1 task=demo-task reward=0.5000 tests=2/4 failing=[named failing check]",
+        "task_outcome",
+        false,
+    ) catch return error.SkipZigTest;
+    const ppaths_hint = @import("platform").paths;
+    ppaths_hint.setEnv("METACODES_TASK_HINT", "demo-task");
+    defer ppaths_hint.unsetEnv("METACODES_TASK_HINT");
+
     // MockServer 扮演 author provider。
     const sse = try proposalSse(a);
     defer a.free(sse);
@@ -217,6 +229,15 @@ test "L2: end-of-run evolution proposes and the next run arms the provisional ru
         }
     }
     try std.testing.expectEqual(self_evolution.Outcome.proposed, outcome);
+
+    // 任务上下文实锚:author 请求体必须携带 task_context(hint + 上次
+    // 结局行含错题名)——义务提案的素材面,packet wire 接线断言。
+    const author_request = server.lastRequest() orelse return error.TestExpectedRequest;
+    try std.testing.expect(std.mem.indexOf(u8, author_request.body(), "task_context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, author_request.body(), "named failing check") != null);
+    // packet 以转义字符串嵌入请求体,断言用免引号 token。
+    try std.testing.expect(std.mem.indexOf(u8, author_request.body(), "task_hint") != null);
+    try std.testing.expect(std.mem.indexOf(u8, author_request.body(), "demo-task") != null);
 
     // F1 实锚:每 Run 战绩记录被提升为受治理 proposition。提升发生在
     // prepare 快照之前,所以 outcome==proposed 已经证明 tinykg 导出侧

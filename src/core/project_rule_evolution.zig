@@ -56,6 +56,8 @@ pub const PrepareInput = struct {
     pricing: rule_author.PricingAuthority,
     generation_evidence: []const ontology_projection.GenerationEvidence,
     held_out_commitments: []const ontology_projection.HeldOutCommitment,
+    /// 当前任务上下文(义务提案素材);透传给 rule_author.prepare。
+    task_context: ?rule_author.TaskContext = null,
 };
 
 pub const ActiveBinding = struct {
@@ -280,6 +282,7 @@ pub fn prepare(
             .active_bundle_revision = active.bundle_revision,
             .active_bundle_sha256 = active.bundle_sha256,
         },
+        .task_context = input.task_context,
     });
     errdefer author_request.deinit();
     const rules_dir = try allocator.dupe(u8, input.project_rules_dir);

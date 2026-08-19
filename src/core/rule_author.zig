@@ -49,7 +49,7 @@ pub const MAX_MODEL_BYTES: usize = 256;
 pub const MAX_REASON_BYTES: usize = 2048;
 pub const MAX_EVIDENCE_ITEMS: usize = 16;
 pub const MAX_EVIDENCE_SUMMARY_BYTES: usize = 4096;
-pub const MAX_PACKET_V2_BYTES: usize = MAX_PACKET_BYTES + ontology_projection.MAX_PACKET_BYTES + 4096;
+pub const MAX_PACKET_V2_BYTES: usize = MAX_PACKET_BYTES + ontology_projection.MAX_PACKET_BYTES + 4096 + 4096;
 
 pub const Trigger = enum {
     user_correction,
@@ -139,7 +139,19 @@ pub const PrepareInput = struct {
     caps: CallCaps,
     pricing: PricingAuthority,
     ontology_projection: ?OntologyProjectionAuthority = null,
+    /// 当前任务上下文(host 声明的任务名 + 该任务上一次尝试的结局行)。
+    /// 动态层"合法过拟合"的素材面:义务提案的主要依据。可选;缺席时
+    /// author 只能靠触发证据概要。
+    task_context: ?TaskContext = null,
 };
+
+pub const TaskContext = struct {
+    task_hint: []const u8,
+    last_outcome: []const u8,
+};
+
+pub const MAX_TASK_HINT_BYTES: usize = 200;
+pub const MAX_TASK_OUTCOME_BYTES: usize = 2000;
 
 const WireRun = struct {
     session_id: []const u8,
@@ -176,6 +188,11 @@ const WireProjectionIdentity = struct {
     held_out_commitments_sha256: []const u8,
 };
 
+const WireTaskContext = struct {
+    task_hint: []const u8,
+    last_outcome: []const u8,
+};
+
 const WirePacketV2 = struct {
     schema_version: []const u8 = PACKET_SCHEMA_VERSION_V2,
     project_sha256: []const u8,
@@ -185,6 +202,7 @@ const WirePacketV2 = struct {
     impact: impact_stats.Snapshot,
     ontology_projection_identity: WireProjectionIdentity,
     ontology_projection: std.json.Value,
+    task_context: ?WireTaskContext = null,
 };
 
 pub const PreparedRequest = struct {
@@ -274,6 +292,18 @@ pub fn prepare(allocator: std.mem.Allocator, input: PrepareInput) !PreparedReque
                 .duplicate_field_behavior = .@"error",
             },
         ) catch return error.InvalidOntologyProjectionPacket;
+        var wire_task_context: ?WireTaskContext = null;
+        if (input.task_context) |context| {
+            if (context.task_hint.len == 0 or context.task_hint.len > MAX_TASK_HINT_BYTES or
+                context.last_outcome.len == 0 or context.last_outcome.len > MAX_TASK_OUTCOME_BYTES or
+                !std.unicode.utf8ValidateSlice(context.task_hint) or
+                !std.unicode.utf8ValidateSlice(context.last_outcome))
+                return error.InvalidTaskContext;
+            wire_task_context = .{
+                .task_hint = try a.dupe(u8, context.task_hint),
+                .last_outcome = try a.dupe(u8, context.last_outcome),
+            };
+        }
         break :blk try std.json.Stringify.valueAlloc(a, WirePacketV2{
             .project_sha256 = input.project_sha256[0..],
             .source = source,
@@ -282,6 +312,7 @@ pub fn prepare(allocator: std.mem.Allocator, input: PrepareInput) !PreparedReque
             .impact = snapshot,
             .ontology_projection_identity = wireProjectionIdentity(&binding),
             .ontology_projection = ontology_value,
+            .task_context = wire_task_context,
         }, .{});
     } else try std.json.Stringify.valueAlloc(a, WirePacket{
         .project_sha256 = input.project_sha256[0..],

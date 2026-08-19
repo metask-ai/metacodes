@@ -79,9 +79,13 @@ const TASK_HINT_ENV = "METACODES_TASK_HINT";
 /// 门**——两遍法生产取证:被动召回 16 trial 仅 4 次命中且全是别题的成绩
 /// 单,同题行从未到达,反馈等于没发。best-effort:无 hint/无匹配 → null。
 /// 返回 `allocator` 所有。
-fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClient) ?[]u8 {
-    const hint_c = std.c.getenv(TASK_HINT_ENV) orelse return null;
-    const hint = std.mem.span(hint_c);
+/// 取 hint 任务最近一次尝试的结局行原文(owned by `allocator`)。注入与
+/// author 任务上下文共用(单一取数路径)。无 hint 匹配 → null。
+pub fn sameTaskOutcomeRow(
+    allocator: std.mem.Allocator,
+    kg: *client_mod.KgClient,
+    hint: []const u8,
+) ?[]u8 {
     if (hint.len == 0 or hint.len > 200) return null;
     var needle_buffer: [232]u8 = undefined;
     const needle = std.fmt.bufPrint(&needle_buffer, " task={s} ", .{hint}) catch return null;
@@ -113,6 +117,14 @@ fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClient) ?
             body = full;
         } else |_| {}
     }
+    return allocator.dupe(u8, body) catch null;
+}
+
+fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClient) ?[]u8 {
+    const hint_c = std.c.getenv(TASK_HINT_ENV) orelse return null;
+    const hint = std.mem.span(hint_c);
+    const body = sameTaskOutcomeRow(allocator, kg, hint) orelse return null;
+    defer allocator.free(body);
     // 框架语对冲"按笔记写不自测"的过度自信模式(schema_drift 验尸),并
     // 要求把每个失败名转成可执行检查(p4 取证:名字送达后仍原样重败同
     // 4 测——缺的是"名字→在工作区复现它的检查"这一步);带路径/模块名的

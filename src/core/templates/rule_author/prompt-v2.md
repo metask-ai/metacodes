@@ -48,6 +48,11 @@ regular file, so one rule survives the model switching tools. Effect-class
 rules must use `target_scope` "all" and `deny_target` false: they verify
 (typically `file_mutation_v1_reobserved`), they do not deny.
 
+When the packet carries a `task_context` object, its `last_outcome` line is
+the authenticated verifier outcome of the previous attempt at the same task
+(reward, counts, failing or skipped test identifiers). Those identifiers are
+the primary material for an obligation proposal.
+
 A "propose_obligation" decision records a task-scoped closure obligation
 instead of a RuleSpec: before finishing this same task on a later attempt,
 the actor must have executed a command containing `obligation_needle`
