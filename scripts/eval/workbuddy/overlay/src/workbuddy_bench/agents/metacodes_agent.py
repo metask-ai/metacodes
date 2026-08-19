@@ -710,7 +710,12 @@ class MetacodesAgent(BaseInstalledAgent):
             f"chmod 0600 {shlex.quote(runtime_contract_path)} || exit 87; "
             'exec 9<<<"$METACODES_ROUTE_TOKEN"; unset METACODES_ROUTE_TOKEN; '
             "export METACODES_API_KEY_FD=9; "
-            f"metacodes {' '.join(flags)} -p {escaped_instruction} --json "
+            # --stream-json: live per-event NDJSON on stdout (text/tool/usage/
+            # turn) so watchers can tail metacodes-output.jsonl mid-run and
+            # kill a doomed trial early instead of waiting for the terminal
+            # result line.  trace.py's final_result already filters
+            # type=="result", so the extra event lines are forward-compatible.
+            f"metacodes {' '.join(flags)} -p {escaped_instruction} --json --stream-json "
             # NDJSON stdout is a machine protocol; stderr must never merge
             # with the exactly-once result event.  It also must not vanish:
             # p3 forensics found the "Harbor-owned stderr stream" reaches no

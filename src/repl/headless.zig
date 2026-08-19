@@ -23,6 +23,7 @@ const tee_backend_mod = @import("../core/tee_backend.zig");
 const tool_context_mod = @import("../tools/context.zig");
 const ui_backend_mod = @import("../core/protocol/ui_backend.zig");
 const writer_backend = @import("../core/writer_backend.zig");
+const stream_json_mod = @import("stream_json_backend.zig");
 
 /// Headless callers can make tool availability part of their frozen runtime
 /// contract with `--disallowed-tools`. The ordinary permission settings still
@@ -101,7 +102,14 @@ pub fn run(
     defer if (eval_runtime) |*runtime| runtime.deinit();
 
     var wb = writer_backend.WriterBackend.initNullWithUsage(&app.usage);
-    var be = wb.backend();
+    var wb_be = wb.backend();
+    // --stream-json:实时 NDJSON 事件流(运行中止损/定位)。tee 挂在 usage 记账
+    // 的 null writer 之上;下游 eval tee 组合拿到的 `be` 已含流式腿,零感知。
+    // c_allocator:emit 可能来自工具线程,App arena 非线程安全(WebUI 同则)。
+    var sjb = stream_json_mod.StreamJsonBackend.init(std.heap.c_allocator, stdoutStreamSink());
+    var sjb_be = sjb.backend();
+    var stream_tee = tee_backend_mod.TeeBackend{ .primary = &wb_be, .secondary = &sjb_be };
+    var be = if (app.config.stream_json) stream_tee.backend() else wb_be;
     const run_control: ?*project_activation.RunControl = if (app.sessionDir()) |dir|
         try project_activation.RunControl.init(
             allocator,
@@ -216,7 +224,9 @@ pub fn run(
         scoped_recall,
         eval_request_gate,
         effective_execution_policy,
-        eval_be != null,
+        // 工具生命周期事件:eval 协议需要;--stream-json 的实时时间线同样依赖
+        // tool_start/tool_result 事件流,单开也要点亮。
+        eval_be != null or app.config.stream_json,
         if (run_control) |control| control.observer() else null,
         if (provisional_gate) |pg|
             pg.gate()
@@ -655,6 +665,15 @@ fn writeStdout(bytes: []const u8) void {
         if (n <= 0) break;
         pos += @as(usize, @intCast(n));
     }
+}
+
+/// --stream-json 的 stdout sink(fd 1 直写,一行一次调用,无缓冲即最实时)。
+fn stdoutStreamWrite(_: *anyopaque, line: []const u8) void {
+    writeStdout(line);
+}
+var stdout_stream_sink_ctx: u8 = 0;
+fn stdoutStreamSink() stream_json_mod.Sink {
+    return .{ .ctx = @ptrCast(&stdout_stream_sink_ctx), .writeFn = &stdoutStreamWrite };
 }
 
 test "lastAssistantText extracts trailing assistant text" {

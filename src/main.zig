@@ -1031,6 +1031,8 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             if (args.next()) |p| config.prompt = allocator.dupe(u8, p) catch p;
         } else if (std.mem.eql(u8, arg, "--json")) {
             config.json_output = true;
+        } else if (std.mem.eql(u8, arg, "--stream-json")) {
+            config.stream_json = true;
         } else if (std.mem.eql(u8, arg, "--web")) {
             // 可选端口参数:下一个 arg 是数字才吃掉(否则它是别的 flag,留给循环)。
             // Iterator 无 peek → 值拷贝试探(POSIX iterator 是纯索引 struct,拷贝安全)。
@@ -1157,6 +1159,7 @@ fn printHelp() void {
         \\  -p, --print <prompt>  Headless: run one prompt and exit (no REPL)
         \\  -                     Headless: read prompt from stdin
         \\  --json                Headless: emit NDJSON result event
+        \\  --stream-json         Headless: also stream per-event NDJSON lines live (text/tool/usage/turn)
         \\  --web [port]          Serve a web UI (HTTP+SSE) instead of the TUI (default port 7777)
         \\  --resume-response <j> Resume a suspended session with a late tool response (@file to read from a file)
         \\  --model <model>       Model (default: claude-sonnet-4-20250514)
@@ -1225,6 +1228,7 @@ test {
     _ = &@import("core/message.zig");
     _ = &@import("core/conversation.zig");
     _ = &@import("core/agent_loop.zig");
+    _ = &@import("repl/stream_json_backend.zig");
     _ = &@import("core/proposed_plan.zig");
     _ = &@import("core/plan_file.zig");
     _ = &@import("swarm/file_lock.zig");

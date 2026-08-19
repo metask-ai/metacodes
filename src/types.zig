@@ -55,6 +55,9 @@ pub const Config = struct {
     prompt: ?[]const u8 = null,
     /// `--json`：headless 下用 NDJSON 事件流输出，便于 CI/脚本消费。
     json_output: bool = false,
+    /// `--stream-json`:headless 运行期实时 NDJSON 事件流(text/tool/usage/turn),
+    /// 每事件一行随发随写——外部看护可 tail 定位/止损,不必等收尾 result 行。
+    stream_json: bool = false,
     /// `--dump-prompt`：构造完 system prompt + 工具 defs 后打印到 stdout 并退出，
     /// 不发网络、不需 API key。用于验证提示词×工具复刻。
     dump_prompt: bool = false,

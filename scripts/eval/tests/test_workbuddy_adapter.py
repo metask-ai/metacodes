@@ -180,6 +180,18 @@ class WorkBuddyTraceTest(unittest.TestCase):
             final_result([])
         with self.assertRaises(TraceError):
             final_result([row, row])
+        # --stream-json 增量事件行(text/tool/usage/turn)与 result 行同栖一个
+        # NDJSON 流:过滤按 type=="result",事件行不得影响 exactly-once 语义。
+        stream_events = [
+            {"type": "turn_begin", "turn": 1},
+            {"type": "tool_start", "id": "t1", "name": "Bash", "input": "{}", "input_bytes": 2},
+            {"type": "text", "text": "hi"},
+            {"type": "usage", "input_tokens": 5, "output_tokens": 2,
+             "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+            row,
+            {"type": "run_end", "turns": 1, "tool_calls": 1, "stop_reason": "end_turn"},
+        ]
+        self.assertEqual(final_result(stream_events)["stop_reason"], row["stop_reason"])
 
     def test_trace_rejects_non_utf8_instead_of_replacing_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3349,6 +3361,10 @@ with tempfile.TemporaryDirectory() as directory:
     assert "export METACODES_TASK_OUTCOMES=/logs/agent/task-outcomes.json; " in command
     # stderr 必须落到 trial 导出的 bind mount(p3 取证:warn 诊断链进虚空)。
     assert "2> >(tee /logs/agent/metacodes-stderr.log >&2)" in command
+    # 运行期实时事件流:output.jsonl 必须边跑边长,外部看护才能止损
+    # (p10 值守只能靠 proxy 日志/容器 CPU 侧写)。result 行消费侧
+    # (trace.final_result)按 type=="result" 过滤,增量行前向兼容。
+    assert " --json --stream-json " in command
     rows = json.loads((logs / "task-outcomes.json").read_text())["outcomes"]
     by_task = {r["task"]: r for r in rows}
     assert set(by_task) == {"feature-medium-etag_header_for_static", "bugfix-pytest-task"}, rows
