@@ -206,7 +206,10 @@ pub fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClien
         // 说教稀释关键指令——只留判决+模式+三行硬约束,短促命令式。
         out.appendSlice(allocator,
             "ESCALATED. The mandated modes above are orders, not suggestions — execute them " ++
-                "literally this attempt. Constraints: the verifier runs OUTSIDE this workspace " ++
+                "literally this attempt. FIRST ACTION: enter every point above — each " ++
+                "failing name, each verifier reason, each artifact it names — into your " ++
+                "task ledger (TaskCreate) as acceptance criteria; work that displaces " ++
+                "these items repeats the last failure. Constraints: the verifier runs OUTSIDE this workspace " ++
                 "and scores ONLY its own tests — equivalent checks you write yourself do not " ++
                 "score, so \"conceptually verified\" is worth zero. A referenced-but-absent " ++
                 "artifact (module, file, function) is something the verifier expects YOU to " ++
@@ -231,6 +234,8 @@ pub fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClien
             "a class, a function) — build exactly those artifacts at the locations the name " ++
             "implies so the named test itself could collect and pass; a private equivalent " ++
             "check of your own scores nothing. " ++
+            "Enter each requirement above into your task ledger (TaskCreate) before " ++
+            "other work — a plan not on the ledger does not survive a long session. " ++
             "Reproduce before you fix: make it fail, then make it pass. " ++
             "A failing requirement is a goal to make true, not a claim to falsify — when the " ++
             "thing it names does not exist, creating it is usually the requirement itself. " ++

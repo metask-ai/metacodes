@@ -18,11 +18,17 @@ const std = @import("std");
 /// the cacheable first request stays byte-identical). Task-agnostic.
 pub const LEDGER_PROMPT_TEXT =
     "[requirement ledger]\n" ++
-    "Before going further: decompose the task statement into your task list " ++
-    "(TaskCreate) — these are your acceptance criteria, one item per " ++
-    "explicitly requested behavior or requirement, including edge conditions " ++
+    // p12 取证:清单只从"任务陈述"取项 → host 注入的结局要求(模块位置)
+    // 从未立项 → 第 1 轮的正确计划被 56 轮 ledger 驱动的工作挤出记忆。
+    // 持久 workflow 会战胜一次性 reminder,故要求必须并轨进清单。
+    "Before going further: decompose the task statement AND every " ++
+    "host-injected requirement (the attempt-history verdict note and any " ++
+    "task obligations, when present) into your task list (TaskCreate) — " ++
+    "these are your acceptance criteria, one item per explicitly requested " ++
+    "behavior or requirement, including edge conditions " ++
     "the statement names. Every conditional clause, named boundary (empty/" ++
-    "zero/duplicate/ordering/case), and requested output artifact is a " ++
+    "zero/duplicate/ordering/case), requested output artifact, and artifact " ++
+    "a verifier reason names as missing is a " ++
     "candidate item — a statement with many clauses deserves many items. " ++
     "Your Definition of Done: every acceptance criterion verified by a check " ++
     "you actually executed in this session (a command, a test, an observed " ++

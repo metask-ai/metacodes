@@ -666,6 +666,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     try std.testing.expect(std.mem.indexOf(u8, text3, "failed 3 consecutive attempt(s)") != null);
     try std.testing.expect(std.mem.indexOf(u8, text3, "UNION") != null);
     try std.testing.expect(std.mem.indexOf(u8, text3, "ESCALATED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text3, "FIRST ACTION: enter every point above") != null);
     try std.testing.expect(std.mem.indexOf(u8, text3, "Garbage In, Garbage Out") == null);
 
     // 召回摘录 800 字符截断(p10 取证雷):8 个长 pytest 名的 failing 列表
@@ -728,6 +729,8 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     // 新框架:等价替代授权句已铲除,字面制计分语义在场。
     try std.testing.expect(std.mem.indexOf(u8, text_long, "with your own equivalent check") == null);
     try std.testing.expect(std.mem.indexOf(u8, text_long, "scores nothing") != null);
+    // p12 取证桥:note 要求必须并轨进任务清单(workflow 吃 reminder 的修法)。
+    try std.testing.expect(std.mem.indexOf(u8, text_long, "task ledger (TaskCreate)") != null);
     ppaths.setEnv("METACODES_TASK_HINT", "wall-task");
 
     // 理由通道(p11 取证):adapter 把验证器 results.xml 的 skip/失败

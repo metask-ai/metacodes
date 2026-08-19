@@ -128,7 +128,8 @@ fn runLedger(
     while (server.requestAt(index)) |request| : (index += 1) {
         const body = request.body();
         if (prompt_request == null and
-            std.mem.indexOf(u8, body, "decompose the task statement") != null)
+            std.mem.indexOf(u8, body, "decompose the task statement AND every") != null and
+            std.mem.indexOf(u8, body, "host-injected requirement") != null)
         {
             prompt_request = try allocator.dupe(u8, body);
         }
