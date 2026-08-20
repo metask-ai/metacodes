@@ -883,6 +883,49 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     }
     // 理由派生义务居首(p13 取证:nudge 预算优先给"创建缺失工件"的
     // import 针——自建测试满足不了 import,名字针可以被自建测试绕过)。
+    // 截断工件 → 参考-重建语义(禁逐字):r5 重发 r3 带超长工件。
+    {
+        var big_art = std.array_list.Managed(u8).init(a);
+        defer big_art.deinit();
+        try big_art.appendSlice("--- widget/_helpers.py ---\\ndef calc(path):\\n");
+        var bi: usize = 0;
+        while (big_art.items.len < 2100) : (bi += 1)
+            try big_art.appendSlice("    x = 1\\n");
+        const payload_t = try std.fmt.allocPrint(a,
+            "{{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+                "{{\"task\":\"trunc-task\",\"attempt_key\":\"t1\",\"reward\":0.9,\"tests_passed\":9,\"tests_total\":10," ++
+                "\"failing_tests\":[\"tests/t.py::TestT::test_last (skipped: widget._case not available)\"]," ++
+                "\"best_artifact\":\"{s}\"}}]}}",
+            .{big_art.items});
+        defer a.free(payload_t);
+        const pfs = @import("platform").fs;
+        const zt = try a.dupeZ(u8, outcomes_path);
+        defer a.free(zt);
+        const fd = pfs.open(zt.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = pfs.close(fd);
+        var off: usize = 0;
+        while (off < payload_t.len) {
+            const n = pfs.write(fd, payload_t[off..]);
+            try std.testing.expect(n > 0);
+            off += @intCast(n);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
+    ppaths.setEnv("METACODES_TASK_HINT", "trunc-task");
+    {
+        const runtime_t = cc.obligation_gate.load(a, &kg, "trunc-task") orelse return error.TestExpectedRuntime;
+        defer {
+            runtime_t.deinit();
+            a.destroy(runtime_t);
+        }
+        try std.testing.expectEqualStrings("widget/_helpers.py", runtime_t.envelopes[0].command_needle);
+        try std.testing.expect(std.mem.indexOf(u8, runtime_t.envelopes[0].reason, "HOST-TRUNCATED") != null);
+        try std.testing.expect(std.mem.indexOf(u8, runtime_t.envelopes[0].reason, "do NOT copy it verbatim") != null);
+        try std.testing.expect(std.mem.indexOf(u8, runtime_t.envelopes[0].reason, "UNCHANGED") == null);
+    }
+    ppaths.setEnv("METACODES_TASK_HINT", "reason-task");
+
     // 队列全序(v30):工件路径居首→import 棘轮→名字义务;
     // 棘轮:最新行(r4)无点分 token,import 义务只能来自历史行(r2)。
     try std.testing.expectEqual(@as(usize, 3), runtime_r.count());

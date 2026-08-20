@@ -619,8 +619,14 @@ pub fn ingestOutcomes(
         if (!std.unicode.utf8ValidateSlice(note_bounded)) note_bounded = "";
         var artifact_bounded = boundedUtf8(row.best_artifact, 1800);
         if (!std.unicode.utf8ValidateSlice(artifact_bounded)) artifact_bounded = "";
+        // binary 侧二次截断同样必须留痕(adapter 1600 帽已标注;此处 1800
+        // 帽裁掉 adapter 标记本身时,重新补一个)。
+        const binary_truncated = artifact_bounded.len < row.best_artifact.len;
         const artifact_part = if (artifact_bounded.len > 0)
-            std.fmt.allocPrint(allocator, "\nbest-attempt artifact (host-extracted, verbatim):\n{s}", .{artifact_bounded}) catch ""
+            std.fmt.allocPrint(allocator, "\nbest-attempt artifact (host-extracted, verbatim):\n{s}{s}", .{
+                artifact_bounded,
+                if (binary_truncated) "\n(HOST-TRUNCATED: quota, do NOT copy verbatim)" else "",
+            }) catch ""
         else
             "";
         defer if (artifact_part.len > 0) allocator.free(artifact_part);

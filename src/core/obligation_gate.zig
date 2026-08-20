@@ -105,6 +105,13 @@ pub const GIGO_REASON =
     "check itself collect and succeed; if what it names is missing, " ++
     "creating it at the named location is the work, not grounds to skip";
 
+pub const ARTIFACT_REF_REASON =
+    "your history note quotes the best attempt's artifact for this exact " ++
+    "path, but it is HOST-TRUNCATED — do NOT copy it verbatim. Use it as " ++
+    "the reference for the working configuration (signature, imports, " ++
+    "shape) and rebuild the complete file at this path; then apply only " ++
+    "the expected-side fixes the reports demand";
+
 pub const ARTIFACT_FIRST_REASON =
     "your history note quotes the best attempt's artifact for this exact " ++
     "path VERBATIM. Write that quoted content to this path UNCHANGED as " ++
@@ -137,25 +144,34 @@ fn appendArtifactFirst(
     for (list.items) |existing| {
         if (std.mem.eql(u8, existing.command_needle, path)) return 0;
     }
+    // 截断的工件禁用"逐字写入"指令(半个文件+UNCHANGED=语法错误毒药),
+    // 换参考-重建语义。
+    const truncated = std.mem.indexOfPos(u8, best, marker, "HOST-TRUNCATED") != null;
+    const reason: []const u8 = if (truncated) ARTIFACT_REF_REASON else ARTIFACT_FIRST_REASON;
     const owned_needle = a.dupe(u8, path) catch return 0;
-    const cid = self_evolution.obligationCandidateId(task_sha[0..], owned_needle, ARTIFACT_FIRST_REASON);
+    const cid = self_evolution.obligationCandidateId(task_sha[0..], owned_needle, reason);
     const owned_cid = a.dupe(u8, cid[0..]) catch return 0;
     const owned_task = a.dupe(u8, task_sha[0..]) catch return 0;
     list.append(.{
         .candidate_id = owned_cid,
         .task_sha256 = owned_task,
         .command_needle = owned_needle,
-        .reason = ARTIFACT_FIRST_REASON,
+        .reason = reason,
     }) catch return 0;
     return 1;
 }
 
+// 生态标注(review):"import X" 针模板是 Python 主义——非 Python 生态
+// 的加载检查命令未必含该子串,义务可能不可满足(危害有界:至多浪费一次
+// nudge)。派生启发式(点分标识符 token)本身跨 Java/Kotlin/JS 有效。
 pub const REASON_IMPORT_REASON =
     "a verifier reason reports this exact import path as unavailable in " ++
     "its run: the module does not exist yet and creating it at exactly " ++
-    "this dotted path is the deliverable. Run `python -c \"import ...\"` " ++
-    "for it and it must succeed; a test file of your own does not " ++
-    "substitute for the module itself";
+    "this dotted path is the deliverable. Prove it loads with a command " ++
+    "containing this needle verbatim (Python: `python -c \"import X\"`; " ++
+    "other runtimes: any load check whose command text contains it) and " ++
+    "it must succeed; a test file of your own does not substitute for " ++
+    "the module itself";
 
 /// 理由派生义务(p13 取证:三轮 turn-1 都推出'需创建模块'而行动层从未
 /// 执行;唯一每轮都被执行的绑定形态=晚期 user-turn 祈使+具体路径,即

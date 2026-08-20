@@ -192,9 +192,14 @@ def _best_artifact(trial_dir: Path) -> str:
             for line in chunk.splitlines()
             if line.startswith("+") and not line.startswith("+++")
         ]
-        content = "\n".join(added)[: 1600 - total]
+        full = "\n".join(added)
+        content = full[: 1600 - total]
         if not content.strip():
             continue
+        # 截断必须显式标注:被截半的文件配上"逐字写入"指令是毒药
+        # (review 抓出;etag 工件 ~25 行从未触发=侥幸)。
+        if len(content) < len(full):
+            content += "\n(HOST-TRUNCATED: file exceeds quota, do NOT copy verbatim)"
         pieces.append(f"--- {path} ---\n{content}")
         total += len(content)
     return "\n".join(pieces)
