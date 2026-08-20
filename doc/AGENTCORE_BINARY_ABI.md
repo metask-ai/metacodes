@@ -12,8 +12,8 @@ model.
 **Status: experimental.** The premature 2026-07-17 freeze was retracted after
 consumer feedback exposed a dangling callback-identity contract. Revision 9
 now defines one exact hard-cut wire shape after Permission authority,
-checkpoint/restore, durable budget, MCP Runtime/Session seams, explicit Skill
-catalog query scope, and independent text Completion were implemented and
+checkpoint/restore, durable budget, MCP Runtime/Session seams, Workspace Skill
+source/identity/policy binding, and independent text Completion were implemented and
 tested; this is not a general v1 stability promise.
 
 Consumers must pin an exact bundle (the manifest records the source commit)
@@ -23,8 +23,9 @@ revision cut while v1 remains experimental.
 
 The current experimental bundle is **ABI v1 revision 9**. Revision 9 is a
 hard-cut replacement for every earlier revision. In addition to the Revision
-8 surface, it adds explicit Skill catalog query scope and an independent,
-no-tools text Completion surface:
+8 surface, it adds a Workspace Skill catalog with explicit local sources,
+concrete default-deny authorization, immutable content binding, and an
+independent no-tools text Completion surface:
 
 - `metask_agentcore_api_v1` is 280 bytes and requires `abi_revision == 9`;
 - `RuntimeConfigV1`, `SessionHostConfigV1`, `SessionCreateConfigV1`,
@@ -32,7 +33,8 @@ no-tools text Completion surface:
   96, 168, 64, 64, 104, and 72 bytes on the required 64-bit ABI;
 - checkpoint, restore, describe, MCP refresh/describe/apply/selection,
   Permission rule update, compact, abort, and all eight Completion entries are mandatory;
-- `SkillCatalogQueryV1`, `CompletionConfigV1`, `CompletionMessageV1`,
+- `SkillSourceV1`, `SkillPolicyV1`, and `SkillCatalogQueryV1` are respectively
+  64, 56, and 80 bytes; `CompletionConfigV1`, `CompletionMessageV1`,
   `CompletionRequestV1`, `CompletionResultV1`, `CompletionInfoV1`, and
   `CompletionEventV1` are respectively 80, 88, 40, 72, 72, 48, and 80 bytes;
 - the exact required capability set is `0x3fffff`;
@@ -48,7 +50,7 @@ matches. Every per-Run callback validates and copies any retained `RunContext`
 fields during the callback, and Host registries bind/compare `session_id`
 atomically under their per-Session lock.
 
-Re-freeze first requires closure of the open items tracked in
+A future stability freeze first requires closure of the open items tracked in
 `doc/AGENTCORE_V1_EXPERIMENTAL_LEDGER.md` (every group A item closed; every
 group B item given an explicit disposition, with B1/B3 fixed or formally
 argued). Only then do the two independent gates apply:
@@ -195,14 +197,16 @@ remain valid until `deinit`; consumers must not copy an owner and deinitialize
 both copies.
 
 `decodeSkillCatalog` returns an owned `ParsedSkillCatalog` for
-`metask.skill-catalog/v1`. It validates the schema, the 1024-Skill limit,
-identity forms, health and issue consistency, and each Skill argument schema.
-Cross-record identity semantics deliberately remain outside the wire decoder:
-AgentCore validates canonical IDs and uniqueness before publishing, while a
-Host projection must independently reject duplicate IDs or invocation names
-so it can preserve domain-specific diagnostics. Because decoded strings and
-arrays are allocator-owned, the consumer may release the AgentCore descriptor
-buffer immediately after decoding.
+`metask.skill-catalog/v1`. Revision 9 hard-cuts the current experimental shape
+of that schema: every earlier unreleased experimental shape bearing the same
+token is void, and consumers must interpret the descriptor only with the exact
+Revision 9 bundle they pin. The decoder validates the
+schema, the 1024-Skill limit, identity forms, duplicate concrete `skill_id` or
+`skill_policy_key` records, health and issue consistency, and each Skill
+argument schema. AgentCore remains the canonical producer and independently
+enforces those uniqueness invariants before publication. Because decoded
+strings and arrays are allocator-owned, the consumer may release the AgentCore
+descriptor buffer immediately after decoding.
 `encodeSkillArguments` accepts positional UTF-8 values, enforces the 64-value
 and encoded 1 MiB limits, and returns the allocator-owned canonical
 `{"values":[...]}` representation accepted by `sessionRunSkill`.
@@ -458,16 +462,24 @@ shell tool selected under the disabled shell policy fail Session creation with
 ### Skill catalog and typed input
 
 `runtime_query_skill_catalog` is independent of Session lifetime so a Host may
-render a Skill menu before creating its first Task or Session. A successful
-query returns both an immutable catalog handle and a library-owned descriptor
-using schema `metask.skill-catalog/v1`. The descriptor contains a Runtime-local
-`catalog_scope_id`, content-derived `catalog_revision`, health, valid
-`skills[]`, and typed `issues[]`; it never contains Skill bodies, physical
-paths, policy internals, or execution mode. Isolated invalid slots produce
-`OK + degraded`; failure to prove the whole snapshot returns
-`SKILL_CATALOG_INVALID` and no partial handle or descriptor.
+render a Skill menu before creating its first Task or Session. It resolves one
+Workspace authority; it is not a directory-scan mode switch. The safe Zig SDK
+therefore deliberately aliases this raw table slot as
+`resolveWorkspaceSkillCatalog`.
 
-An `invalid_resource` issue always carries a typed `reason`; every other issue
+A successful query returns both an immutable catalog handle and a
+library-owned descriptor using schema `metask.skill-catalog/v1`. The descriptor
+contains a Runtime-local `catalog_scope_id`, content-derived
+`catalog_revision`, health, valid `skills[]`, and typed `issues[]`; it never
+contains Skill bodies, physical paths, policy internals, or execution mode.
+Isolated invalid slots produce `OK + degraded`. Failure to prove the whole
+snapshot complete returns `SKILL_CATALOG_INCOMPLETE`, a null handle, and an
+empty descriptor. Structural/resource-limit failures use their dedicated
+statuses and likewise publish no partial snapshot.
+
+Every issue carries `kind = invalid | unavailable | conflict`, its typed code,
+logical `skill_policy_key`, and provider/source provenance. An
+`invalid_resource` issue always carries a typed `reason`; every other issue
 code carries `reason: null`. The resource reasons are `file_too_large`,
 `skill_too_large`, `too_many_files`, `too_many_entries`,
 `directory_too_deep`, `path_too_long`, `unsupported_entry`,
@@ -482,18 +494,19 @@ invocation-name precedence and, if selected, produces a local resource issue.
 An uncertain higher-priority candidate therefore never silently exposes a
 lower-priority Skill with the same invocation name.
 
-Revision 9 requires `SkillCatalogQueryV1.scope_code` to be exactly one of:
+`SkillCatalogQueryV1.reserved0` must be zero. Default discovery merges exactly
+`<workspace_home>/.agents/skills` as User scope and
+`<workspace_root>/.agents/skills` as Workspace scope; Workspace wins across
+scopes. If the canonical paths are equal, AgentCore registers only the
+Workspace contribution, avoiding a synthetic self-conflict.
 
-- `METASK_AGENTCORE_SKILL_CATALOG_SCOPE_PERSONAL_ONLY`: scan only
-  `<workspace_home>/.agents/skills` as the personal source;
-- `METASK_AGENTCORE_SKILL_CATALOG_SCOPE_WORKSPACE_EFFECTIVE`: merge that
-  personal source with `<workspace_root>/.agents/skills`, with the project
-  source taking precedence.
-
-Zero and unknown scope codes are invalid. Scope is never inferred from empty
-fields or from `workspace_root == workspace_home`. If the two canonical paths
-are equal, `workspace_effective` scans the physical directory once and treats
-it as the project contribution, avoiding a synthetic self-conflict.
+The Host may add at most 64 `SkillSourceV1` local directories. Each source has
+scope `SKILL_SOURCE_USER` or `SKILL_SOURCE_WORKSPACE` and a 1..128 byte stable
+ASCII `source_instance_id` using letters, digits, `.`, `_`, `:`, or `-`.
+Duplicate canonical roots or source ids are invalid. Additional sources have
+the same precedence as defaults in their declared scope; two same-scope
+candidates with one invocation name are a conflict, never registration-order
+override. There is no public numeric priority.
 
 Resource accounting includes every regular file below the selected Skill root,
 including `SKILL.md` and hidden files; no ignore file is applied. Every regular
@@ -506,12 +519,26 @@ defines the candidates for one query; later additions are observed by a
 subsequent query. Atomicity means that the completed immutable snapshot is
 published once, not that the Host filesystem is transactional.
 
-Default AgentCore discovery reads exactly
-`<workspace_home>/.agents/skills` and `<workspace_root>/.agents/skills`, with
-the project root winning an invocation-name collision. It does not implicitly
-read `/etc/metacodes/skills`, `.claude/skills`, or `.metacodes/skills`.
-Product adapters may apply their own source policy through the shared Skill
-Runtime; those product defaults are not AgentCore filesystem authority.
+AgentCore does not implicitly read `/etc/metacodes/skills`, `.claude/skills`,
+`.codex/skills`, or `.metacodes/skills`. A Host may explicitly register any
+local directory only when its contents already use the canonical Agent Skill
+format. Directory names do not select a parser; Revision 9 has no Claude/Codex
+format adapter or public Provider Registry. The projected provider id is
+`agents.directory`.
+
+Each valid `skills[]` entry exposes separate identities:
+
+- `skill_policy_key`: the logical invocation slot, equal to
+  `invocation_name` in Revision 9;
+- `provider_id`, `source_scope`, `source_instance_id`, and `contribution_id`:
+  source identity;
+- `content_revision`: body/resources identity;
+- `skill_id`: the concrete source + contribution + content execution identity.
+
+`skill_id`, `contribution_id`, `content_revision`, and `catalog_revision` are
+64-character lowercase hexadecimal digests. A content change creates a new
+`content_revision` and `skill_id`. Policy and execution never authorize a bare
+logical name.
 
 Each valid `skills[]` entry contains this fixed argument-schema shape:
 
@@ -539,11 +566,18 @@ the catalog-revision hash, so changing it produces a new revision and may make
 an input prepared for a differently bound Session return `STALE_CATALOG`.
 
 The Host releases its catalog handle exactly once with
-`skill_catalog_release`. Session create and idle-only refresh retain their own
+`skill_catalog_release`. Session create and idle-only rebind retain their own
 reference, so the Host may release its handle immediately after either call
 succeeds. A catalog must belong to the same Runtime and canonical Workspace
-binding. Refresh atomically replaces the bound snapshot and does not modify
-Conversation or `run_id`.
+binding.
+
+`SkillPolicyV1` is default-deny and lists only granted concrete `skill_id`
+values. Empty means deny all. Session create/restore require Catalog and Policy
+to be both present or both absent. The raw `session_update_skills` slot (safe
+SDK alias `sessionBindSkillPolicy`) jointly validates the replacement Catalog
+and Policy and atomically commits them only while idle. Any failure preserves
+the complete previous binding; it never partially disables exceptions or
+unbinds the old catalog. Rebind does not modify Conversation or `run_id`.
 
 `session_run_input` accepts exactly one tagged input:
 
@@ -554,10 +588,12 @@ Conversation or `run_id`.
   an explicit Host invocation. Arguments are canonical empty or
   `{"values":["..."]}`, with at most 64 values and 1 MiB encoded JSON.
 
-Malformed identity is `INVALID_ARGUMENT`; a mismatched pinned revision is
-`STALE_CATALOG`; missing Skill, invalid arguments, static policy failure, and
-unavailable execution capability use their dedicated statuses. These failures
-occur before Run admission and do not advance `run_id` or mutate Conversation.
+Observable validation order is fixed: malformed wire/identity is
+`INVALID_ARGUMENT`; mismatched pinned revision is `STALE_CATALOG`; an unknown
+concrete id is `SKILL_NOT_FOUND`; an ungranted concrete id is
+`SKILL_POLICY_VIOLATION`; malformed values are `INVALID_SKILL_ARGUMENTS`; and
+unavailable execution is `SKILL_UNAVAILABLE`. These failures occur before Run
+admission and do not advance `run_id` or mutate Conversation.
 Materialization begins only after admission, is private to that activation,
 and is removed before terminal return. A Skill can only narrow the Session's
 tool, shell, and permission authority.
@@ -584,19 +620,27 @@ the outer Run. Every admitted fork child therefore sends the Session model.
 
 A consumer normally uses the Skill ABI in this order:
 
-1. During draft creation, query a catalog and render its descriptor.
-2. Create a Session bound to that catalog.
+1. During draft creation, resolve a complete Workspace catalog and render its
+   descriptor. On `SKILL_CATALOG_INCOMPLETE`, retain the last-good result.
+2. Build a default-deny Policy from concrete descriptor ids and create a
+   Session bound to Catalog + Policy.
 3. Release the Host's catalog handle; the Session retains its own reference.
 4. Submit `RUN_INPUT_SKILL` with an identity and revision from that descriptor.
-5. On `STALE_CATALOG`, query again, re-resolve the identity from the new
-   descriptor, wait until the Session is idle, refresh it, release the new Host
-   handle, and retry with the same `run_id` because the rejected Run was never
-   admitted.
+5. On `STALE_CATALOG`, query again, re-resolve and re-authorize the concrete
+   identity from the new descriptor, wait until the Session is idle, atomically
+   rebind Catalog + Policy, release the new Host handle, and retry with the same
+   `run_id` because the rejected Run was never admitted.
 
-Changing source files alone does not mutate a Session's immutable snapshot.
+Changing source files alone does not mutate a Session's immutable snapshot;
+the old body and resources remain pinned and executable until rebind.
 `STALE_CATALOG` means that the input revision differs from the revision
 currently bound to the Session. If the new descriptor removes the Skill or
 reports it as an issue, the consumer must not blindly retry.
+
+The internal Workspace scope-identity domain remains
+`metask-agentcore/abi-v1/revision-5`. It identifies the scope algorithm first
+introduced in Revision 5 and is intentionally independent of the current ABI
+revision so compatible checkpoint Workspace bindings remain stable.
 
 When a bound snapshot contains at least one model-invocable Skill, AgentCore
 adds one Run-local provider tool named `Skill` to both Text Runs and explicit
@@ -961,14 +1005,17 @@ reliable automatic classification.
 ### ABI evolution
 
 All v1 POD descriptors and the API table require their exact documented
-`struct_size`; every reserved field must be zero. Revision 9 freezes one exact
-experimental cut. A later breaking v1 bundle must increment `abi_revision`,
-and consumers accept only the exact revision they were built against.
-Reserved storage is not permission to infer compatibility. After v1 is
-genuinely stabilized, later layout, function-table, or control-message
-extensions require `metask_agentcore_get_api(2)` and v2 types.
-In particular, assigning a meaning or non-zero value to a Revision 9 reserved
-field is a new wire contract and requires another explicit revision cut.
+`struct_size`; every reserved field must be zero. While Revision 9 remains
+unreleased and experimental, an explicitly approved hard cut may replace its
+wire shape in place only when the library, headers, SDKs, consumers, tests, and
+documentation move atomically; the replaced bundle is void and no compatibility
+path is provided. Consumers must therefore pin the exact bundle they were built
+against. After a revision is formally released, a later breaking v1 bundle must
+increment `abi_revision`. Reserved storage is not permission to infer
+compatibility. After v1 is genuinely stabilized, later layout, function-table,
+or control-message extensions require `metask_agentcore_get_api(2)` and v2
+types. Assigning a meaning or non-zero value to a reserved field is always an
+explicit wire-contract decision, never an inferred compatible extension.
 
 Revision 9's published POD offsets and sizes require a 64-bit pointer ABI.
 The header rejects 32-bit consumers at compile time; a future 32-bit contract

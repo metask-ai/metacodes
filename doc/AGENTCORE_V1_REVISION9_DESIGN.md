@@ -1,82 +1,86 @@
 # AgentCore ABI v1 Revision 9 设计方案
 
-> 状态：R9 已实施；native delivery gate 已通过
-> 日期：2026-08-19
+> 状态：R9 尚未正式发布；本次在 revision 9 内原子重切 Skill SDK
+> 日期：2026-08-20
 > 前置：`AGENTCORE_BINARY_ABI.md`、`AGENTCORE_COMPLETION_RUNTIME_DESIGN.md`、Revision 8 基线实现
-> 目标：① Skill Catalog 显式查询范围；② 独立文本 Completion 公共接口
+> 目标：① 严谨的 Workspace Skill SDK；② 独立文本 Completion 公共接口
 
 ## 0. 决策摘要
 
-Revision 9 的范围只包含两项能力；详细 ABI 契约和 wire 按本文实施，并作为一次范围受控的 hard cut 交付：
-
-1. Skill Catalog 查询必须显式选择 `personal_only` 或 `workspace_effective`；
-2. 将已经在库内使用的 `CompletionRuntime` 投影为独立、无工具、文本型公共 ABI。
-
-Revision 9 不包含 Host Tool 修改，也不为消费方提出的未来能力预建 Provider Registry、格式 adapter、多模态、异步工具调度或完整 RunOptions。
-
-本方案的默认工程边界是：
+Revision 9 的 Skill 公共模型按四层闭合：
 
 ```text
-修改：AgentCore facade / public wire / SDK / conformance tests / 文档
-复用：现有 Skill catalog engine / CompletionRuntime / OwnedProvider
-不改：Core / AgentLoop / Provider 实现 / checkpoint schema / catalog descriptor schema
+Source        从哪里获得 Skill
+Resolution    当前 Workspace authority 下这个逻辑名称解析到哪个贡献
+Authorization Host 授权哪个具体执行身份
+Execution     在哪个 immutable catalog world 中执行
 ```
 
-代码、Header 与 SDK 已原子切换到 ABI Revision 9；交付前仍必须让 wire、实现、SDK、artifact consumer 和门禁保持同一提交可构建，不发布或合入半成品 R9。
+Catalog 查询表达 Workspace authority，不表达扫描模式。`personal_only` 与
+`workspace_effective` 从公共接口移除；`SkillCatalogQueryV1.reserved0` 必须为
+零。默认来源为 user/workspace 两个 `.agents/skills`，消费方可显式增加遵循
+同一 Agent Skill 格式的本地目录。路径注册不是 `.claude`/`.codex` 格式
+adapter，也不会使这些目录成为 AgentCore 的隐式默认来源。
 
-### 0.1 当前确认层级
+Authorization 采用默认拒绝的 concrete Skill policy。公开 `skill_id` 同时绑定
+来源贡献与内容版本；逻辑策略名由 `skill_policy_key` 表达。Session 原子绑定
+Catalog + Policy，执行同时校验 catalog revision 和 concrete Skill identity。
 
-本文记录 Revision 9 的能力范围、架构边界和详细 ABI 语义。结构体字段顺序、size/alignment/offset 已由 Type-First layout 断言和跨语言 gate 固定：
-
-| 层级 | 当前状态 |
-|---|---|
-| R9 能力范围 | 已确认：Catalog 显式查询范围 + Completion 公共接口 |
-| 架构边界 | 已确认：默认不改 Core、AgentLoop、Provider 实现和持久化 schema |
-| 排除项 | 已确认：Host Tool、Provider Registry、格式 adapter、多模态和完整 RunOptions 不进入 R9 |
-| 详细 ABI 契约 | 已确认：wire、借用期、并发、错误、所有权和 provider observation 按本节决策实施 |
-| 实现与测试 | 已实施；Catalog/Completion L2、三 Provider MockServer 和 native delivery gate 已通过 |
-
-详细契约采用以下决策：
-
-- `completion_stream_start` 只在调用期间借用请求数据；成功返回前必须完成序列化和请求体发送；
-- `completion_stream_abort` 可以从另一线程并发打断阻塞中的 `next`；destroy 不得与 `next` 或 abort 并发；
-- 首版不提供请求级 `model_override`；切换模型通过创建另一个 Completion handle 表达；
-- `completion_describe` 只公开 provider kind 和 handle 配置模型，不公开当前无法跨 Provider 诚实保证的 token 上限或 capability；
-- 公共 `completion_complete` 在 AgentCore 内部消费同一 stream 路径并聚合结果，不要求 OpenAI/Gemini 新增非流式 Provider 实现。
-
-## 1. 需求判断与范围控制
-
-消费方需求是设计输入，不直接等于 AgentCore 的架构结论。Revision 9 只接纳能够复用现有底层能力、职责明确且可端到端验收的部分。
-
-| 消费方提议 | Revision 9 决策 | 判断依据 |
-|---|---|---|
-| 显式 `personal_only` / `workspace_effective` | 纳入 | 当前隐式路径不足以表达调用意图；现有 catalog 已支持传入来源集合 |
-| Completion 公共接口 | 纳入 | 库内 `CompletionRuntime` 和 `OwnedProvider` 已存在并有真实内部使用 |
-| Host Tool V2 | 不纳入 | 当前同步 Host Tool 可用，尚无已确认的 correctness 缺陷或必须场景 |
-| `.claude` / `.codex` adapter | 不纳入 | 尚未证明存在必须由 AgentCore 承担的格式差异和稳定契约 |
-| Provider Registry / custom / remote provider | 不纳入 | 会引入新的发现、信任、失效和生命周期模型，当前没有必要 |
-| complete/incomplete catalog observation | 不纳入 | 当前 R9 只查询同步本地 `.agents/skills`，没有暂态远程 Provider |
-| provenance / shadowed projection / typed issue 扩展 | 不纳入 | 现有 descriptor 足以承载当前来源；不为未来 Skill 中心预建模型 |
-| 多模态、structured output、tool calling | 不纳入 | 现有 Completion 最小闭环是无工具文本生成 |
-| 非流式强制取消、通用 deadline | 不纳入 | 当前 Provider 非流式 vtable 没有取消槽，不能伪造能力 |
-
-Revision 大小不是目标。只要两项能力各自形成完整的公共契约、实现、SDK 和测试闭环，Revision 9 即具备独立发布价值。
-
-## 2. 架构位置
-
-### 2.1 Catalog
+Completion 的既定范围和实现保持不变。Revision 9 不包含 Host Tool 修改、
+Provider Registry、remote/custom provider、管理型 catalog observation、格式
+adapter、多模态、异步工具调度或完整 RunOptions。
 
 ```text
-SkillCatalogQueryV1.scope_code
+修改：AgentCore Skill facade / public wire / SDK / conformance tests / 文档
+复用：现有 canonical catalog engine / immutable snapshot / CompletionRuntime
+最小下沉：只给 catalog record 增加来源与内容身份承载字段
+不改：Core / AgentLoop / Provider client / checkpoint schema marker / descriptor schema 名称
+```
+
+R9 尚无 revision 外正式消费者，因此本次明确作为 R9 原地重切，不升级
+`abi_revision`。wire、实现、C/Zig/Rust SDK、artifact consumer、文档和证据必须
+作为一个可构建整体同时切换；不存在同 revision 的双契约兼容层。
+
+## 1. 范围判断
+
+消费方需求只作为输入。R9 接受能形成当前纵向闭环的本地多来源能力，不预建
+完整插件系统。
+
+| 输入 | R9 决策 | 理由 |
+|---|---|---|
+| Workspace 可执行 catalog | 纳入 | Session authority 的唯一可执行视图 |
+| 显式附加本地目录 | 纳入 | 支持第三方同格式 Skill，无需 Provider Registry |
+| 来源身份、内容身份 | 纳入 | 授权、资产映射、冲突和 immutable execution 必需 |
+| complete/incomplete | 纳入 | 防止暂时的目录读取失败被解释为空 catalog |
+| default-deny concrete policy | 纳入 | 防止同名来源切换导致裸逻辑名授权劫持 |
+| winner/source typed projection | 纳入最小集合 | 运行时解释与可靠映射所需 |
+| `personal_only` 可执行视图 | 删除 | Personal 不是与 Workspace authority 同维度的执行模式 |
+| `.claude`/`.codex` adapter | 不纳入 | 尚无稳定格式差异与真实解析需求 |
+| Provider Registry / remote / custom | 不纳入 | 需要新的信任、刷新和生命周期模型 |
+| shadowed 全量管理 observation | 不纳入 | 属于后续 Skill 中心管理 API |
+| public numeric priority | 不纳入 | 注册顺序不应成为授权或覆盖机制 |
+
+## 2. 架构与职责
+
+### 2.1 Skill 四层
+
+```text
+SkillCatalogQueryV1 (Workspace authority + explicit sources)
         ↓
 AgentCore source policy
         ↓
-RuntimeCatalogs.query(sources)
+canonical resolver (validity / precedence / conflict / no fallback)
         ↓
-现有 canonical catalog.build()
+immutable Catalog handle + typed descriptor
+        ↓
+default-deny SkillPolicyV1 (concrete skill_id grants)
+        ↓
+Session binding + pinned execution
 ```
 
-AgentCore 只负责把公开查询范围转换成已有 `catalog.Source` 集合。合法 Candidate、优先级、winner、conflict、invalid candidate、no-fallback 和 immutable snapshot 仍由现有 canonical catalog engine 唯一决定。
+AgentCore 决定默认来源、Workspace 高于 User、同 scope 同名冲突，以及失败
+candidate 不回退 loser。底层 catalog engine 继续唯一负责候选解析、winner、
+资源边界和 snapshot；本次只增加必要 metadata seam，不重写 resolver。
 
 ### 2.2 Completion
 
@@ -92,69 +96,128 @@ AgentCore
 
 Completion 与 Agent Runtime 平级，不从 Session 派生，不读取或修改 Conversation，不经过 AgentLoop，也不共享 Session 的 Provider client。
 
-## 3. Skill Catalog 显式查询范围
+## 3. Workspace Skill SDK
 
-### 3.1 公共 wire
-
-Revision 9 将 `SkillCatalogQueryV1.reserved0` 改为显式的 `scope_code`，并保持结构体大小不变：
+### 3.1 Wire
 
 ```zig
-pub const SkillCatalogQueryScopeV1 = enum(u32) {
-    personal_only = 1,
-    workspace_effective = 2,
-};
+pub const SkillSourceV1 = extern struct {
+    struct_size: u32,
+    scope_code: u32, // USER=1, WORKSPACE=2
+    root: BytesViewV1,
+    source_instance_id: BytesViewV1,
+    reserved: [3]u64,
+}; // 64 bytes
 
 pub const SkillCatalogQueryV1 = extern struct {
     struct_size: u32,
-    scope_code: u32,
+    reserved0: u32, // must be zero
     workspace_root: BytesViewV1,
     workspace_home: BytesViewV1,
     workspace_epoch: BytesViewV1,
-    reserved: [3]u64,
-};
+    additional_sources: ?[*]const SkillSourceV1,
+    additional_source_count: u64,
+    reserved: [1]u64,
+}; // 80 bytes
+
+pub const SkillPolicyV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32, // must be zero
+    granted_skill_ids: ?[*]const BytesViewV1,
+    granted_skill_id_count: u64,
+    reserved: [4]u64,
+}; // 56 bytes
 ```
 
-`scope_code = 0` 和未知值必须返回 `STATUS_INVALID_ARGUMENT`。Revision 9 不允许通过路径相等、空字段或默认值推断查询范围。
+所有 struct 使用 exact `struct_size`，reserved 必须为零。source 数量最多 64，
+`source_instance_id` 为 1..128 字节的 ASCII 字母数字及 `._:-`。重复的 canonical
+root 或 source instance id 是 `INVALID_ARGUMENT`。空 grant 集合表示拒绝全部 Skill。
 
-### 3.2 `personal_only`
+C ABI 函数槽为稳定的 `runtime_query_skill_catalog` 与
+`session_update_skills`；安全 SDK 有意命名为
+`resolveWorkspaceSkillCatalog` 与 `sessionBindSkillPolicy`，Header 注释和
+normative 文档必须声明这组别名。
 
-来源集合固定为：
+### 3.2 Source 与 resolution
+
+默认来源：
 
 ```text
-workspace_home/.agents/skills
-scope    = personal
-priority = 1
+<workspace_home>/.agents/skills  scope=user      source=agents.user.default
+<workspace_root>/.agents/skills  scope=workspace source=agents.workspace.default
 ```
 
-约束：
+Workspace 高于 User。canonical home 与 root 相同时只注册 Workspace 来源，避免
+同一物理目录自冲突。附加来源只能选择 User 或 Workspace scope；它与同 scope
+默认来源处于同一优先级。同 scope 同 invocation name 是 conflict，不按注册顺序
+选 winner。R9 的 provider id 固定为 `agents.directory`。
 
-- `workspace_root` 必填；`workspace_home` 为空时继续沿用现有契约，回退到 canonical `workspace_root`；
-- 只选择用户级来源，不读取项目级目录；
-- Catalog handle 仍绑定该 workspace identity，可用于对应 Session 的 Skill 选择；
-- 不把 Personal 查询解释为“全局、跨 workspace 的可执行授权”。
+不存在 `.claude/skills`、`.codex/skills` 或 bundled 的隐式扫描。消费方可以把
+任意本地目录作为附加来源，但内容必须已经符合 canonical Agent Skill 格式；
+AgentCore 不据路径名称切换解析器。
 
-### 3.3 `workspace_effective`
+不存在 public numeric priority。invalid/unavailable 高优先级 candidate 仍参与
+resolution，不能因为 Host policy 未授权 winner 而回退执行 loser。
 
-来源集合固定为：
+### 3.3 身份与 descriptor
+
+`metask.skill-catalog/v1` schema 名称保持不变，但 R9 原地替换其未发布的 Skill
+identity 字段形状。每个 winner 包含：
 
 ```text
-workspace_home/.agents/skills  scope=personal priority=1
-workspace_root/.agents/skills scope=project  priority=2
+skill_policy_key      逻辑 slot；R9 等于 invocation_name
+provider_id           来源 provider 类型
+source_scope          user | workspace
+source_instance_id    来源实例
+contribution_id       provider 内稳定贡献身份
+content_revision      body/resources 内容身份
+skill_id              provider/source/contribution/content 的 concrete 执行身份
 ```
 
-项目级来源优先于用户级来源。相同 invocation name 的 winner、shadowing、conflict 和 invalid candidate 规则全部复用现有 canonical resolver。
+`skill_id`、`contribution_id`、`content_revision` 和 `catalog_revision` 为 64 位
+小写十六进制摘要字符串。Renderer 不获得物理路径或 opaque provider locator。
+issue 至少包含 kind（invalid/unavailable/conflict）、typed code、逻辑 key 与
+provider/source provenance；一个候选问题不使其他独立 Skill 失效。
 
-当 canonical `workspace_root == workspace_home` 时，只扫描一次物理目录，避免相同文件作为两个 Candidate 产生伪冲突。去重不改变 `scope_code` 的显式要求。
+### 3.4 Complete / incomplete observation
 
-### 3.4 保持不变的语义
+成功查询只发布完整 immutable snapshot：`STATUS_OK + handle + descriptor`。
+不存在可执行的 incomplete handle。缺失来源目录视为完整的空贡献；无法打开、
+遍历或证明某个已存在来源稳定时返回
+`STATUS_SKILL_CATALOG_INCOMPLETE`，handle 为 null、descriptor 为空。
 
-- Catalog snapshot 继续不可变；
-- Host handle 与 Session retain 的引用生命周期不变；
-- Session 更新继续原子替换 Skill binding；
-- MetaWork 禁用 winner 后，执行阶段继续不得回退到 loser；
-- Catalog revision 继续由现有 canonical 内容计算产生；
-- Catalog descriptor 格式和版本不升级；
-- `scope_id` 继续绑定 canonical root/home，不因查询范围新增另一套 Session identity。
+因此 Host 只能用 `STATUS_OK` 的结果替换 committed catalog。incomplete 时保留
+last-good handle/Session binding，不得把它解释为空 catalog。独立 invalid
+candidate 则返回 `OK + degraded` typed issue。
+
+### 3.5 Authorization 与原子绑定
+
+Policy 只授予 descriptor 中的 concrete `skill_id`，默认拒绝，禁止裸
+`skill_policy_key` grant。Session create/restore 要求 Catalog 与 Policy 同时
+存在或同时缺席。idle-only rebind 共同校验二者并原子提交：任何 foreign id、
+重复 id、wrong workspace、资源限制或状态错误都保留旧 binding，不做逐条失活。
+
+### 3.6 Immutable execution 与错误优先序
+
+Catalog handle 固定 Skill body 和全部 resources。文件变化后的新查询产生新的
+`content_revision`、`skill_id` 和通常不同的 `catalog_revision`；旧 Session 继续
+执行旧 snapshot，绝不在旧 revision 下静默读取新内容。
+
+外部 typed invocation 的可观察校验顺序固定为：
+
+1. wire/UTF-8/identity shape → `INVALID_ARGUMENT`；
+2. pinned catalog revision 不匹配 → `STALE_CATALOG`；
+3. concrete `skill_id` 不在 snapshot → `SKILL_NOT_FOUND`；
+4. concrete id 未获 policy grant → `SKILL_POLICY_VIOLATION`；
+5. arguments 不合法 → `INVALID_SKILL_ARGUMENTS`；
+6. winner 当前不可执行 → `SKILL_UNAVAILABLE`；
+7. 通过后才 admission，不通过不消费 `run_id`。
+
+checkpoint 继续使用 compatibility marker 8，但 selection intersection 存储和
+比较 concrete `skill_id`。不改变 checkpoint envelope schema。
+Workspace scope identity 的既有 domain marker 继续是内部
+`metask-agentcore/abi-v1/revision-5`；它表示该身份算法的引入版本，不是当前
+ABI revision，不得机械改成 9。
 
 ## 4. Completion 公共接口
 
@@ -343,19 +406,16 @@ Revision 9 不公开 token 上限或现有内部 `Capability` enum。当前 Open
 
 ### 5.1 公共 ABI
 
-本次已执行：
+Revision 9 是 exact hard cut。最初的 R9 cut 增加 Completion；本次因尚未正式
+发布而在 revision 9 内原子重切 Skill wire：
 
-```text
-ABI v1 Revision 8 → Revision 9
-```
-
-Revision 9 是 exact hard cut：
-
-- API table 增加 Completion 函数；
-- `SkillCatalogQueryV1.reserved0` 变为 `scope_code`；
-- 增加 Catalog query scope 和 Completion 相关 public types；
-- capability bits 增加显式 Catalog scope 与 text Completion；
-- 不保留 Revision 8 table shim、旧字段默认行为或双 revision dispatch。
+- `SkillCatalogQueryV1` 恢复 `reserved0=0`，增加 `additional_sources`；
+- `SkillSelectionV1` 替换为 default-deny `SkillPolicyV1`；
+- 增加 `SkillSourceV1`、concrete identity 和 incomplete status；
+- capability bit 的数值位置不变，语义名称切为
+  `CAP_SKILL_POLICY` 与 `CAP_WORKSPACE_SKILL_CATALOG`；
+- Completion table 和契约不变；
+- 不保留旧 R9 Skill wire shim、默认行为或双 revision dispatch。
 
 ### 5.2 持久化格式不升级
 
@@ -364,8 +424,7 @@ Revision 9 是 exact hard cut：
 - Session checkpoint `STATE_SCHEMA_REVISION`；
 - Session permission checkpoint revision；
 - MCP checkpoint schema；
-- Skill catalog descriptor schema；
-- Skill catalog revision算法。
+- Skill catalog descriptor schema 名称；
 
 Revision 8 基线的 `session_checkpoint.zig` 曾有一个值为 `8` 的 `AGENTCORE_ABI_REVISION`，并将其写入 checkpoint envelope。Revision 9 没有机械地把该值改为 `9`，否则会在 Session 持久化内容没有变化的情况下人为制造 checkpoint 不兼容。
 
@@ -384,11 +443,13 @@ Revision 9 导出的 checkpoint 继续使用当前 schema 和 compatibility mark
 
 | 文件 | 修改内容 |
 |---|---|
-| `sdk/zig/types.zig` | R9 public enums、structs、函数签名、API table 和 layout tests |
-| `src/agentcore/abi_v1.zig` | Catalog scope 验证与 Completion ABI 薄转发 |
-| `src/agentcore/skill_catalog_handles.zig` | 按显式 scope 构造 `.agents/skills` 来源集合 |
-| `src/agentcore/session_checkpoint.zig` | 仅澄清 compatibility marker 命名；编码值不变 |
-| `src/agentcore/completion_handles.zig` | 新增独立 Completion/stream handle、状态和所有权实现 |
+| `sdk/zig/types.zig` | Skill source/query/policy wire、status、capability 与 layout tests |
+| `sdk/zig/protocol.zig` | typed source/identity/issues 与 descriptor validation |
+| `src/agentcore/abi_v1.zig` | Workspace query、policy transaction、error ordering 与 safe aliases |
+| `src/agentcore/skill_catalog_handles.zig` | 默认来源、附加来源验证与 Workspace authority |
+| `src/agentcore/session_authority.zig` | checkpoint selection 交集使用 concrete identity |
+| `src/skills/runtime/catalog.zig` | 最小来源/贡献/内容身份 metadata seam；resolver 不重写 |
+| `src/agentcore/completion_handles.zig` | 既有 R9 Completion 实现保持不变 |
 | `sdk/metask/agentcore.h` | 同步 R9 C ABI |
 | `sdk/zig/root.zig` | Zig SDK 包装与 exact R9 table 校验 |
 | `sdk/rust/src/raw.rs` | Rust raw layout |
@@ -421,15 +482,19 @@ Host Tool ABI
 
 ### 7.1 Catalog
 
-- `personal_only` 只返回用户目录 Skill；
-- `workspace_effective` 合并用户和项目目录；
+- 单一 Workspace authority 合并 user 与 workspace 默认来源；
 - 同名 Skill 由项目来源获胜；
 - `workspace_root == workspace_home` 时只扫描一次且不产生伪冲突；
-- 相同路径下，范围仍由 `scope_code` 而不是路径关系决定；
-- `scope_code = 0` 和未知值返回 invalid argument；
+- `reserved0 != 0` 返回 invalid argument；
+- `.claude/.codex` 不隐式扫描，但同格式目录可显式注册并投影 source identity；
+- 同 scope 同名候选产生 conflict，不按附加来源顺序覆盖；
+- invalid/unavailable winner 不回退 loser；
+- incomplete 查询不返回新 handle/descriptor，旧 Session binding 仍可执行；
+- 内容变化改变 `content_revision` 和 concrete `skill_id`；旧 Session 仍执行 pinned body/resources；
+- policy 默认拒绝，只接受当前 catalog 的 concrete ids；失败 rebind 保留旧 binding；
+- stale/not-found/policy/unavailable/invalid-arguments 的错误优先序有 wire 断言；
 - Catalog handle 可以正常绑定匹配 workspace 的 Session；
-- 禁用 winner 后不执行 loser 的既有回归继续通过；
-- Catalog descriptor 和 revision 保持确定性。
+- Catalog descriptor、identity 和 revision 保持确定性。
 
 ### 7.2 Completion
 
@@ -452,7 +517,7 @@ Host Tool ABI
 - Zig/C/C++/Rust 的 struct size、alignment、offset 和函数表一致；
 - R9 revision、table size 和 capability bits 精确匹配；
 - Revision 8 table 不被 R9 SDK 接受；
-- source-free artifact consumer 跑通两种 Catalog 查询和一次 Completion；
+- source-free artifact consumer 跑通 Workspace Catalog、default-deny policy 和一次 Completion；
 - Revision 8 checkpoint fixture 在 R9 下恢复成功；
 - `zig build agentcore:test` 通过；
 - `zig build agentcore:gate` 通过；
@@ -460,46 +525,48 @@ Host Tool ABI
 
 ## 8. 实施顺序
 
-1. 确认本文的 R9 能力范围、详细 ABI 契约、架构边界和排除项，不先修改代码 revision；
-2. 按 Type-First 原则修改 `sdk/zig/types.zig` 的 R9 wire 和 layout 断言；
-3. 实现 Catalog scope 映射和定向测试；
-4. 实现独立 Completion handle、stream handle 和资源生命周期；
-5. 补 MockServer L2 测试，证明三个 Provider 的实际请求接线；
+1. 明确 Source→Resolution→Authorization→Execution 契约和边界；
+2. Type-First 修改 public wire、layout 与 descriptor validation；
+3. 增加最小 catalog metadata seam，接入 Workspace source policy；
+4. 实现 default-deny policy、原子 binding 和 concrete execution；
+5. 补 identity、explicit source、incomplete、pinning 与错误优先序 L2；
 6. 同步 C Header、Zig SDK、Rust raw/safe SDK 和 artifact consumer；
-7. 增加 checkpoint compatibility 回归，不升级持久化 schema；
-8. 更新 normative ABI 文档和 Completion 旧设计文档状态；
-9. 全部门禁通过后，在同一交付中把公共 ABI revision 从 8 切到 9；
-10. 记录最终测试证据和未实现项，结束 Revision 9。
+7. 更新 normative ABI 文档，不升级 revision 或持久化 schema；
+8. 通过 Debug/ReleaseSafe、MSVC/GNU 与 source-free delivery gates；
+9. 记录最终证据，结束 R9 Skill recut。
 
 ## 9. 实施与验证记录
 
-R9 实现提交为 `6590e4f`。同分支的 MCP Classic 空 `params` 修复提交为
-`9f8f5d9`，它是独立维护项，不增加 R9 capability，也不修改 MCP schema。
+2026-08-20 Skill recut 验证结果：
 
-2026-08-19 验证结果：
+- `zig test sdk/zig/types.zig`：3/3；
+- `zig test sdk/zig/protocol.zig`：19/19；
+- `zig build test:skill-runtime`：通过；
+- `zig build agentcore:test`：通过（负路径测试会输出预期的 provider error 日志）；
+- `zig build agentcore:gate -Dtarget=x86_64-windows-msvc`：C/C++/Zig/Rust native gate 通过；
+- MSVC 与 GNU 的 ReleaseSafe `agentcore:bundle`、`agentcore:consumer`：通过；
+- MSVC 与 GNU 的 ReleaseSafe `agentcore:archive`：archive contract 6/6，产物与 SHA-256 生成成功；
+- MSVC `agentcore:rust`：通过；GNU bundle 与 C/Zig consumer 已通过，但当前机器缺少
+  `x86_64-w64-mingw32-gcc`，因此 GNU Rust link probe 是环境阻塞；
+- `agentcore:rust-bindgen-check`：当前机器缺少 `libclang.dll`，无法执行 bindgen
+  精确再生成 diff；checked-in raw layout 已由 Rust/MSVC、C static asserts 和 Zig layout tests 验证。
 
-- `zig build agentcore:test`：通过；
-- `zig build agentcore:bundle -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSmall`：通过；
-- `zig build agentcore:consumer -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSmall`：C/Zig source-free consumer 通过；
-- `zig build agentcore:rust -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSmall`：Rust link probe 通过；
-- `zig build agentcore:gate -Dtarget=x86_64-windows-msvc`：C/C++/Zig/Rust native delivery gate 通过；
-- `zig build agentcore:archive -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSmall`：manifest、package self-test、archive 与 SHA-256 产物通过。
-
-两项不应被误报为 R9 实现失败的环境/基线事实：
-
-- `agentcore:rust-bindgen-check` 在当前机器缺少 `libclang.dll`，因此无法执行精确再生成 diff；checked-in Rust raw declarations 已通过 Rust 编译、link probe 和跨语言 layout 断言，但仍应在具备 libclang 的发布环境补跑该独立 gate；
-- 完整 ReleaseSmall `agentcore:gate` 会在既有 `Skill materialization is post-admission and pre-Conversation` 单测中以 code 5 崩溃。对照提交 `9f8f5d9` 在同配置同样稳定复现，ReleaseSafe 和 Debug 通过，因此这不是 R9 回归，也不在本次越界修改 Skill/Core。
+旧 R9 cut 的证据不自动证明重切后的 Skill 契约。MCP Classic 空 `params` 修复
+仍是独立维护项，不增加 R9 capability。
 
 ## 10. Definition of Done
 
 Revision 9 只有同时满足以下条件才算完成：
 
-- 两种 Catalog query scope 均由显式 enum 决定，零值不再隐式工作；
-- Catalog 查询和 Session Skill binding 的现有 canonical 语义没有分叉；
+- Catalog 只有一个 Workspace authority；`reserved0` 不承载扫描策略；
+- 默认与显式来源、resolution、concrete identity 和 default-deny policy 闭合；
+- complete/incomplete 不会把暂态失败发布为空 catalog；
+- Catalog + Policy 共同校验、原子提交，失败保留旧 binding；
+- immutable snapshot 与 content identity 有可执行 pinning 证据；
 - Completion 是独立 handle，不借用 Session/Runtime 的 Provider 生命周期；
 - complete、stream、abort、destroy 的所有权和并发状态均有可执行测试；
 - 没有修改 Core、AgentLoop、Provider 实现或 Host Tool；
-- 没有升级 checkpoint/catalog/MCP schema；
+- 没有升级 ABI revision、checkpoint/catalog schema 名称或 MCP schema；
 - 公共 Header、Zig SDK、Rust SDK、artifact 和 normative 文档原子一致；
 - `agentcore:test` 与 `agentcore:gate` 全部通过。
 
