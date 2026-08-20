@@ -39,6 +39,7 @@ pub const Status = enum(u32) {
     mcp_not_refreshed = 24,
     invalid_mcp_selection = 25,
     completion_unsupported_response = 26,
+    skill_catalog_incomplete = 27,
 
     pub fn fromCode(code: u32) error{UnknownStatus}!Status {
         return switch (code) {
@@ -69,6 +70,7 @@ pub const Status = enum(u32) {
             @intFromEnum(Status.mcp_not_refreshed) => .mcp_not_refreshed,
             @intFromEnum(Status.invalid_mcp_selection) => .invalid_mcp_selection,
             @intFromEnum(Status.completion_unsupported_response) => .completion_unsupported_response,
+            @intFromEnum(Status.skill_catalog_incomplete) => .skill_catalog_incomplete,
             else => error.UnknownStatus,
         };
     }
@@ -101,6 +103,7 @@ pub const STATUS_LOGICAL_SESSION_CONFLICT: u32 = @intFromEnum(Status.logical_ses
 pub const STATUS_MCP_NOT_REFRESHED: u32 = @intFromEnum(Status.mcp_not_refreshed);
 pub const STATUS_INVALID_MCP_SELECTION: u32 = @intFromEnum(Status.invalid_mcp_selection);
 pub const STATUS_COMPLETION_UNSUPPORTED_RESPONSE: u32 = @intFromEnum(Status.completion_unsupported_response);
+pub const STATUS_SKILL_CATALOG_INCOMPLETE: u32 = @intFromEnum(Status.skill_catalog_incomplete);
 
 pub const PROVIDER_ANTHROPIC: u32 = 1;
 pub const PROVIDER_OPENAI: u32 = 2;
@@ -202,13 +205,15 @@ pub const MAX_COMPLETION_CONFIG_BYTES_V1: u64 = 1024 * 1024;
 pub const MAX_COMPLETION_MESSAGES_V1: u64 = 4096;
 pub const MAX_COMPLETION_REQUEST_BYTES_V1: u64 = 16 * 1024 * 1024;
 pub const MAX_COMPLETION_RESULT_BYTES_V1: u64 = 16 * 1024 * 1024;
+pub const MAX_SKILL_SOURCES_V1: u64 = 64;
+pub const MAX_SKILL_SOURCE_ID_BYTES_V1: u64 = 128;
 pub const MAX_TURNS_V1: u32 = 1000;
 
 pub const RUN_INPUT_TEXT: u32 = 1;
 pub const RUN_INPUT_SKILL: u32 = 2;
 
-pub const SKILL_SELECTION_DISABLED: u32 = 1;
-pub const SKILL_SELECTION_ENABLED: u32 = 2;
+pub const SKILL_SOURCE_USER: u32 = 1;
+pub const SKILL_SOURCE_WORKSPACE: u32 = 2;
 
 pub const COMPACT_COMPACTED: u32 = 1;
 pub const COMPACT_NO_CHANGE: u32 = 2;
@@ -220,9 +225,6 @@ pub const RUN_CHECKPOINT_BUDGET_REQUIRED: u32 = 1;
 pub const RUN_CHECKPOINT_BUDGET_EXHAUSTED: u32 = 2;
 pub const RUN_CHECKPOINT_RESOURCE_LIMIT: u32 = 3;
 pub const RUN_RESULT_COMPACTION_RECOMMENDED: u32 = 1 << 0;
-
-pub const SKILL_CATALOG_SCOPE_PERSONAL_ONLY: u32 = 1;
-pub const SKILL_CATALOG_SCOPE_WORKSPACE_EFFECTIVE: u32 = 2;
 
 pub const COMPLETION_ROLE_USER: u32 = 1;
 pub const COMPLETION_ROLE_ASSISTANT: u32 = 2;
@@ -334,7 +336,7 @@ pub const CAP_SKILL_CATALOG: u64 = 1 << 6;
 pub const CAP_TYPED_RUN_INPUT: u64 = 1 << 7;
 pub const CAP_SESSION_MODEL_MUTATION: u64 = 1 << 8;
 pub const CAP_MANUAL_COMPACT: u64 = 1 << 9;
-pub const CAP_SKILL_SELECTION: u64 = 1 << 10;
+pub const CAP_SKILL_POLICY: u64 = 1 << 10;
 pub const CAP_HOST_PERMISSION_RULES: u64 = 1 << 11;
 pub const CAP_SESSION_CHECKPOINT: u64 = 1 << 12;
 pub const CAP_SESSION_RESTORE: u64 = 1 << 13;
@@ -344,9 +346,9 @@ pub const CAP_MCP_SESSION_SELECTION: u64 = 1 << 16;
 pub const CAP_DURABLE_BUDGET: u64 = 1 << 17;
 pub const CAP_SESSION_PERMISSION_AUTHORITY: u64 = 1 << 18;
 pub const CAP_RUN_STATE_OBSERVATION: u64 = 1 << 19;
-pub const CAP_SKILL_CATALOG_QUERY_SCOPE: u64 = 1 << 20;
+pub const CAP_WORKSPACE_SKILL_CATALOG: u64 = 1 << 20;
 pub const CAP_TEXT_COMPLETION: u64 = 1 << 21;
-pub const REQUIRED_CAPABILITIES_V1: u64 = CAP_RUNTIME | CAP_BUILTIN_TOOLS | CAP_HOST_SYNC_TOOLS | CAP_HOST_UI | CAP_CORE_EVENTS_JSON | CAP_ABORT | CAP_SKILL_CATALOG | CAP_TYPED_RUN_INPUT | CAP_SESSION_MODEL_MUTATION | CAP_MANUAL_COMPACT | CAP_SKILL_SELECTION | CAP_HOST_PERMISSION_RULES | CAP_SESSION_CHECKPOINT | CAP_SESSION_RESTORE | CAP_SESSION_DESCRIBE | CAP_MCP_RUNTIME_CATALOG | CAP_MCP_SESSION_SELECTION | CAP_DURABLE_BUDGET | CAP_SESSION_PERMISSION_AUTHORITY | CAP_RUN_STATE_OBSERVATION | CAP_SKILL_CATALOG_QUERY_SCOPE | CAP_TEXT_COMPLETION;
+pub const REQUIRED_CAPABILITIES_V1: u64 = CAP_RUNTIME | CAP_BUILTIN_TOOLS | CAP_HOST_SYNC_TOOLS | CAP_HOST_UI | CAP_CORE_EVENTS_JSON | CAP_ABORT | CAP_SKILL_CATALOG | CAP_TYPED_RUN_INPUT | CAP_SESSION_MODEL_MUTATION | CAP_MANUAL_COMPACT | CAP_SKILL_POLICY | CAP_HOST_PERMISSION_RULES | CAP_SESSION_CHECKPOINT | CAP_SESSION_RESTORE | CAP_SESSION_DESCRIBE | CAP_MCP_RUNTIME_CATALOG | CAP_MCP_SESSION_SELECTION | CAP_DURABLE_BUDGET | CAP_SESSION_PERMISSION_AUTHORITY | CAP_RUN_STATE_OBSERVATION | CAP_WORKSPACE_SKILL_CATALOG | CAP_TEXT_COMPLETION;
 
 /// Each published v1 revision is rigid: every struct_size is exact and every
 /// reserved field is zero. A Host pins version, revision, table size, and
@@ -592,14 +594,14 @@ pub const SessionCallbacksV1 = extern struct {
     reserved: [4]u64,
 };
 
-/// New Skills use `default_state_code`. Every listed catalog Skill ID uses the
-/// opposite state. The list is borrowed for the call and must not contain
-/// duplicate or foreign IDs.
-pub const SkillSelectionV1 = extern struct {
+/// Complete default-deny authorization policy for one exact Catalog. Every
+/// listed ID is a concrete source+content `skill_id` from that Catalog. The
+/// list is borrowed for the synchronous call and must be unique.
+pub const SkillPolicyV1 = extern struct {
     struct_size: u32,
-    default_state_code: u32,
-    exception_skill_ids: ?[*]const BytesViewV1,
-    exception_skill_id_count: u64,
+    reserved0: u32,
+    granted_skill_ids: ?[*]const BytesViewV1,
+    granted_skill_id_count: u64,
     reserved: [4]u64,
 };
 
@@ -667,7 +669,7 @@ pub const SessionHostConfigV1 = extern struct {
     allowed_tools: ?[*]const BytesViewV1,
     allowed_tool_count: u64,
     skill_catalog: ?*SkillCatalogHandle,
-    skill_selection: ?*const SkillSelectionV1,
+    skill_policy: ?*const SkillPolicyV1,
     permission_rules: ?*const PermissionRuleSetV1,
     mcp_selection: ?*const McpSelectionV1,
     durable_budget: ?*const DurableBudgetProfileV1,
@@ -682,15 +684,28 @@ pub const SessionCreateConfigV1 = extern struct {
     reserved: [4]u64,
 };
 
-/// Default discovery is limited to `workspace_home/.agents/skills` and
-/// `workspace_root/.agents/skills`; product-specific roots are not scanned.
-pub const SkillCatalogQueryV1 = extern struct {
+/// One additional directory using the canonical Agent Skill format. Registering
+/// a path does not install a `.claude`/`.codex` format adapter.
+pub const SkillSourceV1 = extern struct {
     struct_size: u32,
     scope_code: u32,
+    root: BytesViewV1,
+    source_instance_id: BytesViewV1,
+    reserved: [3]u64,
+};
+
+/// Resolves the complete effective Catalog for one Workspace authority.
+/// Default discovery is limited to user/workspace `.agents/skills`; optional
+/// sources add directories in the same canonical format. `reserved0` is zero.
+pub const SkillCatalogQueryV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
     workspace_root: BytesViewV1,
     workspace_home: BytesViewV1,
     workspace_epoch: BytesViewV1,
-    reserved: [3]u64,
+    additional_sources: ?[*]const SkillSourceV1,
+    additional_source_count: u64,
+    reserved: [1]u64,
 };
 
 pub const CompletionConfigV1 = extern struct {
@@ -954,10 +969,10 @@ pub const SessionDescribeFnV1 = *const fn (
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
 pub const SessionSetModelFnV1 = *const fn (?*SessionHandle, BytesViewV1, ?*OwnedBytesV1) callconv(.c) u32;
-pub const SessionUpdateSkillsFnV1 = *const fn (
+pub const SessionBindSkillsFnV1 = *const fn (
     session: ?*SessionHandle,
     optional_catalog: ?*SkillCatalogHandle,
-    selection: ?*const SkillSelectionV1,
+    policy: ?*const SkillPolicyV1,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
 pub const SessionUpdatePermissionRulesFnV1 = *const fn (
@@ -1041,7 +1056,7 @@ pub const ApiV1 = extern struct {
     session_destroy: ?SessionDestroyFnV1,
     session_describe: ?SessionDescribeFnV1,
     session_set_model: ?SessionSetModelFnV1,
-    session_update_skills: ?SessionUpdateSkillsFnV1,
+    session_update_skills: ?SessionBindSkillsFnV1,
     session_update_permission_rules: ?SessionUpdatePermissionRulesFnV1,
     session_update_mcp: ?SessionUpdateMcpFnV1,
     session_run_input: ?SessionRunInputFnV1,
@@ -1077,13 +1092,14 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(McpCatalogLimitsV1));
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(RuntimeConfigV1));
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(SessionCallbacksV1));
-    try std.testing.expectEqual(@as(usize, 56), @sizeOf(SkillSelectionV1));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(SkillPolicyV1));
     try std.testing.expectEqual(@as(usize, 88), @sizeOf(PermissionRuleSetV1));
     try std.testing.expectEqual(@as(usize, 80), @sizeOf(McpSelectorV1));
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(McpSelectionV1));
     try std.testing.expectEqual(@as(usize, 112), @sizeOf(DurableBudgetProfileV1));
     try std.testing.expectEqual(@as(usize, 168), @sizeOf(SessionHostConfigV1));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(SessionCreateConfigV1));
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(SkillSourceV1));
     try std.testing.expectEqual(@as(usize, 80), @sizeOf(SkillCatalogQueryV1));
     try std.testing.expectEqual(@as(usize, 88), @sizeOf(CompletionConfigV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(CompletionMessageV1));
@@ -1115,13 +1131,13 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(SessionHostConfigV1, "api_key"));
     try std.testing.expectEqual(@as(usize, 80), @offsetOf(SessionHostConfigV1, "allowed_tools"));
     try std.testing.expectEqual(@as(usize, 96), @offsetOf(SessionHostConfigV1, "skill_catalog"));
-    try std.testing.expectEqual(@as(usize, 104), @offsetOf(SessionHostConfigV1, "skill_selection"));
+    try std.testing.expectEqual(@as(usize, 104), @offsetOf(SessionHostConfigV1, "skill_policy"));
     try std.testing.expectEqual(@as(usize, 112), @offsetOf(SessionHostConfigV1, "permission_rules"));
     try std.testing.expectEqual(@as(usize, 120), @offsetOf(SessionHostConfigV1, "mcp_selection"));
     try std.testing.expectEqual(@as(usize, 128), @offsetOf(SessionHostConfigV1, "durable_budget"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(SessionCreateConfigV1, "host"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(SessionCreateConfigV1, "model"));
-    try std.testing.expectEqual(@as(usize, 8), @offsetOf(SkillSelectionV1, "exception_skill_ids"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(SkillPolicyV1, "granted_skill_ids"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(PermissionRuleSetV1, "allow"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(PermissionRuleSetV1, "ask"));
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(PermissionRuleSetV1, "deny"));
@@ -1132,7 +1148,8 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 32), @offsetOf(RunResultV1, "required_checkpoint_bytes"));
     try std.testing.expectEqual(@as(usize, 32), @offsetOf(CheckpointExportResultV1, "digest"));
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(SkillCatalogQueryV1, "workspace_epoch"));
-    try std.testing.expectEqual(@as(usize, 4), @offsetOf(SkillCatalogQueryV1, "scope_code"));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(SkillCatalogQueryV1, "additional_sources"));
+    try std.testing.expectEqual(@as(usize, 64), @offsetOf(SkillCatalogQueryV1, "additional_source_count"));
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(CompletionConfigV1, "model"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(CompletionMessageV1, "text"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(CompletionRequestV1, "system"));
@@ -1177,7 +1194,8 @@ test "typed status and stop reason validate every public code" {
     try std.testing.expectEqual(Status.stale_compact, try Status.fromCode(17));
     try std.testing.expectEqual(Status.invalid_mcp_selection, try Status.fromCode(25));
     try std.testing.expectEqual(Status.completion_unsupported_response, try Status.fromCode(26));
-    try std.testing.expectError(error.UnknownStatus, Status.fromCode(27));
+    try std.testing.expectEqual(Status.skill_catalog_incomplete, try Status.fromCode(27));
+    try std.testing.expectError(error.UnknownStatus, Status.fromCode(28));
     try std.testing.expectError(error.UnknownStatus, Status.fromCode(std.math.maxInt(u32)));
     try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(0));
     try std.testing.expectEqual(StopReason.checkpoint_resource_limit, try StopReason.fromCode(8));
@@ -1193,10 +1211,10 @@ test "typed status and stop reason validate every public code" {
     );
 }
 
-test "Revision 9 Catalog scope and Completion capabilities append without changing prior meanings" {
+test "Revision 9 Workspace Skill authority and Completion capabilities are exact" {
     const std = @import("std");
     try std.testing.expectEqual(@as(u32, 9), ABI_REVISION);
-    try std.testing.expectEqual(@as(u64, 1 << 20), CAP_SKILL_CATALOG_QUERY_SCOPE);
+    try std.testing.expectEqual(@as(u64, 1 << 20), CAP_WORKSPACE_SKILL_CATALOG);
     try std.testing.expectEqual(@as(u64, 1 << 21), CAP_TEXT_COMPLETION);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);

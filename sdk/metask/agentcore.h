@@ -46,6 +46,7 @@ extern "C" {
 #define METASK_AGENTCORE_STATUS_MCP_NOT_REFRESHED 24u
 #define METASK_AGENTCORE_STATUS_INVALID_MCP_SELECTION 25u
 #define METASK_AGENTCORE_STATUS_COMPLETION_UNSUPPORTED_RESPONSE 26u
+#define METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE 27u
 
 #define METASK_AGENTCORE_PROVIDER_ANTHROPIC 1u
 #define METASK_AGENTCORE_PROVIDER_OPENAI 2u
@@ -117,12 +118,14 @@ extern "C" {
 #define METASK_AGENTCORE_MAX_COMPLETION_MESSAGES_V1 4096ULL
 #define METASK_AGENTCORE_MAX_COMPLETION_REQUEST_BYTES_V1 16777216ULL
 #define METASK_AGENTCORE_MAX_COMPLETION_RESULT_BYTES_V1 16777216ULL
+#define METASK_AGENTCORE_MAX_SKILL_SOURCES_V1 64ULL
+#define METASK_AGENTCORE_MAX_SKILL_SOURCE_ID_BYTES_V1 128ULL
 #define METASK_AGENTCORE_MAX_TURNS_V1 1000u
 
 #define METASK_AGENTCORE_RUN_INPUT_TEXT 1u
 #define METASK_AGENTCORE_RUN_INPUT_SKILL 2u
-#define METASK_AGENTCORE_SKILL_SELECTION_DISABLED 1u
-#define METASK_AGENTCORE_SKILL_SELECTION_ENABLED 2u
+#define METASK_AGENTCORE_SKILL_SOURCE_USER 1u
+#define METASK_AGENTCORE_SKILL_SOURCE_WORKSPACE 2u
 #define METASK_AGENTCORE_COMPACT_COMPACTED 1u
 #define METASK_AGENTCORE_COMPACT_NO_CHANGE 2u
 #define METASK_AGENTCORE_COMPACT_DEGRADED 3u
@@ -132,9 +135,6 @@ extern "C" {
 #define METASK_AGENTCORE_RUN_CHECKPOINT_BUDGET_EXHAUSTED 2u
 #define METASK_AGENTCORE_RUN_CHECKPOINT_RESOURCE_LIMIT 3u
 #define METASK_AGENTCORE_RUN_RESULT_COMPACTION_RECOMMENDED (1u << 0)
-
-#define METASK_AGENTCORE_SKILL_CATALOG_SCOPE_PERSONAL_ONLY 1u
-#define METASK_AGENTCORE_SKILL_CATALOG_SCOPE_WORKSPACE_EFFECTIVE 2u
 
 #define METASK_AGENTCORE_COMPLETION_ROLE_USER 1u
 #define METASK_AGENTCORE_COMPLETION_ROLE_ASSISTANT 2u
@@ -213,7 +213,7 @@ extern "C" {
 #define METASK_AGENTCORE_CAP_TYPED_RUN_INPUT (1ULL << 7)
 #define METASK_AGENTCORE_CAP_SESSION_MODEL_MUTATION (1ULL << 8)
 #define METASK_AGENTCORE_CAP_MANUAL_COMPACT (1ULL << 9)
-#define METASK_AGENTCORE_CAP_SKILL_SELECTION (1ULL << 10)
+#define METASK_AGENTCORE_CAP_SKILL_POLICY (1ULL << 10)
 #define METASK_AGENTCORE_CAP_HOST_PERMISSION_RULES (1ULL << 11)
 #define METASK_AGENTCORE_CAP_SESSION_CHECKPOINT (1ULL << 12)
 #define METASK_AGENTCORE_CAP_SESSION_RESTORE (1ULL << 13)
@@ -223,7 +223,7 @@ extern "C" {
 #define METASK_AGENTCORE_CAP_DURABLE_BUDGET (1ULL << 17)
 #define METASK_AGENTCORE_CAP_SESSION_PERMISSION_AUTHORITY (1ULL << 18)
 #define METASK_AGENTCORE_CAP_RUN_STATE_OBSERVATION (1ULL << 19)
-#define METASK_AGENTCORE_CAP_SKILL_CATALOG_QUERY_SCOPE (1ULL << 20)
+#define METASK_AGENTCORE_CAP_WORKSPACE_SKILL_CATALOG (1ULL << 20)
 #define METASK_AGENTCORE_CAP_TEXT_COMPLETION (1ULL << 21)
 #define METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 ((1ULL << 22) - 1ULL)
 
@@ -419,13 +419,15 @@ typedef struct {
     uint64_t reserved[4];
 } metask_agentcore_session_callbacks_v1;
 
+/* Default-deny authorization over concrete skill_id values from exactly one
+ * complete catalog descriptor. Empty grants deny every Skill. */
 typedef struct {
     uint32_t struct_size;
-    uint32_t default_state_code;
-    const metask_agentcore_bytes_view_v1 *exception_skill_ids;
-    uint64_t exception_skill_id_count;
+    uint32_t reserved0;
+    const metask_agentcore_bytes_view_v1 *granted_skill_ids;
+    uint64_t granted_skill_id_count;
     uint64_t reserved[4];
-} metask_agentcore_skill_selection_v1;
+} metask_agentcore_skill_policy_v1;
 
 typedef struct {
     uint32_t struct_size;
@@ -485,7 +487,7 @@ typedef struct {
     const metask_agentcore_bytes_view_v1 *allowed_tools;
     uint64_t allowed_tool_count;
     metask_agentcore_skill_catalog *skill_catalog;
-    const metask_agentcore_skill_selection_v1 *skill_selection;
+    const metask_agentcore_skill_policy_v1 *skill_policy;
     const metask_agentcore_permission_rule_set_v1 *permission_rules;
     const metask_agentcore_mcp_selection_v1 *mcp_selection;
     const metask_agentcore_durable_budget_profile_v1 *durable_budget;
@@ -503,10 +505,22 @@ typedef struct {
 typedef struct {
     uint32_t struct_size;
     uint32_t scope_code;
+    metask_agentcore_bytes_view_v1 root;
+    metask_agentcore_bytes_view_v1 source_instance_id;
+    uint64_t reserved[3];
+} metask_agentcore_skill_source_v1;
+
+/* Resolves one complete Workspace authority. The raw function-table slot keeps
+ * its historical name; SDKs expose this as resolveWorkspaceSkillCatalog. */
+typedef struct {
+    uint32_t struct_size;
+    uint32_t reserved0;
     metask_agentcore_bytes_view_v1 workspace_root;
     metask_agentcore_bytes_view_v1 workspace_home;
     metask_agentcore_bytes_view_v1 workspace_epoch;
-    uint64_t reserved[3];
+    const metask_agentcore_skill_source_v1 *additional_sources;
+    uint64_t additional_source_count;
+    uint64_t reserved[1];
 } metask_agentcore_skill_catalog_query_v1;
 
 typedef struct {
@@ -722,9 +736,11 @@ typedef uint32_t (*metask_agentcore_session_describe_fn_v1)(
 typedef uint32_t (*metask_agentcore_session_set_model_fn_v1)(
     metask_agentcore_session *, metask_agentcore_bytes_view_v1,
     metask_agentcore_owned_bytes_v1 *);
-typedef uint32_t (*metask_agentcore_session_update_skills_fn_v1)(
+/* Raw table slot remains session_update_skills for ABI stability. SDKs expose
+ * this atomic Catalog + Policy transaction as sessionBindSkillPolicy. */
+typedef uint32_t (*metask_agentcore_session_bind_skills_fn_v1)(
     metask_agentcore_session *, metask_agentcore_skill_catalog *,
-    const metask_agentcore_skill_selection_v1 *, metask_agentcore_owned_bytes_v1 *);
+    const metask_agentcore_skill_policy_v1 *, metask_agentcore_owned_bytes_v1 *);
 typedef uint32_t (*metask_agentcore_session_update_permission_rules_fn_v1)(
     metask_agentcore_session *, const metask_agentcore_permission_rule_set_v1 *,
     metask_agentcore_owned_bytes_v1 *);
@@ -768,7 +784,7 @@ typedef struct {
     metask_agentcore_session_destroy_fn_v1 session_destroy;
     metask_agentcore_session_describe_fn_v1 session_describe;
     metask_agentcore_session_set_model_fn_v1 session_set_model;
-    metask_agentcore_session_update_skills_fn_v1 session_update_skills;
+    metask_agentcore_session_bind_skills_fn_v1 session_update_skills;
     metask_agentcore_session_update_permission_rules_fn_v1 session_update_permission_rules;
     metask_agentcore_session_update_mcp_fn_v1 session_update_mcp;
     metask_agentcore_session_run_input_fn_v1 session_run_input;
@@ -835,7 +851,7 @@ metask_agentcore_api_v1_is_compatible(const metask_agentcore_api_v1 *api) {
            api->session_describe != (metask_agentcore_session_describe_fn_v1)0 &&
            api->session_set_model != (metask_agentcore_session_set_model_fn_v1)0 &&
            api->session_update_skills !=
-               (metask_agentcore_session_update_skills_fn_v1)0 &&
+               (metask_agentcore_session_bind_skills_fn_v1)0 &&
            api->session_update_permission_rules !=
                (metask_agentcore_session_update_permission_rules_fn_v1)0 &&
            api->session_update_mcp !=
@@ -932,13 +948,14 @@ METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_apply_report_v1, 64);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_catalog_limits_v1, 64);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_runtime_config_v1, 96);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_callbacks_v1, 72);
-METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_skill_selection_v1, 56);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_skill_policy_v1, 56);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_permission_rule_set_v1, 88);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_selector_v1, 80);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_selection_v1, 56);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_durable_budget_profile_v1, 112);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_host_config_v1, 168);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_create_config_v1, 64);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_skill_source_v1, 64);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_skill_catalog_query_v1, 80);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_completion_config_v1, 88);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_completion_message_v1, 40);
@@ -971,13 +988,14 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_runtime_config_v1, mcp_catalog_l
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, api_key, 16);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, allowed_tools, 80);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, skill_catalog, 96);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, skill_selection, 104);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, skill_policy, 104);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, permission_rules, 112);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, mcp_selection, 120);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, durable_budget, 128);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_create_config_v1, host, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_create_config_v1, model, 16);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_skill_catalog_query_v1, scope_code, 4);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_skill_catalog_query_v1, additional_sources, 56);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_skill_catalog_query_v1, additional_source_count, 64);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_completion_config_v1, model, 40);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_completion_message_v1, text, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_completion_request_v1, system, 24);

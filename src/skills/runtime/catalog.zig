@@ -29,6 +29,8 @@ pub const SourceScope = enum {
     plugin,
 };
 
+pub const DEFAULT_PROVIDER_ID = "agents.directory";
+
 /// Higher numeric priority wins. Equal-priority candidates for the same
 /// invocation name are a conflict, independent of source enumeration order.
 pub const Source = struct {
@@ -36,6 +38,12 @@ pub const Source = struct {
     scope: SourceScope,
     priority: u32,
     namespace: []const u8 = "",
+    /// Logical parser/provider identity. This is metadata only; the shared
+    /// catalog keeps owning canonical parsing and resolution.
+    provider_id: []const u8 = DEFAULT_PROVIDER_ID,
+    /// Stable opaque identity for this configured source. Empty keeps legacy
+    /// in-process callers working and derives an identity from the root.
+    source_instance_id: []const u8 = "",
 };
 
 /// Built-in product source order. AgentCore deliberately supplies its own
@@ -113,8 +121,16 @@ pub const FileRecord = struct {
 };
 
 pub const SkillRecord = struct {
+    /// Internal logical lookup ID retained for shared Runtime callers.
     skill_id: [64]u8,
     invocation_name: []const u8,
+    provider_id: []const u8 = DEFAULT_PROVIDER_ID,
+    source_scope: SourceScope = .project,
+    source_instance_id: []const u8 = "",
+    contribution_id: [64]u8 = [_]u8{'0'} ** 64,
+    content_revision: [64]u8 = [_]u8{'0'} ** 64,
+    /// Concrete source+content identity exposed by AgentCore.
+    execution_id: [64]u8 = [_]u8{'0'} ** 64,
     definition: definition_mod.Skill,
     directories: []const []const u8,
     files: []const FileRecord,
@@ -126,6 +142,8 @@ pub const Issue = struct {
     reason: ?ResourceReason,
     invocation_name: ?[]const u8,
     source_scope: SourceScope,
+    provider_id: []const u8 = DEFAULT_PROVIDER_ID,
+    source_instance_id: []const u8 = "",
     /// Internal-only stable identity for revision hashing and ordering. This
     /// preserves evidence for invalid raw names without exposing those names.
     revision_key: []const u8,
@@ -135,6 +153,7 @@ pub const BuildError = error{
     OutOfMemory,
     ResourceLimit,
     CatalogInvalid,
+    CatalogIncomplete,
     InvalidScopeId,
 };
 
@@ -170,6 +189,14 @@ pub const Snapshot = struct {
         }
         return null;
     }
+
+    pub fn findByExecutionId(self: *const Snapshot, id: []const u8) ?*const SkillRecord {
+        if (id.len != 64) return null;
+        for (self.skills) |*skill| {
+            if (std.mem.eql(u8, &skill.execution_id, id)) return skill;
+        }
+        return null;
+    }
 };
 
 const Candidate = struct {
@@ -177,6 +204,8 @@ const Candidate = struct {
     dir_name: []const u8,
     invocation_name: []const u8,
     scope: SourceScope,
+    provider_id: []const u8 = DEFAULT_PROVIDER_ID,
+    source_instance_id: []const u8 = "",
     priority: u32,
     state: State,
 
@@ -291,6 +320,8 @@ pub fn build(
                 .reason = null,
                 .invocation_name = invocation_name,
                 .source_scope = group[0].scope,
+                .provider_id = group[0].provider_id,
+                .source_instance_id = group[0].source_instance_id,
                 .revision_key = invocation_name,
             });
             continue;
@@ -305,6 +336,8 @@ pub fn build(
                     .reason = reason,
                     .invocation_name = invocation_name,
                     .source_scope = selected.scope,
+                    .provider_id = selected.provider_id,
+                    .source_instance_id = selected.source_instance_id,
                     .revision_key = invocation_name,
                 });
                 continue;
@@ -325,6 +358,8 @@ pub fn build(
                     .reason = reason,
                     .invocation_name = invocation_name,
                     .source_scope = selected.scope,
+                    .provider_id = selected.provider_id,
+                    .source_instance_id = selected.source_instance_id,
                     .revision_key = invocation_name,
                 });
                 continue;
@@ -339,6 +374,8 @@ pub fn build(
                         .reason = null,
                         .invocation_name = invocation_name,
                         .source_scope = selected.scope,
+                        .provider_id = selected.provider_id,
+                        .source_instance_id = selected.source_instance_id,
                         .revision_key = invocation_name,
                     });
                     continue;
@@ -380,20 +417,22 @@ fn enumerateSource(
     issues: *std.ArrayList(Issue),
 ) BuildError!void {
     if (source.root.len == 0 or !std.fs.path.isAbsolute(source.root)) return error.CatalogInvalid;
-    if (source.namespace.len > 128) return error.ResourceLimit;
+    if (source.namespace.len > 128 or source.provider_id.len == 0 or
+        source.provider_id.len > 128 or source.source_instance_id.len > 128)
+        return error.ResourceLimit;
     var root = Dir.openDirAbsolute(io, source.root, .{
         .iterate = true,
         .follow_symlinks = false,
     }) catch |err| switch (err) {
         error.FileNotFound => return,
-        else => return error.CatalogInvalid,
+        else => return error.CatalogIncomplete,
     };
     defer root.close(io);
-    const before = root.stat(io) catch return error.CatalogInvalid;
-    if (before.kind != .directory) return error.CatalogInvalid;
+    const before = root.stat(io) catch return error.CatalogIncomplete;
+    if (before.kind != .directory) return error.CatalogIncomplete;
 
     var iterator = root.iterate();
-    while (iterator.next(io) catch return error.CatalogInvalid) |entry| {
+    while (iterator.next(io) catch return error.CatalogIncomplete) |entry| {
         if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
         try chargeWork(work_budget, limits);
 
@@ -420,8 +459,8 @@ fn enumerateSource(
         const state = probeCandidateDirectory(io, root, entry.name) orelse continue;
         try appendCandidate(arena, source, entry.name, state, candidates, issues);
     }
-    const after = root.stat(io) catch return error.CatalogInvalid;
-    if (!sameDirectoryState(before, after)) return error.CatalogInvalid;
+    const after = root.stat(io) catch return error.CatalogIncomplete;
+    if (!sameDirectoryState(before, after)) return error.CatalogIncomplete;
 }
 
 fn appendCandidate(
@@ -441,6 +480,8 @@ fn appendCandidate(
             .reason = null,
             .invocation_name = null,
             .source_scope = source.scope,
+            .provider_id = source.provider_id,
+            .source_instance_id = try sourceInstanceId(arena, source),
             .revision_key = try arena.dupe(u8, &raw_name_hash),
         });
         return;
@@ -451,9 +492,18 @@ fn appendCandidate(
         .dir_name = try arena.dupe(u8, dir_name),
         .invocation_name = invocation,
         .scope = source.scope,
+        .provider_id = source.provider_id,
+        .source_instance_id = try sourceInstanceId(arena, source),
         .priority = source.priority,
         .state = state,
     });
+}
+
+fn sourceInstanceId(arena: std.mem.Allocator, source: Source) error{OutOfMemory}![]const u8 {
+    if (source.source_instance_id.len != 0)
+        return arena.dupe(u8, source.source_instance_id);
+    const derived = hashHex(source.root);
+    return arena.dupe(u8, &derived);
 }
 
 fn probeCandidateDirectory(
@@ -648,13 +698,20 @@ fn snapshotCandidateTemporary(
     };
     if (!validArgumentNames(definition.arguments)) return error.InvalidDefinition;
 
-    return .{
+    var record = SkillRecord{
         .skill_id = hashHex(candidate.invocation_name),
         .invocation_name = candidate.invocation_name,
+        .provider_id = candidate.provider_id,
+        .source_scope = candidate.scope,
+        .source_instance_id = candidate.source_instance_id,
+        .contribution_id = hashHex(candidate.dir_name),
         .definition = definition,
         .directories = owned_directories,
         .files = owned_files,
     };
+    record.content_revision = computeContentRevision(&record);
+    record.execution_id = computeExecutionId(&record);
+    return record;
 }
 
 fn cloneSkillRecord(arena: std.mem.Allocator, source: SkillRecord) error{OutOfMemory}!SkillRecord {
@@ -670,6 +727,12 @@ fn cloneSkillRecord(arena: std.mem.Allocator, source: SkillRecord) error{OutOfMe
     return .{
         .skill_id = source.skill_id,
         .invocation_name = try arena.dupe(u8, source.invocation_name),
+        .provider_id = try arena.dupe(u8, source.provider_id),
+        .source_scope = source.source_scope,
+        .source_instance_id = try arena.dupe(u8, source.source_instance_id),
+        .contribution_id = source.contribution_id,
+        .content_revision = source.content_revision,
+        .execution_id = source.execution_id,
         .definition = .{
             .name = try arena.dupe(u8, source.definition.name),
             .description = try arena.dupe(u8, source.definition.description),
@@ -712,6 +775,8 @@ fn cloneIssues(
             else
                 null,
             .source_scope = issue.source_scope,
+            .provider_id = try arena.dupe(u8, issue.provider_id),
+            .source_instance_id = try arena.dupe(u8, issue.source_instance_id),
             .revision_key = try arena.dupe(u8, issue.revision_key),
         };
     }
@@ -913,9 +978,21 @@ fn writeDescriptor(writer: *std.Io.Writer, snapshot: *const Snapshot) !void {
     for (snapshot.skills, 0..) |*record, index| {
         if (index != 0) try writer.writeByte(',');
         try writer.writeAll("{\"skill_id\":");
-        try std.json.Stringify.encodeJsonString(&record.skill_id, .{}, writer);
+        try std.json.Stringify.encodeJsonString(&record.execution_id, .{}, writer);
+        try writer.writeAll(",\"skill_policy_key\":");
+        try std.json.Stringify.encodeJsonString(record.invocation_name, .{}, writer);
         try writer.writeAll(",\"invocation_name\":");
         try std.json.Stringify.encodeJsonString(record.invocation_name, .{}, writer);
+        try writer.writeAll(",\"source\":{\"provider_id\":");
+        try std.json.Stringify.encodeJsonString(record.provider_id, .{}, writer);
+        try writer.writeAll(",\"source_scope\":");
+        try std.json.Stringify.encodeJsonString(publicScope(record.source_scope), .{}, writer);
+        try writer.writeAll(",\"source_instance_id\":");
+        try std.json.Stringify.encodeJsonString(record.source_instance_id, .{}, writer);
+        try writer.writeAll(",\"contribution_id\":");
+        try std.json.Stringify.encodeJsonString(&record.contribution_id, .{}, writer);
+        try writer.writeAll("},\"content_revision\":");
+        try std.json.Stringify.encodeJsonString(&record.content_revision, .{}, writer);
         try writer.writeAll(",\"display_name\":");
         try std.json.Stringify.encodeJsonString(record.definition.name, .{}, writer);
         try writer.writeAll(",\"description\":");
@@ -932,9 +1009,11 @@ fn writeDescriptor(writer: *std.Io.Writer, snapshot: *const Snapshot) !void {
     try writer.writeAll("],\"issues\":[");
     for (snapshot.issues, 0..) |*issue, index| {
         if (index != 0) try writer.writeByte(',');
-        try writer.writeAll("{\"code\":");
+        try writer.writeAll("{\"kind\":");
+        try std.json.Stringify.encodeJsonString(issueKind(issue), .{}, writer);
+        try writer.writeAll(",\"code\":");
         try std.json.Stringify.encodeJsonString(@tagName(issue.code), .{}, writer);
-        try writer.writeAll(",\"invocation_name\":");
+        try writer.writeAll(",\"skill_policy_key\":");
         if (issue.invocation_name) |name|
             try std.json.Stringify.encodeJsonString(name, .{}, writer)
         else
@@ -945,10 +1024,25 @@ fn writeDescriptor(writer: *std.Io.Writer, snapshot: *const Snapshot) !void {
         else
             try writer.writeAll("null");
         try writer.writeAll(",\"source_scope\":");
-        try std.json.Stringify.encodeJsonString(@tagName(issue.source_scope), .{}, writer);
+        try std.json.Stringify.encodeJsonString(publicScope(issue.source_scope), .{}, writer);
+        try writer.writeAll(",\"provider_id\":");
+        try std.json.Stringify.encodeJsonString(issue.provider_id, .{}, writer);
+        try writer.writeAll(",\"source_instance_id\":");
+        try std.json.Stringify.encodeJsonString(issue.source_instance_id, .{}, writer);
         try writer.writeByte('}');
     }
     try writer.writeAll("]}");
+}
+
+fn issueKind(issue: *const Issue) []const u8 {
+    return switch (issue.code) {
+        .source_conflict => "conflict",
+        .invalid_resource => switch (issue.reason.?) {
+            .resource_unavailable, .resource_changed => "unavailable",
+            else => "invalid",
+        },
+        .invalid_definition, .invalid_invocation_name => "invalid",
+    };
 }
 
 fn validateUniqueSkillIds(
@@ -961,6 +1055,57 @@ fn validateUniqueSkillIds(
         const entry = seen.getOrPut(record.skill_id) catch return error.OutOfMemory;
         if (entry.found_existing) return error.CatalogInvalid;
     }
+    seen.clearRetainingCapacity();
+    for (records) |record| {
+        const entry = seen.getOrPut(record.execution_id) catch return error.OutOfMemory;
+        if (entry.found_existing) return error.CatalogInvalid;
+    }
+}
+
+fn computeContentRevision(record: *const SkillRecord) [64]u8 {
+    var hash = Sha256.init(.{});
+    hashField(&hash, record.definition.name);
+    hashField(&hash, record.definition.description);
+    hashField(&hash, record.definition.body);
+    hashField(&hash, @tagName(record.definition.context));
+    hashField(&hash, record.definition.agent);
+    hashField(&hash, record.definition.model);
+    hashField(&hash, record.definition.shell);
+    hashU64(&hash, @intFromBool(record.definition.disable_model_invocation));
+    for (record.definition.arguments) |value| hashField(&hash, value);
+    for (record.definition.allowed_tools) |value| hashField(&hash, value);
+    for (record.definition.disallowed_tools) |value| hashField(&hash, value);
+    for (record.directories) |directory| hashField(&hash, directory);
+    for (record.files) |file| {
+        hashField(&hash, file.relative_path);
+        hashU64(&hash, @intFromBool(file.executable));
+        hashField(&hash, file.bytes);
+    }
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hash.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn computeExecutionId(record: *const SkillRecord) [64]u8 {
+    var hash = Sha256.init(.{});
+    hashField(&hash, "agentcore-skill-execution/v1");
+    hashField(&hash, record.provider_id);
+    hashField(&hash, publicScope(record.source_scope));
+    hashField(&hash, record.source_instance_id);
+    hashField(&hash, &record.contribution_id);
+    hashField(&hash, &record.content_revision);
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hash.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn publicScope(scope: SourceScope) []const u8 {
+    return switch (scope) {
+        .personal => "user",
+        .project => "workspace",
+        .enterprise => "enterprise",
+        .plugin => "plugin",
+    };
 }
 
 fn computeRevision(snapshot: *const Snapshot, workspace_epoch: []const u8) [64]u8 {
@@ -969,6 +1114,12 @@ fn computeRevision(snapshot: *const Snapshot, workspace_epoch: []const u8) [64]u
     hashField(&hash, workspace_epoch);
     for (snapshot.skills) |record| {
         hashField(&hash, "skill");
+        hashField(&hash, record.provider_id);
+        hashField(&hash, publicScope(record.source_scope));
+        hashField(&hash, record.source_instance_id);
+        hashField(&hash, &record.contribution_id);
+        hashField(&hash, &record.content_revision);
+        hashField(&hash, &record.execution_id);
         hashField(&hash, record.invocation_name);
         hashField(&hash, record.definition.name);
         hashField(&hash, record.definition.description);
@@ -997,6 +1148,8 @@ fn computeRevision(snapshot: *const Snapshot, workspace_epoch: []const u8) [64]u
         hashField(&hash, if (issue.reason) |reason| @tagName(reason) else "");
         hashField(&hash, issue.revision_key);
         hashField(&hash, @tagName(issue.source_scope));
+        hashField(&hash, issue.provider_id);
+        hashField(&hash, issue.source_instance_id);
     }
     var digest: [Sha256.digest_length]u8 = undefined;
     hash.final(&digest);
@@ -1327,7 +1480,9 @@ test "catalog descriptor preserves each Skill identity across multiple records" 
 
     const PublicSkill = struct {
         skill_id: []const u8,
+        skill_policy_key: []const u8,
         invocation_name: []const u8,
+        content_revision: []const u8,
     };
     const PublicCatalog = struct {
         skills: []const PublicSkill,
@@ -1342,8 +1497,12 @@ test "catalog descriptor preserves each Skill identity across multiple records" 
     try std.testing.expectEqual(snapshot.skills.len, parsed.value.skills.len);
 
     for (parsed.value.skills) |skill| {
-        const expected = hashHex(skill.invocation_name);
-        try std.testing.expectEqualStrings(&expected, skill.skill_id);
+        const logical_id = hashHex(skill.invocation_name);
+        const record = snapshot.findById(&logical_id) orelse
+            return error.SkillMissingFromSnapshot;
+        try std.testing.expectEqualStrings(skill.invocation_name, skill.skill_policy_key);
+        try std.testing.expectEqualStrings(&record.execution_id, skill.skill_id);
+        try std.testing.expectEqualStrings(&record.content_revision, skill.content_revision);
     }
     try std.testing.expect(!std.mem.eql(
         u8,

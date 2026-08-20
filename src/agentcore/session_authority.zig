@@ -315,10 +315,10 @@ pub fn encodeSkillState(
     @memcpy(encoded[16..80], &catalog_snapshot.revision);
 
     for (catalog_snapshot.skills, 0..) |record, index| {
-        if (!skill_catalog.isLowerHex64(&record.skill_id))
+        if (!skill_catalog.isLowerHex64(&record.execution_id))
             return error.InvalidState;
         const offset = skill_header_bytes + index * skill_entry_bytes;
-        @memcpy(encoded[offset..][0..64], &record.skill_id);
+        @memcpy(encoded[offset..][0..64], &record.execution_id);
         encoded[offset + 64] = @intFromEnum(selected.states[index]);
     }
     return encoded;
@@ -436,7 +436,7 @@ pub fn reconcileSkillState(
             .invalidated = enabled_before,
         };
     for (persisted.entries, snapshot.skills) |entry, record| {
-        if (!std.mem.eql(u8, &entry.skill_id, &record.skill_id))
+        if (!std.mem.eql(u8, &entry.skill_id, &record.execution_id))
             return .{
                 .disposition = .changed,
                 .checkpoint_enabled = enabled_before,
@@ -511,6 +511,7 @@ fn allZero(bytes: []const u8) bool {
 fn testRecord(id: u8, name: []const u8) skill_catalog.SkillRecord {
     return .{
         .skill_id = [_]u8{id} ** 64,
+        .execution_id = [_]u8{id} ** 64,
         .invocation_name = name,
         .definition = .{
             .name = name,

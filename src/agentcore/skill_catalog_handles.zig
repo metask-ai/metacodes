@@ -14,6 +14,9 @@ const catalog = core.skills_runtime.catalog;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
 pub const MAX_LIVE_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+/// Scope-identity domain introduced in Revision 5. This is a persisted
+/// identity marker, not the current public ABI revision; changing it would
+/// invalidate otherwise compatible checkpoint Workspace bindings.
 pub const BUNDLE_IDENTITY = "metask-agentcore/abi-v1/revision-5";
 const SCOPE_DOMAIN = "metask.agentcore.skill-catalog.scope/v1";
 
@@ -25,6 +28,7 @@ pub const Error = error{
     InvalidWorkspace,
     WrongRuntime,
     WrongWorkspace,
+    InvalidSource,
     ResourceLimit,
 };
 
@@ -265,11 +269,7 @@ pub const RuntimeCatalogs = struct {
         defer call.deinit();
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
-        const sources = try agentCoreSources(
-            scratch.allocator(),
-            workspace,
-            .workspace_effective,
-        );
+        const sources = try agentCoreSources(scratch.allocator(), workspace, &.{});
         return self.queryUnderGuard(
             io,
             workspace,
@@ -279,19 +279,23 @@ pub const RuntimeCatalogs = struct {
         );
     }
 
-    pub fn queryScope(
+    pub fn queryWorkspace(
         self: *RuntimeCatalogs,
         io: std.Io,
         workspace: *const CanonicalWorkspace,
         workspace_epoch: []const u8,
-        scope: QueryScope,
+        additional_sources: []const AdditionalSource,
         limits: catalog.Limits,
     ) (Error || catalog.BuildError)!*HostCatalog {
         var call = try self.enterCall();
         defer call.deinit();
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
-        const sources = try agentCoreSources(scratch.allocator(), workspace, scope);
+        const sources = try agentCoreSources(
+            scratch.allocator(),
+            workspace,
+            additional_sources,
+        );
         return self.queryUnderGuard(
             io,
             workspace,
@@ -356,10 +360,19 @@ pub const RuntimeCatalogs = struct {
 
 const PERSONAL_AGENTS_PRIORITY: u32 = 1;
 const PROJECT_AGENTS_PRIORITY: u32 = 2;
+pub const DEFAULT_USER_SOURCE_ID = "agents.user.default";
+pub const DEFAULT_WORKSPACE_SOURCE_ID = "agents.workspace.default";
+pub const MAX_ADDITIONAL_SOURCES: usize = 64;
 
-pub const QueryScope = enum {
-    personal_only,
-    workspace_effective,
+pub const AuthorityScope = enum {
+    user,
+    workspace,
+};
+
+pub const AdditionalSource = struct {
+    root: []const u8,
+    scope: AuthorityScope,
+    source_instance_id: []const u8,
 };
 
 /// AgentCore owns only the cross-Agent neutral discovery convention. Product
@@ -368,25 +381,19 @@ pub const QueryScope = enum {
 fn agentCoreSources(
     arena: std.mem.Allocator,
     workspace: *const CanonicalWorkspace,
-    scope: QueryScope,
-) error{OutOfMemory}![]const catalog.Source {
-    if (scope == .personal_only) {
-        const sources = try arena.alloc(catalog.Source, 1);
-        sources[0] = .{
-            .root = try std.fs.path.join(arena, &.{ workspace.home, ".agents", "skills" }),
-            .scope = .personal,
-            .priority = PERSONAL_AGENTS_PRIORITY,
-        };
-        return sources;
-    }
+    additional: []const AdditionalSource,
+) Error![]const catalog.Source {
+    if (additional.len > MAX_ADDITIONAL_SOURCES) return error.ResourceLimit;
     const shared_root = std.mem.eql(u8, workspace.home, workspace.root);
-    const sources = try arena.alloc(catalog.Source, if (shared_root) 1 else 2);
+    const default_count: usize = if (shared_root) 1 else 2;
+    const sources = try arena.alloc(catalog.Source, default_count + additional.len);
     var next: usize = 0;
     if (!shared_root) {
         sources[next] = .{
             .root = try std.fs.path.join(arena, &.{ workspace.home, ".agents", "skills" }),
             .scope = .personal,
             .priority = PERSONAL_AGENTS_PRIORITY,
+            .source_instance_id = DEFAULT_USER_SOURCE_ID,
         };
         next += 1;
     }
@@ -394,8 +401,43 @@ fn agentCoreSources(
         .root = try std.fs.path.join(arena, &.{ workspace.root, ".agents", "skills" }),
         .scope = .project,
         .priority = PROJECT_AGENTS_PRIORITY,
+        .source_instance_id = DEFAULT_WORKSPACE_SOURCE_ID,
     };
-    return sources;
+    next += 1;
+
+    for (additional) |source| {
+        if (source.root.len == 0 or !std.fs.path.isAbsolute(source.root) or
+            !validSourceInstanceId(source.source_instance_id))
+            return error.InvalidSource;
+        for (sources[0..next]) |existing| {
+            if (std.mem.eql(u8, existing.root, source.root) or
+                std.mem.eql(u8, existing.source_instance_id, source.source_instance_id))
+                return error.InvalidSource;
+        }
+        sources[next] = .{
+            .root = source.root,
+            .scope = switch (source.scope) {
+                .user => .personal,
+                .workspace => .project,
+            },
+            .priority = switch (source.scope) {
+                .user => PERSONAL_AGENTS_PRIORITY,
+                .workspace => PROJECT_AGENTS_PRIORITY,
+            },
+            .source_instance_id = source.source_instance_id,
+        };
+        next += 1;
+    }
+    return sources[0..next];
+}
+
+pub fn validSourceInstanceId(value: []const u8) bool {
+    if (value.len == 0 or value.len > 128) return false;
+    for (value) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '.' and byte != '_' and
+            byte != ':' and byte != '-') return false;
+    }
+    return true;
 }
 
 pub const CallGuard = struct {
@@ -606,6 +648,10 @@ test "catalog binding rejects cross-Runtime and cross-Workspace handles without 
 }
 
 test "AgentCore default sources collapse identical canonical home and root" {
+    try std.testing.expectEqualStrings(
+        "metask-agentcore/abi-v1/revision-5",
+        BUNDLE_IDENTITY,
+    );
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -623,7 +669,7 @@ test "AgentCore default sources collapse identical canonical home and root" {
     const sources = try agentCoreSources(
         scratch.allocator(),
         &workspace,
-        .workspace_effective,
+        &.{},
     );
     try std.testing.expectEqual(@as(usize, 1), sources.len);
     try std.testing.expectEqual(catalog.SourceScope.project, sources[0].scope);
@@ -635,7 +681,7 @@ test "AgentCore default sources collapse identical canonical home and root" {
     try std.testing.expectEqualStrings(expected, sources[0].root);
 }
 
-test "AgentCore personal-only source remains personal when home falls back to root" {
+test "AgentCore authority does not reinterpret shared home as a user-only Catalog" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -653,14 +699,14 @@ test "AgentCore personal-only source remains personal when home falls back to ro
     const sources = try agentCoreSources(
         scratch.allocator(),
         &workspace,
-        .personal_only,
+        &.{},
     );
     try std.testing.expectEqual(@as(usize, 1), sources.len);
-    try std.testing.expectEqual(catalog.SourceScope.personal, sources[0].scope);
-    try std.testing.expectEqual(PERSONAL_AGENTS_PRIORITY, sources[0].priority);
+    try std.testing.expectEqual(catalog.SourceScope.project, sources[0].scope);
+    try std.testing.expectEqual(PROJECT_AGENTS_PRIORITY, sources[0].priority);
     const expected = try std.fs.path.join(
         scratch.allocator(),
-        &.{ workspace.home, ".agents", "skills" },
+        &.{ workspace.root, ".agents", "skills" },
     );
     try std.testing.expectEqualStrings(expected, sources[0].root);
 }

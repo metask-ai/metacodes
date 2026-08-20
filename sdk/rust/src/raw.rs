@@ -29,6 +29,7 @@ pub const METASK_AGENTCORE_STATUS_LOGICAL_SESSION_CONFLICT: u32 = 23;
 pub const METASK_AGENTCORE_STATUS_MCP_NOT_REFRESHED: u32 = 24;
 pub const METASK_AGENTCORE_STATUS_INVALID_MCP_SELECTION: u32 = 25;
 pub const METASK_AGENTCORE_STATUS_COMPLETION_UNSUPPORTED_RESPONSE: u32 = 26;
+pub const METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE: u32 = 27;
 pub const METASK_AGENTCORE_PROVIDER_ANTHROPIC: u32 = 1;
 pub const METASK_AGENTCORE_PROVIDER_OPENAI: u32 = 2;
 pub const METASK_AGENTCORE_PROVIDER_GEMINI: u32 = 3;
@@ -97,11 +98,11 @@ pub const METASK_AGENTCORE_MAX_COMPLETION_CONFIG_BYTES_V1: u32 = 1048576;
 pub const METASK_AGENTCORE_MAX_COMPLETION_MESSAGES_V1: u32 = 4096;
 pub const METASK_AGENTCORE_MAX_COMPLETION_REQUEST_BYTES_V1: u32 = 16777216;
 pub const METASK_AGENTCORE_MAX_COMPLETION_RESULT_BYTES_V1: u32 = 16777216;
+pub const METASK_AGENTCORE_MAX_SKILL_SOURCES_V1: u32 = 64;
+pub const METASK_AGENTCORE_MAX_SKILL_SOURCE_ID_BYTES_V1: u32 = 128;
 pub const METASK_AGENTCORE_MAX_TURNS_V1: u32 = 1000;
 pub const METASK_AGENTCORE_RUN_INPUT_TEXT: u32 = 1;
 pub const METASK_AGENTCORE_RUN_INPUT_SKILL: u32 = 2;
-pub const METASK_AGENTCORE_SKILL_SELECTION_DISABLED: u32 = 1;
-pub const METASK_AGENTCORE_SKILL_SELECTION_ENABLED: u32 = 2;
 pub const METASK_AGENTCORE_COMPACT_COMPACTED: u32 = 1;
 pub const METASK_AGENTCORE_COMPACT_NO_CHANGE: u32 = 2;
 pub const METASK_AGENTCORE_COMPACT_DEGRADED: u32 = 3;
@@ -111,8 +112,8 @@ pub const METASK_AGENTCORE_RUN_CHECKPOINT_BUDGET_REQUIRED: u32 = 1;
 pub const METASK_AGENTCORE_RUN_CHECKPOINT_BUDGET_EXHAUSTED: u32 = 2;
 pub const METASK_AGENTCORE_RUN_CHECKPOINT_RESOURCE_LIMIT: u32 = 3;
 pub const METASK_AGENTCORE_RUN_RESULT_COMPACTION_RECOMMENDED: u32 = 1;
-pub const METASK_AGENTCORE_SKILL_CATALOG_SCOPE_PERSONAL_ONLY: u32 = 1;
-pub const METASK_AGENTCORE_SKILL_CATALOG_SCOPE_WORKSPACE_EFFECTIVE: u32 = 2;
+pub const METASK_AGENTCORE_SKILL_SOURCE_USER: u32 = 1;
+pub const METASK_AGENTCORE_SKILL_SOURCE_WORKSPACE: u32 = 2;
 pub const METASK_AGENTCORE_COMPLETION_ROLE_USER: u32 = 1;
 pub const METASK_AGENTCORE_COMPLETION_ROLE_ASSISTANT: u32 = 2;
 pub const METASK_AGENTCORE_COMPLETION_STOP_UNKNOWN: u32 = 0;
@@ -187,7 +188,7 @@ pub const METASK_AGENTCORE_CAP_SKILL_CATALOG: u32 = 64;
 pub const METASK_AGENTCORE_CAP_TYPED_RUN_INPUT: u32 = 128;
 pub const METASK_AGENTCORE_CAP_SESSION_MODEL_MUTATION: u32 = 256;
 pub const METASK_AGENTCORE_CAP_MANUAL_COMPACT: u32 = 512;
-pub const METASK_AGENTCORE_CAP_SKILL_SELECTION: u32 = 1024;
+pub const METASK_AGENTCORE_CAP_SKILL_POLICY: u32 = 1024;
 pub const METASK_AGENTCORE_CAP_HOST_PERMISSION_RULES: u32 = 2048;
 pub const METASK_AGENTCORE_CAP_SESSION_CHECKPOINT: u32 = 4096;
 pub const METASK_AGENTCORE_CAP_SESSION_RESTORE: u32 = 8192;
@@ -197,7 +198,7 @@ pub const METASK_AGENTCORE_CAP_MCP_SESSION_SELECTION: u32 = 65536;
 pub const METASK_AGENTCORE_CAP_DURABLE_BUDGET: u32 = 131072;
 pub const METASK_AGENTCORE_CAP_SESSION_PERMISSION_AUTHORITY: u32 = 262144;
 pub const METASK_AGENTCORE_CAP_RUN_STATE_OBSERVATION: u32 = 524288;
-pub const METASK_AGENTCORE_CAP_SKILL_CATALOG_QUERY_SCOPE: u32 = 1048576;
+pub const METASK_AGENTCORE_CAP_WORKSPACE_SKILL_CATALOG: u32 = 1048576;
 pub const METASK_AGENTCORE_CAP_TEXT_COMPLETION: u32 = 2097152;
 pub const METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1: u32 = 4194303;
 #[repr(C)]
@@ -746,31 +747,31 @@ const _: () = {
 };
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct metask_agentcore_skill_selection_v1 {
+pub struct metask_agentcore_skill_policy_v1 {
     pub struct_size: u32,
-    pub default_state_code: u32,
-    pub exception_skill_ids: *const metask_agentcore_bytes_view_v1,
-    pub exception_skill_id_count: u64,
+    pub reserved0: u32,
+    pub granted_skill_ids: *const metask_agentcore_bytes_view_v1,
+    pub granted_skill_id_count: u64,
     pub reserved: [u64; 4usize],
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of metask_agentcore_skill_selection_v1"]
-        [::std::mem::size_of::<metask_agentcore_skill_selection_v1>() - 56usize];
-    ["Alignment of metask_agentcore_skill_selection_v1"]
-        [::std::mem::align_of::<metask_agentcore_skill_selection_v1>() - 8usize];
-    ["Offset of field: metask_agentcore_skill_selection_v1::struct_size"]
-        [::std::mem::offset_of!(metask_agentcore_skill_selection_v1, struct_size) - 0usize];
-    ["Offset of field: metask_agentcore_skill_selection_v1::default_state_code"]
-        [::std::mem::offset_of!(metask_agentcore_skill_selection_v1, default_state_code) - 4usize];
-    ["Offset of field: metask_agentcore_skill_selection_v1::exception_skill_ids"]
-        [::std::mem::offset_of!(metask_agentcore_skill_selection_v1, exception_skill_ids) - 8usize];
-    ["Offset of field: metask_agentcore_skill_selection_v1::exception_skill_id_count"][::std::mem::offset_of!(
-        metask_agentcore_skill_selection_v1,
-        exception_skill_id_count
+    ["Size of metask_agentcore_skill_policy_v1"]
+        [::std::mem::size_of::<metask_agentcore_skill_policy_v1>() - 56usize];
+    ["Alignment of metask_agentcore_skill_policy_v1"]
+        [::std::mem::align_of::<metask_agentcore_skill_policy_v1>() - 8usize];
+    ["Offset of field: metask_agentcore_skill_policy_v1::struct_size"]
+        [::std::mem::offset_of!(metask_agentcore_skill_policy_v1, struct_size) - 0usize];
+    ["Offset of field: metask_agentcore_skill_policy_v1::reserved0"]
+        [::std::mem::offset_of!(metask_agentcore_skill_policy_v1, reserved0) - 4usize];
+    ["Offset of field: metask_agentcore_skill_policy_v1::granted_skill_ids"]
+        [::std::mem::offset_of!(metask_agentcore_skill_policy_v1, granted_skill_ids) - 8usize];
+    ["Offset of field: metask_agentcore_skill_policy_v1::granted_skill_id_count"][::std::mem::offset_of!(
+        metask_agentcore_skill_policy_v1,
+        granted_skill_id_count
     ) - 16usize];
-    ["Offset of field: metask_agentcore_skill_selection_v1::reserved"]
-        [::std::mem::offset_of!(metask_agentcore_skill_selection_v1, reserved) - 24usize];
+    ["Offset of field: metask_agentcore_skill_policy_v1::reserved"]
+        [::std::mem::offset_of!(metask_agentcore_skill_policy_v1, reserved) - 24usize];
 };
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -945,7 +946,7 @@ pub struct metask_agentcore_session_host_config_v1 {
     pub allowed_tools: *const metask_agentcore_bytes_view_v1,
     pub allowed_tool_count: u64,
     pub skill_catalog: *mut metask_agentcore_skill_catalog,
-    pub skill_selection: *const metask_agentcore_skill_selection_v1,
+    pub skill_policy: *const metask_agentcore_skill_policy_v1,
     pub permission_rules: *const metask_agentcore_permission_rule_set_v1,
     pub mcp_selection: *const metask_agentcore_mcp_selection_v1,
     pub durable_budget: *const metask_agentcore_durable_budget_profile_v1,
@@ -987,10 +988,8 @@ const _: () = {
     ) - 88usize];
     ["Offset of field: metask_agentcore_session_host_config_v1::skill_catalog"]
         [::std::mem::offset_of!(metask_agentcore_session_host_config_v1, skill_catalog) - 96usize];
-    ["Offset of field: metask_agentcore_session_host_config_v1::skill_selection"][::std::mem::offset_of!(
-        metask_agentcore_session_host_config_v1,
-        skill_selection
-    ) - 104usize];
+    ["Offset of field: metask_agentcore_session_host_config_v1::skill_policy"]
+        [::std::mem::offset_of!(metask_agentcore_session_host_config_v1, skill_policy) - 104usize];
     ["Offset of field: metask_agentcore_session_host_config_v1::permission_rules"][::std::mem::offset_of!(
         metask_agentcore_session_host_config_v1,
         permission_rules
@@ -1032,13 +1031,41 @@ const _: () = {
 };
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct metask_agentcore_skill_catalog_query_v1 {
+pub struct metask_agentcore_skill_source_v1 {
     pub struct_size: u32,
     pub scope_code: u32,
+    pub root: metask_agentcore_bytes_view_v1,
+    pub source_instance_id: metask_agentcore_bytes_view_v1,
+    pub reserved: [u64; 3usize],
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of metask_agentcore_skill_source_v1"]
+        [::std::mem::size_of::<metask_agentcore_skill_source_v1>() - 64usize];
+    ["Alignment of metask_agentcore_skill_source_v1"]
+        [::std::mem::align_of::<metask_agentcore_skill_source_v1>() - 8usize];
+    ["Offset of field: metask_agentcore_skill_source_v1::struct_size"]
+        [::std::mem::offset_of!(metask_agentcore_skill_source_v1, struct_size) - 0usize];
+    ["Offset of field: metask_agentcore_skill_source_v1::scope_code"]
+        [::std::mem::offset_of!(metask_agentcore_skill_source_v1, scope_code) - 4usize];
+    ["Offset of field: metask_agentcore_skill_source_v1::root"]
+        [::std::mem::offset_of!(metask_agentcore_skill_source_v1, root) - 8usize];
+    ["Offset of field: metask_agentcore_skill_source_v1::source_instance_id"]
+        [::std::mem::offset_of!(metask_agentcore_skill_source_v1, source_instance_id) - 24usize];
+    ["Offset of field: metask_agentcore_skill_source_v1::reserved"]
+        [::std::mem::offset_of!(metask_agentcore_skill_source_v1, reserved) - 40usize];
+};
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct metask_agentcore_skill_catalog_query_v1 {
+    pub struct_size: u32,
+    pub reserved0: u32,
     pub workspace_root: metask_agentcore_bytes_view_v1,
     pub workspace_home: metask_agentcore_bytes_view_v1,
     pub workspace_epoch: metask_agentcore_bytes_view_v1,
-    pub reserved: [u64; 3usize],
+    pub additional_sources: *const metask_agentcore_skill_source_v1,
+    pub additional_source_count: u64,
+    pub reserved: [u64; 1usize],
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
@@ -1048,8 +1075,8 @@ const _: () = {
         [::std::mem::align_of::<metask_agentcore_skill_catalog_query_v1>() - 8usize];
     ["Offset of field: metask_agentcore_skill_catalog_query_v1::struct_size"]
         [::std::mem::offset_of!(metask_agentcore_skill_catalog_query_v1, struct_size) - 0usize];
-    ["Offset of field: metask_agentcore_skill_catalog_query_v1::scope_code"]
-        [::std::mem::offset_of!(metask_agentcore_skill_catalog_query_v1, scope_code) - 4usize];
+    ["Offset of field: metask_agentcore_skill_catalog_query_v1::reserved0"]
+        [::std::mem::offset_of!(metask_agentcore_skill_catalog_query_v1, reserved0) - 4usize];
     ["Offset of field: metask_agentcore_skill_catalog_query_v1::workspace_root"]
         [::std::mem::offset_of!(metask_agentcore_skill_catalog_query_v1, workspace_root) - 8usize];
     ["Offset of field: metask_agentcore_skill_catalog_query_v1::workspace_home"]
@@ -1058,8 +1085,17 @@ const _: () = {
         metask_agentcore_skill_catalog_query_v1,
         workspace_epoch
     ) - 40usize];
+    ["Offset of field: metask_agentcore_skill_catalog_query_v1::additional_sources"][::std::mem::offset_of!(
+        metask_agentcore_skill_catalog_query_v1,
+        additional_sources
+    ) - 56usize];
+    ["Offset of field: metask_agentcore_skill_catalog_query_v1::additional_source_count"][::std::mem::offset_of!(
+        metask_agentcore_skill_catalog_query_v1,
+        additional_source_count
+    )
+        - 64usize];
     ["Offset of field: metask_agentcore_skill_catalog_query_v1::reserved"]
-        [::std::mem::offset_of!(metask_agentcore_skill_catalog_query_v1, reserved) - 56usize];
+        [::std::mem::offset_of!(metask_agentcore_skill_catalog_query_v1, reserved) - 72usize];
 };
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -1747,11 +1783,11 @@ pub type metask_agentcore_session_set_model_fn_v1 = ::std::option::Option<
         arg3: *mut metask_agentcore_owned_bytes_v1,
     ) -> u32,
 >;
-pub type metask_agentcore_session_update_skills_fn_v1 = ::std::option::Option<
+pub type metask_agentcore_session_bind_skills_fn_v1 = ::std::option::Option<
     unsafe extern "C" fn(
         arg1: *mut metask_agentcore_session,
         arg2: *mut metask_agentcore_skill_catalog,
-        arg3: *const metask_agentcore_skill_selection_v1,
+        arg3: *const metask_agentcore_skill_policy_v1,
         arg4: *mut metask_agentcore_owned_bytes_v1,
     ) -> u32,
 >;
@@ -1831,7 +1867,7 @@ pub struct metask_agentcore_api_v1 {
     pub session_destroy: metask_agentcore_session_destroy_fn_v1,
     pub session_describe: metask_agentcore_session_describe_fn_v1,
     pub session_set_model: metask_agentcore_session_set_model_fn_v1,
-    pub session_update_skills: metask_agentcore_session_update_skills_fn_v1,
+    pub session_update_skills: metask_agentcore_session_bind_skills_fn_v1,
     pub session_update_permission_rules: metask_agentcore_session_update_permission_rules_fn_v1,
     pub session_update_mcp: metask_agentcore_session_update_mcp_fn_v1,
     pub session_run_input: metask_agentcore_session_run_input_fn_v1,

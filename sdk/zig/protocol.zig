@@ -274,6 +274,12 @@ pub const SkillCatalogIssueCode = enum {
     invalid_invocation_name,
 };
 
+pub const SkillCatalogIssueKind = enum {
+    invalid,
+    unavailable,
+    conflict,
+};
+
 pub const SkillCatalogResourceReason = enum {
     file_too_large,
     skill_too_large,
@@ -287,10 +293,8 @@ pub const SkillCatalogResourceReason = enum {
 };
 
 pub const SkillSourceScope = enum {
-    enterprise,
-    personal,
-    project,
-    plugin,
+    user,
+    workspace,
 };
 
 pub const SkillArgumentSchema = struct {
@@ -299,19 +303,32 @@ pub const SkillArgumentSchema = struct {
     names: []const []const u8,
 };
 
+pub const SkillSourceProjection = struct {
+    provider_id: []const u8,
+    source_scope: SkillSourceScope,
+    source_instance_id: []const u8,
+    contribution_id: []const u8,
+};
+
 pub const SkillDescriptor = struct {
     skill_id: []const u8,
+    skill_policy_key: []const u8,
     invocation_name: []const u8,
+    source: SkillSourceProjection,
+    content_revision: []const u8,
     display_name: []const u8,
     description: []const u8,
     argument_schema: SkillArgumentSchema,
 };
 
 pub const SkillCatalogIssue = struct {
+    kind: SkillCatalogIssueKind,
     code: SkillCatalogIssueCode,
     reason: ?SkillCatalogResourceReason,
-    invocation_name: ?[]const u8,
+    skill_policy_key: ?[]const u8,
+    provider_id: []const u8,
     source_scope: SkillSourceScope,
+    source_instance_id: []const u8,
 };
 
 /// Source-free projection of the `metask.skill-catalog/v1` descriptor.
@@ -841,20 +858,42 @@ fn validateSkillCatalog(catalog: SkillCatalog) SkillCatalogDecodeError!void {
         .degraded => if (catalog.issues.len == 0) return error.InvalidPayload,
     }
 
-    for (catalog.skills) |skill| {
+    for (catalog.skills, 0..) |skill, index| {
         if (!lowerHex64(skill.skill_id) or
+            !std.mem.eql(u8, skill.skill_policy_key, skill.invocation_name) or
             !validInvocationName(skill.invocation_name) or
+            !validSourceIdentity(skill.source.provider_id) or
+            !validSourceIdentity(skill.source.source_instance_id) or
+            !lowerHex64(skill.source.contribution_id) or
+            !lowerHex64(skill.content_revision) or
             !std.mem.eql(u8, skill.argument_schema.schema, "metask.skill-arguments/v1") or
             skill.argument_schema.max_values != MAX_SKILL_ARGUMENT_VALUES_V1 or
             !validArgumentNames(skill.argument_schema.names))
             return error.InvalidPayload;
+        for (catalog.skills[0..index]) |earlier| {
+            if (std.mem.eql(u8, earlier.skill_id, skill.skill_id) or
+                std.mem.eql(u8, earlier.skill_policy_key, skill.skill_policy_key))
+                return error.InvalidPayload;
+        }
     }
     for (catalog.issues) |issue| {
         if ((issue.code == .invalid_resource) != (issue.reason != null))
             return error.InvalidPayload;
-        if (issue.invocation_name) |name| {
+        if (issue.skill_policy_key) |name| {
             if (!validInvocationName(name)) return error.InvalidPayload;
         }
+        if (!validSourceIdentity(issue.provider_id) or
+            !validSourceIdentity(issue.source_instance_id))
+            return error.InvalidPayload;
+        const expected_kind: SkillCatalogIssueKind = switch (issue.code) {
+            .source_conflict => .conflict,
+            .invalid_resource => switch (issue.reason.?) {
+                .resource_unavailable, .resource_changed => .unavailable,
+                else => .invalid,
+            },
+            .invalid_definition, .invalid_invocation_name => .invalid,
+        };
+        if (issue.kind != expected_kind) return error.InvalidPayload;
     }
 }
 
@@ -1135,6 +1174,15 @@ fn validInvocationName(name: []const u8) bool {
         if (!std.ascii.isAlphanumeric(byte) and
             byte != '_' and byte != ':' and byte != '-')
             return false;
+    }
+    return true;
+}
+
+fn validSourceIdentity(value: []const u8) bool {
+    if (value.len == 0 or value.len > 128) return false;
+    for (value) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '.' and byte != '_' and
+            byte != ':' and byte != '-') return false;
     }
     return true;
 }
@@ -1421,8 +1469,8 @@ test "Skill catalog decoder owns and validates the public descriptor" {
     const skill_id = "c97ace4c8fef2cee8fa0f3c9f52aab18dbd4f42438afe362ffb8f75ce4c04b84";
     const encoded = try std.fmt.allocPrint(
         a,
-        "{{\"schema\":\"metask.skill-catalog/v1\",\"catalog_scope_id\":\"{s}\",\"catalog_revision\":\"{s}\",\"health\":\"healthy\",\"skills\":[{{\"skill_id\":\"{s}\",\"invocation_name\":\"review\",\"display_name\":\"Review\",\"description\":\"Review a target\",\"argument_schema\":{{\"schema\":\"metask.skill-arguments/v1\",\"max_values\":64,\"names\":[\"target\"]}}}}],\"issues\":[]}}",
-        .{ scope_id, revision, skill_id },
+        "{{\"schema\":\"metask.skill-catalog/v1\",\"catalog_scope_id\":\"{s}\",\"catalog_revision\":\"{s}\",\"health\":\"healthy\",\"skills\":[{{\"skill_id\":\"{s}\",\"skill_policy_key\":\"review\",\"invocation_name\":\"review\",\"source\":{{\"provider_id\":\"agents.directory\",\"source_scope\":\"workspace\",\"source_instance_id\":\"agents.workspace.default\",\"contribution_id\":\"{s}\"}},\"content_revision\":\"{s}\",\"display_name\":\"Review\",\"description\":\"Review a target\",\"argument_schema\":{{\"schema\":\"metask.skill-arguments/v1\",\"max_values\":64,\"names\":[\"target\"]}}}}],\"issues\":[]}}",
+        .{ scope_id, revision, skill_id, scope_id, revision },
     );
     var parsed = try decodeSkillCatalog(a, encoded);
     @memset(encoded, 'x');
@@ -1470,8 +1518,8 @@ test "Skill catalog decoder preserves identity semantics for the consumer" {
     const review_id = "c97ace4c8fef2cee8fa0f3c9f52aab18dbd4f42438afe362ffb8f75ce4c04b84";
     const mismatched = try std.fmt.allocPrint(
         a,
-        "{{\"schema\":\"metask.skill-catalog/v1\",\"catalog_scope_id\":\"{s}\",\"catalog_revision\":\"{s}\",\"health\":\"healthy\",\"skills\":[{{\"skill_id\":\"{s}\",\"invocation_name\":\"workctl\",\"display_name\":\"Workctl\",\"description\":\"Operate Work Agent\",\"argument_schema\":{{\"schema\":\"metask.skill-arguments/v1\",\"max_values\":64,\"names\":[]}}}}],\"issues\":[]}}",
-        .{ hash, hash, review_id },
+        "{{\"schema\":\"metask.skill-catalog/v1\",\"catalog_scope_id\":\"{s}\",\"catalog_revision\":\"{s}\",\"health\":\"healthy\",\"skills\":[{{\"skill_id\":\"{s}\",\"skill_policy_key\":\"workctl\",\"invocation_name\":\"workctl\",\"source\":{{\"provider_id\":\"agents.directory\",\"source_scope\":\"workspace\",\"source_instance_id\":\"workspace.extra\",\"contribution_id\":\"{s}\"}},\"content_revision\":\"{s}\",\"display_name\":\"Workctl\",\"description\":\"Operate Work Agent\",\"argument_schema\":{{\"schema\":\"metask.skill-arguments/v1\",\"max_values\":64,\"names\":[]}}}}],\"issues\":[]}}",
+        .{ hash, hash, review_id, hash, hash },
     );
     defer a.free(mismatched);
     var mismatched_parsed = try decodeSkillCatalog(a, mismatched);
@@ -1483,7 +1531,15 @@ test "Skill catalog decoder preserves identity semantics for the consumer" {
 
     const skill = SkillDescriptor{
         .skill_id = review_id,
+        .skill_policy_key = "review",
         .invocation_name = "review",
+        .source = .{
+            .provider_id = "agents.directory",
+            .source_scope = .workspace,
+            .source_instance_id = "agents.workspace.default",
+            .contribution_id = hash,
+        },
+        .content_revision = hash,
         .display_name = "Review",
         .description = "Review code",
         .argument_schema = .{
@@ -1502,13 +1558,7 @@ test "Skill catalog decoder preserves identity semantics for the consumer" {
     };
     const duplicate = try std.json.Stringify.valueAlloc(a, duplicate_catalog, .{});
     defer a.free(duplicate);
-    var duplicate_parsed = try decodeSkillCatalog(a, duplicate);
-    defer duplicate_parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 2), duplicate_parsed.value.skills.len);
-    try std.testing.expectEqualStrings(
-        duplicate_parsed.value.skills[0].skill_id,
-        duplicate_parsed.value.skills[1].skill_id,
-    );
+    try std.testing.expectError(error.InvalidPayload, decodeSkillCatalog(a, duplicate));
 }
 
 test "Skill catalog decoder enforces the public Skill slot limit" {
@@ -1516,7 +1566,15 @@ test "Skill catalog decoder enforces the public Skill slot limit" {
     const hash = "0" ** 64;
     const skill = SkillDescriptor{
         .skill_id = "c97ace4c8fef2cee8fa0f3c9f52aab18dbd4f42438afe362ffb8f75ce4c04b84",
+        .skill_policy_key = "review",
         .invocation_name = "review",
+        .source = .{
+            .provider_id = "agents.directory",
+            .source_scope = .workspace,
+            .source_instance_id = "agents.workspace.default",
+            .contribution_id = hash,
+        },
+        .content_revision = hash,
         .display_name = "Review",
         .description = "Review code",
         .argument_schema = .{
@@ -1546,7 +1604,7 @@ test "Skill catalog decoder exposes typed degraded issues" {
     const hash = "0" ** 64;
     const encoded = try std.fmt.allocPrint(
         a,
-        "{{\"schema\":\"metask.skill-catalog/v1\",\"catalog_scope_id\":\"{s}\",\"catalog_revision\":\"{s}\",\"health\":\"degraded\",\"skills\":[],\"issues\":[{{\"code\":\"invalid_definition\",\"reason\":null,\"invocation_name\":\"review\",\"source_scope\":\"project\"}},{{\"code\":\"invalid_invocation_name\",\"reason\":null,\"invocation_name\":null,\"source_scope\":\"personal\"}},{{\"code\":\"invalid_resource\",\"reason\":\"file_too_large\",\"invocation_name\":\"tinykg\",\"source_scope\":\"personal\"}}]}}",
+        "{{\"schema\":\"metask.skill-catalog/v1\",\"catalog_scope_id\":\"{s}\",\"catalog_revision\":\"{s}\",\"health\":\"degraded\",\"skills\":[],\"issues\":[{{\"kind\":\"invalid\",\"code\":\"invalid_definition\",\"reason\":null,\"skill_policy_key\":\"review\",\"provider_id\":\"agents.directory\",\"source_scope\":\"workspace\",\"source_instance_id\":\"workspace.default\"}},{{\"kind\":\"invalid\",\"code\":\"invalid_invocation_name\",\"reason\":null,\"skill_policy_key\":null,\"provider_id\":\"agents.directory\",\"source_scope\":\"user\",\"source_instance_id\":\"user.default\"}},{{\"kind\":\"invalid\",\"code\":\"invalid_resource\",\"reason\":\"file_too_large\",\"skill_policy_key\":\"tinykg\",\"provider_id\":\"agents.directory\",\"source_scope\":\"user\",\"source_instance_id\":\"user.default\"}}]}}",
         .{ hash, hash },
     );
     defer a.free(encoded);
@@ -1561,19 +1619,19 @@ test "Skill catalog decoder exposes typed degraded issues" {
     );
     try std.testing.expectEqualStrings(
         "review",
-        parsed.value.issues[0].invocation_name.?,
+        parsed.value.issues[0].skill_policy_key.?,
     );
     try std.testing.expectEqual(
-        SkillSourceScope.project,
+        SkillSourceScope.workspace,
         parsed.value.issues[0].source_scope,
     );
     try std.testing.expectEqual(
         SkillCatalogIssueCode.invalid_invocation_name,
         parsed.value.issues[1].code,
     );
-    try std.testing.expect(parsed.value.issues[1].invocation_name == null);
+    try std.testing.expect(parsed.value.issues[1].skill_policy_key == null);
     try std.testing.expectEqual(
-        SkillSourceScope.personal,
+        SkillSourceScope.user,
         parsed.value.issues[1].source_scope,
     );
     try std.testing.expectEqual(
@@ -1590,8 +1648,8 @@ test "Skill catalog decoder enforces issue code and resource reason pairing" {
     const a = std.testing.allocator;
     const hash = "0" ** 64;
     const cases = [_][]const u8{
-        "{\"code\":\"invalid_resource\",\"reason\":null,\"invocation_name\":\"review\",\"source_scope\":\"project\"}",
-        "{\"code\":\"invalid_definition\",\"reason\":\"file_too_large\",\"invocation_name\":\"review\",\"source_scope\":\"project\"}",
+        "{\"kind\":\"invalid\",\"code\":\"invalid_resource\",\"reason\":null,\"skill_policy_key\":\"review\",\"provider_id\":\"agents.directory\",\"source_scope\":\"workspace\",\"source_instance_id\":\"workspace.default\"}",
+        "{\"kind\":\"invalid\",\"code\":\"invalid_definition\",\"reason\":\"file_too_large\",\"skill_policy_key\":\"review\",\"provider_id\":\"agents.directory\",\"source_scope\":\"workspace\",\"source_instance_id\":\"workspace.default\"}",
     };
     for (cases) |issue| {
         const encoded = try std.fmt.allocPrint(

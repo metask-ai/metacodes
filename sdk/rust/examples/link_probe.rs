@@ -10,6 +10,8 @@ fn main() {
         unsafe { (*api.as_raw()).abi_revision },
         metask_agentcore_sys::METASK_AGENTCORE_ABI_REVISION
     );
+    assert!(api.resolve_workspace_skill_catalog().is_some());
+    assert!(api.session_bind_skill_policy().is_some());
     assert!(unsafe {
         metask_agentcore_sys::metask_agentcore_get_api(
             metask_agentcore_sys::METASK_AGENTCORE_ABI_V1 + 1,

@@ -2512,11 +2512,20 @@ const AbiSession = struct {
         const binding = if (self.skill_binding) |*value| value else return error.SkillCatalogNotBound;
         const root_frame = self.policy_root orelse
             return error.InvalidSessionState;
+        if (!skill_catalog.isLowerHex64(catalog_revision))
+            return error.InvalidCatalogRevision;
+        if (!std.mem.eql(u8, &binding.snapshot().revision, catalog_revision))
+            return error.StaleCatalog;
+        if (!skill_catalog.isLowerHex64(skill_id)) return error.InvalidSkillId;
+        const public_record = binding.snapshot().findByExecutionId(skill_id) orelse
+            return error.SkillNotFound;
+        if (!binding.view().isEnabled(binding.snapshot(), public_record))
+            return error.SkillDisabled;
         var plan = try skill_activation.prepare(
             allocator,
             binding.snapshot(),
             catalog_revision,
-            skill_id,
+            &public_record.skill_id,
             arguments_json,
             .{
                 .context = .external_run_root,
@@ -3330,7 +3339,7 @@ fn canonicalInvocationRecord(
     ) catch return error.OutOfMemory;
     output.writer.writeAll(&plan.snapshot.revision) catch return error.OutOfMemory;
     output.writer.writeAll("\",\"skill_id\":\"") catch return error.OutOfMemory;
-    output.writer.writeAll(&plan.skill.skill_id) catch return error.OutOfMemory;
+    output.writer.writeAll(&plan.skill.execution_id) catch return error.OutOfMemory;
     output.writer.writeAll("\",\"invocation_name\":") catch return error.OutOfMemory;
     std.json.Stringify.encodeJsonString(
         plan.skill.invocation_name,
@@ -3521,7 +3530,7 @@ fn catalogLifecycleStatus(err: anyerror) u32 {
         error.RuntimeBusy, error.SessionBusy => wire.STATUS_BUSY,
         error.RuntimeUnavailable, error.InvalidSessionState => wire.STATUS_INVALID_STATE,
         error.UnsupportedFilesystem => wire.STATUS_SKILL_UNAVAILABLE,
-        error.WrongRuntime, error.WrongWorkspace, error.InvalidWorkspace => wire.STATUS_INVALID_ARGUMENT,
+        error.WrongRuntime, error.WrongWorkspace, error.InvalidWorkspace, error.InvalidSource => wire.STATUS_INVALID_ARGUMENT,
         else => wire.STATUS_CORE_ERROR,
     };
 }
@@ -3531,9 +3540,10 @@ fn catalogQueryStatus(err: anyerror) u32 {
         error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
         error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
         error.CatalogInvalid, error.InvalidScopeId => wire.STATUS_SKILL_CATALOG_INVALID,
+        error.CatalogIncomplete => wire.STATUS_SKILL_CATALOG_INCOMPLETE,
         error.RuntimeBusy => wire.STATUS_BUSY,
         error.RuntimeUnavailable => wire.STATUS_INVALID_STATE,
-        error.InvalidWorkspace => wire.STATUS_INVALID_ARGUMENT,
+        error.InvalidWorkspace, error.InvalidSource => wire.STATUS_INVALID_ARGUMENT,
         else => wire.STATUS_CORE_ERROR,
     };
 }
@@ -3731,42 +3741,90 @@ fn borrowedViews(
     return out;
 }
 
-fn parseSkillSelection(
+fn parseSkillPolicy(
     scratch: std.mem.Allocator,
-    raw: *const wire.SkillSelectionV1,
+    raw: *const wire.SkillPolicyV1,
+    snapshot: *const skill_catalog.Snapshot,
 ) !skill_availability.Spec {
-    if (raw.struct_size != @sizeOf(wire.SkillSelectionV1) or
+    if (raw.struct_size != @sizeOf(wire.SkillPolicyV1) or
+        raw.reserved0 != 0 or
         !allZero(raw.reserved))
         return error.InvalidArgument;
-    const default_state: skill_availability.State = switch (raw.default_state_code) {
-        wire.SKILL_SELECTION_DISABLED => .disabled,
-        wire.SKILL_SELECTION_ENABLED => .enabled,
-        else => return error.InvalidArgument,
-    };
-    if (raw.exception_skill_id_count > wire.MAX_SKILL_CATALOG_SKILLS_V1)
+    if (raw.granted_skill_id_count > wire.MAX_SKILL_CATALOG_SKILLS_V1)
         return error.ResourceLimit;
-    const count = std.math.cast(usize, raw.exception_skill_id_count) orelse
+    const count = std.math.cast(usize, raw.granted_skill_id_count) orelse
         return error.Overflow;
     if (count == 0) {
-        return .{ .default_state = default_state, .exceptions = &.{} };
+        return .{ .default_state = .disabled, .exceptions = &.{} };
     }
-    const ids = (raw.exception_skill_ids orelse return error.InvalidArgument)[0..count];
+    const ids = (raw.granted_skill_ids orelse return error.InvalidArgument)[0..count];
     const exceptions = try scratch.alloc(skill_availability.Exception, count);
-    const exception_state: skill_availability.State =
-        if (default_state == .enabled) .disabled else .enabled;
     for (ids, 0..) |id, index| {
-        if (id.len > 64) return error.InvalidArgument;
-        const skill_id = try text(id);
-        if (skill_id.len == 0) return error.InvalidArgument;
+        if (id.len != 64) return error.InvalidArgument;
+        const execution_id = try text(id);
+        const record = snapshot.findByExecutionId(execution_id) orelse
+            return error.ForeignSkillId;
         exceptions[index] = .{
-            .skill_id = skill_id,
-            .state = exception_state,
+            .skill_id = &record.skill_id,
+            .state = .enabled,
         };
     }
     return .{
-        .default_state = default_state,
+        .default_state = .disabled,
         .exceptions = exceptions,
     };
+}
+
+fn parseAdditionalSkillSources(
+    scratch: std.mem.Allocator,
+    ptr: ?[*]const wire.SkillSourceV1,
+    count64: u64,
+    metadata_total: *u64,
+) ![]const skill_catalog_handles.AdditionalSource {
+    if (count64 > wire.MAX_SKILL_SOURCES_V1) return error.ResourceLimit;
+    const count = std.math.cast(usize, count64) orelse return error.Overflow;
+    if (count == 0) return &.{};
+    const raw_sources = (ptr orelse return error.InvalidArgument)[0..count];
+    const sources = try scratch.alloc(skill_catalog_handles.AdditionalSource, count);
+    for (raw_sources, sources) |raw, *source| {
+        if (raw.struct_size != @sizeOf(wire.SkillSourceV1) or
+            !allZero(raw.reserved)) return error.InvalidArgument;
+        const scope: skill_catalog_handles.AuthorityScope = switch (raw.scope_code) {
+            wire.SKILL_SOURCE_USER => .user,
+            wire.SKILL_SOURCE_WORKSPACE => .workspace,
+            else => return error.InvalidArgument,
+        };
+        try addMetadata(
+            metadata_total,
+            raw.root.len,
+            wire.MAX_SESSION_METADATA_BYTES_V1,
+        );
+        try addMetadata(
+            metadata_total,
+            raw.source_instance_id.len,
+            wire.MAX_SESSION_METADATA_BYTES_V1,
+        );
+        const root = try text(raw.root);
+        const source_instance_id = try text(raw.source_instance_id);
+        if (root.len == 0 or !skill_catalog_handles.validSourceInstanceId(source_instance_id))
+            return error.InvalidArgument;
+        const canonical = skill_catalog_handles.CanonicalWorkspace.init(
+            scratch,
+            root,
+            root,
+        ) catch |err| return if (err == error.OutOfMemory)
+            error.OutOfMemory
+        else
+            error.InvalidArgument;
+        source.* = .{
+            .root = canonical.root,
+            .scope = scope,
+            .source_instance_id = source_instance_id,
+        };
+        // `scratch` is an Arena in every caller; the canonical strings remain
+        // live through the synchronous query and are released with the Arena.
+    }
+    return sources;
 }
 
 fn parsePermissionRuleViews(
@@ -4290,17 +4348,9 @@ fn runtimeQuerySkillCatalog(
     const descriptor_out = out_descriptor_json orelse
         return fail(wire.STATUS_INVALID_ARGUMENT, "out_descriptor_json is required", out_error);
     if (query.struct_size != @sizeOf(wire.SkillCatalogQueryV1) or
+        query.reserved0 != 0 or
         !allZero(query.reserved))
         return fail(wire.STATUS_INVALID_ARGUMENT, "invalid SkillCatalogQueryV1", out_error);
-    const query_scope: skill_catalog_handles.QueryScope = switch (query.scope_code) {
-        wire.SKILL_CATALOG_SCOPE_PERSONAL_ONLY => .personal_only,
-        wire.SKILL_CATALOG_SCOPE_WORKSPACE_EFFECTIVE => .workspace_effective,
-        else => return fail(
-            wire.STATUS_INVALID_ARGUMENT,
-            "invalid Skill catalog query scope",
-            out_error,
-        ),
-    };
 
     var metadata: u64 = 0;
     for ([_]wire.BytesViewV1{
@@ -4320,17 +4370,26 @@ fn runtimeQuerySkillCatalog(
     if (root.len == 0)
         return fail(wire.STATUS_INVALID_ARGUMENT, "workspace_root is required", out_error);
 
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const additional_sources = parseAdditionalSkillSources(
+        scratch.allocator(),
+        query.additional_sources,
+        query.additional_source_count,
+        &metadata,
+    ) catch |err| return failError(inputErrorStatus(err), err, out_error);
+
     var workspace = skill_catalog_handles.CanonicalWorkspace.init(
         allocator,
         root,
         home,
     ) catch |err| return failError(catalogLifecycleStatus(err), err, out_error);
     defer workspace.deinit();
-    const host = runtime.catalogs.queryScope(
+    const host = runtime.catalogs.queryWorkspace(
         runtime.materializations.io,
         &workspace,
         epoch,
-        query_scope,
+        additional_sources,
         .{},
     ) catch |err| return failError(catalogQueryStatus(err), err, out_error);
     var keep_host = false;
@@ -5680,8 +5739,14 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     defer workspace.deinit();
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
-    const initial_selection = if (host.skill_selection) |selection|
-        parseSkillSelection(scratch.allocator(), selection) catch |err|
+    const initial_catalog = if (host.skill_catalog) |catalog_handle|
+        catalogFrom(catalog_handle)
+    else
+        null;
+    if ((initial_catalog == null) != (host.skill_policy == null))
+        return fail(wire.STATUS_INVALID_ARGUMENT, "Skill Catalog and policy must be bound together", out_error);
+    const initial_selection = if (host.skill_policy) |policy|
+        parseSkillPolicy(scratch.allocator(), policy, initial_catalog.?.snapshot()) catch |err|
             return failError(inputErrorStatus(err), err, out_error)
     else
         null;
@@ -5695,10 +5760,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     var initial_binding = createInitialSkillBinding(
         runtime,
         &workspace_scope_id,
-        if (host.skill_catalog) |catalog_handle|
-            catalogFrom(catalog_handle)
-        else
-            null,
+        initial_catalog,
         if (initial_selection) |*selection| selection else null,
     ) catch |err| return failError(
         if (err == error.InvalidSkillBinding)
@@ -5844,8 +5906,14 @@ fn sessionRestore(
     defer workspace.deinit();
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
-    const skill_selection = if (host.skill_selection) |selection|
-        parseSkillSelection(scratch.allocator(), selection) catch |err|
+    const current_catalog = if (host.skill_catalog) |catalog_handle|
+        catalogFrom(catalog_handle)
+    else
+        null;
+    if ((current_catalog == null) != (host.skill_policy == null))
+        return fail(wire.STATUS_INVALID_ARGUMENT, "Skill Catalog and policy must be bound together", out_error);
+    const parsed_skill_policy = if (host.skill_policy) |policy|
+        parseSkillPolicy(scratch.allocator(), policy, current_catalog.?.snapshot()) catch |err|
             return failError(inputErrorStatus(err), err, out_error)
     else
         null;
@@ -5881,8 +5949,8 @@ fn sessionRestore(
     var current_skill_binding = createInitialSkillBinding(
         runtime,
         &workspace_scope_id,
-        if (host.skill_catalog) |catalog_handle| catalogFrom(catalog_handle) else null,
-        if (skill_selection) |*selection| selection else null,
+        current_catalog,
+        if (parsed_skill_policy) |*selection| selection else null,
     ) catch |err| return failError(
         if (err == error.InvalidSkillBinding)
             wire.STATUS_INVALID_ARGUMENT
@@ -6029,7 +6097,7 @@ fn sessionSetModel(
 fn sessionUpdateSkills(
     handle: ?*wire.SessionHandle,
     optional_catalog_handle: ?*wire.SkillCatalogHandle,
-    selection_ptr: ?*const wire.SkillSelectionV1,
+    policy_ptr: ?*const wire.SkillPolicyV1,
     out_error: ?*wire.OwnedBytesV1,
 ) callconv(.c) u32 {
     emptyError(out_error);
@@ -6050,18 +6118,25 @@ fn sessionUpdateSkills(
     defer self.finishMutation();
     if (self.facade_poisoned.load(.acquire))
         return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
-    const selection = selection_ptr orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "Skill selection is required", out_error);
+    const policy = policy_ptr orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "Skill policy is required", out_error);
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
-    const spec = parseSkillSelection(scratch.allocator(), selection) catch |err|
+    const optional_catalog = if (optional_catalog_handle) |catalog_handle|
+        catalogFrom(catalog_handle)
+    else
+        null;
+    const target_snapshot = if (optional_catalog) |catalog|
+        catalog.snapshot()
+    else if (self.skill_binding) |*binding|
+        binding.snapshot()
+    else
+        return fail(wire.STATUS_INVALID_STATE, "Skill Catalog is not bound", out_error);
+    const spec = parseSkillPolicy(scratch.allocator(), policy, target_snapshot) catch |err|
         return failError(inputErrorStatus(err), err, out_error);
     self.updateSkillsAdmitted(
         runtime,
-        if (optional_catalog_handle) |catalog_handle|
-            catalogFrom(catalog_handle)
-        else
-            null,
+        optional_catalog,
         spec,
     ) catch |err| return failError(sessionMutationStatus(err), err, out_error);
     return wire.STATUS_OK;
@@ -9064,6 +9139,7 @@ test "Revision 6 AgentCore restore is atomic and continues logical operation IDs
 test "Revision 6 AgentCore restore degrades unavailable and changed Skill authority" {
     const record = skill_catalog.SkillRecord{
         .skill_id = [_]u8{'1'} ** 64,
+        .execution_id = [_]u8{'1'} ** 64,
         .invocation_name = "checkpoint-skill",
         .definition = .{
             .name = "checkpoint-skill",
@@ -9245,7 +9321,7 @@ test "Revision 6 AgentCore restore degrades unavailable and changed Skill author
     );
     try std.testing.expectEqualSlices(
         u8,
-        &record.skill_id,
+        &record.execution_id,
         &unavailable.report.issues[0].skill_id,
     );
     try std.testing.expectEqual(
@@ -10068,6 +10144,7 @@ test "disabled AgentCore Skill fails before admission and materialization" {
     defer materializations.deinit() catch unreachable;
     const record = skill_catalog.SkillRecord{
         .skill_id = [_]u8{'a'} ** 64,
+        .execution_id = [_]u8{'e'} ** 64,
         .invocation_name = "review",
         .definition = .{
             .name = "Review",
@@ -10133,7 +10210,7 @@ test "disabled AgentCore Skill fails before admission and materialization" {
         &materializations,
         1,
         &snapshot.revision,
-        &record.skill_id,
+        &record.execution_id,
         "{\"values\":[]}",
         1,
     ));
@@ -10158,7 +10235,7 @@ test "disabled AgentCore Skill fails before admission and materialization" {
         &materializations,
         1,
         &snapshot.revision,
-        &record.skill_id,
+        &record.execution_id,
         "{\"values\":[]}",
         1,
     ));
@@ -10818,6 +10895,7 @@ test "Skill materialization is post-admission and pre-Conversation" {
     defer materializations.deinit() catch unreachable;
     const record = skill_catalog.SkillRecord{
         .skill_id = [_]u8{'a'} ** 64,
+        .execution_id = [_]u8{'e'} ** 64,
         .invocation_name = "review",
         .definition = .{
             .name = "Review",
@@ -10955,6 +11033,7 @@ test "typed Skill invocation record is deterministic and JSON-safe" {
     defer plan_arena.deinit();
     const record = skill_catalog.SkillRecord{
         .skill_id = [_]u8{'b'} ** 64,
+        .execution_id = [_]u8{'b'} ** 64,
         .invocation_name = "review:deep",
         .definition = .{
             .name = "Review",

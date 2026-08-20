@@ -384,11 +384,13 @@ pub fn main(init: std.process.Init) !void {
 
     var query = wire.SkillCatalogQueryV1{
         .struct_size = @sizeOf(wire.SkillCatalogQueryV1),
-        .scope_code = wire.SKILL_CATALOG_SCOPE_PERSONAL_ONLY,
+        .reserved0 = 0,
         .workspace_root = sdk.bytesView(workspace),
         .workspace_home = sdk.bytesView(workspace),
         .workspace_epoch = sdk.bytesView("fixture-epoch"),
-        .reserved = [_]u64{0} ** 3,
+        .additional_sources = null,
+        .additional_source_count = 0,
+        .reserved = [_]u64{0} ** 1,
     };
     var catalog: ?*wire.SkillCatalogHandle = null;
     defer if (catalog) |handle| {
@@ -396,20 +398,7 @@ pub fn main(init: std.process.Init) !void {
     };
     var descriptor = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
     defer api.bufferRelease()(&descriptor);
-    try expectStatus(.ok, api.runtimeQuerySkillCatalog()(
-        runtime,
-        &query,
-        &catalog,
-        &descriptor,
-        &diagnostic,
-    ), diagnostic);
-    if (catalog == null or descriptor.ptr == null or descriptor.len == 0)
-        return error.MissingPersonalSkillCatalog;
-    try expectStatus(.ok, api.skillCatalogRelease()(catalog, &diagnostic), diagnostic);
-    catalog = null;
-    api.bufferRelease()(&descriptor);
-    query.scope_code = wire.SKILL_CATALOG_SCOPE_WORKSPACE_EFFECTIVE;
-    try expectStatus(.ok, api.runtimeQuerySkillCatalog()(
+    try expectStatus(.ok, api.resolveWorkspaceSkillCatalog()(
         runtime,
         &query,
         &catalog,
@@ -428,7 +417,7 @@ pub fn main(init: std.process.Init) !void {
         decoded_catalog.value.issues.len != 1 or
         decoded_catalog.value.issues[0].code != .invalid_resource or
         decoded_catalog.value.issues[0].reason != .file_too_large or
-        !std.mem.eql(u8, decoded_catalog.value.issues[0].invocation_name orelse "", "oversized"))
+        !std.mem.eql(u8, decoded_catalog.value.issues[0].skill_policy_key orelse "", "oversized"))
         return error.InvalidCatalogIsolation;
     const identities = try catalogIdentities(a, descriptor_bytes, "review");
     const workctl_identities = try catalogIdentities(a, descriptor_bytes, "workctl");
@@ -438,9 +427,14 @@ pub fn main(init: std.process.Init) !void {
     api.bufferRelease()(&descriptor);
 
     const allowed = [_]wire.BytesViewV1{ sdk.bytesView("AskUserQuestion"), sdk.bytesView("Read"), sdk.bytesView("HostEcho") };
-    var skill_selection = std.mem.zeroes(wire.SkillSelectionV1);
-    skill_selection.struct_size = @sizeOf(wire.SkillSelectionV1);
-    skill_selection.default_state_code = wire.SKILL_SELECTION_ENABLED;
+    const granted_skill_ids = [_]wire.BytesViewV1{
+        sdk.bytesView(identities.skill_id),
+        sdk.bytesView(workctl_identities.skill_id),
+    };
+    var skill_policy = std.mem.zeroes(wire.SkillPolicyV1);
+    skill_policy.struct_size = @sizeOf(wire.SkillPolicyV1);
+    skill_policy.granted_skill_ids = &granted_skill_ids;
+    skill_policy.granted_skill_id_count = granted_skill_ids.len;
     var initial_rules = std.mem.zeroes(wire.PermissionRuleSetV1);
     initial_rules.struct_size = @sizeOf(wire.PermissionRuleSetV1);
     var session_host = wire.SessionHostConfigV1{
@@ -455,7 +449,7 @@ pub fn main(init: std.process.Init) !void {
         .allowed_tools = &allowed,
         .allowed_tool_count = allowed.len,
         .skill_catalog = catalog,
-        .skill_selection = &skill_selection,
+        .skill_policy = &skill_policy,
         .permission_rules = &initial_rules,
         .mcp_selection = null,
         .durable_budget = null,
@@ -492,7 +486,7 @@ pub fn main(init: std.process.Init) !void {
     );
     try expectStatus(
         .ok,
-        api.sessionUpdateSkills()(session, null, &skill_selection, &diagnostic),
+        api.sessionBindSkillPolicy()(session, null, &skill_policy, &diagnostic),
         diagnostic,
     );
     try expectStatus(
@@ -586,7 +580,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (restored_catalog) |handle| {
         _ = api.skillCatalogRelease()(handle, &diagnostic);
     };
-    try expectStatus(.ok, api.runtimeQuerySkillCatalog()(
+    try expectStatus(.ok, api.resolveWorkspaceSkillCatalog()(
         runtime,
         &query,
         &restored_catalog,
@@ -706,7 +700,7 @@ pub fn main(init: std.process.Init) !void {
     try expectStatus(.ok, api.completionDestroy()(completion, &diagnostic), diagnostic);
     completion = null;
 
-    std.debug.print("AgentCore source-free consumer: Revision 9 Catalog scopes, Completion, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 9 Workspace Skill Catalog, Completion, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 const CatalogIdentities = struct {

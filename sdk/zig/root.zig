@@ -24,7 +24,9 @@ pub const SkillArgumentSchema = protocol.SkillArgumentSchema;
 pub const SkillCatalogIssue = protocol.SkillCatalogIssue;
 pub const SkillCatalogHealth = protocol.SkillCatalogHealth;
 pub const SkillCatalogIssueCode = protocol.SkillCatalogIssueCode;
+pub const SkillCatalogIssueKind = protocol.SkillCatalogIssueKind;
 pub const SkillCatalogResourceReason = protocol.SkillCatalogResourceReason;
+pub const SkillSourceProjection = protocol.SkillSourceProjection;
 pub const SkillSourceScope = protocol.SkillSourceScope;
 pub const McpCatalog = protocol.McpCatalog;
 pub const SessionDescription = protocol.SessionDescription;
@@ -146,7 +148,8 @@ pub const Api = struct {
     pub fn runtimeDestroy(self: Api) types.RuntimeDestroyFnV1 {
         return self.raw.runtime_destroy.?;
     }
-    pub fn runtimeQuerySkillCatalog(self: Api) types.RuntimeQuerySkillCatalogFnV1 {
+    /// Safe SDK name for the raw `runtime_query_skill_catalog` ABI slot.
+    pub fn resolveWorkspaceSkillCatalog(self: Api) types.RuntimeQuerySkillCatalogFnV1 {
         return self.raw.runtime_query_skill_catalog.?;
     }
     pub fn skillCatalogRelease(self: Api) types.SkillCatalogReleaseFnV1 {
@@ -176,7 +179,9 @@ pub const Api = struct {
     pub fn sessionSetModel(self: Api) types.SessionSetModelFnV1 {
         return self.raw.session_set_model.?;
     }
-    pub fn sessionUpdateSkills(self: Api) types.SessionUpdateSkillsFnV1 {
+    /// Atomically binds a complete Catalog plus default-deny policy, or
+    /// replaces only the policy when the Catalog argument is null.
+    pub fn sessionBindSkillPolicy(self: Api) types.SessionBindSkillsFnV1 {
         return self.raw.session_update_skills.?;
     }
     pub fn sessionUpdatePermissionRules(self: Api) types.SessionUpdatePermissionRulesFnV1 {

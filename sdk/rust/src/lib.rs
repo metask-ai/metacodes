@@ -90,6 +90,21 @@ impl Api {
     pub fn owned_buffer(self) -> OwnedBuffer {
         OwnedBuffer::new(self)
     }
+
+    /// Intent-revealing SDK alias for the raw
+    /// `runtime_query_skill_catalog` function-table slot.
+    pub fn resolve_workspace_skill_catalog(
+        self,
+    ) -> raw::metask_agentcore_runtime_query_skill_catalog_fn_v1 {
+        self.table().runtime_query_skill_catalog
+    }
+
+    /// Intent-revealing SDK alias for the raw `session_update_skills` slot.
+    /// The operation atomically binds a complete Catalog plus default-deny
+    /// concrete Skill policy, or replaces only the policy when Catalog is null.
+    pub fn session_bind_skill_policy(self) -> raw::metask_agentcore_session_bind_skills_fn_v1 {
+        self.table().session_update_skills
+    }
 }
 
 /// Library-owned output buffer. Use this only for diagnostics, catalog/session
