@@ -370,6 +370,20 @@ fn appendDerived(
 
 /// 从 KG 装载当前任务的义务运行时(author 学得的 + GIGO 派生的)。
 /// 两路皆空/店不可用 → null(零开销)。
+/// 最新行"全过"判定(tests=p/t 且 p==t>0):任务已解决。
+/// p33 取证:filterwarnings 史上全 1.0,陈年 author 义务仍每轮 nudge,
+/// agent 被推去修鬼问题把好代码改坏(1.0→0.5)。棘轮在未解决时救命、
+/// 在已解决时投毒——已解决 ⇒ 零义务(Lean 镜面 solved_quiescence)。
+pub fn rowSolved(row: []const u8) bool {
+    const tag = std.mem.indexOf(u8, row, " tests=") orelse return false;
+    const start = tag + " tests=".len;
+    const slash = std.mem.indexOfScalarPos(u8, row, start, '/') orelse return false;
+    const end = std.mem.indexOfScalarPos(u8, row, slash, ' ') orelse return false;
+    const passed = std.fmt.parseInt(u32, row[start..slash], 10) catch return false;
+    const total = std.fmt.parseInt(u32, row[slash + 1 .. end], 10) catch return false;
+    return total > 0 and passed == total;
+}
+
 pub fn load(
     gpa: std.mem.Allocator,
     kg: *kg_client_mod.KgClient,
@@ -385,6 +399,15 @@ pub fn load(
     var combined = std.array_list.Managed(self_evolution.ObligationEnvelope).init(a);
     if (task_hint.len > 0 and task_hint.len <= 200) {
         const scoped_recall = @import("../kg/scoped_recall.zig");
+        // 已解决静默:最新裁决全过 → 不装载任何义务(含 stored)。
+        if (scoped_recall.sameTaskOutcomeRow(a, kg, task_hint)) |newest_probe| {
+            const solved = rowSolved(newest_probe);
+            a.free(newest_probe);
+            if (solved) {
+                arena.deinit();
+                return null;
+            }
+        }
         // 理由派生(模块 import)在前且**扫全部历史行**(p15 取证:棘轮缺失
         // ——p14 结构成功后其行不再含 "not available",单看最新行义务消失,
         // 工作区重置后模块无人重建 → 8 skip 回归。内容寻址+去重保证一次

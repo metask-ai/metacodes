@@ -319,6 +319,16 @@ pub fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClien
         out.appendSlice(allocator, best) catch return null;
         out.appendSlice(allocator, "\n") catch return null;
     }
+    // 已解决静默(p33 取证):最新裁决全过 → 短注(已证配置+复验令),
+    // 跳过 mode/GIGO/ESCALATED 的全部压力面——解决态的重注入只会投毒。
+    if (@import("../core/obligation_gate.zig").rowSolved(body)) {
+        out.appendSlice(allocator,
+            "This task's best configuration is already proven by the verdict above: " ++
+                "reproduce that approach, re-run your whole check suite to confirm, and " ++
+                "do not innovate beyond what the task statement asks.\n" ++
+                "</system-reminder>\n") catch return null;
+        return out.toOwnedSlice(allocator) catch null;
+    }
     const max_streak = appendModeSection(&out, allocator, history.items) catch 0;
     if (max_streak >= 3) {
         // 升级态瘦身(提示饱和对策):union/invert 级别的点在场时,九层

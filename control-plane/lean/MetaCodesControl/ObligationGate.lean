@@ -91,4 +91,16 @@ theorem failure_never_satisfies (item : Item) (matched : Bool)
   unfold afterResult
   simp [h]
 
+/-- Solved quiescence: a task whose newest verdict passes everything loads
+zero obligations — the ratchet protects unsolved work and must release on
+solved work (p33: stale author obligations on an all-green task pushed the
+agent into fixing ghosts, 1.0 → 0.5). -/
+def loadCount (solved : Bool) (pending : Nat) : Nat :=
+  if solved then 0 else pending
+
+theorem solved_loads_nothing (pending : Nat) : loadCount true pending = 0 := by rfl
+
+theorem unsolved_keeps_ratchet (pending : Nat) :
+    loadCount false pending = pending := by rfl
+
 end MetaCodesControl.ObligationGate
