@@ -91,16 +91,41 @@ theorem failure_never_satisfies (item : Item) (matched : Bool)
   unfold afterResult
   simp [h]
 
-/-- Solved quiescence: a task whose newest verdict passes everything loads
-zero obligations — the ratchet protects unsolved work and must release on
-solved work (p33: stale author obligations on an all-green task pushed the
-agent into fixing ghosts, 1.0 → 0.5). -/
-def loadCount (solved : Bool) (pending : Nat) : Nat :=
-  if solved then 0 else pending
+/-- Solved quiescence, v35: silence swaps the needle, it does not close the
+channel. Stale pending obligations never load on ever-solved work (the
+ratchet still releases — p33: stale author obligations on an all-green task
+pushed the agent into fixing ghosts, 1.0 → 0.5). But the imperative channel
+stays open for at most one reproduce-best artifact directive (p35: with a
+zero-needle silence, a conflicting stored memory outweighed the note at
+action time — the model recited the proven module path in thinking, then
+wrote the stale correction instead; 0.2727 wall regression). `artifact` is
+the number of artifact-path directives derivable from the best verdict
+(0 when the best row carries no artifact). -/
+def loadCount (solved : Bool) (pending artifact : Nat) : Nat :=
+  if solved then min artifact 1 else pending
 
-theorem solved_loads_nothing (pending : Nat) : loadCount true pending = 0 := by rfl
+/-- Solved work never loads stale pending obligations — the load is bounded
+by the single reproduce-best directive regardless of pending count. -/
+theorem solved_never_loads_stale (pending artifact : Nat) :
+    loadCount true pending artifact ≤ 1 := by
+  simpa [loadCount] using Nat.min_le_right artifact 1
 
-theorem unsolved_keeps_ratchet (pending : Nat) :
-    loadCount false pending = pending := by rfl
+/-- Solved work with no derivable artifact is truly silent. -/
+theorem solved_without_artifact_is_silent (pending : Nat) :
+    loadCount true pending 0 = 0 := by rfl
+
+/-- Solved work with a derivable artifact loads exactly the one
+reproduce-best directive — the imperative channel does not close. -/
+theorem solved_swaps_needle (pending artifact : Nat) (h : 1 ≤ artifact) :
+    loadCount true pending artifact = 1 := by
+  simp [loadCount, Nat.min_eq_right h]
+
+/-- The load on solved work is independent of how many stale obligations
+are pending — poison cannot re-enter through volume. -/
+theorem solved_load_ignores_pending (p q artifact : Nat) :
+    loadCount true p artifact = loadCount true q artifact := by rfl
+
+theorem unsolved_keeps_ratchet (pending artifact : Nat) :
+    loadCount false pending artifact = pending := by rfl
 
 end MetaCodesControl.ObligationGate

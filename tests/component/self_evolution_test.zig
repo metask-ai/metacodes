@@ -1021,6 +1021,107 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     try std.testing.expect(std.mem.indexOf(u8, text_rg, "tests=4/4") != null);
     try std.testing.expect(std.mem.indexOf(u8, text_rg, "ESCALATED") == null);
     try std.testing.expect(std.mem.indexOf(u8, text_rg, "Per-point reading mode") == null);
+    // v35 冲突记忆失效句(p35 取证:etag 剂量到达且 thinking 复述正确,
+    // 行动被店内 CORRECTION 记忆反杀):静默 note 必须声明已证配置压过
+    // 矛盾记忆。
+    try std.testing.expect(std.mem.indexOf(u8, text_rg, "the proven configuration wins") != null);
+
+    // v35 L2(静默换针,撤修复必红——v34 在解决态一律 load()==null):
+    // 曾全过且最佳行携带工件路径 → 义务=复现最佳单针(工件路径逐字令),
+    // 陈年 stored 义务仍拒载。
+    {
+        const payload_af = "{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+            "{\"task\":\"artifact-task\",\"attempt_key\":\"af1\",\"reward\":1.0,\"tests_passed\":3,\"tests_total\":3," ++
+            "\"failing_tests\":[],\"final_note\":\"module landed; all green\"," ++
+            "\"best_artifact\":\"--- pkg/_helper.py ---\\nfrom hashlib import sha256\\n\"}]}";
+        const pfs = @import("platform").fs;
+        const za = try a.dupeZ(u8, outcomes_path);
+        defer a.free(za);
+        const fd = pfs.open(za.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = pfs.close(fd);
+        var off: usize = 0;
+        while (off < payload_af.len) {
+            const n = pfs.write(fd, payload_af[off..]);
+            try std.testing.expect(n > 0);
+            off += @intCast(n);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
+    {
+        const payload_af2 = "{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+            "{\"task\":\"artifact-task\",\"attempt_key\":\"af2\",\"reward\":0.3,\"tests_passed\":1,\"tests_total\":3," ++
+            "\"failing_tests\":[\"tests/af.py::T::t_regressed (failed: assert)\"]}]}";
+        const pfs = @import("platform").fs;
+        const zb = try a.dupeZ(u8, outcomes_path);
+        defer a.free(zb);
+        const fd = pfs.open(zb.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = pfs.close(fd);
+        var off: usize = 0;
+        while (off < payload_af2.len) {
+            const n = pfs.write(fd, payload_af2[off..]);
+            try std.testing.expect(n > 0);
+            off += @intCast(n);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
+    ppaths.setEnv("METACODES_TASK_HINT", "artifact-task");
+    // 陈年义务:解决态必须拒载,即便换针通道开着。
+    _ = kg.remember(.observation, "metacodes-provisional-obligation-v1 task=artifact-task needle=tests/af.py::T::t_stale reason=stale ghost", "provisional_obligation", false) catch {};
+    {
+        const runtime_af = cc.obligation_gate.load(a, &kg, "artifact-task") orelse
+            return error.TestExpectedReproduceNeedle;
+        defer {
+            runtime_af.deinit();
+            a.destroy(runtime_af);
+        }
+        try std.testing.expectEqual(@as(usize, 1), runtime_af.envelopes.len);
+        try std.testing.expectEqualStrings("pkg/_helper.py", runtime_af.envelopes[0].command_needle);
+        try std.testing.expect(std.mem.indexOf(u8, runtime_af.envelopes[0].reason, "VERBATIM") != null);
+    }
+
+    // v35 L2(cap 钉最佳,撤修复必红——旧 cap 只留最新 8 行,最老的全过
+    // 行被驱逐 → 曾经全过失明 → 鬼义务复武装):唯一全过行最老 + 8 条
+    // 回归行,曾经全过判定必须仍然成立(回归框架 note + 零陈年义务)。
+    {
+        const pfs = @import("platform").fs;
+        var attempt: usize = 0;
+        while (attempt < 9) : (attempt += 1) {
+            const payload_cap = if (attempt == 0)
+                try std.fmt.allocPrint(a,
+                    "{{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+                        "{{\"task\":\"cap-task\",\"attempt_key\":\"c{d}\",\"reward\":1.0,\"tests_passed\":2,\"tests_total\":2," ++
+                        "\"failing_tests\":[],\"final_note\":\"proven early\"}}]}}", .{attempt})
+            else
+                try std.fmt.allocPrint(a,
+                    "{{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+                        "{{\"task\":\"cap-task\",\"attempt_key\":\"c{d}\",\"reward\":0.5,\"tests_passed\":1,\"tests_total\":2," ++
+                        "\"failing_tests\":[\"tests/cap.py::T::t_late (failed: assert)\"]}}]}}", .{attempt});
+            defer a.free(payload_cap);
+            const zc = try a.dupeZ(u8, outcomes_path);
+            defer a.free(zc);
+            const fd = pfs.open(zc.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+            try std.testing.expect(fd >= 0);
+            defer _ = pfs.close(fd);
+            var off: usize = 0;
+            while (off < payload_cap.len) {
+                const n = pfs.write(fd, payload_cap[off..]);
+                try std.testing.expect(n > 0);
+                off += @intCast(n);
+            }
+            try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
+        }
+        ppaths.setEnv("METACODES_TASK_HINT", "cap-task");
+        _ = kg.remember(.observation, "metacodes-provisional-obligation-v1 task=cap-task needle=tests/cap.py::T::t_ghost reason=stale ghost", "provisional_obligation", false) catch {};
+        // 最佳行无工件 → 真静默(零义务);cap 若驱逐 1.0 行则鬼义务复载。
+        try std.testing.expect(cc.obligation_gate.load(a, &kg, "cap-task") == null);
+        var built_cap = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+        defer built_cap.deinit(a);
+        const text_cap = built_cap.text orelse return error.TestExpectedInjection;
+        try std.testing.expect(std.mem.indexOf(u8, text_cap, "REGRESSED from an already-proven configuration") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text_cap, "Garbage In, Garbage Out") == null);
+    }
     ppaths.setEnv("METACODES_TASK_HINT", "wall-task");
 
     // UTF-8 截断安全(p10 现场雷):中文 note >300 字节,裸字节截断切码点

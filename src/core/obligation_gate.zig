@@ -397,6 +397,9 @@ pub fn load(
         return null;
     };
     var combined = std.array_list.Managed(self_evolution.ObligationEnvelope).init(a);
+    // v35:解决态换针标志——true 时只保留"复现最佳"工件针,
+    // 理由派生/形状派生/stored 陈年义务全部拒载。
+    var reproduce_only = false;
     if (task_hint.len > 0 and task_hint.len <= 200) {
         const scoped_recall = @import("../kg/scoped_recall.zig");
         // 已解决静默键在**最佳行**(p34 取证:键最新行时,回归行让任务
@@ -426,45 +429,71 @@ pub fn load(
         // defer 已清完 history0 之后才拆竞技场(UAF 教训:return 触发的
         // 块级 defer 会晚于 arena.deinit 执行)。
         if (ever_solved) {
-            arena.deinit();
-            return null;
+            // v35(p35 取证):静默≠零针,而是换针。v34 在此直接零义务,
+            // 唯一全勤祈使通道随之关闭——etag 的剂量完整到达且 thinking
+            // 逐字复述了已证模块路径,行动时刻却被店内冲突 CORRECTION
+            // 记忆反杀(async 版写进 asgi.py,模块未建,0.2727 回墙)。
+            // 解决态撤陈年义务不变;"复现最佳"必须占据 nudge 通道:只装
+            // 最佳行的工件路径逐字令,最佳行无工件时才真零针。
+            // Lean 镜面 solved_swaps_needle(loadCount solved ≤ 1)。
+            {
+                var history1 = std.array_list.Managed([]u8).init(a);
+                defer {
+                    for (history1.items) |row| a.free(row);
+                    history1.deinit();
+                }
+                scoped_recall.collectHistory(a, kg, task_hint, &history1);
+                if (scoped_recall.sameTaskOutcomeRow(a, kg, task_hint)) |newest_row| {
+                    defer a.free(newest_row);
+                    _ = appendArtifactFirst(a, &combined, self_evolution.taskIdentity(task_hint), history1.items, newest_row);
+                }
+            }
+            if (combined.items.len == 0) {
+                arena.deinit();
+                return null;
+            }
+            reproduce_only = true;
         }
-        // 理由派生(模块 import)在前且**扫全部历史行**(p15 取证:棘轮缺失
-        // ——p14 结构成功后其行不再含 "not available",单看最新行义务消失,
-        // 工作区重置后模块无人重建 → 8 skip 回归。内容寻址+去重保证一次
-        // 暴露跨轮存续)。
-        {
-            var history = std.array_list.Managed([]u8).init(a);
-            defer {
-                for (history.items) |row| a.free(row);
-                history.deinit();
+        if (!reproduce_only) {
+            // 理由派生(模块 import)在前且**扫全部历史行**(p15 取证:棘轮缺失
+            // ——p14 结构成功后其行不再含 "not available",单看最新行义务消失,
+            // 工作区重置后模块无人重建 → 8 skip 回归。内容寻址+去重保证一次
+            // 暴露跨轮存续)。
+            {
+                var history = std.array_list.Managed([]u8).init(a);
+                defer {
+                    for (history.items) |row| a.free(row);
+                    history.deinit();
+                }
+                scoped_recall.collectHistory(a, kg, task_hint, &history);
+                if (scoped_recall.sameTaskOutcomeRow(a, kg, task_hint)) |newest_row| {
+                    defer a.free(newest_row);
+                    _ = appendArtifactFirst(a, &combined, self_evolution.taskIdentity(task_hint), history.items, newest_row);
+                }
+                var back = history.items.len;
+                while (back > 0) {
+                    back -= 1;
+                    _ = appendReasonDerived(a, &combined, self_evolution.taskIdentity(task_hint), history.items[back]);
+                }
             }
-            scoped_recall.collectHistory(a, kg, task_hint, &history);
-            if (scoped_recall.sameTaskOutcomeRow(a, kg, task_hint)) |newest_row| {
-                defer a.free(newest_row);
-                _ = appendArtifactFirst(a, &combined, self_evolution.taskIdentity(task_hint), history.items, newest_row);
+            if (scoped_recall.sameTaskOutcomeRow(a, kg, task_hint)) |row| {
+                var history2 = std.array_list.Managed([]u8).init(a);
+                defer {
+                    for (history2.items) |h| a.free(h);
+                    history2.deinit();
+                }
+                scoped_recall.collectHistory(a, kg, task_hint, &history2);
+                _ = appendDerived(a, &combined, self_evolution.taskIdentity(task_hint), row, history2.items);
             }
-            var back = history.items.len;
-            while (back > 0) {
-                back -= 1;
-                _ = appendReasonDerived(a, &combined, self_evolution.taskIdentity(task_hint), history.items[back]);
-            }
-        }
-        if (scoped_recall.sameTaskOutcomeRow(a, kg, task_hint)) |row| {
-            var history2 = std.array_list.Managed([]u8).init(a);
-            defer {
-                for (history2.items) |h| a.free(h);
-                history2.deinit();
-            }
-            scoped_recall.collectHistory(a, kg, task_hint, &history2);
-            _ = appendDerived(a, &combined, self_evolution.taskIdentity(task_hint), row, history2.items);
         }
     }
     // stored(author 陈年义务)排在派生之后(p17 取证:预算被裸针 stored
     // 义务吃光,携带验证器报告的新鲜形状义务永远轮不到);且被任一派生
     // 针**包含**的 stored 针退役(如裸 "pkg._mod" ⊂ "import pkg._mod",
-    // 精确+带报告的派生版胜出)。
+    // 精确+带报告的派生版胜出)。解决态(reproduce_only)陈年义务一律
+    // 拒载——棘轮释放语义不因换针回退。
     for (stored) |envelope| {
+        if (reproduce_only) break;
         var superseded = false;
         for (combined.items) |existing| {
             if (std.mem.indexOf(u8, existing.command_needle, envelope.command_needle) != null) {

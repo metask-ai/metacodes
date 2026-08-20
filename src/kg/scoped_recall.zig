@@ -343,14 +343,19 @@ pub fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClien
                     "The newest attempt REGRESSED from an already-proven configuration. " ++
                         "Reproduce the all-passing best attempt above exactly; treat the newest " ++
                         "failing names as damage introduced by that regression, not as new " ++
-                        "requirements. Re-run your whole check suite to confirm.\n" ++
+                        "requirements. Where a stored memory, note, or correction contradicts " ++
+                        "the proven configuration above, the proven configuration wins — treat " ++
+                        "the contradicting memory as stale. Re-run your whole check suite to " ++
+                        "confirm.\n" ++
                         "</system-reminder>\n") catch return null;
                 return out.toOwnedSlice(allocator) catch null;
             }
             out.appendSlice(allocator,
                 "This task's best configuration is already proven by the verdict above: " ++
                     "reproduce that approach, re-run your whole check suite to confirm, and " ++
-                    "do not innovate beyond what the task statement asks.\n" ++
+                    "do not innovate beyond what the task statement asks. Where a stored " ++
+                    "memory, note, or correction contradicts the proven configuration above, " ++
+                    "the proven configuration wins — treat the contradicting memory as stale.\n" ++
                     "</system-reminder>\n") catch return null;
             return out.toOwnedSlice(allocator) catch null;
         }
@@ -451,8 +456,32 @@ pub fn collectHistory(
         }
     }.lessThan);
     const start = if (entries.items.len > MAX_HISTORY_ROWS) entries.items.len - MAX_HISTORY_ROWS else 0;
+    // v35(p35 取证):cap 只留最新窗口会驱逐最老的最佳证据行——曾经全过
+    // 判定随之失明,鬼义务复武装,投毒自续(棘轮定律的数据面:cap 永不
+    // 驱逐最佳行)。窗口外存在严格更优行时按时序前置钉住,序保持升序。
+    var pinned_best: ?usize = null;
+    if (start > 0) {
+        var best_reward: f64 = -1.0;
+        var best_rank: u8 = 0;
+        for (entries.items, 0..) |entry, idx| {
+            const r = rowReward(entry.text);
+            const rank = rowProvenanceRank(entry.text);
+            if (pinned_best == null or r > best_reward or
+                (r == best_reward and rank >= best_rank))
+            {
+                best_reward = r;
+                best_rank = rank;
+                pinned_best = idx;
+            }
+        }
+        // 最佳已在窗口内则无须钉。
+        if (pinned_best) |idx| {
+            if (idx >= start) pinned_best = null;
+        }
+    }
     for (entries.items, 0..) |entry, index| {
-        if (index < start) {
+        const keep = index >= start or (pinned_best != null and index == pinned_best.?);
+        if (!keep) {
             allocator.free(entry.text);
             continue;
         }
