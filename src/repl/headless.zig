@@ -132,6 +132,9 @@ pub fn run(
     // 自演化 S2:store 里有临时规则 → 以固定 kernel 合并进(或独立构成)
     // 项目规则 gate。装载失败/降级一律回退到普通 gate,绝不放倒 Run。
     const self_evo_enabled = self_evolution_mod.enabledFromEnv();
+    // host-run 裁决:开工即钉住检查命令(内容哈希),收尾比对后由 host 执行。
+    const host_check_mod = @import("../core/host_check.zig");
+    const host_check_pin: ?host_check_mod.Pin = if (self_evo_enabled) host_check_mod.Pin.fromEnv() else null;
     var self_evo_ingested: usize = 0;
     var provisional_gate: ?*self_evolution_mod.ProvisionalGate = null;
     defer if (provisional_gate) |pg| pg.deinit();
@@ -256,6 +259,21 @@ pub fn run(
     // 一切结果(含降级)静默——自演化永不影响 Run 的退出语义。
     if (self_evo_enabled) evolve: {
         const known_graph = if (app.kg) |*k| k else break :evolve;
+        // host-run 裁决先于 endOfRun:裁决行入库后,author 的 task_context
+        // 与下一轮注入立即可见(模型不可干预,失败静默降级)。
+        if (host_check_pin) |*pin| {
+            const hint: []const u8 = if (std.c.getenv("METACODES_TASK_HINT")) |h| std.mem.span(h) else "";
+            const note_owned: ?[]const u8 = lastAssistantText(&app.conversation, allocator) catch null;
+            defer if (note_owned) |n| if (n.len > 0) allocator.free(n);
+            _ = host_check_mod.runAndIngest(
+                allocator,
+                known_graph,
+                pin,
+                hint,
+                if (note_owned) |n| n else "",
+                @intCast(@import("../util/time.zig").nowWallNs()),
+            );
+        }
         const control = run_control orelse break :evolve;
         const binding = control.journal.runBinding() catch break :evolve;
         var identity_buffer: [512]u8 = undefined;

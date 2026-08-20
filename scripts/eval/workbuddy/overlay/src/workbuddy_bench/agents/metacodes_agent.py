@@ -519,6 +519,8 @@ class MetacodesAgent(BaseInstalledAgent):
                     "reward": float(reward),
                     "tests_passed": int(score.get("tests_passed") or 0),
                     "tests_total": int(score.get("tests_total") or 0),
+                    # 溯源:评测验证器 = 外部权威(binary 缺省同值,这里显式)。
+                    "provenance": "external_oracle",
                     "failing_tests": failing,
                     "_trial_dir": str(trial_dir),
                 }

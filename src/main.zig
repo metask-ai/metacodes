@@ -154,6 +154,8 @@ pub const ontology_rule_projection = @import("core/ontology_rule_projection.zig"
 pub const rule_author = @import("core/rule_author.zig");
 pub const project_rule_evolution = @import("core/project_rule_evolution.zig");
 pub const self_evolution = @import("core/self_evolution.zig");
+pub const verdict = @import("core/verdict.zig");
+pub const host_check = @import("core/host_check.zig");
 pub const obligation_gate = @import("core/obligation_gate.zig");
 pub const rule_source_receipt = @import("core/rule_source_receipt.zig");
 pub const project_rule_spec = @import("core/project_rule_spec.zig");
@@ -1229,6 +1231,8 @@ test {
     _ = &@import("core/conversation.zig");
     _ = &@import("core/agent_loop.zig");
     _ = &@import("repl/stream_json_backend.zig");
+    _ = &@import("core/verdict.zig");
+    _ = &@import("core/host_check.zig");
     _ = &@import("core/proposed_plan.zig");
     _ = &@import("core/plan_file.zig");
     _ = &@import("swarm/file_lock.zig");

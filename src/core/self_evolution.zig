@@ -506,6 +506,9 @@ const OutcomeRow = struct {
     /// ≤1800B)。复制+打补丁替代重新推导——p22/p23 取证:模型每轮重推实现,
     /// 多约束整合必丢面;给它能工作的代码,自由度即消失。
     best_artifact: []const u8 = "",
+    /// 溯源层级(verdict.Provenance 名字)。缺省=external_oracle:存量行
+    /// 全部来自评测验证器,如实向后兼容。
+    provenance: []const u8 = "external_oracle",
 };
 
 const OutcomeFile = struct {
@@ -542,6 +545,16 @@ pub fn ingestOutcomes(
         if (n <= 0) return 0;
         offset += @intCast(n);
     }
+    return ingestOutcomesFromText(allocator, kg, bytes);
+}
+
+/// 文本入口(原生裁决闭环:host-run 合成的 JSON 不经文件直接入库;
+/// 文件入口 ingestOutcomes 只是它的读盘包装)。
+pub fn ingestOutcomesFromText(
+    allocator: std.mem.Allocator,
+    kg: *kg_client_mod.KgClient,
+    bytes: []const u8,
+) usize {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const parsed = std.json.parseFromSliceLeaky(OutcomeFile, arena.allocator(), bytes, .{
@@ -630,17 +643,19 @@ pub fn ingestOutcomes(
         else
             "";
         defer if (artifact_part.len > 0) allocator.free(artifact_part);
+        // prov 放在 failing 之前(定界安全区),值经 Provenance.parse 归一。
+        const prov = @tagName(@import("verdict.zig").Provenance.parse(row.provenance));
         const text = if (note_bounded.len > 0)
             std.fmt.allocPrint(
                 allocator,
-                OUTCOME_MARKER ++ ": key={s} task={s} reward={d:.4} tests={d}/{d} failing=[{s}] note={s}{s}",
-                .{ key, row.task, row.reward, row.tests_passed, row.tests_total, failing.items, note_bounded, artifact_part },
+                OUTCOME_MARKER ++ ": key={s} task={s} reward={d:.4} tests={d}/{d} prov={s} failing=[{s}] note={s}{s}",
+                .{ key, row.task, row.reward, row.tests_passed, row.tests_total, prov, failing.items, note_bounded, artifact_part },
             ) catch continue
         else
             std.fmt.allocPrint(
                 allocator,
-                OUTCOME_MARKER ++ ": key={s} task={s} reward={d:.4} tests={d}/{d} failing=[{s}]{s}",
-                .{ key, row.task, row.reward, row.tests_passed, row.tests_total, failing.items, artifact_part },
+                OUTCOME_MARKER ++ ": key={s} task={s} reward={d:.4} tests={d}/{d} prov={s} failing=[{s}]{s}",
+                .{ key, row.task, row.reward, row.tests_passed, row.tests_total, prov, failing.items, artifact_part },
             ) catch continue;
         defer allocator.free(text);
         _ = kg.remember(.observation, text, OUTCOME_SCHEMA_TYPE, false) catch continue;

@@ -255,20 +255,39 @@ fn rowReward(row: []const u8) f64 {
     return std.fmt.parseFloat(f64, row[start..end]) catch -1;
 }
 
+/// 行的溯源层级(无 prov 字段 → external_oracle,存量行如实兼容)。
+fn rowProvenanceRank(row: []const u8) u8 {
+    const verdict = @import("../core/verdict.zig");
+    const tag = std.mem.indexOf(u8, row, " prov=") orelse
+        return verdict.Provenance.external_oracle.rank();
+    const start = tag + " prov=".len;
+    const end = std.mem.indexOfScalarPos(u8, row, start, ' ') orelse row.len;
+    return verdict.Provenance.parse(row[start..end]).rank();
+}
+
 pub fn bestHistoryRow(history: []const []u8, newest: []const u8) ?[]const u8 {
     const newest_reward = rowReward(newest);
     var best: ?[]const u8 = null;
     var best_reward: f64 = newest_reward;
+    // 字典序 (reward, provenance rank, recency):自跑检查的行绝不压过
+    // 同分的权威行——策略 Lean 镜面 VerdictProvenance.better。
+    var best_rank: u8 = 0;
     for (history) |row| {
         if (std.mem.eql(u8, row, newest)) continue;
         const r = rowReward(row);
+        const rank = rowProvenanceRank(row);
         if (r > best_reward) {
             best_reward = r;
+            best_rank = rank;
             best = row;
         } else if (best != null and r == best_reward) {
-            // 同分取更新的行:工件升级写会产生同 attempt 的复本,后写的带
-            // 最佳工件(history 升序,越靠后 node_id 越大)。
-            best = row;
+            if (rank > best_rank) {
+                best_rank = rank;
+                best = row;
+            } else if (rank == best_rank) {
+                // 同分同级取更新(工件升级复本在后;history 升序=recency)。
+                best = row;
+            }
         }
     }
     return best;

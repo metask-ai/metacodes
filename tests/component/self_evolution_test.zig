@@ -938,6 +938,28 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     try std.testing.expect(std.mem.indexOf(u8, runtime_r.envelopes[2].reason, "the verifier reported: failed: assert ") != null);
     try std.testing.expect(std.mem.indexOf(u8, runtime_r.envelopes[2].reason, "  PLUS  ") != null);
     try std.testing.expect(std.mem.indexOf(u8, runtime_r.envelopes[2].reason, "Satisfy EVERY one of these simultaneously") != null);
+    // 原生 host-run 裁决全链(v32):钉住假检查(pytest 风格输出,exit 1)
+    // → host 执行 → 解析 → 入库(prov=host_run)→ 注入可见。全程真 spawn。
+    {
+        ppaths.setEnv("METACODES_HOST_CHECK", "printf 'FAILED tests/hc.py::TestH::test_native_loop - AssertionError: native\\n'; exit 1");
+        defer ppaths.unsetEnv("METACODES_HOST_CHECK");
+        const host_check = cc.host_check;
+        const pin = host_check.Pin.fromEnv() orelse return error.TestExpectedPin;
+        ppaths.setEnv("METACODES_TASK_HINT", "native-task");
+        const summary = host_check.runAndIngest(a, &kg, &pin, "native-task", "native final note", 424242) orelse
+            return error.TestExpectedSummary;
+        try std.testing.expectEqual(@as(u32, 0), summary.passed);
+        try std.testing.expectEqual(@as(usize, 1), summary.ingested);
+        var built_hc = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+        defer built_hc.deinit(a);
+        const text_hc = built_hc.text orelse return error.TestExpectedInjection;
+        try std.testing.expect(std.mem.indexOf(u8, text_hc, "prov=host_run") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text_hc, "tests/hc.py::TestH::test_native_loop") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text_hc, "native final note") != null);
+        // 钉住防篡改:改环境后拒跑。
+        ppaths.setEnv("METACODES_HOST_CHECK", "echo tampered; exit 0");
+        try std.testing.expect(host_check.runAndIngest(a, &kg, &pin, "native-task", "", 424243) == null);
+    }
     ppaths.setEnv("METACODES_TASK_HINT", "wall-task");
 
     // UTF-8 截断安全(p10 现场雷):中文 note >300 字节,裸字节截断切码点
