@@ -727,23 +727,31 @@ Modern `tools/list` cache metadata is required; `server/discover` may omit both
 cache fields. Each server TTL starts when that server's discovery completes,
 not when the multi-server refresh began.
 
-Canonical MCP schemas are retained losslessly, but Revision 9 advertises only
-a bounded local validation profile. References, header projection,
-`uniqueItems: true`, numeric constraints, and numeric or structural
-`enum`/`const` are unavailable rather than approximately validated. Container,
-node, and work-unit budgets fail closed. This is not a claim of complete JSON
-Schema 2020-12 support.
-`format` is admitted as an annotation, exact JSON number lexemes survive
-validation and `tools/call` encoding, and `outputSchema` is applied only to a
-successful result. An `isError=true` Tool business error may omit
+Canonical MCP schemas are retained losslessly and dialect-transparently.
+Absent `$schema`, explicit JSON Schema 2020-12, explicit Draft-07, and any
+other string dialect declaration do not by themselves affect Tool
+availability. AgentCore validates bounded JSON structure and the MCP input
+object envelope, then projects the common `type`/`properties`/`required` shape
+to model providers; root `$schema` and non-projected root keywords remain only
+in the canonical record. This is not a claim that AgentCore implements any
+complete JSON Schema dialect.
+
+Before `tools/call`, AgentCore validates that arguments are a bounded JSON
+object and applies Permission, Skill restrictions, and canonical Tool identity.
+The MCP server remains authoritative for JSON Schema semantics. AgentCore does
+not locally reject an invocation for `required`, property type, `enum`/`const`,
+reference, or other schema-constraint mismatch. When `outputSchema` is present,
+a successful result must still carry `structuredContent`, but its schema
+semantics are server-owned. An `isError=true` Tool business error may omit
 `structuredContent` without losing its typed content.
 
 Catalog is the sole executable admission authority. A Snapshot stores only a
-canonical Tool pointer, stable model alias, and compact copied diagnostics for
-each admitted Tool. Rejected schemas and tools requiring MCP Tasks are visible
-only as catalog issues and cannot be found or selected. Session materializes a
-provider `PreparedTool` only for selected admitted entries; a non-allocation
-disagreement with the recorded admission is an invariant violation. View
+canonical Tool and stable model alias for each admitted entry. Structurally
+invalid or over-budget schemas and tools requiring MCP Tasks are visible only
+as catalog issues and cannot be found or selected; dialect and semantic
+keywords alone never create such an issue. Session materializes a provider
+`PreparedTool` only for selected admitted entries; a non-allocation disagreement
+with the recorded envelope admission is an invariant violation. View
 destruction releases materialized tools before releasing the retained
 Snapshot. MCP Tasks, notification pumping, and automatic request replay remain
 outside Revision 9.
@@ -949,15 +957,15 @@ allocations or unbounded work:
 | retained Skill catalog snapshots per Runtime | 256 MiB resident bytes |
 | active materializations per Runtime | 256 MiB |
 | MCP Runtime servers / canonical tools | 64 / 1024 |
-| MCP local-schema container entries / validation work units | 256 / 65536 |
+| MCP schema/arguments JSON container entries / admission work units | 256 / 65536 |
 | MCP legacy default TTL / maximum accepted TTL | 30 s / 300 s |
 | one Run | 1000 turns |
 | one tool_result file_refs array / path / URI / title / kind | 32 / 4096 / 8192 / 256 / 64 bytes |
 
 MCP schema and invocation JSON cross the depth/node/container/work admission
-gate before a dynamic JSON tree is allocated. Invocation number lexemes are
-retained exactly; JSON Schema `integer` means a mathematical integer (`1.0`
-and `1e3` included), not merely a value that fit Zig's i64 parser.
+gate before a dynamic JSON tree is allocated. Invocation JSON must have an
+object root; AgentCore does not interpret its values against the retained JSON
+Schema.
 
 Configuration and pre-admission Run limits return
 `METASK_AGENTCORE_STATUS_RESOURCE_LIMIT`. An oversized UI response is released exactly once,

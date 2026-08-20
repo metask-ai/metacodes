@@ -7930,10 +7930,19 @@ test "Revision 6 MCP schema denial precedes Permission callback eligibility" {
         core.permission.checkPermission(
             &session.core_session.permission_ctx,
             model_name,
-            "{\"city\":7}",
+            "[]",
         ),
     );
     try std.testing.expect(session.pending_permission == null);
+    try std.testing.expectEqual(
+        core.permission.PermissionResult.ask,
+        core.permission.checkPermission(
+            &session.core_session.permission_ctx,
+            model_name,
+            "{\"city\":7}",
+        ),
+    );
+    try std.testing.expect(session.pending_permission != null);
     try std.testing.expectEqual(
         core.permission.PermissionResult.ask,
         core.permission.checkPermission(
@@ -8136,7 +8145,7 @@ test "Revision 6 MCP view update is idle atomic and invalidates schema-bound gra
         old_model_name,
         "{\"country\":\"France\"}",
     ));
-    try std.testing.expect(!changed_run_view.validatesInvocation(
+    try std.testing.expect(changed_run_view.validatesInvocation(
         old_model_name,
         "{\"city\":\"Paris\"}",
     ));

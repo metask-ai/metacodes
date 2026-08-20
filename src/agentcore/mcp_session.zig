@@ -319,11 +319,10 @@ pub const View = struct {
         model_name: []const u8,
         arguments_json: []const u8,
     ) schema.Validation {
-        const entry = self.findModelTool(model_name) orelse
-            return .{ .invalid = .schema_violation };
+        if (self.findModelTool(model_name) == null)
+            return .{ .invalid = .not_object };
         return schema.validateArguments(
             self.allocator,
-            entry.tool.input_schema_json,
             arguments_json,
             .{},
         );
@@ -444,11 +443,10 @@ pub const Environment = struct {
         name: []const u8,
         arguments_json: []const u8,
     ) schema.Validation {
-        const entry = self.findModelTool(name) orelse
-            return .{ .invalid = .schema_violation };
+        if (self.findModelTool(name) == null)
+            return .{ .invalid = .not_object };
         return schema.validateArguments(
             self.allocator,
-            entry.tool.input_schema_json,
             arguments_json,
             .{},
         );
@@ -489,7 +487,7 @@ pub const Environment = struct {
             .valid => {},
             .invalid => |issue| switch (issue) {
                 .resource_limit => return error.ResourceLimit,
-                .invalid_json, .schema_violation => return .{ .host_rejected = try tool_ctx.allocator.dupe(u8, "MCP arguments violate the admitted schema") },
+                .invalid_json, .not_object => return .{ .host_rejected = try tool_ctx.allocator.dupe(u8, "MCP arguments must be a valid JSON object") },
             },
             .out_of_memory => return error.OutOfMemory,
         }
@@ -566,7 +564,7 @@ pub const Environment = struct {
                 return false;
             if (self.base_policy) |policy|
                 if (!policy.allowsInvocation(name, arguments_json)) return false;
-            // Preserve the ordinary schema-deny fast path, but let typed
+            // Preserve the ordinary arguments-envelope deny fast path, but let typed
             // resource/OOM failures reach dispatch. Collapsing those failures
             // into this bool would misreport infrastructure failure as user
             // denial.
@@ -768,7 +766,7 @@ test "Session MCP view never auto-selects wider Runtime authority" {
     try std.testing.expectEqual(@as(u32, 0), view.invalidated);
 }
 
-test "Session cannot select a Catalog-rejected tool and performs no call" {
+test "Session can select an opaque-schema Tool without calling it" {
     const fixture = @import("mcp_test_support.zig");
     var server = fixture.Server{
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"x\":{\"$ref\":\"#/$defs/x\"}}}",
@@ -786,17 +784,16 @@ test "Session cannot select a Catalog-rejected tool and performs no call" {
     _ = try manager.refresh();
     const snapshot = try manager.retainCurrent();
     defer snapshot.release();
-    try std.testing.expectError(
-        error.InvalidSelection,
-        View.init(std.testing.allocator, snapshot, &.{.{
-            .server_binding_identity = binding,
-            .tool_name = "weather",
-        }}, .fresh),
-    );
+    var view = try View.init(std.testing.allocator, snapshot, &.{.{
+        .server_binding_identity = binding,
+        .tool_name = "weather",
+    }}, .fresh);
+    defer view.deinit();
+    try std.testing.expectEqual(@as(usize, 1), view.entries.len);
     try std.testing.expectEqual(@as(u32, 0), server.calls);
 }
 
-test "Session MCP view binds canonical identity validates before dispatch and retains its generation" {
+test "Session MCP view binds identity validates argument envelope and retains generation" {
     const fixture = @import("mcp_test_support.zig");
     const Base = struct {
         fn dispatch(
@@ -876,7 +873,8 @@ test "Session MCP view binds canonical identity validates before dispatch and re
         &identity.binding,
     );
     try std.testing.expect(first.validatesInvocation(model_name, "{\"city\":\"Paris\"}"));
-    try std.testing.expect(!first.validatesInvocation(model_name, "{\"city\":7}"));
+    try std.testing.expect(first.validatesInvocation(model_name, "{\"city\":7}"));
+    try std.testing.expect(!first.validatesInvocation(model_name, "[]"));
 
     var environment = try Environment.init(
         std.testing.allocator,
@@ -896,19 +894,19 @@ test "Session MCP view binds canonical identity validates before dispatch and re
         model_name,
         "{\"city\":\"Paris\"}",
     ));
-    try std.testing.expect(!environment.executionPolicy().allowsInvocation(
+    try std.testing.expect(environment.executionPolicy().allowsInvocation(
         model_name,
         "{\"city\":7}",
     ));
     var tool_context = core.tool_context.ToolContext{ .allocator = std.testing.allocator };
-    var rejected = try environment.surface().dispatcher.dispatch(
+    var semantically_opaque = try environment.surface().dispatcher.dispatch(
         &tool_context,
         model_name,
         "{\"city\":7}",
     );
-    defer rejected.deinit(std.testing.allocator);
-    try std.testing.expect(rejected == .host_rejected);
-    try std.testing.expectEqual(@as(u32, 0), server.calls);
+    defer semantically_opaque.deinit(std.testing.allocator);
+    try std.testing.expect(semantically_opaque == .ok);
+    try std.testing.expectEqual(@as(u32, 1), server.calls);
     var result = try environment.surface().dispatcher.dispatch(
         &tool_context,
         model_name,
@@ -916,7 +914,7 @@ test "Session MCP view binds canonical identity validates before dispatch and re
     );
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result == .ok);
-    try std.testing.expectEqual(@as(u32, 1), server.calls);
+    try std.testing.expectEqual(@as(u32, 2), server.calls);
 
     try std.testing.expectEqual(@as(u64, 2), try manager.refresh());
     const second_snapshot = try manager.retainCurrent();

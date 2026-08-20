@@ -105,12 +105,12 @@ pub const ServerRecord = struct {
 
 pub const MAX_MODEL_TOOL_NAME_BYTES: usize = 64;
 
-/// A Snapshot stores only immutable copied admission evidence. Provider
-/// projection trees are materialized only for tools selected into a Run View.
+/// A Snapshot stores immutable canonical Tool identity and provider alias.
+/// Provider projection trees are materialized only for tools selected into a
+/// Run View.
 pub const AdmittedTool = struct {
     canonical: canonical.Tool,
     model_name: []const u8,
-    diagnostics: []const schema.ProjectionDiagnostic,
 };
 
 pub const ServerDescription = struct {
@@ -829,7 +829,7 @@ pub const Manager = struct {
                     error.InvalidSelection => error.InvalidConfig,
                     error.ResourceLimit => error.ResourceLimit,
                 };
-                const inspected = try inspectTool(a, self.allocator, model_name, tool);
+                const inspected = try inspectTool(self.allocator, model_name, tool);
                 switch (inspected) {
                     .admitted => |admitted| admitted_tools.append(a, admitted) catch
                         return error.OutOfMemory,
@@ -903,10 +903,6 @@ fn cloneServerRecord(
             .canonical = try cloneTool(allocator, &admitted.canonical),
             .model_name = allocator.dupe(u8, admitted.model_name) catch
                 return error.OutOfMemory,
-            .diagnostics = allocator.dupe(
-                schema.ProjectionDiagnostic,
-                admitted.diagnostics,
-            ) catch return error.OutOfMemory,
         };
     }
     return .{
@@ -957,10 +953,9 @@ fn cloneOptional(
 }
 
 /// Perform the one authoritative executable admission pass. The temporary
-/// PreparedTool proves the complete schema can be parsed and projected under
-/// the declared profile; only compact diagnostics survive in the Snapshot.
+/// PreparedTool proves the bounded MCP envelope can be projected for model
+/// providers; JSON Schema dialect and keyword semantics remain server-owned.
 fn inspectTool(
-    snapshot_allocator: std.mem.Allocator,
     scratch_backing: std.mem.Allocator,
     model_name: []const u8,
     tool: canonical.Tool,
@@ -972,14 +967,9 @@ fn inspectTool(
         .unavailable => |issue| .{ .unavailable = .{ .schema = issue } },
         .available => |*prepared| blk: {
             defer prepared.deinit();
-            const diagnostics = snapshot_allocator.dupe(
-                schema.ProjectionDiagnostic,
-                prepared.diagnostics,
-            ) catch return error.OutOfMemory;
             break :blk .{ .admitted = .{
                 .canonical = tool,
                 .model_name = model_name,
-                .diagnostics = diagnostics,
             } };
         },
     };
@@ -1000,18 +990,7 @@ pub fn materializeAdmittedTool(
     ) catch return error.OutOfMemory;
     return switch (admission) {
         .unavailable => error.AdmissionInvariantViolation,
-        .available => |prepared| blk: {
-            if (!std.mem.eql(
-                schema.ProjectionDiagnostic,
-                prepared.diagnostics,
-                admitted.diagnostics,
-            )) {
-                var cleanup = prepared;
-                cleanup.deinit();
-                return error.AdmissionInvariantViolation;
-            }
-            break :blk prepared;
-        },
+        .available => |prepared| prepared,
     };
 }
 
@@ -1879,9 +1858,9 @@ test "catalog description resolves stable issue identity without live handles" {
     );
 }
 
-test "Catalog is the sole admission authority for schema and required-task tools" {
+test "Catalog admits opaque schema semantics and excludes required-task tools" {
     const fixture = @import("mcp_test_support.zig");
-    var invalid_schema = fixture.Server{
+    var opaque_schema = fixture.Server{
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"x\":{\"$ref\":\"#/$defs/x\"}}}",
     };
     var required_task = Fake{ .required_task = true };
@@ -1891,7 +1870,7 @@ test "Catalog is the sole admission authority for schema and required-task tools
         .{
             .binding = invalid_binding,
             .namespace = "invalid",
-            .connector = invalid_schema.connector(),
+            .connector = opaque_schema.connector(),
             .transport = .stdio,
             .client = .{ .name = "agentcore-test", .version = "1" },
         },
@@ -1908,7 +1887,7 @@ test "Catalog is the sole admission authority for schema and required-task tools
     _ = try manager.refresh();
     const snapshot = try manager.retainCurrent();
     defer snapshot.release();
-    try std.testing.expect(snapshot.findTool(&invalid_binding, "weather") == null);
+    try std.testing.expect(snapshot.findTool(&invalid_binding, "weather") != null);
     const required_server = snapshot.findServer(&required_binding) orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 0), required_server.admitted_tools.len);
@@ -1916,16 +1895,9 @@ test "Catalog is the sole admission authority for schema and required-task tools
 
     var description = try snapshot.describe(std.testing.allocator);
     defer description.deinit();
-    try std.testing.expectEqual(@as(usize, 0), description.tools.len);
-    try std.testing.expectEqual(@as(usize, 2), description.issues.len);
-    var saw_schema = false;
-    var saw_task = false;
-    for (description.issues) |issue| {
-        if (std.mem.eql(u8, issue.kind, "unsupported_reference")) saw_schema = true;
-        if (std.mem.eql(u8, issue.kind, "task_required_unsupported")) saw_task = true;
-    }
-    try std.testing.expect(saw_schema);
-    try std.testing.expect(saw_task);
+    try std.testing.expectEqual(@as(usize, 1), description.tools.len);
+    try std.testing.expectEqual(@as(usize, 1), description.issues.len);
+    try std.testing.expectEqualStrings("task_required_unsupported", description.issues[0].kind);
 }
 
 test "catalog configuration rejects duplicate identity and unsafe namespace" {

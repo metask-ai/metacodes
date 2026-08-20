@@ -193,7 +193,7 @@ pub const Client = struct {
     ) CallOutcome {
         if (!std.mem.eql(u8, &tool.identity.server_binding_identity, &self.binding))
             return .{ .failed = .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_call) } };
-        if (schema.validateArguments(result_allocator, tool.input_schema_json, arguments_json, .{}) != .valid)
+        if (schema.validateArguments(result_allocator, arguments_json, .{}) != .valid)
             return .{ .failed = .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_call) } };
 
         self.mutex.lock();
@@ -257,23 +257,12 @@ pub const Client = struct {
             .diagnostic => |diagnostic| return .{ .failed = .{ .diagnostic = diagnostic } },
             .value => |value| value,
         };
-        if (!result.is_error) if (tool.output_schema_json) |output_schema| {
-            const structured = result.structured_content_json orelse {
+        if (!result.is_error and tool.output_schema_json != null) {
+            if (result.structured_content_json == null) {
                 result.deinit();
                 return .{ .failed = .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_call) } };
-            };
-            switch (schema.validateInstance(result_allocator, output_schema, structured, .{})) {
-                .valid => {},
-                .invalid => {
-                    result.deinit();
-                    return .{ .failed = .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_call) } };
-                },
-                .out_of_memory => {
-                    result.deinit();
-                    return .{ .failed = .out_of_memory };
-                },
             }
-        };
+        }
         return .{ .result = result };
     }
 
@@ -1100,7 +1089,7 @@ test "Classic server without tools capability never receives tools list" {
     try std.testing.expectEqual(@as(u8, 0), fake.list_requests);
 }
 
-test "tool business error is preserved without success structuredContent" {
+test "server remains schema authority and its Tool error is preserved" {
     var fake = FakeConnector{
         .era = .modern_2026_07_28,
         .business_error = true,
@@ -1119,7 +1108,7 @@ test "tool business error is preserved without success structuredContent" {
     var called = client.callTool(
         std.testing.allocator,
         &client.catalog.tools[0],
-        "{\"city\":\"Paris\"}",
+        "{\"city\":7}",
         .{},
     );
     defer if (called == .result) called.result.deinit();

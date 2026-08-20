@@ -819,6 +819,7 @@ const PublicMcpProbe = struct {
     server_era_code: u32 = wire.MCP_ERA_2026_07_28,
     advertise_tools: bool = true,
     required_task: bool = false,
+    dialect_matrix: bool = false,
     tool_count: u8 = 1,
     probe_open_status: u32 = wire.MCP_OPEN_OK,
     probe_exchange_status: ?u32 = null,
@@ -975,11 +976,18 @@ const PublicMcpProbe = struct {
                 eraIndex(connection.era_code) orelse
                     return wire.MCP_EXCHANGE_FATAL
             ] += 1;
-            if (self.tool_count == 0 or self.tool_count > 2)
+            if (!self.dialect_matrix and (self.tool_count == 0 or self.tool_count > 2))
                 return wire.MCP_EXCHANGE_FATAL;
             break :blk if (self.required_task) std.fmt.allocPrint(
                 std.heap.c_allocator,
                 "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"tasked\",\"inputSchema\":{{\"type\":\"object\"}},\"execution\":{{\"taskSupport\":\"required\"}}}}],\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
+                .{id},
+            ) else if (self.dialect_matrix) std.fmt.allocPrint(
+                std.heap.c_allocator,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[" ++
+                    "{{\"name\":\"implicit\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"implicit_arg\":{{\"type\":\"string\"}}}},\"required\":[\"implicit_arg\"]}}}}," ++
+                    "{{\"name\":\"modern\",\"inputSchema\":{{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\",\"properties\":{{\"modern_arg\":{{\"type\":\"string\"}}}},\"required\":[\"modern_arg\"]}}}}," ++
+                    "{{\"name\":\"draft7\",\"inputSchema\":{{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"type\":\"object\",\"properties\":{{\"draft7_arg\":{{\"type\":\"string\",\"minLength\":1}}}},\"required\":[\"draft7_arg\"],\"additionalProperties\":false}},\"outputSchema\":{{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"type\":\"object\"}}}}],\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
                 .{id},
             ) else if (self.server_era_code == wire.MCP_ERA_2026_07_28 and self.tool_count == 2) std.fmt.allocPrint(
                 std.heap.c_allocator,
@@ -1660,6 +1668,140 @@ test "L2 public MCP wire failures preserve downgrade and no-replay semantics" {
         runtime = null;
         try probe.expectClosedExactlyOnce();
     }
+}
+
+test "L2 MCP admits implicit 2020-12 and Draft-07 schemas and projects all Tools" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var provider = try harness.MockServer.start(FINAL_SSE, 0);
+    defer provider.stop();
+    const base_url = try provider.urlOwned(a);
+    defer a.free(base_url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+
+    var probe = PublicMcpProbe{ .dialect_matrix = true };
+    var server = std.mem.zeroes(wire.McpServerV1);
+    server.struct_size = @sizeOf(wire.McpServerV1);
+    server.transport_code = wire.MCP_TRANSPORT_STDIO;
+    server.negotiation_policy_code = wire.MCP_NEGOTIATION_AUTO;
+    server.server_binding_identity = [_]u8{0x6d} ** 32;
+    server.configuration_fingerprint = server.server_binding_identity;
+    server.namespace = sdk.bytesView("dialects");
+    server.client_name = sdk.bytesView("agentcore-component-test");
+    server.client_version = sdk.bytesView("9");
+    server.timeout_ms = 1000;
+    server.connector = probe.connector();
+    const servers = [_]wire.McpServerV1{server};
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    runtime_config.mcp_servers = &servers;
+    runtime_config.mcp_server_count = servers.len;
+    var runtime: ?*wire.RuntimeHandle = null;
+    var session: ?*wire.SessionHandle = null;
+    defer {
+        if (session) |handle| {
+            _ = api.sessionDestroy()(handle, &diagnostic);
+            session = null;
+            api.bufferRelease()(&diagnostic);
+        }
+        if (runtime) |handle| {
+            _ = api.runtimeDestroy()(handle, &diagnostic);
+            runtime = null;
+            api.bufferRelease()(&diagnostic);
+        }
+    }
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+    );
+    var generation: u64 = 0;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeRefreshMcp()(runtime, &generation, &diagnostic),
+    );
+
+    var description = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&description);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeDescribeMcp()(runtime, &description, &diagnostic),
+    );
+    const encoded = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
+    const decoded = try sdk.decodeMcpCatalog(a, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 3), decoded.value.tools.len);
+    try std.testing.expectEqual(@as(usize, 0), decoded.value.issues.len);
+    var saw_implicit = false;
+    var saw_modern = false;
+    var saw_draft7 = false;
+    for (decoded.value.tools) |tool| {
+        if (std.mem.eql(u8, tool.canonical_name, "implicit")) saw_implicit = true;
+        if (std.mem.eql(u8, tool.canonical_name, "modern")) saw_modern = true;
+        if (std.mem.eql(u8, tool.canonical_name, "draft7")) saw_draft7 = true;
+    }
+    try std.testing.expect(saw_implicit and saw_modern and saw_draft7);
+
+    var selectors = [_]wire.McpSelectorV1{
+        std.mem.zeroes(wire.McpSelectorV1),
+        std.mem.zeroes(wire.McpSelectorV1),
+        std.mem.zeroes(wire.McpSelectorV1),
+    };
+    const names = [_][]const u8{ "implicit", "modern", "draft7" };
+    for (&selectors, names) |*selector, name| {
+        selector.struct_size = @sizeOf(wire.McpSelectorV1);
+        selector.server_binding_identity = server.server_binding_identity;
+        selector.tool_name = sdk.bytesView(name);
+    }
+    var selection = std.mem.zeroes(wire.McpSelectionV1);
+    selection.struct_size = @sizeOf(wire.McpSelectionV1);
+    selection.selectors = &selectors;
+    selection.selector_count = selectors.len;
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView(base_url);
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    host.mcp_selection = &selection;
+    var create_config = sessionCreateConfig(&host, "test-model");
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.on_event = acceptEvent;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionCreate()(runtime, &create_config, &callbacks, &session, &diagnostic),
+    );
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRunText(
+            session,
+            1,
+            sdk.bytesView("inspect available MCP Tools"),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    const request = provider.requestAt(0) orelse return error.NoRequestCaptured;
+    for ([_][]const u8{ "implicit_arg", "modern_arg", "draft7_arg" }) |property|
+        try std.testing.expect(std.mem.indexOf(u8, request.body(), property) != null);
+    try std.testing.expect(std.mem.indexOf(u8, request.body(), "\"$schema\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, request.body(), "draft-07") == null);
 }
 
 test "L2 public MCP catalog preserves heterogeneous multi-server tool windows" {

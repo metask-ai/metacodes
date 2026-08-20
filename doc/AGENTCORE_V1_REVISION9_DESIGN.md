@@ -26,9 +26,10 @@ Authorization 采用默认拒绝的 concrete Skill policy。公开 `skill_id` �
 来源贡献与内容版本；逻辑策略名由 `skill_policy_key` 表达。Session 原子绑定
 Catalog + Policy，执行同时校验 catalog revision 和 concrete Skill identity。
 
-Completion 的既定范围和实现保持不变。Revision 9 不包含 Host Tool 修改、
-Provider Registry、remote/custom provider、管理型 catalog observation、格式
-adapter、多模态、异步工具调度或完整 RunOptions。
+Completion 的既定范围和实现保持不变。MCP 只修正 schema admission 边界：
+`$schema` 不再决定 Tool 可用性，服务端负责 JSON Schema 语义。Revision 9 不包含
+Host Tool 修改、Provider Registry、remote/custom provider、管理型 catalog
+observation、格式 adapter、多模态、异步工具调度或完整 RunOptions。
 
 ```text
 修改：AgentCore Skill facade / public wire / SDK / conformance tests / 文档
@@ -95,6 +96,20 @@ AgentCore
 ```
 
 Completion 与 Agent Runtime 平级，不从 Session 派生，不读取或修改 Conversation，不经过 AgentLoop，也不共享 Session 的 Provider client。
+
+### 2.3 MCP schema 边界修正
+
+AgentCore 不是通用 JSON Schema validator。Canonical catalog 无损保存原始
+`inputSchema`/`outputSchema`；无 `$schema`、显式 2020-12 和显式 Draft-07 是一等
+验收场景，其他字符串 dialect 同样不能单独导致 Tool unavailable。Provider
+projection 只提取通用 object/properties/required 形状，不把根级 `$schema` 发给
+模型。
+
+调用前只检查 arguments 是资源受限的 JSON object，并继续执行 Permission、Skill
+restriction 和 canonical MCP Tool identity 校验。required、property type、enum、
+reference 等 JSON Schema 语义由 MCP Server 最终验证；服务端拒绝作为 Tool error
+返回，而不是误报为 catalog、权限或 transport 失败。本次不新增 dialect adapter，
+也不修改具体 Provider client。
 
 ## 3. Workspace Skill SDK
 
@@ -449,6 +464,10 @@ Revision 9 导出的 checkpoint 继续使用当前 schema 和 compatibility mark
 | `src/agentcore/skill_catalog_handles.zig` | 默认来源、附加来源验证与 Workspace authority |
 | `src/agentcore/session_authority.zig` | checkpoint selection 交集使用 concrete identity |
 | `src/skills/runtime/catalog.zig` | 最小来源/贡献/内容身份 metadata seam；resolver 不重写 |
+| `src/agentcore/mcp_schema.zig` | dialect-transparent envelope admission 与 Provider 投影 |
+| `src/agentcore/mcp_catalog.zig` | dialect/semantic keyword 不再淘汰 Tool |
+| `src/agentcore/mcp_session.zig` | 调用前只执行 JSON object envelope 校验 |
+| `src/agentcore/mcp_runtime.zig` | MCP Server 负责 input/output schema 语义 |
 | `src/agentcore/completion_handles.zig` | 既有 R9 Completion 实现保持不变 |
 | `sdk/metask/agentcore.h` | 同步 R9 C ABI |
 | `sdk/zig/root.zig` | Zig SDK 包装与 exact R9 table 校验 |
@@ -512,7 +531,16 @@ Host Tool ABI
 - 非预期 tool/server-tool 事件不会被静默解释为完整文本结果；
 - 所有成功和失败路径无内存泄漏、无凭据悬挂引用。
 
-### 7.3 ABI 与交付
+### 7.3 MCP schema compatibility
+
+- 无 `$schema`、显式 2020-12、显式 Draft-07 都进入同一可执行 catalog；
+- 三类 Tool 同时投影到 Provider 请求，properties/required 保留且根级 `$schema` 不发送；
+- dialect、reference、数值约束和未知 semantic keyword 不单独淘汰 Tool；
+- 非法 JSON、非 object arguments 和资源超限仍在本地拒绝；
+- schema 语义不匹配的 object arguments 能到达 MCP Server，服务端 Tool error 完整返回；
+- outputSchema dialect 不影响 Tool admission，成功结果仍要求 structuredContent。
+
+### 7.4 ABI 与交付
 
 - Zig/C/C++/Rust 的 struct size、alignment、offset 和函数表一致；
 - R9 revision、table size 和 capability bits 精确匹配；
@@ -566,6 +594,7 @@ Revision 9 只有同时满足以下条件才算完成：
 - Completion 是独立 handle，不借用 Session/Runtime 的 Provider 生命周期；
 - complete、stream、abort、destroy 的所有权和并发状态均有可执行测试；
 - 没有修改 Core、AgentLoop、Provider 实现或 Host Tool；
+- MCP schema dialect 不决定 Tool 可用性，服务端保有 schema 语义权威；
 - 没有升级 ABI revision、checkpoint/catalog schema 名称或 MCP schema；
 - 公共 Header、Zig SDK、Rust SDK、artifact 和 normative 文档原子一致；
 - `agentcore:test` 与 `agentcore:gate` 全部通过。
