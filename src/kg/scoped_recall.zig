@@ -293,6 +293,35 @@ pub fn bestHistoryRow(history: []const []u8, newest: []const u8) ?[]const u8 {
     return best;
 }
 
+/// v37 note 载体的逐字复现指令(与 obligation_gate.appendArtifactFirst 同一
+/// "--- path ---" 定界契约):工件未截断 → FIRST-edit UNCHANGED 逐字令;
+/// 截断 → 参考-重建语义(半个文件+UNCHANGED=语法错误毒药)。
+fn appendVerbatimDirective(out: *std.ArrayList(u8), allocator: std.mem.Allocator, best: []const u8) void {
+    const marker = std.mem.indexOf(u8, best, "best-attempt artifact") orelse return;
+    const path_open = std.mem.indexOfPos(u8, best, marker, "--- ") orelse return;
+    const path_close = std.mem.indexOfPos(u8, best, path_open + 4, " ---") orelse return;
+    const path = best[path_open + 4 .. path_close];
+    if (path.len == 0 or path.len > 160) return;
+    if (std.mem.indexOfScalar(u8, path, '\n') != null) return;
+    const truncated = std.mem.indexOfPos(u8, best, marker, "HOST-TRUNCATED") != null;
+    if (truncated) {
+        out.appendSlice(allocator, "FIRST EDIT: rebuild the complete file at `") catch return;
+        out.appendSlice(allocator, path) catch return;
+        out.appendSlice(allocator,
+            "` using the quoted artifact above as the authoritative reference for " ++
+                "signature, imports and shape (it is HOST-TRUNCATED — do not copy it " ++
+                "verbatim). Only then apply the expected-side fixes the reports demand.\n") catch return;
+        return;
+    }
+    out.appendSlice(allocator, "FIRST EDIT: write the artifact quoted above to `") catch return;
+    out.appendSlice(allocator, path) catch return;
+    out.appendSlice(allocator,
+        "` byte-for-byte UNCHANGED — do not retype it from memory, do not adjust " ++
+            "signatures, file modes or imports; every free-hand rewrite so far has " ++
+            "regressed an already-solved facet. Only after that file is in place " ++
+            "apply the expected-side fixes the reports demand.\n") catch return;
+}
+
 /// v36 卡滞平台判定:最近 3 行(升序尾部)reward 相同且 failing 段逐字节
 /// 相同 → 压力栈已被证明非因果。任何变化(新失败名/新分数)即打破。
 pub fn stuckPlateau(history: []const []u8) bool {
@@ -435,10 +464,12 @@ pub fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClien
         if (ever_solved) {
             if (!gate.rowSolved(body)) {
                 // 最新回归:引用最佳全过行(含 final_note 的已证方案)。
+                var best_for_directive: ?[]const u8 = null;
                 if (bestHistoryRow(history.items, body)) |best| {
                     out.appendSlice(allocator, "# 历史最佳尝试(全过;host 声明)\n") catch return null;
                     out.appendSlice(allocator, best) catch return null;
                     out.appendSlice(allocator, "\n") catch return null;
+                    best_for_directive = best;
                 }
                 out.appendSlice(allocator,
                     "The newest attempt REGRESSED from an already-proven configuration. " ++
@@ -447,8 +478,14 @@ pub fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClien
                         "requirements. Where a stored memory, note, or correction contradicts " ++
                         "the proven configuration above, the proven configuration wins — treat " ++
                         "the contradicting memory as stale. Re-run your whole check suite to " ++
-                        "confirm.\n" ++
-                        "</system-reminder>\n") catch return null;
+                        "confirm.\n") catch return null;
+                // v37(p37 取证):VERBATIM 逐字指令原先只挂在 nudge 文本里——
+                // agent 提前自己碰了工件路径 → 义务提前 met → nudge 永不触发
+                // → 指令丢失,模型第三次徒手重打实现(漏 'rb',6×TypeError)。
+                // 指令改由 note 正文携带:note 无触发条件、每轮必达。路径从
+                // 工件块机械提取,与 appendArtifactFirst 同一定界契约。
+                if (best_for_directive) |best| appendVerbatimDirective(&out, allocator, best);
+                out.appendSlice(allocator, "</system-reminder>\n") catch return null;
                 return out.toOwnedSlice(allocator) catch null;
             }
             out.appendSlice(allocator,

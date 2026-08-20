@@ -1160,6 +1160,16 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         var sym_lens2: [cc.kg_scoped_recall.MAX_SUPERSEDED_SYMBOLS]usize = undefined;
         try std.testing.expectEqual(@as(usize, 0), cc.kg_scoped_recall.artifactSupersededSymbols(a, &kg, "wall-task", &sym_storage2, &sym_lens2));
     }
+    // v37 note 载体逐字指令(撤修复必红——p37 取证:义务提前 met 让 nudge
+    // 里的 VERBATIM 指令永不送达,模型第三次徒手重打漏 'rb'):回归态
+    // note 正文必须自带 FIRST-edit 逐字令与工件路径。
+    {
+        var built_vb = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+        defer built_vb.deinit(a);
+        const text_vb = built_vb.text orelse return error.TestExpectedInjection;
+        try std.testing.expect(std.mem.indexOf(u8, text_vb, "FIRST EDIT: write the artifact quoted above to `pkg/_helper.py`") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text_vb, "byte-for-byte UNCHANGED") != null);
+    }
 
     // v35 L2(cap 钉最佳,撤修复必红——旧 cap 只留最新 8 行,最老的全过
     // 行被驱逐 → 曾经全过失明 → 鬼义务复武装):唯一全过行最老 + 8 条
