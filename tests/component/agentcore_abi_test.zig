@@ -820,6 +820,7 @@ const PublicMcpProbe = struct {
     advertise_tools: bool = true,
     required_task: bool = false,
     dialect_matrix: bool = false,
+    business_error: bool = false,
     tool_count: u8 = 1,
     probe_open_status: u32 = wire.MCP_OPEN_OK,
     probe_exchange_status: ?u32 = null,
@@ -838,6 +839,7 @@ const PublicMcpProbe = struct {
     list_requests: u32 = 0,
     list_requests_by_era: [4]u32 = [_]u32{0} ** 4,
     call_requests: u32 = 0,
+    saw_schema_mismatch_arguments: bool = false,
     notifications: u32 = 0,
     notifications_by_era: [4]u32 = [_]u32{0} ** 4,
     closes: u32 = 0,
@@ -987,7 +989,8 @@ const PublicMcpProbe = struct {
                 "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[" ++
                     "{{\"name\":\"implicit\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"implicit_arg\":{{\"type\":\"string\"}}}},\"required\":[\"implicit_arg\"]}}}}," ++
                     "{{\"name\":\"modern\",\"inputSchema\":{{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\",\"properties\":{{\"modern_arg\":{{\"type\":\"string\"}}}},\"required\":[\"modern_arg\"]}}}}," ++
-                    "{{\"name\":\"draft7\",\"inputSchema\":{{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"type\":\"object\",\"properties\":{{\"draft7_arg\":{{\"type\":\"string\",\"minLength\":1}}}},\"required\":[\"draft7_arg\"],\"additionalProperties\":false}},\"outputSchema\":{{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"type\":\"object\"}}}}],\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
+                    "{{\"name\":\"draft7\",\"inputSchema\":{{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"type\":\"object\",\"properties\":{{\"draft7_arg\":{{\"type\":\"string\",\"minLength\":1}}}},\"required\":[\"draft7_arg\"],\"additionalProperties\":false}},\"outputSchema\":{{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"type\":\"object\"}}}}," ++
+                    "{{\"name\":\"custom\",\"inputSchema\":{{\"$schema\":\"https://example.invalid/custom-dialect\",\"type\":\"object\",\"properties\":{{\"custom_arg\":{{\"type\":\"string\"}}}},\"required\":[\"custom_arg\"]}}}}],\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
                 .{id},
             ) else if (self.server_era_code == wire.MCP_ERA_2026_07_28 and self.tool_count == 2) std.fmt.allocPrint(
                 std.heap.c_allocator,
@@ -1006,9 +1009,16 @@ const PublicMcpProbe = struct {
                 "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"city\":{{\"type\":\"string\"}}}},\"required\":[\"city\"],\"additionalProperties\":false}},\"outputSchema\":{{\"type\":\"object\",\"properties\":{{\"ok\":{{\"type\":\"boolean\"}}}},\"required\":[\"ok\"]}}}}]}}}}",
                 .{id},
             );
-        } else if (std.mem.indexOf(u8, encoded, "tools/call") != null) {
+        } else if (std.mem.indexOf(u8, encoded, "tools/call") != null) blk: {
             self.call_requests += 1;
-            return wire.MCP_EXCHANGE_FATAL;
+            if (!self.business_error) return wire.MCP_EXCHANGE_FATAL;
+            self.saw_schema_mismatch_arguments =
+                std.mem.indexOf(u8, encoded, "\"city\":7") != null;
+            break :blk std.fmt.allocPrint(
+                std.heap.c_allocator,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"content\":[{{\"type\":\"text\",\"text\":\"city must be string\"}}],\"isError\":true}}}}",
+                .{id},
+            );
         } else return wire.MCP_EXCHANGE_FATAL;
         const owned = response catch return wire.MCP_EXCHANGE_FATAL;
         self.requests += 1;
@@ -1104,6 +1114,39 @@ const PublicMcpProbe = struct {
             wire.MCP_ERA_2025_06_18 => "2025-06-18",
             else => null,
         };
+    }
+};
+
+const PublicMcpToolErrorProbe = struct {
+    saw_error: bool = false,
+    preserved_content: bool = false,
+
+    fn event(
+        raw: ?*anyopaque,
+        _: ?*const wire.RunContextV1,
+        event_json: wire.BytesViewV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const bytes = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, bytes) catch
+            return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        const event_value = switch (parsed.value) {
+            .known => |known| known,
+            .unknown => return wire.EVENT_CONTINUE,
+        };
+        switch (event_value) {
+            .tool_result => |result| {
+                self.saw_error = result.is_error;
+                self.preserved_content = std.mem.indexOf(
+                    u8,
+                    result.content,
+                    "city must be string",
+                ) != null;
+            },
+            else => {},
+        }
+        return wire.EVENT_CONTINUE;
     }
 };
 
@@ -1670,7 +1713,7 @@ test "L2 public MCP wire failures preserve downgrade and no-replay semantics" {
     }
 }
 
-test "L2 MCP admits implicit 2020-12 and Draft-07 schemas and projects all Tools" {
+test "L2 MCP admits primary and other string dialects and projects all Tools" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1737,24 +1780,27 @@ test "L2 MCP admits implicit 2020-12 and Draft-07 schemas and projects all Tools
     const encoded = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
     const decoded = try sdk.decodeMcpCatalog(a, encoded);
     defer decoded.deinit();
-    try std.testing.expectEqual(@as(usize, 3), decoded.value.tools.len);
+    try std.testing.expectEqual(@as(usize, 4), decoded.value.tools.len);
     try std.testing.expectEqual(@as(usize, 0), decoded.value.issues.len);
     var saw_implicit = false;
     var saw_modern = false;
     var saw_draft7 = false;
+    var saw_custom = false;
     for (decoded.value.tools) |tool| {
         if (std.mem.eql(u8, tool.canonical_name, "implicit")) saw_implicit = true;
         if (std.mem.eql(u8, tool.canonical_name, "modern")) saw_modern = true;
         if (std.mem.eql(u8, tool.canonical_name, "draft7")) saw_draft7 = true;
+        if (std.mem.eql(u8, tool.canonical_name, "custom")) saw_custom = true;
     }
-    try std.testing.expect(saw_implicit and saw_modern and saw_draft7);
+    try std.testing.expect(saw_implicit and saw_modern and saw_draft7 and saw_custom);
 
     var selectors = [_]wire.McpSelectorV1{
         std.mem.zeroes(wire.McpSelectorV1),
         std.mem.zeroes(wire.McpSelectorV1),
         std.mem.zeroes(wire.McpSelectorV1),
+        std.mem.zeroes(wire.McpSelectorV1),
     };
-    const names = [_][]const u8{ "implicit", "modern", "draft7" };
+    const names = [_][]const u8{ "implicit", "modern", "draft7", "custom" };
     for (&selectors, names) |*selector, name| {
         selector.struct_size = @sizeOf(wire.McpSelectorV1);
         selector.server_binding_identity = server.server_binding_identity;
@@ -1798,10 +1844,148 @@ test "L2 MCP admits implicit 2020-12 and Draft-07 schemas and projects all Tools
         ),
     );
     const request = provider.requestAt(0) orelse return error.NoRequestCaptured;
-    for ([_][]const u8{ "implicit_arg", "modern_arg", "draft7_arg" }) |property|
+    for ([_][]const u8{ "implicit_arg", "modern_arg", "draft7_arg", "custom_arg" }) |property|
         try std.testing.expect(std.mem.indexOf(u8, request.body(), property) != null);
     try std.testing.expect(std.mem.indexOf(u8, request.body(), "\"$schema\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, request.body(), "draft-07") == null);
+}
+
+test "L2 MCP server schema Tool error crosses Session and ABI intact" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var provider_bodies = [_][]const u8{ FINAL_SSE, FINAL_SSE };
+    var provider = try harness.MockServer.startCassette(&provider_bodies, 0);
+    defer provider.stop();
+    const base_url = try provider.urlOwned(a);
+    defer a.free(base_url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+
+    var mcp_probe = PublicMcpProbe{ .business_error = true };
+    var mcp_server = std.mem.zeroes(wire.McpServerV1);
+    mcp_server.struct_size = @sizeOf(wire.McpServerV1);
+    mcp_server.transport_code = wire.MCP_TRANSPORT_STDIO;
+    mcp_server.negotiation_policy_code = wire.MCP_NEGOTIATION_AUTO;
+    mcp_server.server_binding_identity = [_]u8{0x73} ** 32;
+    mcp_server.configuration_fingerprint = mcp_server.server_binding_identity;
+    mcp_server.namespace = sdk.bytesView("schemaerror");
+    mcp_server.client_name = sdk.bytesView("agentcore-component-test");
+    mcp_server.client_version = sdk.bytesView("9");
+    mcp_server.timeout_ms = 1000;
+    mcp_server.connector = mcp_probe.connector();
+    const servers = [_]wire.McpServerV1{mcp_server};
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    runtime_config.mcp_servers = &servers;
+    runtime_config.mcp_server_count = servers.len;
+    var runtime: ?*wire.RuntimeHandle = null;
+    var session: ?*wire.SessionHandle = null;
+    defer {
+        if (session) |handle| {
+            _ = api.sessionDestroy()(handle, &diagnostic);
+            session = null;
+            api.bufferRelease()(&diagnostic);
+        }
+        if (runtime) |handle| {
+            _ = api.runtimeDestroy()(handle, &diagnostic);
+            runtime = null;
+            api.bufferRelease()(&diagnostic);
+        }
+    }
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+    );
+    var generation: u64 = 0;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeRefreshMcp()(runtime, &generation, &diagnostic),
+    );
+
+    var selector = std.mem.zeroes(wire.McpSelectorV1);
+    selector.struct_size = @sizeOf(wire.McpSelectorV1);
+    selector.server_binding_identity = mcp_server.server_binding_identity;
+    selector.tool_name = sdk.bytesView("weather");
+    const selectors = [_]wire.McpSelectorV1{selector};
+    var selection = std.mem.zeroes(wire.McpSelectionV1);
+    selection.struct_size = @sizeOf(wire.McpSelectionV1);
+    selection.selectors = &selectors;
+    selection.selector_count = selectors.len;
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView(base_url);
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    host.mcp_selection = &selection;
+    var create_config = sessionCreateConfig(&host, "test-model");
+    var event_probe = PublicMcpToolErrorProbe{};
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &event_probe;
+    callbacks.on_event = PublicMcpToolErrorProbe.event;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionCreate()(runtime, &create_config, &callbacks, &session, &diagnostic),
+    );
+
+    var session_description = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&session_description);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionDescribe()(session, &session_description, &diagnostic),
+    );
+    const encoded_description = try sdk.borrowedBytes(.{
+        .ptr = session_description.ptr,
+        .len = session_description.len,
+    });
+    const decoded_description = try sdk.decodeSessionDescription(a, encoded_description);
+    defer decoded_description.deinit();
+    try std.testing.expectEqual(@as(usize, 1), decoded_description.value.mcp.tools.len);
+    const model_name = decoded_description.value.mcp.tools[0].model_name;
+    const tool_sse = try std.fmt.allocPrint(
+        a,
+        "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_mcp_error\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_mcp_error\",\"name\":\"{s}\",\"input\":{{}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"city\\\":7}}\"}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
+            "data: {{\"type\":\"message_stop\"}}\n\n",
+        .{model_name},
+    );
+    defer a.free(tool_sse);
+    provider_bodies[0] = tool_sse;
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 2;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRunText(
+            session,
+            1,
+            sdk.bytesView("call the MCP weather Tool"),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
+    try std.testing.expectEqual(@as(u32, 1), mcp_probe.call_requests);
+    try std.testing.expect(mcp_probe.saw_schema_mismatch_arguments);
+    try std.testing.expect(event_probe.saw_error);
+    try std.testing.expect(event_probe.preserved_content);
 }
 
 test "L2 public MCP catalog preserves heterogeneous multi-server tool windows" {

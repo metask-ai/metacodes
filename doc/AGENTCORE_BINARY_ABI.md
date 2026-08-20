@@ -736,6 +736,14 @@ to model providers; root `$schema` and non-projected root keywords remain only
 in the canonical record. This is not a claim that AgentCore implements any
 complete JSON Schema dialect.
 
+Provider projection must nevertheless be structurally complete. A `$ref` or
+`$dynamicRef` inside the projected `properties` tree is unavailable with
+`provider_critical_projection_loss`, because the common Provider Tool shape
+does not carry the canonical root `$defs`; AgentCore does not silently emit a
+dangling reference or resolve it locally. Root `required` entries must be
+unique and name projected properties. These are projection-integrity checks,
+not JSON Schema instance validation.
+
 Before `tools/call`, AgentCore validates that arguments are a bounded JSON
 object and applies Permission, Skill restrictions, and canonical Tool identity.
 The MCP server remains authoritative for JSON Schema semantics. AgentCore does
@@ -747,9 +755,10 @@ semantics are server-owned. An `isError=true` Tool business error may omit
 
 Catalog is the sole executable admission authority. A Snapshot stores only a
 canonical Tool and stable model alias for each admitted entry. Structurally
-invalid or over-budget schemas and tools requiring MCP Tasks are visible only
-as catalog issues and cannot be found or selected; dialect and semantic
-keywords alone never create such an issue. Session materializes a provider
+invalid, over-budget, or projection-incomplete schemas and tools requiring MCP
+Tasks are visible only as catalog issues and cannot be found or selected;
+dialect and semantic keywords alone never create such an issue. Session
+materializes a provider
 `PreparedTool` only for selected admitted entries; a non-allocation disagreement
 with the recorded envelope admission is an invariant violation. View
 destruction releases materialized tools before releasing the retained

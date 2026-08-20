@@ -766,7 +766,7 @@ test "Session MCP view never auto-selects wider Runtime authority" {
     try std.testing.expectEqual(@as(u32, 0), view.invalidated);
 }
 
-test "Session can select an opaque-schema Tool without calling it" {
+test "Session cannot select a Tool with a broken Provider projection" {
     const fixture = @import("mcp_test_support.zig");
     var server = fixture.Server{
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"x\":{\"$ref\":\"#/$defs/x\"}}}",
@@ -784,12 +784,13 @@ test "Session can select an opaque-schema Tool without calling it" {
     _ = try manager.refresh();
     const snapshot = try manager.retainCurrent();
     defer snapshot.release();
-    var view = try View.init(std.testing.allocator, snapshot, &.{.{
-        .server_binding_identity = binding,
-        .tool_name = "weather",
-    }}, .fresh);
-    defer view.deinit();
-    try std.testing.expectEqual(@as(usize, 1), view.entries.len);
+    try std.testing.expectError(
+        error.InvalidSelection,
+        View.init(std.testing.allocator, snapshot, &.{.{
+            .server_binding_identity = binding,
+            .tool_name = "weather",
+        }}, .fresh),
+    );
     try std.testing.expectEqual(@as(u32, 0), server.calls);
 }
 

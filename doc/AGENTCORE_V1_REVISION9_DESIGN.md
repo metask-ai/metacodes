@@ -105,11 +105,21 @@ AgentCore 不是通用 JSON Schema validator。Canonical catalog 无损保存原
 projection 只提取通用 object/properties/required 形状，不把根级 `$schema` 发给
 模型。
 
+Dialect-transparent admission 不等于允许 AgentCore 产生坏的 Provider schema。
+当前公共投影不携带 canonical 根级 `$defs`，因此投影 `properties` 子树内出现
+`$ref`/`$dynamicRef` 时，以 `provider_critical_projection_loss` 排除；根级
+`required` 必须唯一且指向投影字段。AgentCore 不静默发送悬空引用，也不在本地
+解析引用。这些只属于 projection integrity，不恢复 JSON Schema 语义验证。
+
 调用前只检查 arguments 是资源受限的 JSON object，并继续执行 Permission、Skill
 restriction 和 canonical MCP Tool identity 校验。required、property type、enum、
 reference 等 JSON Schema 语义由 MCP Server 最终验证；服务端拒绝作为 Tool error
 返回，而不是误报为 catalog、权限或 transport 失败。本次不新增 dialect adapter，
 也不修改具体 Provider client。
+
+R9 明确放弃 dialect token 白名单和 Permission 前的本地 schema 实例拦截，因此不再
+提供未知方言或参数语义不匹配的早期类型化拒绝；换取的是零方言表维护、更广的 MCP
+生态覆盖，以及 MCP Server 作为唯一 schema 语义权威。
 
 ## 3. Workspace Skill SDK
 
@@ -535,7 +545,9 @@ Host Tool ABI
 
 - 无 `$schema`、显式 2020-12、显式 Draft-07 都进入同一可执行 catalog；
 - 三类 Tool 同时投影到 Provider 请求，properties/required 保留且根级 `$schema` 不发送；
-- dialect、reference、数值约束和未知 semantic keyword 不单独淘汰 Tool；
+- dialect、数值约束和未知 semantic keyword 不单独淘汰 Tool；
+- 投影树内无法携带定义的 `$ref`/`$dynamicRef` 形成 typed projection issue；
+- 根级 `required` 重复或无法映射到 projected properties 时不进入 Run；
 - 非法 JSON、非 object arguments 和资源超限仍在本地拒绝；
 - schema 语义不匹配的 object arguments 能到达 MCP Server，服务端 Tool error 完整返回；
 - outputSchema dialect 不影响 Tool admission，成功结果仍要求 structuredContent。

@@ -275,15 +275,60 @@ fn validateSchemaEnvelope(value: std.json.Value, input: bool) ?Issue {
         if (root_type != .string or !std.mem.eql(u8, root_type.string, "object"))
             return .{ .code = .provider_critical_projection_loss, .keyword = "type" };
     }
-    if (value.object.get("properties")) |properties|
-        if (properties != .object)
+    const properties = value.object.get("properties");
+    if (properties) |projected| {
+        if (projected != .object)
             return .{ .code = .invalid_schema, .keyword = "properties" };
+        if (input) {
+            var iterator = projected.object.iterator();
+            while (iterator.next()) |entry|
+                if (findProjectedReference(entry.value_ptr.*)) |keyword|
+                    return .{
+                        .code = .provider_critical_projection_loss,
+                        .keyword = keyword,
+                    };
+        }
+    }
     if (value.object.get("required")) |required| {
         if (required != .array)
             return .{ .code = .invalid_schema, .keyword = "required" };
-        for (required.array.items) |item|
+        for (required.array.items, 0..) |item, index| {
             if (item != .string)
                 return .{ .code = .invalid_schema, .keyword = "required" };
+            if (input) {
+                for (required.array.items[0..index]) |prior|
+                    if (std.mem.eql(u8, prior.string, item.string))
+                        return .{ .code = .invalid_schema, .keyword = "required" };
+                if (properties == null or properties.?.object.get(item.string) == null)
+                    return .{
+                        .code = .provider_critical_projection_loss,
+                        .keyword = "required",
+                    };
+            }
+        }
+    }
+    return null;
+}
+
+/// References inside the projected `properties` tree cannot be forwarded
+/// intact because the common Provider Tool shape does not carry the canonical
+/// root `$defs`. Reject that broken projection without interpreting any JSON
+/// Schema constraint or resolving references locally.
+/// The context-free fail-closed walk may also reject a nested property
+/// literally named `$ref`; R9 accepts that rare conservative trade-off.
+fn findProjectedReference(value: std.json.Value) ?[]const u8 {
+    switch (value) {
+        .object => |object| {
+            if (object.get("$ref") != null) return "$ref";
+            if (object.get("$dynamicRef") != null) return "$dynamicRef";
+            var iterator = object.iterator();
+            while (iterator.next()) |entry|
+                if (findProjectedReference(entry.value_ptr.*)) |keyword|
+                    return keyword;
+        },
+        .array => |array| for (array.items) |item|
+            if (findProjectedReference(item)) |keyword| return keyword,
+        else => {},
     }
     return null;
 }
@@ -363,7 +408,7 @@ test "provider projection admits the three primary MCP schema forms" {
 test "dialect and semantic keywords do not decide Tool availability" {
     const encoded =
         "{\"$schema\":\"https://example.invalid/custom-dialect\",\"type\":\"object\"," ++
-        "\"properties\":{\"x\":{\"$ref\":\"https://example/schema\"}," ++
+        "\"properties\":{\"x\":{\"type\":\"string\",\"pattern\":\"^[a-z]+$\"}," ++
         "\"n\":{\"type\":\"number\",\"multipleOf\":0.1}," ++
         "\"tags\":{\"type\":\"array\",\"uniqueItems\":true}}," ++
         "\"additionalProperties\":false}";
@@ -371,6 +416,62 @@ test "dialect and semantic keywords do not decide Tool availability" {
     var admission = try prepareTool(std.testing.allocator, "mcp__weather", &tool, .{});
     defer if (admission == .available) admission.available.deinit();
     try std.testing.expect(admission == .available);
+}
+
+test "provider projection rejects dangling references and incoherent required" {
+    const referenced = testTool(
+        "{\"type\":\"object\",\"$defs\":{\"name\":{\"type\":\"string\"}}," ++
+            "\"properties\":{\"record\":{\"type\":\"object\",\"properties\":{" ++
+            "\"name\":{\"$ref\":\"#/$defs/name\"}}}}}",
+        null,
+    );
+    var reference_admission = try prepareTool(
+        std.testing.allocator,
+        "mcp__weather",
+        &referenced,
+        .{},
+    );
+    defer if (reference_admission == .available) reference_admission.available.deinit();
+    try std.testing.expect(reference_admission == .unavailable);
+    try std.testing.expectEqual(
+        IssueCode.provider_critical_projection_loss,
+        reference_admission.unavailable.code,
+    );
+    try std.testing.expectEqualStrings("$ref", reference_admission.unavailable.keyword.?);
+
+    const missing_property = testTool(
+        "{\"type\":\"object\",\"properties\":{},\"required\":[\"city\"]}",
+        null,
+    );
+    var missing_admission = try prepareTool(
+        std.testing.allocator,
+        "mcp__weather",
+        &missing_property,
+        .{},
+    );
+    defer if (missing_admission == .available) missing_admission.available.deinit();
+    try std.testing.expect(missing_admission == .unavailable);
+    try std.testing.expectEqual(
+        IssueCode.provider_critical_projection_loss,
+        missing_admission.unavailable.code,
+    );
+    try std.testing.expectEqualStrings("required", missing_admission.unavailable.keyword.?);
+
+    const duplicate_required = testTool(
+        "{\"type\":\"object\",\"properties\":{\"city\":{}}," ++
+            "\"required\":[\"city\",\"city\"]}",
+        null,
+    );
+    var duplicate_admission = try prepareTool(
+        std.testing.allocator,
+        "mcp__weather",
+        &duplicate_required,
+        .{},
+    );
+    defer if (duplicate_admission == .available) duplicate_admission.available.deinit();
+    try std.testing.expect(duplicate_admission == .unavailable);
+    try std.testing.expectEqual(IssueCode.invalid_schema, duplicate_admission.unavailable.code);
+    try std.testing.expectEqualStrings("required", duplicate_admission.unavailable.keyword.?);
 }
 
 test "invalid schema envelope and resource excess remain unavailable" {

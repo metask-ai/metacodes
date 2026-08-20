@@ -1858,7 +1858,7 @@ test "catalog description resolves stable issue identity without live handles" {
     );
 }
 
-test "Catalog admits opaque schema semantics and excludes required-task tools" {
+test "Catalog excludes broken Provider projections and required-task tools" {
     const fixture = @import("mcp_test_support.zig");
     var opaque_schema = fixture.Server{
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"x\":{\"$ref\":\"#/$defs/x\"}}}",
@@ -1887,7 +1887,7 @@ test "Catalog admits opaque schema semantics and excludes required-task tools" {
     _ = try manager.refresh();
     const snapshot = try manager.retainCurrent();
     defer snapshot.release();
-    try std.testing.expect(snapshot.findTool(&invalid_binding, "weather") != null);
+    try std.testing.expect(snapshot.findTool(&invalid_binding, "weather") == null);
     const required_server = snapshot.findServer(&required_binding) orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 0), required_server.admitted_tools.len);
@@ -1895,9 +1895,17 @@ test "Catalog admits opaque schema semantics and excludes required-task tools" {
 
     var description = try snapshot.describe(std.testing.allocator);
     defer description.deinit();
-    try std.testing.expectEqual(@as(usize, 1), description.tools.len);
-    try std.testing.expectEqual(@as(usize, 1), description.issues.len);
-    try std.testing.expectEqualStrings("task_required_unsupported", description.issues[0].kind);
+    try std.testing.expectEqual(@as(usize, 0), description.tools.len);
+    try std.testing.expectEqual(@as(usize, 2), description.issues.len);
+    var saw_projection_loss = false;
+    var saw_required_task = false;
+    for (description.issues) |issue| {
+        if (std.mem.eql(u8, issue.kind, "provider_critical_projection_loss"))
+            saw_projection_loss = true;
+        if (std.mem.eql(u8, issue.kind, "task_required_unsupported"))
+            saw_required_task = true;
+    }
+    try std.testing.expect(saw_projection_loss and saw_required_task);
 }
 
 test "catalog configuration rejects duplicate identity and unsafe namespace" {
