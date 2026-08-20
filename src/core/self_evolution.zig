@@ -567,40 +567,20 @@ pub fn ingestOutcomesFromText(
     // 名(旧提取器只认 pytest,15/16 任务 failing=[])而新行有名时**升级写**
     // ——注入选择器按 node_id 取最新,升级行自动生效。无名行都很短
     // (~150B),不会被召回摘录截断,"failing=[]" 判定可靠。
-    const StoredState = struct { names: bool, artifact: bool };
-    var seen = std.StringHashMapUnmanaged(StoredState){};
-    if (kg.recallTyped(OUTCOME_MARKER, MAX_OUTCOME_ROWS, false, OUTCOME_SCHEMA_TYPE)) |hits| {
-        defer {
-            for (hits) |*hit| hit.deinit(kg.allocator);
-            kg.allocator.free(hits);
-        }
-        for (hits) |hit| {
-            // artifact 标记在行尾,摘录中缝会吞掉 → truncated 命中必须取全
-            // 文再判(误判"无工件"会每轮重写,重复 attempt-key 行污染 streak)。
-            var text_src: []const u8 = hit.text;
-            var full_owned: ?[]u8 = null;
-            defer if (full_owned) |full| kg.allocator.free(full);
-            if (hit.text_truncated) {
-                if (kg.fetchNodeText(hit.node_id)) |full| {
-                    full_owned = full;
-                    text_src = full;
-                } else |_| {}
-            }
-            const state = StoredState{
-                .names = std.mem.indexOf(u8, text_src, "failing=[]") == null,
-                .artifact = std.mem.indexOf(u8, text_src, "best-attempt artifact") != null,
-            };
-            if (extractOutcomeKey(text_src)) |key| {
-                const entry = seen.getOrPut(arena.allocator(), arena.allocator().dupe(u8, key) catch continue) catch continue;
-                if (!entry.found_existing) {
-                    entry.value_ptr.* = state;
-                } else {
-                    entry.value_ptr.names = entry.value_ptr.names or state.names;
-                    entry.value_ptr.artifact = entry.value_ptr.artifact or state.artifact;
-                }
-            }
-        }
-    } else |_| {}
+    //
+    // v38(p38 取证,地基修复):旧去重靠"整面预取 seen 映射"且帽=40,而
+    // p1 根一轮就携 444 行——预取自第一轮起饱和,~92% 既存键对去重不可见,
+    // 三根每轮近乎全量重摄取(etag 单任务灌到 117 行/全店 484 行)。recall
+    // 40 窗随之失真:"最新行"冻结在旧 1.0 行,分支判定永走已解决态,v37
+    // FIRST-EDIT 指令结构性死路(note sha 三轮逐字节不变)。且 CLI 硬帽
+    // limit≤200(客户端超采 limit*2+4 ⇒ 可用上限 98),"放大预取窗"在任何
+    // 健康增长的店上仍会再饱和——预取式去重不可扩展。改为**逐行定点探测**:
+    // 每条入店候选按其 key 精查(BM25 对唯一键强命中),任意店规模下正确;
+    // 探测中发现同键多节点 = 灌店残留,当场 GC(保最新副本,升级语义按
+    // max-id 生效),每轮限额——店自愈。
+    const StoredState = struct { names: bool, artifact: bool, present: bool };
+    const MAX_GC_PER_RUN: usize = 64;
+    var gc_count: usize = 0;
 
     var written: usize = 0;
     for (parsed.outcomes, 0..) |row, index| {
@@ -609,7 +589,49 @@ pub fn ingestOutcomesFromText(
         if (row.attempt_key.len == 0 or row.attempt_key.len > 200) continue;
         var key_buffer: [512]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buffer, "{s}#{s}", .{ row.task, row.attempt_key }) catch continue;
-        if (seen.get(key)) |state| {
+        // v38 逐行定点探测:BM25 对唯一键强命中;命中里精确匹配 " key=<key> "
+        // 才算在库(避免前缀键误判)。同键多节点当场 GC(保最新)。
+        var state = StoredState{ .names = false, .artifact = false, .present = false };
+        {
+            var probe_buffer: [560]u8 = undefined;
+            const probe = std.fmt.bufPrint(&probe_buffer, OUTCOME_MARKER ++ " key={s}", .{key}) catch continue;
+            var exact_buffer: [520]u8 = undefined;
+            const exact = std.fmt.bufPrint(&exact_buffer, " key={s} ", .{key}) catch continue;
+            if (kg.recallTyped(probe, 16, false, OUTCOME_SCHEMA_TYPE)) |hits| {
+                defer {
+                    for (hits) |*hit| hit.deinit(kg.allocator);
+                    kg.allocator.free(hits);
+                }
+                var newest_id: u64 = 0;
+                for (hits) |hit| {
+                    if (std.mem.indexOf(u8, hit.text, exact) == null) continue;
+                    if (hit.node_id > newest_id) newest_id = hit.node_id;
+                }
+                for (hits) |hit| {
+                    if (std.mem.indexOf(u8, hit.text, exact) == null) continue;
+                    if (hit.node_id != newest_id and gc_count < MAX_GC_PER_RUN) {
+                        kg.forget(hit.node_id) catch {};
+                        gc_count += 1;
+                        continue;
+                    }
+                    // artifact 标记在行尾,摘录中缝会吞掉 → truncated 命中必须
+                    // 取全文再判(误判"无工件"会每轮重写)。
+                    var text_src: []const u8 = hit.text;
+                    var full_owned: ?[]u8 = null;
+                    defer if (full_owned) |full| kg.allocator.free(full);
+                    if (hit.text_truncated) {
+                        if (kg.fetchNodeText(hit.node_id)) |full| {
+                            full_owned = full;
+                            text_src = full;
+                        } else |_| {}
+                    }
+                    state.present = true;
+                    state.names = state.names or std.mem.indexOf(u8, text_src, "failing=[]") == null;
+                    state.artifact = state.artifact or std.mem.indexOf(u8, text_src, "best-attempt artifact") != null;
+                }
+            } else |_| {}
+        }
+        if (state.present) {
             // 已在库:升级写仅两种——存量无名+新行有名;存量无工件+新行带
             // 最佳工件(工件只挂最佳行,升级一次后 state.artifact 恒真)。
             const name_upgrade = !state.names and row.failing_tests.len > 0;
@@ -661,6 +683,8 @@ pub fn ingestOutcomesFromText(
         _ = kg.remember(.observation, text, OUTCOME_SCHEMA_TYPE, false) catch continue;
         written += 1;
     }
+    if (gc_count > 0)
+        log.warn("self-evolution", "outcome duplicate GC removed {d} rows (store self-heal)", .{gc_count});
     if (written > 0)
         log.info("self-evolution", "ingested {d} task outcomes", .{written});
     return written;

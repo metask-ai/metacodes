@@ -91,7 +91,10 @@ pub fn sameTaskOutcomeRow(
     const needle = std.fmt.bufPrint(&needle_buffer, " task={s} ", .{hint}) catch return null;
     var query_buffer: [280]u8 = undefined;
     const query = std.fmt.bufPrint(&query_buffer, OUTCOME_NOTE_MARKER ++ " {s}", .{hint}) catch return null;
-    const hits = kg.recallTyped(query, 40, false, "task_outcome") catch return null;
+    // v38:读窗 40→98(灌店残留清净前,40 窗看不到真实最新行——"最新行"
+    // 冻结在旧 1.0 行,分支判定失真。98=CLI 硬帽 200 经客户端超采
+    // limit*2+4 反推的最大可用值)。
+    const hits = kg.recallTyped(query, 98, false, "task_outcome") catch return null;
     defer {
         for (hits) |*h| h.deinit(kg.allocator);
         kg.allocator.free(hits);
@@ -575,7 +578,10 @@ pub fn collectHistory(
     const needle = std.fmt.bufPrint(&needle_buffer, " task={s} ", .{hint}) catch return;
     var query_buffer: [280]u8 = undefined;
     const query = std.fmt.bufPrint(&query_buffer, OUTCOME_NOTE_MARKER ++ " {s}", .{hint}) catch return;
-    const hits = kg.recallTyped(query, 40, false, "task_outcome") catch return;
+    // v38:读窗 40→98(灌店残留清净前,40 窗看不到真实最新行——"最新行"
+    // 冻结在旧 1.0 行,分支判定失真。98=CLI 硬帽 200 经客户端超采
+    // limit*2+4 反推的最大可用值)。
+    const hits = kg.recallTyped(query, 98, false, "task_outcome") catch return;
     defer {
         for (hits) |*h| h.deinit(kg.allocator);
         kg.allocator.free(hits);

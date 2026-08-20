@@ -1171,6 +1171,47 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         try std.testing.expect(std.mem.indexOf(u8, text_vb, "byte-for-byte UNCHANGED") != null);
     }
 
+    // v38 L2(灌店自愈,撤修复必红——旧码同键双行永存且重摄取穿透):手工
+    // 灌两条同键行(模拟跨 run 重摄取穿透),同键行再次到达时定点探测
+    // GC 较老副本、拒绝再写:同键只剩一行,ingest 计 0。
+    {
+        const dup_row = "metacodes-task-outcome-v1: key=gc-task#g1 task=gc-task reward=0.5000 tests=1/2 prov=verifier failing=[tests/g.py::T::t_x (failed: assert)]";
+        _ = kg.remember(.observation, dup_row, "task_outcome", false) catch {};
+        _ = kg.remember(.observation, dup_row, "task_outcome", false) catch {};
+        // 同键行再次到达(模拟下一轮根重投)。
+        const payload_gc = "{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+            "{\"task\":\"gc-task\",\"attempt_key\":\"g1\",\"reward\":0.5,\"tests_passed\":1,\"tests_total\":2," ++
+            "\"failing_tests\":[\"tests/g.py::T::t_x (failed: assert)\"]}]}";
+        {
+            const pfs = @import("platform").fs;
+            const zg = try a.dupeZ(u8, outcomes_path);
+            defer a.free(zg);
+            const fd = pfs.open(zg.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+            try std.testing.expect(fd >= 0);
+            defer _ = pfs.close(fd);
+            var off: usize = 0;
+            while (off < payload_gc.len) {
+                const n = pfs.write(fd, payload_gc[off..]);
+                try std.testing.expect(n > 0);
+                off += @intCast(n);
+            }
+        }
+        // 已在库且带名 → 拒绝重写(计 0);探测顺带 GC 较老副本。
+        try std.testing.expectEqual(@as(usize, 0), self_evolution.ingestOutcomes(a, &kg));
+        // 同键去重后仅剩一行(GC 保最新副本)。
+        const hits_gc = kg.recallTyped("task-outcome-v1 gc-task", 50, false, "task_outcome") catch
+            return error.TestExpectedRecall;
+        defer {
+            for (hits_gc) |*h| h.deinit(kg.allocator);
+            kg.allocator.free(hits_gc);
+        }
+        var remaining: usize = 0;
+        for (hits_gc) |h| {
+            if (std.mem.indexOf(u8, h.text, " key=gc-task#g1 ") != null) remaining += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), remaining);
+    }
+
     // v35 L2(cap 钉最佳,撤修复必红——旧 cap 只留最新 8 行,最老的全过
     // 行被驱逐 → 曾经全过失明 → 鬼义务复武装):唯一全过行最老 + 8 条
     // 回归行,曾经全过判定必须仍然成立(回归框架 note + 零陈年义务)。
