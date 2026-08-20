@@ -293,6 +293,107 @@ pub fn bestHistoryRow(history: []const []u8, newest: []const u8) ?[]const u8 {
     return best;
 }
 
+/// v36 卡滞平台判定:最近 3 行(升序尾部)reward 相同且 failing 段逐字节
+/// 相同 → 压力栈已被证明非因果。任何变化(新失败名/新分数)即打破。
+pub fn stuckPlateau(history: []const []u8) bool {
+    if (history.len < 3) return false;
+    const tail = history[history.len - 3 ..];
+    const r0 = rowReward(tail[0]);
+    const f0 = failingSection(tail[0]) orelse return false;
+    for (tail[1..]) |row| {
+        if (rowReward(row) != r0) return false;
+        const f = failingSection(row) orelse return false;
+        if (!std.mem.eql(u8, f, f0)) return false;
+    }
+    return true;
+}
+
+pub const MAX_SUPERSEDED_SYMBOLS: usize = 4;
+
+/// v36 读平面 supersede(p36 取证:v35 针钉住了工件路径,模型却经 6 次主动
+/// KgRecall 拉回冲突 CORRECTION 记忆,在正确路径写了 async 版——毒经读
+/// 平面绕过注入面)。曾经全过且最佳行携带工件时,从工件正文**词法**提取
+/// 定义符号(def/class/fn/function 后的标识符,≥4 字符,上限 4 个);
+/// KgRecall 对提及这些符号的非结局行命中盖 provenance_caveat 戳。
+/// 符号内存由 out_storage(调用方 buffer)持有;返回符号数,0=非静默态或
+/// 无工件。内容盲、任务无关:符号来自该任务自己的已证工件。
+pub fn artifactSupersededSymbols(
+    allocator: std.mem.Allocator,
+    kg: *client_mod.KgClient,
+    hint: []const u8,
+    out_storage: *[MAX_SUPERSEDED_SYMBOLS][64]u8,
+    out_lens: *[MAX_SUPERSEDED_SYMBOLS]usize,
+) usize {
+    if (hint.len == 0 or hint.len > 200) return 0;
+    const gate = @import("../core/obligation_gate.zig");
+    var history = std.array_list.Managed([]u8).init(allocator);
+    defer {
+        for (history.items) |row| allocator.free(row);
+        history.deinit();
+    }
+    collectHistory(allocator, kg, hint, &history);
+    const newest = sameTaskOutcomeRow(allocator, kg, hint) orelse return 0;
+    defer allocator.free(newest);
+    var ever_solved = gate.rowSolved(newest);
+    if (!ever_solved) for (history.items) |row| {
+        if (gate.rowSolved(row)) {
+            ever_solved = true;
+            break;
+        }
+    };
+    if (!ever_solved) return 0;
+    const best = bestHistoryRow(history.items, newest) orelse newest;
+    const marker = std.mem.indexOf(u8, best, "best-attempt artifact") orelse return 0;
+    const body = best[marker..];
+    var count: usize = 0;
+    const keywords = [_][]const u8{ "def ", "class ", "fn ", "function " };
+    var pos: usize = 0;
+    while (pos < body.len and count < MAX_SUPERSEDED_SYMBOLS) {
+        var next_hit: ?usize = null;
+        var next_len: usize = 0;
+        for (keywords) |kw| {
+            if (std.mem.indexOfPos(u8, body, pos, kw)) |at| {
+                // 词首边界:行首或前一字符非标识符成分(排除 "undef "/"async def" 的
+                // "def" 误配不重要——async def 的 def 也算词首,提取同一个符号)。
+                if (at > 0) {
+                    const prev = body[at - 1];
+                    const prev_ident = (prev >= 'a' and prev <= 'z') or (prev >= 'A' and prev <= 'Z') or
+                        (prev >= '0' and prev <= '9') or prev == '_';
+                    if (prev_ident) continue;
+                }
+                if (next_hit == null or at < next_hit.?) {
+                    next_hit = at;
+                    next_len = kw.len;
+                }
+            }
+        }
+        const at = next_hit orelse break;
+        var i = at + next_len;
+        const sym_start = i;
+        while (i < body.len) : (i += 1) {
+            const c = body[i];
+            const ident = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+                (c >= '0' and c <= '9') or c == '_';
+            if (!ident) break;
+        }
+        const sym = body[sym_start..i];
+        pos = i;
+        if (sym.len < 4 or sym.len > 64) continue;
+        var dup = false;
+        for (0..count) |k| {
+            if (std.mem.eql(u8, out_storage[k][0..out_lens[k]], sym)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        @memcpy(out_storage[count][0..sym.len], sym);
+        out_lens[count] = sym.len;
+        count += 1;
+    }
+    return count;
+}
+
 pub fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClient) ?[]u8 {
     const hint_c = std.c.getenv(TASK_HINT_ENV) orelse return null;
     const hint = std.mem.span(hint_c);
@@ -361,6 +462,22 @@ pub fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClien
         }
     }
     const max_streak = appendModeSection(&out, allocator, history.items) catch 0;
+    // v36 卡滞平台冷却(p36 取证:filterwarnings 106→124 请求/轮,reward
+    // 恒 0.5,失败集恒定——压力栈在该任务上已被证明非因果,纯烧预算。
+    // 键=(最近 3 行 reward 相同 ∧ failing 段相同):任何新剂量(新机制发
+    // 新针/reward 动/失败集动)都会打破键、恢复全额压力——etag 式破墙
+    // 靠的是新剂量内容,不会被冷却误杀)。Lean 镜面 plateau_caps_pressure。
+    if (max_streak >= 3 and stuckPlateau(history.items)) {
+        out.appendSlice(allocator,
+            "COOLED. This task's reward and failing set have been unchanged across " ++
+                "the last attempts while the full pressure playbook ran — that playbook " ++
+                "is proven non-causal here, so it is withdrawn this attempt. Work from " ++
+                "the task statement and the verdict facts above; make ONE deliberately " ++
+                "different attempt instead of re-executing the previous playbook. " ++
+                "Re-run your whole check suite before closing.\n" ++
+                "</system-reminder>\n") catch return null;
+        return out.toOwnedSlice(allocator) catch null;
+    }
     if (max_streak >= 3) {
         // 升级态瘦身(提示饱和对策):union/invert 级别的点在场时,九层
         // 说教稀释关键指令——只留判决+模式+三行硬约束,短促命令式。

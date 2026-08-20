@@ -15,6 +15,7 @@ const common = @import("common.zig");
 const log = @import("../util/log.zig");
 const retrieval_protocol = @import("../kg/retrieval_protocol.zig");
 const lexical_query_plan = @import("../kg/lexical_query_plan.zig");
+const scoped_recall_mod = @import("../kg/scoped_recall.zig");
 
 fn requireKg(ctx: *const ToolContext) ?*kg_mod.KgClient {
     return ctx.kg;
@@ -197,6 +198,24 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const plan_version = if (plan) |value| value.schema_version.text() else "query-only";
     log.info("kg", "kg_recall type_filter={s} lexical_plan={s}", .{ type_canon orelse "none", plan_version });
 
+    // v36 读平面 supersede(p36 取证:毒经 6 次主动 KgRecall 绕过注入面):
+    // 静默态已证工件的定义符号——提及它们的记忆命中盖 provenance 戳。
+    var sym_storage: [scoped_recall_mod.MAX_SUPERSEDED_SYMBOLS][64]u8 = undefined;
+    var sym_lens: [scoped_recall_mod.MAX_SUPERSEDED_SYMBOLS]usize = undefined;
+    var sym_slices: [scoped_recall_mod.MAX_SUPERSEDED_SYMBOLS][]const u8 = undefined;
+    var sym_count: usize = 0;
+    if (std.c.getenv("METACODES_TASK_HINT")) |hint_c| {
+        sym_count = scoped_recall_mod.artifactSupersededSymbols(
+            ctx.allocator,
+            kg,
+            std.mem.span(hint_c),
+            &sym_storage,
+            &sym_lens,
+        );
+        for (0..sym_count) |i| sym_slices[i] = sym_storage[i][0..sym_lens[i]];
+    }
+    const superseded_symbols: []const []const u8 = sym_slices[0..sym_count];
+
     if (plan) |value| {
         if (value.executesAll()) {
             return executeRecallBatch(
@@ -207,6 +226,7 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
                 &ledger_guard.?,
                 ledger_scope,
                 ledger_seen_count,
+                superseded_symbols,
             );
         }
     }
@@ -258,7 +278,7 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             try out.appendSlice(ctx.allocator, row);
             continue;
         }
-        try appendRecallHitRow(&out, ctx.allocator, h, seen_before, ledger_guard != null, SINGLE_RECALL_HIT_TEXT_BYTES);
+        try appendRecallHitRow(&out, ctx.allocator, h, seen_before, ledger_guard != null, SINGLE_RECALL_HIT_TEXT_BYTES, superseded_symbols);
     }
     // 搭车 facet(PM:可见性,零额外调用):结果里各类型计数,让模型知道有哪些类型 → 可 --type 精化。
     const known_types = [_][]const u8{ "decision", "module", "bug", "user_preference", "observation" };
@@ -365,6 +385,7 @@ fn executeRecallBatch(
     guard: *lexical_query_plan.Ledger.Guard,
     ledger_scope: []const u8,
     ledger_seen_count: usize,
+    superseded_symbols: []const []const u8,
 ) anyerror![]u8 {
     std.debug.assert(plan.schema_version == .host_batch_v3);
     std.debug.assert(plan.executesAll());
@@ -430,7 +451,7 @@ fn executeRecallBatch(
                 if (first_new_evidence_node_id == 0 and std.mem.eql(u8, exposed_type, "evidence")) {
                     first_new_evidence_node_id = hit.node_id;
                 }
-                try appendRecallHitRow(&hit_rows, ctx.allocator, hit, false, true, batchHitTextBytes(merged_count - 1));
+                try appendRecallHitRow(&hit_rows, ctx.allocator, hit, false, true, batchHitTextBytes(merged_count - 1), superseded_symbols);
             }
             const type_str = if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
             for (known_types, 0..) |type_name, facet_index| {
@@ -526,6 +547,28 @@ fn executeRecallBatch(
     return owned;
 }
 
+/// v36 读平面 supersede 判定(纯函数,L2 直测):非结局行命中提及任一
+/// 已证工件定义符号 → 该记忆被 host_run 工件取代,须盖 provenance 戳。
+/// 结局行(task_outcome)本身携带裁决,永不盖戳。
+pub fn hitSupersededByArtifact(
+    superseded_symbols: []const []const u8,
+    hit_text: []const u8,
+    hit_type: []const u8,
+) bool {
+    if (superseded_symbols.len == 0) return false;
+    if (std.mem.eql(u8, hit_type, "task_outcome")) return false;
+    for (superseded_symbols) |sym| {
+        if (std.mem.indexOf(u8, hit_text, sym) != null) return true;
+    }
+    return false;
+}
+
+pub const SUPERSEDED_CAVEAT =
+    "superseded_by_host_run_artifact: a host-run all-passing verdict for " ++
+    "this task proves a specific artifact that defines the symbols this " ++
+    "memory mentions; where this memory contradicts that artifact, the " ++
+    "artifact wins (host_run outranks stored claims)";
+
 fn appendRecallHitRow(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -533,6 +576,7 @@ fn appendRecallHitRow(
     seen_before: bool,
     include_seen: bool,
     max_text_bytes: usize,
+    superseded_symbols: []const []const u8,
 ) !void {
     const type_str = if (hit.schema_type.len > 0) hit.schema_type else hit.kind;
     const row = try std.fmt.allocPrint(allocator, "{{\"node_id\":{d},\"type\":\"{s}\",\"scope\":\"{s}\",\"score\":{d:.2},\"text\":", .{
@@ -562,6 +606,10 @@ fn appendRecallHitRow(
         if (source_excerpt.len < hit.source_label.len) try out.appendSlice(allocator, ",\"source_truncated\":true");
     }
     if (include_seen) try out.appendSlice(allocator, if (seen_before) ",\"seen_before\":true" else ",\"seen_before\":false");
+    if (hitSupersededByArtifact(superseded_symbols, hit.text, type_str)) {
+        try out.appendSlice(allocator, ",\"provenance_caveat\":");
+        try appendJsonString(out, allocator, SUPERSEDED_CAVEAT);
+    }
     try out.append(allocator, '}');
 }
 

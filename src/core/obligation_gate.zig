@@ -400,6 +400,10 @@ pub fn load(
     // v35:解决态换针标志——true 时只保留"复现最佳"工件针,
     // 理由派生/形状派生/stored 陈年义务全部拒载。
     var reproduce_only = false;
+    // v36:卡滞平台冷却——reward 与失败集连续 3 轮恒定时,压力栈已被
+    // 证明非因果,义务 nudge 预算降为 1(与 note 侧 COOLED 同键;任何
+    // 新剂量打破键即恢复全额)。Lean 镜面 plateau_caps_pressure。
+    var plateau = false;
     if (task_hint.len > 0 and task_hint.len <= 200) {
         const scoped_recall = @import("../kg/scoped_recall.zig");
         // 已解决静默键在**最佳行**(p34 取证:键最新行时,回归行让任务
@@ -413,6 +417,7 @@ pub fn load(
                 history0.deinit();
             }
             scoped_recall.collectHistory(a, kg, task_hint, &history0);
+            plateau = scoped_recall.stuckPlateau(history0.items);
             for (history0.items) |row| {
                 if (rowSolved(row)) {
                     ever_solved = true;
@@ -541,6 +546,9 @@ pub fn load(
         .nudged = nudged,
         .pending_ids = pending_ids,
         .pending_lens = pending_lens,
+        // v36 冷却:平台态预充预算,只剩 1 次 nudge(压力栈已证非因果时
+        // 不再全额施压;新剂量打破平台键即恢复)。
+        .nudges_used = if (plateau) MAX_OBLIGATION_NUDGES - 1 else 0,
     };
     return runtime;
 }

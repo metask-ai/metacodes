@@ -128,4 +128,24 @@ theorem solved_load_ignores_pending (p q artifact : Nat) :
 theorem unsolved_keeps_ratchet (pending artifact : Nat) :
     loadCount false pending artifact = pending := by rfl
 
+/-- v36 stuck-plateau cooling: when reward and the failing set have been
+byte-identical for the last three attempts under the full pressure playbook,
+the playbook is proven non-causal on this task — the nudge budget drops to
+one (p36: the permanently-stuck task consumed the largest request share of
+the batch at a flat reward). Any new evidence — a reward change, a
+failing-set change, a fresh needle from a new mechanism — breaks the plateau
+key and restores full pressure, so a breakthrough dose is never cooled
+away. -/
+def nudgeBudget (plateau : Bool) : Nat :=
+  if plateau then 1 else maxNudges
+
+theorem plateau_caps_pressure : nudgeBudget true = 1 := by rfl
+
+theorem fresh_evidence_restores : nudgeBudget false = maxNudges := by rfl
+
+/-- Cooling never closes the channel entirely: even on a plateau one nudge
+remains available. -/
+theorem cooled_channel_stays_open (plateau : Bool) : 1 ≤ nudgeBudget plateau := by
+  cases plateau <;> simp [nudgeBudget, maxNudges]
+
 end MetaCodesControl.ObligationGate

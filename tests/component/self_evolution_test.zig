@@ -665,9 +665,57 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     const text3 = built3.text orelse return error.TestExpectedInjection;
     try std.testing.expect(std.mem.indexOf(u8, text3, "failed 3 consecutive attempt(s)") != null);
     try std.testing.expect(std.mem.indexOf(u8, text3, "UNION") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text3, "ESCALATED") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text3, "FIRST ACTION: enter every point above") != null);
+    // v36 卡滞平台冷却(策略更新,取代 v25 的 ESCALATED 钉):3 行 reward
+    // 与 failing 段逐字节相同 → 压力栈已证非因果 → COOLED 短注取代
+    // ESCALATED 重注(mode 行保留:数据面照旧,只撤律令面)。
+    try std.testing.expect(std.mem.indexOf(u8, text3, "COOLED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text3, "ESCALATED") == null);
     try std.testing.expect(std.mem.indexOf(u8, text3, "Garbage In, Garbage Out") == null);
+    // 冷却的义务面:nudge 预算降为 1(nudges_used 预充 MAX-1)。
+    {
+        const runtime_cool = cc.obligation_gate.load(a, &kg, "wall-task") orelse
+            return error.TestExpectedRuntime;
+        defer {
+            runtime_cool.deinit();
+            a.destroy(runtime_cool);
+        }
+        try std.testing.expectEqual(cc.obligation_gate.MAX_OBLIGATION_NUDGES - 1, runtime_cool.nudges_used);
+    }
+    // 新剂量打破平台键(冷却绝不能误杀新证据):第 4 行同名但带新注解 →
+    // failing 段变化 → 平台破 → ESCALATED 全额回归,义务预算复原。
+    {
+        const payload4b = "{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+            "{\"task\":\"wall-task\",\"attempt_key\":\"a4\",\"reward\":0.27,\"tests_passed\":3,\"tests_total\":11," ++
+            "\"failing_tests\":[\"tests/t.py::TestX::test_uses_sha256 (skipped: fresh reason arrived)\"]}]}";
+        const pfs = @import("platform").fs;
+        const z4b = try a.dupeZ(u8, outcomes_path);
+        defer a.free(z4b);
+        const fd = pfs.open(z4b.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = pfs.close(fd);
+        var off: usize = 0;
+        while (off < payload4b.len) {
+            const n = pfs.write(fd, payload4b[off..]);
+            try std.testing.expect(n > 0);
+            off += @intCast(n);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
+    var built4b = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    defer built4b.deinit(a);
+    const text4b = built4b.text orelse return error.TestExpectedInjection;
+    try std.testing.expect(std.mem.indexOf(u8, text4b, "ESCALATED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text4b, "FIRST ACTION: enter every point above") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text4b, "COOLED") == null);
+    {
+        const runtime_warm = cc.obligation_gate.load(a, &kg, "wall-task") orelse
+            return error.TestExpectedRuntime;
+        defer {
+            runtime_warm.deinit();
+            a.destroy(runtime_warm);
+        }
+        try std.testing.expectEqual(@as(u8, 0), runtime_warm.nudges_used);
+    }
 
     // 召回摘录 800 字符截断(p10 取证雷):8 个长 pytest 名的 failing 列表
     // 超 800 → 摘录无闭括号 → failingSection=null → mode 段静默消失,
@@ -1033,7 +1081,7 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         const payload_af = "{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
             "{\"task\":\"artifact-task\",\"attempt_key\":\"af1\",\"reward\":1.0,\"tests_passed\":3,\"tests_total\":3," ++
             "\"failing_tests\":[],\"final_note\":\"module landed; all green\"," ++
-            "\"best_artifact\":\"--- pkg/_helper.py ---\\nfrom hashlib import sha256\\n\"}]}";
+            "\"best_artifact\":\"--- pkg/_helper.py ---\\nfrom hashlib import sha256\\n\\n\\ndef calc_helper(filepath):\\n    return sha256(open(filepath,'rb').read()).hexdigest()[:16]\\n\"}]}";
         const pfs = @import("platform").fs;
         const za = try a.dupeZ(u8, outcomes_path);
         defer a.free(za);
@@ -1079,6 +1127,38 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         try std.testing.expectEqual(@as(usize, 1), runtime_af.envelopes.len);
         try std.testing.expectEqualStrings("pkg/_helper.py", runtime_af.envelopes[0].command_needle);
         try std.testing.expect(std.mem.indexOf(u8, runtime_af.envelopes[0].reason, "VERBATIM") != null);
+    }
+    // v36 读平面 supersede(撤修复必红——p36 取证:毒经 6 次主动 KgRecall
+    // 绕过注入面,模型在正确路径写了冲突记忆的 async 版):① 静默态从已证
+    // 工件正文词法提取定义符号;② 提及符号的非结局命中判 superseded。
+    {
+        var sym_storage: [cc.kg_scoped_recall.MAX_SUPERSEDED_SYMBOLS][64]u8 = undefined;
+        var sym_lens: [cc.kg_scoped_recall.MAX_SUPERSEDED_SYMBOLS]usize = undefined;
+        const n = cc.kg_scoped_recall.artifactSupersededSymbols(a, &kg, "artifact-task", &sym_storage, &sym_lens);
+        try std.testing.expectEqual(@as(usize, 1), n);
+        try std.testing.expectEqualStrings("calc_helper", sym_storage[0][0..sym_lens[0]]);
+        const syms = [_][]const u8{sym_storage[0][0..sym_lens[0]]};
+        try std.testing.expect(cc.tools.kg_tools.hitSupersededByArtifact(
+            &syms,
+            "CORRECTION: calc_helper is async and content-based",
+            "observation",
+        ));
+        // 结局行永不盖戳(它携带裁决本身)。
+        try std.testing.expect(!cc.tools.kg_tools.hitSupersededByArtifact(
+            &syms,
+            "task-outcome row mentioning calc_helper",
+            "task_outcome",
+        ));
+        // 不提及符号的记忆不盖戳。
+        try std.testing.expect(!cc.tools.kg_tools.hitSupersededByArtifact(
+            &syms,
+            "unrelated memory about widgets",
+            "observation",
+        ));
+        // 非静默态任务(未曾全过)提不出符号。
+        var sym_storage2: [cc.kg_scoped_recall.MAX_SUPERSEDED_SYMBOLS][64]u8 = undefined;
+        var sym_lens2: [cc.kg_scoped_recall.MAX_SUPERSEDED_SYMBOLS]usize = undefined;
+        try std.testing.expectEqual(@as(usize, 0), cc.kg_scoped_recall.artifactSupersededSymbols(a, &kg, "wall-task", &sym_storage2, &sym_lens2));
     }
 
     // v35 L2(cap 钉最佳,撤修复必红——旧 cap 只留最新 8 行,最老的全过

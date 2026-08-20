@@ -24,7 +24,8 @@ const web_fetch_tool = @import("tools/web_fetch.zig");
 const ask_user_tool = @import("tools/ask_user.zig");
 const plan_mode_tool = @import("tools/plan_mode.zig");
 const task_tools = @import("tools/task_tools.zig");
-const kg_tools = @import("tools/kg_tools.zig");
+/// pub:v36 读平面 supersede 的纯判定(hitSupersededByArtifact)需 L2 直测。
+pub const kg_tools = @import("tools/kg_tools.zig");
 const kg_retrieval = @import("kg/retrieval_protocol.zig");
 const formal_task_audit = @import("formal/task_audit.zig");
 const agent_tool = @import("tools/agent.zig");
