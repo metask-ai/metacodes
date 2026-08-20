@@ -991,6 +991,36 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
     try std.testing.expect(std.mem.indexOf(u8, text_s, "ESCALATED") == null);
     try std.testing.expect(std.mem.indexOf(u8, text_s, "Garbage In, Garbage Out") == null);
     try std.testing.expect(std.mem.indexOf(u8, text_s, "Per-point reading mode") == null);
+    // 回归后仍静默(v34,p34 取证):曾全过的任务,最新行回归 → 依旧
+    // 零义务,note = 复现最佳 + "最新失败是回归损伤非新需求"。
+    {
+        const payload_rg = "{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+            "{\"task\":\"solved-task\",\"attempt_key\":\"s2\",\"reward\":0.5,\"tests_passed\":2,\"tests_total\":4," ++
+            "\"failing_tests\":[\"tests/s.py::T::t_ghost1 (failed: exact match empty)\"]}]}";
+        const pfs = @import("platform").fs;
+        const zg = try a.dupeZ(u8, outcomes_path);
+        defer a.free(zg);
+        const fd = pfs.open(zg.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = pfs.close(fd);
+        var off: usize = 0;
+        while (off < payload_rg.len) {
+            const n = pfs.write(fd, payload_rg[off..]);
+            try std.testing.expect(n > 0);
+            off += @intCast(n);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
+    ppaths.setEnv("METACODES_TASK_HINT", "solved-task");
+    try std.testing.expect(cc.obligation_gate.load(a, &kg, "solved-task") == null);
+    var built_rg = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+    defer built_rg.deinit(a);
+    const text_rg = built_rg.text orelse return error.TestExpectedInjection;
+    try std.testing.expect(std.mem.indexOf(u8, text_rg, "REGRESSED from an already-proven configuration") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_rg, "damage introduced by that regression") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_rg, "tests=4/4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_rg, "ESCALATED") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text_rg, "Per-point reading mode") == null);
     ppaths.setEnv("METACODES_TASK_HINT", "wall-task");
 
     // UTF-8 截断安全(p10 现场雷):中文 note >300 字节,裸字节截断切码点

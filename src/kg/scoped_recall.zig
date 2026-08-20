@@ -319,15 +319,41 @@ pub fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClien
         out.appendSlice(allocator, best) catch return null;
         out.appendSlice(allocator, "\n") catch return null;
     }
-    // 已解决静默(p33 取证):最新裁决全过 → 短注(已证配置+复验令),
-    // 跳过 mode/GIGO/ESCALATED 的全部压力面——解决态的重注入只会投毒。
-    if (@import("../core/obligation_gate.zig").rowSolved(body)) {
-        out.appendSlice(allocator,
-            "This task's best configuration is already proven by the verdict above: " ++
-                "reproduce that approach, re-run your whole check suite to confirm, and " ++
-                "do not innovate beyond what the task statement asks.\n" ++
-                "</system-reminder>\n") catch return null;
-        return out.toOwnedSlice(allocator) catch null;
+    // 已解决静默(p33/p34 取证):键**曾经全过**(最佳行或最新行)。
+    // 最新行回归时仍静默——已证配置存在,正确剂量="复现最佳",重新
+    // 施压只会让 agent 追自己的回归鬼影(filterwarnings 1.0→0.5→0.5)。
+    {
+        const gate = @import("../core/obligation_gate.zig");
+        var ever_solved = gate.rowSolved(body);
+        if (!ever_solved) for (history.items) |row| {
+            if (gate.rowSolved(row)) {
+                ever_solved = true;
+                break;
+            }
+        };
+        if (ever_solved) {
+            if (!gate.rowSolved(body)) {
+                // 最新回归:引用最佳全过行(含 final_note 的已证方案)。
+                if (bestHistoryRow(history.items, body)) |best| {
+                    out.appendSlice(allocator, "# 历史最佳尝试(全过;host 声明)\n") catch return null;
+                    out.appendSlice(allocator, best) catch return null;
+                    out.appendSlice(allocator, "\n") catch return null;
+                }
+                out.appendSlice(allocator,
+                    "The newest attempt REGRESSED from an already-proven configuration. " ++
+                        "Reproduce the all-passing best attempt above exactly; treat the newest " ++
+                        "failing names as damage introduced by that regression, not as new " ++
+                        "requirements. Re-run your whole check suite to confirm.\n" ++
+                        "</system-reminder>\n") catch return null;
+                return out.toOwnedSlice(allocator) catch null;
+            }
+            out.appendSlice(allocator,
+                "This task's best configuration is already proven by the verdict above: " ++
+                    "reproduce that approach, re-run your whole check suite to confirm, and " ++
+                    "do not innovate beyond what the task statement asks.\n" ++
+                    "</system-reminder>\n") catch return null;
+            return out.toOwnedSlice(allocator) catch null;
+        }
     }
     const max_streak = appendModeSection(&out, allocator, history.items) catch 0;
     if (max_streak >= 3) {

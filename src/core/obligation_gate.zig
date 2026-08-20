@@ -399,14 +399,35 @@ pub fn load(
     var combined = std.array_list.Managed(self_evolution.ObligationEnvelope).init(a);
     if (task_hint.len > 0 and task_hint.len <= 200) {
         const scoped_recall = @import("../kg/scoped_recall.zig");
-        // 已解决静默:最新裁决全过 → 不装载任何义务(含 stored)。
-        if (scoped_recall.sameTaskOutcomeRow(a, kg, task_hint)) |newest_probe| {
-            const solved = rowSolved(newest_probe);
-            a.free(newest_probe);
-            if (solved) {
-                arena.deinit();
-                return null;
+        // 已解决静默键在**最佳行**(p34 取证:键最新行时,回归行让任务
+        // 重新显得未解决 → 鬼义务复载 → 投毒自续。曾经全过 = 已证配置
+        // 存在,正确剂量是"复现最佳"而非重新施压)。
+        var ever_solved = false;
+        {
+            var history0 = std.array_list.Managed([]u8).init(a);
+            defer {
+                for (history0.items) |row| a.free(row);
+                history0.deinit();
             }
+            scoped_recall.collectHistory(a, kg, task_hint, &history0);
+            for (history0.items) |row| {
+                if (rowSolved(row)) {
+                    ever_solved = true;
+                    break;
+                }
+            }
+            if (!ever_solved) {
+                if (scoped_recall.sameTaskOutcomeRow(a, kg, task_hint)) |newest_probe| {
+                    ever_solved = rowSolved(newest_probe);
+                    a.free(newest_probe);
+                }
+            }
+        }
+        // defer 已清完 history0 之后才拆竞技场(UAF 教训:return 触发的
+        // 块级 defer 会晚于 arena.deinit 执行)。
+        if (ever_solved) {
+            arena.deinit();
+            return null;
         }
         // 理由派生(模块 import)在前且**扫全部历史行**(p15 取证:棘轮缺失
         // ——p14 结构成功后其行不再含 "not available",单看最新行义务消失,
