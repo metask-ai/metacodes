@@ -5345,7 +5345,8 @@ fn restoreCheckpoint(
             var still_enabled = false;
             if (binding) |*current| {
                 for (current.snapshot().skills, 0..) |record, index| {
-                    if (std.mem.eql(u8, &record.skill_id, &entry.skill_id)) {
+                    // Checkpoint SkillEntry.skill_id stores the execution identity.
+                    if (std.mem.eql(u8, &record.execution_id, &entry.skill_id)) {
                         still_enabled = current.selection.states[index] == .enabled;
                         break;
                     }
@@ -9145,9 +9146,9 @@ test "Revision 6 AgentCore restore is atomic and continues logical operation IDs
     runtime.catalogs.finishDestroy();
 }
 
-test "Revision 6 AgentCore restore degrades unavailable and changed Skill authority" {
+test "Revision 9 AgentCore restore uses execution identity and degrades unavailable or changed Skill authority" {
     const record = skill_catalog.SkillRecord{
-        .skill_id = [_]u8{'1'} ** 64,
+        .skill_id = [_]u8{'0'} ** 64,
         .execution_id = [_]u8{'1'} ** 64,
         .invocation_name = "checkpoint-skill",
         .definition = .{
@@ -9167,6 +9168,11 @@ test "Revision 6 AgentCore restore degrades unavailable and changed Skill author
         .directories = &.{},
         .files = &.{},
     };
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &record.skill_id,
+        &record.execution_id,
+    ));
     var snapshot_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer snapshot_arena.deinit();
     var snapshot = skill_catalog.Snapshot{
@@ -9276,6 +9282,52 @@ test "Revision 6 AgentCore restore degrades unavailable and changed Skill author
         .allowed_tools = &.{},
         .workspace_scope_id = scope_id,
     };
+    const all_enabled = skill_availability.Spec{
+        .default_state = .enabled,
+        .exceptions = &.{},
+    };
+    var matching_cell = skill_catalog_handles.CatalogCell{
+        .runtime = &runtime.catalogs,
+        .snapshot = &snapshot,
+        .references = 1,
+        .accounted_bytes = 0,
+    };
+    var matching_binding: ?SkillBinding = .{
+        .cell = &matching_cell,
+        .selection = try skill_availability.Selection.init(
+            std.testing.allocator,
+            &snapshot,
+            all_enabled,
+        ),
+    };
+    const matching = try restoreCheckpoint(
+        &runtime,
+        base_config,
+        &matching_binding,
+        checkpoint.source(),
+        limits,
+    );
+    try std.testing.expect(matching_binding == null);
+    try std.testing.expectEqual(
+        session_authority.RestoreHealth.complete,
+        matching.report.health,
+    );
+    try std.testing.expectEqual(
+        session_authority.SkillDisposition.restored,
+        matching.report.skill.disposition,
+    );
+    try std.testing.expectEqual(@as(u32, 1), matching.report.skill.restored_enabled);
+    try std.testing.expectEqual(@as(u32, 0), matching.report.skill.invalidated);
+    try std.testing.expectEqual(@as(usize, 0), matching.report.issues.len);
+    try std.testing.expect(matching.session.skill_binding != null);
+    matching.session.skill_binding.?.selection.deinit();
+    matching.session.skill_binding = null;
+    var matching_diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        sessionDestroy(matching.session.handle(), &matching_diagnostic),
+    );
+    bufferRelease(&matching_diagnostic);
 
     var no_binding: ?SkillBinding = null;
     var mismatched_mode = base_config;
@@ -9346,10 +9398,6 @@ test "Revision 6 AgentCore restore degrades unavailable and changed Skill author
         &.{},
         .{},
     );
-    const all_enabled = skill_availability.Spec{
-        .default_state = .enabled,
-        .exceptions = &.{},
-    };
     var changed_binding = try createInitialSkillBinding(
         &runtime,
         &scope_id,
