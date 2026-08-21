@@ -3298,3 +3298,105 @@ test "L2 /kg plan fresh-process byte stability: writer process A then root-id-on
         try std.testing.expectEqualStrings(first, third);
     }
 }
+
+test "L2 KG v42: 深探针 data 失败 → 隔离重建(字节保全);transient 失败 → 原店保留" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // shim 是 POSIX sh
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const root = pbuf[0..dir_len];
+    const store = try std.fmt.allocPrint(a, "{s}/kgv42.kg", .{root});
+    defer a.free(store);
+
+    // 先用真 bin 建好健康店(版本门可通过 = p41 毒店的真实形态)。
+    {
+        var kg = try makeClient(a, bin, store, "proj-v42");
+        defer kg.deinit();
+        kg.ensureReady();
+        if (!kg.ready) return error.SkipZigTest;
+        _ = try kg.remember(.decision, "v42 continuity probe seed row", "decision", false);
+    }
+
+    // shim:店里有 POISON 标记 → list-recent 报 data 级 InvalidRecord(模拟
+    // p41 撕裂店:store-info 头部照常通过,首个真实读全灭);JITTER 标记 →
+    // 报 transient Timeout。其余命令透传真 bin。
+    const shim = try std.fmt.allocPrint(a, "{s}/tinykg-shim.sh", .{root});
+    defer a.free(shim);
+    const shim_src = try std.fmt.allocPrint(a, "#!/bin/sh\n" ++
+        "if [ \"$1\" = \"list-recent\" ] && [ -f \"$2/POISON\" ]; then\n" ++
+        "  echo 'tinykg: error: InvalidRecord' >&2\n  exit 1\nfi\n" ++
+        "if [ \"$1\" = \"list-recent\" ] && [ -f \"$2/JITTER\" ]; then\n" ++
+        "  echo 'tinykg: error: Timeout' >&2\n  exit 1\nfi\n" ++
+        "exec \"{s}\" \"$@\"\n", .{bin});
+    defer a.free(shim_src);
+    try overwriteFile(a, shim, shim_src);
+    {
+        const shim_z = try a.dupeZ(u8, shim);
+        defer a.free(shim_z);
+        if (std.c.chmod(shim_z.ptr, 0o755) != 0) return error.SkipZigTest;
+    }
+
+    const poison = try std.fmt.allocPrint(a, "{s}/POISON", .{store});
+    defer a.free(poison);
+    try overwriteFile(a, poison, "x");
+
+    // data 失败 → 隔离 + 重建:ready、店是新的(POISON 消失)、隔离目录保全字节。
+    {
+        var kg = try makeClient(a, shim, store, "proj-v42");
+        defer kg.deinit();
+        kg.ensureReady();
+        try std.testing.expect(kg.ready);
+        // 撤门红线:无隔离时 POISON 仍在店里,记忆系统在死店上装活。
+        try std.testing.expect(!pathExists(poison));
+        var found_quarantine = false;
+        {
+            var it_dir = try std.Io.Dir.openDirAbsolute(std.testing.io, root, .{ .iterate = true });
+            defer it_dir.close(std.testing.io);
+            var it = it_dir.iterate();
+            while (try it.next(std.testing.io)) |e| {
+                if (std.mem.startsWith(u8, e.name, "kgv42.kg.quarantined.")) {
+                    found_quarantine = true;
+                    const qp = try std.fmt.allocPrint(a, "{s}/{s}/POISON", .{ root, e.name });
+                    defer a.free(qp);
+                    try std.testing.expect(pathExists(qp));
+                }
+            }
+        }
+        try std.testing.expect(found_quarantine);
+        // 重建店必须活着可写——这就是 p41 里死掉的那个能力。
+        const id = try kg.remember(.decision, "post-quarantine fresh store write", "decision", false);
+        try std.testing.expect(id > 0);
+    }
+
+    // transient 失败 → 不隔离:环境抖动不核爆记忆,原店字节原位保留。
+    const store2 = try std.fmt.allocPrint(a, "{s}/kgv42b.kg", .{root});
+    defer a.free(store2);
+    {
+        var kg = try makeClient(a, bin, store2, "proj-v42b");
+        defer kg.deinit();
+        kg.ensureReady();
+        if (!kg.ready) return error.SkipZigTest;
+        _ = try kg.remember(.decision, "v42 transient probe seed row", "decision", false);
+    }
+    const jitter = try std.fmt.allocPrint(a, "{s}/JITTER", .{store2});
+    defer a.free(jitter);
+    try overwriteFile(a, jitter, "x");
+    {
+        var kg = try makeClient(a, shim, store2, "proj-v42b");
+        defer kg.deinit();
+        kg.ensureReady();
+        try std.testing.expect(kg.ready);
+        try std.testing.expect(pathExists(jitter)); // 店仍在原位
+        var it_dir = try std.Io.Dir.openDirAbsolute(std.testing.io, root, .{ .iterate = true });
+        defer it_dir.close(std.testing.io);
+        var it = it_dir.iterate();
+        while (try it.next(std.testing.io)) |e| {
+            try std.testing.expect(!std.mem.startsWith(u8, e.name, "kgv42b.kg.quarantined."));
+        }
+    }
+}

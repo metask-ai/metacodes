@@ -205,6 +205,77 @@ def _best_artifact(trial_dir: Path) -> str:
     return "\n".join(pieces)
 
 
+def _advance_continuity_chain(
+    logs_dir: Path,
+    continuity_root: Path,
+    session_id: str,
+    store_import_sha: "str | None",
+) -> None:
+    """v42 导出门 host 侧:只有通过容器内深探针的导出才推进
+    `store-latest.tar`。
+
+    p41 取证:trial 1 的 GC 删除把店写进引擎读不回的状态,无门导出把毒店
+    推进链头,整臂 + 后代 trial 的记忆系统静默死亡。探针结果由容器内
+    `kg-export-probe.rc` 携带;rc 缺失/不可读按失败处理(fail-closed)。
+    探针不过时写降级账本行:`export_sha256` 保持上一个好 tar 的 sha(链
+    校验语义 = 本 trial 未推进,下一 trial 的导入见证仍对得上保留的
+    tar),被拒导出的 sha 记进 `rejected_export_sha256` 供取证。
+    """
+    export_host = logs_dir / "kg-export.tar"
+    if not export_host.is_file():
+        raise ValueError(
+            "kg store continuity export did not appear on the log mount"
+        )
+    exported = export_host.read_bytes()
+    if len(exported) > _MAX_CONTINUITY_TAR_BYTES:
+        raise ValueError("kg store continuity export exceeds its bound")
+    export_sha = hashlib.sha256(exported).hexdigest()
+    ledger_path = continuity_root / _CONTINUITY_LEDGER
+    try:
+        probe_rc = int(
+            (logs_dir / "kg-export-probe.rc").read_text(encoding="utf-8").strip()
+            or "1"
+        )
+    except (OSError, ValueError):
+        probe_rc = 1
+    if probe_rc == 0:
+        staging = continuity_root / f".export-{session_id}.tar"
+        staging.write_bytes(exported)
+        row = {
+            "trial": session_id,
+            "import_sha256": store_import_sha or "empty",
+            "export_sha256": export_sha,
+            "bytes": len(exported),
+        }
+        with open(ledger_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(staging, continuity_root / _CONTINUITY_TAR)
+        return
+    prev_rows = _read_continuity_ledger(ledger_path)
+    prev_sha = prev_rows[-1].get("export_sha256") if prev_rows else None
+    row = {
+        "trial": session_id,
+        "import_sha256": store_import_sha or "empty",
+        "export_sha256": prev_sha or "empty",
+        "bytes": len(exported),
+        "degraded": True,
+        "export_probe_rc": probe_rc,
+        "rejected_export_sha256": export_sha,
+    }
+    with open(ledger_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    print(
+        "metacodes adapter: kg export failed the integrity probe "
+        f"(rc={probe_rc}); continuity chain NOT advanced, previous good "
+        "store retained",
+        flush=True,
+    )
+
+
 def _read_continuity_ledger(path: Path) -> list:
     if not path.exists():
         return []
@@ -798,7 +869,19 @@ class MetacodesAgent(BaseInstalledAgent):
             # Always produce an export: an untouched store still advances the
             # ledger chain deterministically (empty dir tars are tiny), so the
             # next trial's import witness never has to guess.
+            # v42 导出侧完整性门:导出前在容器内用会话同款读形态深探针店。
+            # p41 取证:trial 1 的 GC 删除把店写进引擎读不回的状态,无门导出
+            # 把毒店推进链头,之后整臂 + 以其为种子的后代 trial 的记忆系统
+            # 静默死亡(15/16 InvalidRecord 全灭)。探针结果落
+            # kg-export-probe.rc,host 侧据此决定链是否推进;空店(会话未建
+            # 店)按 0 记——空导出无毒,importer 只会 init fresh。
             store_export = (
+                'if [ -d "$METACODES_KG_STORE" ] '
+                '&& [ -n "$(ls -A "$METACODES_KG_STORE" 2>/dev/null)" ]; then '
+                '"$METACODES_KG_BIN" list-recent "$METACODES_KG_STORE" '
+                "--kind project --limit 200 >/dev/null 2>/dev/null; "
+                'printf "%s" "$?" > /logs/agent/kg-export-probe.rc; '
+                'else printf "0" > /logs/agent/kg-export-probe.rc; fi; '
                 'mkdir -p "$METACODES_KG_STORE" || exit 78; '
                 'tar -cf /logs/agent/kg-export.tar -C "$(dirname "$METACODES_KG_STORE")" '
                 '"$(basename "$METACODES_KG_STORE")" || exit 78; '
@@ -889,30 +972,12 @@ class MetacodesAgent(BaseInstalledAgent):
             cwd="/workspace",
         )
         if self._memory_accumulation:
-            continuity_root = _continuity_root(self.logs_dir)
-            export_host = self.logs_dir / "kg-export.tar"
-            if not export_host.is_file():
-                raise ValueError(
-                    "kg store continuity export did not appear on the log mount"
-                )
-            exported = export_host.read_bytes()
-            if len(exported) > _MAX_CONTINUITY_TAR_BYTES:
-                raise ValueError("kg store continuity export exceeds its bound")
-            staging = continuity_root / f".export-{self._session_id}.tar"
-            staging.write_bytes(exported)
-            export_sha = hashlib.sha256(exported).hexdigest()
-            ledger_path = continuity_root / _CONTINUITY_LEDGER
-            row = {
-                "trial": self._session_id,
-                "import_sha256": store_import_sha or "empty",
-                "export_sha256": export_sha,
-                "bytes": len(exported),
-            }
-            with open(ledger_path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(row, sort_keys=True) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(staging, continuity_root / _CONTINUITY_TAR)
+            _advance_continuity_chain(
+                self.logs_dir,
+                _continuity_root(self.logs_dir),
+                self._session_id,
+                store_import_sha,
+            )
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         try:

@@ -3638,3 +3638,156 @@ with tempfile.TemporaryDirectory() as directory:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+
+
+class ContinuityExportGateTest(unittest.TestCase):
+    """v42 导出门:只有通过容器内深探针的导出才推进 store-latest.tar。
+
+    p41 取证:trial 1 的 GC 删除把店写进引擎读不回的状态,无门导出把毒店
+    推进链头,整臂 + 以其为种子的后代 trial 的记忆系统静默死亡(15/16
+    InvalidRecord 全灭)。这里对提取出的 `_advance_continuity_chain` 真实
+    代码对象做行为断言:探针不过/收据缺失 → 链不推进 + 降级账本行保持
+    链头 = 保留 tar 的 sha(下一 trial 的导入见证仍闭合)。
+    """
+
+    @staticmethod
+    def _helpers():
+        source = (
+            Path(__file__).parents[1]
+            / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {"_advance_continuity_chain", "_read_continuity_ledger"}
+        consts = {
+            "_CONTINUITY_DIRNAME",
+            "_CONTINUITY_TAR",
+            "_CONTINUITY_LEDGER",
+            "_MAX_CONTINUITY_TAR_BYTES",
+        }
+        body = []
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name in wanted:
+                body.append(node)
+            elif isinstance(node, ast.Assign) and any(
+                getattr(target, "id", None) in consts for target in node.targets
+            ):
+                body.append(node)
+        module = ast.Module(body=body, type_ignores=[])
+        namespace = {"hashlib": hashlib, "json": json, "os": os, "Path": Path}
+        exec(compile(module, "<continuity-gate>", "exec"), namespace)
+        return namespace
+
+    def _dirs(self):
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        base = Path(holder.name)
+        logs = base / "logs"
+        logs.mkdir()
+        croot = base / "kg-store-continuity"
+        croot.mkdir()
+        return logs, croot
+
+    def test_export_probe_pass_advances_chain(self):
+        ns = self._helpers()
+        logs, croot = self._dirs()
+        (logs / "kg-export.tar").write_bytes(b"TAR-ONE")
+        (logs / "kg-export-probe.rc").write_text("0", encoding="utf-8")
+        ns["_advance_continuity_chain"](logs, croot, "trialA", None)
+        self.assertEqual((croot / "store-latest.tar").read_bytes(), b"TAR-ONE")
+        rows = [
+            json.loads(line)
+            for line in (croot / "ledger.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            rows[0]["export_sha256"], hashlib.sha256(b"TAR-ONE").hexdigest()
+        )
+        self.assertEqual(rows[0]["import_sha256"], "empty")
+        self.assertNotIn("degraded", rows[0])
+
+    def test_export_probe_failure_keeps_previous_tar_and_writes_degraded_row(self):
+        ns = self._helpers()
+        logs, croot = self._dirs()
+        good_sha = hashlib.sha256(b"GOOD-TAR").hexdigest()
+        (croot / "store-latest.tar").write_bytes(b"GOOD-TAR")
+        (croot / "ledger.jsonl").write_text(
+            json.dumps(
+                {
+                    "trial": "prev",
+                    "import_sha256": "empty",
+                    "export_sha256": good_sha,
+                    "bytes": 8,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (logs / "kg-export.tar").write_bytes(b"BAD-TAR")
+        (logs / "kg-export-probe.rc").write_text("1", encoding="utf-8")
+        ns["_advance_continuity_chain"](logs, croot, "trialB", good_sha)
+        # 链不推进:保留的 tar 原字节原位。
+        self.assertEqual((croot / "store-latest.tar").read_bytes(), b"GOOD-TAR")
+        rows = [
+            json.loads(line)
+            for line in (croot / "ledger.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(len(rows), 2)
+        degraded = rows[-1]
+        self.assertTrue(degraded["degraded"])
+        self.assertEqual(degraded["export_probe_rc"], 1)
+        self.assertEqual(
+            degraded["rejected_export_sha256"],
+            hashlib.sha256(b"BAD-TAR").hexdigest(),
+        )
+        # 链头见证闭合:账本头 sha == 保留 tar 的 sha(下一 trial 导入校验用)。
+        self.assertEqual(degraded["export_sha256"], good_sha)
+        self.assertEqual(
+            hashlib.sha256((croot / "store-latest.tar").read_bytes()).hexdigest(),
+            degraded["export_sha256"],
+        )
+
+    def test_export_probe_receipt_missing_fails_closed(self):
+        ns = self._helpers()
+        logs, croot = self._dirs()
+        good_sha = hashlib.sha256(b"GOOD-TAR").hexdigest()
+        (croot / "store-latest.tar").write_bytes(b"GOOD-TAR")
+        (croot / "ledger.jsonl").write_text(
+            json.dumps(
+                {
+                    "trial": "prev",
+                    "import_sha256": "empty",
+                    "export_sha256": good_sha,
+                    "bytes": 8,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (logs / "kg-export.tar").write_bytes(b"UNPROVEN")
+        ns["_advance_continuity_chain"](logs, croot, "trialC", good_sha)
+        self.assertEqual((croot / "store-latest.tar").read_bytes(), b"GOOD-TAR")
+        rows = [
+            json.loads(line)
+            for line in (croot / "ledger.jsonl").read_text().splitlines()
+        ]
+        self.assertTrue(rows[-1]["degraded"])
+        self.assertEqual(rows[-1]["export_sha256"], good_sha)
+
+    def test_adapter_command_probes_store_before_export(self):
+        source = (
+            Path(__file__).parents[1]
+            / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            '\'"$METACODES_KG_BIN" list-recent "$METACODES_KG_STORE" \'',
+            source,
+        )
+        self.assertIn(
+            'printf "%s" "$?" > /logs/agent/kg-export-probe.rc',
+            source,
+        )
+        # 空店按探针通过记:空导出无毒,importer 只会 init fresh。
+        self.assertIn(
+            'else printf "0" > /logs/agent/kg-export-probe.rc; fi',
+            source,
+        )

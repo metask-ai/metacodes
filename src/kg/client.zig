@@ -677,6 +677,9 @@ pub const KgClient = struct {
         }
         // 版本门(含 legacy 自动 migrate)。
         if (!self.checkStoreVersionOrMigrate(bin)) return;
+        // v42 连续性完整性门(导入侧):版本门只读头部元数据,损坏 store 能带着
+        // 完好版本字段通过,然后在首个作用域读上全灭。深探针 + 隔离重建。
+        if (!self.deepProbeOrQuarantine(bin)) return;
         self.ready = true;
         log.info("kg", "ready bin={s} store={s} domain={s}", .{ bin, self.store_path, self.domain });
     }
@@ -719,6 +722,65 @@ pub const KgClient = struct {
         log.info("kg", "legacy→v2 自动 migrate 成功 store={s}", .{self.store_path});
         // autoMigrateLegacyStore only returns true after probeStore reopens canonical
         // and sees the exact 2/3 pair; do not add a third redundant subprocess here.
+        return true;
+    }
+
+    /// v42 导入侧完整性门。背景(p41 取证):store-info 只读头部,一个被
+    /// 压实/删除路径写坏的 store 带着完好版本字段通过版本门,随后会话内
+    /// 所有作用域读写以 InvalidRecord 全灭——记忆系统静默死亡,且坏店经
+    /// 连续性导出链传染全部后代 trial(15/16 失去记忆)。这里在版本门后用
+    /// findProjectNode 的真实读形态(list-recent --kind project)做一次深
+    /// 探针:data 类失败 = 店对本引擎确定性不可读 → 原子改名隔离(字节保
+    /// 全,可取证)+ 重建空店(剂量由结局根在 ingest 重新摄取,损失有界);
+    /// transient 失败不隔离(环境抖动不该核爆记忆)。返回 false 仅当隔离/
+    /// 重建本身失败(已 setDegraded)。
+    fn deepProbeOrQuarantine(self: *KgClient, bin: []const u8) bool {
+        const out = self.runRaw(&.{ "list-recent", self.store_path, "--kind", "project", "--limit", "200" }) catch {
+            // spawn 失败是环境问题不是店问题:交给后续 op 的重试/降级路径。
+            return true;
+        };
+        const exit_code = out.exit_code;
+        const err_name_owned: ?[]u8 = if (exit_code != 0) self.allocator.dupe(u8, parseCliError(out.stderr)) catch null else null;
+        self.freeOut(out);
+        if (exit_code == 0) return true;
+        const err_name: []const u8 = err_name_owned orelse "OutOfMemory";
+        defer if (err_name_owned) |n| self.allocator.free(n);
+        if (classifyCliError(err_name) != .data) {
+            log.warn("kg", "store deep probe transient failure err={s}; not quarantining", .{err_name});
+            return true;
+        }
+        // 与 migrate 共用 host lock:并发进程只允许一个执行隔离。
+        var lock = self.acquireMigrationLock() catch |err| {
+            self.setDegraded("store integrity quarantine lock failed: {s}(store={s})", .{ @errorName(err), self.store_path });
+            return false;
+        };
+        defer lock.release();
+        // 等锁期间另一进程可能已隔离并重建:重探针,通过即完成。
+        if (self.runRaw(&.{ "list-recent", self.store_path, "--kind", "project", "--limit", "200" })) |re_out| {
+            const re_exit = re_out.exit_code;
+            self.freeOut(re_out);
+            if (re_exit == 0) return true;
+        } else |_| {}
+        const ts: u64 = @intCast(@max(0, time.nowUnix()));
+        const quarantine_path = std.fmt.allocPrint(self.allocator, "{s}.quarantined.{d}", .{ self.store_path, ts }) catch {
+            self.setDegraded("store integrity quarantine path allocation failed(err={s} store={s})", .{ err_name, self.store_path });
+            return false;
+        };
+        defer self.allocator.free(quarantine_path);
+        if (!renamePath(self.store_path, quarantine_path)) {
+            self.setDegraded("store integrity quarantine rename failed(err={s} store={s})", .{ err_name, self.store_path });
+            return false;
+        }
+        log.warn("kg", "store integrity quarantine: deep probe failed err={s}; broken store preserved at {s}; initializing FRESH store (outcome-root re-ingest restores dose)", .{ err_name, quarantine_path });
+        const init_out = self.runRaw(&.{ "init", self.store_path }) catch {
+            self.setDegraded("post-quarantine tinykg init failed(bin={s} store={s})", .{ bin, self.store_path });
+            return false;
+        };
+        defer self.freeOut(init_out);
+        if (init_out.exit_code != 0) {
+            self.setDegraded("post-quarantine tinykg init exit={d}: {s}", .{ init_out.exit_code, trimForLog(init_out.stderr) });
+            return false;
+        }
         return true;
     }
 
