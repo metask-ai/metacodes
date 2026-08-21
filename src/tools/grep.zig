@@ -107,32 +107,67 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const head_limit: usize = parseUsize(common.extractJsonArg(args, "head_limit")) orelse DEFAULT_HEAD_LIMIT;
     const offset = parseUsize(common.extractJsonArg(args, "offset")) orelse 0;
 
-    // positional: pattern, path
-    try argv.append(allocator, pattern);
-    try argv.append(allocator, path);
-
-    // 转成 [*:0]const u8 数组（z-strings）
-    var argv_z = try allocator.alloc(?[*:0]const u8, argv.items.len + 1);
-    defer {
-        for (argv_z[0..argv.items.len]) |p| if (p) |pp| allocator.free(std.mem.span(pp));
-        allocator.free(argv_z);
+    // v39 G1 修复阶梯(终局取证:GLM 在 JSON 里双重转义正则——`\\\\(` 到达
+    // rg 成"字面反斜杠+未闭合组",sealed 一轮 28 次 GrepExecFailed/20 trial,
+    // 且错误经 system_error 黑盒化,模型自纠慢)。确定性阶梯:
+    //   ① 原样 → ② 反斜杠折叠(\\→\,仅当模式含双反斜杠) → ③ -F 字面量。
+    // 仅对 rg 的 "regex parse error" 降级;修复命中时在输出首行注明,模型
+    // 可见可学。任务无关:纯入参转义修复,不看模式语义。
+    const collapsed = collapseDoubleBackslashes(allocator, pattern);
+    defer if (collapsed) |c| allocator.free(c);
+    const Attempt = struct { pat: []const u8, literal: bool, note: ?[]const u8 };
+    var attempts_buf: [3]Attempt = undefined;
+    var n_attempts: usize = 0;
+    attempts_buf[n_attempts] = .{ .pat = pattern, .literal = false, .note = null };
+    n_attempts += 1;
+    if (collapsed) |c| {
+        attempts_buf[n_attempts] = .{ .pat = c, .literal = false, .note = "[Grep: pattern auto-repaired — double-escaped backslashes collapsed]\n" };
+        n_attempts += 1;
     }
-    for (argv.items, 0..) |s, i| {
-        argv_z[i] = (try allocator.dupeZ(u8, s)).ptr;
-    }
-    argv_z[argv.items.len] = null;
+    attempts_buf[n_attempts] = .{ .pat = pattern, .literal = true, .note = "[Grep: pattern was not a valid regex — matched as FIXED-STRING literal instead]\n" };
+    n_attempts += 1;
 
-    // rg 退出语义:0=有匹配,1=无匹配(合法空),>=2/信号死=真实故障(如沙箱内
-    // dyld 加载失败)。假空结果比报错危险 → fail loud(与 glob.zig 同款)。
-    const spawned = try common.spawnCaptureWithStderrTimed(
-        argv_z,
-        allocator,
-        ctx.abort,
-        0,
-        ctx.spawn_tick_fn,
-        common.MAX_SPAWN_CAPTURE_BYTES,
-        null,
-    );
+    var spawned: common.SpawnOut = undefined;
+    var used_note: ?[]const u8 = null;
+    var ai: usize = 0;
+    while (ai < n_attempts) : (ai += 1) {
+        const at = attempts_buf[ai];
+        var items = std.array_list.Managed([]const u8).init(allocator);
+        defer items.deinit();
+        try items.appendSlice(argv.items);
+        if (at.literal) try items.append("-F");
+        try items.append(at.pat);
+        try items.append(path);
+        var argv_z = try allocator.alloc(?[*:0]const u8, items.items.len + 1);
+        defer {
+            for (argv_z[0..items.items.len]) |p| if (p) |pp| allocator.free(std.mem.span(pp));
+            allocator.free(argv_z);
+        }
+        for (items.items, 0..) |s, i| {
+            argv_z[i] = (try allocator.dupeZ(u8, s)).ptr;
+        }
+        argv_z[items.items.len] = null;
+
+        // rg 退出语义:0=有匹配,1=无匹配(合法空),>=2/信号死=真实故障。
+        spawned = try common.spawnCaptureWithStderrTimed(
+            argv_z,
+            allocator,
+            ctx.abort,
+            0,
+            ctx.spawn_tick_fn,
+            common.MAX_SPAWN_CAPTURE_BYTES,
+            null,
+        );
+        const parse_error = spawned.exit_code == 2 and
+            std.mem.indexOf(u8, spawned.stderr, "regex parse error") != null;
+        if (parse_error and ai + 1 < n_attempts) {
+            allocator.free(spawned.stdout);
+            allocator.free(spawned.stderr);
+            continue;
+        }
+        used_note = at.note;
+        break;
+    }
     defer allocator.free(spawned.stderr);
     // 有输出的 exit 2 = 部分目录不可读的 best-effort 结果,照常返回。
     // 空输出时只把"工具没跑起来"当故障:信号死(负值,如沙箱内 dyld 加载失败)、
@@ -148,7 +183,14 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         });
         return error.GrepExecFailed;
     }
-    const raw = spawned.stdout;
+    var raw = spawned.stdout;
+    if (used_note) |note| {
+        if (raw.len > 0) {
+            const with_note = try std.mem.concat(allocator, u8, &.{ note, raw });
+            allocator.free(raw);
+            raw = with_note;
+        }
+    }
 
     // grep 主体结果(可能分页)。
     const grep_out: []u8 = blk: {
@@ -257,6 +299,24 @@ fn isTrue(s: ?[]const u8) bool {
 
 fn testCtx() ToolContext {
     return ToolContext.simple(std.testing.allocator);
+}
+
+
+/// v39 G1:把双反斜杠折叠一级(`\\\\` 到 `\\`)。模式不含双反斜杠 → null(无可修)。
+fn collapseDoubleBackslashes(allocator: std.mem.Allocator, pat: []const u8) ?[]u8 {
+    if (std.mem.indexOf(u8, pat, "\\\\") == null) return null;
+    var out = std.array_list.Managed(u8).init(allocator);
+    defer out.deinit();
+    var i: usize = 0;
+    while (i < pat.len) : (i += 1) {
+        if (i + 1 < pat.len and pat[i] == '\\' and pat[i + 1] == '\\') {
+            out.append('\\') catch return null;
+            i += 1;
+        } else {
+            out.append(pat[i]) catch return null;
+        }
+    }
+    return out.toOwnedSlice() catch null;
 }
 
 test "GrepTool missing pattern" {
@@ -600,4 +660,54 @@ test "GrepTool path=. 默认值不被存在性检查误伤" {
     // path 缺省 = "." 必存在,statPath 不该拦;pattern 无匹配返空但不报 PathNotFound。
     const r = try execute(&ctx, "{\"pattern\":\"zzzzzz-nonexistent-zzzzzz\"}");
     defer std.testing.allocator.free(r);
+}
+
+test "GrepTool v39 repair ladder: double-escaped pattern auto-collapses" {
+    // 撤修复必红:GLM 双重转义的 `validate\\\\(` 在 v38 直接 GrepExecFailed;
+    // v39 阶梯折叠为 `validate\\(` 后命中,且输出首行携带修复注记。
+    const ctx = testCtx();
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "grep-repair-test.txt");
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    try std.testing.expect(fd >= 0);
+    _ = pfs.write(fd, "call validate(x) here\n");
+    _ = pfs.close(fd);
+    defer _ = std.c.unlink(path.ptr);
+
+    var abuf: [400]u8 = undefined;
+    // 生产形态:extractJsonArg 不做 JSON 反转义,模型按 JSON 规范写的 `\\(`
+    // (意图 `\(`)以**双反斜杠原始字节**抵达工具 → rg 视角=字面反斜杠+未闭合组。
+    const args = try std.fmt.bufPrint(&abuf, "{{\"pattern\":\"(?:validate\\\\()\",\"path\":\"{s}\",\"output_mode\":\"content\"}}", .{path});
+    const r = try execute(&ctx, args);
+    defer std.testing.allocator.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "auto-repaired") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "validate(x)") != null);
+}
+
+test "GrepTool v39 repair ladder: hopeless regex degrades to fixed-string" {
+    const ctx = testCtx();
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "grep-literal-test.txt");
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    try std.testing.expect(fd >= 0);
+    _ = pfs.write(fd, "weird (?:token here\n");
+    _ = pfs.close(fd);
+    defer _ = std.c.unlink(path.ptr);
+
+    var abuf: [400]u8 = undefined;
+    // 无双反斜杠可折叠、本身也不是合法正则 → 第三级 -F 字面量命中。
+    const args = try std.fmt.bufPrint(&abuf, "{{\"pattern\":\"(?:token\",\"path\":\"{s}\",\"output_mode\":\"content\"}}", .{path});
+    const r = try execute(&ctx, args);
+    defer std.testing.allocator.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "FIXED-STRING") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "weird (?:token here") != null);
+}
+
+test "collapseDoubleBackslashes unit" {
+    const a = std.testing.allocator;
+    const c1 = collapseDoubleBackslashes(a, "no backslash");
+    try std.testing.expect(c1 == null);
+    const c2 = collapseDoubleBackslashes(a, "a\\\\(b").?;
+    defer a.free(c2);
+    try std.testing.expectEqualStrings("a\\(b", c2);
 }

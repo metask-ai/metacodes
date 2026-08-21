@@ -63,6 +63,17 @@ const DOING_TASKS_SECTION =
 ;
 
 /// getActionsSection。逐字复制，不改动。
+/// v39 G3+G5(codex 基础面对照取证):验证 gate 收尾 + 持续性。终局 sealed
+/// 唯一 build_error 零分 = 跑了验证却红着交卷;47/48 自发验证证明缺的不是
+/// "跑验证"而是"验证约束收尾"。持续性段对弱模型的早收敛显式加压。
+const VALIDATION_SECTION =
+    \\# Completing and validating your work
+    \\ - Keep going until the task is fully resolved before ending your turn. Do not stop at analysis or a partial fix; carry the change through implementation and verification. If a tool call fails, diagnose and continue — do not give up early.
+    \\ - After your FINAL edit, re-run the narrowest check that covers what you changed (the failing test, the file's test module, or a quick build). Never end the turn with the workspace failing to build, or with a check you ran earlier now failing — fix it, or revert to the last working state, before finishing.
+    \\ - Run the most specific test first, then broaden only as needed for confidence. Do not re-read a file you just edited to "verify" the edit — the Edit tool fails loudly on mismatch; spend that step running a real check instead.
+    \\ - Fix problems at the root cause rather than papering over symptoms. Do not fix unrelated bugs or failing tests you did not cause; mention them in your final message instead.
+;
+
 const ACTIONS_SECTION =
     \\# Executing actions with care
     \\
@@ -358,6 +369,7 @@ pub fn buildFull(
         INTRO_SECTION,             sep,
         SYSTEM_SECTION,            sep,
         DOING_TASKS_SECTION,       sep,
+        VALIDATION_SECTION,        sep,
         ACTIONS_SECTION,           sep,
         using_tools_section,       if (deferred_section.len > 0) sep else "",
         deferred_section,          sep,
@@ -583,6 +595,8 @@ test "build produces non-empty prompt with MetaCode identity" {
     try testing.expect(std.mem.indexOf(u8, s, "# System") != null);
     try testing.expect(std.mem.indexOf(u8, s, "# Doing tasks") != null);
     try testing.expect(std.mem.indexOf(u8, s, "# Executing actions with care") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "# Completing and validating your work") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "Never end the turn with the workspace failing to build") != null);
     try testing.expect(std.mem.indexOf(u8, s, "# Using your tools") != null);
     try testing.expect(std.mem.indexOf(u8, s, "# Environment") != null);
 }

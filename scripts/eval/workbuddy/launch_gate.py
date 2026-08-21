@@ -606,6 +606,7 @@ def build_launch_manifest(
     max_metered_tokens: int,
     prior_exposure_microusd: int = 0,
     quality_evidence_on_commit: bool = False,
+    diagnostic_tasks: "Sequence[str] | None" = None,
     comparison_id: str | None = None,
 ) -> Dict[str, object]:
     if not RUN_ID_RE.fullmatch(run_id):
@@ -623,6 +624,18 @@ def build_launch_manifest(
         raise LaunchError(str(exc)) from exc
 
     cohort_row = _cohort(cohort_manifest.resolve(), subset, cohort, take)
+    # v39 诊断选择(sealed 烧毁后迭代面): 任意任务子集,跨 cohort;收据强制
+    # quality_evidence_on_commit=False,manifest 记 diagnostic_selection 以示
+    # 与冻结 cohort 声明面的区隔——诊断结果永不作为声明成绩。
+    if diagnostic_tasks is not None:
+        names = list(diagnostic_tasks)
+        if not names or len(names) != len(set(names)):
+            raise LaunchError("diagnostic task selection is empty or duplicated")
+        cohort_row = dict(cohort_row)
+        cohort_row["selected_tasks"] = names
+        cohort_row["selected_tasks_sha256"] = _canonical_sha256(names)
+        cohort_row["cohort"] = f"diagnostic({cohort})"
+        quality_evidence_on_commit = False
     artifact_row = _artifact_contract(split_mount_manifest.resolve())
     job_path = job_config.resolve()
     model_path = model_config.resolve()
@@ -646,7 +659,11 @@ def build_launch_manifest(
     host_control_plane = _host_control_plane()
     expected_selection = {"mode": "name", "names": selected}
     if job.get("dataset") != cohort_row["dataset"] or job.get("task_selection") != expected_selection:
-        raise LaunchError("WorkBuddy job dataset/task_selection differs from frozen cohort")
+        raise LaunchError(
+            "WorkBuddy job dataset/task_selection differs from frozen cohort"
+            if diagnostic_tasks is None
+            else "WorkBuddy job task_selection differs from the diagnostic selection"
+        )
     if job.get("harness") != "metacodes/0.1.0" or job.get("model_connection") != "local_proxy":
         raise LaunchError("WorkBuddy job must use the pinned metacodes local-proxy harness")
     if job.get("record_full_io") is not True or job.get("n_attempts") != 1:
@@ -4888,6 +4905,7 @@ def main(argv: list[str] | None = None) -> int:
     create.add_argument("--subset", choices=("code", "web", "office", "security"), required=True)
     create.add_argument("--cohort", choices=("dev", "dev_etag", "promotion_a", "promotion_b", "sealed"), required=True)
     create.add_argument("--take", type=int, default=0)
+    create.add_argument("--diagnostic-tasks", default=None, help="comma-separated任意任务子集(诊断态,收据非质量证据)")
     create.add_argument("--split-mount-manifest", type=Path, required=True)
     create.add_argument("--environment-preflight-receipt", type=Path, required=True)
     create.add_argument("--job-config", type=Path, required=True)
@@ -4955,6 +4973,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_metered_tokens=args.max_metered_tokens,
                 prior_exposure_microusd=args.prior_exposure_microusd,
                 quality_evidence_on_commit=args.quality_evidence_on_commit,
+                diagnostic_tasks=(args.diagnostic_tasks.split(",") if args.diagnostic_tasks else None),
                 comparison_id=args.comparison_id,
             )
             _write_private_new(

@@ -19,6 +19,29 @@ const builtin = @import("builtin");
 const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
+/// v39 G4 离线熔断(终局取证:离线容器里 agent 陷 WebFetch 并行重试风暴后
+/// 进程死亡、零结果事件,整个 harbor run 中止)。进程级连续失败计数:达阈值
+/// 后本 run 拒绝继续外呼,给模型"环境离线,改用本地手段"的明确信号;任一次
+/// 成功即复位——长交互会话不会被一段网络抖动永久禁用。进程级=eval 每
+/// trial 独立进程,作用域天然正确。
+pub const OFFLINE_BREAKER_THRESHOLD: u32 = 5;
+var consecutive_failures = std.atomic.Value(u32).init(0);
+
+/// 测试钩子:复位熔断计数。
+pub fn resetOfflineBreakerForTest() void {
+    consecutive_failures.store(0, .release);
+}
+
+
+/// 测试钩子:模拟一次网络失败(与 execute 失败路径同一计数器)。
+pub fn noteFetchFailureForTest() u32 {
+    return consecutive_failures.fetchAdd(1, .acq_rel) + 1;
+}
+
+pub fn offlineBreakerTripped() bool {
+    return consecutive_failures.load(.acquire) >= OFFLINE_BREAKER_THRESHOLD;
+}
+
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
     const url = common.extractJsonArg(args, "url") orelse return error.MissingUrl;
@@ -29,6 +52,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // 基本 URL 合法性：必须以 http:// 或 https:// 开头
     if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) {
         return error.InvalidUrl;
+    }
+
+    if (offlineBreakerTripped()) {
+        common.setErrorDetail(ctx.error_detail, allocator, "WebFetch disabled for this run after {d} consecutive network failures — the environment appears to be OFFLINE. Do not retry any network tool; solve the task with local files and commands only.", .{consecutive_failures.load(.acquire)});
+        return error.FetchFailed;
     }
 
     // 用 curl 抓取
@@ -53,8 +81,13 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer allocator.free(out.stderr);
 
     if (out.exit_code != 0) {
+        const n = consecutive_failures.fetchAdd(1, .acq_rel) + 1;
+        if (n >= OFFLINE_BREAKER_THRESHOLD) {
+            common.setErrorDetail(ctx.error_detail, allocator, "WebFetch failed ({d} consecutive network failures) — the environment appears to be OFFLINE. Further WebFetch calls this run will be rejected; solve the task with local files and commands only.", .{n});
+        }
         return error.FetchFailed;
     }
+    consecutive_failures.store(0, .release);
 
     // HTML → text(全文,受 16MB 捕获守卫上界)。
     const text = try htmlToText(out.stdout, allocator);
@@ -211,4 +244,24 @@ test "WebFetch rejects non-http URLs" {
     const ctx = ToolContext{ .allocator = a };
     try std.testing.expectError(error.InvalidUrl, execute(&ctx, "{\"url\":\"file:///etc/passwd\"}"));
     try std.testing.expectError(error.InvalidUrl, execute(&ctx, "{\"url\":\"ftp://x\"}"));
+}
+
+test "v39 offline breaker trips after threshold and rejects before spawn" {
+    resetOfflineBreakerForTest();
+    defer resetOfflineBreakerForTest();
+    var i: u32 = 0;
+    while (i < OFFLINE_BREAKER_THRESHOLD - 1) : (i += 1) {
+        _ = noteFetchFailureForTest();
+    }
+    try std.testing.expect(!offlineBreakerTripped());
+    _ = noteFetchFailureForTest();
+    try std.testing.expect(offlineBreakerTripped());
+    // tripped 后 execute 必须在 spawn 前拒绝,并携带 OFFLINE 提示。
+    var detail: ?[]const u8 = null;
+    var ctx = ToolContext{ .allocator = std.testing.allocator, .error_detail = &detail };
+    defer if (detail) |d| std.testing.allocator.free(d);
+    const r = execute(&ctx, "{\"url\":\"https://example.com/x\"}");
+    try std.testing.expectError(error.FetchFailed, r);
+    try std.testing.expect(detail != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.?, "OFFLINE") != null);
 }

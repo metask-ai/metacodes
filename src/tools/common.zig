@@ -164,6 +164,25 @@ pub fn spawnCaptureStdoutCapped(
     return spawnCaptureStdoutAbortableTimedCapped(argv, allocator, abort, timeout_ms, max_bytes);
 }
 
+
+/// v39 G2(终局取证:并行工具爆发下受限容器 fork 压力,Glob/Grep SpawnError
+/// 24 次/48 trial,无重试直接把瞬时资源竖成模型可见故障)。spawn 层一次
+/// 150ms 退避重试:只针对 SpawnError 类(fork/exec 资源性失败),Timeout/
+/// Abort/OOM 语义不变。
+fn captureWithSpawnRetry(
+    argv: []const ?[*:0]const u8,
+    allocator: std.mem.Allocator,
+    opts: process.CaptureOpts,
+) process.CaptureError!process.Captured {
+    return process.capture(argv, allocator, opts) catch |e| switch (e) {
+        error.Timeout, error.Aborted, error.OutOfMemory => return e,
+        else => {
+            @import("../util/time.zig").sleepMs(150);
+            return process.capture(argv, allocator, opts);
+        },
+    };
+}
+
 fn spawnCaptureStdoutAbortableTimedCapped(
     argv: []const ?[*:0]const u8,
     allocator: std.mem.Allocator,
@@ -181,7 +200,7 @@ fn spawnCaptureStdoutAbortableTimedCapped(
             return a.isAborted();
         }
     };
-    const r = process.capture(argv, allocator, .{
+    const r = captureWithSpawnRetry(argv, allocator, .{
         .timeout_ms = timeout_ms,
         .max_bytes = if (max_bytes == 0) std.math.maxInt(usize) else max_bytes,
         .want_stderr = false,
@@ -279,7 +298,7 @@ pub fn spawnCaptureWithStderrTimed(
         }
     };
     var tick_bridge: ?TickBridge = if (tick_fn) |tf| .{ .f = tf } else null;
-    const r = process.capture(argv, allocator, .{
+    const r = captureWithSpawnRetry(argv, allocator, .{
         .timeout_ms = timeout_ms,
         .max_bytes = if (max_bytes == 0) std.math.maxInt(usize) else max_bytes,
         .want_stderr = true,
