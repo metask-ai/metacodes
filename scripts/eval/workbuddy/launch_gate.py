@@ -628,7 +628,9 @@ def build_launch_manifest(
     # quality_evidence_on_commit=False,manifest 记 diagnostic_selection 以示
     # 与冻结 cohort 声明面的区隔——诊断结果永不作为声明成绩。
     if diagnostic_tasks is not None:
-        names = list(diagnostic_tasks)
+        # harbor 解析清单按字典序,契约名单必须同序(p40 取证:保序名单致
+        # post-run 审计 selected_tasks 不等,runner exit 0 但收据拒 commit)。
+        names = sorted(diagnostic_tasks)
         if not names or len(names) != len(set(names)):
             raise LaunchError("diagnostic task selection is empty or duplicated")
         cohort_row = dict(cohort_row)
@@ -2169,8 +2171,15 @@ def _runtime_contract(manifest: Mapping[str, Any]) -> Dict[str, object]:
     proxy_path = instance_dir / "proxy.yaml"
     resolved = _json(resolved_path)
     selected = list(manifest["cohort"]["selected_tasks"])
+    resolved_selected = resolved.get("selected_tasks")
+    diagnostic_manifest = str(manifest["cohort"].get("cohort", "")).startswith("diagnostic(")
+    selection_matches = (
+        sorted(resolved_selected or []) == sorted(selected)
+        if diagnostic_manifest
+        else resolved_selected == selected
+    )
     if (
-        resolved.get("selected_tasks") != selected
+        not selection_matches
         or resolved.get("model_connection") != "local_proxy"
         or resolved.get("record_full_io") is not True
         or resolved.get("harness_resolved_slug") != "metacodes/0.1.0"
