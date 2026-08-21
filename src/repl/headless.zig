@@ -254,6 +254,20 @@ pub fn run(
     };
     if (run_control) |control| try control.finishRun(@tagName(result.stop_reason));
 
+    // v41 机制遥测:run 末把义务运行时状态折叠成 ontology 行(host 观测,
+    // 任务无关)。独立于 self_evo 开关——遥测是机制自观察的数据面;一切
+    // 失败静默。
+    if (obligation_runtime) |runtime| {
+        if (app.kg) |*known_graph| {
+            const hint: []const u8 = if (std.c.getenv("METACODES_TASK_HINT")) |h| std.mem.span(h) else "";
+            const rid: []const u8 = if (run_control) |control| blk: {
+                const b = control.journal.runBinding() catch break :blk "unbound";
+                break :blk b.run_id.asSlice();
+            } else "unbound";
+            _ = @import("../core/obligation_gate.zig").writeTelemetry(allocator, known_graph, runtime, hint, rid);
+        }
+    }
+
     // 自演化 S1+S3:Run 完结(观察日志封口)后,规则效果回灌本体 +
     // 满足稀疏触发时经隔离单次 provider 调用起草临时规则并写回 store。
     // 一切结果(含降级)静默——自演化永不影响 Run 的退出语义。

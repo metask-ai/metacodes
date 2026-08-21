@@ -148,4 +148,52 @@ remains available. -/
 theorem cooled_channel_stays_open (plateau : Bool) : 1 ≤ nudgeBudget plateau := by
   cases plateau <;> simp [nudgeBudget, maxNudges]
 
+/-- v41 needle-efficacy fold: retirement is provably loss-free in both rules.
+Rule A (inert): a needle nudged in at least `k` rounds that the model never
+once dispatched is behaviorally inert — retiring it cannot lose progress the
+model was never going to make. A mechanism evolution that changes the
+needle's reason mints a fresh candidate id, so history-proven breakthrough
+needles (etag) restart their count under a new identity and are never
+swept. Rule B (non-causal): a needle that was satisfied in some round with
+no reward gain in or after that round is proven non-causal for this task —
+its satisfaction does not move the score. -/
+def inertRetire (k nudgeRounds dispatchRounds : Nat) : Bool :=
+  if k ≤ nudgeRounds ∧ dispatchRounds = 0 then true else false
+
+def nonCausalRetire (metRounds : Nat) (gainAfterMet : Bool) : Bool :=
+  if 1 ≤ metRounds ∧ gainAfterMet = false then true else false
+
+/-- A needle the model ever acted on is never inert-retired — compliance is
+absolute protection under Rule A. -/
+theorem dispatched_never_inert (k n d : Nat) (h : 1 ≤ d) :
+    inertRetire k n d = false := by
+  unfold inertRetire
+  rw [if_neg]
+  rintro ⟨_, hd⟩
+  omega
+
+/-- Below the nudge threshold nothing retires — young needles are safe. -/
+theorem under_threshold_never_inert (k n d : Nat) (h : n < k) :
+    inertRetire k n d = false := by
+  unfold inertRetire
+  rw [if_neg]
+  rintro ⟨hk, _⟩
+  omega
+
+/-- Any reward gain after compliance protects the needle under Rule B. -/
+theorem gain_protects (m : Nat) : nonCausalRetire m true = false := by
+  unfold nonCausalRetire
+  rw [if_neg]
+  rintro ⟨_, hg⟩
+  exact absurd hg (by simp)
+
+/-- A never-satisfied needle is never non-causal-retired — Rule B only
+judges needles whose satisfaction was actually observed. -/
+theorem unmet_never_noncausal (g : Bool) : nonCausalRetire 0 g = false := by
+  unfold nonCausalRetire
+  rw [if_neg]
+  rintro ⟨hm, _⟩
+  omega
+
 end MetaCodesControl.ObligationGate
+

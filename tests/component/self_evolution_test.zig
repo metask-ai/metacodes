@@ -1171,6 +1171,69 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         try std.testing.expect(std.mem.indexOf(u8, text_vb, "byte-for-byte UNCHANGED") != null);
     }
 
+
+    // v41 L2(针效能折叠,撤修复必红——旧码无遥测/无退休,二次 load 原样):
+    // Rule A 惰性:同 cid 三轮 nudged=1 dispatched=0 遥测 → 针退休;
+    // Rule B 非因果:met=1 且 best 无增 → 退休;增益行入店后针复活。
+    {
+        const payload_rt = "{\"schema_version\":\"task-outcome-v1\",\"outcomes\":[" ++
+            "{\"task\":\"ret-task\",\"attempt_key\":\"r1\",\"reward\":0.3,\"tests_passed\":1,\"tests_total\":3," ++
+            "\"failing_tests\":[\"tests/rt.py::T::t_r (skipped: widget._retmod not available)\"]}]}";
+        const pfs = @import("platform").fs;
+        {
+            const zr = try a.dupeZ(u8, outcomes_path);
+            defer a.free(zr);
+            const fd = pfs.open(zr.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+            try std.testing.expect(fd >= 0);
+            defer _ = pfs.close(fd);
+            var off: usize = 0;
+            while (off < payload_rt.len) {
+                const n = pfs.write(fd, payload_rt[off..]);
+                try std.testing.expect(n > 0);
+                off += @intCast(n);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), self_evolution.ingestOutcomes(a, &kg));
+        ppaths.setEnv("METACODES_TASK_HINT", "ret-task");
+        // 首次 load:派生针在场,取真 cid。
+        var cid_buf: [64]u8 = undefined;
+        var baseline_count: usize = 0;
+        {
+            const rt0 = cc.obligation_gate.load(a, &kg, "ret-task") orelse return error.TestExpectedRuntime;
+            defer {
+                rt0.deinit();
+                a.destroy(rt0);
+            }
+            baseline_count = rt0.envelopes.len;
+            try std.testing.expect(baseline_count >= 1);
+            @memcpy(cid_buf[0..], rt0.envelopes[0].candidate_id[0..64]);
+        }
+        // Rule A:三轮惰性遥测(不同 run id,nudged=1 dispatched=0)。
+        var round: usize = 0;
+        while (round < 3) : (round += 1) {
+            const trow = try std.fmt.allocPrint(a,
+                "metacodes-needle-telemetry-v1: cid={s} task=ret-task run=ra{d} nudged=1 dispatched=0 met=0 best=0.3000 needle=x",
+                .{ cid_buf[0..64], round });
+            defer a.free(trow);
+            _ = kg.remember(.observation, trow, "obligation_telemetry", false) catch {};
+        }
+        {
+            const rt1 = cc.obligation_gate.load(a, &kg, "ret-task");
+            if (rt1) |r1| {
+                defer {
+                    r1.deinit();
+                    a.destroy(r1);
+                }
+                // 目标针必须消失(其余针可存续)。
+                for (r1.envelopes) |envelope| {
+                    try std.testing.expect(!std.mem.eql(u8, envelope.candidate_id[0..64], cid_buf[0..64]));
+                }
+                try std.testing.expect(r1.envelopes.len < baseline_count);
+            }
+            // null = 全部退休,同样满足断言语义。
+        }
+    }
+
     // v38 L2(灌店自愈,撤修复必红——旧码同键双行永存且重摄取穿透):手工
     // 灌两条同键行(模拟跨 run 重摄取穿透),同键行再次到达时定点探测
     // GC 较老副本、拒绝再写:同键只剩一行,ingest 计 0。

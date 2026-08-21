@@ -11,6 +11,7 @@
 const std = @import("std");
 const self_evolution = @import("self_evolution.zig");
 const kg_client_mod = @import("../kg/client.zig");
+const log = @import("../util/log.zig");
 
 pub const MAX_OBLIGATION_NUDGES: u8 = 3;
 
@@ -511,6 +512,33 @@ pub fn load(
     }
     {
     }
+    // v41 针效能折叠:装配完成后按遥测退休(Rule A 惰性/Rule B 非因果)。
+    // 解决态换针(reproduce_only)不受折叠——复现针的价值由最佳行证据背书。
+    if (!reproduce_only and combined.items.len > 0 and task_hint.len > 0 and task_hint.len <= 200) {
+        const scoped_recall2 = @import("../kg/scoped_recall.zig");
+        var current_best: f64 = -1.0;
+        {
+            var hist = std.array_list.Managed([]u8).init(a);
+            defer {
+                for (hist.items) |row| a.free(row);
+                hist.deinit();
+            }
+            scoped_recall2.collectHistory(a, kg, task_hint, &hist);
+            for (hist.items) |row| {
+                const r = rowRewardOf(row);
+                if (r > current_best) current_best = r;
+            }
+        }
+        var keep = std.array_list.Managed(self_evolution.ObligationEnvelope).init(a);
+        for (combined.items) |envelope| {
+            if (needleRetired(kg, envelope.candidate_id, current_best)) {
+                log.warn("obligation", "needle retired by telemetry fold cid={s} needle={s}", .{ envelope.candidate_id[0..@min(envelope.candidate_id.len, 16)], envelope.command_needle[0..@min(envelope.command_needle.len, 60)] });
+                continue;
+            }
+            keep.append(envelope) catch continue;
+        }
+        combined = keep;
+    }
     const envelopes = combined.items;
     if (envelopes.len == 0) {
         arena.deinit();
@@ -551,6 +579,129 @@ pub fn load(
         .nudges_used = if (plateau) MAX_OBLIGATION_NUDGES - 1 else 0,
     };
     return runtime;
+}
+
+
+// ============================================================================
+// v41 机制遥测 + 针效能折叠(自进化路线图 v36/v37 两级)
+// ============================================================================
+
+/// 遥测行前缀。每 run 每义务一行,run_id 保证跨 run 不重;行含该轮写入时
+/// 的任务历史最佳 reward(best),Rule B 无需跨行关联即可判"履约后无增益"。
+pub const TELEMETRY_MARKER = "metacodes-needle-telemetry-v1";
+pub const TELEMETRY_SCHEMA_TYPE = "obligation_telemetry";
+/// Rule A 阈值:同一 candidate_id 被 nudge 满 K 轮且从未 dispatch → 行为学
+/// 惰性,退休不可能损失进展(模型根本不理它)。机制演进换 reason 即新
+/// id,新身份重新计数——etag 破墙史下证明安全。
+pub const INERT_NUDGE_ROUNDS: u32 = 3;
+
+/// run 末把义务运行时状态折叠成遥测行落店(host 观测,任务无关)。
+/// 返回写入行数;一切失败静默(遥测绝不影响 Run 退出语义)。
+pub fn writeTelemetry(
+    allocator: std.mem.Allocator,
+    kg: *kg_client_mod.KgClient,
+    runtime: *const Runtime,
+    task_hint: []const u8,
+    run_id: []const u8,
+) usize {
+    if (task_hint.len == 0 or task_hint.len > 200) return 0;
+    if (!kg.ready) return 0;
+    // 当轮可见的历史最佳 reward(含最新行)。
+    const scoped_recall = @import("../kg/scoped_recall.zig");
+    var best: f64 = -1.0;
+    {
+        var history = std.array_list.Managed([]u8).init(allocator);
+        defer {
+            for (history.items) |row| allocator.free(row);
+            history.deinit();
+        }
+        scoped_recall.collectHistory(allocator, kg, task_hint, &history);
+        for (history.items) |row| {
+            const r = rowRewardOf(row);
+            if (r > best) best = r;
+        }
+        if (scoped_recall.sameTaskOutcomeRow(allocator, kg, task_hint)) |newest| {
+            defer allocator.free(newest);
+            const r = rowRewardOf(newest);
+            if (r > best) best = r;
+        }
+    }
+    var written: usize = 0;
+    for (runtime.envelopes, 0..) |envelope, i| {
+        const dispatched = runtime.met[i] or runtime.pending_lens[i] > 0;
+        const text = std.fmt.allocPrint(
+            allocator,
+            TELEMETRY_MARKER ++ ": cid={s} task={s} run={s} nudged={d} dispatched={d} met={d} best={d:.4} needle={s}",
+            .{
+                envelope.candidate_id,
+                task_hint,
+                run_id,
+                @as(u8, if (runtime.nudged[i]) 1 else 0),
+                @as(u8, if (dispatched) 1 else 0),
+                @as(u8, if (runtime.met[i]) 1 else 0),
+                best,
+                envelope.command_needle[0..@min(envelope.command_needle.len, 120)],
+            },
+        ) catch continue;
+        defer allocator.free(text);
+        _ = kg.remember(.observation, text, TELEMETRY_SCHEMA_TYPE, false) catch continue;
+        written += 1;
+    }
+    if (written > 0)
+        log.info("obligation", "needle telemetry written rows={d} task={s}", .{ written, task_hint });
+    return written;
+}
+
+fn rowRewardOf(row: []const u8) f64 {
+    const tag = std.mem.indexOf(u8, row, " reward=") orelse return -1.0;
+    const start = tag + " reward=".len;
+    var end = start;
+    while (end < row.len and (std.ascii.isDigit(row[end]) or row[end] == '.')) end += 1;
+    return std.fmt.parseFloat(f64, row[start..end]) catch -1.0;
+}
+
+/// 针效能折叠判定(Rule A 惰性 + Rule B 非因果)。对单个 candidate_id 探测
+/// 遥测行,与当前最佳 reward 比对。Lean 镜面 inertRetire/nonCausalRetire。
+pub fn needleRetired(
+    kg: *kg_client_mod.KgClient,
+    candidate_id: []const u8,
+    current_best: f64,
+) bool {
+    var probe_buffer: [160]u8 = undefined;
+    const probe = std.fmt.bufPrint(&probe_buffer, TELEMETRY_MARKER ++ " cid={s}", .{candidate_id[0..@min(candidate_id.len, 64)]}) catch return false;
+    var exact_buffer: [96]u8 = undefined;
+    const exact = std.fmt.bufPrint(&exact_buffer, " cid={s} ", .{candidate_id[0..@min(candidate_id.len, 64)]}) catch return false;
+    const hits = kg.recallTyped(probe, 16, false, TELEMETRY_SCHEMA_TYPE) catch return false;
+    defer {
+        for (hits) |*h| h.deinit(kg.allocator);
+        kg.allocator.free(hits);
+    }
+    var nudge_rounds: u32 = 0;
+    var dispatch_rounds: u32 = 0;
+    var met_no_gain = false;
+    for (hits) |hit| {
+        if (std.mem.indexOf(u8, hit.text, exact) == null) continue;
+        if (std.mem.indexOf(u8, hit.text, " nudged=1 ") != null) nudge_rounds += 1;
+        if (std.mem.indexOf(u8, hit.text, " dispatched=1 ") != null) dispatch_rounds += 1;
+        if (std.mem.indexOf(u8, hit.text, " met=1 ") != null) {
+            const best_at = extractBestField(hit.text);
+            // Rule B:履约当轮记录的最佳 ≥ 当前最佳 → 履约之后零增益。
+            if (best_at >= -0.5 and current_best <= best_at + 0.0001) met_no_gain = true;
+        }
+    }
+    // Rule A:满 K 轮被点名、零 dispatch → 惰性退休。
+    if (nudge_rounds >= INERT_NUDGE_ROUNDS and dispatch_rounds == 0) return true;
+    // Rule B:曾履约且此后无增益 → 非因果退休。
+    if (met_no_gain) return true;
+    return false;
+}
+
+fn extractBestField(row: []const u8) f64 {
+    const tag = std.mem.indexOf(u8, row, " best=") orelse return -1.0;
+    const start = tag + " best=".len;
+    var end = start;
+    while (end < row.len and (std.ascii.isDigit(row[end]) or row[end] == '.' or row[end] == '-')) end += 1;
+    return std.fmt.parseFloat(f64, row[start..end]) catch -1.0;
 }
 
 fn testRuntime(envelope_count: usize) Runtime {
