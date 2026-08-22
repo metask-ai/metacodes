@@ -434,6 +434,13 @@ pub const McpCancellationV1 = extern struct {
     reserved: [2]u64,
 };
 
+pub const McpResponseV1 = extern struct {
+    struct_size: u32,
+    http_status: u32,
+    body: OwnedBytesV1,
+    reserved: [2]u64,
+};
+
 pub const McpOpenFnV1 = *const fn (
     connector_ctx: ?*anyopaque,
     purpose_code: u32,
@@ -447,7 +454,7 @@ pub const McpRequestFnV1 = *const fn (
     request_json: BytesViewV1,
     timeout_ms: u32,
     cancellation: ?*const McpCancellationV1,
-    out_response_json: ?*OwnedBytesV1,
+    out_response: ?*McpResponseV1,
 ) callconv(.c) u32;
 pub const McpNotifyFnV1 = *const fn (
     connector_ctx: ?*anyopaque,
@@ -1084,6 +1091,7 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(RunContextV1));
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(HostToolV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(McpCancellationV1));
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(McpResponseV1));
     try std.testing.expectEqual(@as(usize, 80), @sizeOf(McpConnectorV1));
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(McpProtocolLimitsV1));
     try std.testing.expectEqual(@as(usize, 224), @sizeOf(McpServerV1));
@@ -1123,6 +1131,8 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(RunContextV1, "session_id"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(HostToolV1, "ctx"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(McpConnectorV1, "ctx"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(McpResponseV1, "body"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(McpResponseV1, "reserved"));
     try std.testing.expectEqual(@as(usize, 104), @offsetOf(McpServerV1, "connector"));
     try std.testing.expectEqual(@as(usize, 184), @offsetOf(McpServerV1, "protocol_limits"));
     try std.testing.expectEqual(@as(usize, 192), @offsetOf(McpServerV1, "configuration_fingerprint"));
@@ -1211,7 +1221,7 @@ test "typed status and stop reason validate every public code" {
     );
 }
 
-test "Revision 9 Workspace Skill authority and Completion capabilities are exact" {
+test "Revision 9 public capability and MCP negotiation codes are exact" {
     const std = @import("std");
     try std.testing.expectEqual(@as(u32, 9), ABI_REVISION);
     try std.testing.expectEqual(@as(u64, 1 << 20), CAP_WORKSPACE_SKILL_CATALOG);

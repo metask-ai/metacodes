@@ -22,10 +22,10 @@ function-table order, and semantics may change only through another explicit
 revision cut while v1 remains experimental.
 
 The current experimental bundle is **ABI v1 revision 9**. Revision 9 is a
-hard-cut replacement for every earlier revision. In addition to the Revision
-8 surface, it adds a Workspace Skill catalog with explicit local sources,
-concrete default-deny authorization, immutable content binding, and an
-independent no-tools text Completion surface:
+hard-cut replacement for every earlier revision. Its current unreleased shape
+includes the Workspace Skill catalog, independent no-tools text Completion,
+and an MCP request callback that reports the full HTTP response fact required
+for protocol negotiation:
 
 - `metask_agentcore_api_v1` is 280 bytes and requires `abi_revision == 9`;
 - `RuntimeConfigV1`, `SessionHostConfigV1`, `SessionCreateConfigV1`,
@@ -37,6 +37,8 @@ independent no-tools text Completion surface:
   64, 56, and 80 bytes; `CompletionConfigV1`, `CompletionMessageV1`,
   `CompletionRequestV1`, `CompletionResultV1`, `CompletionInfoV1`, and
   `CompletionEventV1` are respectively 80, 88, 40, 72, 72, 48, and 80 bytes;
+- `McpResponseV1` is 40 bytes and carries the final HTTP status beside its
+  Host-owned response body;
 - the exact required capability set is `0x3fffff`;
 - `manifest.json` records revision 9, table size 280, and that exact capability
   set.
@@ -683,11 +685,17 @@ environment. Credentials, live connections, and request state never enter a
 Session checkpoint.
 
 `auto` probes Modern first. A validated `MethodNotFound` may enter Classic;
-stdio probe timeout or child exit may also enter Classic, while HTTP timeout,
-network, authentication, and server failures fail closed. Classic starts with
-an exact 2025-11 request. If that response selects 2025-06, Runtime closes the
-connection and reopens exact 2025-06 once. Only the final exact-era handshake
-may publish capabilities or create the operational client.
+stdio probe timeout or child exit may also enter Classic. For Streamable HTTP,
+a completed response is reported as `MCP_EXCHANGE_RESPONSE` with its final HTTP
+status and body. A bare HTTP 400 from the disposable `server/discover` probe is
+Classic evidence; a complete, request-id-matching JSON-RPC response overrides
+that default. Strictly valid `-32022` data contributes its `supported` versions,
+and malformed typed `-32022`, other JSON-RPC errors, 401/403, every status other
+than 2xx/400, and transport failures do not downgrade. No body-shape or string
+heuristic is used. Classic starts with an exact 2025-11 request. If that response
+selects 2025-06, Runtime closes the connection and reopens exact 2025-06 once.
+Only the final exact-era handshake may publish capabilities or create the
+operational client.
 
 The Host-owned Connector is also the MCP transport compliance boundary. Every
 successful `open` must create a connection context permanently bound to the
@@ -708,8 +716,20 @@ closes a mismatch and performs the exact-era reopen itself.
 | Candidate selection and validation of the server-selected protocol | AgentCore |
 | Closing a mismatch and performing an exact-era reopen | AgentCore |
 | JSON-RPC request bodies and Classic lifecycle ordering | AgentCore |
+| Probe HTTP status gate, JSON-RPC validation, and era selection | AgentCore |
 | HTTP headers, authentication, cookies, session IDs, and connection pooling | Host Connector |
+| Reporting every completed HTTP response's final status and body | Host Connector |
 | Binding one connection context to `purpose_code` and `requested_era_code` | Host Connector |
+
+`metask_agentcore_mcp_request_fn_v1` writes a 40-byte
+`metask_agentcore_mcp_response_v1`. Stdio responses use `http_status == 0`;
+Streamable HTTP completed responses use their final status in the range
+200..599. Non-response outcomes use status zero and an empty body.
+`release_response` keeps its signature: for every non-empty body AgentCore calls
+it exactly once with `&response.body`. On actual connections, stdio and HTTP 2xx
+enter the era parser, HTTP 401/403 map to `auth_error`, and every other HTTP
+status maps to `server_error` before protocol parsing. These failures never
+switch era or replay `tools/call`.
 
 `runtime_describe_mcp` returns `agentcore.mcp-catalog/v1`. Every server entry
 contains `server_binding_identity`, namespace, negotiated protocol,
@@ -854,6 +874,7 @@ ABI v1 has three ownership classes:
 |---|---|---|
 | `metask_agentcore_bytes_view_v1` inputs and event/request views | Borrowed for the current synchronous call or callback | Never released |
 | Host tool results and UI responses | Host-owned callback output | Canonical `{NULL,0}` is never released; every other descriptor is passed to its paired Host release callback exactly once, independent of status |
+| MCP response bodies | Host-owned callback output inside `metask_agentcore_mcp_response_v1` | Canonical `{NULL,0}` is never released; every other body is passed as `&response.body` to `release_response` exactly once, independent of exchange status or descriptor validity |
 | AgentCore catalog descriptors, Completion model/text/event payloads, and API diagnostics | Library-owned output | Released only with the discovered `buffer_release` function |
 
 Status controls whether callback output is consumed, not whether it is

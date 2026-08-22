@@ -29,9 +29,14 @@ pub const Cancellation = struct {
     }
 };
 
+pub const ExchangeResponse = struct {
+    http_status: u32,
+    body: []u8,
+};
+
 pub const ExchangeOutcome = union(enum) {
     /// Allocated by the allocator passed to `Connection.request`.
-    response: []u8,
+    response: ExchangeResponse,
     timeout,
     network_error,
     auth_error,
@@ -166,6 +171,7 @@ pub const Client = struct {
     backing: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     connection: Connection,
+    transport: negotiation.Transport,
     mutex: sync.Mutex = .{},
     era: canonical.Era,
     capabilities: canonical.CanonicalCapabilities,
@@ -229,7 +235,11 @@ pub const Client = struct {
             cancellation,
         ) catch return .{ .failed = .indeterminate };
         const response = switch (exchange) {
-            .response => |bytes| bytes,
+            .response => |value| switch (classifyActualResponse(self.transport, value)) {
+                .body => |body| body,
+                .auth_error => return .{ .failed = .auth_error },
+                .server_error => return .{ .failed = .server_error },
+            },
             .timeout => return .{ .failed = .timeout },
             .network_error => return .{ .failed = .network_error },
             .auth_error => return .{ .failed = .auth_error },
@@ -341,7 +351,7 @@ const DriverState = struct {
         else
             error.TransportFailure;
         const response = switch (exchange) {
-            .response => |bytes| bytes,
+            .response => |value| value,
             .timeout => return .timeout,
             .network_error => return .network_error,
             .auth_error => return .auth_error,
@@ -350,9 +360,17 @@ const DriverState = struct {
             .cancelled => return .cancelled,
             .indeterminate => return .malformed_response,
         };
-        const parsed = modern.parseDiscoverResponse(
+        switch (self.config.transport) {
+            .stdio => if (response.http_status != 0) return .malformed_response,
+            .streamable_http => switch (response.http_status) {
+                200...299, 400 => {},
+                401, 403 => return .auth_error,
+                else => return .server_error,
+            },
+        }
+        const parsed = modern.parseDiscoverProbeResponse(
             self.backing,
-            response,
+            response.body,
             1,
             self.config.limits,
         ) catch return error.OutOfMemory;
@@ -363,6 +381,11 @@ const DriverState = struct {
             },
             .diagnostic => |diagnostic| if (diagnostic.code == .method_not_found)
                 .method_not_found
+            else if (self.config.transport == .streamable_http and
+                response.http_status == 400 and
+                diagnostic.code != .remote_error and
+                diagnostic.rpc_code != wire.UNSUPPORTED_PROTOCOL_VERSION)
+                .legacy_http_400
             else
                 .malformed_response,
         };
@@ -427,7 +450,10 @@ const DriverState = struct {
         else
             error.TransportFailure;
         const response = switch (exchange) {
-            .response => |bytes| bytes,
+            .response => |value| switch (classifyActualResponse(self.config.transport, value)) {
+                .body => |body| body,
+                .auth_error, .server_error => return error.TransportFailure,
+            },
             else => return error.TransportFailure,
         };
         var handshake = switch (era) {
@@ -548,6 +574,7 @@ pub fn connectServer(backing: std.mem.Allocator, config: Config) ConnectOutcome 
         .backing = backing,
         .arena = arena,
         .connection = connection,
+        .transport = config.transport,
         .era = era,
         .capabilities = capabilities,
         .binding = config.server_binding_identity,
@@ -603,7 +630,10 @@ fn listAllTools(
             .{},
         ) catch return error.TransportFailure;
         const response = switch (exchange) {
-            .response => |bytes| bytes,
+            .response => |value| switch (classifyActualResponse(state.config.transport, value)) {
+                .body => |body| body,
+                .auth_error, .server_error => return error.TransportFailure,
+            },
             else => return error.TransportFailure,
         };
         var page = switch (era) {
@@ -685,6 +715,29 @@ fn allZero(value: []const u8) bool {
     return true;
 }
 
+const ActualResponseDisposition = union(enum) {
+    body: []u8,
+    auth_error,
+    server_error,
+};
+
+fn classifyActualResponse(
+    transport: negotiation.Transport,
+    response: ExchangeResponse,
+) ActualResponseDisposition {
+    return switch (transport) {
+        .stdio => if (response.http_status == 0)
+            .{ .body = response.body }
+        else
+            .server_error,
+        .streamable_http => switch (response.http_status) {
+            200...299 => .{ .body = response.body },
+            401, 403 => .auth_error,
+            else => .server_error,
+        },
+    };
+}
+
 const FakeConnector = struct {
     era: canonical.Era,
     advertise_tools: bool = true,
@@ -696,6 +749,10 @@ const FakeConnector = struct {
     typed_content: bool = false,
     optional_task: bool = false,
     paginate_tools: bool = false,
+    probe_response_body: ?[]const u8 = null,
+    probe_http_status: u32 = 0,
+    actual_http_status: u32 = 0,
+    call_http_status: ?u32 = null,
     list_requests: u8 = 0,
     saw_second_page_cursor: bool = false,
     opens: u8 = 0,
@@ -745,7 +802,9 @@ const FakeConnector = struct {
             return .indeterminate;
         const id = requestId(encoded) orelse return .server_error;
         const response = if (std.mem.indexOf(u8, encoded, "server/discover") != null)
-            if (self.era == .modern_2026_07_28) try std.fmt.allocPrint(
+            if (connection.purpose == .disposable_probe and self.probe_response_body != null)
+                try allocator.dupe(u8, self.probe_response_body.?)
+            else if (self.era == .modern_2026_07_28) try std.fmt.allocPrint(
                 allocator,
                 "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{{}},\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
                 .{id},
@@ -835,7 +894,15 @@ const FakeConnector = struct {
                 )
         else
             return .server_error;
-        return .{ .response = response };
+        return .{ .response = .{
+            .http_status = if (connection.purpose == .disposable_probe)
+                self.probe_http_status
+            else if (std.mem.indexOf(u8, encoded, "tools/call") != null)
+                self.call_http_status orelse self.actual_http_status
+            else
+                self.actual_http_status,
+            .body = response,
+        } };
     }
 
     fn notify(raw: *anyopaque, _: []const u8, _: u32, _: Cancellation) anyerror!void {
@@ -867,6 +934,183 @@ const FakeConnector = struct {
         return std.fmt.parseInt(u64, encoded[start..end], 10) catch null;
     }
 };
+
+test "Streamable HTTP AUTO treats bare 400 variants as Classic evidence and revalidates exact" {
+    const bodies = [_][]const u8{
+        "",
+        "<html>legacy endpoint</html>",
+        "{\"jsonrpc\":\"2.0\"",
+        "{\"jsonrpc\":\"2.0\",\"id\":99,\"error\":{\"code\":-32601,\"message\":\"not found\"}}",
+    };
+    for (bodies, 0..) |body, index| {
+        var fake = FakeConnector{
+            .era = .classic_2025_11_25,
+            .probe_response_body = body,
+            .probe_http_status = 400,
+            .actual_http_status = 200,
+        };
+        const connected = connectServer(std.testing.allocator, .{
+            .connector = fake.connector(),
+            .transport = .streamable_http,
+            .server_binding_identity = [_]u8{@intCast(0x41 + index)} ** 32,
+            .client = .{ .name = "agentcore-test", .version = "9" },
+        });
+        const client = switch (connected) {
+            .client => |value| value,
+            .failed => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(canonical.Era.classic_2025_11_25, client.era);
+        try std.testing.expectEqual(@as(u8, 2), fake.opens);
+        try std.testing.expectEqual(@as(u8, 1), fake.closes);
+        client.deinit();
+    }
+}
+
+test "Streamable HTTP AUTO strictly consumes supported versions from 400 -32022" {
+    var fake = FakeConnector{
+        .era = .classic_2025_06_18,
+        .probe_response_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32022,\"message\":\"Unsupported protocol version\",\"data\":{\"requested\":\"2026-07-28\",\"supported\":[\"2025-06-18\"]}}}",
+        .probe_http_status = 400,
+        .actual_http_status = 200,
+    };
+    const connected = connectServer(std.testing.allocator, .{
+        .connector = fake.connector(),
+        .transport = .streamable_http,
+        .server_binding_identity = [_]u8{0x42} ** 32,
+        .client = .{ .name = "agentcore-test", .version = "9" },
+    });
+    const client = switch (connected) {
+        .client => |value| value,
+        .failed => return error.TestUnexpectedResult,
+    };
+    defer client.deinit();
+    try std.testing.expectEqual(canonical.Era.classic_2025_06_18, client.era);
+    try std.testing.expectEqual(@as(u8, 2), fake.opens);
+}
+
+test "Streamable HTTP AUTO accepts validated negotiation evidence on HTTP 200 or 400" {
+    const cases = [_]struct {
+        era: canonical.Era,
+        status: u32,
+        body: []const u8,
+    }{
+        .{
+            .era = .classic_2025_11_25,
+            .status = 200,
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"not found\"}}",
+        },
+        .{
+            .era = .classic_2025_06_18,
+            .status = 200,
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32022,\"message\":\"Unsupported protocol version\",\"data\":{\"requested\":\"2026-07-28\",\"supported\":[\"2025-06-18\"]}}}",
+        },
+        .{
+            .era = .modern_2026_07_28,
+            .status = 400,
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{},\"ttlMs\":1000,\"cacheScope\":\"private\"}}",
+        },
+    };
+    for (cases, 0..) |case, index| {
+        var fake = FakeConnector{
+            .era = case.era,
+            .probe_response_body = case.body,
+            .probe_http_status = case.status,
+            .actual_http_status = 200,
+        };
+        const connected = connectServer(std.testing.allocator, .{
+            .connector = fake.connector(),
+            .transport = .streamable_http,
+            .server_binding_identity = [_]u8{@intCast(0x48 + index)} ** 32,
+            .client = .{ .name = "agentcore-test", .version = "9" },
+        });
+        const client = switch (connected) {
+            .client => |value| value,
+            .failed => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(case.era, client.era);
+        client.deinit();
+    }
+}
+
+test "Streamable HTTP AUTO refuses unlisted status and malformed typed -32022" {
+    const cases = [_]struct {
+        status: u32,
+        body: []const u8,
+        expected: canonical.DiagnosticCode,
+    }{
+        .{ .status = 422, .body = "not acceptable", .expected = .downgrade_refused },
+        .{
+            .status = 400,
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32022,\"message\":\"Unsupported protocol version\",\"data\":{\"requested\":7,\"supported\":[\"2025-11-25\"]}}}",
+            .expected = .probe_failed,
+        },
+    };
+    for (cases, 0..) |case, index| {
+        var fake = FakeConnector{
+            .era = .classic_2025_11_25,
+            .probe_response_body = case.body,
+            .probe_http_status = case.status,
+            .actual_http_status = 200,
+        };
+        const connected = connectServer(std.testing.allocator, .{
+            .connector = fake.connector(),
+            .transport = .streamable_http,
+            .server_binding_identity = [_]u8{@intCast(0x50 + index)} ** 32,
+            .client = .{ .name = "agentcore-test", .version = "9" },
+        });
+        switch (connected) {
+            .client => |client| {
+                client.deinit();
+                return error.TestUnexpectedResult;
+            },
+            .failed => |failure| switch (failure) {
+                .diagnostic => |diagnostic| try std.testing.expectEqual(case.expected, diagnostic.code),
+                else => return error.TestUnexpectedResult,
+            },
+        }
+        try std.testing.expectEqual(@as(u8, 1), fake.opens);
+        try std.testing.expectEqual(@as(u8, 1), fake.closes);
+    }
+}
+
+test "Streamable HTTP actual request maps status before protocol parsing without replay" {
+    const cases = [_]struct { status: u32, auth: bool }{
+        .{ .status = 401, .auth = true },
+        .{ .status = 500, .auth = false },
+    };
+    for (cases, 0..) |case, index| {
+        var fake = FakeConnector{
+            .era = .modern_2026_07_28,
+            .probe_http_status = 200,
+            .actual_http_status = 200,
+            .call_http_status = case.status,
+        };
+        const connected = connectServer(std.testing.allocator, .{
+            .connector = fake.connector(),
+            .transport = .streamable_http,
+            .server_binding_identity = [_]u8{@intCast(0x60 + index)} ** 32,
+            .client = .{ .name = "agentcore-test", .version = "9" },
+        });
+        const client = switch (connected) {
+            .client => |value| value,
+            .failed => return error.TestUnexpectedResult,
+        };
+        const before = fake.requests;
+        const called = client.callTool(
+            std.testing.allocator,
+            &client.catalog.tools[0],
+            "{\"city\":\"Paris\"}",
+            .{},
+        );
+        try std.testing.expect(called == .failed);
+        if (case.auth)
+            try std.testing.expect(called.failed == .auth_error)
+        else
+            try std.testing.expect(called.failed == .server_error);
+        try std.testing.expectEqual(before + 1, fake.requests);
+        client.deinit();
+    }
+}
 
 test "modern client owns disposable probe actual lifecycle catalog and call" {
     var fake = FakeConnector{ .era = .modern_2026_07_28 };

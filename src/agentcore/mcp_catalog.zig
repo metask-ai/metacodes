@@ -1240,7 +1240,7 @@ const Fake = struct {
                 )
         else
             return .server_error;
-        return .{ .response = response };
+        return .{ .response = .{ .http_status = 0, .body = response } };
     }
 
     fn notify(_: *anyopaque, _: []const u8, _: u32, _: runtime.Cancellation) anyerror!void {}

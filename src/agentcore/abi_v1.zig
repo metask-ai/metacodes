@@ -160,12 +160,14 @@ const AbiHostTool = struct {
 
 const AbiMcpConnector = struct {
     descriptor: wire.McpConnectorV1,
+    transport: mcp_negotiation.Transport,
     max_frame_bytes: u64,
     timeout_ms: u32,
     refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
 
     fn create(
         descriptor: wire.McpConnectorV1,
+        transport: mcp_negotiation.Transport,
         max_frame_bytes: u64,
         timeout_ms: u32,
     ) error{OutOfMemory}!*AbiMcpConnector {
@@ -173,6 +175,7 @@ const AbiMcpConnector = struct {
             return error.OutOfMemory;
         self.* = .{
             .descriptor = descriptor,
+            .transport = transport,
             .max_frame_bytes = max_frame_bytes,
             .timeout_ms = timeout_ms,
         };
@@ -238,6 +241,7 @@ const AbiMcpConnector = struct {
             };
             connection.* = .{
                 .descriptor = self.descriptor,
+                .transport = self.transport,
                 .max_frame_bytes = self.max_frame_bytes,
                 .host_connection = host_connection,
             };
@@ -261,6 +265,7 @@ const AbiMcpConnector = struct {
 
 const AbiMcpConnection = struct {
     descriptor: wire.McpConnectorV1,
+    transport: mcp_negotiation.Transport,
     max_frame_bytes: u64,
     host_connection: *anyopaque,
 
@@ -289,7 +294,12 @@ const AbiMcpConnection = struct {
             .is_cancelled = cancellationPoll,
             .reserved = [_]u64{0} ** 2,
         };
-        var response = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+        var response = wire.McpResponseV1{
+            .struct_size = @sizeOf(wire.McpResponseV1),
+            .http_status = 0,
+            .body = .{ .ptr = null, .len = 0 },
+            .reserved = [_]u64{0} ** 2,
+        };
         const status = self.descriptor.request.?(
             self.descriptor.ctx,
             self.host_connection,
@@ -298,22 +308,33 @@ const AbiMcpConnection = struct {
             &public_cancellation,
             &response,
         );
-        defer if (hasReleaseToken(response))
+        defer if (hasReleaseToken(response.body))
             self.descriptor.release_response.?(
                 self.descriptor.ctx,
                 self.host_connection,
-                &response,
+                &response.body,
             );
-        if (!canonicalOwned(response)) return error.InvalidConnectorResponse;
+        if (response.struct_size != @sizeOf(wire.McpResponseV1) or
+            !allZero(response.reserved) or !canonicalOwned(response.body))
+            return error.InvalidConnectorResponse;
         if (status == wire.MCP_EXCHANGE_RESPONSE) {
-            if (response.len == 0 or response.len > self.max_frame_bytes)
+            const status_valid = switch (self.transport) {
+                .stdio => response.http_status == 0,
+                .streamable_http => response.http_status >= 200 and response.http_status <= 599,
+            };
+            if (!status_valid or response.body.len > self.max_frame_bytes or
+                (response.body.len == 0 and self.transport == .stdio))
                 return error.InvalidConnectorResponse;
-            const source = try ownedSlice(response);
+            const source = try ownedSlice(response.body);
             const copied = response_allocator.dupe(u8, source) catch
                 return error.OutOfMemory;
-            return .{ .response = copied };
+            return .{ .response = .{
+                .http_status = response.http_status,
+                .body = copied,
+            } };
         }
-        if (response.len != 0) return error.InvalidConnectorResponse;
+        if (response.http_status != 0 or response.body.len != 0)
+            return error.InvalidConnectorResponse;
         return switch (status) {
             wire.MCP_EXCHANGE_TIMEOUT => .timeout,
             wire.MCP_EXCHANGE_NETWORK_ERROR => .network_error,
@@ -4175,6 +4196,7 @@ fn parseMcpSpecs(
         const protocol_limits = try parseMcpProtocolLimits(descriptor.protocol_limits);
         const connector = try AbiMcpConnector.create(
             descriptor.connector,
+            transport,
             protocol_limits.max_frame_bytes,
             descriptor.timeout_ms,
         );
@@ -6783,6 +6805,118 @@ fn testHostIdent(anchor: *anyopaque) core.agent_session.HostRunIdentity {
         .identity = .{ .session_id = core.session_id.SessionId.single, .run_id = 1 },
         .host_session_ctx = anchor,
     };
+}
+
+test "Revision 9 hard-cut MCP response descriptor preserves HTTP fact and releases the body field" {
+    const Probe = struct {
+        var status: u32 = wire.MCP_EXCHANGE_RESPONSE;
+        var http_status: u32 = 400;
+        var releases: usize = 0;
+        var body_field: ?*wire.OwnedBytesV1 = null;
+        var released_field: ?*wire.OwnedBytesV1 = null;
+        var empty_body = false;
+        const payload = "legacy rejection";
+
+        fn request(
+            _: ?*anyopaque,
+            _: ?*anyopaque,
+            _: wire.BytesViewV1,
+            _: u32,
+            _: ?*const wire.McpCancellationV1,
+            out_response: ?*wire.McpResponseV1,
+        ) callconv(.c) u32 {
+            const out = out_response orelse return wire.MCP_EXCHANGE_FATAL;
+            out.* = .{
+                .struct_size = @sizeOf(wire.McpResponseV1),
+                .http_status = http_status,
+                .body = if (empty_body)
+                    .{ .ptr = null, .len = 0 }
+                else
+                    .{ .ptr = @constCast(payload.ptr), .len = payload.len },
+                .reserved = [_]u64{0} ** 2,
+            };
+            body_field = &out.body;
+            return status;
+        }
+
+        fn release(
+            _: ?*anyopaque,
+            _: ?*anyopaque,
+            response: ?*wire.OwnedBytesV1,
+        ) callconv(.c) void {
+            releases += 1;
+            released_field = response;
+        }
+    };
+    var descriptor = std.mem.zeroes(wire.McpConnectorV1);
+    descriptor.struct_size = @sizeOf(wire.McpConnectorV1);
+    descriptor.request = Probe.request;
+    descriptor.release_response = Probe.release;
+    var host_connection: u8 = 0;
+    var connection = AbiMcpConnection{
+        .descriptor = descriptor,
+        .transport = .streamable_http,
+        .max_frame_bytes = 1024,
+        .host_connection = @ptrCast(&host_connection),
+    };
+
+    Probe.status = wire.MCP_EXCHANGE_RESPONSE;
+    Probe.http_status = 400;
+    Probe.releases = 0;
+    Probe.body_field = null;
+    Probe.released_field = null;
+    Probe.empty_body = false;
+    const outcome = try AbiMcpConnection.request(
+        &connection,
+        std.testing.allocator,
+        "{}",
+        1000,
+        .{},
+    );
+    defer std.testing.allocator.free(outcome.response.body);
+    try std.testing.expectEqual(@as(u32, 400), outcome.response.http_status);
+    try std.testing.expectEqualStrings(Probe.payload, outcome.response.body);
+    try std.testing.expectEqual(@as(usize, 1), Probe.releases);
+    try std.testing.expect(Probe.released_field == Probe.body_field);
+
+    Probe.http_status = 204;
+    Probe.releases = 0;
+    Probe.empty_body = true;
+    const empty_outcome = try AbiMcpConnection.request(
+        &connection,
+        std.testing.allocator,
+        "{}",
+        1000,
+        .{},
+    );
+    defer std.testing.allocator.free(empty_outcome.response.body);
+    try std.testing.expectEqual(@as(u32, 204), empty_outcome.response.http_status);
+    try std.testing.expectEqual(@as(usize, 0), empty_outcome.response.body.len);
+    try std.testing.expectEqual(@as(usize, 0), Probe.releases);
+
+    Probe.status = wire.MCP_EXCHANGE_RESPONSE;
+    Probe.http_status = 400;
+    Probe.releases = 0;
+    Probe.empty_body = false;
+    connection.max_frame_bytes = 1;
+    try std.testing.expectError(
+        error.InvalidConnectorResponse,
+        AbiMcpConnection.request(&connection, std.testing.allocator, "{}", 1000, .{}),
+    );
+    try std.testing.expectEqual(@as(usize, 1), Probe.releases);
+    connection.max_frame_bytes = 1024;
+
+    Probe.status = wire.MCP_EXCHANGE_SERVER_ERROR;
+    Probe.http_status = 0;
+    Probe.releases = 0;
+    Probe.body_field = null;
+    Probe.released_field = null;
+    try std.testing.expectError(
+        error.InvalidConnectorResponse,
+        AbiMcpConnection.request(&connection, std.testing.allocator, "{}", 1000, .{}),
+    );
+    try std.testing.expectEqual(@as(usize, 1), Probe.releases);
+    try std.testing.expect(Probe.released_field == Probe.body_field);
 }
 
 test "Host zero-length result must use a null pointer and preserves release descriptor on rejection" {

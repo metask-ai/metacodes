@@ -19,12 +19,15 @@ pub const Transport = enum(u8) {
     streamable_http,
 };
 
-/// Observations are emitted only after the modern probe response has passed
-/// its transport framing and JSON-RPC shape checks. `method_not_found` is
-/// therefore distinct from arbitrary malformed bytes containing -32601.
+/// Typed protocol observations are emitted only after JSON-RPC validation.
+/// `legacy_http_400` is the one transport-level observation: it means a
+/// completed disposable Streamable HTTP probe response whose body did not
+/// override HTTP 400's default legacy evidence. `method_not_found` remains
+/// distinct from arbitrary malformed bytes containing -32601.
 pub const ProbeObservation = union(enum) {
     discovered_versions: []const []const u8,
     method_not_found,
+    legacy_http_400,
     timeout,
     child_exit,
     network_error,
@@ -74,6 +77,10 @@ pub fn selectFromProbe(
             .{ .value = .classic_2025_11_25 }
         else
             .{ .diagnostic = canonical.Diagnostic.init(.unsupported_protocol_version, .negotiation) },
+        .legacy_http_400 => if (policy == .auto and transport == .streamable_http)
+            .{ .value = .classic_2025_11_25 }
+        else
+            .{ .diagnostic = canonical.Diagnostic.init(.downgrade_refused, .negotiation) },
         .timeout => if (policy == .auto and transport == .stdio)
             .{ .value = .classic_2025_11_25 }
         else

@@ -369,6 +369,29 @@ const _: () = {
     ["Offset of field: metask_agentcore_mcp_cancellation_v1::reserved"]
         [::std::mem::offset_of!(metask_agentcore_mcp_cancellation_v1, reserved) - 24usize];
 };
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct metask_agentcore_mcp_response_v1 {
+    pub struct_size: u32,
+    pub http_status: u32,
+    pub body: metask_agentcore_owned_bytes_v1,
+    pub reserved: [u64; 2usize],
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of metask_agentcore_mcp_response_v1"]
+        [::std::mem::size_of::<metask_agentcore_mcp_response_v1>() - 40usize];
+    ["Alignment of metask_agentcore_mcp_response_v1"]
+        [::std::mem::align_of::<metask_agentcore_mcp_response_v1>() - 8usize];
+    ["Offset of field: metask_agentcore_mcp_response_v1::struct_size"]
+        [::std::mem::offset_of!(metask_agentcore_mcp_response_v1, struct_size) - 0usize];
+    ["Offset of field: metask_agentcore_mcp_response_v1::http_status"]
+        [::std::mem::offset_of!(metask_agentcore_mcp_response_v1, http_status) - 4usize];
+    ["Offset of field: metask_agentcore_mcp_response_v1::body"]
+        [::std::mem::offset_of!(metask_agentcore_mcp_response_v1, body) - 8usize];
+    ["Offset of field: metask_agentcore_mcp_response_v1::reserved"]
+        [::std::mem::offset_of!(metask_agentcore_mcp_response_v1, reserved) - 24usize];
+};
 pub type metask_agentcore_mcp_open_fn_v1 = ::std::option::Option<
     unsafe extern "C" fn(
         arg1: *mut ::std::os::raw::c_void,
@@ -385,7 +408,7 @@ pub type metask_agentcore_mcp_request_fn_v1 = ::std::option::Option<
         arg3: metask_agentcore_bytes_view_v1,
         arg4: u32,
         arg5: *const metask_agentcore_mcp_cancellation_v1,
-        arg6: *mut metask_agentcore_owned_bytes_v1,
+        arg6: *mut metask_agentcore_mcp_response_v1,
     ) -> u32,
 >;
 pub type metask_agentcore_mcp_notify_fn_v1 = ::std::option::Option<

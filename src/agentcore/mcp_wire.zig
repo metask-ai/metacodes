@@ -5,6 +5,17 @@ const canonical = @import("mcp_canonical.zig");
 
 pub const JSON_RPC_VERSION = "2.0";
 pub const METHOD_NOT_FOUND: i64 = -32601;
+pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
+pub const RemoteError = struct {
+    code: i64,
+    data: ?std.json.Value,
+};
+
+pub const ResponseEnvelope = union(enum) {
+    result: std.json.Value,
+    remote_error: RemoteError,
+};
 
 pub const ClientInfo = struct {
     name: []const u8,
@@ -18,13 +29,13 @@ pub const ClientInfo = struct {
     }
 };
 
-pub fn parseEnvelope(
+pub fn parseResponseEnvelope(
     allocator: std.mem.Allocator,
     encoded: []const u8,
     expected_id: u64,
     phase: canonical.Phase,
     limits: canonical.Limits,
-) error{OutOfMemory}!canonical.Outcome(std.json.Value) {
+) error{OutOfMemory}!canonical.Outcome(ResponseEnvelope) {
     canonical.validateFrame(encoded, limits) catch |err|
         return .{ .diagnostic = canonical.Diagnostic.init(
             if (err == error.ResourceLimit) .resource_limit else .invalid_json,
@@ -70,15 +81,40 @@ pub fn parseEnvelope(
             return .{ .diagnostic = canonical.Diagnostic.init(.invalid_envelope, phase) };
         canonical.validateText(message_value.string, limits.max_text_bytes) catch
             return .{ .diagnostic = canonical.Diagnostic.init(.resource_limit, phase) };
-        return .{ .diagnostic = .{
-            .code = if (code_value.integer == METHOD_NOT_FOUND) .method_not_found else .remote_error,
-            .phase = phase,
-            .rpc_code = code_value.integer,
-        } };
+        return .{ .value = .{ .remote_error = .{
+            .code = code_value.integer,
+            .data = value.object.get("data"),
+        } } };
     }
     if (result.? != .object)
         return .{ .diagnostic = canonical.Diagnostic.init(.invalid_envelope, phase) };
-    return .{ .value = result.? };
+    return .{ .value = .{ .result = result.? } };
+}
+
+pub fn parseEnvelope(
+    allocator: std.mem.Allocator,
+    encoded: []const u8,
+    expected_id: u64,
+    phase: canonical.Phase,
+    limits: canonical.Limits,
+) error{OutOfMemory}!canonical.Outcome(std.json.Value) {
+    const envelope = try parseResponseEnvelope(allocator, encoded, expected_id, phase, limits);
+    return switch (envelope) {
+        .diagnostic => |diagnostic| .{ .diagnostic = diagnostic },
+        .value => |value| switch (value) {
+            .result => |result| .{ .value = result },
+            .remote_error => |remote_error| .{ .diagnostic = .{
+                .code = if (remote_error.code == METHOD_NOT_FOUND)
+                    .method_not_found
+                else if (remote_error.code == UNSUPPORTED_PROTOCOL_VERSION)
+                    .unsupported_protocol_version
+                else
+                    .remote_error,
+                .phase = phase,
+                .rpc_code = remote_error.code,
+            } },
+        },
+    };
 }
 
 /// Validate the era-specific Result contract. A structurally valid

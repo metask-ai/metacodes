@@ -279,6 +279,13 @@ typedef struct {
     uint64_t reserved[2];
 } metask_agentcore_mcp_cancellation_v1;
 
+typedef struct {
+    uint32_t struct_size;
+    uint32_t http_status;
+    metask_agentcore_owned_bytes_v1 body;
+    uint64_t reserved[2];
+} metask_agentcore_mcp_response_v1;
+
 /* Each successful open binds its opaque connection context permanently to
  * purpose_code and requested_era_code. For Streamable HTTP, the Host owns
  * HTTP protocol state: after a successful exact-era initialization it MUST
@@ -293,7 +300,7 @@ typedef uint32_t (*metask_agentcore_mcp_open_fn_v1)(
 typedef uint32_t (*metask_agentcore_mcp_request_fn_v1)(
     void *, void *, metask_agentcore_bytes_view_v1, uint32_t,
     const metask_agentcore_mcp_cancellation_v1 *,
-    metask_agentcore_owned_bytes_v1 *);
+    metask_agentcore_mcp_response_v1 *);
 typedef uint32_t (*metask_agentcore_mcp_notify_fn_v1)(
     void *, void *, metask_agentcore_bytes_view_v1, uint32_t,
     const metask_agentcore_mcp_cancellation_v1 *);
@@ -306,8 +313,12 @@ typedef void (*metask_agentcore_mcp_release_connector_fn_v1)(void *);
 /* Host owns connector ctx, credentials, and live connection contexts.
  * retain_connector and release_connector are mandatory and must be thread-safe;
  * they keep ctx alive across Runtime calls. Every successful open is closed
- * exactly once. Every non-empty response descriptor is released exactly once,
- * independent of request status. AgentCore copies successful response bytes
+ * exactly once. For a completed Streamable HTTP response, request returns
+ * MCP_EXCHANGE_RESPONSE and reports its status and body through
+ * metask_agentcore_mcp_response_v1. Stdio responses use http_status == 0.
+ * Non-response outcomes use http_status == 0 and an empty body. Every
+ * non-empty body is released exactly once by passing &response.body to
+ * release_response, independent of status. AgentCore copies response bytes
  * before release. */
 typedef struct {
     uint32_t struct_size;
@@ -940,6 +951,7 @@ METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_owned_bytes_v1, 16);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_run_context_v1, 56);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_host_tool_v1, 96);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_cancellation_v1, 40);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_response_v1, 40);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_connector_v1, 80);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_protocol_limits_v1, 96);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_server_v1, 224);
@@ -980,6 +992,8 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_context_v1, run_id, 16);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_context_v1, session_id, 24);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_host_tool_v1, ctx, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_connector_v1, ctx, 8);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_response_v1, body, 8);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_response_v1, reserved, 24);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_server_v1, connector, 104);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_server_v1, protocol_limits, 184);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_server_v1, configuration_fingerprint, 192);
