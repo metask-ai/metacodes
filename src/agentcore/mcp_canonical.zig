@@ -308,9 +308,28 @@ pub fn encodeValue(
     value: std.json.Value,
     max_bytes: usize,
 ) Error![]const u8 {
-    const encoded = std.json.Stringify.valueAlloc(allocator, value, .{}) catch
+    // Count the escaped representation before allocating it. A small input
+    // string can expand substantially when JSON escaping is applied, so an
+    // allocate-then-check implementation would let the configured wire limit
+    // be exceeded transiently.
+    var count_buffer: [256]u8 = undefined;
+    var discarding: std.Io.Writer.Discarding = .init(&count_buffer);
+    std.json.Stringify.value(value, .{}, &discarding.writer) catch
         return error.OutOfMemory;
-    if (encoded.len > max_bytes) return error.ResourceLimit;
+    const encoded_len_u64 = discarding.fullCount();
+    if (encoded_len_u64 > max_bytes or encoded_len_u64 > std.math.maxInt(usize))
+        return error.ResourceLimit;
+    const encoded_len: usize = @intCast(encoded_len_u64);
+
+    var allocating = std.Io.Writer.Allocating.initCapacity(
+        allocator,
+        encoded_len,
+    ) catch return error.OutOfMemory;
+    defer allocating.deinit();
+    std.json.Stringify.value(value, .{}, &allocating.writer) catch
+        return error.OutOfMemory;
+    const encoded = allocating.toOwnedSlice() catch return error.OutOfMemory;
+    std.debug.assert(encoded.len == encoded_len);
     return encoded;
 }
 
@@ -615,4 +634,16 @@ test "MCP permission identity binds server name and schema" {
     try std.testing.expect(!allZero(&base.permissionBinding()));
     try std.testing.expect(!std.mem.eql(u8, &base.permissionBinding(), &renamed.permissionBinding()));
     try std.testing.expect(!std.mem.eql(u8, &base.permissionBinding(), &other_server.permissionBinding()));
+}
+
+test "canonical encoding rejects escaped output before allocating" {
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    try std.testing.expectError(
+        error.ResourceLimit,
+        encodeValue(failing.allocator(), .{ .string = "\x00\x01\x02" }, 4),
+    );
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
 }

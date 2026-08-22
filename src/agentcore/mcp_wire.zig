@@ -51,6 +51,9 @@ pub fn parseResponseEnvelope(
     const root = std.json.parseFromSliceLeaky(std.json.Value, allocator, encoded, .{
         .duplicate_field_behavior = .@"error",
         .max_value_len = limits.max_frame_bytes,
+        // Call results are returned as semantic JSON. Preserve every numeric
+        // lexeme instead of silently round-tripping provider data through f64.
+        .parse_numbers = false,
     }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .diagnostic = canonical.Diagnostic.init(.invalid_json, phase) };
@@ -69,8 +72,9 @@ pub fn parseResponseEnvelope(
         return .{ .diagnostic = canonical.Diagnostic.init(.invalid_envelope, phase) };
     const id_value = root.object.get("id") orelse
         return .{ .diagnostic = canonical.Diagnostic.init(.response_id_mismatch, phase) };
-    if (id_value != .integer or id_value.integer < 0 or
-        @as(u64, @intCast(id_value.integer)) != expected_id)
+    const response_id = numberAsU64(id_value) orelse
+        return .{ .diagnostic = canonical.Diagnostic.init(.response_id_mismatch, phase) };
+    if (response_id != expected_id)
         return .{ .diagnostic = canonical.Diagnostic.init(.response_id_mismatch, phase) };
 
     const result = root.object.get("result");
@@ -84,12 +88,14 @@ pub fn parseResponseEnvelope(
             return .{ .diagnostic = canonical.Diagnostic.init(.invalid_envelope, phase) };
         const message_value = value.object.get("message") orelse
             return .{ .diagnostic = canonical.Diagnostic.init(.invalid_envelope, phase) };
-        if (code_value != .integer or message_value != .string)
+        const code = numberAsI64(code_value) orelse
+            return .{ .diagnostic = canonical.Diagnostic.init(.invalid_envelope, phase) };
+        if (message_value != .string)
             return .{ .diagnostic = canonical.Diagnostic.init(.invalid_envelope, phase) };
         canonical.validateText(message_value.string, limits.max_text_bytes) catch
             return .{ .diagnostic = canonical.Diagnostic.init(.resource_limit, phase) };
         return .{ .value = .{ .remote_error = .{
-            .code = code_value.integer,
+            .code = code,
             .data = value.object.get("data"),
         } } };
     }
@@ -136,10 +142,12 @@ pub fn validateCompleteResult(
 ) ?canonical.Diagnostic {
     if (result != .object)
         return canonical.Diagnostic.init(.invalid_field, phase);
+    // Classic eras do not assign semantics to the Modern resultType field.
+    // A vendor extension with that name must not be interpreted as a Modern
+    // input-required or unsupported-result response.
+    if (era != .modern_2026_07_28) return null;
     const result_type = result.object.get("resultType") orelse {
-        if (era == .modern_2026_07_28)
-            return canonical.Diagnostic.init(.missing_result_type, phase);
-        return null;
+        return canonical.Diagnostic.init(.missing_result_type, phase);
     };
     if (result_type != .string)
         return canonical.Diagnostic.init(.invalid_field, phase);
@@ -172,7 +180,7 @@ fn validateInputRequired(result: std.json.Value, limits: canonical.Limits) canon
             const id = request.object.get("id") orelse return error.InvalidValue;
             const method = request.object.get("method") orelse return error.InvalidValue;
             if (jsonrpc != .string or !std.mem.eql(u8, jsonrpc.string, JSON_RPC_VERSION) or
-                (id != .integer and id != .string) or method != .string)
+                (id != .string and numberAsI64(id) == null) or method != .string)
                 return error.InvalidValue;
             if (!std.mem.eql(u8, method.string, "sampling/createMessage") and
                 !std.mem.eql(u8, method.string, "roots/list") and
@@ -229,10 +237,27 @@ pub fn numberAsNonNegativeFloat(value: std.json.Value) ?f64 {
     const number: f64 = switch (value) {
         .integer => |integer| if (integer >= 0) @floatFromInt(integer) else return null,
         .float => |float_value| float_value,
+        .number_string => |encoded| std.fmt.parseFloat(f64, encoded) catch return null,
         else => return null,
     };
     if (number < 0 or !std.math.isFinite(number)) return null;
     return number;
+}
+
+fn numberAsI64(value: std.json.Value) ?i64 {
+    return switch (value) {
+        .integer => |integer| integer,
+        .number_string => |encoded| std.fmt.parseInt(i64, encoded, 10) catch null,
+        else => null,
+    };
+}
+
+fn numberAsU64(value: std.json.Value) ?u64 {
+    return switch (value) {
+        .integer => |integer| if (integer < 0) null else @intCast(integer),
+        .number_string => |encoded| std.fmt.parseInt(u64, encoded, 10) catch null,
+        else => null,
+    };
 }
 
 test "strict envelope classifies method not found without accepting wrong ids" {
@@ -263,6 +288,39 @@ test "response envelope permits escaped C0 bytes in arbitrary result content" {
         arena.allocator(),
         "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"\\u001b[31mred\"}]}}",
         7,
+        .tools_call,
+        .{},
+    );
+    try std.testing.expect(parsed == .value);
+}
+
+test "response envelope preserves high precision result number lexemes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try parseResponseEnvelope(
+        arena.allocator(),
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"precise\":0.123456789012345678901234567890,\"huge\":900719925474099312345}}",
+        7,
+        .tools_call,
+        .{},
+    );
+    try std.testing.expect(parsed == .value);
+    const encoded = try canonical.encodeValue(arena.allocator(), parsed.value.result, 1024);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        encoded,
+        "0.123456789012345678901234567890",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "900719925474099312345") != null);
+}
+
+test "response envelope matches the full unsigned request id domain" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try parseResponseEnvelope(
+        arena.allocator(),
+        "{\"jsonrpc\":\"2.0\",\"id\":18446744073709551615,\"result\":{}}",
+        std.math.maxInt(u64),
         .tools_call,
         .{},
     );
@@ -311,4 +369,18 @@ test "modern complete result requires resultType after validating input required
     );
     try std.testing.expect(validateCompleteResult(missing.value, .classic_2025_11_25, .tools_call, .{}) == null);
     try std.testing.expect(validateCompleteResult(missing.value, .classic_2025_06_18, .tools_call, .{}) == null);
+
+    var vendor = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"resultType\":\"vendor-specific\"}",
+        .{},
+    );
+    defer vendor.deinit();
+    try std.testing.expect(validateCompleteResult(
+        vendor.value,
+        .classic_2025_11_25,
+        .tools_call,
+        .{},
+    ) == null);
 }

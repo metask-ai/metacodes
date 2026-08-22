@@ -249,6 +249,7 @@ pub const View = struct {
             const prepared = catalog.materializeAdmittedTool(
                 backing,
                 resolved.admitted,
+                resolved.server.protocol_limits,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.AdmissionInvariantViolation => return error.AdmissionInvariantViolation,
@@ -319,12 +320,12 @@ pub const View = struct {
         model_name: []const u8,
         arguments_json: []const u8,
     ) schema.Validation {
-        if (self.findModelTool(model_name) == null)
+        const entry = self.findModelTool(model_name) orelse
             return .{ .invalid = .not_object };
         return schema.validateArguments(
             self.allocator,
             arguments_json,
-            .{},
+            schema.Limits.fromProtocol(entry.server.protocol_limits),
         );
     }
 
@@ -443,12 +444,12 @@ pub const Environment = struct {
         name: []const u8,
         arguments_json: []const u8,
     ) schema.Validation {
-        if (self.findModelTool(name) == null)
+        const entry = self.findModelTool(name) orelse
             return .{ .invalid = .not_object };
         return schema.validateArguments(
             self.allocator,
             arguments_json,
-            .{},
+            schema.Limits.fromProtocol(entry.server.protocol_limits),
         );
     }
 
@@ -514,9 +515,9 @@ pub const Environment = struct {
         );
         return switch (outcome) {
             .result => |*result| blk: {
+                defer result.deinit();
                 const encoded = try tool_ctx.allocator.dupe(u8, result.raw_result_json);
                 const is_error = result.is_error;
-                result.deinit();
                 break :blk if (is_error)
                     .{ .host_failed = encoded }
                 else

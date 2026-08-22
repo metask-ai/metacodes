@@ -294,6 +294,12 @@ pub fn parseDiscoverProbeResponse(
                     owned.deinit();
                     return unsupportedVersionFieldFailure();
                 };
+                // An unsupported-version response cannot coherently advertise
+                // the exact requested version as supported.
+                if (std.mem.eql(u8, version.string, requested.string)) {
+                    owned.deinit();
+                    return unsupportedVersionFieldFailure();
+                }
                 for (versions[0..index]) |existing| {
                     if (std.mem.eql(u8, existing, version.string)) {
                         owned.deinit();
@@ -575,6 +581,19 @@ test "server discover does not require list-result cache metadata" {
     try std.testing.expect(parsed == .value);
     try std.testing.expect(parsed.value.cache.ttl_ms == null);
     try std.testing.expectEqual(canonical.CacheScope.private, parsed.value.cache.scope);
+}
+
+test "unsupported-version error rejects a supported list containing the requested era" {
+    var parsed = try parseDiscoverProbeResponse(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"error\":{\"code\":-32022,\"message\":\"unsupported\",\"data\":{\"requested\":\"2026-07-28\",\"supported\":[\"2026-07-28\",\"2025-11-25\"]}}}",
+        6,
+        .{},
+    );
+    defer if (parsed == .value) parsed.value.deinit();
+    try std.testing.expect(parsed == .diagnostic);
+    try std.testing.expectEqual(canonical.DiagnosticCode.invalid_field, parsed.diagnostic.code);
+    try std.testing.expectEqual(@as(?i64, wire.UNSUPPORTED_PROTOCOL_VERSION), parsed.diagnostic.rpc_code);
 }
 
 test "discover handshake owns parsed text after the response buffer is released" {

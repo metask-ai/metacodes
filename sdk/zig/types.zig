@@ -415,7 +415,9 @@ pub const HostToolV1 = extern struct {
 /// `MCP-Session-Id` in this connection context. Probe, actual, and reopened
 /// exact-era connections must not share session identifiers or mutable
 /// protocol state. Credentials and transport handles never enter AgentCore
-/// checkpoints.
+/// checkpoints. The cancellation descriptor, its context, and callback are
+/// borrowed only for the synchronous request/notify callback invocation. A
+/// Host must not retain or poll them after that callback returns.
 pub const McpIsCancelledFnV1 = *const fn (
     cancellation_ctx: ?*const anyopaque,
 ) callconv(.c) u32;
@@ -461,6 +463,9 @@ pub const McpCloseFnV1 = *const fn (
     connector_ctx: ?*anyopaque,
     connection_ctx: ?*anyopaque,
 ) callconv(.c) void;
+/// `release_response` is called exactly once for every non-canonical-empty
+/// response token, including an invalid `{ ptr != null, len == 0 }` token.
+/// AgentCore passes the address of `McpResponseV1.body` itself.
 pub const McpReleaseResponseFnV1 = *const fn (
     connector_ctx: ?*anyopaque,
     connection_ctx: ?*anyopaque,

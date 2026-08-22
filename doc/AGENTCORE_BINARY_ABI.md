@@ -711,6 +711,11 @@ only within the same authentication context. The Host must never change an
 existing connection's era after inspecting an initialize response: AgentCore
 closes a mismatch and performs the exact-era reopen itself.
 
+The `metask_agentcore_mcp_cancellation_v1` descriptor, its `ctx`, and its poll
+callback are borrowed only for the synchronous request or notification callback
+invocation. A Host must not retain the descriptor or poll it after that callback
+returns.
+
 | Responsibility | Owner |
 |---|---|
 | Candidate selection and validation of the server-selected protocol | AgentCore |
@@ -725,11 +730,14 @@ closes a mismatch and performs the exact-era reopen itself.
 `metask_agentcore_mcp_response_v1`. Stdio responses use `http_status == 0`;
 Streamable HTTP completed responses use their final status in the range
 200..599. Non-response outcomes use status zero and an empty body.
-`release_response` keeps its signature: for every non-empty body AgentCore calls
-it exactly once with `&response.body`. On actual connections, stdio and HTTP 2xx
+`release_response` keeps its signature: canonical `{NULL,0}` is never released;
+for every other body token AgentCore calls it exactly once with
+`&response.body`, including when an invalid token has `ptr != NULL` and
+`len == 0`. On actual connections, stdio and HTTP 2xx
 enter the era parser, HTTP 401/403 map to `auth_error`, and every other HTTP
 status maps to `server_error` before protocol parsing. These failures never
-switch era or replay `tools/call`.
+switch era or replay `tools/call`. `MCP_EXCHANGE_FATAL` permanently retires the
+connection from dispatch; a later catalog refresh must open a replacement.
 
 `metask_agentcore_mcp_notify_fn_v1` has only two outcomes:
 `MCP_NOTIFY_OK` means the notification was committed, and `MCP_NOTIFY_FAILED`

@@ -88,6 +88,7 @@ pub const Pool = struct {
         defer self.mutex.unlock();
         const instance = self.findLocked(id) orelse
             return error.InstanceUnavailable;
+        if (!instance.client.isUsable()) return error.InstanceUnavailable;
         if (instance.refs == std.math.maxInt(u32)) return error.ResourceLimit;
         instance.refs += 1;
         return .{ .pool = self, .instance = instance };
@@ -100,6 +101,7 @@ pub const Pool = struct {
         defer self.mutex.unlock();
         const instance = self.findLocked(id) orelse
             return error.InstanceUnavailable;
+        if (!instance.client.isUsable()) return error.InstanceUnavailable;
         if (instance.refs == std.math.maxInt(u32)) return error.ResourceLimit;
         instance.refs += 1;
     }
@@ -112,6 +114,13 @@ pub const Pool = struct {
             return;
         };
         self.releaseLocked(instance);
+    }
+
+    pub fn isUsable(self: *Pool, id: InstanceId) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const instance = self.findLocked(id) orelse return false;
+        return instance.client.isUsable();
     }
 
     fn releasePointer(self: *Pool, instance: *Instance) void {

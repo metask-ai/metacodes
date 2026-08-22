@@ -18,8 +18,21 @@ pub const Limits = struct {
     max_instance_bytes: usize = (canonical.Limits{}).max_frame_bytes,
     max_depth: u16 = (canonical.Limits{}).max_json_depth,
     max_nodes: u32 = (canonical.Limits{}).max_json_nodes,
-    max_container_entries: usize = 256,
-    max_work_units: u32 = 65_536,
+    max_container_entries: usize = (canonical.Limits{}).max_json_nodes,
+    max_work_units: usize = (canonical.Limits{}).max_frame_bytes + 1,
+
+    pub fn fromProtocol(protocol: canonical.Limits) Limits {
+        return .{
+            .max_schema_bytes = protocol.max_schema_bytes,
+            .max_instance_bytes = protocol.max_frame_bytes,
+            .max_depth = protocol.max_json_depth,
+            .max_nodes = protocol.max_json_nodes,
+            .max_container_entries = protocol.max_json_nodes,
+            // A complete-input Scanner cannot emit more semantic/partial
+            // tokens than there are input bytes plus end_of_document.
+            .max_work_units = protocol.max_frame_bytes +| 1,
+        };
+    }
 };
 
 pub const IssueCode = enum(u16) {
@@ -142,6 +155,12 @@ pub fn prepareTool(
         value.object
     else
         null;
+    if (properties) |projected|
+        if (!validProviderProjectionText(.{ .object = projected }, limits.max_schema_bytes))
+            return finishUnavailable(&arena, .invalid_schema, "properties");
+    for (required) |name|
+        canonical.validateText(name, limits.max_schema_bytes) catch
+            return finishUnavailable(&arena, .invalid_schema, "required");
 
     const description = tool.description orelse tool.title orelse tool.identity.name;
     return .{ .available = .{
@@ -156,6 +175,27 @@ pub fn prepareTool(
             },
         },
     } };
+}
+
+/// The canonical record may retain arbitrary escaped JSON text, including C0
+/// payload content. Provider-visible Tool schemas are a narrower trust
+/// boundary: every projected key and string must satisfy the protocol text
+/// contract before it can enter a model request.
+fn validProviderProjectionText(value: std.json.Value, max_bytes: usize) bool {
+    switch (value) {
+        .string => |text| canonical.validateText(text, max_bytes) catch return false,
+        .array => |array| for (array.items) |item|
+            if (!validProviderProjectionText(item, max_bytes)) return false,
+        .object => |object| {
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                canonical.validateText(entry.key_ptr.*, max_bytes) catch return false;
+                if (!validProviderProjectionText(entry.value_ptr.*, max_bytes)) return false;
+            }
+        },
+        else => {},
+    }
+    return true;
 }
 
 fn validateSchemaEnvelope(value: std.json.Value, input: bool) ?Issue {
@@ -383,6 +423,44 @@ test "invalid schema envelope and resource excess remain unavailable" {
     defer if (limited == .available) limited.available.deinit();
     try std.testing.expect(limited == .unavailable);
     try std.testing.expectEqual(IssueCode.schema_resource_limit, limited.unavailable.code);
+}
+
+test "provider projection rejects C0 text without banning arbitrary MCP payload text" {
+    const escaped_key = testTool(
+        "{\"type\":\"object\",\"properties\":{\"bad\\u001bkey\":{\"type\":\"string\"}}}",
+        null,
+    );
+    var admission = try prepareTool(
+        std.testing.allocator,
+        "mcp__weather",
+        &escaped_key,
+        .{},
+    );
+    defer if (admission == .available) admission.available.deinit();
+    try std.testing.expect(admission == .unavailable);
+    try std.testing.expectEqual(IssueCode.invalid_schema, admission.unavailable.code);
+    try std.testing.expectEqualStrings("properties", admission.unavailable.keyword.?);
+
+    try std.testing.expect(validateArguments(
+        std.testing.allocator,
+        "{\"content\":\"\\u001b[31mred\"}",
+        .{},
+    ) == .valid);
+}
+
+test "schema limits derive from the server protocol contract" {
+    const limits = Limits.fromProtocol(.{
+        .max_frame_bytes = 4096,
+        .max_schema_bytes = 1024,
+        .max_json_depth = 7,
+        .max_json_nodes = 19,
+    });
+    try std.testing.expectEqual(@as(usize, 4096), limits.max_instance_bytes);
+    try std.testing.expectEqual(@as(usize, 1024), limits.max_schema_bytes);
+    try std.testing.expectEqual(@as(u16, 7), limits.max_depth);
+    try std.testing.expectEqual(@as(u32, 19), limits.max_nodes);
+    try std.testing.expectEqual(@as(usize, 19), limits.max_container_entries);
+    try std.testing.expectEqual(@as(usize, 4097), limits.max_work_units);
 }
 
 test "argument validation enforces only bounded JSON object envelope" {

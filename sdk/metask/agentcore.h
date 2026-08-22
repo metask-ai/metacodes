@@ -265,6 +265,9 @@ typedef struct {
 } metask_agentcore_host_tool_v1;
 
 typedef uint32_t (*metask_agentcore_mcp_is_cancelled_fn_v1)(const void *);
+/* The cancellation descriptor, its ctx, and callback are borrowed only for
+ * the synchronous request/notify invocation. The Host MUST NOT retain or poll
+ * them after that callback returns. */
 typedef struct {
     uint32_t struct_size;
     uint32_t reserved0;
@@ -313,9 +316,10 @@ typedef void (*metask_agentcore_mcp_release_connector_fn_v1)(void *);
  * MCP_EXCHANGE_RESPONSE and reports its status and body through
  * metask_agentcore_mcp_response_v1. Stdio responses use http_status == 0.
  * Non-response outcomes use http_status == 0 and an empty body. Every
- * non-empty body is released exactly once by passing &response.body to
- * release_response, independent of status. AgentCore copies response bytes
- * before release. */
+ * non-canonical-empty body token is released exactly once by passing
+ * &response.body to release_response, independent of status. This includes an
+ * invalid { ptr != NULL, len == 0 } token. AgentCore copies valid response
+ * bytes before release. */
 typedef struct {
     uint32_t struct_size;
     uint32_t reserved0;

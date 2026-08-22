@@ -45,6 +45,8 @@ pub const ExchangeOutcome = union(enum) {
     cancelled,
     /// The request may have reached the server. Callers must not replay it.
     indeterminate,
+    /// The Host callback contract failed. The connection must never be reused.
+    fatal,
 };
 
 pub const Connection = struct {
@@ -135,10 +137,19 @@ pub const Config = struct {
     client: wire.ClientInfo,
     timeout_ms: u32 = 30_000,
     limits: canonical.Limits = .{},
+    max_catalog_bytes: usize = 64 * 1024 * 1024,
 };
 
 pub const ConnectFailure = union(enum) {
     diagnostic: canonical.Diagnostic,
+    timeout,
+    network_error,
+    auth_error,
+    server_error,
+    child_exit,
+    cancelled,
+    indeterminate,
+    fatal,
     resource_limit,
     out_of_memory,
 };
@@ -168,11 +179,15 @@ pub const CallOutcome = union(enum) {
 };
 
 pub const Client = struct {
+    // deinit is exclusive: the instance pool calls it only after every
+    // catalog-owner and dispatch lease has been released.
     backing: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     connection: Connection,
+    connection_live: bool = true,
     transport: negotiation.Transport,
     mutex: sync.Mutex = .{},
+    usable: std.atomic.Value(bool) = .init(true),
     era: canonical.Era,
     capabilities: canonical.CanonicalCapabilities,
     binding: [32]u8,
@@ -184,10 +199,20 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         const backing = self.backing;
-        self.connection.close();
+        if (self.connection_live) self.connection.close();
         self.catalog.deinit();
         self.arena.deinit();
         backing.destroy(self);
+    }
+
+    pub fn isUsable(self: *const Client) bool {
+        return self.usable.load(.acquire);
+    }
+
+    fn retireConnection(self: *Client) void {
+        if (!self.usable.swap(false, .acq_rel)) return;
+        self.connection.close();
+        self.connection_live = false;
     }
 
     pub fn callTool(
@@ -199,11 +224,24 @@ pub const Client = struct {
     ) CallOutcome {
         if (!std.mem.eql(u8, &tool.identity.server_binding_identity, &self.binding))
             return .{ .failed = .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_call) } };
-        if (schema.validateArguments(result_allocator, arguments_json, .{}) != .valid)
-            return .{ .failed = .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_call) } };
+        switch (schema.validateArguments(
+            result_allocator,
+            arguments_json,
+            schema.Limits.fromProtocol(self.limits),
+        )) {
+            .valid => {},
+            .invalid => |issue| return .{ .failed = switch (issue) {
+                .resource_limit => .resource_limit,
+                .invalid_json, .not_object => .{
+                    .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_call),
+                },
+            } },
+            .out_of_memory => return .{ .failed = .out_of_memory },
+        }
 
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (!self.usable.load(.acquire)) return .{ .failed = .instance_unavailable };
         if (cancellation.isCancelled()) return .{ .failed = .cancelled };
         const request_id = self.takeRequestId() orelse return .{ .failed = .resource_limit };
         var exchange_arena = std.heap.ArenaAllocator.init(self.backing);
@@ -233,7 +271,11 @@ pub const Client = struct {
             request,
             self.timeout_ms,
             cancellation,
-        ) catch return .{ .failed = .indeterminate };
+        ) catch |err| {
+            if (err == error.OutOfMemory) return .{ .failed = .out_of_memory };
+            self.retireConnection();
+            return .{ .failed = .indeterminate };
+        };
         const response = switch (exchange) {
             .response => |value| switch (classifyActualResponse(self.transport, value)) {
                 .body => |body| body,
@@ -247,6 +289,10 @@ pub const Client = struct {
             .child_exit => return .{ .failed = .child_exit },
             .cancelled => return .{ .failed = .cancelled },
             .indeterminate => return .{ .failed = .indeterminate },
+            .fatal => {
+                self.retireConnection();
+                return .{ .failed = .indeterminate };
+            },
         };
         const parsed = switch (self.era) {
             .modern_2026_07_28 => modern.parseCallToolResponse(
@@ -292,6 +338,7 @@ const DriverState = struct {
     probe_observation: ?negotiation.ProbeObservation = null,
     probe_handshake: ?canonical.OwnedHandshake = null,
     final_capabilities: ?canonical.CanonicalCapabilities = null,
+    actual_failure: ?ConnectFailure = null,
     next_request_id: u64 = 1,
 
     fn driver(self: *DriverState) negotiation.Driver {
@@ -359,6 +406,7 @@ const DriverState = struct {
             .child_exit => return .child_exit,
             .cancelled => return .cancelled,
             .indeterminate => return .malformed_response,
+            .fatal => return error.TransportFailure,
         };
         switch (self.config.transport) {
             .stdio => if (response.http_status != 0) return .malformed_response,
@@ -368,6 +416,9 @@ const DriverState = struct {
                 else => return .server_error,
             },
         }
+        if (self.config.transport == .streamable_http and
+            response.http_status == 400 and response.body.len == 0)
+            return .legacy_http_400;
         const parsed = modern.parseDiscoverProbeResponse(
             self.backing,
             response.body,
@@ -383,7 +434,7 @@ const DriverState = struct {
                 .method_not_found
             else if (self.config.transport == .streamable_http and
                 response.http_status == 400 and
-                diagnostic.code != .remote_error and
+                isLegacyBare400Diagnostic(diagnostic) and
                 diagnostic.rpc_code != wire.UNSUPPORTED_PROTOCOL_VERSION)
                 .legacy_http_400
             else
@@ -403,11 +454,16 @@ const DriverState = struct {
     fn connectActual(raw: ?*anyopaque, era: canonical.Era) negotiation.DriverError!void {
         const self = cast(raw);
         if (self.actual_connection != null) return error.TransportFailure;
+        self.actual_failure = null;
         const opened = self.config.connector.open(.actual, era) catch |err|
-            return if (err == error.OutOfMemory) error.OutOfMemory else error.TransportFailure;
+            return if (err == error.OutOfMemory) error.OutOfMemory else self.failActual(.fatal);
         self.actual_connection = switch (opened) {
             .connection => |connection| connection,
-            else => return error.TransportFailure,
+            .timeout => return self.failActual(.timeout),
+            .network_error => return self.failActual(.network_error),
+            .auth_error => return self.failActual(.auth_error),
+            .server_error => return self.failActual(.server_error),
+            .child_exit => return self.failActual(.child_exit),
         };
     }
 
@@ -448,13 +504,21 @@ const DriverState = struct {
         ) catch |err| return if (err == error.OutOfMemory)
             error.OutOfMemory
         else
-            error.TransportFailure;
+            self.failActual(.fatal);
         const response = switch (exchange) {
             .response => |value| switch (classifyActualResponse(self.config.transport, value)) {
                 .body => |body| body,
-                .auth_error, .server_error => return error.TransportFailure,
+                .auth_error => return self.failActual(.auth_error),
+                .server_error => return self.failActual(.server_error),
             },
-            else => return error.TransportFailure,
+            .timeout => return self.failActual(.timeout),
+            .network_error => return self.failActual(.network_error),
+            .auth_error => return self.failActual(.auth_error),
+            .server_error => return self.failActual(.server_error),
+            .child_exit => return self.failActual(.child_exit),
+            .cancelled => return self.failActual(.cancelled),
+            .indeterminate => return self.failActual(.indeterminate),
+            .fatal => return self.failActual(.fatal),
         };
         var handshake = switch (era) {
             .modern_2026_07_28 => switch (modern.parseDiscoverResponse(
@@ -504,6 +568,11 @@ const DriverState = struct {
         return .{ .known = selected };
     }
 
+    fn failActual(self: *DriverState, failure: ConnectFailure) negotiation.DriverError {
+        self.actual_failure = failure;
+        return error.TransportFailure;
+    }
+
     fn disconnectActual(raw: ?*anyopaque) void {
         const self = cast(raw);
         if (self.actual_connection) |connection| connection.close();
@@ -517,9 +586,17 @@ fn isUnsupportedRevision(diagnostic: canonical.Diagnostic) bool {
         diagnostic.code == .method_not_found;
 }
 
+fn isLegacyBare400Diagnostic(diagnostic: canonical.Diagnostic) bool {
+    return switch (diagnostic.code) {
+        .invalid_json, .invalid_envelope, .response_id_mismatch => true,
+        else => false,
+    };
+}
+
 pub fn connectServer(backing: std.mem.Allocator, config: Config) ConnectOutcome {
     config.limits.validate() catch return .{ .failed = .resource_limit };
-    if (allZero(&config.server_binding_identity) or config.timeout_ms == 0)
+    if (allZero(&config.server_binding_identity) or config.timeout_ms == 0 or
+        config.max_catalog_bytes == 0)
         return .{ .failed = .resource_limit };
     var state = DriverState{ .backing = backing, .config = config };
     const selected = negotiation.negotiate(
@@ -528,7 +605,8 @@ pub fn connectServer(backing: std.mem.Allocator, config: Config) ConnectOutcome 
         config.transport,
     ) catch return .{ .failed = .out_of_memory };
     const era = switch (selected) {
-        .diagnostic => |diagnostic| return .{ .failed = .{ .diagnostic = diagnostic } },
+        .diagnostic => |diagnostic| return .{ .failed = state.actual_failure orelse
+            .{ .diagnostic = diagnostic } },
         .value => |value| value,
     };
     const connection = state.actual_connection orelse
@@ -545,7 +623,8 @@ pub fn connectServer(backing: std.mem.Allocator, config: Config) ConnectOutcome 
                 error.OutOfMemory => .out_of_memory,
                 error.ResourceLimit => .resource_limit,
                 error.ProtocolFailure => .{ .diagnostic = canonical.Diagnostic.init(.invalid_field, .tools_list) },
-                error.TransportFailure => .{ .diagnostic = canonical.Diagnostic.init(.connection_failed, .tools_list) },
+                error.TransportFailure => state.actual_failure orelse
+                    .{ .diagnostic = canonical.Diagnostic.init(.connection_failed, .tools_list) },
             } };
         }
     else
@@ -600,8 +679,10 @@ fn listAllTools(
     defer tools.deinit(a);
     var cursor: ?[]const u8 = null;
     var pages: usize = 0;
+    var retained_bytes: usize = @sizeOf(canonical.OwnedCatalog);
     while (true) {
-        if (pages == state.config.limits.max_tools + 1) return error.ResourceLimit;
+        if (pages > state.config.limits.max_tools or pages == std.math.maxInt(usize))
+            return error.ResourceLimit;
         pages += 1;
         const id = state.next_request_id;
         if (id == std.math.maxInt(u64)) return error.ResourceLimit;
@@ -628,13 +709,56 @@ fn listAllTools(
             request,
             state.config.timeout_ms,
             .{},
-        ) catch return error.TransportFailure;
+        ) catch |err| return if (err == error.OutOfMemory)
+            error.OutOfMemory
+        else blk: {
+            state.actual_failure = .fatal;
+            break :blk error.TransportFailure;
+        };
         const response = switch (exchange) {
             .response => |value| switch (classifyActualResponse(state.config.transport, value)) {
                 .body => |body| body,
-                .auth_error, .server_error => return error.TransportFailure,
+                .auth_error => {
+                    state.actual_failure = .auth_error;
+                    return error.TransportFailure;
+                },
+                .server_error => {
+                    state.actual_failure = .server_error;
+                    return error.TransportFailure;
+                },
             },
-            else => return error.TransportFailure,
+            .timeout => {
+                state.actual_failure = .timeout;
+                return error.TransportFailure;
+            },
+            .network_error => {
+                state.actual_failure = .network_error;
+                return error.TransportFailure;
+            },
+            .auth_error => {
+                state.actual_failure = .auth_error;
+                return error.TransportFailure;
+            },
+            .server_error => {
+                state.actual_failure = .server_error;
+                return error.TransportFailure;
+            },
+            .child_exit => {
+                state.actual_failure = .child_exit;
+                return error.TransportFailure;
+            },
+            .cancelled => {
+                state.actual_failure = .cancelled;
+                return error.TransportFailure;
+            },
+            .indeterminate => {
+                state.actual_failure = .indeterminate;
+                return error.TransportFailure;
+            },
+            .fatal => {
+                state.actual_failure = .fatal;
+                return error.TransportFailure;
+            },
         };
         var page = switch (era) {
             .modern_2026_07_28 => switch (modern.parseListToolsResponse(
@@ -681,18 +805,52 @@ fn listAllTools(
                 error.InvalidValue => error.ProtocolFailure,
             };
             copied.execution_mode = tool.execution_mode;
+            retained_bytes = std.math.add(
+                usize,
+                retained_bytes,
+                toolLogicalBytes(copied),
+            ) catch return error.ResourceLimit;
+            if (retained_bytes > state.config.max_catalog_bytes)
+                return error.ResourceLimit;
             tools.append(a, copied) catch return error.OutOfMemory;
         }
         combined.cache = conservativeCache(combined.cache, page.cache, pages == 1);
-        if (page.meta_json) |meta| combined.meta_json = a.dupe(u8, meta) catch return error.OutOfMemory;
-        cursor = if (page.next_cursor) |next|
-            a.dupe(u8, next) catch return error.OutOfMemory
-        else
-            null;
+        if (page.meta_json) |meta| {
+            retained_bytes = std.math.add(usize, retained_bytes, meta.len) catch
+                return error.ResourceLimit;
+            if (retained_bytes > state.config.max_catalog_bytes)
+                return error.ResourceLimit;
+            combined.meta_json = a.dupe(u8, meta) catch return error.OutOfMemory;
+        }
+        cursor = if (page.next_cursor) |next| cursor: {
+            retained_bytes = std.math.add(usize, retained_bytes, next.len) catch
+                return error.ResourceLimit;
+            if (retained_bytes > state.config.max_catalog_bytes)
+                return error.ResourceLimit;
+            break :cursor a.dupe(u8, next) catch return error.OutOfMemory;
+        } else null;
         if (cursor == null) break;
     }
     combined.tools = tools.toOwnedSlice(a) catch return error.OutOfMemory;
     return combined;
+}
+
+fn optionalLen(value: ?[]const u8) usize {
+    return if (value) |bytes| bytes.len else 0;
+}
+
+fn toolLogicalBytes(tool: canonical.Tool) usize {
+    return @sizeOf(canonical.Tool) +|
+        tool.identity.name.len +|
+        optionalLen(tool.title) +|
+        optionalLen(tool.description) +|
+        tool.input_schema_json.len +|
+        optionalLen(tool.output_schema_json) +|
+        optionalLen(tool.annotations_json) +|
+        optionalLen(tool.icons_json) +|
+        optionalLen(tool.meta_json) +|
+        optionalLen(tool.execution_json) +|
+        tool.raw_json.len;
 }
 
 fn conservativeCache(
@@ -744,6 +902,7 @@ const FakeConnector = struct {
     advertise_tools_2025_11: ?bool = null,
     advertise_tools_2025_06: ?bool = null,
     indeterminate_call: bool = false,
+    fatal_call: bool = false,
     business_error: bool = false,
     input_required_once: bool = false,
     typed_content: bool = false,
@@ -798,6 +957,8 @@ const FakeConnector = struct {
         const connection: *FakeConnection = @ptrCast(@alignCast(raw));
         const self = connection.owner;
         self.requests += 1;
+        if (std.mem.indexOf(u8, encoded, "tools/call") != null and self.fatal_call)
+            return .fatal;
         if (std.mem.indexOf(u8, encoded, "tools/call") != null and self.indeterminate_call)
             return .indeterminate;
         const id = requestId(encoded) orelse return .server_error;
@@ -1112,6 +1273,29 @@ test "Streamable HTTP actual request maps status before protocol parsing without
     }
 }
 
+test "Streamable HTTP connection revalidation preserves authentication failure" {
+    var fake = FakeConnector{
+        .era = .modern_2026_07_28,
+        .actual_http_status = 401,
+    };
+    const connected = connectServer(std.testing.allocator, .{
+        .connector = fake.connector(),
+        .transport = .streamable_http,
+        .policy = .modern_only,
+        .server_binding_identity = [_]u8{0x69} ** 32,
+        .client = .{ .name = "agentcore-test", .version = "9" },
+    });
+    switch (connected) {
+        .client => |client| {
+            client.deinit();
+            return error.TestUnexpectedResult;
+        },
+        .failed => |failure| try std.testing.expect(failure == .auth_error),
+    }
+    try std.testing.expectEqual(@as(u8, 1), fake.opens);
+    try std.testing.expectEqual(@as(u8, 1), fake.closes);
+}
+
 test "modern client owns disposable probe actual lifecycle catalog and call" {
     var fake = FakeConnector{ .era = .modern_2026_07_28 };
     const connected = connectServer(std.testing.allocator, .{
@@ -1190,6 +1374,67 @@ test "Classic client performs initialized notification and indeterminate call is
     );
     try std.testing.expect(called == .failed and called.failed == .indeterminate);
     try std.testing.expectEqual(before + 1, fake.requests);
+}
+
+test "fatal tools call retires the connection and the instance cannot be reused" {
+    var fake = FakeConnector{ .era = .classic_2025_11_25, .fatal_call = true };
+    const connected = connectServer(std.testing.allocator, .{
+        .connector = fake.connector(),
+        .transport = .stdio,
+        .policy = .legacy_only,
+        .server_binding_identity = [_]u8{0x72} ** 32,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    });
+    const client = switch (connected) {
+        .client => |value| value,
+        .failed => return error.TestUnexpectedResult,
+    };
+    defer client.deinit();
+    const before = fake.requests;
+    const closes_before = fake.closes;
+    const first = client.callTool(
+        std.testing.allocator,
+        &client.catalog.tools[0],
+        "{\"city\":\"Paris\"}",
+        .{},
+    );
+    try std.testing.expect(first == .failed and first.failed == .indeterminate);
+    try std.testing.expect(!client.isUsable());
+    try std.testing.expectEqual(closes_before + 1, fake.closes);
+    const second = client.callTool(
+        std.testing.allocator,
+        &client.catalog.tools[0],
+        "{\"city\":\"Paris\"}",
+        .{},
+    );
+    try std.testing.expect(second == .failed and second.failed == .instance_unavailable);
+    try std.testing.expectEqual(before + 1, fake.requests);
+}
+
+test "tools call uses the configured protocol limits and preserves resource classification" {
+    var fake = FakeConnector{ .era = .classic_2025_11_25 };
+    const connected = connectServer(std.testing.allocator, .{
+        .connector = fake.connector(),
+        .transport = .stdio,
+        .policy = .legacy_only,
+        .server_binding_identity = [_]u8{0x73} ** 32,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+        .limits = .{ .max_json_depth = 12 },
+    });
+    const client = switch (connected) {
+        .client => |value| value,
+        .failed => return error.TestUnexpectedResult,
+    };
+    defer client.deinit();
+    const before = fake.requests;
+    const called = client.callTool(
+        std.testing.allocator,
+        &client.catalog.tools[0],
+        "{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":0}}}}}}}}}}}}}",
+        .{},
+    );
+    try std.testing.expect(called == .failed and called.failed == .resource_limit);
+    try std.testing.expectEqual(before, fake.requests);
 }
 
 test "Classic optional task metadata keeps ordinary tools call semantics" {

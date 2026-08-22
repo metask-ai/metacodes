@@ -343,6 +343,7 @@ const AbiMcpConnection = struct {
             wire.MCP_EXCHANGE_CHILD_EXIT => .child_exit,
             wire.MCP_EXCHANGE_CANCELLED => .cancelled,
             wire.MCP_EXCHANGE_INDETERMINATE => .indeterminate,
+            wire.MCP_EXCHANGE_FATAL => .fatal,
             else => error.HostConnectorFatal,
         };
     }
@@ -5443,8 +5444,15 @@ fn restoreCheckpoint(
                 .subsystem = .mcp,
                 .reason = if (!allowed_by_current)
                     .authority_narrowed
-                else if (current_tool != null)
-                    .schema_changed
+                else if (current_tool) |current|
+                    if (!std.mem.eql(
+                        u8,
+                        &current.admitted.canonical.identity.schema_fingerprint,
+                        &entry.schema_fingerprint,
+                    ))
+                        .schema_changed
+                    else
+                        .unavailable
                 else
                     .unavailable,
                 .server_binding_identity = entry.server_binding_identity,
@@ -6197,6 +6205,11 @@ fn sessionUpdateMcp(
     emptyError(out_error);
     const self = sessionFrom(handle orelse
         return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    const runtime = self.runtime orelse
+        return fail(wire.STATUS_INVALID_STATE, "Session has no owning Runtime", out_error);
+    var runtime_call = runtime.catalogs.enterCall() catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    defer runtime_call.deinit();
     const selection = selection_ptr orelse
         return fail(wire.STATUS_INVALID_ARGUMENT, "MCP selection is required", out_error);
     var scratch = std.heap.ArenaAllocator.init(allocator);
@@ -6917,6 +6930,20 @@ test "Revision 9 hard-cut MCP response descriptor preserves HTTP fact and releas
     );
     try std.testing.expectEqual(@as(usize, 1), Probe.releases);
     try std.testing.expect(Probe.released_field == Probe.body_field);
+
+    Probe.status = wire.MCP_EXCHANGE_FATAL;
+    Probe.http_status = 0;
+    Probe.releases = 0;
+    Probe.empty_body = true;
+    const fatal = try AbiMcpConnection.request(
+        &connection,
+        std.testing.allocator,
+        "{}",
+        1000,
+        .{},
+    );
+    try std.testing.expect(fatal == .fatal);
+    try std.testing.expectEqual(@as(usize, 0), Probe.releases);
 }
 
 test "Host zero-length result must use a null pointer and preserves release descriptor on rejection" {
