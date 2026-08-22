@@ -1147,13 +1147,10 @@ fn allZero(value: []const u8) bool {
     return true;
 }
 
+const test_support = @import("mcp_test_support.zig");
+
 const Fake = struct {
-    opens: u8 = 0,
-    closes: u8 = 0,
-    ttl_ms: u64 = 1000,
-    tool_count: u8 = 1,
-    paginate: bool = false,
-    required_task: bool = false,
+    server: test_support.Server = .{},
     fail_open_oom: bool = false,
     fail_open: bool = false,
     reenter_manager: ?*Manager = null,
@@ -1163,13 +1160,15 @@ const Fake = struct {
     block_open: bool = false,
     open_waiting: bool = false,
 
-    const Conn = struct { owner: *Fake };
-
     fn connector(self: *Fake) runtime.Connector {
         return .{ .ctx = self, .open_fn = open };
     }
 
-    fn open(raw: *anyopaque, _: runtime.ConnectionPurpose, _: canonical.Era) anyerror!runtime.OpenOutcome {
+    fn open(
+        raw: *anyopaque,
+        purpose: runtime.ConnectionPurpose,
+        era: canonical.Era,
+    ) anyerror!runtime.OpenOutcome {
         const self: *Fake = @ptrCast(@alignCast(raw));
         if (self.reenter_manager) |manager| {
             self.reenter_manager = null;
@@ -1187,76 +1186,7 @@ const Fake = struct {
         self.block_mutex.unlock();
         if (self.fail_open_oom) return error.OutOfMemory;
         if (self.fail_open) return .server_error;
-        const connection = try std.heap.c_allocator.create(Conn);
-        connection.* = .{ .owner = self };
-        self.opens += 1;
-        return .{ .connection = .{
-            .ctx = connection,
-            .request_fn = request,
-            .notify_fn = notify,
-            .close_fn = close,
-        } };
-    }
-
-    fn request(
-        raw: *anyopaque,
-        allocator: std.mem.Allocator,
-        encoded: []const u8,
-        _: u32,
-        _: runtime.Cancellation,
-    ) anyerror!runtime.ExchangeOutcome {
-        const connection: *Conn = @ptrCast(@alignCast(raw));
-        const id = requestId(encoded) orelse return .server_error;
-        const response = if (std.mem.indexOf(u8, encoded, "server/discover") != null)
-            try std.fmt.allocPrint(
-                allocator,
-                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{{}},\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
-                .{ id, connection.owner.ttl_ms },
-            )
-        else if (std.mem.indexOf(u8, encoded, "tools/list") != null)
-            if (connection.owner.paginate)
-                try std.fmt.allocPrint(
-                    allocator,
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\"}}}}],\"nextCursor\":\"again\",\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
-                    .{ id, connection.owner.ttl_ms },
-                )
-            else if (connection.owner.required_task)
-                try std.fmt.allocPrint(
-                    allocator,
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"tasked\",\"inputSchema\":{{\"type\":\"object\"}},\"execution\":{{\"taskSupport\":\"required\"}}}}],\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
-                    .{ id, connection.owner.ttl_ms },
-                )
-            else if (connection.owner.tool_count == 1)
-                try std.fmt.allocPrint(
-                    allocator,
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"city\":{{\"type\":\"string\"}}}}}}}}],\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
-                    .{ id, connection.owner.ttl_ms },
-                )
-            else
-                try std.fmt.allocPrint(
-                    allocator,
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\"}}}},{{\"name\":\"alerts\",\"inputSchema\":{{\"type\":\"object\"}}}}],\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
-                    .{ id, connection.owner.ttl_ms },
-                )
-        else
-            return .server_error;
-        return .{ .response = .{ .http_status = 0, .body = response } };
-    }
-
-    fn notify(_: *anyopaque, _: []const u8, _: u32, _: runtime.Cancellation) anyerror!void {}
-
-    fn close(raw: *anyopaque) void {
-        const connection: *Conn = @ptrCast(@alignCast(raw));
-        connection.owner.closes += 1;
-        std.heap.c_allocator.destroy(connection);
-    }
-
-    fn requestId(encoded: []const u8) ?u64 {
-        const marker = "\"id\":";
-        const start = (std.mem.indexOf(u8, encoded, marker) orelse return null) + marker.len;
-        var end = start;
-        while (end < encoded.len and std.ascii.isDigit(encoded[end])) : (end += 1) {}
-        return std.fmt.parseInt(u64, encoded[start..end], 10) catch null;
+        return self.server.connector().open(purpose, era);
     }
 };
 
@@ -1317,10 +1247,10 @@ test "catalog refresh publishes generations while retained Run snapshot remains 
         &description.tools[0].permission_binding,
         0,
     ));
-    try std.testing.expectEqual(@as(u8, 4), fake.opens);
+    try std.testing.expectEqual(@as(u32, 4), fake.server.opens);
     // Each disposable probe and the Manager's released generation-1 owner are
     // closed; the explicit `first` retain keeps its actual connection alive.
-    try std.testing.expectEqual(@as(u8, 2), fake.closes);
+    try std.testing.expectEqual(@as(u32, 2), fake.server.closes);
 }
 
 test "Connector callback reentry is rejected instead of deadlocking" {
@@ -1461,7 +1391,7 @@ test "declarative apply reuses unchanged instances and rejects failed candidates
     const no_op = try manager.apply(1, &initial);
     try std.testing.expectEqual(ApplyDisposition.applied, no_op.disposition);
     try std.testing.expectEqual(@as(u64, 1), no_op.catalog_generation);
-    try std.testing.expectEqual(@as(u8, 2), stable.opens);
+    try std.testing.expectEqual(@as(u32, 2), stable.server.opens);
 
     const expanded = [_]ServerSpec{
         initial[0],
@@ -1482,8 +1412,8 @@ test "declarative apply reuses unchanged instances and rejects failed candidates
         stable_instance,
         second.findServer(&stable_binding).?.instance_id,
     );
-    try std.testing.expectEqual(@as(u8, 2), stable.opens);
-    try std.testing.expectEqual(@as(u8, 2), added.opens);
+    try std.testing.expectEqual(@as(u32, 2), stable.server.opens);
+    try std.testing.expectEqual(@as(u32, 2), added.server.opens);
 
     const rejected_specs = [_]ServerSpec{
         .{
@@ -1570,7 +1500,7 @@ test "unchanged unavailable server does not reject an unrelated addition" {
     defer description.deinit();
     try std.testing.expectEqual(@as(usize, 2), description.servers.len);
     try std.testing.expectEqual(@as(usize, 1), description.issues.len);
-    try std.testing.expectEqual(@as(u32, 2), added.opens);
+    try std.testing.expectEqual(@as(u32, 2), added.server.opens);
 }
 
 test "reapplying an unchanged desired set reconnects a missing server" {
@@ -1631,8 +1561,8 @@ test "rejected candidate releases instances acquired before the failure" {
     const report = try manager.apply(1, &candidate);
     try std.testing.expectEqual(ApplyDisposition.rejected, report.disposition);
     try std.testing.expectEqual(@as(u64, 1), report.catalog_generation);
-    try std.testing.expect(admitted_first.opens != 0);
-    try std.testing.expectEqual(admitted_first.opens, admitted_first.closes);
+    try std.testing.expect(admitted_first.server.opens != 0);
+    try std.testing.expectEqual(admitted_first.server.opens, admitted_first.server.closes);
     var current = try manager.describeCurrent(std.testing.allocator);
     defer current.deinit();
     try std.testing.expectEqual(@as(usize, 0), current.servers.len);
@@ -1683,7 +1613,7 @@ test "catalog description uses an exact destination window for every server" {
 }
 
 test "catalog freshness is clocked bounded and visible through description" {
-    var fake = Fake{ .ttl_ms = 1000 };
+    var fake = Fake{ .server = .{ .ttl_ms = 1000 } };
     var clock = TestClock{ .now_ns = 10 * std.time.ns_per_s };
     const specs = [_]ServerSpec{.{
         .binding = [_]u8{0x37} ** 32,
@@ -1715,7 +1645,7 @@ test "catalog freshness is clocked bounded and visible through description" {
 }
 
 test "one server resource limit does not suppress unrelated catalog entries" {
-    var over_limit = Fake{ .paginate = true };
+    var over_limit = Fake{ .server = .{ .paginate = true } };
     var healthy = Fake{};
     const specs = [_]ServerSpec{
         .{
@@ -1859,11 +1789,10 @@ test "catalog description resolves stable issue identity without live handles" {
 }
 
 test "Catalog excludes broken Provider projections and required-task tools" {
-    const fixture = @import("mcp_test_support.zig");
-    var opaque_schema = fixture.Server{
+    var opaque_schema = test_support.Server{
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"x\":{\"$ref\":\"#/$defs/x\"}}}",
     };
-    var required_task = Fake{ .required_task = true };
+    var required_task = Fake{ .server = .{ .required_task = true } };
     const invalid_binding = [_]u8{0x51} ** 32;
     const required_binding = [_]u8{0x52} ** 32;
     const specs = [_]ServerSpec{
@@ -1959,5 +1888,5 @@ test "catalog configuration rejects duplicate identity and unsafe namespace" {
             .{ .max_namespace_bytes = MAX_NAMESPACE_BYTES + 8 },
         ),
     );
-    try std.testing.expectEqual(@as(u8, 0), fake.opens);
+    try std.testing.expectEqual(@as(u32, 0), fake.server.opens);
 }
