@@ -8327,7 +8327,7 @@ test "Revision 6 MCP view update is idle atomic and invalidates schema-bound gra
     );
 }
 
-test "Revision 6 checkpoint restores compatible MCP view and exact Session grant" {
+test "checkpoint restores compatible MCP view and exact Session grant" {
     const fixture = @import("mcp_test_support.zig");
     const Cleanup = struct {
         fn session(value: *AbiSession) void {

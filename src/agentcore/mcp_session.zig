@@ -610,8 +610,8 @@ fn selectionFingerprint(
         }
     }.lessThan);
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    // Must match mcp_checkpoint.zig and remain stable for R6MCP migration.
-    hasher.update("agentcore-r6-mcp-session-selection\x00");
+    // Must match mcp_checkpoint.zig.
+    hasher.update("agentcore-mcp-session-selection\x00");
     for (digests) |digest| hasher.update(&digest);
     var result: [32]u8 = undefined;
     hasher.final(&result);

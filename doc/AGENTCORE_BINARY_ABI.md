@@ -785,12 +785,10 @@ destruction releases materialized tools before releasing the retained
 Snapshot. MCP Tasks, notification pumping, and automatic request replay remain
 outside Revision 9.
 
-The value-only MCP checkpoint section writes `R7MCP` state revision 2. Its
-decoder accepts only the exact `R6MCP`/revision 1 and `R7MCP`/revision 2 pairs;
-the new 2025-06 era value is appended and era remains provenance rather than a
-selection fingerprint input. This does not make AgentCore ABI Revision 6
-checkpoints loadable through Revision 9 discovery—the outer ABI remains a hard
-cut.
+The value-only MCP checkpoint section has one current `MCPSEL` format and no
+independent revision axis. Its decoder rejects every earlier `R6MCP`/`R7MCP`
+encoding. Era remains provenance rather than a selection fingerprint input.
+The outer AgentCore ABI Revision 9 remains the sole compatibility boundary.
 
 ### Model-visible MCP diagnostics
 

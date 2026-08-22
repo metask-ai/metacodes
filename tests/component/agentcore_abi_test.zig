@@ -2830,7 +2830,7 @@ test "L2 Revision 7 public mutations and compact use the exact hard-cut table" {
     );
 }
 
-test "L2 Revision 7 public MCP checkpoint restore facade preserves Conversation under narrower current authority" {
+test "L2 public MCP checkpoint restore facade preserves Conversation under narrower current authority" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
