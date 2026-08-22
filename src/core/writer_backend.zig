@@ -127,7 +127,7 @@ pub const WriterBackend = struct {
             // print-only sink 不收这些(旧 @hasDecl 守卫即编译期消失):
             // ui_request_pending:异步前端专属;print-only(headless/后台 job)不投递,no-op。
             // diag_*:L4 诊断事件,DiagnosticsBackend 专属,渲染后端 no-op。
-            .set_current_tool, .clear_current_tool, .tool_progress, .progress, .tool_result, .config_changed, .session_lifecycle, .agent_lifecycle, .tasks_changed, .ui_request_pending, .ui_request_resolved, .diag_turn_begin, .diag_turn_end, .diag_model_request, .diag_compact_request, .diag_compact_begin, .diag_compact_end, .diag_tool_stage, .diag_breaker_tripped, .diag_cache_break, .diag_continuation, .context_projection, .policy_decision, .diag_run_end => {},
+            .set_current_tool, .clear_current_tool, .tool_progress, .progress, .tool_result, .file_changes, .output_segment_begin, .output_segment_end, .config_changed, .session_lifecycle, .agent_lifecycle, .tasks_changed, .ui_request_pending, .ui_request_resolved, .diag_turn_begin, .diag_turn_end, .diag_model_request, .diag_compact_request, .diag_compact_begin, .diag_compact_end, .diag_tool_stage, .diag_breaker_tripped, .diag_cache_break, .diag_continuation, .context_projection, .policy_decision, .diag_run_end => {},
         }
     }
 };

@@ -340,6 +340,7 @@ test "L2 Lean-selected source-CAS rewrites existing Write through one host-synth
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -423,6 +424,7 @@ test "L2 malformed Write cannot be normalized by source-CAS lowering" {
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -463,6 +465,7 @@ test "L2 malformed Write cannot be normalized by source-CAS lowering" {
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer signal_result.freeFileChanges(allocator);
     switch (signal_result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -525,6 +528,7 @@ test "L2 host synthesis rejects non-UTF8 source without starting a dispatch" {
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -592,6 +596,7 @@ test "L2 execution policy can reject synthesized Edit with zero file effect" {
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -655,6 +660,7 @@ test "L2 rejected auto-recovery dispatch start cancels inflight authorization" {
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     try std.testing.expect(result == .host_fatal);
     const after = try readArtifact(allocator, path);
     defer allocator.free(after);
@@ -714,6 +720,7 @@ test "L2 source drift between synthesis selection and recovery pre starts no dis
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -782,6 +789,7 @@ test "L2 source drift after recovery admission is reobserved without overwrite" 
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -833,6 +841,7 @@ test "L2 admitted new-file Write cannot truncate a target created after observat
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -892,6 +901,7 @@ test "L2 Lean-admitted exact Edit refuses a source changed before native dispatc
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer blocked.freeFileChanges(allocator);
     switch (blocked) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -924,6 +934,7 @@ test "L2 Lean-admitted exact Edit refuses a source changed before native dispatc
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer rejected.freeFileChanges(allocator);
     switch (rejected) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -1002,6 +1013,7 @@ test "L2 exact recovery preserves content CAS across the blocked Write and later
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer blocked.freeFileChanges(allocator);
     switch (blocked) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -1034,6 +1046,7 @@ test "L2 exact recovery preserves content CAS across the blocked Write and later
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer rejected.freeFileChanges(allocator);
     switch (rejected) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -1091,6 +1104,7 @@ test "L2 exact recovery can fill an existing empty file without ordinary empty-n
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer blocked.freeFileChanges(allocator);
     switch (blocked) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -1118,6 +1132,7 @@ test "L2 exact recovery can fill an existing empty file without ordinary empty-n
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer recovered.freeFileChanges(allocator);
     switch (recovered) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -1174,6 +1189,7 @@ test "L2 malformed unrelated Edit remains a tool error while an exact obligation
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer blocked.freeFileChanges(allocator);
     switch (blocked) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -1194,6 +1210,7 @@ test "L2 malformed unrelated Edit remains a tool error while an exact obligation
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer malformed.freeFileChanges(allocator);
     switch (malformed) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -1254,6 +1271,7 @@ test "L2 rejected dispatch start cancels exact recovery inflight state" {
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer blocked.freeFileChanges(allocator);
     switch (blocked) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -1284,6 +1302,7 @@ test "L2 rejected dispatch start cancels exact recovery inflight state" {
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer rejected.freeFileChanges(allocator);
     try std.testing.expect(rejected == .host_fatal);
     try std.testing.expectEqual(@as(usize, 1), sink_state.rejected_starts);
     try std.testing.expectEqual(@as(usize, 2), sink_state.formal_events);
@@ -1354,6 +1373,7 @@ test "L2 exact-edit admission never delegates to an embedding Session executor" 
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -1438,6 +1458,7 @@ test "L2 governed executeOne rejects detached Bash and Monitor before process cr
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer explicit.freeFileChanges(allocator);
     switch (explicit) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -1467,6 +1488,7 @@ test "L2 governed executeOne rejects detached Bash and Monitor before process cr
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer foreground.freeFileChanges(allocator);
     switch (foreground) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -1497,6 +1519,7 @@ test "L2 governed executeOne rejects detached Bash and Monitor before process cr
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer monitor.freeFileChanges(allocator);
     switch (monitor) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -1701,6 +1724,7 @@ fn loadAndDispatchProbe(
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     switch (result) {
         .done => |done| {
             if (done.content) |bytes| allocator.free(bytes);
@@ -1889,6 +1913,7 @@ test "L2 promoted Lean deny rule blocks the real dispatcher before side effects"
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -2118,6 +2143,7 @@ test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edi
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer blocked.freeFileChanges(allocator);
     switch (blocked) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -2188,6 +2214,7 @@ test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edi
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer other_edit.freeFileChanges(allocator);
     switch (other_edit) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -2222,6 +2249,7 @@ test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edi
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer partial.freeFileChanges(allocator);
     switch (partial) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -2251,6 +2279,7 @@ test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edi
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer recovered.freeFileChanges(allocator);
     switch (recovered) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -2284,6 +2313,7 @@ test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edi
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer created.freeFileChanges(allocator);
     switch (created) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -2311,6 +2341,7 @@ test "L2 exact recovery blocks partial Edit and admits byte-exact whole-file Edi
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer directory_block.freeFileChanges(allocator);
     switch (directory_block) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -2462,6 +2493,7 @@ test "L2 shadow project rule records Lean blocks without changing real dispatch"
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -2729,6 +2761,7 @@ test "L2 normal RunControl finish publishes a bound operational observer" {
             allocator,
             .{ .bytes = [_]u8{'0'} ** 12 },
         );
+        defer result.freeFileChanges(allocator);
         switch (result) {
             .done => |done| {
                 defer if (done.content) |bytes| allocator.free(bytes);
@@ -3160,6 +3193,7 @@ test "L2 multi-target recovery keeps obligations independent and journals one mi
             allocator,
             .{ .bytes = [_]u8{'0'} ** 12 },
         );
+        defer result.freeFileChanges(allocator);
         switch (result) {
             .done => |done| {
                 defer if (done.content) |bytes| allocator.free(bytes);
@@ -3188,6 +3222,7 @@ test "L2 multi-target recovery keeps obligations independent and journals one mi
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer recovered_a.freeFileChanges(allocator);
     switch (recovered_a) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -3221,6 +3256,7 @@ test "L2 multi-target recovery keeps obligations independent and journals one mi
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer recovered_b.freeFileChanges(allocator);
     switch (recovered_b) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -3332,6 +3368,7 @@ test "L2 exact recovery obligation capacity fails closed before a new target" {
             allocator,
             .{ .bytes = [_]u8{'0'} ** 12 },
         );
+        defer result.freeFileChanges(allocator);
         if (index < 32) {
             switch (result) {
                 .done => |done| {
@@ -3395,6 +3432,7 @@ test "L2 multi-rule recovery follows the first blocking Lean verdict only" {
             allocator,
             .{ .bytes = [_]u8{'0'} ** 12 },
         );
+        defer result.freeFileChanges(allocator);
         switch (result) {
             .done => |done| {
                 defer if (done.content) |bytes| allocator.free(bytes);
@@ -3471,6 +3509,7 @@ fn runBatchRuntimeFixture(rule_count: usize) !BatchRuntimeStats {
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     const elapsed = cc.util_time.nowNs() - started;
     switch (result) {
         .done => |done| {
@@ -3605,6 +3644,7 @@ test "L2 target mismatch skips checker while retaining auditable dispatch filter
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -3691,6 +3731,7 @@ test "L2 exact recovery retains source and Edit rules while pruning unrelated to
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -3777,6 +3818,7 @@ test "L2 repeated identical signals retain distinct physical checker calls" {
             allocator,
             .{ .bytes = [_]u8{'0'} ** 12 },
         );
+        defer result.freeFileChanges(allocator);
         switch (result) {
             .done => |done| {
                 if (done.content) |bytes| allocator.free(bytes);
@@ -3891,6 +3933,7 @@ test "L2 malformed Lean batch verdict fails before the real dispatcher" {
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     try std.testing.expect(result == .host_fatal);
     try std.testing.expectEqual(@as(usize, 0), probe.calls);
     try journal.finishRun("HostToolFatal");
@@ -3978,6 +4021,7 @@ test "L2 exact recovery checker fault fails closed before Edit side effects" {
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer blocked.freeFileChanges(allocator);
     switch (blocked) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -4004,6 +4048,7 @@ test "L2 exact recovery checker fault fails closed before Edit side effects" {
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer rejected.freeFileChanges(allocator);
     try std.testing.expect(rejected == .host_fatal);
     const unchanged = try readArtifact(allocator, path);
     defer allocator.free(unchanged);
@@ -4066,6 +4111,7 @@ test "L2 same-cardinality batch binding drift has no durable verdict and no disp
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     try std.testing.expect(result == .host_fatal);
     try std.testing.expectEqual(@as(usize, 0), probe.calls);
     try journal.finishRun("HostToolFatal");
@@ -4156,6 +4202,7 @@ test "L2 promoted Lean post rule admits matched Write and poisons unavailable re
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer matched.freeFileChanges(allocator);
     switch (matched) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -4184,6 +4231,7 @@ test "L2 promoted Lean post rule admits matched Write and poisons unavailable re
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer vanished.freeFileChanges(allocator);
     try std.testing.expect(vanished == .host_fatal);
     try std.testing.expectEqual(@as(usize, 1), vanishing.calls);
     try std.testing.expect(!pfs.exists(vanished_path.ptr));
@@ -4397,6 +4445,7 @@ test "L2 an Edit that rewrites an existing file under Write-only rules reports a
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -4613,6 +4662,7 @@ test "L2 effect-class rule reaches the checker for Edit and is pruned for Bash" 
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -4643,6 +4693,7 @@ test "L2 effect-class rule reaches the checker for Edit and is pruned for Bash" 
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer bash_result.freeFileChanges(allocator);
     switch (bash_result) {
         .done => |done| {
             if (done.content) |bytes| allocator.free(bytes);
@@ -4771,6 +4822,7 @@ test "L2 verify-only rule admits an oversized new-file Write and reports the ove
         allocator,
         .{ .bytes = [_]u8{'0'} ** 12 },
     );
+    defer result.freeFileChanges(allocator);
     switch (result) {
         .done => |done| {
             defer if (done.content) |bytes| allocator.free(bytes);
@@ -4840,6 +4892,7 @@ test "dispatch_started 记录真实 within_root(根外 false/根内 true)" {
         allocator,
         .{ .bytes = [_]u8{'1'} ** 12 },
     );
+    defer out_result.freeFileChanges(allocator);
     switch (out_result) {
         .done => |done| {
             if (done.content) |bytes| allocator.free(bytes);
@@ -4868,6 +4921,7 @@ test "dispatch_started 记录真实 within_root(根外 false/根内 true)" {
         allocator,
         .{ .bytes = [_]u8{'2'} ** 12 },
     );
+    defer in_result.freeFileChanges(allocator);
     switch (in_result) {
         .done => |done| {
             if (done.content) |bytes| allocator.free(bytes);

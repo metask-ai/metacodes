@@ -313,6 +313,8 @@ test "L2 headless formal tool crosses registry, TinyKG sensor, compiled Lean, an
     const result_line = try cc.repl_headless.buildResultLine(
         allocator,
         final_text,
+        "final",
+        null,
         result,
         &cc.app_module.UsageTotals{},
         "fixture-model",

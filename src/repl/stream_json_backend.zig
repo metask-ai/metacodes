@@ -128,6 +128,20 @@ pub const StreamJsonBackend = struct {
                 "{{\"type\":\"auto_compact\",\"dropped\":{d},\"kept\":{d}}}\n",
                 .{ c.dropped, c.kept },
             ),
+            // 输出语义定性(见 core/output_semantics.zig)。**没有它,本流的消费者只能看到一串
+            // 无差别的 `text` 行**:分不清工具前的过程说明与最终答案,拼不回 max_tokens 续写,
+            // 也丢不掉被回滚的残片——正是这条协议要消灭的重复状态机。
+            // 消费者:按 `index` 把 `text` 行归段,收到本行后按 `disposition` 处置
+            // (`discarded` → 丢弃该段已缓冲字节;`final`+`continued` 同 `group` 拼成答案)。
+            // 增量 type,按本文件头的前向兼容约定,老消费者按 type 过滤即可无视。
+            .output_segment_begin => |seg| try w.print(
+                "{{\"type\":\"output_segment_begin\",\"index\":{d},\"turn\":{d},\"group\":{d}}}\n",
+                .{ seg.index, seg.turn, seg.group },
+            ),
+            .output_segment_end => |seg| try w.print(
+                "{{\"type\":\"output_segment_end\",\"index\":{d},\"turn\":{d},\"group\":{d},\"disposition\":\"{s}\",\"bytes\":{d}}}\n",
+                .{ seg.index, seg.turn, seg.group, @tagName(seg.disposition), seg.bytes },
+            ),
             else => return, // 渲染/roster/config 事件不入运行时间线
         }
         const line = aw.written();
@@ -193,6 +207,60 @@ test "StreamJsonBackend: 事件→NDJSON 行,每行合法 JSON,忽略渲染事�
     try std.testing.expectEqualStrings("text", kinds.items[1]);
     try std.testing.expectEqualStrings("tool_result", kinds.items[2]);
     try std.testing.expectEqualStrings("usage", kinds.items[3]);
+}
+
+test "StreamJsonBackend: 输出段定性进时间线,消费者不必自建 final 状态机" {
+    const a = std.testing.allocator;
+    var cap = CaptureSink{ .allocator = a };
+    defer cap.buf.deinit(a);
+    var sjb = StreamJsonBackend.init(a, cap.sink());
+    const be = sjb.backend();
+    const sid = @import("../core/session_id.zig").SessionId.single;
+
+    // 工具前的过程说明 → commentary;续写两段 → continued + final(同 group)。
+    be.emitEvent(sid, .{ .output_segment_begin = .{ .index = 0, .turn = 1, .group = 0 } });
+    be.emitEvent(sid, .{ .text_chunk = "looking…" });
+    be.emitEvent(sid, .{ .output_segment_end = .{ .index = 0, .turn = 1, .group = 0, .disposition = .commentary, .bytes = 9 } });
+    be.emitEvent(sid, .{ .output_segment_begin = .{ .index = 1, .turn = 2, .group = 1 } });
+    be.emitEvent(sid, .{ .text_chunk = "half " });
+    be.emitEvent(sid, .{ .output_segment_end = .{ .index = 1, .turn = 2, .group = 1, .disposition = .continued, .bytes = 5 } });
+    be.emitEvent(sid, .{ .output_segment_begin = .{ .index = 2, .turn = 2, .group = 1 } });
+    be.emitEvent(sid, .{ .text_chunk = "done" });
+    be.emitEvent(sid, .{ .output_segment_end = .{ .index = 2, .turn = 2, .group = 1, .disposition = .final, .bytes = 4 } });
+
+    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, cap.buf.items, "\n"), '\n');
+    var open_index: ?i64 = null;
+    var answer: std.ArrayList(u8) = .empty;
+    defer answer.deinit(a);
+    var buffered: std.ArrayList(u8) = .empty;
+    defer buffered.deinit(a);
+    var saw_final = false;
+
+    // 一个**只看这条流**的消费者:按 index 归段,按 disposition 处置。
+    while (it.next()) |line| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, line, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        const kind = obj.get("type").?.string;
+        if (std.mem.eql(u8, kind, "output_segment_begin")) {
+            open_index = obj.get("index").?.integer;
+            buffered.clearRetainingCapacity();
+        } else if (std.mem.eql(u8, kind, "text")) {
+            try std.testing.expect(open_index != null); // 文本永远落在某个段内
+            try buffered.appendSlice(a, obj.get("text").?.string);
+        } else if (std.mem.eql(u8, kind, "output_segment_end")) {
+            try std.testing.expectEqual(open_index.?, obj.get("index").?.integer);
+            const disposition = obj.get("disposition").?.string;
+            if (std.mem.eql(u8, disposition, "continued") or std.mem.eql(u8, disposition, "final")) {
+                try answer.appendSlice(a, buffered.items);
+                if (std.mem.eql(u8, disposition, "final")) saw_final = true;
+            }
+            open_index = null;
+            buffered.clearRetainingCapacity();
+        }
+    }
+    try std.testing.expect(saw_final);
+    try std.testing.expectEqualStrings("half done", answer.items); // commentary 不在答案里
 }
 
 test "StreamJsonBackend: 超限 input 截断到码点边界且显式标注" {

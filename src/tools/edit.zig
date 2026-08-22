@@ -244,6 +244,18 @@ fn executeWholeFileExact(
         // helper first attempts to restore `observed`, but the post-check must
         // not trust that best-effort rollback without reading the host again.
         ctx.reportFileMutation(file_path, .{ .known = observed }, new_content);
+        // A short write may already have changed the inode and the best-effort
+        // rollback is not trusted. Report `partial`, not `failed`: the caller
+        // must be told the file may differ from both before and after.
+        ctx.reportFileChange(.{
+            .path = file_path,
+            .kind = .modified,
+            .status = .partial,
+            .before_bytes = observed.len,
+            .after_bytes = new_content.len,
+            .unified_diff = null,
+            .diff_complete = false,
+        });
         return err;
     };
 
@@ -288,6 +300,36 @@ fn replaceWholeFileFd(
     };
 }
 
+/// Publish a committed Edit on the stable file-change contract, computing the
+/// diff locally. Used by the paths that do not already have one: the Lean
+/// recovery receipt (deliberately diff-free for the model) and the
+/// patch-computation fallback.
+fn publishCommittedChange(
+    ctx: *const ToolContext,
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    old_content: []const u8,
+    content: []const u8,
+) void {
+    const patch_mod = @import("../core/patch.zig");
+    var diff: ?[]u8 = null;
+    defer if (diff) |d| allocator.free(d);
+    if (patch_mod.compute(allocator, old_content, content)) |computed| {
+        var owned = computed;
+        defer owned.deinit(allocator);
+        diff = patch_mod.toGitDiff(allocator, file_path, owned.hunks) catch null;
+    } else |_| {}
+    ctx.reportFileChange(.{
+        .path = file_path,
+        .kind = .modified,
+        .status = if (std.mem.eql(u8, old_content, content)) .no_change else .applied,
+        .before_bytes = old_content.len,
+        .after_bytes = content.len,
+        .unified_diff = diff,
+        .diff_complete = diff != null,
+    });
+}
+
 fn finalizeCommittedWrite(
     ctx: *const ToolContext,
     allocator: std.mem.Allocator,
@@ -327,6 +369,11 @@ fn finalizeCommittedWrite(
     // receipt to the provider.  The replacement content is already present in
     // the model's original Write proposal.
     if (!expose_diff_to_model) {
+        // Host-side contract still owes the consumer this file's real change.
+        // The diff stays out of the model-visible receipt (it would turn Write
+        // permission into a read channel) but the host may see it, exactly like
+        // the effect and highlight caches above.
+        publishCommittedChange(ctx, allocator, file_path, old_content, content);
         var receipt: std.Io.Writer.Allocating = .init(allocator);
         defer receipt.deinit();
         try receipt.writer.writeAll("{\"file_path\":");
@@ -346,6 +393,7 @@ fn finalizeCommittedWrite(
     // structuredPatch + gitDiff
     const patch_mod = @import("../core/patch.zig");
     var patch = patch_mod.compute(allocator, old_content, content) catch {
+        publishCommittedChange(ctx, allocator, file_path, old_content, content);
         return try std.fmt.allocPrint(allocator,
             \\{{"file_path":"{s}","old_string":"{s}","new_string":"{s}","success":true}}
         , .{ file_path, old_raw, new_raw });
@@ -355,6 +403,15 @@ fn finalizeCommittedWrite(
     defer allocator.free(structured);
     const git_diff = try patch_mod.toGitDiff(allocator, file_path, patch.hunks);
     defer allocator.free(git_diff);
+    ctx.reportFileChange(.{
+        .path = file_path,
+        .kind = .modified,
+        .status = if (std.mem.eql(u8, old_content, content)) .no_change else .applied,
+        .before_bytes = old_content.len,
+        .after_bytes = content.len,
+        .unified_diff = git_diff,
+        .diff_complete = true,
+    });
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();

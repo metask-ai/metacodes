@@ -27,6 +27,8 @@
 const std = @import("std");
 const api_stream = @import("../../api/stream.zig");
 const file_reference = @import("../file_reference.zig");
+const output_semantics = @import("../output_semantics.zig");
+const file_change = @import("../file_change.zig");
 const abort = @import("../../util/abort.zig");
 const types = @import("../../types.zig"); // UI-free 核心类型(PermissionMode/ReasoningEffort)
 
@@ -194,6 +196,26 @@ pub const CoreEvent = union(enum) {
         file_refs: ?[]const file_reference.FileReference = null,
     },
 
+    /// **文件修改结果**(见 core/file_change.zig)。**无条件发**(它是证据不是渲染,headless/
+    /// subagent/关工具卡时同样发),每个产生了文件修改的 slot 一条。
+    ///
+    /// **时序**:本轮工具**全部执行完后一次性发**,早于本轮任何 `tool_result`——不是紧邻配对。
+    /// 这是刻意的:挂起(UiPending)、host fatal、结果组装失败都可能发生在盘已经真的改过之后,
+    /// 只有把证据放在所有分支之前才不会静默丢失。消费者按 `id` 与 tool_result 配对,不靠相邻。
+    ///
+    /// `changes` 是借用切片,emit 同步消费;跨线程留存须逐条 `Record.clone`。上层据此展示每个
+    /// 文件的实际修改,不必解析 tool_result.content 里的工具私有 `gitDiff`。
+    ///
+    /// `overflow`/`lost` 说明本次 dispatch 报告不完整(超单次上限 / 复制失败),消费者应显示
+    /// "不完整"而不是把少报当成少改。
+    file_changes: struct {
+        id: []const u8,
+        name: []const u8,
+        changes: []const file_change.Record,
+        overflow: bool = false,
+        lost: bool = false,
+    },
+
     /// token 计数增量。
     usage: api_stream.UsageDelta,
 
@@ -257,6 +279,28 @@ pub const CoreEvent = union(enum) {
     /// 一轮流式输出结束(取代旧 `print("\x1b[0m\n")`/`print("\n")`)。
     /// backend 决定闭颜色括号 + 尾换行。
     stream_done,
+
+    /// **可见输出段开始**(输出语义 v1,见 core/output_semantics.zig)。此后到配对的
+    /// `output_segment_end` 之间的每个 `text_chunk` 都属于本段。`thinking_chunk` **不**属于
+    /// 任何段——思考永不进入结果。段索引在 Run 内单调,回滚的段也占一个索引。
+    output_segment_begin: struct {
+        index: u32,
+        turn: u32,
+        group: u32,
+    },
+
+    /// **可见输出段结束 + 语义定性**。agent_loop 在它**真正知道**时才发:见到 tool_use →
+    /// commentary;自然 end_turn → final;max_tokens 续写 → continued(与同 group 的下一段
+    /// 合成一个结果);abort/预算终止 → partial;流内错误回滚 → discarded(消费者须丢弃已缓冲
+    /// 的该段字节)。消费者不再需要自建"什么算 final"的状态机——`stream_done` 只表示一次
+    /// provider stream 结束,从来不是完成信号。
+    output_segment_end: struct {
+        index: u32,
+        turn: u32,
+        group: u32,
+        disposition: output_semantics.Disposition,
+        bytes: u64,
+    },
 
     /// 可挂起 UI 请求预留(Stage 1):异步前端(Slack/邮件/工作流)收到此事件后,
     /// 据 tool_use_id + request_json 把请求 out-of-band 投递给人类,响应到达后经
@@ -376,6 +420,49 @@ test "CoreEvent.context_warning 可 JSON 序列化" {
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "context_warning") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "medium") != null);
+}
+
+test "CoreEvent.output_segment_end 可 JSON 序列化(进程外前端整条 union 序列化)" {
+    const ev = CoreEvent{ .output_segment_end = .{
+        .index = 3,
+        .turn = 2,
+        .group = 1,
+        .disposition = .final,
+        .bytes = 42,
+    } };
+    const out = try std.json.Stringify.valueAlloc(std.testing.allocator, ev, .{});
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "output_segment_end") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "final") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"bytes\":42") != null);
+}
+
+test "CoreEvent.file_changes 可 JSON 序列化(含 locator union 与可选 diff)" {
+    // WebBackend 把整条 CoreEvent 交给 std.json.Stringify;若这条序列化不了,web 前端会
+    // 静默丢事件(emit 里 catch → log.warn)。这里把它钉死。
+    const records = [_]file_change.Record{.{
+        .locator = .{ .workspace_path = "src/a.zig" },
+        .from_locator = .{ .absolute_path = "/old/a.zig" },
+        .kind = .moved,
+        .status = .applied,
+        .tool = "ApplyPatch",
+        .tool_use_id = "tu-1",
+        .agent_depth = 1,
+        .before_bytes = 3,
+        .after_bytes = 4,
+        .unified_diff = "-a\n+b\n",
+    }};
+    const ev = CoreEvent{ .file_changes = .{
+        .id = "tu-1",
+        .name = "ApplyPatch",
+        .changes = &records,
+    } };
+    const out = try std.json.Stringify.valueAlloc(std.testing.allocator, ev, .{});
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "file_changes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "src/a.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "/old/a.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "moved") != null);
 }
 
 test "CoreEvent.usage 复用 stream.UsageDelta" {

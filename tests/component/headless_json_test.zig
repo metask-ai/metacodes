@@ -21,7 +21,7 @@ test "L2 headless --json: result 行字段完整 + 合法 JSON + text 转义" {
     };
     const result = RunResult{ .stop_reason = .end_turn, .turns = 3, .tool_calls = 2 };
 
-    const line = try headless.buildResultLine(a, "hi \"there\"\nline2", result, &usage, "claude-sonnet-4-20250514");
+    const line = try headless.buildResultLine(a, "hi \"there\"\nline2", "final", null, result, &usage, "claude-sonnet-4-20250514");
     defer a.free(line);
 
     // 尾部换行(NDJSON)
@@ -33,7 +33,7 @@ test "L2 headless --json: result 行字段完整 + 合法 JSON + text 转义" {
         "\"input_tokens\":120", "\"output_tokens\":45",
         "\"cache_read_input_tokens\":80",
         "\"cache_creation_input_tokens\":20",
-        "\"cost_usd\":",
+        "\"cost_usd\":",   "\"text_kind\":\"final\"",
     }) |needle| {
         try std.testing.expect(std.mem.indexOf(u8, line, needle) != null);
     }
@@ -49,7 +49,7 @@ test "L2 headless --json: stop_reason 各值都能序列化(含 tool_loop)" {
     const a = std.testing.allocator;
     const usage = UsageTotals{};
     for ([_]cc.agent_loop.StopReason{ .end_turn, .max_turns, .aborted, .api_error, .tool_error, .tool_loop }) |sr| {
-        const line = try headless.buildResultLine(a, "", .{ .stop_reason = sr, .turns = 1, .tool_calls = 0 }, &usage, "m");
+        const line = try headless.buildResultLine(a, "", "none", null, .{ .stop_reason = sr, .turns = 1, .tool_calls = 0 }, &usage, "m");
         defer a.free(line);
         const parsed = try std.json.parseFromSlice(std.json.Value, a, std.mem.trimEnd(u8, line, "\n"), .{});
         defer parsed.deinit();

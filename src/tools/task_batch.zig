@@ -238,6 +238,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         .kg_projects_dir = ctx.kg_projects_dir,
         .artifact_root = ctx.artifact_root,
         .tool_result_metrics = ctx.tool_result_metrics,
+        .file_change_journal = ctx.file_change_journal,
     };
 
     // 展开每个 item 的 prompt(c_allocator owned;并发线程与串行都用)。

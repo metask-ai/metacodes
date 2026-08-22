@@ -424,6 +424,9 @@ const PlannedWrite = struct {
     new_content: []const u8,
     kind: enum { add, update, delete, move },
     move_from: ?[]const u8 = null, // move:原文件绝对路径(需删除)
+    /// phase 2 落盘时算出的本文件 gitDiff(arena owned)。同时喂稳定文件修改契约与结果 JSON,
+    /// 避免同一份 LCS 算两遍。delete 无 diff。
+    diff: ?[]const u8 = null,
 };
 
 fn setDetail(ctx: *const ToolContext, allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
@@ -451,6 +454,14 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     // ── 事务 phase 1:算出所有计划写入 + 校验(全在内存,任一失败即整批放弃)──
     var plans = std.ArrayList(PlannedWrite).empty;
+    // phase 1 任一失败 = 整批零落盘。已经建好计划的那些文件确实"被拒了",消费者该看到,
+    // 否则一次被权限挡下的 ApplyPatch 在文件修改契约上完全静默。
+    // **已知边界**:触发失败的那个文件本身还没进 plans(解析/定位/存在性校验在 append 之前),
+    // 它只出现在工具错误的 detail 里,不在这批 rejected 中——登记而非假装完整。
+    var phase2_started = false;
+    errdefer if (!phase2_started) {
+        for (plans.items) |*pl| publishPlanChange(ctx, arena, pl, .rejected);
+    };
     for (hunks.items) |h| {
         switch (h) {
             .add_file => |af| {
@@ -513,20 +524,19 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
 
     // ── 事务 phase 2:全部校验通过 → 逐个落盘 ──
-    for (plans.items) |pl| {
-        switch (pl.kind) {
-            .delete => try deleteFile(arena, pl.path),
-            .add, .update, .move => {
-                try writeFileMkParents(pl.new_content, pl.path);
-                // Move = 写新 + 删旧。删旧失败**不吞**——否则源和目标同时存在(内容重复)却报成功。
-                if (pl.kind == .move) if (pl.move_from) |from| try deleteFile(arena, from);
-                // 刷新 read_state(避免紧接着 Edit 报 stale)。
-                if (ctx.read_state) |rs| {
-                    if (read_state.statPath(pl.path) catch null) |st| {
-                        rs.recordHashed(pl.path, st.mtime_ns, st.size, std.hash.Wyhash.hash(0, pl.new_content)) catch {};
-                    }
-                }
-            },
+    // 本阶段**非原子、无回滚**(见文件头)。因此每个文件在自己落盘后立刻上报稳定文件修改契约:
+    // 中途失败时,前面的文件如实报 applied、失败那个报 partial(短写可能已改动 inode)、
+    // 后面没碰过的报 rejected。批级"部分完成"由这组逐文件真相表达,而不是一个含糊的整批状态。
+    phase2_started = true;
+    for (plans.items, 0..) |*pl, plan_index| {
+        const landed = applyOnePlan(ctx, arena, pl);
+        if (landed) |_| {
+            publishPlanChange(ctx, arena, pl, .applied);
+            continue;
+        } else |err| {
+            publishPlanChange(ctx, arena, pl, if (pl.kind == .delete) .failed else .partial);
+            for (plans.items[plan_index + 1 ..]) |*rest| publishPlanChange(ctx, arena, rest, .rejected);
+            return err;
         }
     }
 
@@ -543,24 +553,125 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     return try buildResult(allocator, arena, plans.items);
 }
 
-/// 结果 JSON:含 summary(A/M/D 计数)+ 合并 gitDiff(逐文件拼接,供工具卡渲染)。
-fn buildResult(allocator: std.mem.Allocator, arena: std.mem.Allocator, plans: []const PlannedWrite) ![]u8 {
+/// 列出这次调用**打算**改哪些文件,并全部报成 `rejected`。
+///
+/// 用于 ApplyPatch 在 dispatch **之前**就被权限拒掉的情况:那时工具体从没跑过,而 patch 目标
+/// 藏在不透明的信封里,host 看不见。与其让 agent_loop 去解析工具私有格式(正是本契约要消灭的
+/// 事),不如由拥有该格式的工具自己交代目标——只读、不落盘、不校验存在性。
+///
+/// 解析失败 → 什么都不报:一个连解析都过不去的 patch 没有可信的目标清单,编一份比沉默更糟。
+pub fn publishRejectedTargets(ctx: *const ToolContext, args: []const u8) void {
+    const allocator = ctx.allocator;
+    const patch_raw = common.extractJsonArg(args, "patch") orelse
+        common.extractJsonArg(args, "input") orelse return;
+    const patch_text = util_json.unescapeString(patch_raw, allocator) catch return;
+    defer allocator.free(patch_text);
+
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const hunks = Parser.parse(arena, patch_text) catch return;
+    for (hunks.items) |h| {
+        switch (h) {
+            .add_file => |af| {
+                const abs = normalizeForReport(arena, ctx, af.path) orelse continue;
+                ctx.reportFileChange(.{ .path = abs, .kind = .created, .status = .rejected });
+            },
+            .delete_file => |df| {
+                const abs = normalizeForReport(arena, ctx, df.path) orelse continue;
+                ctx.reportFileChange(.{ .path = abs, .kind = .deleted, .status = .rejected });
+            },
+            .update_file => |uf| {
+                const abs = normalizeForReport(arena, ctx, uf.path) orelse continue;
+                if (uf.move_path) |mp| {
+                    const dst = normalizeForReport(arena, ctx, mp) orelse continue;
+                    ctx.reportFileChange(.{ .path = dst, .from_path = abs, .kind = .moved, .status = .rejected });
+                } else {
+                    ctx.reportFileChange(.{ .path = abs, .kind = .modified, .status = .rejected });
+                }
+            },
+        }
+    }
+}
+
+/// 归一化一条**只用于上报**的路径。归一化失败 → 跳过该条:一条连路径都解析不出来的目标,
+/// 报出去只会让消费者看到垃圾。
+fn normalizeForReport(arena: std.mem.Allocator, ctx: *const ToolContext, raw: []const u8) ?[]const u8 {
+    return path_mod.normalizeChecked(arena, raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs }) catch null;
+}
+
+/// 落一个计划(写/删/移),并把本文件的 gitDiff 算进 plan(供上报与结果 JSON 共用)。
+fn applyOnePlan(ctx: *const ToolContext, arena: std.mem.Allocator, pl: *PlannedWrite) !void {
+    switch (pl.kind) {
+        .delete => try deleteFile(arena, pl.path),
+        .add, .update, .move => {
+            try writeFileMkParents(pl.new_content, pl.path);
+            // Move = 写新 + 删旧。删旧失败**不吞**——否则源和目标同时存在(内容重复)却报成功。
+            if (pl.kind == .move) if (pl.move_from) |from| try deleteFile(arena, from);
+            // 刷新 read_state(避免紧接着 Edit 报 stale)。
+            if (ctx.read_state) |rs| {
+                if (read_state.statPath(pl.path) catch null) |st| {
+                    rs.recordHashed(pl.path, st.mtime_ns, st.size, std.hash.Wyhash.hash(0, pl.new_content)) catch {};
+                }
+            }
+        },
+    }
+}
+
+fn planDiff(arena: std.mem.Allocator, pl: *PlannedWrite) ?[]const u8 {
+    if (pl.kind == .delete) return null;
+    if (pl.diff) |d| return d;
     const patch_mod = @import("../core/patch.zig");
+    const patch = patch_mod.compute(arena, pl.old_content, pl.new_content) catch return null;
+    pl.diff = patch_mod.toGitDiff(arena, pl.path, patch.hunks) catch null;
+    return pl.diff;
+}
+
+fn publishPlanChange(
+    ctx: *const ToolContext,
+    arena: std.mem.Allocator,
+    pl: *PlannedWrite,
+    status: @import("../core/file_change.zig").Status,
+) void {
+    const kind: @import("../core/file_change.zig").Kind = switch (pl.kind) {
+        .add => .created,
+        .update => .modified,
+        .delete => .deleted,
+        .move => .moved,
+    };
+    // 没落盘的条目不谈"改了什么":diff 只在真写下去时才有意义。
+    const diff = if (status.changedDisk()) planDiff(arena, pl) else null;
+    ctx.reportFileChange(.{
+        .path = pl.path,
+        .from_path = if (pl.kind == .move) pl.move_from else null,
+        .kind = kind,
+        .status = if (status == .applied and pl.kind == .update and
+            std.mem.eql(u8, pl.old_content, pl.new_content))
+            .no_change
+        else
+            status,
+        .before_bytes = pl.old_content.len,
+        .after_bytes = if (pl.kind == .delete) 0 else pl.new_content.len,
+        .unified_diff = diff,
+        .diff_complete = pl.kind == .delete or !status.changedDisk() or diff != null,
+    });
+}
+
+/// 结果 JSON:含 summary(A/M/D 计数)+ 合并 gitDiff(逐文件拼接,供工具卡渲染)。
+fn buildResult(allocator: std.mem.Allocator, arena: std.mem.Allocator, plans: []PlannedWrite) ![]u8 {
     var git_all = std.ArrayList(u8).empty;
     var n_add: usize = 0;
     var n_mod: usize = 0;
     var n_del: usize = 0;
-    for (plans) |pl| {
+    for (plans) |*pl| {
         switch (pl.kind) {
             .add => n_add += 1,
             .update, .move => n_mod += 1,
             .delete => n_del += 1,
         }
-        if (pl.kind != .delete) {
-            const patch = patch_mod.compute(arena, pl.old_content, pl.new_content) catch continue;
-            const gd = patch_mod.toGitDiff(arena, pl.path, patch.hunks) catch continue;
-            try git_all.appendSlice(arena, gd);
-        }
+        // phase 2 已算过就直接复用,避免同一份 LCS 跑两遍。
+        if (planDiff(arena, pl)) |gd| try git_all.appendSlice(arena, gd);
     }
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();

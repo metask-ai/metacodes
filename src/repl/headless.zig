@@ -14,6 +14,7 @@ const std = @import("std");
 const pfs = @import("platform").fs;
 const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
+const output_semantics = @import("../core/output_semantics.zig");
 const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
 const permission_mod = @import("../permission.zig");
 const project_activation = @import("../core/project_rule_activation.zig");
@@ -239,6 +240,12 @@ pub fn run(
             null,
     );
     run_options.obligations = obligation_runtime;
+    // 输出语义账本:最终结果由 core 定性并组装。取代旧的 lastAssistantText 猜测——那个只看
+    // conversation 最后一条 assistant message,分不清 commentary/final,也拼不回 max_tokens
+    // 续写被拆成多条 message 的完整答案。
+    var output_ledger = output_semantics.Ledger.init(allocator);
+    defer output_ledger.deinit();
+    run_options.output_ledger = &output_ledger;
     const result = agent_loop.run(
         &app.conversation,
         app.provider(),
@@ -277,14 +284,22 @@ pub fn run(
         // 与下一轮注入立即可见(模型不可干预,失败静默降级)。
         if (host_check_pin) |*pin| {
             const hint: []const u8 = if (std.c.getenv("METACODES_TASK_HINT")) |h| std.mem.span(h) else "";
-            const note_owned: ?[]const u8 = lastAssistantText(&app.conversation, allocator) catch null;
+            // 裁决用的 outcome note 要的是**这次 Run 的结果**。conversation 尾条可能是工具调用
+            // 前的过程说明,也可能是被主机拒绝的"过早最终答案"——拿它当结论会污染自演化的
+            // 输入。core 已经定性好了,优先用;没定性出结果才退回旧取法。
+            const classified = projectRunText(&output_ledger);
+            const note_owned: ?[]const u8 = if (classified.text != null)
+                null
+            else
+                lastAssistantText(&app.conversation, allocator) catch null;
             defer if (note_owned) |n| if (n.len > 0) allocator.free(n);
+            const note: []const u8 = classified.text orelse (note_owned orelse "");
             _ = host_check_mod.runAndIngest(
                 allocator,
                 known_graph,
                 pin,
                 hint,
-                if (note_owned) |n| n else "",
+                note,
                 @intCast(@import("../util/time.zig").nowWallNs()),
             );
         }
@@ -341,11 +356,14 @@ pub fn run(
         }
     }
 
-    const final_text = lastAssistantText(&app.conversation, allocator) catch "";
-    defer if (final_text.len > 0) allocator.free(final_text);
+    const projected = projectRunText(&output_ledger);
+    const final_text = if (projected.text) |t| t else lastAssistantText(&app.conversation, allocator) catch "";
+    const final_text_owned = projected.text == null;
+    const text_kind = if (projected.text != null) projected.kind else fallbackTextKind(final_text);
+    defer if (final_text_owned and final_text.len > 0) allocator.free(final_text);
 
     if (json_output) {
-        try emitJson(allocator, final_text, result, &app.usage, app.activeModel());
+        try emitJson(allocator, final_text, text_kind, &app.file_change_journal, result, &app.usage, app.activeModel());
     } else {
         // 纯文本：直接打模型最终回复 + 结尾换行
         writeStdout(final_text);
@@ -426,6 +444,7 @@ fn buildOptions(
         .home_dir = app.homeDir(),
         .artifact_root = app.sessionDir() orelse "",
         .tool_result_metrics = &app.tool_result_metrics,
+        .file_change_journal = &app.file_change_journal,
         .agents = &app.agents,
         .parent_model = app.activeModel(),
         .skills_set = &app.skills,
@@ -510,6 +529,11 @@ pub fn resumeSuspended(
     else
         null;
 
+    var output_ledger = output_semantics.Ledger.init(allocator);
+    defer output_ledger.deinit();
+    // resume 不重新召回;fresh eval metadata 已在原进程消费。
+    var resume_options = buildOptions(app, null, null, execution_policy, false, run_control.observer(), run_control.formalGate());
+    resume_options.output_ledger = &output_ledger;
     const result = agent_loop.resumeRun(
         &app.conversation,
         app.provider(),
@@ -518,7 +542,7 @@ pub fn resumeSuspended(
         state.tool_use_id,
         response_json,
         crs,
-        buildOptions(app, null, null, execution_policy, false, run_control.observer(), run_control.formalGate()), // resume 不重新召回;fresh eval metadata 已在原进程消费
+        resume_options,
         &be,
         allocator,
     ) catch |err| {
@@ -541,10 +565,13 @@ pub fn resumeSuspended(
         suspend_state.clear(dir); // 恢复完成,挂起点作废
     }
 
-    const final_text = lastAssistantText(&app.conversation, allocator) catch "";
-    defer if (final_text.len > 0) allocator.free(final_text);
+    const projected = projectRunText(&output_ledger);
+    const final_text = if (projected.text) |t| t else lastAssistantText(&app.conversation, allocator) catch "";
+    const final_text_owned = projected.text == null;
+    const text_kind = if (projected.text != null) projected.kind else fallbackTextKind(final_text);
+    defer if (final_text_owned and final_text.len > 0) allocator.free(final_text);
     if (json_output) {
-        try emitJson(allocator, final_text, result, &app.usage, app.activeModel());
+        try emitJson(allocator, final_text, text_kind, &app.file_change_journal, result, &app.usage, app.activeModel());
     } else {
         writeStdout(final_text);
         if (final_text.len == 0 or final_text[final_text.len - 1] != '\n') writeStdout("\n");
@@ -600,6 +627,29 @@ test "headless tool policy intersects exact CLI denies with its parent" {
     try std.testing.expect(execution.allowsTool("KgRecall"));
 }
 
+/// Run 文本 + 它到底是什么。text 借自 ledger(不 owned);null = core 没定性出任何可见输出,
+/// 调用方退回 lastAssistantText(兜底:嵌入方没挂账本,或本 Run 只产出过 commentary)。
+pub const RunText = struct {
+    text: ?[]const u8,
+    /// "final"(完成的结果)| "partial"(可见但未完成)| "unclassified"(兜底取到的
+    /// conversation 尾条文本,core 没把它定性成结果)| "none"(没有可见输出)。
+    kind: []const u8,
+};
+
+pub fn projectRunText(ledger: *const output_semantics.Ledger) RunText {
+    if (ledger.finalText()) |t| return .{ .text = t, .kind = "final" };
+    // 中断/错误/限额停机产生的可见文本:照打给用户,但明确不是完成的结果。
+    if (ledger.partialText()) |t| return .{ .text = t, .kind = "partial" };
+    return .{ .text = null, .kind = "none" };
+}
+
+/// 兜底路径的诚实标注:core 没定性出结果,但 conversation 尾条还有文本(例如整个 Run 只产出
+/// commentary 后撞 max_turns)。**不能沿用 "none"**——那等于一边说"没有可见输出"一边把文本
+/// 打进同一条 receipt。
+fn fallbackTextKind(text: []const u8) []const u8 {
+    return if (text.len == 0) "none" else "unclassified";
+}
+
 /// 把 conversation 最后一条 assistant message 的所有 text block 拼起来（owned）。
 pub fn lastAssistantText(conv: *const @import("../core/conversation.zig").Conversation, allocator: std.mem.Allocator) ![]const u8 {
     var i: usize = conv.messages.items.len;
@@ -631,11 +681,13 @@ pub fn lastAssistantText(conv: *const @import("../core/conversation.zig").Conver
 fn emitJson(
     allocator: std.mem.Allocator,
     final_text: []const u8,
+    text_kind: []const u8,
+    changes: ?*@import("../core/file_change.zig").Journal,
     result: agent_loop.RunResult,
     usage: *const app_mod.UsageTotals,
     model: []const u8,
 ) !void {
-    const line = try buildResultLine(allocator, final_text, result, usage, model);
+    const line = try buildResultLine(allocator, final_text, text_kind, changes, result, usage, model);
     defer allocator.free(line);
     writeStdout(line);
 }
@@ -644,6 +696,13 @@ fn emitJson(
 pub fn buildResultLine(
     allocator: std.mem.Allocator,
     final_text: []const u8,
+    /// 输出语义(见 core/output_semantics.zig):"final" = 完成的结果;"partial" = 可见但未完成
+    /// (中断/API 错误/限额);"none" = 本 Run 没有可见输出。消费者不必再从 stop_reason 猜。
+    text_kind: []const u8,
+    /// 本 Run 的文件修改账本(见 core/file_change.zig)。非 null → 结果行带 `file_changes`
+    /// 信封(`{schema_version, truncated, changes[]}`,由该模块自己拼,不在这里散装),
+    /// 消费者拿实际改动不解析 tool_result 里的工具私有 gitDiff。
+    changes: ?*@import("../core/file_change.zig").Journal,
     result: agent_loop.RunResult,
     usage: *const app_mod.UsageTotals,
     model: []const u8,
@@ -676,6 +735,15 @@ pub fn buildResultLine(
         cost,
     });
     try std.json.Stringify.encodeJsonString(final_text, .{}, &aw.writer);
+    try aw.writer.writeAll(",\"text_kind\":");
+    try std.json.Stringify.encodeJsonString(text_kind, .{}, &aw.writer);
+    if (changes) |journal| {
+        const file_change = @import("../core/file_change.zig");
+        const records = journal.acquire();
+        defer journal.release();
+        try aw.writer.writeAll(",\"file_changes\":");
+        try file_change.writeJsonEnvelope(&aw.writer, records, journal.truncated);
+    }
     try aw.writer.writeAll("}\n");
     return try aw.toOwnedSlice();
 }

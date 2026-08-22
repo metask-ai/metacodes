@@ -130,6 +130,18 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     };
     defer if (git_diff) |g| a.free(g);
 
+    // 稳定文件修改契约:notebook 整文件被重写,diff 描述被改动的 cell(与工具卡展示同源)。
+    // 无 diff(cell 内容算不出 patch)时明确标 incomplete,不让消费者把"没 diff"读成"没改"。
+    ctx.reportFileChange(.{
+        .path = path,
+        .kind = .modified,
+        .status = if (std.mem.eql(u8, content, out_json)) .no_change else .applied,
+        .before_bytes = content.len,
+        .after_bytes = out_json.len,
+        .unified_diff = git_diff,
+        .diff_complete = git_diff != null,
+    });
+
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
     try out.writer.print(

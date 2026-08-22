@@ -99,7 +99,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // M2:LSP baseline 移到盘写后(新建文件 old="")——盘写不被 LSP 阻塞,只结果等诊断。
     @import("lsp_diag.zig").snapshotBaseline(ctx, path, old_content orelse "");
 
-    return try renderResult(ctx, allocator, path, old_content orelse "", content);
+    return try renderResult(ctx, allocator, path, old_content orelse "", content, before);
 }
 
 /// 旧文件读的 size 守卫(轴A):旧内容仅供 diff 展示,巨型文件的 diff 无意义且整读 OOM →
@@ -120,10 +120,20 @@ fn captureBeforeContent(allocator: std.mem.Allocator, path: []const u8) observat
 }
 
 /// 渲染 Write 成功结果：success + path + structuredPatch + gitDiff (+ lspDiagnostics)。
-fn renderResult(ctx: *const ToolContext, allocator: std.mem.Allocator, path: []const u8, old_content: []const u8, new_content: []const u8) ![]u8 {
+/// 同时把这次写入投到**稳定的文件修改契约**(core/file_change.zig)——上层拿实际改动不再靠
+/// 解析下面这个结果 JSON 里的 `gitDiff`(那是工具私有渲染字段)。
+fn renderResult(
+    ctx: *const ToolContext,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    old_content: []const u8,
+    new_content: []const u8,
+    before: observation.BeforeContent,
+) ![]u8 {
     const patch_mod = @import("../core/patch.zig");
     var patch = patch_mod.compute(allocator, old_content, new_content) catch {
-        // diff 失败不致命：退回最简结果
+        // diff 失败不致命：退回最简结果。改动是真的,只是拿不到 diff → 契约上标注证据不完整。
+        publishFileChange(ctx, path, before, old_content, new_content, null, false);
         return try std.fmt.allocPrint(allocator, "{{\"success\":true, \"path\": \"{s}\"}}", .{path});
     };
     defer patch.deinit(allocator);
@@ -132,6 +142,7 @@ fn renderResult(ctx: *const ToolContext, allocator: std.mem.Allocator, path: []c
     defer allocator.free(structured);
     const git_diff = try patch_mod.toGitDiff(allocator, path, patch.hunks);
     defer allocator.free(git_diff);
+    publishFileChange(ctx, path, before, old_content, new_content, git_diff, true);
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -145,6 +156,37 @@ fn renderResult(ctx: *const ToolContext, allocator: std.mem.Allocator, path: []c
     try @import("lsp_diag.zig").appendToResult(ctx, allocator, &out.writer, path, new_content);
     try out.writer.writeByte('}');
     return try out.toOwnedSlice();
+}
+
+/// 投递一条文件修改记录。`before` 决定是新建还是修改:只有明确观察到 ENOENT 才敢说 created;
+/// 读不到旧内容(权限/过大/失败)时按 modified 报——不为了好看的分类而编造事实。
+fn publishFileChange(
+    ctx: *const ToolContext,
+    path: []const u8,
+    before: observation.BeforeContent,
+    old_content: []const u8,
+    new_content: []const u8,
+    unified_diff: ?[]const u8,
+    diff_complete: bool,
+) void {
+    const created = before == .missing;
+    const known_before = before == .known;
+    // `.unknown` = 文件在那儿但旧内容读不到(权限/超过 10MB 展示上限/读失败)。此时 diff 是拿
+    // **空基线**算的(整篇都显示成新增),before_bytes 也只能报 0——那是"不知道",不是"本来是空的"。
+    // 标 incomplete,让消费者知道 before 一侧不可信,而不是拿一份看起来完整的假 diff 去展示。
+    const baseline_known = created or known_before;
+    ctx.reportFileChange(.{
+        .path = path,
+        .kind = if (created) .created else .modified,
+        .status = if (known_before and std.mem.eql(u8, old_content, new_content))
+            .no_change
+        else
+            .applied,
+        .before_bytes = if (created) 0 else old_content.len,
+        .after_bytes = new_content.len,
+        .unified_diff = unified_diff,
+        .diff_complete = diff_complete and baseline_known,
+    });
 }
 
 /// 为 path 创建所有缺失的父目录（等价 mkdir -p 到 dirname）。已存在的目录忽略。
