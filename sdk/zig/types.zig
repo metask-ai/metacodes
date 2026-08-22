@@ -303,13 +303,7 @@ pub const MCP_EXCHANGE_CANCELLED: u32 = 6;
 pub const MCP_EXCHANGE_INDETERMINATE: u32 = 7;
 pub const MCP_EXCHANGE_FATAL: u32 = 8;
 pub const MCP_NOTIFY_OK: u32 = 0;
-pub const MCP_NOTIFY_TIMEOUT: u32 = 1;
-pub const MCP_NOTIFY_NETWORK_ERROR: u32 = 2;
-pub const MCP_NOTIFY_AUTH_ERROR: u32 = 3;
-pub const MCP_NOTIFY_SERVER_ERROR: u32 = 4;
-pub const MCP_NOTIFY_CHILD_EXIT: u32 = 5;
-pub const MCP_NOTIFY_CANCELLED: u32 = 6;
-pub const MCP_NOTIFY_FATAL: u32 = 7;
+pub const MCP_NOTIFY_FAILED: u32 = 1;
 
 pub const CHECKPOINT_IO_OK: u32 = 0;
 pub const CHECKPOINT_IO_FAILED: u32 = 1;

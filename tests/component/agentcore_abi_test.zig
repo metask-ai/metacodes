@@ -827,6 +827,7 @@ const PublicMcpProbe = struct {
     probe_response_body: ?[]const u8 = null,
     probe_http_status: u32 = 0,
     actual_http_status: u32 = 0,
+    notify_status: u32 = wire.MCP_NOTIFY_OK,
     connections: [8]Connection = [_]Connection{.{}} ** 8,
     connection_count: usize = 0,
     open_attempts: u32 = 0,
@@ -1048,20 +1049,21 @@ const PublicMcpProbe = struct {
         _: u32,
         _: ?*const wire.McpCancellationV1,
     ) callconv(.c) u32 {
-        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.MCP_NOTIFY_FATAL));
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.MCP_NOTIFY_FAILED));
         const connection = liveConnection(raw, connection_ctx) orelse
-            return wire.MCP_NOTIFY_FATAL;
+            return wire.MCP_NOTIFY_FAILED;
         if (connection.purpose_code != wire.MCP_CONNECTION_ACTUAL or
             connection.era_code == wire.MCP_ERA_2026_07_28)
-            return wire.MCP_NOTIFY_FATAL;
+            return wire.MCP_NOTIFY_FAILED;
         const encoded = sdk.borrowedBytes(notification_json) catch
-            return wire.MCP_NOTIFY_FATAL;
+            return wire.MCP_NOTIFY_FAILED;
         if (std.mem.indexOf(u8, encoded, "notifications/initialized") == null)
-            return wire.MCP_NOTIFY_FATAL;
+            return wire.MCP_NOTIFY_FAILED;
+        if (self.notify_status != wire.MCP_NOTIFY_OK) return self.notify_status;
         self.notifications += 1;
         self.notifications_by_era[
             eraIndex(connection.era_code) orelse
-                return wire.MCP_NOTIFY_FATAL
+                return wire.MCP_NOTIFY_FAILED
         ] += 1;
         return wire.MCP_NOTIFY_OK;
     }
@@ -1220,20 +1222,18 @@ const PublicHttpMcpConnector = struct {
         _: u32,
         _: ?*const wire.McpCancellationV1,
     ) callconv(.c) u32 {
-        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.MCP_NOTIFY_FATAL));
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.MCP_NOTIFY_FAILED));
         const connection: *Connection = @ptrCast(@alignCast(connection_ctx orelse
-            return wire.MCP_NOTIFY_FATAL));
-        if (connection.owner != self) return wire.MCP_NOTIFY_FATAL;
-        const body = sdk.borrowedBytes(notification_json) catch return wire.MCP_NOTIFY_FATAL;
+            return wire.MCP_NOTIFY_FAILED));
+        if (connection.owner != self) return wire.MCP_NOTIFY_FAILED;
+        const body = sdk.borrowedBytes(notification_json) catch return wire.MCP_NOTIFY_FAILED;
         const result = self.post(connection.era_code, body) catch
-            return wire.MCP_NOTIFY_NETWORK_ERROR;
+            return wire.MCP_NOTIFY_FAILED;
         defer std.heap.c_allocator.free(result.body);
         return if (result.status >= 200 and result.status < 300)
             wire.MCP_NOTIFY_OK
-        else if (result.status == 401 or result.status == 403)
-            wire.MCP_NOTIFY_AUTH_ERROR
         else
-            wire.MCP_NOTIFY_SERVER_ERROR;
+            wire.MCP_NOTIFY_FAILED;
     }
 
     fn post(self: *@This(), era_code: u32, body: []const u8) !HttpResult {
@@ -1871,6 +1871,7 @@ test "L2 public MCP wire failures preserve downgrade and no-replay semantics" {
         transport: u32,
         probe_open_status: u32 = wire.MCP_OPEN_OK,
         probe_exchange_status: ?u32 = null,
+        notify_status: u32 = wire.MCP_NOTIFY_OK,
         expected_servers: usize,
         expected_issue: ?[]const u8,
         expected_actual_attempts: u32,
@@ -1943,6 +1944,14 @@ test "L2 public MCP wire failures preserve downgrade and no-replay semantics" {
             .expected_protocol = "2025-11-25",
         },
         .{
+            .transport = wire.MCP_TRANSPORT_STDIO,
+            .notify_status = wire.MCP_NOTIFY_FAILED,
+            .expected_servers = 0,
+            .expected_issue = "connection_failed",
+            .expected_actual_attempts = 1,
+            .expected_request_attempts = 2,
+        },
+        .{
             .transport = wire.MCP_TRANSPORT_STREAMABLE_HTTP,
             .probe_exchange_status = wire.MCP_EXCHANGE_NETWORK_ERROR,
             .expected_servers = 0,
@@ -1992,6 +2001,7 @@ test "L2 public MCP wire failures preserve downgrade and no-replay semantics" {
             .server_era_code = wire.MCP_ERA_2025_11_25,
             .probe_open_status = case.probe_open_status,
             .probe_exchange_status = case.probe_exchange_status,
+            .notify_status = case.notify_status,
         };
         var server = std.mem.zeroes(wire.McpServerV1);
         server.struct_size = @sizeOf(wire.McpServerV1);

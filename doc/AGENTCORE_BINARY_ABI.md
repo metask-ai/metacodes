@@ -731,6 +731,12 @@ enter the era parser, HTTP 401/403 map to `auth_error`, and every other HTTP
 status maps to `server_error` before protocol parsing. These failures never
 switch era or replay `tools/call`.
 
+`metask_agentcore_mcp_notify_fn_v1` has only two outcomes:
+`MCP_NOTIFY_OK` means the notification was committed, and `MCP_NOTIFY_FAILED`
+means it was not. AgentCore does not branch on a Host-side failure category and
+does not retry or replay a failed notification; detailed transport outcomes
+belong to `open` and `request`, where AgentCore can act on them.
+
 `runtime_describe_mcp` returns `agentcore.mcp-catalog/v1`. Every server entry
 contains `server_binding_identity`, namespace, negotiated protocol,
 fingerprint, `cache_scope`, `fresh`, `ttl_remaining_ms`, and its Tool range.

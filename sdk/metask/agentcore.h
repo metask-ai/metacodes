@@ -181,13 +181,7 @@ extern "C" {
 #define METASK_AGENTCORE_MCP_EXCHANGE_INDETERMINATE 7u
 #define METASK_AGENTCORE_MCP_EXCHANGE_FATAL 8u
 #define METASK_AGENTCORE_MCP_NOTIFY_OK 0u
-#define METASK_AGENTCORE_MCP_NOTIFY_TIMEOUT 1u
-#define METASK_AGENTCORE_MCP_NOTIFY_NETWORK_ERROR 2u
-#define METASK_AGENTCORE_MCP_NOTIFY_AUTH_ERROR 3u
-#define METASK_AGENTCORE_MCP_NOTIFY_SERVER_ERROR 4u
-#define METASK_AGENTCORE_MCP_NOTIFY_CHILD_EXIT 5u
-#define METASK_AGENTCORE_MCP_NOTIFY_CANCELLED 6u
-#define METASK_AGENTCORE_MCP_NOTIFY_FATAL 7u
+#define METASK_AGENTCORE_MCP_NOTIFY_FAILED 1u
 #define METASK_AGENTCORE_CHECKPOINT_IO_OK 0u
 #define METASK_AGENTCORE_CHECKPOINT_IO_FAILED 1u
 #define METASK_AGENTCORE_CHECKPOINT_IO_FATAL 2u
@@ -301,6 +295,8 @@ typedef uint32_t (*metask_agentcore_mcp_request_fn_v1)(
     void *, void *, metask_agentcore_bytes_view_v1, uint32_t,
     const metask_agentcore_mcp_cancellation_v1 *,
     metask_agentcore_mcp_response_v1 *);
+/* Notifications have one committed-success outcome. Any transport, protocol,
+ * cancellation, or Host failure returns MCP_NOTIFY_FAILED. */
 typedef uint32_t (*metask_agentcore_mcp_notify_fn_v1)(
     void *, void *, metask_agentcore_bytes_view_v1, uint32_t,
     const metask_agentcore_mcp_cancellation_v1 *);
