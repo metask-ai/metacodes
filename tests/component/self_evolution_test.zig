@@ -1234,6 +1234,80 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         }
     }
 
+    // v43 L2(重放自证伪,撤修复必红——旧码声明 1.0 后静默恒在:REGRESSED
+    // 措辞常驻、压力针拒载、met 无增益针被 Rule B 错杀):
+    // ① solved 行 + 连续 2 轮未达 → 静默解除:note 无 REGRESSED 措辞,
+    //    load 装载完整压力栈(工件针+派生针);
+    // ② solved 行 + 仅 1 轮未达(宽限) → REGRESSED 静默保持,且 v43 多文件
+    //    工件的 (apply-diff) 段带 diff 应用指令;
+    // ③ 声明失信时 Rule B 停用:met=1 且 best 无增益的针仍在场。
+    {
+        const artifact_block = "\nbest-attempt artifact (host-extracted, verbatim):" ++
+            "\n--- pkg/repro_mod.py ---\nfrom hashlib import sha256\n\ndef make_tag(body):\n    return sha256(body).hexdigest()[:16]" ++
+            "\n--- pkg/wire.py (apply-diff) ---\n@@ -10,3 +10,4 @@\n import os\n+from pkg.repro_mod import make_tag\n def handler():";
+        const solved_row = "metacodes-task-outcome-v1: key=repro-task#s1 task=repro-task reward=1.0000 tests=3/3 prov=verifier failing=[]" ++ artifact_block;
+        const fail_row_1 = "metacodes-task-outcome-v1: key=repro-task#f1 task=repro-task reward=0.4545 tests=1/3 prov=verifier failing=[tests/rp.py::T::t_wire (failed: assert)]";
+        const fail_row_2 = "metacodes-task-outcome-v1: key=repro-task#f2 task=repro-task reward=0.4545 tests=1/3 prov=verifier failing=[tests/rp.py::T::t_wire (failed: assert)]";
+        _ = kg.remember(.observation, solved_row, "task_outcome", false) catch {};
+        _ = kg.remember(.observation, fail_row_1, "task_outcome", false) catch {};
+        ppaths.setEnv("METACODES_TASK_HINT", "repro-task");
+        // ② 宽限窗口(1 连败):REGRESSED 静默保持 + apply-diff 指令在场。
+        {
+            var built_g = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+            defer built_g.deinit(a);
+            const text_g = built_g.text orelse return error.TestExpectedInjection;
+            try std.testing.expect(std.mem.indexOf(u8, text_g, "REGRESSED from an already-proven configuration") != null);
+            try std.testing.expect(std.mem.indexOf(u8, text_g, "pkg/wire.py (apply-diff)") != null);
+            try std.testing.expect(std.mem.indexOf(u8, text_g, "The sections marked (apply-diff) are unified-diff hunks") != null);
+        }
+        // ① 第二连败:声明失信,静默解除。
+        _ = kg.remember(.observation, fail_row_2, "task_outcome", false) catch {};
+        {
+            var built_i = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
+            defer built_i.deinit(a);
+            const text_i = built_i.text orelse return error.TestExpectedInjection;
+            try std.testing.expect(std.mem.indexOf(u8, text_i, "REGRESSED from an already-proven configuration") == null);
+            try std.testing.expect(std.mem.indexOf(u8, text_i, "already proven by the verdict") == null);
+        }
+        var repro_cid: [64]u8 = undefined;
+        {
+            const rt_i = cc.obligation_gate.load(a, &kg, "repro-task") orelse return error.TestExpectedRuntime;
+            defer {
+                rt_i.deinit();
+                a.destroy(rt_i);
+            }
+            // 完整压力栈:工件针之外必须还有派生针(旧码 reproduce_only 仅 1 针)。
+            try std.testing.expect(rt_i.envelopes.len >= 2);
+            var found_artifact_needle = false;
+            for (rt_i.envelopes) |envelope| {
+                if (std.mem.eql(u8, envelope.command_needle, "pkg/repro_mod.py")) {
+                    found_artifact_needle = true;
+                    @memcpy(repro_cid[0..], envelope.candidate_id[0..64]);
+                }
+            }
+            try std.testing.expect(found_artifact_needle);
+        }
+        // ③ Rule B 豁免:met=1 且 best 记录声明值(1.0)→ 无豁免时
+        // current_best(1.0)≤best_at+ε 必退;声明失信下针必须存活。
+        {
+            const trow = try std.fmt.allocPrint(a,
+                "metacodes-needle-telemetry-v1: cid={s} task=repro-task run=rb0 nudged=0 dispatched=1 met=1 best=1.0000 needle=pkg/repro_mod.py",
+                .{repro_cid[0..64]});
+            defer a.free(trow);
+            _ = kg.remember(.observation, trow, "obligation_telemetry", false) catch {};
+            const rt_b = cc.obligation_gate.load(a, &kg, "repro-task") orelse return error.TestExpectedRuntime;
+            defer {
+                rt_b.deinit();
+                a.destroy(rt_b);
+            }
+            var still_there = false;
+            for (rt_b.envelopes) |envelope| {
+                if (std.mem.eql(u8, envelope.candidate_id[0..64], repro_cid[0..64])) still_there = true;
+            }
+            try std.testing.expect(still_there);
+        }
+    }
+
     // v38 L2(灌店自愈,撤修复必红——旧码同键双行永存且重摄取穿透):手工
     // 灌两条同键行(模拟跨 run 重摄取穿透),同键行再次到达时定点探测
     // GC 较老副本、拒绝再写:同键只剩一行,ingest 计 0。

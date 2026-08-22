@@ -375,6 +375,36 @@ fn appendDerived(
 /// p33 取证:filterwarnings 史上全 1.0,陈年 author 义务仍每轮 nudge,
 /// agent 被推去修鬼问题把好代码改坏(1.0→0.5)。棘轮在未解决时救命、
 /// 在已解决时投毒——已解决 ⇒ 零义务(Lean 镜面 solved_quiescence)。
+/// v43 重放自证伪:已解静默的前提是"声明的最佳可复现"。历史存在已解行
+/// (claimed),而尾部连续 REPRO_GRACE_ROUNDS 行全部未达 → 声明对当前环境
+/// 不可复现(p44b/p45 取证:声明 1.0 的工件重放两轮逐字节 0.4545——工件
+/// 通道曾只载新建文件,既有文件的接线 hunks 丢失,静默又拒载全部压力针,
+/// 平台自锁)。第一次回归保留静默(REGRESSED 重放一次机会);连续两轮未达
+/// 才解除,恢复满压力栈。Lean 镜面 claimInvalidated/one_regression_keeps_grace。
+pub const REPRO_GRACE_ROUNDS: usize = 2;
+
+pub fn claimNotReproduced(history: []const []u8) bool {
+    // 失信仅适用于**带工件的声明**:工件重放是机械可执行的复现指令,
+    // 连续两轮执行未达即"不可复现"的实证。无工件的静默只是文本引导,
+    // 维持 v35 语义(p33 取证:对已证任务重新施压只会让 agent 追自己的
+    // 回归鬼影)。Lean 镜面 textual_claim_never_invalidates。
+    var solved_with_artifact = false;
+    for (history) |row| {
+        if (rowSolved(row) and std.mem.indexOf(u8, row, "best-attempt artifact") != null) {
+            solved_with_artifact = true;
+            break;
+        }
+    }
+    if (!solved_with_artifact) return false;
+    var streak: usize = 0;
+    var i: usize = history.len;
+    while (i > 0) : (i -= 1) {
+        if (rowSolved(history[i - 1])) break;
+        streak += 1;
+    }
+    return streak >= REPRO_GRACE_ROUNDS;
+}
+
 pub fn rowSolved(row: []const u8) bool {
     const tag = std.mem.indexOf(u8, row, " tests=") orelse return false;
     const start = tag + " tests=".len;
@@ -405,6 +435,8 @@ pub fn load(
     // 证明非因果,义务 nudge 预算降为 1(与 note 侧 COOLED 同键;任何
     // 新剂量打破键即恢复全额)。Lean 镜面 plateau_caps_pressure。
     var plateau = false;
+    // v43:声明失信标志(重放自证伪),函数级——折叠段的 Rule B 依赖它。
+    var claim_invalid = false;
     if (task_hint.len > 0 and task_hint.len <= 200) {
         const scoped_recall = @import("../kg/scoped_recall.zig");
         // 已解决静默键在**最佳行**(p34 取证:键最新行时,回归行让任务
@@ -431,10 +463,12 @@ pub fn load(
                     a.free(newest_probe);
                 }
             }
+            // v43:声明不可复现 → 已解静默失效,回到满压力栈装载。
+            claim_invalid = claimNotReproduced(history0.items);
         }
         // defer 已清完 history0 之后才拆竞技场(UAF 教训:return 触发的
         // 块级 defer 会晚于 arena.deinit 执行)。
-        if (ever_solved) {
+        if (ever_solved and !claim_invalid) {
             // v35(p35 取证):静默≠零针,而是换针。v34 在此直接零义务,
             // 唯一全勤祈使通道随之关闭——etag 的剂量完整到达且 thinking
             // 逐字复述了已证模块路径,行动时刻却被店内冲突 CORRECTION
@@ -531,7 +565,7 @@ pub fn load(
         }
         var keep = std.array_list.Managed(self_evolution.ObligationEnvelope).init(a);
         for (combined.items) |envelope| {
-            if (needleRetired(kg, envelope.candidate_id, current_best)) {
+            if (needleRetired(kg, envelope.candidate_id, current_best, !claim_invalid)) {
                 log.warn("obligation", "needle retired by telemetry fold cid={s} needle={s}", .{ envelope.candidate_id[0..@min(envelope.candidate_id.len, 16)], envelope.command_needle[0..@min(envelope.command_needle.len, 60)] });
                 continue;
             }
@@ -666,6 +700,7 @@ pub fn needleRetired(
     kg: *kg_client_mod.KgClient,
     candidate_id: []const u8,
     current_best: f64,
+    claim_valid: bool,
 ) bool {
     var probe_buffer: [160]u8 = undefined;
     const probe = std.fmt.bufPrint(&probe_buffer, TELEMETRY_MARKER ++ " cid={s}", .{candidate_id[0..@min(candidate_id.len, 64)]}) catch return false;
@@ -686,7 +721,10 @@ pub fn needleRetired(
         if (std.mem.indexOf(u8, hit.text, " met=1 ") != null) {
             const best_at = extractBestField(hit.text);
             // Rule B:履约当轮记录的最佳 ≥ 当前最佳 → 履约之后零增益。
-            if (best_at >= -0.5 and current_best <= best_at + 0.0001) met_no_gain = true;
+            // v43:声明失信(重放自证伪)时 Rule B 停用——best 字段承载的是
+            // 未能复现的声明值,拿它判"无增益"会错杀史证突破针。Rule A
+            // (惰性)不依赖 best,照常。Lean 镜面 invalid_claim_never_retires。
+            if (claim_valid and best_at >= -0.5 and current_best <= best_at + 0.0001) met_no_gain = true;
         }
     }
     // Rule A:满 K 轮被点名、零 dispatch → 惰性退休。

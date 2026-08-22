@@ -3791,3 +3791,83 @@ class ContinuityExportGateTest(unittest.TestCase):
             'else printf "0" > /logs/agent/kg-export-probe.rc; fi',
             source,
         )
+
+
+class BestArtifactMultiFileTest(unittest.TestCase):
+    """v43 多文件工件:新建文件递送全文,修改型文件递送 diff hunks。
+
+    p32etag 取证:1.0 方案 = 新建模块 + 既有文件的接线 hunks;旧通道只取
+    new-file → 接线整个丢失 → 声明 1.0 的重放永远 5/11(0.4545 平台自锁)。
+    """
+
+    @staticmethod
+    def _extract():
+        source = (
+            Path(__file__).parents[1]
+            / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        body = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_best_artifact"
+        ]
+        module = ast.Module(body=body, type_ignores=[])
+        namespace = {"Path": Path}
+        exec(compile(module, "<best-artifact>", "exec"), namespace)
+        return namespace["_best_artifact"]
+
+    def _trial(self, patch_text):
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        trial = Path(holder.name)
+        (trial / "verifier").mkdir()
+        (trial / "verifier" / "agent.patch").write_text(patch_text, encoding="utf-8")
+        return trial
+
+    PATCH = (
+        "diff --git a/pkg/newmod.py b/pkg/newmod.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/pkg/newmod.py\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+def make_tag(body):\n"
+        "+    return body[:16]\n"
+        "diff --git a/pkg/asgi.py b/pkg/asgi.py\n"
+        "index 111..222 100644\n"
+        "--- a/pkg/asgi.py\n"
+        "+++ b/pkg/asgi.py\n"
+        "@@ -10,3 +10,4 @@\n"
+        " import os\n"
+        "+from pkg.newmod import make_tag\n"
+        " def handler():\n"
+        "diff --git a/tests/test_new.py b/tests/test_new.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/tests/test_new.py\n"
+        "@@ -0,0 +1,1 @@\n"
+        "+def test_x(): pass\n"
+    )
+
+    def test_modified_file_hunks_are_delivered_with_apply_diff_tag(self):
+        artifact = self._extract()(self._trial(self.PATCH))
+        # 新建段:全文、原定界、在前。
+        self.assertIn("--- pkg/newmod.py ---\ndef make_tag(body):", artifact)
+        # 修改段:apply-diff 定界 + hunk 头 + 接线行(旧通道整个丢弃这段)。
+        self.assertIn("--- pkg/asgi.py (apply-diff) ---", artifact)
+        self.assertIn("@@ -10,3 +10,4 @@", artifact)
+        self.assertIn("+from pkg.newmod import make_tag", artifact)
+        # 新建段先于修改段;tests/ 照旧跳过。
+        self.assertLess(
+            artifact.index("pkg/newmod.py"), artifact.index("pkg/asgi.py")
+        )
+        self.assertNotIn("tests/test_new.py", artifact)
+
+    def test_truncation_is_labelled_and_capped(self):
+        big = self.PATCH.replace(
+            "+    return body[:16]\n",
+            "".join(f"+    x{i} = {i}\n" for i in range(400)),
+        )
+        artifact = self._extract()(self._trial(big))
+        self.assertLessEqual(len(artifact), 4096 + 400)
+        self.assertIn("HOST-TRUNCATED", artifact)

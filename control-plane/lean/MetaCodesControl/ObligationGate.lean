@@ -195,5 +195,69 @@ theorem unmet_never_noncausal (g : Bool) : nonCausalRetire 0 g = false := by
   rintro ⟨hm, _⟩
   omega
 
+/-! ## v43 reproduce-mode self-invalidation
+
+Solved quiescence (v35) presupposes that the claimed best is reproducible.
+p44b/p45 forensics: a claimed-1.0 artifact replayed byte-identically to
+0.4545 for two rounds — the artifact channel had dropped the modified-file
+wiring hunks, while quiescence kept refusing every pressure needle: a
+self-locking plateau. The claim is invalidated when the tail of the task's
+history shows `reproGrace` consecutive unsolved rounds after a solved row;
+the first regression keeps quiescence (one REGRESSED replay chance). An
+invalidated claim also suspends retirement Rule B: the telemetry `best`
+field carries the unreproducible claim, and judging "no gain" against it
+would retire the historically proven breakthrough needle. -/
+
+def reproGrace : Nat := 2
+
+/-- Claim invalidation: a solved row **carrying an artifact** exists and the
+trailing failure streak has exhausted the grace budget.  Artifact-backed
+claims are mechanically replayable — two failed replays are empirical proof
+of unreproducibility.  Textual claims (no artifact) keep v35 semantics:
+re-pressuring a proven task only chases regression ghosts (p33). -/
+def claimInvalidated (solvedWithArtifact : Bool) (failStreak : Nat) : Bool :=
+  solvedWithArtifact && Nat.ble reproGrace failStreak
+
+/-- A claim without an artifact never invalidates, whatever the streak —
+the v35 quiescence for textual claims is preserved verbatim.  Zig mirror:
+cap-task pin ("solved without artifact stays truly silent"). -/
+theorem textual_claim_never_invalidates (k : Nat) :
+    claimInvalidated false k = false := by rfl
+
+/-- The first regression after a solved round keeps quiescence — the
+REGRESSED replay directive gets one chance before pressure returns.
+Zig mirror: "one regression keeps the replay grace". -/
+theorem one_regression_keeps_grace (s : Bool) :
+    claimInvalidated s 1 = false := by
+  cases s <;> rfl
+
+/-- Two consecutive unreproduced rounds invalidate the claim.
+Zig mirror: "two failed replays restore the pressure stack". -/
+theorem invalidated_restores_pressure :
+    claimInvalidated true 2 = true := by rfl
+
+/-- Quiescence holds only while the claim stands. -/
+def quiesce (everSolved claimInvalid : Bool) : Bool :=
+  everSolved && !claimInvalid
+
+theorem invalid_claim_never_quiesces (es : Bool) :
+    quiesce es true = false := by
+  cases es <;> rfl
+
+theorem valid_claim_keeps_quiescence :
+    quiesce true false = true := by rfl
+
+/-- Rule B applies only under a standing claim: with the claim invalidated,
+"met with no gain" is not evidence — the recorded best is the very value
+that failed to reproduce. -/
+def ruleBRetire (claimValid met noGain : Bool) : Bool :=
+  claimValid && met && noGain
+
+theorem invalid_claim_never_retires (m g : Bool) :
+    ruleBRetire false m g = false := by rfl
+
+theorem standing_claim_keeps_rule_b :
+    ruleBRetire true true true = true := by rfl
+
 end MetaCodesControl.ObligationGate
 

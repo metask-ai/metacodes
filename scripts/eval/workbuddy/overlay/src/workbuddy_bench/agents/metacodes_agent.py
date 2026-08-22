@@ -178,29 +178,50 @@ def _best_artifact(trial_dir: Path) -> str:
         )
     except OSError:
         return ""
-    pieces = []
-    total = 0
+    # v43 多文件工件(p32etag 取证:1.0 方案 = 新建模块 + 既有文件的接线
+    # hunks,旧通道只取 new-file → 接线整个丢失 → 声明 1.0 的重放永远
+    # 5/11,且 v35 静默拒载全部压力针 → 平台自锁)。新建文件递送全文
+    # (逐字重放),修改型文件递送 unified-diff hunks(段头标注 apply-diff,
+    # 消费端切换 diff 语义指令);新建段在前;总帽 4096、至多 4 文件。
+    new_pieces = []
+    mod_pieces = []
     for chunk in patch.split("diff --git ")[1:]:
-        if "\nnew file mode" not in chunk:
-            continue
         header = chunk.splitlines()[0]
         path = header.split(" b/")[-1].strip()
-        if path.startswith("tests/") or total >= 1600 or len(pieces) >= 2:
+        if path.startswith("tests/"):
             continue
-        added = [
-            line[1:]
-            for line in chunk.splitlines()
-            if line.startswith("+") and not line.startswith("+++")
-        ]
-        full = "\n".join(added)
-        content = full[: 1600 - total]
+        if "\nnew file mode" in chunk:
+            added = [
+                line[1:]
+                for line in chunk.splitlines()
+                if line.startswith("+") and not line.startswith("+++")
+            ]
+            body = "\n".join(added)
+            if body.strip():
+                new_pieces.append((f"--- {path} ---", body))
+        else:
+            lines = chunk.splitlines()
+            first_hunk = next(
+                (i for i, line in enumerate(lines) if line.startswith("@@")), None
+            )
+            if first_hunk is None:
+                continue
+            body = "\n".join(lines[first_hunk:])
+            if body.strip():
+                mod_pieces.append((f"--- {path} (apply-diff) ---", body))
+    pieces = []
+    total = 0
+    for tag, body in new_pieces + mod_pieces:
+        if len(pieces) >= 4 or total >= 4096:
+            break
+        content = body[: 4096 - total]
         if not content.strip():
             continue
         # 截断必须显式标注:被截半的文件配上"逐字写入"指令是毒药
         # (review 抓出;etag 工件 ~25 行从未触发=侥幸)。
-        if len(content) < len(full):
+        if len(content) < len(body):
             content += "\n(HOST-TRUNCATED: file exceeds quota, do NOT copy verbatim)"
-        pieces.append(f"--- {path} ---\n{content}")
+        pieces.append(f"{tag}\n{content}")
         total += len(content)
     return "\n".join(pieces)
 

@@ -303,9 +303,17 @@ fn appendVerbatimDirective(out: *std.ArrayList(u8), allocator: std.mem.Allocator
     const marker = std.mem.indexOf(u8, best, "best-attempt artifact") orelse return;
     const path_open = std.mem.indexOfPos(u8, best, marker, "--- ") orelse return;
     const path_close = std.mem.indexOfPos(u8, best, path_open + 4, " ---") orelse return;
-    const path = best[path_open + 4 .. path_close];
+    var path = best[path_open + 4 .. path_close];
+    // v43 多文件工件:修改型段的定界是 "--- <path> (apply-diff) ---",
+    // 提取到的 path 会带该后缀;剥掉并切到 diff 语义指令。
+    var first_is_diff = false;
+    if (std.mem.endsWith(u8, path, " (apply-diff)")) {
+        first_is_diff = true;
+        path = path[0 .. path.len - " (apply-diff)".len];
+    }
     if (path.len == 0 or path.len > 160) return;
     if (std.mem.indexOfScalar(u8, path, '\n') != null) return;
+    const has_diff_sections = std.mem.indexOfPos(u8, best, marker, " (apply-diff) ---") != null;
     const truncated = std.mem.indexOfPos(u8, best, marker, "HOST-TRUNCATED") != null;
     if (truncated) {
         out.appendSlice(allocator, "FIRST EDIT: rebuild the complete file at `") catch return;
@@ -316,6 +324,14 @@ fn appendVerbatimDirective(out: *std.ArrayList(u8), allocator: std.mem.Allocator
                 "verbatim). Only then apply the expected-side fixes the reports demand.\n") catch return;
         return;
     }
+    if (first_is_diff) {
+        out.appendSlice(allocator, "FIRST EDIT: apply the diff hunks quoted above to `") catch return;
+        out.appendSlice(allocator, path) catch return;
+        out.appendSlice(allocator,
+            "` exactly as written — every hunk, no re-derivation. Then apply every " ++
+                "other quoted section the same way before anything else.\n") catch return;
+        return;
+    }
     out.appendSlice(allocator, "FIRST EDIT: write the artifact quoted above to `") catch return;
     out.appendSlice(allocator, path) catch return;
     out.appendSlice(allocator,
@@ -323,6 +339,12 @@ fn appendVerbatimDirective(out: *std.ArrayList(u8), allocator: std.mem.Allocator
             "signatures, file modes or imports; every free-hand rewrite so far has " ++
             "regressed an already-solved facet. Only after that file is in place " ++
             "apply the expected-side fixes the reports demand.\n") catch return;
+    if (has_diff_sections) {
+        out.appendSlice(allocator,
+            "The sections marked (apply-diff) are unified-diff hunks against " ++
+                "existing files — apply every quoted hunk exactly (do not re-derive " ++
+                "the change) before running checks.\n") catch return;
+    }
 }
 
 /// v36 卡滞平台判定:最近 3 行(升序尾部)reward 相同且 failing 段逐字节
@@ -373,6 +395,9 @@ pub fn artifactSupersededSymbols(
             break;
         }
     };
+    // v43 重放自证伪:声明不可复现 → 已解语义失效,supersede 通道随
+    // 压力栈一起回到未解形态。
+    if (ever_solved and gate.claimNotReproduced(history.items)) ever_solved = false;
     if (!ever_solved) return 0;
     const best = bestHistoryRow(history.items, newest) orelse newest;
     const marker = std.mem.indexOf(u8, best, "best-attempt artifact") orelse return 0;
@@ -464,6 +489,10 @@ pub fn sameTaskOutcomeNote(allocator: std.mem.Allocator, kg: *client_mod.KgClien
                 break;
             }
         };
+        // v43 重放自证伪(p44b/p45 取证:声明 1.0 的工件重放两轮逐字节
+        // 0.4545——静默 + 不完整工件 = 平台自锁):连续 REPRO_GRACE_ROUNDS
+        // 轮未达声明 → 静默失效,落回未解路径(最佳行引用仍在,压力栈恢复)。
+        if (ever_solved and gate.claimNotReproduced(history.items)) ever_solved = false;
         if (ever_solved) {
             if (!gate.rowSolved(body)) {
                 // 最新回归:引用最佳全过行(含 final_note 的已证方案)。
