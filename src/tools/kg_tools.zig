@@ -569,7 +569,21 @@ pub const SUPERSEDED_CAVEAT =
     "memory mentions; where this memory contradicts that artifact, the " ++
     "artifact wins (host_run outranks stored claims)";
 
-fn appendRecallHitRow(
+/// v44 硬性撤回(etag 取证 KG 12738):v36 的 caveat 只是给冲突记忆加一行
+/// 注解, 把裁决权交回模型——实测两次败于同一形态(p35 与 e2-dev):模型读到
+/// caveat、复述了"已证配置胜出", 随后仍改主意采信冲突记忆, 同一分数 0.2727
+/// 撞墙两次。既然 host_run 全过裁决在证据位阶上高于存量声明, 就不该把该
+/// 声明的正文继续摆进上下文让模型权衡——正文换成撤回存根, 只留 node_id
+/// 供显式取回。这不是删除记忆(库中原样保留), 是读平面的证据位阶执行。
+/// Lean 镜面 withdrawn_carries_no_claim。
+pub const SUPERSEDED_WITHDRAWN_TEXT =
+    "[withdrawn by host-run artifact] this stored memory names symbols that " ++
+    "a host-run all-passing verdict for this task defines differently. Its " ++
+    "body is withheld because it has twice been followed over the proven " ++
+    "artifact. Follow the artifact quoted in the attempt-history note. If " ++
+    "you truly need this memory's body, fetch it explicitly by node_id.";
+
+pub fn appendRecallHitRow(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     hit: kg_mod.RecallHit,
@@ -588,7 +602,12 @@ fn appendRecallHitRow(
     // source bytes. Control characters can expand 6x when escaped; budgeting
     // before serialization would recreate the oversized-result failure with
     // perfectly valid TinyKG text.
-    const excerpt = try boundedJsonTextExcerptAlloc(allocator, hit.text, max_text_bytes);
+    // v44:被已证工件取代的记忆, 正文以撤回存根替代(证据位阶执行)。
+    const superseded = hitSupersededByArtifact(superseded_symbols, hit.text, type_str);
+    const excerpt = if (superseded)
+        try allocator.dupe(u8, SUPERSEDED_WITHDRAWN_TEXT)
+    else
+        try boundedJsonTextExcerptAlloc(allocator, hit.text, max_text_bytes);
     defer allocator.free(excerpt);
     try appendJsonString(out, allocator, excerpt);
     const text_total_bytes = if (hit.text_total_bytes > 0) hit.text_total_bytes else hit.text.len;
@@ -606,9 +625,10 @@ fn appendRecallHitRow(
         if (source_excerpt.len < hit.source_label.len) try out.appendSlice(allocator, ",\"source_truncated\":true");
     }
     if (include_seen) try out.appendSlice(allocator, if (seen_before) ",\"seen_before\":true" else ",\"seen_before\":false");
-    if (hitSupersededByArtifact(superseded_symbols, hit.text, type_str)) {
+    if (superseded) {
         try out.appendSlice(allocator, ",\"provenance_caveat\":");
         try appendJsonString(out, allocator, SUPERSEDED_CAVEAT);
+        try out.appendSlice(allocator, ",\"body_withheld\":true");
     }
     try out.append(allocator, '}');
 }

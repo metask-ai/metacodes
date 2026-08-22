@@ -1124,9 +1124,18 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
             runtime_af.deinit();
             a.destroy(runtime_af);
         }
-        try std.testing.expectEqual(@as(usize, 1), runtime_af.envelopes.len);
+        // v44 更新(KG 12738):本 pin 的形态(带工件已解 + 最新行回归)与 etag
+        // e2-dev 故障完全相同, 而"恰好 1 针"正是产出 0.2727 的那条策略——
+        // p35 当年只证明了 0 针不如 1 针, 从未检验 1 针是否足够, e2-dev 补上
+        // 了反例(剂量完整递送、agent 复述逐字指令, 仍被冲突记忆翻盘)。故计数
+        // 断言放宽为"工件针在首 + 回归行派生针跟随"; 本 pin 真正守护的内容
+        // (陈年 stored 义务必须拒载、工件针带 VERBATIM 且排第一)逐条保留。
+        try std.testing.expect(runtime_af.envelopes.len >= 2);
         try std.testing.expectEqualStrings("pkg/_helper.py", runtime_af.envelopes[0].command_needle);
         try std.testing.expect(std.mem.indexOf(u8, runtime_af.envelopes[0].reason, "VERBATIM") != null);
+        for (runtime_af.envelopes) |e| {
+            try std.testing.expect(std.mem.indexOf(u8, e.command_needle, "t_stale") == null);
+        }
     }
     // v36 读平面 supersede(撤修复必红——p36 取证:毒经 6 次主动 KgRecall
     // 绕过注入面,模型在正确路径写了冲突记忆的 async 版):① 静默态从已证
@@ -1251,16 +1260,18 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
         _ = kg.remember(.observation, solved_row, "task_outcome", false) catch {};
         _ = kg.remember(.observation, fail_row_1, "task_outcome", false) catch {};
         ppaths.setEnv("METACODES_TASK_HINT", "repro-task");
-        // ② 宽限窗口(1 连败):REGRESSED 静默保持 + apply-diff 指令在场。
+        // ② v44 改语义(原 v43 pin 锁的是 grace=2 的"1 连败仍静默"):
+        // **一次未达即失信** → 静默立刻解除(无 REGRESSED 措辞), 但多文件工件
+        // 与逐字令必须仍在——失信的回应是加压, 不是丢掉唯一已证配置。
         {
             var built_g = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
             defer built_g.deinit(a);
             const text_g = built_g.text orelse return error.TestExpectedInjection;
-            try std.testing.expect(std.mem.indexOf(u8, text_g, "REGRESSED from an already-proven configuration") != null);
+            try std.testing.expect(std.mem.indexOf(u8, text_g, "REGRESSED from an already-proven configuration") == null);
             try std.testing.expect(std.mem.indexOf(u8, text_g, "pkg/wire.py (apply-diff)") != null);
-            try std.testing.expect(std.mem.indexOf(u8, text_g, "The sections marked (apply-diff) are unified-diff hunks") != null);
+            try std.testing.expect(std.mem.indexOf(u8, text_g, "FIRST EDIT") != null);
         }
-        // ① 第二连败:声明失信,静默解除。
+        // ① 第二次未达:失信保持稳定(不因再次失败而回摆)。
         _ = kg.remember(.observation, fail_row_2, "task_outcome", false) catch {};
         {
             var built_i = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conversation, &abort_signal);
@@ -1305,6 +1316,73 @@ test "L2: final_note rides the outcome row into note and GIGO stays intact" {
                 if (std.mem.eql(u8, envelope.candidate_id[0..64], repro_cid[0..64])) still_there = true;
             }
             try std.testing.expect(still_there);
+        }
+    }
+
+    // v44 L2(etag 下滑环三修,撤任一修必红——KG 12738):
+    // ① 宽限收紧:带工件声明**一次**未达即失信(旧码需连败 2 轮);
+    // ② 复现态压力兜底:回归行下复现针之外必须挂该行派生针(旧码仅 1 针);
+    // ③ 冲突记忆硬性撤回:被已证工件取代的记忆正文换存根(旧码仅加 caveat)。
+    {
+        const art = "\nbest-attempt artifact (host-extracted, verbatim):" ++
+            "\n--- pkg/v44_mod.py ---\ndef make_tag(b):\n    return b[:8]";
+        const solved = "metacodes-task-outcome-v1: key=v44-task#s1 task=v44-task reward=1.0000 tests=4/4 prov=verifier failing=[]" ++ art;
+        const regressed = "metacodes-task-outcome-v1: key=v44-task#f1 task=v44-task reward=0.2500 tests=1/4 prov=verifier " ++
+            "failing=[tests/v44.py::T::t_a (skipped: pkg.v44_helper not available)]";
+        _ = kg.remember(.observation, solved, "task_outcome", false) catch {};
+        _ = kg.remember(.observation, regressed, "task_outcome", false) catch {};
+        ppaths.setEnv("METACODES_TASK_HINT", "v44-task");
+        // ① 一次未达即失信 → 静默解除(旧码 grace=2 时此处仍静默)。
+        var hist = std.array_list.Managed([]u8).init(a);
+        defer {
+            for (hist.items) |row| a.free(row);
+            hist.deinit();
+        }
+        cc.kg_scoped_recall.collectHistory(a, &kg, "v44-task", &hist);
+        try std.testing.expect(cc.obligation_gate.claimNotReproduced(hist.items));
+        try std.testing.expectEqual(@as(usize, 1), cc.obligation_gate.REPRO_GRACE_ROUNDS);
+        // ② 压力兜底:装载针数必须 >1(工件针 + 回归行派生针)。
+        {
+            const rt = cc.obligation_gate.load(a, &kg, "v44-task") orelse return error.TestExpectedRuntime;
+            defer {
+                rt.deinit();
+                a.destroy(rt);
+            }
+            try std.testing.expect(rt.envelopes.len >= 2);
+            var has_artifact_needle = false;
+            for (rt.envelopes) |e| {
+                if (std.mem.eql(u8, e.command_needle, "pkg/v44_mod.py")) has_artifact_needle = true;
+            }
+            try std.testing.expect(has_artifact_needle);
+        }
+        // ③ 冲突记忆正文撤回:走**真实渲染路径** appendRecallHitRow, 断言冲突
+        // 记忆正文不再出现在 provider 可见 JSON 中(旧码只加 caveat、正文照发,
+        // 模型两次据此翻盘:p35 与 e2-dev 同为 0.2727)。
+        {
+            const syms = [_][]const u8{"make_tag"};
+            const poison = "CORRECTION: make_tag must be async and content-based";
+            var row: std.ArrayList(u8) = .empty;
+            defer row.deinit(a);
+            const hit = cc.kg_client.RecallHit{
+                .node_id = 4242,
+                .kind = try a.dupe(u8, "observation"),
+                .domain = try a.dupe(u8, "project"),
+                .schema_type = try a.dupe(u8, "observation"),
+                .text = try a.dupe(u8, poison),
+                .text_total_bytes = poison.len,
+                .text_truncated = false,
+                .score = 9.0,
+                .source_label = try a.dupe(u8, ""),
+            };
+            defer hit.deinit(a);
+            try cc.tools.kg_tools.appendRecallHitRow(&row, a, hit, false, false, 4096, &syms);
+            const rendered = row.items;
+            try std.testing.expect(std.mem.indexOf(u8, rendered, "async and content-based") == null);
+            try std.testing.expect(std.mem.indexOf(u8, rendered, "withdrawn by host-run artifact") != null);
+            try std.testing.expect(std.mem.indexOf(u8, rendered, "\"body_withheld\":true") != null);
+            try std.testing.expect(std.mem.indexOf(u8, rendered, "4242") != null);
+            // 结局行携带裁决本身, 永不撤回。
+            try std.testing.expect(!cc.tools.kg_tools.hitSupersededByArtifact(&syms, poison, "task_outcome"));
         }
     }
 
