@@ -577,6 +577,25 @@ test "server discover does not require list-result cache metadata" {
     try std.testing.expectEqual(canonical.CacheScope.private, parsed.value.cache.scope);
 }
 
+test "discover handshake owns parsed text after the response buffer is released" {
+    const allocator = std.testing.allocator;
+    const response = try allocator.dupe(
+        u8,
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{" ++
+            "\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"]," ++
+            "\"capabilities\":{},\"instructions\":\"persist me\"}}",
+    );
+    var parsed = try parseDiscoverResponse(allocator, response, 6, .{});
+    try std.testing.expect(parsed == .value);
+
+    @memset(response, 0xaa);
+    allocator.free(response);
+    defer parsed.value.deinit();
+
+    try std.testing.expectEqualStrings("2026-07-28", parsed.value.supported_versions[0]);
+    try std.testing.expectEqualStrings("persist me", parsed.value.instructions.?);
+}
+
 test "modern tools list preserves full schemas and derives bound identity" {
     const response =
         "{\"jsonrpc\":\"2.0\",\"id\":11,\"result\":{" ++

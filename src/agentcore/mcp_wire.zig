@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const canonical = @import("mcp_canonical.zig");
+const json = @import("mcp_json.zig");
 
 pub const JSON_RPC_VERSION = "2.0";
 pub const METHOD_NOT_FOUND: i64 = -32601;
@@ -41,6 +42,12 @@ pub fn parseResponseEnvelope(
             if (err == error.ResourceLimit) .resource_limit else .invalid_json,
             phase,
         ) };
+    switch (json.admit(allocator, encoded, structuralLimits(encoded.len, limits))) {
+        .valid => {},
+        .invalid_json => return .{ .diagnostic = canonical.Diagnostic.init(.invalid_json, phase) },
+        .resource_limit => return .{ .diagnostic = canonical.Diagnostic.init(.resource_limit, phase) },
+        .out_of_memory => return error.OutOfMemory,
+    }
     const root = std.json.parseFromSliceLeaky(std.json.Value, allocator, encoded, .{
         .duplicate_field_behavior = .@"error",
         .max_value_len = limits.max_frame_bytes,
@@ -185,6 +192,12 @@ pub fn parseArguments(
 ) canonical.Error!std.json.Value {
     if (encoded.len == 0 or encoded.len > limits.max_schema_bytes)
         return error.ResourceLimit;
+    switch (json.admit(allocator, encoded, structuralLimits(encoded.len, limits))) {
+        .valid => {},
+        .invalid_json => return error.InvalidValue,
+        .resource_limit => return error.ResourceLimit,
+        .out_of_memory => return error.OutOfMemory,
+    }
     const value = std.json.parseFromSliceLeaky(std.json.Value, allocator, encoded, .{
         .duplicate_field_behavior = .@"error",
         .max_value_len = limits.max_schema_bytes,
@@ -199,6 +212,17 @@ pub fn parseArguments(
     if (value != .object) return error.InvalidValue;
     try canonical.validateJsonValue(value, limits);
     return value;
+}
+
+fn structuralLimits(encoded_len: usize, limits: canonical.Limits) json.Limits {
+    return .{
+        .max_depth = limits.max_json_depth,
+        .max_nodes = limits.max_json_nodes,
+        .max_container_entries = limits.max_json_nodes,
+        // Frame size already bounds total scanner work. This keeps the guard
+        // structural without inventing a second public wire limit.
+        .max_work_units = encoded_len +| 1,
+    };
 }
 
 pub fn numberAsNonNegativeFloat(value: std.json.Value) ?f64 {
@@ -230,6 +254,38 @@ test "strict envelope classifies method not found without accepting wrong ids" {
         .{},
     );
     try std.testing.expectEqual(canonical.DiagnosticCode.response_id_mismatch, wrong.diagnostic.code);
+}
+
+test "response envelope permits escaped C0 bytes in arbitrary result content" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try parseEnvelope(
+        arena.allocator(),
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"\\u001b[31mred\"}]}}",
+        7,
+        .tools_call,
+        .{},
+    );
+    try std.testing.expect(parsed == .value);
+}
+
+test "response structure budget is enforced before dynamic tree allocation" {
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        // The scanner and its O(depth) bookkeeping each allocate once. Any
+        // attempt to materialize the dynamic tree would be the third request.
+        .{ .fail_index = 2 },
+    );
+    const parsed = try parseEnvelope(
+        failing.allocator(),
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}",
+        7,
+        .discovery,
+        .{ .max_json_nodes = 2 },
+    );
+    try std.testing.expectEqual(canonical.DiagnosticCode.resource_limit, parsed.diagnostic.code);
+    try std.testing.expectEqual(@as(usize, 2), failing.alloc_index);
+    try std.testing.expect(!failing.has_induced_failure);
 }
 
 test "modern complete result requires resultType after validating input required" {

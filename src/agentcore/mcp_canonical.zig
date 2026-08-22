@@ -292,6 +292,11 @@ pub fn validateText(value: []const u8, max_bytes: usize) Error!void {
     }
 }
 
+fn validateJsonText(value: []const u8, max_bytes: usize) Error!void {
+    if (value.len > max_bytes) return error.ResourceLimit;
+    if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidValue;
+}
+
 pub fn validateToolName(value: []const u8, limits: Limits) Error!void {
     if (value.len == 0 or value.len > limits.max_tool_name_bytes)
         return error.InvalidValue;
@@ -324,13 +329,15 @@ fn validateJsonValueAt(
         return error.ResourceLimit;
     nodes.* += 1;
     switch (value) {
-        .string, .number_string => |text_value| try validateText(text_value, limits.max_frame_bytes),
+        // Arbitrary JSON content may legally contain escaped C0 characters.
+        // Protocol fields apply `validateText` explicitly at their own boundary.
+        .string, .number_string => |text_value| try validateJsonText(text_value, limits.max_frame_bytes),
         .array => |array| for (array.items) |child|
             try validateJsonValueAt(child, depth + 1, nodes, limits),
         .object => |object| {
             var iterator = object.iterator();
             while (iterator.next()) |entry| {
-                try validateText(entry.key_ptr.*, limits.max_text_bytes);
+                try validateJsonText(entry.key_ptr.*, limits.max_text_bytes);
                 try validateJsonValueAt(entry.value_ptr.*, depth + 1, nodes, limits);
             }
         },
